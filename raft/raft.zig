@@ -1,4 +1,8 @@
+const std = @import("std");
+
 pub const Node = @import("node.zig").Node;
+pub const PeerRole = @import("node.zig").PeerRole;
+pub const Peer = @import("node.zig").Peer;
 pub const Config = @import("config.zig").Config;
 pub const Message = @import("message.zig").Message;
 pub const LogEntry = @import("message.zig").LogEntry;

@@ -10,7 +10,7 @@ fn defaultConfig() Config {
     return .{
         .heartbeat_ticks = 2,
         .election_timeout_min_ticks = 5,
-        .election_timeout_max_ticks = 8,
+        .election_timeout_max_ticks = 15,
         .tick_interval_ms = 10,
         .max_entries_per_msg = 64,
         .max_msg_size = 1_048_576,

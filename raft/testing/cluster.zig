@@ -9,12 +9,13 @@ pub const TestCluster = struct {
     allocator: std.mem.Allocator,
     nodes: std.AutoHashMap(NodeId, *MetaNode),
     drop_from: std.AutoHashMap(NodeId, void),
+    tick_count: u64,
 
     pub const MetaNode = struct {
         node: Node,
         log: raft.MemRaftLog,
         inbox: std.ArrayList(Message),
-        peers: []const NodeId,
+        peers: []const raft.Peer,
     };
 
     pub fn init(
@@ -28,8 +29,8 @@ pub const TestCluster = struct {
         try nodes.ensureTotalCapacity(@intCast(ids.len));
 
         for (ids) |id| {
-            const peers = try buildPeers(allocator, ids, id);
-            const is_learner = containsNode(learners, id);
+            const peers = try buildPeers(allocator, ids, learners, id);
+            const self_role: raft.PeerRole = if (containsNode(learners, id)) .learner else .voter;
 
             var entry = try allocator.create(MetaNode);
             entry.* = .{
@@ -44,7 +45,7 @@ pub const TestCluster = struct {
                 peers,
                 entry.log.asRaftLog(),
                 config,
-                is_learner,
+                self_role,
             );
 
             try nodes.put(id, entry);
@@ -54,6 +55,7 @@ pub const TestCluster = struct {
             .allocator = allocator,
             .nodes = nodes,
             .drop_from = drop_from,
+            .tick_count = 0,
         };
     }
 
@@ -84,12 +86,20 @@ pub const TestCluster = struct {
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
             if (self.drop_from.contains(entry.node.id)) {
+                // std.debug.print(
+                //     "[raft] cluster tick={d} drop-from node={d} outbox={d}\n",
+                //     .{ self.tick_count, entry.node.id, entry.node.takeOutbox().len },
+                // );
                 entry.node.clearOutbox();
                 continue;
             }
             const outbox = entry.node.takeOutbox();
             if (outbox.len == 0) continue;
             for (outbox) |msg| {
+                // std.debug.print(
+                //     "[raft] cluster tick={d} deliver {d}->{d} kind={s} term={d}\n",
+                //     .{ self.tick_count, entry.node.id, msg.to, @tagName(msg.msg), msg.msg.term() },
+                // );
                 if (self.nodes.get(msg.to)) |dest| {
                     _ = dest.inbox.append(self.allocator, msg.msg) catch {
                         @panic("raft: inbox append failed");
@@ -116,6 +126,8 @@ pub const TestCluster = struct {
     pub fn runTicks(self: *TestCluster, ticks: u32) !void {
         var i: u32 = 0;
         while (i < ticks) : (i += 1) {
+            self.tick_count += 1;
+            // std.debug.print("[raft] cluster tick={d} begin\n", .{self.tick_count});
             try self.tickAll();
             try self.deliverInbox();
         }
@@ -136,11 +148,22 @@ pub const TestCluster = struct {
         }
     }
 
-    fn buildPeers(allocator: std.mem.Allocator, ids: []const NodeId, self_id: NodeId) ![]const NodeId {
-        var peers = std.ArrayList(NodeId).empty;
+    fn buildPeers(
+        allocator: std.mem.Allocator,
+        ids: []const NodeId,
+        learners: []const NodeId,
+        self_id: NodeId,
+    ) ![]const raft.Peer {
+        var peers = std.ArrayList(raft.Peer).empty;
         for (ids) |id| {
             if (id == self_id) continue;
-            try peers.append(allocator, id);
+            const role: raft.PeerRole = if (containsNode(learners, id)) .learner else .voter;
+            try peers.append(allocator, .{
+                .id = id,
+                .next_index = 1,
+                .match_index = 0,
+                .role = role,
+            });
         }
         return peers.toOwnedSlice(allocator);
     }

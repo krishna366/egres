@@ -2,6 +2,7 @@ const std = @import("std");
 const msg = @import("message.zig");
 const raftlog_mod = @import("raftlog.zig");
 const config_mod = @import("config.zig");
+const raft_log = std.log.scoped(.raft);
 
 pub const NodeId = msg.NodeId;
 pub const Message = msg.Message;
@@ -34,6 +35,7 @@ pub const RaftError = error{
 } || RaftLogError;
 
 pub const Peer = struct {
+    id: NodeId,
     next_index: u64,
     // Highest log index known to be replicated on this peer (leader view).
     match_index: u64,
@@ -46,6 +48,29 @@ pub const Outbound = struct {
 };
 
 pub const Node = struct {
+    pub const DebugOutput = enum {
+        debug_print,
+        none,
+    };
+
+    const TimeoutResetReason = enum {
+        init,
+        grant_vote,
+        start_prevote,
+        start_election,
+        append_entries,
+        step_down,
+    };
+
+    pub var debug_output_mode: DebugOutput = .none;
+
+    fn dbg(comptime format: []const u8, args: anytype) void {
+        switch (debug_output_mode) {
+            .debug_print => std.debug.print("[raft] " ++ format ++ "\n", args),
+            .none => return,
+        }
+    }
+
     id: NodeId,
     peers: std.AutoHashMap(NodeId, Peer),
 
@@ -66,6 +91,7 @@ pub const Node = struct {
 
     elapsed_ticks: u32,
     election_timeout: u32,
+    tick_count: u64,
     config: Config,
 
     allocator: std.mem.Allocator,
@@ -76,14 +102,14 @@ pub const Node = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         id: NodeId,
-        peers: []const NodeId,
+        peers: []const Peer,
         log: RaftLog,
         config: Config,
-        is_learner: bool,
+        self_role: PeerRole,
     ) !Node {
         try config.validate();
-        const seed = @as(u64, @intCast(std.time.nanoTimestamp()));
-        const prng = std.Random.DefaultPrng.init(seed ^ id);
+        const seed = @as(u64, @intCast(std.time.nanoTimestamp())) ^ id;
+        const prng = std.Random.DefaultPrng.init(seed);
         var node = Node{
             .id = id,
             .peers = std.AutoHashMap(NodeId, Peer).init(allocator),
@@ -100,19 +126,31 @@ pub const Node = struct {
             .prevotes_received = std.AutoHashMap(NodeId, void).init(allocator),
             .elapsed_ticks = 0,
             .election_timeout = config.election_timeout_min_ticks,
+            .tick_count = 0,
             .config = config,
             .allocator = allocator,
             .outbox = std.ArrayList(Outbound).empty,
             .prng = prng,
         };
-        for (peers) |peer_id| {
-            try node.peers.put(peer_id, .{ .next_index = 1, .match_index = 0, .role = .voter });
+        for (peers) |peer| {
+            try node.peers.put(peer.id, peer);
         }
-        if (is_learner) {
+        if (self_role == .learner) {
             node.state = .learner;
         }
         node.recomputeQuorum();
-        node.resetElectionTimeout();
+        node.resetElectionTimeout(.init);
+        dbg(
+            "init node={d} state={s} term={d} election_timeout={d} quorum={d} seed=0x{x}",
+            .{
+                node.id,
+                @tagName(node.state),
+                node.current_term,
+                node.election_timeout,
+                node.quorum_size,
+                seed,
+            },
+        );
         return node;
     }
 
@@ -124,6 +162,7 @@ pub const Node = struct {
     }
 
     pub fn tick(self: *Node) RaftError!void {
+        self.tick_count += 1;
         self.elapsed_ticks += 1;
         switch (self.state) {
             .leader => if (self.elapsed_ticks >= self.config.heartbeat_ticks) {
@@ -131,6 +170,17 @@ pub const Node = struct {
                 try self.broadcastHeartbeat();
             },
             .follower, .candidate => if (self.elapsed_ticks >= self.election_timeout) {
+                dbg(
+                    "election-timeout tick={d} node={d} state={s} term={d} elapsed={d} timeout={d}",
+                    .{
+                        self.tick_count,
+                        self.id,
+                        @tagName(self.state),
+                        self.current_term,
+                        self.elapsed_ticks,
+                        self.election_timeout,
+                    },
+                );
                 if (self.config.enable_prevote) {
                     try self.startPreVote();
                 } else {
@@ -160,7 +210,11 @@ pub const Node = struct {
     pub fn startPreVote(self: *Node) RaftError!void {
         if (self.state == .learner) return;
         self.elapsed_ticks = 0;
-        self.resetElectionTimeout();
+        self.resetElectionTimeout(.start_prevote);
+        dbg(
+            "start-prevote tick={d} node={d} term={d} last_idx={d} last_term={d}",
+            .{ self.tick_count, self.id, self.current_term, self.log.lastIndex(), self.log.lastTerm() },
+        );
 
         self.prevotes_received.clearRetainingCapacity();
         try self.prevotes_received.put(self.id, {});
@@ -185,7 +239,11 @@ pub const Node = struct {
         self.voted_for = self.id;
         self.leader_id = null;
         self.elapsed_ticks = 0;
-        self.resetElectionTimeout();
+        self.resetElectionTimeout(.start_election);
+        dbg(
+            "start-election tick={d} node={d} term={d} timeout={d}",
+            .{ self.tick_count, self.id, self.current_term, self.election_timeout },
+        );
 
         self.votes_received.clearRetainingCapacity();
         try self.votes_received.put(self.id, {});
@@ -210,6 +268,7 @@ pub const Node = struct {
         self.state = .leader;
         self.leader_id = self.id;
         self.elapsed_ticks = 0;
+        dbg("become-leader tick={d} node={d} term={d}", .{ self.tick_count, self.id, self.current_term });
 
         var it = self.peers.iterator();
         while (it.next()) |kv| {
@@ -252,6 +311,10 @@ pub const Node = struct {
 
     pub fn handleRequestVote(self: *Node, rv: RequestVote) RaftError!void {
         if (rv.term < self.current_term) {
+            dbg(
+                "vote-reject tick={d} node={d} candidate={d} reason=stale_term rv_term={d} cur_term={d}",
+                .{ self.tick_count, self.id, rv.candidate_id, rv.term, self.current_term },
+            );
             self.send(rv.candidate_id, Message{ .request_vote_reply = .{
                 .term = self.current_term,
                 .vote_granted = false,
@@ -261,6 +324,10 @@ pub const Node = struct {
         }
 
         if (self.state == .learner) {
+            dbg(
+                "vote-reject tick={d} node={d} candidate={d} reason=learner",
+                .{ self.tick_count, self.id, rv.candidate_id },
+            );
             self.send(rv.candidate_id, Message{ .request_vote_reply = .{
                 .term = self.current_term,
                 .vote_granted = false,
@@ -276,10 +343,29 @@ pub const Node = struct {
         if (can_vote and up_to_date) {
             self.voted_for = rv.candidate_id;
             self.elapsed_ticks = 0;
-            self.resetElectionTimeout();
+            self.resetElectionTimeout(.grant_vote);
             try self.persistHardState();
             granted = true;
         }
+        const self_last_term = self.log.lastTerm();
+        const self_last_index = self.log.lastIndex();
+        dbg(
+            "vote tick={d} node={d} candidate={d} term={d} granted={} can_vote={} up_to_date={} voted_for={any} cand_last=({d},{d}) self_last=({d},{d})",
+            .{
+                self.tick_count,
+                self.id,
+                rv.candidate_id,
+                rv.term,
+                granted,
+                can_vote,
+                up_to_date,
+                self.voted_for,
+                rv.last_log_term,
+                rv.last_log_index,
+                self_last_term,
+                self_last_index,
+            },
+        );
 
         self.send(rv.candidate_id, Message{ .request_vote_reply = .{
             .term = self.current_term,
@@ -290,6 +376,10 @@ pub const Node = struct {
 
     pub fn handlePreVote(self: *Node, pv: PreVote) RaftError!void {
         if (self.state == .learner) {
+            dbg(
+                "prevote-reject tick={d} node={d} candidate={d} reason=learner",
+                .{ self.tick_count, self.id, pv.candidate_id },
+            );
             self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
                 .term = self.current_term,
                 .vote_granted = false,
@@ -298,6 +388,10 @@ pub const Node = struct {
             return;
         }
         if (pv.term < self.current_term) {
+            dbg(
+                "prevote-reject tick={d} node={d} candidate={d} reason=stale_term pv_term={d} cur_term={d}",
+                .{ self.tick_count, self.id, pv.candidate_id, pv.term, self.current_term },
+            );
             self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
                 .term = self.current_term,
                 .vote_granted = false,
@@ -307,6 +401,20 @@ pub const Node = struct {
         }
 
         const up_to_date = self.isLogUpToDate(pv.last_log_term, pv.last_log_index);
+        dbg(
+            "prevote tick={d} node={d} candidate={d} term={d} granted={} cand_last=({d},{d}) self_last=({d},{d})",
+            .{
+                self.tick_count,
+                self.id,
+                pv.candidate_id,
+                pv.term,
+                up_to_date,
+                pv.last_log_term,
+                pv.last_log_index,
+                self.log.lastTerm(),
+                self.log.lastIndex(),
+            },
+        );
         self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
             .term = self.current_term,
             .vote_granted = up_to_date,
@@ -320,6 +428,17 @@ pub const Node = struct {
         if (!pvr.vote_granted) return;
 
         _ = try self.prevotes_received.put(pvr.from, {});
+        dbg(
+            "prevote-reply tick={d} node={d} from={d} term={d} count={d} quorum={d}",
+            .{
+                self.tick_count,
+                self.id,
+                pvr.from,
+                self.current_term,
+                self.prevotes_received.count(),
+                self.quorumSize(),
+            },
+        );
         if (self.prevotes_received.count() >= self.quorumSize()) {
             try self.startElection();
         }
@@ -331,6 +450,17 @@ pub const Node = struct {
         if (!rvr.vote_granted) return;
 
         _ = try self.votes_received.put(rvr.from, {});
+        dbg(
+            "vote-reply tick={d} node={d} from={d} term={d} count={d} quorum={d}",
+            .{
+                self.tick_count,
+                self.id,
+                rvr.from,
+                self.current_term,
+                self.votes_received.count(),
+                self.quorumSize(),
+            },
+        );
         if (self.votes_received.count() >= self.quorumSize()) {
             try self.becomeLeader();
         }
@@ -354,7 +484,7 @@ pub const Node = struct {
         }
         self.leader_id = ae.leader_id;
         self.elapsed_ticks = 0;
-        self.resetElectionTimeout();
+        self.resetElectionTimeout(.append_entries);
 
         if (ae.prev_log_index > 0) {
             const prev = self.log.entry(ae.prev_log_index);
@@ -544,7 +674,12 @@ pub const Node = struct {
 
     fn addPeer(self: *Node, id: NodeId, role: PeerRole) void {
         if (self.hasPeer(id)) return;
-        _ = self.peers.put(id, .{ .next_index = self.log.lastIndex() + 1, .match_index = 0, .role = role }) catch {
+        _ = self.peers.put(id, .{
+            .id = id,
+            .next_index = self.log.lastIndex() + 1,
+            .match_index = 0,
+            .role = role,
+        }) catch {
             @panic("raft: addPeer out of memory");
         };
         self.recomputeQuorum();
@@ -584,18 +719,36 @@ pub const Node = struct {
             if (peer.role == .voter) voters += 1;
         }
         self.quorum_size = (voters / 2) + 1;
+        dbg("node={d} quorum_size={d}", .{ self.id, self.quorum_size });
     }
 
-    fn resetElectionTimeout(self: *Node) void {
+    fn resetElectionTimeout(self: *Node, reason: TimeoutResetReason) void {
+        const old_timeout = self.election_timeout;
         const rand = self.prng.random();
-        self.election_timeout = rand.intRangeAtMost(
-            u32,
-            self.config.election_timeout_min_ticks,
-            self.config.election_timeout_max_ticks,
+        const draw = rand.int(u32);
+        const min = self.config.election_timeout_min_ticks;
+        const max = self.config.election_timeout_max_ticks;
+        const span = (max - min) + 1;
+        self.election_timeout = min + (draw % span);
+        dbg(
+            "timeout-reset tick={d} node={d} reason={s} old={d} new={d} draw={d} range=[{d},{d}] elapsed={d}",
+            .{
+                self.tick_count,
+                self.id,
+                @tagName(reason),
+                old_timeout,
+                self.election_timeout,
+                draw,
+                min,
+                max,
+                self.elapsed_ticks,
+            },
         );
     }
 
     fn stepDown(self: *Node, new_term: u64) RaftError!void {
+        const prev_state = self.state;
+        const prev_term = self.current_term;
         if (self.state == .learner) {
             self.state = .learner;
         } else {
@@ -605,7 +758,11 @@ pub const Node = struct {
         self.voted_for = null;
         self.leader_id = null;
         self.elapsed_ticks = 0;
-        self.resetElectionTimeout();
+        self.resetElectionTimeout(.step_down);
+        dbg(
+            "step-down tick={d} node={d} {s}/term={d} -> {s}/term={d}",
+            .{ self.tick_count, self.id, @tagName(prev_state), prev_term, @tagName(self.state), self.current_term },
+        );
         try self.persistHardState();
     }
 

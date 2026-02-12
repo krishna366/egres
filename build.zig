@@ -165,8 +165,13 @@ fn addRaftTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     });
     raft_tests.root_module.addImport("raft", raft_mod);
     const run_raft_tests = b.addRunArtifact(raft_tests);
+    const run_raft_tests_trace = b.addRunArtifact(raft_tests);
+    run_raft_tests_trace.stdio = .inherit;
 
     const raft_test_step = b.step("test-raft", "Run raft tests");
     raft_test_step.dependOn(&run_raft_tests.step);
+
+    const raft_test_trace_step = b.step("test-raft-trace", "Run raft tests with raft debug logs");
+    raft_test_trace_step.dependOn(&run_raft_tests_trace.step);
     return raft_test_step;
 }
