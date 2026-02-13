@@ -1,23 +1,18 @@
 const std = @import("std");
-const msg = @import("message.zig");
 const raftlog_mod = @import("raftlog.zig");
 const config_mod = @import("config.zig");
+const zen = @import("buffers_gen");
 const raft_log = std.log.scoped(.raft);
 
-pub const NodeId = msg.NodeId;
-pub const Message = msg.Message;
-pub const MessageType = msg.MessageType;
-pub const RequestVote = msg.RequestVote;
-pub const RequestVoteReply = msg.RequestVoteReply;
-pub const PreVote = msg.PreVote;
-pub const PreVoteReply = msg.PreVoteReply;
-pub const AppendEntries = msg.AppendEntries;
-pub const AppendEntriesReply = msg.AppendEntriesReply;
-pub const LogEntry = msg.LogEntry;
-pub const State = msg.State;
-pub const EntryType = msg.EntryType;
-pub const ConfChange = msg.ConfChange;
-pub const ConfChangeType = msg.ConfChangeType;
+pub const NodeId = raftlog_mod.NodeId;
+pub const State = enum {
+    follower,
+    candidate,
+    leader,
+    learner,
+};
+pub const ConfChange = raftlog_mod.ConfChange;
+pub const ConfChangeType = raftlog_mod.ConfChangeType;
 
 pub const PeerRole = enum {
     voter,
@@ -32,7 +27,8 @@ pub const RaftError = error{
     NotLeader,
     InvalidMessage,
     ConfChangeInProgress,
-} || RaftLogError;
+    InvalidBytes,
+} || RaftLogError || zen.Error;
 
 pub const Peer = struct {
     id: NodeId,
@@ -44,8 +40,10 @@ pub const Peer = struct {
 
 pub const Outbound = struct {
     to: NodeId,
-    msg: Message,
+    payload: []u8,
 };
+
+pub const Inbound = []u8;
 
 pub const Node = struct {
     pub const DebugOutput = enum {
@@ -155,6 +153,7 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        self.clearOutbox();
         self.votes_received.deinit();
         self.prevotes_received.deinit();
         self.peers.deinit();
@@ -191,19 +190,17 @@ pub const Node = struct {
         }
     }
 
-    pub fn handleMessage(self: *Node, message: Message) RaftError!void {
-        const msg_term = message.term();
-        if (msg_term > self.current_term) {
-            try self.stepDown(msg_term);
-        }
+    pub fn handleInbound(self: *Node, inbound: Inbound) RaftError!void {
+        try self.handleEncoded(inbound);
+    }
 
-        switch (message) {
-            .request_vote => |rv| try self.handleRequestVote(rv),
-            .request_vote_reply => |rvr| try self.handleRequestVoteReply(rvr),
-            .append_entries => |ae| try self.handleAppendEntries(ae),
-            .append_entries_reply => |aer| try self.handleAppendEntriesReply(aer),
-            .pre_vote => |pv| try self.handlePreVote(pv),
-            .pre_vote_reply => |pvr| try self.handlePreVoteReply(pvr),
+    fn handleEncoded(self: *Node, buf: []const u8) RaftError!void {
+        switch (zen.parseMessageWithTail(buf) catch return RaftError.InvalidMessage) {
+            .RequestVote => |rv| try self.handleRequestVote(rv),
+            .RequestVoteReply => |rvr| try self.handleRequestVoteReply(rvr),
+            .AppendEntries => |ae| try self.handleAppendEntries(ae),
+            .AppendEntriesReply => |aer| try self.handleAppendEntriesReply(aer),
+            else => return RaftError.InvalidMessage,
         }
     }
 
@@ -219,16 +216,9 @@ pub const Node = struct {
         self.prevotes_received.clearRetainingCapacity();
         try self.prevotes_received.put(self.id, {});
 
-        const pv = PreVote{
-            .term = self.current_term,
-            .candidate_id = self.id,
-            .last_log_index = self.log.lastIndex(),
-            .last_log_term = self.log.lastTerm(),
-        };
-
         var it = self.peers.iterator();
         while (it.next()) |kv| {
-            self.send(kv.key_ptr.*, Message{ .pre_vote = pv });
+            try self.sendRequestVote(kv.key_ptr.*, true);
         }
     }
 
@@ -250,16 +240,9 @@ pub const Node = struct {
 
         try self.persistHardState();
 
-        const rv = RequestVote{
-            .term = self.current_term,
-            .candidate_id = self.id,
-            .last_log_index = self.log.lastIndex(),
-            .last_log_term = self.log.lastTerm(),
-        };
-
         var it = self.peers.iterator();
         while (it.next()) |kv| {
-            self.send(kv.key_ptr.*, Message{ .request_vote = rv });
+            try self.sendRequestVote(kv.key_ptr.*, false);
         }
     }
 
@@ -289,173 +272,160 @@ pub const Node = struct {
     pub fn sendAppendEntries(self: *Node, peer: NodeId) RaftError!void {
         if (self.state != .leader) return;
         const state = self.peers.getPtr(peer) orelse return;
-        const next_index = state.next_index;
-        const prev_index = if (next_index == 0) 0 else next_index - 1;
-        var prev_term: u64 = 0;
-        if (prev_index != 0) {
-            if (self.log.entry(prev_index)) |log_entry| {
-                prev_term = log_entry.term;
-            }
+        const prev_index = if (state.next_index == 0) 0 else state.next_index - 1;
+        const prev_term: u64 = if (prev_index == 0) 0 else (try self.log.term(prev_index)) orelse 0;
+        const entries = try self.log.entriesFromRef(state.next_index, self.config.max_entries_per_msg);
+
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+
+        var ae_writer = try zen.AppendEntriesWriter.initWithBuf(self.allocator, &buf);
+        defer ae_writer.deinit(self.allocator);
+
+        var entry_offsets = std.ArrayList(u32).empty;
+        defer entry_offsets.deinit(self.allocator);
+        try entry_offsets.ensureTotalCapacity(self.allocator, entries.len);
+
+        for (entries) |entry_ref| {
+            var entry_buf = try zen.LogEntryBuffer.initWithTail(self.allocator, entry_ref.bytes, .borrowed);
+            defer entry_buf.deinit();
+
+            const entry_off = try entry_buf.cloneInto(self.allocator, &buf);
+            try entry_offsets.append(self.allocator, entry_off);
         }
-        const entries = self.log.entriesFrom(next_index, self.config.max_entries_per_msg);
-        const ae = AppendEntries{
+
+        try ae_writer.set(.{
             .term = self.current_term,
             .leader_id = self.id,
             .prev_log_index = prev_index,
             .prev_log_term = prev_term,
-            .entries = entries,
+            .entries = entry_offsets.items,
             .leader_commit = self.commit_index,
-        };
-        self.send(peer, Message{ .append_entries = ae });
+        });
+        _ = try ae_writer.finishWithTail();
+        const bytes = try buf.toOwnedSlice(self.allocator);
+        self.sendEncoded(peer, bytes);
     }
 
-    pub fn handleRequestVote(self: *Node, rv: RequestVote) RaftError!void {
-        if (rv.term < self.current_term) {
+    fn handleRequestVote(self: *Node, rv: zen.RequestVoteReader) RaftError!void {
+        const rv_term = rv.term();
+        const is_prevote = rv.isPrevote();
+        const candidate_id = rv.candidateId();
+        const last_log_index = rv.lastLogIndex();
+        const last_log_term = rv.lastLogTerm();
+        if (!is_prevote and rv_term > self.current_term) {
+            try self.stepDown(rv_term);
+        }
+
+        if (rv_term < self.current_term) {
             dbg(
                 "vote-reject tick={d} node={d} candidate={d} reason=stale_term rv_term={d} cur_term={d}",
-                .{ self.tick_count, self.id, rv.candidate_id, rv.term, self.current_term },
+                .{ self.tick_count, self.id, candidate_id, rv_term, self.current_term },
             );
-            self.send(rv.candidate_id, Message{ .request_vote_reply = .{
-                .term = self.current_term,
-                .vote_granted = false,
-                .from = self.id,
-            } });
+            try self.sendRequestVoteReply(candidate_id, false, is_prevote);
             return;
         }
 
         if (self.state == .learner) {
             dbg(
                 "vote-reject tick={d} node={d} candidate={d} reason=learner",
-                .{ self.tick_count, self.id, rv.candidate_id },
+                .{ self.tick_count, self.id, candidate_id },
             );
-            self.send(rv.candidate_id, Message{ .request_vote_reply = .{
-                .term = self.current_term,
-                .vote_granted = false,
-                .from = self.id,
-            } });
+            try self.sendRequestVoteReply(candidate_id, false, is_prevote);
             return;
         }
 
-        const can_vote = self.voted_for == null or self.voted_for.? == rv.candidate_id;
-        const up_to_date = self.isLogUpToDate(rv.last_log_term, rv.last_log_index);
+        const up_to_date = self.isLogUpToDate(last_log_term, last_log_index);
+        const can_vote = self.voted_for == null or self.voted_for.? == candidate_id;
 
         var granted = false;
-        if (can_vote and up_to_date) {
-            self.voted_for = rv.candidate_id;
+        if (is_prevote) {
+            granted = up_to_date;
+        } else if (can_vote and up_to_date) {
+            self.voted_for = candidate_id;
             self.elapsed_ticks = 0;
             self.resetElectionTimeout(.grant_vote);
             try self.persistHardState();
             granted = true;
         }
-        const self_last_term = self.log.lastTerm();
-        const self_last_index = self.log.lastIndex();
-        dbg(
-            "vote tick={d} node={d} candidate={d} term={d} granted={} can_vote={} up_to_date={} voted_for={any} cand_last=({d},{d}) self_last=({d},{d})",
-            .{
-                self.tick_count,
-                self.id,
-                rv.candidate_id,
-                rv.term,
-                granted,
-                can_vote,
-                up_to_date,
-                self.voted_for,
-                rv.last_log_term,
-                rv.last_log_index,
-                self_last_term,
-                self_last_index,
-            },
-        );
+        if (is_prevote) {
+            dbg(
+                "prevote tick={d} node={d} candidate={d} term={d} granted={} up_to_date={} cand_last=({d},{d}) self_last=({d},{d})",
+                .{
+                    self.tick_count,
+                    self.id,
+                    candidate_id,
+                    rv_term,
+                    granted,
+                    up_to_date,
+                    last_log_term,
+                    last_log_index,
+                    self.log.lastTerm(),
+                    self.log.lastIndex(),
+                },
+            );
+        } else {
+            dbg(
+                "vote tick={d} node={d} candidate={d} term={d} granted={} can_vote={} up_to_date={} voted_for={any} cand_last=({d},{d}) self_last=({d},{d})",
+                .{
+                    self.tick_count,
+                    self.id,
+                    candidate_id,
+                    rv_term,
+                    granted,
+                    can_vote,
+                    up_to_date,
+                    self.voted_for,
+                    last_log_term,
+                    last_log_index,
+                    self.log.lastTerm(),
+                    self.log.lastIndex(),
+                },
+            );
+        }
 
-        self.send(rv.candidate_id, Message{ .request_vote_reply = .{
-            .term = self.current_term,
-            .vote_granted = granted,
-            .from = self.id,
-        } });
+        try self.sendRequestVoteReply(candidate_id, granted, is_prevote);
     }
 
-    pub fn handlePreVote(self: *Node, pv: PreVote) RaftError!void {
-        if (self.state == .learner) {
-            dbg(
-                "prevote-reject tick={d} node={d} candidate={d} reason=learner",
-                .{ self.tick_count, self.id, pv.candidate_id },
-            );
-            self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
-                .term = self.current_term,
-                .vote_granted = false,
-                .from = self.id,
-            } });
+    fn handleRequestVoteReply(self: *Node, rvr: zen.RequestVoteReplyReader) RaftError!void {
+        const is_prevote = rvr.isPrevote();
+        const term = rvr.term();
+        if (!is_prevote and term > self.current_term) {
+            try self.stepDown(term);
             return;
         }
-        if (pv.term < self.current_term) {
+        if (term < self.current_term) return;
+        if (!rvr.voteGranted()) return;
+
+        const from = rvr.from();
+        if (is_prevote) {
+            if (self.state == .learner) return;
+            _ = try self.prevotes_received.put(from, {});
             dbg(
-                "prevote-reject tick={d} node={d} candidate={d} reason=stale_term pv_term={d} cur_term={d}",
-                .{ self.tick_count, self.id, pv.candidate_id, pv.term, self.current_term },
+                "prevote-reply tick={d} node={d} from={d} term={d} count={d} quorum={d}",
+                .{
+                    self.tick_count,
+                    self.id,
+                    from,
+                    self.current_term,
+                    self.prevotes_received.count(),
+                    self.quorumSize(),
+                },
             );
-            self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
-                .term = self.current_term,
-                .vote_granted = false,
-                .from = self.id,
-            } });
+            if (self.prevotes_received.count() >= self.quorumSize()) {
+                try self.startElection();
+            }
             return;
         }
 
-        const up_to_date = self.isLogUpToDate(pv.last_log_term, pv.last_log_index);
-        dbg(
-            "prevote tick={d} node={d} candidate={d} term={d} granted={} cand_last=({d},{d}) self_last=({d},{d})",
-            .{
-                self.tick_count,
-                self.id,
-                pv.candidate_id,
-                pv.term,
-                up_to_date,
-                pv.last_log_term,
-                pv.last_log_index,
-                self.log.lastTerm(),
-                self.log.lastIndex(),
-            },
-        );
-        self.send(pv.candidate_id, Message{ .pre_vote_reply = .{
-            .term = self.current_term,
-            .vote_granted = up_to_date,
-            .from = self.id,
-        } });
-    }
-
-    pub fn handlePreVoteReply(self: *Node, pvr: PreVoteReply) RaftError!void {
-        if (self.state == .learner) return;
-        if (pvr.term < self.current_term) return;
-        if (!pvr.vote_granted) return;
-
-        _ = try self.prevotes_received.put(pvr.from, {});
-        dbg(
-            "prevote-reply tick={d} node={d} from={d} term={d} count={d} quorum={d}",
-            .{
-                self.tick_count,
-                self.id,
-                pvr.from,
-                self.current_term,
-                self.prevotes_received.count(),
-                self.quorumSize(),
-            },
-        );
-        if (self.prevotes_received.count() >= self.quorumSize()) {
-            try self.startElection();
-        }
-    }
-
-    pub fn handleRequestVoteReply(self: *Node, rvr: RequestVoteReply) RaftError!void {
         if (self.state != .candidate) return;
-        if (rvr.term < self.current_term) return; // candidate should have +1 term.
-        if (!rvr.vote_granted) return;
-
-        _ = try self.votes_received.put(rvr.from, {});
+        _ = try self.votes_received.put(from, {});
         dbg(
             "vote-reply tick={d} node={d} from={d} term={d} count={d} quorum={d}",
             .{
                 self.tick_count,
                 self.id,
-                rvr.from,
+                from,
                 self.current_term,
                 self.votes_received.count(),
                 self.quorumSize(),
@@ -466,87 +436,103 @@ pub const Node = struct {
         }
     }
 
-    pub fn handleAppendEntries(self: *Node, ae: AppendEntries) RaftError!void {
-        if (ae.term < self.current_term) {
-            self.send(ae.leader_id, Message{ .append_entries_reply = .{
-                .term = self.current_term,
+    pub fn handleAppendEntries(self: *Node, ae: zen.AppendEntriesReader) RaftError!void {
+        const ae_term = ae.term();
+        const leader_id = ae.leaderId();
+        if (ae_term > self.current_term) {
+            try self.stepDown(ae_term);
+        }
+        if (ae_term < self.current_term) {
+            try self.sendAppendEntriesReply(leader_id, .{
                 .success = false,
-                .from = self.id,
                 .match_index = 0,
                 .conflict_term = 0,
                 .conflict_index = self.log.lastIndex() + 1,
-            } });
+            });
             return;
         }
 
         if (self.state != .follower and self.state != .learner) {
             self.state = .follower;
         }
-        self.leader_id = ae.leader_id;
+        self.leader_id = leader_id;
         self.elapsed_ticks = 0;
         self.resetElectionTimeout(.append_entries);
 
-        if (ae.prev_log_index > 0) {
-            const prev = self.log.entry(ae.prev_log_index);
-            if (prev == null or prev.?.term != ae.prev_log_term) {
-                self.send(ae.leader_id, Message{ .append_entries_reply = .{
-                    .term = self.current_term,
+        if (ae.prevLogIndex() > 0) {
+            const prev_term_opt = try self.log.term(ae.prevLogIndex());
+            if (prev_term_opt == null or prev_term_opt.? != ae.prevLogTerm()) {
+                try self.sendAppendEntriesReply(leader_id, .{
                     .success = false,
-                    .from = self.id,
                     .match_index = 0,
-                    .conflict_term = if (prev) |p| p.term else 0,
-                    .conflict_index = if (prev) |p| self.log.firstIndexOfTerm(p.term) else self.log.lastIndex() + 1,
-                } });
+                    .conflict_term = prev_term_opt orelse 0,
+                    .conflict_index = if (prev_term_opt) |t| self.log.firstIndexOfTerm(t) else self.log.lastIndex() + 1,
+                });
                 return;
             }
         }
 
-        if (ae.entries.len > 0) {
-            var append_from: ?usize = null;
-            for (ae.entries, 0..) |log_entry, i| {
-                if (self.log.entry(log_entry.index)) |existing| {
-                    if (existing.term != log_entry.term) {
-                        self.log.truncateFrom(log_entry.index);
-                        append_from = i;
-                        break;
-                    }
-                } else {
-                    append_from = i;
+        var append_from: ?usize = null;
+        const ae_entries_len = ae.entriesLen();
+        if (ae_entries_len > 0) {
+            var idx: u32 = 0;
+            while (idx < ae_entries_len) : (idx += 1) {
+                const log_entry = try ae.entriesAt(idx);
+                const term_opt = try self.log.term(log_entry.index());
+                if (term_opt == null or term_opt.? != log_entry.term()) {
+                    append_from = @intCast(idx);
                     break;
                 }
             }
 
-            if (append_from) |start| {
-                const slice = ae.entries[start..];
-                try self.log.append(slice);
+            var entries_to_append = std.ArrayList(zen.LogEntryBuffer).empty;
+            defer {
+                for (entries_to_append.items) |*entry| {
+                    entry.deinit();
+                }
+                entries_to_append.deinit(self.allocator);
+            }
+
+            const start_idx: usize = if (append_from) |v| v else ae_entries_len;
+            for (start_idx..ae_entries_len) |append_idx| {
+                const entry = try ae.entriesAtClone(self.allocator, @intCast(append_idx));
+                try entries_to_append.append(self.allocator, entry);
+            }
+            if (entries_to_append.items.len > 0) {
+                try self.log.append(entries_to_append.items);
                 try self.log.sync();
             }
         }
 
-        if (ae.leader_commit > self.commit_index) {
+        if (ae.leaderCommit() > self.commit_index) {
             const last_index = self.log.lastIndex();
-            self.commit_index = if (ae.leader_commit < last_index) ae.leader_commit else last_index;
+            self.commit_index = if (ae.leaderCommit() < last_index) ae.leaderCommit() else last_index;
         }
         self.applyCommitted();
 
-        self.send(ae.leader_id, Message{ .append_entries_reply = .{
-            .term = self.current_term,
+        try self.sendAppendEntriesReply(leader_id, .{
             .success = true,
-            .from = self.id,
             .match_index = self.log.lastIndex(),
             .conflict_term = 0,
             .conflict_index = 0,
-        } });
+        });
     }
 
-    pub fn handleAppendEntriesReply(self: *Node, aer: AppendEntriesReply) RaftError!void {
+    pub fn handleAppendEntriesReply(self: *Node, aer: zen.AppendEntriesReplyReader) RaftError!void {
         if (self.state != .leader) return;
-        if (aer.term < self.current_term) return;
+        const term = aer.term();
+        if (term < self.current_term) return;
+        if (term > self.current_term) {
+            try self.stepDown(term);
+            return;
+        }
 
-        if (!aer.success) {
-            if (self.peers.getPtr(aer.from)) |state| {
-                if (aer.conflict_index > 0) {
-                    state.next_index = aer.conflict_index;
+        const from = aer.from();
+        if (!aer.success()) {
+            if (self.peers.getPtr(from)) |state| {
+                const conflict_index = aer.conflictIndex();
+                if (conflict_index > 0) {
+                    state.next_index = conflict_index;
                 } else if (state.next_index > 1) {
                     state.next_index -= 1;
                 }
@@ -554,9 +540,10 @@ pub const Node = struct {
             return;
         }
 
-        if (self.peers.getPtr(aer.from)) |state| {
-            state.match_index = aer.match_index;
-            state.next_index = aer.match_index + 1;
+        if (self.peers.getPtr(from)) |state| {
+            const match_index = aer.matchIndex();
+            state.match_index = match_index;
+            state.next_index = match_index + 1;
         }
         self.advanceCommitIndex();
         self.applyCommitted();
@@ -566,8 +553,19 @@ pub const Node = struct {
         if (self.state != .leader) return RaftError.NotLeader;
 
         const new_index = self.log.lastIndex() + 1;
-        const entry = LogEntry{ .index = new_index, .term = self.current_term, .data = data };
-        try self.log.append(&[_]LogEntry{entry});
+        var writer = try zen.LogEntryWriter.init(self.allocator);
+        defer writer.deinit();
+        try writer.set(.{
+            .index = new_index,
+            .term = self.current_term,
+            .data = data,
+            .is_normal = true,
+            .is_conf_change = false,
+            .conf_change = zen.NullOffset,
+        });
+        var entry = try writer.finishWithTail();
+        defer entry.deinit();
+        try self.log.append(&[_]zen.LogEntryBuffer{entry});
         try self.log.sync();
         var it = self.peers.iterator();
         while (it.next()) |kv| {
@@ -582,14 +580,36 @@ pub const Node = struct {
 
         self.pending_conf_change = true;
         const new_index = self.log.lastIndex() + 1;
-        const entry = LogEntry{
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(self.allocator);
+
+        var cc_writer = try zen.ConfChangeWriter.initWithBuf(self.allocator, &buf);
+        try cc_writer.set(.{
+            .add_voter = cc.change_type == .add_voter,
+            .add_learner = cc.change_type == .add_learner,
+            .to_voter = cc.change_type == .to_voter,
+            .to_learner = cc.change_type == .to_learner,
+            .remove_node = cc.change_type == .remove_node,
+            .node_id = cc.node_id,
+        });
+        const cc_res = try cc_writer.finish();
+
+        var le_writer = try zen.LogEntryWriter.initWithBuf(self.allocator, &buf);
+        try le_writer.set(.{
             .index = new_index,
             .term = self.current_term,
-            .ty = .conf_change,
-            .conf_change = cc,
             .data = &[_]u8{},
-        };
-        try self.log.append(&[_]LogEntry{entry});
+            .is_normal = false,
+            .is_conf_change = true,
+            .conf_change = cc_res.offset,
+        });
+        const le_res = try le_writer.finish();
+        try zen.addTail(self.allocator, &buf, zen.LogEntryReader, le_res.offset);
+
+        const bytes = try buf.toOwnedSlice(self.allocator);
+        var entry = try zen.LogEntryBuffer.initWithTail(self.allocator, bytes, .owned);
+        defer entry.deinit();
+        try self.log.append(&[_]zen.LogEntryBuffer{entry});
         try self.log.sync();
         var it = self.peers.iterator();
         while (it.next()) |kv| {
@@ -615,7 +635,7 @@ pub const Node = struct {
         try self.log.sync();
     }
 
-    pub fn persistLog(self: *Node, entries: []const LogEntry) RaftError!void {
+    pub fn persistLog(self: *Node, entries: []const zen.LogEntryBuffer) RaftError!void {
         try self.log.append(entries);
         try self.log.sync();
     }
@@ -627,10 +647,87 @@ pub const Node = struct {
         return candidate_index >= self.log.lastIndex();
     }
 
-    pub fn send(self: *Node, to: NodeId, message: Message) void {
-        _ = self.outbox.append(self.allocator, .{ .to = to, .msg = message }) catch {
+    fn sendEncoded(self: *Node, to: NodeId, payload: []u8) void {
+        _ = self.outbox.append(self.allocator, .{
+            .to = to,
+            .payload = payload,
+        }) catch {
+            self.allocator.free(payload);
             @panic("raft: outbox append failed");
         };
+    }
+
+    fn decodeConfChange(self: *Node, reader: zen.ConfChangeReader) RaftError!ConfChange {
+        _ = self;
+        const change_type: ConfChangeType = if (reader.addVoter())
+            .add_voter
+        else if (reader.addLearner())
+            .add_learner
+        else if (reader.toVoter())
+            .to_voter
+        else if (reader.toLearner())
+            .to_learner
+        else if (reader.removeNode())
+            .remove_node
+        else
+            return RaftError.InvalidMessage;
+        return .{
+            .change_type = change_type,
+            .node_id = reader.nodeId(),
+        };
+    }
+
+    fn sendRequestVote(self: *Node, to: NodeId, is_prevote: bool) !void {
+        var writer = try zen.RequestVoteWriter.init(self.allocator);
+        defer writer.deinit();
+
+        try writer.set(.{
+            .term = self.current_term,
+            .candidate_id = self.id,
+            .last_log_index = self.log.lastIndex(),
+            .last_log_term = self.log.lastTerm(),
+            .is_prevote = is_prevote,
+        });
+        const out = try writer.finishWithTail();
+        const bytes = out.bytes orelse return zen.Error.Invalid;
+        self.sendEncoded(to, bytes);
+    }
+
+    fn sendRequestVoteReply(self: *Node, to: NodeId, vote_granted: bool, is_prevote: bool) !void {
+        var writer = try zen.RequestVoteReplyWriter.init(self.allocator);
+        defer writer.deinit();
+
+        try writer.set(.{
+            .term = self.current_term,
+            .vote_granted = vote_granted,
+            .from = self.id,
+            .is_prevote = is_prevote,
+        });
+        const buf = try writer.finishWithTail();
+        const bytes = buf.bytes orelse return zen.Error.Invalid;
+        self.sendEncoded(to, bytes);
+    }
+
+    fn sendAppendEntriesReply(self: *Node, to: NodeId, opts: struct {
+        success: bool,
+        match_index: u64,
+        conflict_term: u64,
+        conflict_index: u64,
+    }) !void {
+        var writer = try zen.AppendEntriesReplyWriter.init(self.allocator);
+        defer writer.deinit();
+
+        try writer.set(.{
+            .term = self.current_term,
+            .success = opts.success,
+            .from = self.id,
+            .match_index = opts.match_index,
+            .conflict_term = opts.conflict_term,
+            .conflict_index = opts.conflict_index,
+        });
+        const buf = try writer.finishWithTail();
+        const bytes = buf.bytes orelse return zen.Error.Invalid;
+        self.sendEncoded(to, bytes);
     }
 
     pub fn takeOutbox(self: *Node) []Outbound {
@@ -638,6 +735,9 @@ pub const Node = struct {
     }
 
     pub fn clearOutbox(self: *Node) void {
+        for (self.outbox.items) |outbound| {
+            self.allocator.free(outbound.payload);
+        }
         self.outbox.clearRetainingCapacity();
     }
 
@@ -648,12 +748,12 @@ pub const Node = struct {
     pub fn applyCommitted(self: *Node) void {
         while (self.last_applied < self.commit_index) {
             self.last_applied += 1;
-            const entry = self.log.entry(self.last_applied) orelse continue;
-            if (entry.ty == .conf_change and entry.conf_change != null) {
-                self.applyConfChange(entry.conf_change.?);
+            const entry = (self.log.entryRef(self.last_applied) catch continue) orelse continue;
+            const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
+            if (reader.confChange()) |cc_reader| {
+                const cc = self.decodeConfChange(cc_reader) catch continue;
+                self.applyConfChange(cc);
                 self.pending_conf_change = false;
-            } else {
-                // normal entry -> apply to state machine (not yet wired)
             }
         }
     }

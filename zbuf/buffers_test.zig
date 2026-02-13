@@ -64,6 +64,7 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     }
     var root_res = try root.finishWithTail();
     root_res.bytes = try buf.toOwnedSlice(alloc); // Own the bytes.
+    root_res.ownership = .owned;
     return root_res;
 }
 

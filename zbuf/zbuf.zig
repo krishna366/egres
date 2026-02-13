@@ -5,6 +5,11 @@ pub const Error = error{
     Invalid,
 };
 
+pub const Ownership = enum {
+    borrowed,
+    owned,
+};
+
 pub const NullOffset: u32 = 0xFFFF_FFFF;
 
 pub const MessageTail = struct {
@@ -15,6 +20,7 @@ pub const MessageTail = struct {
 
 pub const message_magic: u32 = 0x4655425A; // "ZBUF" little-endian
 pub const message_tail_size: u16 = 16;
+const payload_alignment: usize = 4;
 
 pub fn appendMessageTail(list: *std.ArrayList(u8), alloc: std.mem.Allocator, table_id: u16, table_version: u16, offset: u32) !void {
     const start = list.items.len;
@@ -87,8 +93,8 @@ pub fn reserveHeader(list: *std.ArrayList(u8), alloc: std.mem.Allocator, size_by
     return base;
 }
 
-pub fn appendBytesAligned(list: *std.ArrayList(u8), alloc: std.mem.Allocator, data: []const u8, alignment: usize) !u32 {
-    const aligned = alignForward(list.items.len, alignment);
+pub fn appendBytes(list: *std.ArrayList(u8), alloc: std.mem.Allocator, data: []const u8) !u32 {
+    const aligned = alignForward(list.items.len, payload_alignment);
     if (aligned > list.items.len) {
         try appendZeros(list, alloc, aligned - list.items.len);
     }
@@ -97,8 +103,8 @@ pub fn appendBytesAligned(list: *std.ArrayList(u8), alloc: std.mem.Allocator, da
     return off;
 }
 
-pub fn appendU32SliceAligned(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values: []const u32, alignment: usize) !u32 {
-    const aligned = alignForward(list.items.len, alignment);
+pub fn appendU32Slice(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values: []const u32) !u32 {
+    const aligned = alignForward(list.items.len, payload_alignment);
     if (aligned > list.items.len) {
         try appendZeros(list, alloc, aligned - list.items.len);
     }

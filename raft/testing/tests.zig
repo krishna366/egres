@@ -1,6 +1,7 @@
 const std = @import("std");
 const raft = @import("raft");
 const cluster_mod = @import("cluster.zig");
+const zen = raft.buffers;
 
 const TestCluster = cluster_mod.TestCluster;
 const Config = raft.Config;
@@ -182,17 +183,22 @@ test "candidate steps down on higher term" {
     const follower = cluster.getNode(follower_id) orelse return error.MissingNode;
     const higher_term = follower.current_term + 5;
 
-    const msg = raft.Message{ .append_entries = .{
+    var writer = try zen.AppendEntriesWriter.init(std.testing.allocator);
+    defer writer.deinit();
+    try writer.set(.{
         .term = higher_term,
         .leader_id = follower_id,
         .prev_log_index = 0,
         .prev_log_term = 0,
-        .entries = &[_]raft.LogEntry{},
+        .entries = &[_]u32{},
         .leader_commit = 0,
-    } };
+    });
+    var buf = try writer.finishWithTail();
+    defer buf.deinit();
+    const encoded = buf.bytes orelse return error.Invalid;
 
     const leader_node = cluster.getNode(leader) orelse return error.MissingNode;
-    try leader_node.handleMessage(msg);
+    try leader_node.handleInbound(encoded);
 
     try std.testing.expect(!leader_node.isLeader());
     try std.testing.expect(leader_node.current_term == higher_term);
@@ -235,8 +241,9 @@ test "log replication" {
         if (node.id == leader) continue;
         try std.testing.expectEqual(@as(u64, @intCast(expected.items.len)), node.log.lastIndex());
         for (expected.items, 0..) |data, idx| {
-            const entry_log = node.log.entry(@intCast(idx + 1)) orelse return error.MissingEntry;
-            try std.testing.expectEqualSlices(u8, data, entry_log.data);
+            const log_entry = (try node.log.entryRef(@intCast(idx + 1))) orelse return error.MissingEntry;
+            const reader = try zen.LogEntryReader.parseRoot(log_entry.bytes);
+            try std.testing.expectEqualSlices(u8, data, reader.data());
         }
     }
 }

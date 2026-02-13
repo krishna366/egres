@@ -15,10 +15,11 @@ pub const LogEntry = schema.Table(.{
     .{ .id = 1, .name = "index", .ty = schema.U64 },
     .{ .id = 2, .name = "term", .ty = schema.U64 },
     .{ .id = 3, .name = "data", .ty = schema.Bytes },
+
     .{ .id = 4, .name = "entry_type", .ty = schema.B64 },
-    .{ .name = "normal", .ty = schema.Bool(.{ .field_id = 4, .bit = 0 }) },
-    .{ .name = "conf_change", .ty = schema.Bool(.{ .field_id = 4, .bit = 1 }) },
-    .{ .id = 5, .name = "conf_change_payload", .ty = ConfChange },
+    .{ .name = "is_normal", .ty = schema.Bool(.{ .field_id = 4, .bit = 0 }) },
+    .{ .name = "is_conf_change", .ty = schema.Bool(.{ .field_id = 4, .bit = 1 }) },
+    .{ .id = 5, .name = "conf_change", .ty = ConfChange },
 });
 
 pub const RequestVote = schema.Table(.{
@@ -26,36 +27,27 @@ pub const RequestVote = schema.Table(.{
     .{ .id = 2, .name = "candidate_id", .ty = schema.U64 },
     .{ .id = 3, .name = "last_log_index", .ty = schema.U64 },
     .{ .id = 4, .name = "last_log_term", .ty = schema.U64 },
+
+    .{ .id = 5, .name = "status", .ty = schema.B64 },
+    .{ .name = "is_prevote", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
 });
 
 pub const RequestVoteReply = schema.Table(.{
     .{ .id = 1, .name = "term", .ty = schema.U64 },
-    .{ .id = 2, .name = "status", .ty = schema.B64 },
-    .{ .name = "vote_granted", .ty = schema.Bool(.{ .field_id = 2, .bit = 0 }) },
-    .{ .id = 3, .name = "from", .ty = schema.U64 },
-});
+    .{ .id = 2, .name = "from", .ty = schema.U64 },
 
-pub const PreVote = schema.Table(.{
-    .{ .id = 1, .name = "term", .ty = schema.U64 },
-    .{ .id = 2, .name = "candidate_id", .ty = schema.U64 },
-    .{ .id = 3, .name = "last_log_index", .ty = schema.U64 },
-    .{ .id = 4, .name = "last_log_term", .ty = schema.U64 },
-});
-
-pub const PreVoteReply = schema.Table(.{
-    .{ .id = 1, .name = "term", .ty = schema.U64 },
-    .{ .id = 2, .name = "status", .ty = schema.B64 },
-    .{ .name = "vote_granted", .ty = schema.Bool(.{ .field_id = 2, .bit = 0 }) },
-    .{ .id = 3, .name = "from", .ty = schema.U64 },
+    .{ .id = 3, .name = "status", .ty = schema.B64 },
+    .{ .name = "is_prevote", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
+    .{ .name = "vote_granted", .ty = schema.Bool(.{ .field_id = 3, .bit = 1 }) },
 });
 
 pub const AppendEntries = schema.Table(.{
     .{ .id = 1, .name = "term", .ty = schema.U64 },
     .{ .id = 2, .name = "leader_id", .ty = schema.U64 },
-    .{ .id = 3, .name = "prev_log_index", .ty = schema.U64 },
-    .{ .id = 4, .name = "prev_log_term", .ty = schema.U64 },
-    .{ .id = 5, .name = "entries", .ty = schema.Array(LogEntry) },
-    .{ .id = 6, .name = "leader_commit", .ty = schema.U64 },
+    .{ .id = 3, .name = "leader_commit", .ty = schema.U64 },
+    .{ .id = 4, .name = "prev_log_index", .ty = schema.U64 },
+    .{ .id = 5, .name = "prev_log_term", .ty = schema.U64 },
+    .{ .id = 6, .name = "entries", .ty = schema.Array(LogEntry) },
 });
 
 pub const AppendEntriesReply = schema.Table(.{
@@ -81,8 +73,6 @@ pub const tables = .{
     .{ .name = "LogEntry", .ty = LogEntry, .id = tableId(2) },
     .{ .name = "RequestVote", .ty = RequestVote, .id = tableId(3) },
     .{ .name = "RequestVoteReply", .ty = RequestVoteReply, .id = tableId(4) },
-    .{ .name = "PreVote", .ty = PreVote, .id = tableId(5) },
-    .{ .name = "PreVoteReply", .ty = PreVoteReply, .id = tableId(6) },
-    .{ .name = "AppendEntries", .ty = AppendEntries, .id = tableId(7) },
-    .{ .name = "AppendEntriesReply", .ty = AppendEntriesReply, .id = tableId(8) },
+    .{ .name = "AppendEntries", .ty = AppendEntries, .id = tableId(5) },
+    .{ .name = "AppendEntriesReply", .ty = AppendEntriesReply, .id = tableId(6) },
 };

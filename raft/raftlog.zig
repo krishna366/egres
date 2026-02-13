@@ -1,8 +1,25 @@
 const std = @import("std");
-const msg = @import("message.zig");
+const zen = @import("buffers_gen");
 
-pub const NodeId = msg.NodeId;
-pub const LogEntry = msg.LogEntry;
+pub const NodeId = u64;
+pub const ConfChangeType = enum(u8) {
+    add_voter,
+    add_learner,
+    to_voter,
+    to_learner,
+    remove_node,
+};
+pub const ConfChange = struct {
+    change_type: ConfChangeType,
+    node_id: NodeId,
+};
+pub const LogEntryBuffer = zen.LogEntryBuffer;
+pub const StoredEntry = struct {
+    index: u64,
+    term: u64,
+    data_len: u32,
+    bytes: []u8,
+};
 
 pub const HardState = struct {
     current_term: u64,
@@ -18,8 +35,7 @@ pub const Snapshot = struct {
 pub const RaftLogError = error{
     Compacted,
     Unavailable,
-    OutOfMemory,
-};
+} || std.mem.Allocator.Error || zen.Error;
 
 pub const RaftLog = struct {
     ctx: *anyopaque,
@@ -33,13 +49,13 @@ pub const RaftLog = struct {
         firstIndex: *const fn (*anyopaque) u64,
         lastIndex: *const fn (*anyopaque) u64,
         lastTerm: *const fn (*anyopaque) u64,
-        term: *const fn (*anyopaque, u64) RaftLogError!u64,
-        entry: *const fn (*anyopaque, u64) ?LogEntry,
-        entriesFrom: *const fn (*anyopaque, u64, u32) []const LogEntry,
-        entriesRange: *const fn (*anyopaque, u64, u64, u64) []const LogEntry,
+        term: *const fn (*anyopaque, u64) RaftLogError!?u64,
+        entryRef: *const fn (*anyopaque, u64) RaftLogError!?StoredEntry,
+        entriesFromRef: *const fn (*anyopaque, u64, u32) RaftLogError![]const StoredEntry,
+        entriesRangeRef: *const fn (*anyopaque, u64, u64, u64) RaftLogError![]const StoredEntry,
         firstIndexOfTerm: *const fn (*anyopaque, u64) u64,
         lastIndexOfTerm: *const fn (*anyopaque, u64) u64,
-        append: *const fn (*anyopaque, []const LogEntry) RaftLogError!void,
+        append: *const fn (*anyopaque, []const LogEntryBuffer) RaftLogError!void,
         truncateFrom: *const fn (*anyopaque, u64) void,
         compactUntil: *const fn (*anyopaque, u64) void,
         sync: *const fn (*anyopaque) RaftLogError!void,
@@ -73,20 +89,20 @@ pub const RaftLog = struct {
         return self.vtable.lastTerm(self.ctx);
     }
 
-    pub fn term(self: RaftLog, index: u64) RaftLogError!u64 {
+    pub fn term(self: RaftLog, index: u64) RaftLogError!?u64 {
         return self.vtable.term(self.ctx, index);
     }
 
-    pub fn entry(self: RaftLog, index: u64) ?LogEntry {
-        return self.vtable.entry(self.ctx, index);
+    pub fn entryRef(self: RaftLog, index: u64) RaftLogError!?StoredEntry {
+        return self.vtable.entryRef(self.ctx, index);
     }
 
-    pub fn entriesFrom(self: RaftLog, start_index: u64, max_count: u32) []const LogEntry {
-        return self.vtable.entriesFrom(self.ctx, start_index, max_count);
+    pub fn entriesFromRef(self: RaftLog, start_index: u64, max_count: u32) RaftLogError![]const StoredEntry {
+        return self.vtable.entriesFromRef(self.ctx, start_index, max_count);
     }
 
-    pub fn entriesRange(self: RaftLog, lo: u64, hi: u64, max_bytes: u64) []const LogEntry {
-        return self.vtable.entriesRange(self.ctx, lo, hi, max_bytes);
+    pub fn entriesRangeRef(self: RaftLog, lo: u64, hi: u64, max_bytes: u64) RaftLogError![]const StoredEntry {
+        return self.vtable.entriesRangeRef(self.ctx, lo, hi, max_bytes);
     }
 
     pub fn firstIndexOfTerm(self: RaftLog, term_value: u64) u64 {
@@ -97,7 +113,7 @@ pub const RaftLog = struct {
         return self.vtable.lastIndexOfTerm(self.ctx, term_value);
     }
 
-    pub fn append(self: RaftLog, entries: []const LogEntry) RaftLogError!void {
+    pub fn append(self: RaftLog, entries: []const LogEntryBuffer) RaftLogError!void {
         return self.vtable.append(self.ctx, entries);
     }
 
@@ -114,16 +130,23 @@ pub const RaftLog = struct {
     }
 };
 
+pub fn deinitOwnedEntries(alloc: std.mem.Allocator, entries: []LogEntryBuffer) void {
+    for (entries) |*entry_buf| {
+        entry_buf.deinit();
+    }
+    alloc.free(entries);
+}
+
 pub const MemRaftLog = struct {
     allocator: std.mem.Allocator,
-    entries: std.ArrayList(LogEntry),
+    entries: std.ArrayList(StoredEntry),
     hard_state: HardState,
     snapshot_info: Snapshot,
 
     pub fn init(allocator: std.mem.Allocator) MemRaftLog {
         return .{
             .allocator = allocator,
-            .entries = std.ArrayList(LogEntry).empty,
+            .entries = std.ArrayList(StoredEntry).empty,
             .hard_state = .{ .current_term = 0, .voted_for = null },
             .snapshot_info = .{ .index = 0, .term = 0, .data = &[_]u8{} },
         };
@@ -188,56 +211,56 @@ pub const MemRaftLog = struct {
         return self.entries.items[self.entries.items.len - 1].term;
     }
 
-    fn term(ctx: *anyopaque, index: u64) RaftLogError!u64 {
+    fn term(ctx: *anyopaque, index: u64) RaftLogError!?u64 {
         if (index == 0) return 0;
         const self = fromCtx(ctx);
         if (self.snapshot_info.index != 0 and index == self.snapshot_info.index) return self.snapshot_info.term;
-        const log_entry = entry(ctx, index) orelse return RaftLogError.Unavailable;
-        return log_entry.term;
+        const found = self.findStored(index) orelse return null;
+        return found.term;
     }
 
-    fn entry(ctx: *anyopaque, index: u64) ?LogEntry {
+    fn entryRef(ctx: *anyopaque, index: u64) RaftLogError!?StoredEntry {
         const self = fromCtx(ctx);
-        if (index == 0) return null;
-        if (self.entries.items.len == 0) return null;
-        const base = self.entries.items[0].index;
-        if (index < base) return null;
-        const offset: usize = @intCast(index - base);
-        if (offset >= self.entries.items.len) return null;
-        return self.entries.items[offset];
+        const stored = self.findStored(index) orelse return null;
+        return stored;
     }
 
-    fn entriesFrom(ctx: *anyopaque, start_index: u64, max_count: u32) []const LogEntry {
+    fn entriesFromRef(ctx: *anyopaque, start_index: u64, max_count: u32) RaftLogError![]const StoredEntry {
         const self = fromCtx(ctx);
-        if (self.entries.items.len == 0) return &[_]LogEntry{};
+        if (self.entries.items.len == 0) return &[_]StoredEntry{};
+
         const base = self.entries.items[0].index;
-        if (start_index < base) return &[_]LogEntry{};
+        if (start_index < base) return &[_]StoredEntry{};
+
         const offset: usize = @intCast(start_index - base);
-        if (offset >= self.entries.items.len) return &[_]LogEntry{};
+        if (offset >= self.entries.items.len) return &[_]StoredEntry{};
+
         const start = offset;
         const max: usize = @intCast(max_count);
         const end = if (start + max <= self.entries.items.len) start + max else self.entries.items.len;
         return self.entries.items[start..end];
     }
 
-    fn entriesRange(ctx: *anyopaque, lo: u64, hi: u64, max_bytes: u64) []const LogEntry {
+    fn entriesRangeRef(ctx: *anyopaque, lo: u64, hi: u64, max_bytes: u64) RaftLogError![]const StoredEntry {
         const self = fromCtx(ctx);
-        if (lo >= hi) return &[_]LogEntry{};
-        if (self.entries.items.len == 0) return &[_]LogEntry{};
+        if (lo >= hi) return &[_]StoredEntry{};
+        if (self.entries.items.len == 0) return &[_]StoredEntry{};
         const base = self.entries.items[0].index;
-        if (hi <= base) return &[_]LogEntry{};
+        if (hi <= base) return &[_]StoredEntry{};
         const start_index = if (lo > base) lo else base;
         const start_offset: usize = @intCast(start_index - base);
-        if (start_offset >= self.entries.items.len) return &[_]LogEntry{};
+        if (start_offset >= self.entries.items.len) return &[_]StoredEntry{};
 
         var end_offset: usize = start_offset;
         var size: u64 = 0;
         while (end_offset < self.entries.items.len) : (end_offset += 1) {
-            const log_entry = self.entries.items[end_offset];
-            if (log_entry.index >= hi) break;
-            size += @intCast(log_entry.data.len);
+            const stored = self.entries.items[end_offset];
+            if (stored.index >= hi) break;
+            size += stored.data_len;
             if (max_bytes > 0 and end_offset > start_offset and size > max_bytes) break;
         }
+
+        if (end_offset <= start_offset) return &[_]StoredEntry{};
         return self.entries.items[start_offset..end_offset];
     }
 
@@ -259,11 +282,12 @@ pub const MemRaftLog = struct {
         return 0;
     }
 
-    fn append(ctx: *anyopaque, new_entries: []const LogEntry) RaftLogError!void {
+    fn append(ctx: *anyopaque, new_entries: []const LogEntryBuffer) RaftLogError!void {
         const self = fromCtx(ctx);
         if (new_entries.len == 0) return;
 
-        const first = new_entries[0].index;
+        const first_reader = try new_entries[0].initReader();
+        const first = first_reader.index();
         if (self.entries.items.len > 0) {
             const base = self.entries.items[0].index;
             const last = self.entries.items[self.entries.items.len - 1].index;
@@ -274,14 +298,15 @@ pub const MemRaftLog = struct {
             }
         }
 
-        for (new_entries) |log_entry| {
-            const data_copy = if (log_entry.data.len == 0) &[_]u8{} else try self.allocator.dupe(u8, log_entry.data);
+        for (new_entries) |entry_buf| {
+            const bytes = entry_buf.bytes orelse return RaftLogError.Invalid;
+            const reader = try entry_buf.initReader();
+            const encoded = try self.allocator.dupe(u8, bytes);
             try self.entries.append(self.allocator, .{
-                .index = log_entry.index,
-                .term = log_entry.term,
-                .data = data_copy,
-                .ty = log_entry.ty,
-                .conf_change = log_entry.conf_change,
+                .index = reader.index(),
+                .term = reader.term(),
+                .data_len = @as(u32, @intCast(reader.data().len)),
+                .bytes = encoded,
             });
         }
     }
@@ -296,8 +321,8 @@ pub const MemRaftLog = struct {
         }
         const offset: usize = @intCast(from_index - base);
         if (offset >= self.entries.items.len) return;
-        for (self.entries.items[offset..]) |log_entry| {
-            if (log_entry.data.len != 0) self.allocator.free(log_entry.data);
+        for (self.entries.items[offset..]) |stored| {
+            self.allocator.free(stored.bytes);
         }
         self.entries.shrinkRetainingCapacity(offset);
     }
@@ -312,8 +337,8 @@ pub const MemRaftLog = struct {
             self.clearEntries();
             return;
         }
-        for (self.entries.items[0..offset]) |log_entry| {
-            if (log_entry.data.len != 0) self.allocator.free(log_entry.data);
+        for (self.entries.items[0..offset]) |stored| {
+            self.allocator.free(stored.bytes);
         }
         self.entries.items = self.entries.items[offset..];
     }
@@ -323,10 +348,20 @@ pub const MemRaftLog = struct {
     }
 
     fn clearEntries(self: *MemRaftLog) void {
-        for (self.entries.items) |log_entry| {
-            if (log_entry.data.len != 0) self.allocator.free(log_entry.data);
+        for (self.entries.items) |stored| {
+            self.allocator.free(stored.bytes);
         }
         self.entries.shrinkRetainingCapacity(0);
+    }
+
+    fn findStored(self: *MemRaftLog, index: u64) ?StoredEntry {
+        if (index == 0) return null;
+        if (self.entries.items.len == 0) return null;
+        const base = self.entries.items[0].index;
+        if (index < base) return null;
+        const offset: usize = @intCast(index - base);
+        if (offset >= self.entries.items.len) return null;
+        return self.entries.items[offset];
     }
 
     const vtable = RaftLog.VTable{
@@ -338,9 +373,9 @@ pub const MemRaftLog = struct {
         .lastIndex = lastIndex,
         .lastTerm = lastTerm,
         .term = term,
-        .entry = entry,
-        .entriesFrom = entriesFrom,
-        .entriesRange = entriesRange,
+        .entryRef = entryRef,
+        .entriesFromRef = entriesFromRef,
+        .entriesRangeRef = entriesRangeRef,
         .firstIndexOfTerm = firstIndexOfTerm,
         .lastIndexOfTerm = lastIndexOfTerm,
         .append = append,

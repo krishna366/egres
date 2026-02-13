@@ -2,7 +2,7 @@ const std = @import("std");
 const raft = @import("raft");
 pub const Node = raft.Node;
 pub const NodeId = raft.NodeId;
-pub const Message = raft.Message;
+pub const Inbound = raft.Inbound;
 pub const Config = raft.Config;
 
 pub const TestCluster = struct {
@@ -14,7 +14,7 @@ pub const TestCluster = struct {
     pub const MetaNode = struct {
         node: Node,
         log: raft.MemRaftLog,
-        inbox: std.ArrayList(Message),
+        inbox: std.ArrayList(Inbound),
         peers: []const raft.Peer,
     };
 
@@ -36,7 +36,7 @@ pub const TestCluster = struct {
             entry.* = .{
                 .node = undefined,
                 .log = raft.MemRaftLog.init(allocator),
-                .inbox = std.ArrayList(Message).empty,
+                .inbox = std.ArrayList(Inbound).empty,
                 .peers = peers,
             };
             entry.node = try Node.init(
@@ -63,6 +63,9 @@ pub const TestCluster = struct {
         var it = self.nodes.valueIterator();
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
+            for (entry.inbox.items) |msg| {
+                self.allocator.free(msg);
+            }
             entry.node.deinit();
             entry.log.deinit();
             entry.inbox.deinit(self.allocator);
@@ -101,7 +104,11 @@ pub const TestCluster = struct {
                 //     .{ self.tick_count, entry.node.id, msg.to, @tagName(msg.msg), msg.msg.term() },
                 // );
                 if (self.nodes.get(msg.to)) |dest| {
-                    _ = dest.inbox.append(self.allocator, msg.msg) catch {
+                    const inbound: Inbound = self.allocator.dupe(u8, msg.payload) catch {
+                        @panic("raft: encoded message dup failed");
+                    };
+                    _ = dest.inbox.append(self.allocator, inbound) catch {
+                        self.allocator.free(inbound);
                         @panic("raft: inbox append failed");
                     };
                 }
@@ -116,7 +123,8 @@ pub const TestCluster = struct {
             const entry = entry_ptr.*;
             if (entry.inbox.items.len == 0) continue;
             for (entry.inbox.items) |msg| {
-                try entry.node.handleMessage(msg);
+                try entry.node.handleInbound(msg);
+                self.allocator.free(msg);
             }
             entry.inbox.clearRetainingCapacity();
         }
