@@ -5,40 +5,95 @@ const std = @import("std");
 pub fn Queue(comptime T: type, comptime capacity: usize) type {
     return struct {
         const Self = @This();
+        pub const Error = error{QueueClosed};
 
         buf: [capacity]T = undefined,
         head: usize = 0,
         len: usize = 0,
+        closed: bool = false,
         mutex: std.Thread.Mutex = .{},
         not_empty: std.Thread.Condition = .{},
         not_full: std.Thread.Condition = .{},
 
-        pub fn push(q: *Self, item: T) void {
+        pub fn pushOrClosed(q: *Self, item: T) Error!void {
             q.mutex.lock();
             defer q.mutex.unlock();
 
-            while (q.len == capacity) {
+            while (q.len == capacity and !q.closed) {
                 q.not_full.wait(&q.mutex);
             }
+            if (q.closed) return error.QueueClosed;
 
             q.buf[(q.head + q.len) % capacity] = item;
             q.len += 1;
             q.not_empty.signal();
         }
 
-        pub fn pop(q: *Self) T {
+        pub fn tryPush(q: *Self, item: T) bool {
             q.mutex.lock();
             defer q.mutex.unlock();
 
-            while (q.len == 0) {
+            if (q.closed or q.len == capacity) return false;
+            q.buf[(q.head + q.len) % capacity] = item;
+            q.len += 1;
+            q.not_empty.signal();
+            return true;
+        }
+
+        pub fn popOrNull(q: *Self) ?T {
+            q.mutex.lock();
+            defer q.mutex.unlock();
+
+            while (q.len == 0 and !q.closed) {
                 q.not_empty.wait(&q.mutex);
             }
+            if (q.len == 0) return null;
 
             const item = q.buf[q.head];
             q.head = (q.head + 1) % capacity;
             q.len -= 1;
             q.not_full.signal();
             return item;
+        }
+
+        pub fn tryPop(q: *Self) ?T {
+            q.mutex.lock();
+            defer q.mutex.unlock();
+
+            if (q.len == 0) return null;
+            const item = q.buf[q.head];
+            q.head = (q.head + 1) % capacity;
+            q.len -= 1;
+            q.not_full.signal();
+            return item;
+        }
+
+        pub fn peek(q: *Self) ?T {
+            q.mutex.lock();
+            defer q.mutex.unlock();
+            if (q.len == 0) return null;
+            return q.buf[q.head];
+        }
+
+        pub fn count(q: *Self) usize {
+            q.mutex.lock();
+            defer q.mutex.unlock();
+            return q.len;
+        }
+
+        pub fn isClosed(q: *Self) bool {
+            q.mutex.lock();
+            defer q.mutex.unlock();
+            return q.closed;
+        }
+
+        pub fn close(q: *Self) void {
+            q.mutex.lock();
+            defer q.mutex.unlock();
+            if (q.closed) return;
+            q.closed = true;
+            q.not_empty.broadcast();
+            q.not_full.broadcast();
         }
     };
 }

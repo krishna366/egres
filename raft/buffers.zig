@@ -60,6 +60,25 @@ pub const AppendEntriesReply = schema.Table(.{
     .{ .id = 6, .name = "conflict_index", .ty = schema.U64 },
 });
 
+pub const TransportHandshake = schema.Table(.{
+    .{ .id = 1, .name = "cluster_id", .ty = schema.U64 },
+    .{ .id = 2, .name = "node_id", .ty = schema.U64 },
+});
+
+pub const JoinRequest = schema.Table(.{
+    .{ .id = 1, .name = "cluster_id", .ty = schema.U64 },
+    .{ .id = 2, .name = "node_id", .ty = schema.U64 },
+    .{ .id = 3, .name = "addr", .ty = schema.Bytes },
+});
+
+pub const JoinResponse = schema.Table(.{
+    .{ .id = 1, .name = "status", .ty = schema.B64 },
+    .{ .name = "accepted", .ty = schema.Bool(.{ .field_id = 1, .bit = 0 }) },
+    .{ .id = 2, .name = "leader_id", .ty = schema.U64 },
+    .{ .id = 3, .name = "reason_code", .ty = schema.U32 },
+    .{ .id = 4, .name = "leader_addr", .ty = schema.Bytes },
+});
+
 // zbuf tail currently stores table_id as u16, so we reserve high bits in u16
 // for module-level namespacing and OR local ids into the low bits.
 const RAFT_TABLE_NS: u16 = 0xA500;
@@ -75,4 +94,7 @@ pub const tables = .{
     .{ .name = "RequestVoteReply", .ty = RequestVoteReply, .id = tableId(4) },
     .{ .name = "AppendEntries", .ty = AppendEntries, .id = tableId(5) },
     .{ .name = "AppendEntriesReply", .ty = AppendEntriesReply, .id = tableId(6) },
+    .{ .name = "TransportHandshake", .ty = TransportHandshake, .id = tableId(7) },
+    .{ .name = "JoinRequest", .ty = JoinRequest, .id = tableId(8) },
+    .{ .name = "JoinResponse", .ty = JoinResponse, .id = tableId(9) },
 };

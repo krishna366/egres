@@ -9,6 +9,7 @@ pub const TestCluster = struct {
     allocator: std.mem.Allocator,
     nodes: std.AutoHashMap(NodeId, *MetaNode),
     drop_from: std.AutoHashMap(NodeId, void),
+    drop_to: std.AutoHashMap(NodeId, void),
     tick_count: u64,
 
     pub const MetaNode = struct {
@@ -26,6 +27,7 @@ pub const TestCluster = struct {
     ) !TestCluster {
         var nodes = std.AutoHashMap(NodeId, *MetaNode).init(allocator);
         const drop_from = std.AutoHashMap(NodeId, void).init(allocator);
+        const drop_to = std.AutoHashMap(NodeId, void).init(allocator);
         try nodes.ensureTotalCapacity(@intCast(ids.len));
 
         for (ids) |id| {
@@ -55,6 +57,7 @@ pub const TestCluster = struct {
             .allocator = allocator,
             .nodes = nodes,
             .drop_from = drop_from,
+            .drop_to = drop_to,
             .tick_count = 0,
         };
     }
@@ -74,6 +77,7 @@ pub const TestCluster = struct {
         }
         self.nodes.deinit();
         self.drop_from.deinit();
+        self.drop_to.deinit();
     }
 
     pub fn tickAll(self: *TestCluster) !void {
@@ -104,6 +108,7 @@ pub const TestCluster = struct {
                 //     .{ self.tick_count, entry.node.id, msg.to, @tagName(msg.msg), msg.msg.term() },
                 // );
                 if (self.nodes.get(msg.to)) |dest| {
+                    if (self.drop_to.contains(msg.to)) continue;
                     const inbound: Inbound = self.allocator.dupe(u8, msg.payload) catch {
                         @panic("raft: encoded message dup failed");
                     };
@@ -153,6 +158,16 @@ pub const TestCluster = struct {
             };
         } else {
             _ = self.drop_from.remove(id);
+        }
+    }
+
+    pub fn setDropTo(self: *TestCluster, id: NodeId, drop: bool) void {
+        if (drop) {
+            _ = self.drop_to.put(id, {}) catch {
+                @panic("raft: drop_to insert failed");
+            };
+        } else {
+            _ = self.drop_to.remove(id);
         }
     }
 

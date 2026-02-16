@@ -1,7 +1,8 @@
 const std = @import("std");
 const raftlog_mod = @import("raftlog.zig");
-const config_mod = @import("config.zig");
 const zen = @import("buffers_gen");
+const utils = @import("utils");
+const linux = std.os.linux;
 const raft_log = std.log.scoped(.raft);
 
 pub const NodeId = raftlog_mod.NodeId;
@@ -19,7 +20,25 @@ pub const PeerRole = enum {
     learner,
 };
 
-pub const Config = config_mod.Config;
+pub const Config = struct {
+    heartbeat_ticks: u32 = 2,
+    election_timeout_min_ticks: u32 = 10,
+    election_timeout_max_ticks: u32 = 20,
+    max_entries_per_msg: u32 = 64,
+    max_msg_size: u32 = 1_048_576,
+    enable_prevote: bool = true,
+
+    pub fn validate(self: Config) !void {
+        if (self.election_timeout_min_ticks == 0) return error.InvalidConfig;
+        if (self.election_timeout_max_ticks < self.election_timeout_min_ticks) return error.InvalidConfig;
+        if (self.heartbeat_ticks == 0) return error.InvalidConfig;
+        if (self.heartbeat_ticks >= self.election_timeout_min_ticks) return error.InvalidConfig;
+    }
+};
+
+pub const ConfigError = error{
+    InvalidConfig,
+};
 pub const RaftLog = raftlog_mod.RaftLog;
 pub const RaftLogError = raftlog_mod.RaftLogError;
 
@@ -28,6 +47,7 @@ pub const RaftError = error{
     InvalidMessage,
     ConfChangeInProgress,
     InvalidBytes,
+    QueueClosed,
 } || RaftLogError || zen.Error;
 
 pub const Peer = struct {
@@ -44,6 +64,23 @@ pub const Outbound = struct {
 };
 
 pub const Inbound = []u8;
+pub const ProposalEntry = struct {
+    term: u64,
+    index: u64,
+};
+
+pub const CommitStatus = enum {
+    committed,
+    not_leader,
+    step_down,
+    shutdown,
+};
+
+pub const CommitCallback = *const fn (
+    ctx: *anyopaque,
+    entry: ProposalEntry,
+    status: CommitStatus,
+) void;
 
 pub const Node = struct {
     pub const DebugOutput = enum {
@@ -78,7 +115,7 @@ pub const Node = struct {
 
     state: State,
     commit_index: u64,
-    last_applied: u64,
+    last_applied: std.atomic.Value(u64),
     leader_id: ?NodeId,
     pending_conf_change: bool,
     quorum_size: usize,
@@ -96,6 +133,25 @@ pub const Node = struct {
 
     outbox: std.ArrayList(Outbound),
     prng: std.Random.DefaultPrng,
+    proposal_wake_fd: std.posix.fd_t,
+    proposal_requests: ProposalQueue,
+    pending_commit_callbacks: PendingCommitQueue,
+    shutting_down: std.atomic.Value(bool),
+    commit_wait_mutex: std.Thread.Mutex,
+    commit_wait_cond: std.Thread.Condition,
+
+    const ProposalQueue = utils.Queue(ProposalRequest, 4096);
+    const PendingCommitQueue = utils.Queue(PendingCommit, 4096);
+    const ProposalRequest = struct {
+        data: []u8,
+        cb: CommitCallback,
+        ctx: *anyopaque,
+    };
+    const PendingCommit = struct {
+        entry: ProposalEntry,
+        cb: CommitCallback,
+        ctx: *anyopaque,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -116,7 +172,7 @@ pub const Node = struct {
             .log = log,
             .state = .follower,
             .commit_index = 0,
-            .last_applied = 0,
+            .last_applied = std.atomic.Value(u64).init(0),
             .leader_id = null,
             .pending_conf_change = false,
             .quorum_size = 1,
@@ -129,6 +185,12 @@ pub const Node = struct {
             .allocator = allocator,
             .outbox = std.ArrayList(Outbound).empty,
             .prng = prng,
+            .proposal_wake_fd = try std.posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK),
+            .proposal_requests = .{},
+            .pending_commit_callbacks = .{},
+            .shutting_down = std.atomic.Value(bool).init(false),
+            .commit_wait_mutex = .{},
+            .commit_wait_cond = .{},
         };
         for (peers) |peer| {
             try node.peers.put(peer.id, peer);
@@ -153,11 +215,35 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        self.proposal_requests.close();
+        while (self.proposal_requests.tryPop()) |req| {
+            self.allocator.free(req.data);
+            req.cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
+        }
+        self.failAllPendingCallbacks(.shutdown);
+        self.pending_commit_callbacks.close();
+        std.posix.close(self.proposal_wake_fd);
         self.clearOutbox();
         self.votes_received.deinit();
         self.prevotes_received.deinit();
         self.peers.deinit();
         self.outbox.deinit(self.allocator);
+    }
+
+    pub fn proposalWakeFd(self: *const Node) std.posix.fd_t {
+        return self.proposal_wake_fd;
+    }
+
+    pub fn startShutdown(self: *Node) void {
+        self.shutting_down.store(true, .seq_cst);
+        self.proposal_requests.close();
+        self.notifyCommitCallbacks();
+        var one: u64 = 1;
+        _ = std.posix.write(self.proposal_wake_fd, std.mem.asBytes(&one)) catch {};
+    }
+
+    pub fn isShuttingDown(self: *const Node) bool {
+        return self.shutting_down.load(.seq_cst);
     }
 
     pub fn tick(self: *Node) RaftError!void {
@@ -190,11 +276,7 @@ pub const Node = struct {
         }
     }
 
-    pub fn handleInbound(self: *Node, inbound: Inbound) RaftError!void {
-        try self.handleEncoded(inbound);
-    }
-
-    fn handleEncoded(self: *Node, buf: []const u8) RaftError!void {
+    pub fn handleInbound(self: *Node, buf: Inbound) RaftError!void {
         switch (zen.parseMessageWithTail(buf) catch return RaftError.InvalidMessage) {
             .RequestVote => |rv| try self.handleRequestVote(rv),
             .RequestVoteReply => |rvr| try self.handleRequestVoteReply(rvr),
@@ -280,7 +362,7 @@ pub const Node = struct {
         defer buf.deinit(self.allocator);
 
         var ae_writer = try zen.AppendEntriesWriter.initWithBuf(self.allocator, &buf);
-        defer ae_writer.deinit(self.allocator);
+        defer ae_writer.deinit();
 
         var entry_offsets = std.ArrayList(u32).empty;
         defer entry_offsets.deinit(self.allocator);
@@ -545,11 +627,10 @@ pub const Node = struct {
             state.match_index = match_index;
             state.next_index = match_index + 1;
         }
-        self.advanceCommitIndex();
-        self.applyCommitted();
+        self.advance();
     }
 
-    pub fn propose(self: *Node, data: []const u8) RaftError!u64 {
+    pub fn _propose(self: *Node, data: []const u8) RaftError!u64 {
         if (self.state != .leader) return RaftError.NotLeader;
 
         const new_index = self.log.lastIndex() + 1;
@@ -565,13 +646,115 @@ pub const Node = struct {
         });
         var entry = try writer.finishWithTail();
         defer entry.deinit();
+
         try self.log.append(&[_]zen.LogEntryBuffer{entry});
         try self.log.sync();
+        self.advance();
         var it = self.peers.iterator();
         while (it.next()) |kv| {
             try self.sendAppendEntries(kv.key_ptr.*);
         }
         return new_index;
+    }
+
+    /// Preferred external proposal API.
+    /// Callers should enqueue through this method; direct `propose` calls are
+    /// intended for the single-threaded raft runtime loop.
+    pub fn proposeWithCallback(
+        self: *Node,
+        data: []const u8,
+        cb: CommitCallback,
+        ctx: *anyopaque,
+    ) RaftError!void {
+        if (self.isShuttingDown()) return error.QueueClosed;
+        const owned = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(owned);
+        try self.proposal_requests.pushOrClosed(.{
+            .data = owned,
+            .cb = cb,
+            .ctx = ctx,
+        });
+        var one: u64 = 1;
+        _ = std.posix.write(self.proposal_wake_fd, std.mem.asBytes(&one)) catch {};
+    }
+
+    pub fn processProposalRequests(self: *Node, max_batch: usize) RaftError!usize {
+        if (self.isShuttingDown()) {
+            while (self.proposal_requests.tryPop()) |req| {
+                self.allocator.free(req.data);
+                req.cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
+            }
+            return 0;
+        }
+        var batch = std.ArrayList(ProposalRequest).empty;
+        defer batch.deinit(self.allocator);
+
+        while (batch.items.len < max_batch) {
+            const req = self.proposal_requests.tryPop() orelse break;
+            try batch.append(self.allocator, req);
+        }
+        if (batch.items.len == 0) return 0;
+
+        defer for (batch.items) |req| self.allocator.free(req.data);
+
+        const term = self.current_term;
+        const first_index = self.appendNormalEntriesBatch(batch.items) catch |err| switch (err) {
+            error.NotLeader => {
+                for (batch.items) |req| {
+                    req.cb(req.ctx, .{ .term = term, .index = 0 }, .not_leader);
+                }
+                return batch.items.len;
+            },
+            else => return err,
+        };
+
+        for (batch.items, 0..) |req, i| {
+            const entry = ProposalEntry{
+                .term = term,
+                .index = first_index + @as(u64, @intCast(i)),
+            };
+            self.pending_commit_callbacks.pushOrClosed(.{
+                .entry = entry,
+                .cb = req.cb,
+                .ctx = req.ctx,
+            }) catch |err| switch (err) {
+                error.QueueClosed => req.cb(req.ctx, entry, .shutdown),
+            };
+        }
+        self.notifyCommitCallbacks();
+
+        return batch.items.len;
+    }
+
+    pub fn processCommitCallbacks(self: *Node, max_callbacks: usize) usize {
+        var count: usize = 0;
+        while (count < max_callbacks) : (count += 1) {
+            const head = self.pending_commit_callbacks.peek() orelse break;
+            if (head.entry.index > self.last_applied.load(.seq_cst)) break;
+
+            const ready = self.pending_commit_callbacks.tryPop() orelse break;
+            ready.cb(ready.ctx, ready.entry, .committed);
+        }
+        return count;
+    }
+
+    fn hasReadyCommitCallback(self: *Node) bool {
+        const head = self.pending_commit_callbacks.peek() orelse return false;
+        return head.entry.index <= self.last_applied.load(.seq_cst);
+    }
+
+    fn notifyCommitCallbacks(self: *Node) void {
+        self.commit_wait_mutex.lock();
+        defer self.commit_wait_mutex.unlock();
+        self.commit_wait_cond.broadcast();
+    }
+
+    pub fn waitForCommitCallbacks(self: *Node) void {
+        self.commit_wait_mutex.lock();
+        defer self.commit_wait_mutex.unlock();
+        while (!self.isShuttingDown() and !self.hasReadyCommitCallback()) {
+            self.commit_wait_cond.wait(&self.commit_wait_mutex);
+        }
     }
 
     pub fn proposeConfChange(self: *Node, cc: ConfChange) RaftError!u64 {
@@ -609,8 +792,11 @@ pub const Node = struct {
         const bytes = try buf.toOwnedSlice(self.allocator);
         var entry = try zen.LogEntryBuffer.initWithTail(self.allocator, bytes, .owned);
         defer entry.deinit();
+
         try self.log.append(&[_]zen.LogEntryBuffer{entry});
         try self.log.sync();
+        self.advance();
+
         var it = self.peers.iterator();
         while (it.next()) |kv| {
             try self.sendAppendEntries(kv.key_ptr.*);
@@ -745,10 +931,19 @@ pub const Node = struct {
         return self.quorum_size;
     }
 
+    pub fn advance(self: *Node) void {
+        self.advanceCommitIndex();
+        self.applyCommitted();
+    }
+
     pub fn applyCommitted(self: *Node) void {
-        while (self.last_applied < self.commit_index) {
-            self.last_applied += 1;
-            const entry = (self.log.entryRef(self.last_applied) catch continue) orelse continue;
+        var applied = self.last_applied.load(.seq_cst);
+        var advanced = false;
+        while (applied < self.commit_index) {
+            applied += 1;
+            self.last_applied.store(applied, .seq_cst);
+            advanced = true;
+            const entry = (self.log.entryRef(applied) catch continue) orelse continue;
             const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
             if (reader.confChange()) |cc_reader| {
                 const cc = self.decodeConfChange(cc_reader) catch continue;
@@ -756,6 +951,7 @@ pub const Node = struct {
                 self.pending_conf_change = false;
             }
         }
+        if (advanced) self.notifyCommitCallbacks();
     }
 
     fn applyConfChange(self: *Node, cc: ConfChange) void {
@@ -859,6 +1055,7 @@ pub const Node = struct {
         self.leader_id = null;
         self.elapsed_ticks = 0;
         self.resetElectionTimeout(.step_down);
+        self.failAllPendingCallbacks(.step_down);
         dbg(
             "step-down tick={d} node={d} {s}/term={d} -> {s}/term={d}",
             .{ self.tick_count, self.id, @tagName(prev_state), prev_term, @tagName(self.state), self.current_term },
@@ -866,8 +1063,79 @@ pub const Node = struct {
         try self.persistHardState();
     }
 
+    fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {
+        while (self.pending_commit_callbacks.tryPop()) |head| {
+            head.cb(head.ctx, head.entry, status);
+        }
+    }
+
+    fn appendNormalEntriesBatch(self: *Node, requests: []const ProposalRequest) RaftError!u64 {
+        if (self.state != .leader) return RaftError.NotLeader;
+        if (requests.len == 0) return self.log.lastIndex() + 1;
+
+        var entries = std.ArrayList(zen.LogEntryBuffer).empty;
+        defer {
+            for (entries.items) |*entry| entry.deinit();
+            entries.deinit(self.allocator);
+        }
+        try entries.ensureTotalCapacity(self.allocator, requests.len);
+
+        // TODO: Need to figure how to deal with conf changes.
+        const first_index = self.log.lastIndex() + 1;
+        var index = first_index;
+        for (requests) |req| {
+            var writer = try zen.LogEntryWriter.init(self.allocator);
+            defer writer.deinit();
+            try writer.set(.{
+                .index = index,
+                .term = self.current_term,
+                .data = req.data,
+                .is_normal = true,
+                .is_conf_change = false,
+                .conf_change = zen.NullOffset,
+            });
+            const entry = try writer.finishWithTail();
+            try entries.append(self.allocator, entry);
+            index += 1;
+        }
+
+        try self.log.append(entries.items);
+        // TODO: If leader, this sync can be run concurrently with sendAppendEntries.
+        try self.log.sync();
+        self.advance();
+
+        var it = self.peers.iterator();
+        while (it.next()) |kv| {
+            try self.sendAppendEntries(kv.key_ptr.*);
+        }
+        return first_index;
+    }
+
     fn advanceCommitIndex(self: *Node) void {
-        _ = self;
-        // TODO: compute majority match index and advance commit_index safely.
+        if (self.state != .leader) return;
+
+        var matches = std.ArrayList(u64).empty;
+        defer matches.deinit(self.allocator);
+
+        // Leader always has its own log up to lastIndex.
+        matches.append(self.allocator, self.log.lastIndex()) catch return;
+
+        var it = self.peers.valueIterator();
+        while (it.next()) |peer| {
+            if (peer.role != .voter) continue;
+            matches.append(self.allocator, peer.match_index) catch return;
+        }
+
+        if (matches.items.len == 0) return;
+
+        std.mem.sort(u64, matches.items, {}, comptime std.sort.asc(u64));
+
+        const quorum_pos = matches.items.len - self.quorum_size;
+        const candidate = matches.items[quorum_pos];
+        if (candidate <= self.commit_index) return;
+
+        const term = self.log.term(candidate) catch return orelse return;
+        if (term != self.current_term) return;
+        self.commit_index = candidate;
     }
 };

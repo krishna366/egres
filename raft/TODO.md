@@ -1,17 +1,17 @@
 ## Multi-Process Raft TODO
 
-1. Define wire transport boundary.
+1. [x] Define wire transport boundary.
 - Frame each message on TCP/Unix socket as `u32 len` + bytes.
 - Keep zbuf tail inside the frame payload.
 - Add `sendMessage(fd, []u8)` and `readMessage(fd) -> []u8`.
 
-2. Build a network adapter around `Node`.
+2. [x] Build a network adapter around `Node`.
 - Single-threaded event loop per process.
 - Poll sockets + timer tick.
 - Feed inbound frames to `node.handleInbound(...)`.
 - Flush `node.takeOutbox()` to peer connections.
 
-3. Add peer addressing and connection manager.
+3. [x] Add peer addressing and connection manager.
 - Static config first: `node_id -> host:port`.
 - Maintain reconnecting outbound connections.
 - Accept inbound connections and map to peer id via handshake.
@@ -42,3 +42,8 @@
 - Max frame size check before allocation.
 - Connection/auth sanity checks.
 - Structured logs for term transitions and message flow.
+
+9. Add proposal commit notification path.
+- Emit `CommitEvent{ index, term, ... }` from the Raft loop into thread-safe queue.
+- Keep caller-side pending map keyed by `(index, term)` to resolve proposal outcomes.
+- Fail all pending waiters on step-down/shutdown and handle timeout cleanup.

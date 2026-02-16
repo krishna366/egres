@@ -223,6 +223,11 @@ fn addRaftTests(
         .target = target,
         .optimize = optimize,
     });
+    const utils_mod = b.createModule(.{
+        .root_source_file = b.path("u/utils.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const raft_buffers_mod = b.createModule(.{
         .root_source_file = b.path("raft/buffers.zig"),
         .target = target,
@@ -256,6 +261,7 @@ fn addRaftTests(
     });
     raft_mod.addImport("buffers_gen", raft_buffers_gen_mod);
     raft_mod.addImport("zbuf", zbuf_mod);
+    raft_mod.addImport("utils", utils_mod);
 
     const raft_tests = b.addTest(.{
         .root_module = b.createModule(.{

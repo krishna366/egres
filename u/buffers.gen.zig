@@ -5,6 +5,8 @@ const zbuf = @import("zbuf").zbuf;
 pub const Error = std.mem.Allocator.Error || zbuf.Error;
 pub const NullOffset: u32 = zbuf.NullOffset;
 
+pub const Ownership = zbuf.Ownership;
+
 pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, T.VERSION, offset);
 }
@@ -91,7 +93,6 @@ pub const BlockOffsetReader = struct {
 };
 
 pub const BlockOffsetBuffer = struct {
-    pub const Ownership = enum { borrowed, owned };
     alloc: std.mem.Allocator,
     offset: u32,
     bytes: ?[]u8,
@@ -275,6 +276,17 @@ pub const TableIndexReader = struct {
         return BlockOffsetReader.init(self.buf, child_off);
     }
 
+    pub fn offsetsAtClone(self: Self, alloc: std.mem.Allocator, i: u32) Error!BlockOffsetBuffer {
+        const child = try self.offsetsAt(i);
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(alloc);
+        const child_buf = try BlockOffsetBuffer.initWithOffset(alloc, @constCast(self.buf), child.base, .borrowed);
+        const child_off = try child_buf.cloneInto(alloc, &out);
+        try addTail(alloc, &out, BlockOffsetReader, child_off);
+        const bytes = try out.toOwnedSlice(alloc);
+        return BlockOffsetBuffer.initWithTail(alloc, bytes, .owned);
+    }
+
     pub fn bloomFilter(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 20;
         const header_end = @as(u32, self.base) + self.size_bytes;
@@ -341,7 +353,6 @@ pub const TableIndexReader = struct {
 };
 
 pub const TableIndexBuffer = struct {
-    pub const Ownership = enum { borrowed, owned };
     alloc: std.mem.Allocator,
     offset: u32,
     bytes: ?[]u8,

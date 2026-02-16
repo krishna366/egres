@@ -41,16 +41,19 @@ pub fn main() !void {
             std.log.debug("accept error: {}\n", .{err});
             continue;
         };
-        conns.push(.{
+        conns.pushOrClosed(.{
             .connId = nextConnId.fetchAdd(1, std.builtin.AtomicOrder.monotonic),
             .conn = conn,
-        });
+            }) catch {
+            conn.stream.close();
+            break;
+        };
     }
 }
 
 fn workerLoop(allocator: std.mem.Allocator) void {
     while (true) {
-        const job = conns.pop();
+        const job = conns.popOrNull() orelse break;
         processJob(allocator, job) catch |err| {
             std.log.debug("Got error while processing job: {}", .{err});
         };
