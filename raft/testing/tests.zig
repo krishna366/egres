@@ -4,6 +4,7 @@ const cluster_mod = @import("cluster.zig");
 const zen = raft.buffers;
 
 const TestCluster = cluster_mod.TestCluster;
+const TestLog = cluster_mod.TestLog;
 const Config = raft.Config;
 const NodeId = raft.NodeId;
 
@@ -216,13 +217,13 @@ test "proposal callback fires on commit" {
     var cfg = defaultConfig();
     cfg.enable_prevote = false;
 
-    var log = raft.MemRaftLog.init(std.testing.allocator);
-    defer log.deinit();
+    var test_wal = try TestLog.init(std.testing.allocator, 1);
+    defer test_wal.deinit(std.testing.allocator);
     var node = try raft.Node.init(
         std.testing.allocator,
         1,
         &[_]raft.Peer{},
-        log.asRaftLog(),
+        test_wal.asRaftWAL(),
         cfg,
         .voter,
     );
@@ -260,13 +261,13 @@ test "raft runtime starts and stops cleanly" {
     const port = try reserveLocalPort();
     const listen_addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-    var log = raft.MemRaftLog.init(std.testing.allocator);
-    defer log.deinit();
+    var test_wal = try TestLog.init(std.testing.allocator, 1);
+    defer test_wal.deinit(std.testing.allocator);
     var node = try raft.Node.init(
         std.testing.allocator,
         1,
         &[_]raft.Peer{},
-        log.asRaftLog(),
+        test_wal.asRaftWAL(),
         cfg,
         .voter,
     );
@@ -297,13 +298,13 @@ test "raft runtime processes proposal" {
     const port = try reserveLocalPort();
     const listen_addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-    var log = raft.MemRaftLog.init(std.testing.allocator);
-    defer log.deinit();
+    var test_wal = try TestLog.init(std.testing.allocator, 1);
+    defer test_wal.deinit(std.testing.allocator);
     var node = try raft.Node.init(
         std.testing.allocator,
         1,
         &[_]raft.Peer{},
-        log.asRaftLog(),
+        test_wal.asRaftWAL(),
         cfg,
         .voter,
     );
@@ -360,13 +361,13 @@ test "raft runtime stop wakes blocked callback thread" {
     const port = try reserveLocalPort();
     const listen_addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-    var log = raft.MemRaftLog.init(std.testing.allocator);
-    defer log.deinit();
+    var test_wal = try TestLog.init(std.testing.allocator, 1);
+    defer test_wal.deinit(std.testing.allocator);
     var node = try raft.Node.init(
         std.testing.allocator,
         1,
         &[_]raft.Peer{},
-        log.asRaftLog(),
+        test_wal.asRaftWAL(),
         cfg,
         .voter,
     );
@@ -393,13 +394,13 @@ test "raft runtime propose after shutdown returns QueueClosed" {
     const port = try reserveLocalPort();
     const listen_addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-    var log = raft.MemRaftLog.init(std.testing.allocator);
-    defer log.deinit();
+    var test_wal = try TestLog.init(std.testing.allocator, 1);
+    defer test_wal.deinit(std.testing.allocator);
     var node = try raft.Node.init(
         std.testing.allocator,
         1,
         &[_]raft.Peer{},
-        log.asRaftLog(),
+        test_wal.asRaftWAL(),
         cfg,
         .voter,
     );
@@ -506,13 +507,13 @@ test "join request is rejected by non-leader" {
     const port = try reserveLocalPort();
     const listen_addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-    var log = raft.MemRaftLog.init(std.testing.allocator);
-    defer log.deinit();
+    var test_wal = try TestLog.init(std.testing.allocator, 1);
+    defer test_wal.deinit(std.testing.allocator);
     var node = try raft.Node.init(
         std.testing.allocator,
         1,
         &[_]raft.Peer{},
-        log.asRaftLog(),
+        test_wal.asRaftWAL(),
         cfg,
         .voter,
     );
@@ -578,13 +579,13 @@ test "leader accepts join request" {
     const port = try reserveLocalPort();
     const listen_addr = try std.net.Address.parseIp("127.0.0.1", port);
 
-    var log = raft.MemRaftLog.init(std.testing.allocator);
-    defer log.deinit();
+    var test_wal = try TestLog.init(std.testing.allocator, 1);
+    defer test_wal.deinit(std.testing.allocator);
     var node = try raft.Node.init(
         std.testing.allocator,
         1,
         &[_]raft.Peer{},
-        log.asRaftLog(),
+        test_wal.asRaftWAL(),
         cfg,
         .voter,
     );
@@ -665,13 +666,13 @@ test "single-node leader adds joiner as learner" {
         .{learner_port},
     );
 
-    var leader_log = raft.MemRaftLog.init(alloc);
-    defer leader_log.deinit();
+    var leader_wal = try TestLog.init(alloc, 1);
+    defer leader_wal.deinit(alloc);
     var leader = try raft.Node.init(
         alloc,
         1,
         &[_]raft.Peer{},
-        leader_log.asRaftLog(),
+        leader_wal.asRaftWAL(),
         cfg,
         .voter,
     );
@@ -683,8 +684,8 @@ test "single-node leader adds joiner as learner" {
         _ = try leader._propose(p);
     }
 
-    var learner_log = raft.MemRaftLog.init(alloc);
-    defer learner_log.deinit();
+    var learner_wal = try TestLog.init(alloc, 2);
+    defer learner_wal.deinit(alloc);
     var learner = try raft.Node.init(
         alloc,
         2,
@@ -696,7 +697,7 @@ test "single-node leader adds joiner as learner" {
                 .role = .voter,
             },
         },
-        learner_log.asRaftLog(),
+        learner_wal.asRaftWAL(),
         cfg,
         .learner,
     );
@@ -824,12 +825,6 @@ test "follower catches up after disconnect and reconnect" {
     const lagging_id: NodeId = if (leader_id != 2) 2 else 3;
     const lagging = cluster.getNode(lagging_id) orelse return error.MissingNode;
 
-    var expected = std.ArrayList([]u8).empty;
-    defer {
-        for (expected.items) |item| std.testing.allocator.free(item);
-        expected.deinit(std.testing.allocator);
-    }
-
     const disconnect_start: usize = 10;
     const reconnect_at: usize = 40;
     const total_props: usize = 80;
@@ -856,11 +851,9 @@ test "follower catches up after disconnect and reconnect" {
             "{d}",
             .{proposed_count + 1},
         );
-        try expected.append(std.testing.allocator, payload);
+        defer std.testing.allocator.free(payload);
         _ = current_leader._propose(payload) catch |err| switch (err) {
             raft.RaftError.NotLeader => {
-                _ = expected.pop();
-                std.testing.allocator.free(payload);
                 try cluster.runTicks(1);
                 continue;
             },
@@ -875,10 +868,16 @@ test "follower catches up after disconnect and reconnect" {
         return error.MissingNode;
     try std.testing.expectEqual(leader.log.lastIndex(), lagging.log.lastIndex());
 
-    for (expected.items, 0..) |payload, idx| {
-        const log_entry = (try lagging.log.entryRef(@intCast(idx + 1))) orelse
+    var idx: u64 = 1;
+    while (idx <= leader.log.lastIndex()) : (idx += 1) {
+        const leader_entry = (try leader.log.entryRef(idx)) orelse
             return error.MissingEntry;
-        const reader = try zen.LogEntryReader.parseRoot(log_entry.bytes);
-        try std.testing.expectEqualSlices(u8, payload, reader.data());
+        const lagging_entry = (try lagging.log.entryRef(idx)) orelse
+            return error.MissingEntry;
+
+        const leader_reader = try zen.LogEntryReader.parseRoot(leader_entry.bytes);
+        const lagging_reader = try zen.LogEntryReader.parseRoot(lagging_entry.bytes);
+        try std.testing.expectEqual(leader_reader.term(), lagging_reader.term());
+        try std.testing.expectEqualSlices(u8, leader_reader.data(), lagging_reader.data());
     }
 }

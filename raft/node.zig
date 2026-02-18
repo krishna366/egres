@@ -1,19 +1,19 @@
 const std = @import("std");
-const raftlog_mod = @import("raftlog.zig");
+const raftwal_mod = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const utils = @import("utils");
 const linux = std.os.linux;
 const raft_log = std.log.scoped(.raft);
 
-pub const NodeId = raftlog_mod.NodeId;
+pub const NodeId = raftwal_mod.NodeId;
 pub const State = enum {
     follower,
     candidate,
     leader,
     learner,
 };
-pub const ConfChange = raftlog_mod.ConfChange;
-pub const ConfChangeType = raftlog_mod.ConfChangeType;
+pub const ConfChange = raftwal_mod.ConfChange;
+pub const ConfChangeType = raftwal_mod.ConfChangeType;
 
 pub const PeerRole = enum {
     voter,
@@ -39,8 +39,8 @@ pub const Config = struct {
 pub const ConfigError = error{
     InvalidConfig,
 };
-pub const RaftLog = raftlog_mod.RaftLog;
-pub const RaftLogError = raftlog_mod.RaftLogError;
+pub const RaftWAL = raftwal_mod.RaftWAL;
+pub const RaftLogError = raftwal_mod.RaftLogError;
 
 pub const RaftError = error{
     NotLeader,
@@ -111,7 +111,7 @@ pub const Node = struct {
 
     current_term: u64,
     voted_for: ?NodeId,
-    log: RaftLog,
+    log: RaftWAL,
 
     state: State,
     commit_index: u64,
@@ -157,7 +157,7 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         id: NodeId,
         peers: []const Peer,
-        log: RaftLog,
+        log: RaftWAL,
         config: Config,
         self_role: PeerRole,
     ) !Node {
@@ -369,7 +369,11 @@ pub const Node = struct {
         try entry_offsets.ensureTotalCapacity(self.allocator, entries.len);
 
         for (entries) |entry_ref| {
-            var entry_buf = try zen.LogEntryBuffer.initWithTail(self.allocator, entry_ref.bytes, .borrowed);
+            var entry_buf = try zen.LogEntryBuffer.initWithTail(
+                self.allocator,
+                @constCast(entry_ref.bytes),
+                .borrowed,
+            );
             defer entry_buf.deinit();
 
             const entry_off = try entry_buf.cloneInto(self.allocator, &buf);
@@ -817,7 +821,11 @@ pub const Node = struct {
     }
 
     pub fn persistHardState(self: *Node) RaftError!void {
-        try self.log.setHardState(.{ .current_term = self.current_term, .voted_for = self.voted_for });
+        try self.log.setHardState(.{
+            .current_term = self.current_term,
+            .voted_for = self.voted_for orelse 0,
+            .commit_index = self.commit_index,
+        });
         try self.log.sync();
     }
 

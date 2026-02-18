@@ -14,16 +14,17 @@ pub const ConfChange = struct {
     node_id: NodeId,
 };
 pub const LogEntryBuffer = zen.LogEntryBuffer;
+pub const HardState = struct {
+    current_term: u64,
+    voted_for: u64,
+    commit_index: u64,
+};
 pub const StoredEntry = struct {
     index: u64,
     term: u64,
     data_len: u32,
-    bytes: []u8,
-};
-
-pub const HardState = struct {
-    current_term: u64,
-    voted_for: ?NodeId,
+    // Borrowed/owned payload bytes. Callers must treat this as read-only.
+    bytes: []const u8,
 };
 
 pub const Snapshot = struct {
@@ -37,7 +38,7 @@ pub const RaftLogError = error{
     Unavailable,
 } || std.mem.Allocator.Error || zen.Error;
 
-pub const RaftLog = struct {
+pub const RaftWAL = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
@@ -50,6 +51,8 @@ pub const RaftLog = struct {
         lastIndex: *const fn (*anyopaque) u64,
         lastTerm: *const fn (*anyopaque) u64,
         term: *const fn (*anyopaque, u64) RaftLogError!?u64,
+        // `Ref` APIs return borrowed views. Implementations may invalidate these
+        // views after the next ref call or after any mutating log operation.
         entryRef: *const fn (*anyopaque, u64) RaftLogError!?StoredEntry,
         entriesFromRef: *const fn (*anyopaque, u64, u32) RaftLogError![]const StoredEntry,
         entriesRangeRef: *const fn (*anyopaque, u64, u64, u64) RaftLogError![]const StoredEntry,
@@ -61,71 +64,73 @@ pub const RaftLog = struct {
         sync: *const fn (*anyopaque) RaftLogError!void,
     };
 
-    pub fn hardState(self: RaftLog) HardState {
+    pub fn hardState(self: RaftWAL) HardState {
         return self.vtable.hardState(self.ctx);
     }
 
-    pub fn setHardState(self: RaftLog, hs: HardState) RaftLogError!void {
+    pub fn setHardState(self: RaftWAL, hs: HardState) RaftLogError!void {
         return self.vtable.setHardState(self.ctx, hs);
     }
 
-    pub fn snapshot(self: RaftLog) Snapshot {
+    pub fn snapshot(self: RaftWAL) Snapshot {
         return self.vtable.snapshot(self.ctx);
     }
 
-    pub fn setSnapshot(self: RaftLog, snap: Snapshot) RaftLogError!void {
+    pub fn setSnapshot(self: RaftWAL, snap: Snapshot) RaftLogError!void {
         return self.vtable.setSnapshot(self.ctx, snap);
     }
 
-    pub fn firstIndex(self: RaftLog) u64 {
+    pub fn firstIndex(self: RaftWAL) u64 {
         return self.vtable.firstIndex(self.ctx);
     }
 
-    pub fn lastIndex(self: RaftLog) u64 {
+    pub fn lastIndex(self: RaftWAL) u64 {
         return self.vtable.lastIndex(self.ctx);
     }
 
-    pub fn lastTerm(self: RaftLog) u64 {
+    pub fn lastTerm(self: RaftWAL) u64 {
         return self.vtable.lastTerm(self.ctx);
     }
 
-    pub fn term(self: RaftLog, index: u64) RaftLogError!?u64 {
+    pub fn term(self: RaftWAL, index: u64) RaftLogError!?u64 {
         return self.vtable.term(self.ctx, index);
     }
 
-    pub fn entryRef(self: RaftLog, index: u64) RaftLogError!?StoredEntry {
+    pub fn entryRef(self: RaftWAL, index: u64) RaftLogError!?StoredEntry {
         return self.vtable.entryRef(self.ctx, index);
     }
 
-    pub fn entriesFromRef(self: RaftLog, start_index: u64, max_count: u32) RaftLogError![]const StoredEntry {
+    // Borrowed refs, valid only per implementation contract (typically until
+    // the next ref call or mutating operation on the same log instance).
+    pub fn entriesFromRef(self: RaftWAL, start_index: u64, max_count: u32) RaftLogError![]const StoredEntry {
         return self.vtable.entriesFromRef(self.ctx, start_index, max_count);
     }
 
-    pub fn entriesRangeRef(self: RaftLog, lo: u64, hi: u64, max_bytes: u64) RaftLogError![]const StoredEntry {
+    pub fn entriesRangeRef(self: RaftWAL, lo: u64, hi: u64, max_bytes: u64) RaftLogError![]const StoredEntry {
         return self.vtable.entriesRangeRef(self.ctx, lo, hi, max_bytes);
     }
 
-    pub fn firstIndexOfTerm(self: RaftLog, term_value: u64) u64 {
+    pub fn firstIndexOfTerm(self: RaftWAL, term_value: u64) u64 {
         return self.vtable.firstIndexOfTerm(self.ctx, term_value);
     }
 
-    pub fn lastIndexOfTerm(self: RaftLog, term_value: u64) u64 {
+    pub fn lastIndexOfTerm(self: RaftWAL, term_value: u64) u64 {
         return self.vtable.lastIndexOfTerm(self.ctx, term_value);
     }
 
-    pub fn append(self: RaftLog, entries: []const LogEntryBuffer) RaftLogError!void {
+    pub fn append(self: RaftWAL, entries: []const LogEntryBuffer) RaftLogError!void {
         return self.vtable.append(self.ctx, entries);
     }
 
-    pub fn truncateFrom(self: RaftLog, from_index: u64) void {
+    pub fn truncateFrom(self: RaftWAL, from_index: u64) void {
         return self.vtable.truncateFrom(self.ctx, from_index);
     }
 
-    pub fn compactUntil(self: RaftLog, index: u64) void {
+    pub fn compactUntil(self: RaftWAL, index: u64) void {
         return self.vtable.compactUntil(self.ctx, index);
     }
 
-    pub fn sync(self: RaftLog) RaftLogError!void {
+    pub fn sync(self: RaftWAL) RaftLogError!void {
         return self.vtable.sync(self.ctx);
     }
 };
@@ -137,22 +142,22 @@ pub fn deinitOwnedEntries(alloc: std.mem.Allocator, entries: []LogEntryBuffer) v
     alloc.free(entries);
 }
 
-pub const MemRaftLog = struct {
+pub const MemWAL = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(StoredEntry),
     hard_state: HardState,
     snapshot_info: Snapshot,
 
-    pub fn init(allocator: std.mem.Allocator) MemRaftLog {
+    pub fn init(allocator: std.mem.Allocator) MemWAL {
         return .{
             .allocator = allocator,
             .entries = std.ArrayList(StoredEntry).empty,
-            .hard_state = .{ .current_term = 0, .voted_for = null },
+            .hard_state = .{ .current_term = 0, .voted_for = 0, .commit_index = 0 },
             .snapshot_info = .{ .index = 0, .term = 0, .data = &[_]u8{} },
         };
     }
 
-    pub fn deinit(self: *MemRaftLog) void {
+    pub fn deinit(self: *MemWAL) void {
         self.clearEntries();
         if (self.snapshot_info.data.len != 0) {
             self.allocator.free(self.snapshot_info.data);
@@ -160,11 +165,11 @@ pub const MemRaftLog = struct {
         self.entries.deinit(self.allocator);
     }
 
-    pub fn asRaftLog(self: *MemRaftLog) RaftLog {
+    pub fn asRaftWAL(self: *MemWAL) RaftWAL {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    fn fromCtx(ctx: *anyopaque) *MemRaftLog {
+    fn fromCtx(ctx: *anyopaque) *MemWAL {
         return @ptrCast(@alignCast(ctx));
     }
 
@@ -322,7 +327,7 @@ pub const MemRaftLog = struct {
         const offset: usize = @intCast(from_index - base);
         if (offset >= self.entries.items.len) return;
         for (self.entries.items[offset..]) |stored| {
-            self.allocator.free(stored.bytes);
+            self.allocator.free(@constCast(stored.bytes));
         }
         self.entries.shrinkRetainingCapacity(offset);
     }
@@ -338,7 +343,7 @@ pub const MemRaftLog = struct {
             return;
         }
         for (self.entries.items[0..offset]) |stored| {
-            self.allocator.free(stored.bytes);
+            self.allocator.free(@constCast(stored.bytes));
         }
         self.entries.items = self.entries.items[offset..];
     }
@@ -347,14 +352,14 @@ pub const MemRaftLog = struct {
         _ = ctx;
     }
 
-    fn clearEntries(self: *MemRaftLog) void {
+    fn clearEntries(self: *MemWAL) void {
         for (self.entries.items) |stored| {
-            self.allocator.free(stored.bytes);
+            self.allocator.free(@constCast(stored.bytes));
         }
         self.entries.shrinkRetainingCapacity(0);
     }
 
-    fn findStored(self: *MemRaftLog, index: u64) ?StoredEntry {
+    fn findStored(self: *MemWAL, index: u64) ?StoredEntry {
         if (index == 0) return null;
         if (self.entries.items.len == 0) return null;
         const base = self.entries.items[0].index;
@@ -364,7 +369,7 @@ pub const MemRaftLog = struct {
         return self.entries.items[offset];
     }
 
-    const vtable = RaftLog.VTable{
+    const vtable = RaftWAL.VTable{
         .hardState = hardState,
         .setHardState = setHardState,
         .snapshot = snapshot,

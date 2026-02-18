@@ -5,6 +5,56 @@ pub const NodeId = raft.NodeId;
 pub const Inbound = raft.Inbound;
 pub const Config = raft.Config;
 
+pub const TestWalBackend = enum {
+    mem,
+    disk,
+};
+
+pub const test_wal_backend: TestWalBackend = .disk;
+
+pub const TestLog = struct {
+    mem: ?raft.MemWAL = null,
+    disk: ?raft.DiskWAL = null,
+    wal_dir: ?[]u8 = null,
+
+    pub fn init(allocator: std.mem.Allocator, id: NodeId) !TestLog {
+        var out: TestLog = .{};
+        switch (test_wal_backend) {
+            .mem => out.mem = raft.MemWAL.init(allocator),
+            .disk => {
+                const wal_dir = try makeWalDir(allocator, id);
+                out.wal_dir = wal_dir;
+                out.disk = try raft.DiskWAL.openPath(wal_dir, allocator);
+            },
+        }
+        return out;
+    }
+
+    pub fn deinit(self: *TestLog, allocator: std.mem.Allocator) void {
+        if (self.mem) |*log| log.deinit();
+        if (self.disk) |*storage| storage.deinit();
+        if (self.wal_dir) |wal_dir| {
+            std.fs.cwd().deleteTree(wal_dir) catch {};
+            allocator.free(wal_dir);
+        }
+    }
+
+    pub fn asRaftWAL(self: *TestLog) raft.RaftWAL {
+        return switch (test_wal_backend) {
+            .mem => self.mem.?.asRaftWAL(),
+            .disk => self.disk.?.asRaftWAL(),
+        };
+    }
+
+    fn makeWalDir(allocator: std.mem.Allocator, id: NodeId) ![]u8 {
+        var buf: [192]u8 = undefined;
+        const ts = std.time.nanoTimestamp();
+        const path = try std.fmt.bufPrint(&buf, "/tmp/egres-test-cluster-{d}-{d}", .{ ts, id });
+        try std.fs.cwd().makePath(path);
+        return allocator.dupe(u8, path);
+    }
+};
+
 pub const TestCluster = struct {
     allocator: std.mem.Allocator,
     nodes: std.AutoHashMap(NodeId, *MetaNode),
@@ -14,7 +64,7 @@ pub const TestCluster = struct {
 
     pub const MetaNode = struct {
         node: Node,
-        log: raft.MemRaftLog,
+        wal: TestLog,
         inbox: std.ArrayList(Inbound),
         peers: []const raft.Peer,
     };
@@ -37,7 +87,7 @@ pub const TestCluster = struct {
             var entry = try allocator.create(MetaNode);
             entry.* = .{
                 .node = undefined,
-                .log = raft.MemRaftLog.init(allocator),
+                .wal = try TestLog.init(allocator, id),
                 .inbox = std.ArrayList(Inbound).empty,
                 .peers = peers,
             };
@@ -45,7 +95,7 @@ pub const TestCluster = struct {
                 allocator,
                 id,
                 peers,
-                entry.log.asRaftLog(),
+                entry.wal.asRaftWAL(),
                 config,
                 self_role,
             );
@@ -70,7 +120,7 @@ pub const TestCluster = struct {
                 self.allocator.free(msg);
             }
             entry.node.deinit();
-            entry.log.deinit();
+            entry.wal.deinit(self.allocator);
             entry.inbox.deinit(self.allocator);
             self.allocator.free(entry.peers);
             self.allocator.destroy(entry);

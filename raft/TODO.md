@@ -17,8 +17,8 @@
 - Accept inbound connections and map to peer id via handshake.
 
 4. Add process-level durable log implementation.
-- Keep `MemRaftLog` for tests.
-- Add `FileRaftLog` implementing the same `RaftLog` vtable.
+- Keep `MemWAL` for tests.
+- Add `FileRaftLog` implementing the same `RaftWAL` vtable.
 - Append raw `LogEntryBuffer.bytes` to WAL (length-prefixed records).
 - Recover hard state + log on startup.
 
