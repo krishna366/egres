@@ -76,15 +76,19 @@ pub fn build(b: *std.Build) void {
 
     const schema_mod = makeSchemaModule(b, target, optimize);
     const regen_buffers_step = addRegenAllBuffers(b, target, optimize, schema_mod);
+    const raft_mod = makeRaftModule(b, target, optimize);
 
     addZbufCli(b, target, optimize, schema_mod);
+    addRaftDaemon(b, target, optimize, raft_mod);
     const zbuf_test_step = addZbufTests(b, target, optimize, regen_buffers_step);
-    const raft_test_steps = addRaftTests(b, target, optimize, regen_buffers_step);
+    const raft_test_steps = addRaftTests(b, target, optimize, regen_buffers_step, raft_mod);
+    const multiproc_step = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
 
     const all_test_step = b.step("test", "Run all tests");
     all_test_step.dependOn(regen_buffers_step);
     all_test_step.dependOn(zbuf_test_step);
     all_test_step.dependOn(raft_test_steps.all_step);
+    all_test_step.dependOn(multiproc_step);
 }
 
 fn makeModule(
@@ -308,14 +312,56 @@ fn makeRaftModule(
     return raft_mod;
 }
 
+fn addRaftDaemon(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    raft_mod: *std.Build.Module,
+) void {
+    const raftd_exe = b.addExecutable(.{
+        .name = "raftd",
+        .root_module = makeModule(b, target, optimize, "raftd.zig"),
+    });
+    raftd_exe.root_module.addImport("raft", raft_mod);
+    b.installArtifact(raftd_exe);
+
+    const raftd_step = b.step("raftd", "Build raft daemon binary");
+    raftd_step.dependOn(&raftd_exe.step);
+}
+
+fn addRaftMultiprocHarness(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    raft_mod: *std.Build.Module,
+    regen_buffers_step: *std.Build.Step,
+) *std.Build.Step {
+    const harness_exe = b.addExecutable(.{
+        .name = "raft-multiproc-harness",
+        .root_module = makeModule(b, target, optimize, "raft/testing/multiproc_harness.zig"),
+    });
+    harness_exe.root_module.addImport("raft", raft_mod);
+
+    const run = b.addRunArtifact(harness_exe);
+    run.step.dependOn(regen_buffers_step);
+    run.step.dependOn(b.getInstallStep());
+    run.addArg("zig-out/bin/raftd");
+
+    const step = b.step(
+        "test-raft-multiproc",
+        "Run multi-process raft integration harness",
+    );
+    step.dependOn(&run.step);
+    return step;
+}
+
 fn addRaftTests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     regen_buffers_step: *std.Build.Step,
+    raft_mod: *std.Build.Module,
 ) RaftTestSteps {
-    const raft_mod = makeRaftModule(b, target, optimize);
-
     const raft_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "raft/testing/tests.zig"),
     });
