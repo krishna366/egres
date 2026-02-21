@@ -1,16 +1,8 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const build_options = @import("build_options");
 const raft = @import("raft");
 const zen = raft.buffers;
-
-fn testPrint(comptime fmt: []const u8, args: anytype) void {
-    if (!builtin.is_test) return;
-    _ = fmt;
-    _ = args;
-    // std.debug.print(fmt, args);
-    return;
-}
+const u = raft.utils;
 
 fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
@@ -76,7 +68,7 @@ fn appendRange(
             appended += 1;
         }
         if (appended % 100 == 0 or idx > end) {
-            testPrint(
+            u.testPrint(
                 "[diskwal_test] appendRange progress start={d} end={d} next_idx={d} appended={d}\n",
                 .{ start, end, idx, appended },
             );

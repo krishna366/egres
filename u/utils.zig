@@ -1,4 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+pub const compression = @import("compress.zig");
+
+// testPrint helps emit debugging output from tests without affecting non-test builds.
+pub fn testPrint(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) return;
+    // std.debug.print(fmt, args);
+    _ = fmt;
+    _ = args;
+}
 
 // Queue blocks producers when full and consumers when empty.
 // Queue is thread safe.

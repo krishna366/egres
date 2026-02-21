@@ -118,6 +118,21 @@ pub fn appendU32Slice(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values
     return off;
 }
 
+pub fn appendU64Slice(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values: []const u64) !u32 {
+    const aligned = alignForward(list.items.len, payload_alignment);
+    if (aligned > list.items.len) {
+        try appendZeros(list, alloc, aligned - list.items.len);
+    }
+    const off = @as(u32, @intCast(list.items.len));
+    try list.ensureUnusedCapacity(alloc, values.len * 8);
+    for (values) |v| {
+        const start = list.items.len;
+        list.items.len += 8;
+        writeIntLittle(u64, list.items, start, v);
+    }
+    return off;
+}
+
 pub fn sliceAt(buf: []const u8, off: u32, len: u32) ![]const u8 {
     const start: usize = off;
     const end: usize = start + len;

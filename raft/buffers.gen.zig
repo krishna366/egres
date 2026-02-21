@@ -1300,6 +1300,16 @@ pub const AppendEntriesReader = struct {
 
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        const slot_end_arr_44 = @as(u32, self.base) + 52;
+        if (slot_end_arr_44 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 44));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 48));
+            if (elem_count > 0) {
+                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
+                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
+            }
+        }
         const count_entries: u32 = self.entriesLen();
         var i_entries: u32 = 0;
         while (i_entries < count_entries) : (i_entries += 1) {
@@ -1417,17 +1427,17 @@ pub const AppendEntriesWriter = struct {
         try zbuf.patchU64(out.items, self.base + 36, v);
     }
 
-    pub fn setEntries(self: *Self, child_offsets: []const u32) Error!void {
+    pub fn setEntries(self: *Self, values: []const u32) Error!void {
         const out = self.bufMut();
-        if (child_offsets.len == 0) {
+        if (values.len == 0) {
             try zbuf.patchU32(out.items, self.base + 44, 0);
             try zbuf.patchU32(out.items, self.base + 48, 0);
             return;
         }
-        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, child_offsets);
+        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
         const index_off = abs_index_off;
         try zbuf.patchU32(out.items, self.base + 44, index_off);
-        try zbuf.patchU32(out.items, self.base + 48, @as(u32, @intCast(child_offsets.len)));
+        try zbuf.patchU32(out.items, self.base + 48, @as(u32, @intCast(values.len)));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {

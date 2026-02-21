@@ -14,6 +14,8 @@ pub const Row = schema.Table(.{
     .{ .id = 4, .name = "row_cell", .ty = Cell },
     .{ .id = 5, .name = "status", .ty = schema.B64 },
     .{ .id = 6, .name = "lifecycle", .ty = schema.B64 },
+    .{ .id = 7, .name = "u32_values", .ty = schema.Array(schema.U32) },
+    .{ .id = 8, .name = "u64_values", .ty = schema.Array(schema.U64) },
     .{ .name = "is_active", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
     .{ .name = "is_draining", .ty = schema.Bool(.{ .field_id = 5, .bit = 33 }) },
     .{ .name = "is_bootstrapping", .ty = schema.Bool(.{ .field_id = 6, .bit = 1 }) },
@@ -27,8 +29,18 @@ pub const Table = schema.Table(.{
     .{ .id = 4, .name = "table_row", .ty = Row },
 });
 
+pub const U32ArrayOnly = schema.Table(.{
+    .{ .id = 1, .name = "values", .ty = schema.Array(schema.U32) },
+});
+
+pub const U64ArrayOnly = schema.Table(.{
+    .{ .id = 1, .name = "values", .ty = schema.Array(schema.U64) },
+});
+
 pub const tables = .{
     .{ .name = "Cell", .ty = Cell, .id = 1 },
     .{ .name = "Row", .ty = Row, .id = 2 },
     .{ .name = "Table", .ty = Table, .id = 3 },
+    .{ .name = "U32ArrayOnly", .ty = U32ArrayOnly, .id = 4 },
+    .{ .name = "U64ArrayOnly", .ty = U64ArrayOnly, .id = 5 },
 };

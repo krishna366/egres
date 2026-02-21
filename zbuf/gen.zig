@@ -92,6 +92,31 @@ fn boolBitWidthForKind(comptime k: schema.Kind) u16 {
     };
 }
 
+fn arrayElemSizeForKind(comptime k: schema.Kind) u16 {
+    return switch (k) {
+        .u32 => 4,
+        .u64, .b64 => 8,
+        .table => 4, // table arrays store u32 offsets
+        else => @compileError("unsupported array child kind"),
+    };
+}
+
+fn scalarTypeNameForKind(comptime k: schema.Kind) []const u8 {
+    return switch (k) {
+        .u32 => "u32",
+        .u64, .b64 => "u64",
+        else => @compileError("not a scalar array child kind"),
+    };
+}
+
+fn scalarReadFnForKind(comptime k: schema.Kind) []const u8 {
+    return switch (k) {
+        .u32 => "readU32",
+        .u64, .b64 => "readU64",
+        else => @compileError("not a scalar array child kind"),
+    };
+}
+
 fn findFieldInfoById(comptime infos: anytype, comptime field_id: u32) ?FieldInfo {
     inline for (infos) |info| {
         if (info.id == field_id) return info;
@@ -205,28 +230,42 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try w.writeAll("    }\n\n");
             },
             .array => {
-                // Arrays are stored as (index_off,count); index_off points to u32 offsets.
-                const child = schema.childOfArray(info.ty);
+                // Arrays are stored as (index_off,count). For table arrays, index_off points
+                // to u32 offsets. For scalar arrays, index_off points to packed scalar elements.
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                const elem_size = arrayElemSizeForKind(child_kind);
                 const name_camel_arr = try schema.camelName(alloc, info.name);
                 defer alloc.free(name_camel_arr);
                 try w.print("    pub fn {s}Len(self: Self) u32 {{\n", .{name_camel_arr});
-                try emitArrayLenGetter(w, info.offset);
+                try emitArrayLenGetter(w, info.offset, elem_size);
                 try w.writeAll("    }\n\n");
-
-                const child_name = tableNameForType(child);
-                try w.print("    pub fn {s}At(self: Self, i: u32) Error!{s}Reader {{\n", .{ name_camel_arr, child_name });
-                try emitArrayAtGetter(w, info.offset, child_name);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}AtClone(self: Self, alloc: std.mem.Allocator, i: u32) Error!{s}Buffer {{\n", .{ name_camel_arr, child_name });
-                try w.print("        const child = try self.{s}At(i);\n", .{name_camel_arr});
-                try w.writeAll("        var out = std.ArrayList(u8).empty;\n");
-                try w.writeAll("        errdefer out.deinit(alloc);\n");
-                try w.print("        const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(self.buf), child.base, .borrowed);\n", .{child_name});
-                try w.writeAll("        const child_off = try child_buf.cloneInto(alloc, &out);\n");
-                try w.print("        try addTail(alloc, &out, {s}Reader, child_off);\n", .{child_name});
-                try w.writeAll("        const bytes = try out.toOwnedSlice(alloc);\n");
-                try w.print("        return {s}Buffer.initWithTail(alloc, bytes, .owned);\n", .{child_name});
-                try w.writeAll("    }\n\n");
+                switch (child_kind) {
+                    .table => {
+                        const child_name = tableNameForType(child);
+                        try w.print("    pub fn {s}At(self: Self, i: u32) Error!{s}Reader {{\n", .{ name_camel_arr, child_name });
+                        try emitArrayAtGetterTable(w, info.offset, child_name);
+                        try w.writeAll("    }\n\n");
+                        try w.print("    pub fn {s}AtClone(self: Self, alloc: std.mem.Allocator, i: u32) Error!{s}Buffer {{\n", .{ name_camel_arr, child_name });
+                        try w.print("        const child = try self.{s}At(i);\n", .{name_camel_arr});
+                        try w.writeAll("        var out = std.ArrayList(u8).empty;\n");
+                        try w.writeAll("        errdefer out.deinit(alloc);\n");
+                        try w.print("        const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(self.buf), child.base, .borrowed);\n", .{child_name});
+                        try w.writeAll("        const child_off = try child_buf.cloneInto(alloc, &out);\n");
+                        try w.print("        try addTail(alloc, &out, {s}Reader, child_off);\n", .{child_name});
+                        try w.writeAll("        const bytes = try out.toOwnedSlice(alloc);\n");
+                        try w.print("        return {s}Buffer.initWithTail(alloc, bytes, .owned);\n", .{child_name});
+                        try w.writeAll("    }\n\n");
+                    },
+                    .u32, .u64, .b64 => {
+                        const scalar_ty = scalarTypeNameForKind(child_kind);
+                        const scalar_read_fn = scalarReadFnForKind(child_kind);
+                        try w.print("    pub fn {s}At(self: Self, i: u32) Error!{s} {{\n", .{ name_camel_arr, scalar_ty });
+                        try emitArrayAtGetterScalar(w, info.offset, elem_size, scalar_read_fn);
+                        try w.writeAll("    }\n\n");
+                    },
+                    else => @compileError("unsupported array child kind"),
+                }
             },
             .table => {
                 const child_name = tableNameForType(info.ty);
@@ -250,7 +289,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         var needed = false;
         for (infos) |info| {
             switch (schema.kindOf(info.ty)) {
-                .bytes, .table => {
+                .bytes, .array, .table => {
                     needed = true;
                     break;
                 },
@@ -270,14 +309,20 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try emitBytesVerify(w, info.offset);
             },
             .array => {
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                const elem_size = arrayElemSizeForKind(child_kind);
                 const name_camel_arr = try schema.camelName(alloc, info.name);
                 defer alloc.free(name_camel_arr);
-                try w.print("        const count_{s}: u32 = self.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
-                try w.print("        var i_{s}: u32 = 0;\n", .{name_camel_arr});
-                try w.print("        while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
-                try w.print("            const child_view = try self.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
-                try w.writeAll("            try child_view.verify();\n");
-                try w.writeAll("        }\n");
+                try emitArrayVerifyRange(w, info.offset, elem_size);
+                if (child_kind == .table) {
+                    try w.print("        const count_{s}: u32 = self.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
+                    try w.print("        var i_{s}: u32 = 0;\n", .{name_camel_arr});
+                    try w.print("        while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
+                    try w.print("            const child_view = try self.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
+                    try w.writeAll("            try child_view.verify();\n");
+                    try w.writeAll("        }\n");
+                }
             },
             .table => {
                 const name = try schema.camelName(alloc, info.name);
@@ -338,22 +383,41 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try w.writeAll("        }\n");
             },
             .array => {
-                const child = schema.childOfArray(info.ty);
-                const child_name = tableNameForType(child);
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
                 const name_camel_arr = try schema.camelName(alloc, info.name);
                 defer alloc.free(name_camel_arr);
-                try w.print("        const count_{s}: u32 = reader.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
-                try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
-                try w.print("            var child_offsets_{s} = try alloc.alloc(u32, @intCast(count_{s}));\n", .{ name_camel_arr, name_camel_arr });
-                try w.print("            defer alloc.free(child_offsets_{s});\n", .{name_camel_arr});
-                try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
-                try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
-                try w.print("                const child = try reader.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
-                try w.print("                const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(reader.buf), child.base, .borrowed);\n", .{child_name});
-                try w.print("                child_offsets_{s}[@intCast(i_{s})] = try child_buf.cloneInto(alloc, out);\n", .{ name_camel_arr, name_camel_arr });
-                try w.writeAll("            }\n");
-                try w.print("            try writer.set{s}(child_offsets_{s});\n", .{ name_camel, name_camel_arr });
-                try w.writeAll("        }\n");
+                switch (child_kind) {
+                    .table => {
+                        const child_name = tableNameForType(child);
+                        try w.print("        const count_{s}: u32 = reader.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
+                        try w.print("            var child_offsets_{s} = try alloc.alloc(u32, @intCast(count_{s}));\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("            defer alloc.free(child_offsets_{s});\n", .{name_camel_arr});
+                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
+                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
+                        try w.print("                const child = try reader.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("                const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(reader.buf), child.base, .borrowed);\n", .{child_name});
+                        try w.print("                child_offsets_{s}[@intCast(i_{s})] = try child_buf.cloneInto(alloc, out);\n", .{ name_camel_arr, name_camel_arr });
+                        try w.writeAll("            }\n");
+                        try w.print("            try writer.set{s}(child_offsets_{s});\n", .{ name_camel, name_camel_arr });
+                        try w.writeAll("        }\n");
+                    },
+                    .u32, .u64, .b64 => {
+                        const scalar_ty = scalarTypeNameForKind(child_kind);
+                        try w.print("        const count_{s}: u32 = reader.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
+                        try w.print("            var values_{s} = try alloc.alloc({s}, @intCast(count_{s}));\n", .{ name_camel_arr, scalar_ty, name_camel_arr });
+                        try w.print("            defer alloc.free(values_{s});\n", .{name_camel_arr});
+                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
+                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
+                        try w.print("                values_{s}[@intCast(i_{s})] = try reader.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr, name_camel_arr, name_camel_arr });
+                        try w.writeAll("            }\n");
+                        try w.print("            try writer.set{s}(values_{s});\n", .{ name_camel, name_camel_arr });
+                        try w.writeAll("        }\n");
+                    },
+                    else => @compileError("unsupported array child kind"),
+                }
             },
         }
     }
@@ -468,19 +532,41 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                 try w.writeAll("    }\n\n");
             },
             .array => {
-                // Append index table and patch (index_off,count) in the header (offsets are payload-relative).
-                try w.print("    pub fn set{s}(self: *Self, child_offsets: []const u32) Error!void {{\n", .{name_camel});
-                try w.writeAll("        const out = self.bufMut();\n");
-                try w.writeAll("        if (child_offsets.len == 0) {\n");
-                try w.print("            try zbuf.patchU32(out.items, self.base + {d}, 0);\n", .{info.offset});
-                try w.print("            try zbuf.patchU32(out.items, self.base + {d}, 0);\n", .{info.offset + 4});
-                try w.writeAll("            return;\n");
-                try w.writeAll("        }\n");
-                try w.writeAll("        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, child_offsets);\n");
-                try w.writeAll("        const index_off = abs_index_off;\n");
-                try w.print("        try zbuf.patchU32(out.items, self.base + {d}, index_off);\n", .{info.offset});
-                try w.print("        try zbuf.patchU32(out.items, self.base + {d}, @as(u32, @intCast(child_offsets.len)));\n", .{info.offset + 4});
-                try w.writeAll("    }\n\n");
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                switch (child_kind) {
+                    .table, .u32 => {
+                        // Append u32 data and patch (index_off,count) in the header.
+                        try w.print("    pub fn set{s}(self: *Self, values: []const u32) Error!void {{\n", .{name_camel});
+                        try w.writeAll("        const out = self.bufMut();\n");
+                        try w.writeAll("        if (values.len == 0) {\n");
+                        try w.print("            try zbuf.patchU32(out.items, self.base + {d}, 0);\n", .{info.offset});
+                        try w.print("            try zbuf.patchU32(out.items, self.base + {d}, 0);\n", .{info.offset + 4});
+                        try w.writeAll("            return;\n");
+                        try w.writeAll("        }\n");
+                        try w.writeAll("        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);\n");
+                        try w.writeAll("        const index_off = abs_index_off;\n");
+                        try w.print("        try zbuf.patchU32(out.items, self.base + {d}, index_off);\n", .{info.offset});
+                        try w.print("        try zbuf.patchU32(out.items, self.base + {d}, @as(u32, @intCast(values.len)));\n", .{info.offset + 4});
+                        try w.writeAll("    }\n\n");
+                    },
+                    .u64, .b64 => {
+                        // Append u64 data and patch (index_off,count) in the header.
+                        try w.print("    pub fn set{s}(self: *Self, values: []const u64) Error!void {{\n", .{name_camel});
+                        try w.writeAll("        const out = self.bufMut();\n");
+                        try w.writeAll("        if (values.len == 0) {\n");
+                        try w.print("            try zbuf.patchU32(out.items, self.base + {d}, 0);\n", .{info.offset});
+                        try w.print("            try zbuf.patchU32(out.items, self.base + {d}, 0);\n", .{info.offset + 4});
+                        try w.writeAll("            return;\n");
+                        try w.writeAll("        }\n");
+                        try w.writeAll("        const abs_index_off = try zbuf.appendU64Slice(out, self.alloc, values);\n");
+                        try w.writeAll("        const index_off = abs_index_off;\n");
+                        try w.print("        try zbuf.patchU32(out.items, self.base + {d}, index_off);\n", .{info.offset});
+                        try w.print("        try zbuf.patchU32(out.items, self.base + {d}, @as(u32, @intCast(values.len)));\n", .{info.offset + 4});
+                        try w.writeAll("    }\n\n");
+                    },
+                    else => @compileError("unsupported array child kind"),
+                }
             },
             .table => {
                 // Patch inline table offset slot.
@@ -646,19 +732,19 @@ fn emitBoolSetter(w: anytype, bits_offset: u16, bit_index: u16) !void {
     try w.writeAll("        try zbuf.patchU64(out.items, word_off, word);\n");
 }
 
-fn emitArrayLenGetter(w: anytype, offset: u16) !void {
+fn emitArrayLenGetter(w: anytype, offset: u16, elem_size: u16) !void {
     try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
     try w.writeAll("        if (slot_end > header_end) return 0;\n");
     try w.print("        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
     try w.print("        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset + 4});
     try w.writeAll("        if (elem_count == 0) return 0;\n");
-    try w.writeAll("        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;\n");
+    try w.print("        const end = @as(usize, index_off) + @as(usize, elem_count) * {d};\n", .{elem_size});
     try w.writeAll("        if (end > self.buf.len) return 0;\n");
     try w.writeAll("        return elem_count;\n");
 }
 
-fn emitArrayAtGetter(w: anytype, offset: u16, child_name: []const u8) !void {
+fn emitArrayAtGetterTable(w: anytype, offset: u16, child_name: []const u8) !void {
     try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
     try w.writeAll("        if (slot_end > header_end) return zbuf.Error.OutOfBounds;\n");
@@ -671,6 +757,37 @@ fn emitArrayAtGetter(w: anytype, offset: u16, child_name: []const u8) !void {
     try w.writeAll("        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;\n");
     try w.writeAll("        const child_off = try zbuf.readU32(self.buf, entry_off);\n");
     try w.print("        return {s}Reader.init(self.buf, child_off);\n", .{child_name});
+}
+
+fn emitArrayAtGetterScalar(
+    w: anytype,
+    offset: u16,
+    elem_size: u16,
+    read_fn: []const u8,
+) !void {
+    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
+    try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
+    try w.writeAll("        if (slot_end > header_end) return zbuf.Error.OutOfBounds;\n");
+    try w.print("        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset});
+    try w.print("        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset + 4});
+    try w.writeAll("        if (i >= elem_count) return zbuf.Error.OutOfBounds;\n");
+    try w.writeAll("        if (elem_count == 0) return zbuf.Error.OutOfBounds;\n");
+    try w.print("        const index_end = @as(usize, index_off) + @as(usize, elem_count) * {d};\n", .{elem_size});
+    try w.writeAll("        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;\n");
+    try w.print("        const entry_off = @as(usize, index_off) + @as(usize, i) * {d};\n", .{elem_size});
+    try w.print("        return try zbuf.{s}(self.buf, entry_off);\n", .{read_fn});
+}
+
+fn emitArrayVerifyRange(w: anytype, offset: u16, elem_size: u16) !void {
+    try w.print("        const slot_end_arr_{d} = @as(u32, self.base) + {d};\n", .{ offset, offset + 8 });
+    try w.print("        if (slot_end_arr_{d} <= header_end) {{\n", .{offset});
+    try w.print("            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset});
+    try w.print("            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset + 4});
+    try w.writeAll("            if (elem_count > 0) {\n");
+    try w.print("                const index_end = @as(usize, index_off) + @as(usize, elem_count) * {d};\n", .{elem_size});
+    try w.writeAll("                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;\n");
+    try w.writeAll("            }\n");
+    try w.writeAll("        }\n");
 }
 
 fn emitTableGetter(w: anytype, offset: u16, child_name: []const u8) !void {

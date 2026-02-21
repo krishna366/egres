@@ -1,5 +1,6 @@
 const std = @import("std");
 const gen = @import("buffers_gen");
+const zbuf = @import("zbuf").zbuf;
 
 fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     var buf: std.ArrayList(u8) = .{};
@@ -35,6 +36,10 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     const leaves = [_]u32{ l1_off, l2_res.offset };
     try n1.setCells(&leaves);
     try n1.setRowCell(l1_off);
+    const n1_u32_values = [_]u32{ 11, 22, 33 };
+    const n1_u64_values = [_]u64{ 100, 200 };
+    try n1.setU32Values(&n1_u32_values);
+    try n1.setU64Values(&n1_u64_values);
     try n1.statusSetBit(33);
     const n1_res = try n1.finish();
     const n1_off = n1_res.offset;
@@ -44,6 +49,10 @@ fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
     try n2.setValue(2000);
     const no_leaves = [_]u32{};
     try n2.setCells(&no_leaves);
+    const n2_no_u32_values = [_]u32{};
+    const n2_u64_values = [_]u64{ 9000 };
+    try n2.setU32Values(&n2_no_u32_values);
+    try n2.setU64Values(&n2_u64_values);
     try n2.setRowCell(gen.NullOffset);
     try n2.statusSet(0x8);
     try n2.statusClearBit(3);
@@ -109,6 +118,13 @@ test "zbuf format roundtrip" {
     try std.testing.expect(n0.isBootstrapping());
     try std.testing.expect(n0.lifecycleHasBit(1));
     try std.testing.expect(!n0.lifecycleHasBit(41));
+    try std.testing.expectEqual(@as(u32, 3), n0.u32ValuesLen());
+    try std.testing.expectEqual(@as(u32, 2), n0.u64ValuesLen());
+    try std.testing.expectEqual(@as(u32, 11), try n0.u32ValuesAt(0));
+    try std.testing.expectEqual(@as(u32, 22), try n0.u32ValuesAt(1));
+    try std.testing.expectEqual(@as(u32, 33), try n0.u32ValuesAt(2));
+    try std.testing.expectEqual(@as(u64, 100), try n0.u64ValuesAt(0));
+    try std.testing.expectEqual(@as(u64, 200), try n0.u64ValuesAt(1));
 
     const n1 = try root.rowsAt(1);
     try std.testing.expectEqualSlices(u8, "n2", n1.name());
@@ -120,6 +136,9 @@ test "zbuf format roundtrip" {
     try std.testing.expect(n1.isRetiring());
     try std.testing.expect(n1.lifecycleHasBit(41));
     try std.testing.expect(!n1.lifecycleHasBit(1));
+    try std.testing.expectEqual(@as(u32, 0), n1.u32ValuesLen());
+    try std.testing.expectEqual(@as(u32, 1), n1.u64ValuesLen());
+    try std.testing.expectEqual(@as(u64, 9000), try n1.u64ValuesAt(0));
 
     try root.verify();
 }
@@ -249,4 +268,74 @@ test "finishWithTail returns tail-wrapped owned bytes" {
 
     const table = try out.initReader();
     try std.testing.expectEqual(@as(u32, 7), table.count());
+}
+
+test "empty u32 array overhead is header-only" {
+    const empty_u32 = [_]u32{};
+    {
+        var writer = try gen.U32ArrayOnlyWriter.init(std.testing.allocator);
+        defer writer.deinit();
+        try writer.setValues(&empty_u32);
+
+        var without_tail = try writer.finish();
+        defer without_tail.deinit();
+        const bytes_without_tail = without_tail.bytes orelse return error.Invalid;
+        try std.testing.expectEqual(@as(usize, gen.U32ArrayOnlyWriter.SIZE_BYTES), bytes_without_tail.len);
+    }
+    {
+        var writer = try gen.U32ArrayOnlyWriter.init(std.testing.allocator);
+        defer writer.deinit();
+        try writer.setValues(&empty_u32);
+
+        var with_tail = try writer.finishWithTail();
+        defer with_tail.deinit();
+        const bytes_with_tail = with_tail.bytes orelse return error.Invalid;
+        const expected_with_tail =
+            @as(usize, gen.U32ArrayOnlyWriter.SIZE_BYTES) +
+            @as(usize, @import("zbuf").zbuf.message_tail_size);
+        try std.testing.expectEqual(expected_with_tail, bytes_with_tail.len);
+    }
+}
+
+test "u32 array roundtrip and bounds" {
+    var writer = try gen.U32ArrayOnlyWriter.init(std.testing.allocator);
+    defer writer.deinit();
+
+    const values = [_]u32{ 7, 42, 99, 12345 };
+    try writer.setValues(&values);
+
+    var out = try writer.finishWithTail();
+    defer out.deinit();
+    const reader = try out.initReader();
+
+    try std.testing.expectEqual(@as(u32, values.len), reader.valuesLen());
+    try std.testing.expectEqual(@as(u32, 7), try reader.valuesAt(0));
+    try std.testing.expectEqual(@as(u32, 42), try reader.valuesAt(1));
+    try std.testing.expectEqual(@as(u32, 99), try reader.valuesAt(2));
+    try std.testing.expectEqual(@as(u32, 12345), try reader.valuesAt(3));
+    try std.testing.expectError(zbuf.Error.OutOfBounds, reader.valuesAt(4));
+}
+
+test "u64 array roundtrip and bounds" {
+    var writer = try gen.U64ArrayOnlyWriter.init(std.testing.allocator);
+    defer writer.deinit();
+
+    const values = [_]u64{
+        0,
+        1,
+        0x1122_3344_5566_7788,
+        std.math.maxInt(u64),
+    };
+    try writer.setValues(&values);
+
+    var out = try writer.finishWithTail();
+    defer out.deinit();
+    const reader = try out.initReader();
+
+    try std.testing.expectEqual(@as(u32, values.len), reader.valuesLen());
+    try std.testing.expectEqual(@as(u64, 0), try reader.valuesAt(0));
+    try std.testing.expectEqual(@as(u64, 1), try reader.valuesAt(1));
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), try reader.valuesAt(2));
+    try std.testing.expectEqual(std.math.maxInt(u64), try reader.valuesAt(3));
+    try std.testing.expectError(zbuf.Error.OutOfBounds, reader.valuesAt(4));
 }

@@ -335,6 +335,15 @@ pub const TableIndexReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
+        const slot_end_arr_4 = @as(u32, self.base) + 12;
+        if (slot_end_arr_4 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 4));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 8));
+            if (elem_count > 0) {
+                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
+                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
+            }
+        }
         const count_offsets: u32 = self.offsetsLen();
         var i_offsets: u32 = 0;
         while (i_offsets < count_offsets) : (i_offsets += 1) {
@@ -436,17 +445,17 @@ pub const TableIndexWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setOffsets(self: *Self, child_offsets: []const u32) Error!void {
+    pub fn setOffsets(self: *Self, values: []const u32) Error!void {
         const out = self.bufMut();
-        if (child_offsets.len == 0) {
+        if (values.len == 0) {
             try zbuf.patchU32(out.items, self.base + 4, 0);
             try zbuf.patchU32(out.items, self.base + 8, 0);
             return;
         }
-        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, child_offsets);
+        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
         const index_off = abs_index_off;
         try zbuf.patchU32(out.items, self.base + 4, index_off);
-        try zbuf.patchU32(out.items, self.base + 8, @as(u32, @intCast(child_offsets.len)));
+        try zbuf.patchU32(out.items, self.base + 8, @as(u32, @intCast(values.len)));
     }
 
     pub fn setBloomFilter(self: *Self, data: []const u8) Error!void {

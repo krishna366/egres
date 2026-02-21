@@ -27,3 +27,4 @@ pub const PeerAddr = transport.PeerAddr;
 pub const requestJoin = transport.requestJoin;
 pub const runtime = @import("runtime.zig");
 pub const RaftRuntime = runtime.RaftRuntime;
+pub const utils = @import("utils");

@@ -80,12 +80,16 @@ pub fn build(b: *std.Build) void {
 
     addZbufCli(b, target, optimize, schema_mod);
     addRaftDaemon(b, target, optimize, raft_mod);
+    const zdb_test_step = addZdbTests(b, target, optimize);
+    const utils_test_step = addUCompressTests(b, target, optimize);
     const zbuf_test_step = addZbufTests(b, target, optimize, regen_buffers_step);
     const raft_test_steps = addRaftTests(b, target, optimize, regen_buffers_step, raft_mod);
     const multiproc_step = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
 
     const all_test_step = b.step("test", "Run all tests");
     all_test_step.dependOn(regen_buffers_step);
+    all_test_step.dependOn(zdb_test_step);
+    all_test_step.dependOn(utils_test_step);
     all_test_step.dependOn(zbuf_test_step);
     all_test_step.dependOn(raft_test_steps.all_step);
     all_test_step.dependOn(multiproc_step);
@@ -207,6 +211,7 @@ fn addServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .name = "server",
         .root_module = makeModule(b, target, optimize, "server.zig"),
     });
+    addVendoredCompressionSources(b, exe);
 
     b.installArtifact(exe);
 
@@ -267,12 +272,69 @@ fn addZbufTests(
     const zbuf_negative_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zbuf/negative_test.zig"),
     });
+    addVendoredCompressionSources(b, zbuf_tests);
+    addVendoredCompressionSources(b, zbuf_negative_tests);
 
     const zbuf_test_step = b.step("test-zbuf", "Run zbuf serialization tests");
     zbuf_test_step.dependOn(regen_buffers_step);
     zbuf_test_step.dependOn(&b.addRunArtifact(zbuf_tests).step);
     zbuf_test_step.dependOn(&b.addRunArtifact(zbuf_negative_tests).step);
     return zbuf_test_step;
+}
+
+fn addZdbTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step {
+    const zbuf_mod = makeModule(b, target, optimize, "zbuf.zig");
+    const utils_mod = makeModule(b, target, optimize, "u/utils.zig");
+    utils_mod.addIncludePath(b.path("."));
+    utils_mod.addIncludePath(b.path("third_party/lz4/lib"));
+    utils_mod.addIncludePath(b.path("third_party/zstd/lib"));
+    const zdb_mod = makeModule(b, target, optimize, "zdb.zig");
+    zdb_mod.addImport("zbuf", zbuf_mod);
+    zdb_mod.addImport("utils", utils_mod);
+
+    const zdb_core_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb/core_test.zig"),
+    });
+    zdb_core_tests.root_module.addImport("zdb", zdb_mod);
+
+    const zdb_skl_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb/skl/test.zig"),
+    });
+    zdb_skl_tests.root_module.addImport("zdb", zdb_mod);
+    zdb_skl_tests.root_module.addImport("utils", utils_mod);
+
+    const zdb_table_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb/table/test.zig"),
+    });
+    addVendoredCompressionSources(b, zdb_core_tests);
+    addVendoredCompressionSources(b, zdb_skl_tests);
+    addVendoredCompressionSources(b, zdb_table_tests);
+    zdb_table_tests.root_module.addImport("zdb", zdb_mod);
+
+    const zdb_test_step = b.step("test-zdb", "Run zdb core tests");
+    zdb_test_step.dependOn(&b.addRunArtifact(zdb_core_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(zdb_skl_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(zdb_table_tests).step);
+    return zdb_test_step;
+}
+
+fn addUCompressTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step {
+    const utils_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "u/compress_test.zig"),
+    });
+    addVendoredCompressionSources(b, utils_tests);
+
+    const step = b.step("test-utils", "Run utility tests");
+    step.dependOn(&b.addRunArtifact(utils_tests).step);
+    return step;
 }
 
 fn addDiskwalTestRun(
@@ -288,6 +350,7 @@ fn addDiskwalTestRun(
         .root_module = makeModule(b, target, optimize, "raft/diskwal_test.zig"),
         .filters = filters,
     });
+    addVendoredCompressionSources(b, test_artifact);
     test_artifact.root_module.addImport("raft", raft_mod);
     test_artifact.root_module.addImport("build_options", build_options_mod);
     test_artifact.step.dependOn(regen_buffers_step);
@@ -322,6 +385,7 @@ fn addRaftDaemon(
         .name = "raftd",
         .root_module = makeModule(b, target, optimize, "raftd.zig"),
     });
+    addVendoredCompressionSources(b, raftd_exe);
     raftd_exe.root_module.addImport("raft", raft_mod);
     b.installArtifact(raftd_exe);
 
@@ -340,6 +404,7 @@ fn addRaftMultiprocHarness(
         .name = "raft-multiproc-harness",
         .root_module = makeModule(b, target, optimize, "raft/testing/multiproc_harness.zig"),
     });
+    addVendoredCompressionSources(b, harness_exe);
     harness_exe.root_module.addImport("raft", raft_mod);
 
     const run = b.addRunArtifact(harness_exe);
@@ -365,6 +430,7 @@ fn addRaftTests(
     const raft_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "raft/testing/tests.zig"),
     });
+    addVendoredCompressionSources(b, raft_tests);
     raft_tests.root_module.addImport("raft", raft_mod);
     raft_tests.step.dependOn(regen_buffers_step);
 
@@ -424,4 +490,52 @@ fn addRaftTests(
         .default_step = raft_test_step,
         .all_step = raft_test_all_step,
     };
+}
+
+fn addVendoredCompressionSources(b: *std.Build, compile: *std.Build.Step.Compile) void {
+    compile.linkLibC();
+    compile.root_module.addIncludePath(b.path("."));
+    compile.root_module.addIncludePath(b.path("third_party/lz4/lib"));
+    compile.root_module.addIncludePath(b.path("third_party/zstd/lib"));
+
+    compile.root_module.addCSourceFiles(.{
+        .root = b.path("."),
+        .files = &.{
+            "third_party/lz4/lib/lz4.c",
+            "u/compress_shim.c",
+            "third_party/zstd/lib/common/debug.c",
+            "third_party/zstd/lib/common/entropy_common.c",
+            "third_party/zstd/lib/common/error_private.c",
+            "third_party/zstd/lib/common/fse_decompress.c",
+            "third_party/zstd/lib/common/pool.c",
+            "third_party/zstd/lib/common/threading.c",
+            "third_party/zstd/lib/common/xxhash.c",
+            "third_party/zstd/lib/common/zstd_common.c",
+            "third_party/zstd/lib/compress/fse_compress.c",
+            "third_party/zstd/lib/compress/hist.c",
+            "third_party/zstd/lib/compress/huf_compress.c",
+            "third_party/zstd/lib/compress/zstd_compress.c",
+            "third_party/zstd/lib/compress/zstd_compress_literals.c",
+            "third_party/zstd/lib/compress/zstd_compress_sequences.c",
+            "third_party/zstd/lib/compress/zstd_compress_superblock.c",
+            "third_party/zstd/lib/compress/zstd_double_fast.c",
+            "third_party/zstd/lib/compress/zstd_fast.c",
+            "third_party/zstd/lib/compress/zstd_lazy.c",
+            "third_party/zstd/lib/compress/zstd_ldm.c",
+            "third_party/zstd/lib/compress/zstd_opt.c",
+            "third_party/zstd/lib/compress/zstd_preSplit.c",
+            "third_party/zstd/lib/compress/zstdmt_compress.c",
+            "third_party/zstd/lib/decompress/huf_decompress.c",
+            "third_party/zstd/lib/decompress/zstd_ddict.c",
+            "third_party/zstd/lib/decompress/zstd_decompress.c",
+            "third_party/zstd/lib/decompress/zstd_decompress_block.c",
+        },
+        .flags = &.{
+            "-I.",
+            "-Ithird_party/lz4/lib",
+            "-Ithird_party/zstd/lib",
+            "-DZSTD_MULTITHREAD=0",
+            "-DZSTD_DISABLE_ASM=1",
+        },
+    });
 }
