@@ -26,6 +26,16 @@ pub const TableIndex = schema.Table(.{
     .{ .id = 9, .name = "bloom_filter", .ty = schema.Bytes },
 });
 
+pub const ManifestChange = schema.Table(.{
+    .{ .id = 1, .name = "op", .ty = schema.U32 }, // 0=CREATE, 1=DELETE
+    .{ .id = 2, .name = "table_id", .ty = schema.U64 },
+    .{ .id = 3, .name = "level", .ty = schema.U32 }, // 0 for DELETE
+});
+
+pub const ManifestChangeSet = schema.Table(.{
+    .{ .id = 1, .name = "changes", .ty = schema.Array(ManifestChange) },
+});
+
 // zbuf tail stores table_id as u16, so use a module namespace in high bits and
 // OR local ids into low bits.
 const ZDB_TABLE_NS: u16 = 0xB600;
@@ -37,4 +47,6 @@ fn tableId(comptime local_id: u16) u16 {
 pub const tables = .{
     .{ .name = "BlockIndex", .ty = BlockIndex, .id = tableId(1) },
     .{ .name = "TableIndex", .ty = TableIndex, .id = tableId(2) },
+    .{ .name = "ManifestChange", .ty = ManifestChange, .id = tableId(3) },
+    .{ .name = "ManifestChangeSet", .ty = ManifestChangeSet, .id = tableId(4) },
 };

@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) void {
 
     addZbufCli(b, target, optimize, schema_mod);
     addRaftDaemon(b, target, optimize, raft_mod);
-    const zdb_test_step = addZdbTests(b, target, optimize);
+    const zdb_test_step = addZdbTests(b, target, optimize, regen_buffers_step);
     const utils_test_step = addUCompressTests(b, target, optimize);
     const zbuf_test_step = addZbufTests(b, target, optimize, regen_buffers_step);
     const raft_test_steps = addRaftTests(b, target, optimize, regen_buffers_step, raft_mod);
@@ -286,6 +286,7 @@ fn addZdbTests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    regen_buffers_step: *std.Build.Step,
 ) *std.Build.Step {
     const zbuf_mod = makeModule(b, target, optimize, "zbuf.zig");
     const utils_mod = makeModule(b, target, optimize, "u/utils.zig");
@@ -300,12 +301,14 @@ fn addZdbTests(
         .root_module = makeModule(b, target, optimize, "zdb/core_test.zig"),
     });
     zdb_core_tests.root_module.addImport("zdb", zdb_mod);
+    zdb_core_tests.step.dependOn(regen_buffers_step);
 
     const zdb_skl_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/skl/test.zig"),
     });
     zdb_skl_tests.root_module.addImport("zdb", zdb_mod);
     zdb_skl_tests.root_module.addImport("utils", utils_mod);
+    zdb_skl_tests.step.dependOn(regen_buffers_step);
 
     const zdb_table_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/table/test.zig"),
@@ -314,11 +317,20 @@ fn addZdbTests(
     addVendoredCompressionSources(b, zdb_skl_tests);
     addVendoredCompressionSources(b, zdb_table_tests);
     zdb_table_tests.root_module.addImport("zdb", zdb_mod);
+    zdb_table_tests.step.dependOn(regen_buffers_step);
+
+    const zdb_manifest_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb/manifest_test.zig"),
+    });
+    addVendoredCompressionSources(b, zdb_manifest_tests);
+    zdb_manifest_tests.root_module.addImport("zdb", zdb_mod);
+    zdb_manifest_tests.step.dependOn(regen_buffers_step);
 
     const zdb_test_step = b.step("test-zdb", "Run zdb core tests");
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_core_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_skl_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_table_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(zdb_manifest_tests).step);
     return zdb_test_step;
 }
 
