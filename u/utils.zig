@@ -10,6 +10,28 @@ pub fn testPrint(comptime fmt: []const u8, args: anytype) void {
     _ = args;
 }
 
+/// search finds the first index in [0, items.len) for which pred(ctx, items[i]) is true,
+/// assuming the range is partitioned as [false…false, true…true].
+/// Returns items.len when the predicate is never true (mirrors Go's sort.Search).
+pub fn search(
+    comptime T: type,
+    items: []const T,
+    ctx: anytype,
+    comptime pred: fn (@TypeOf(ctx), T) bool,
+) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (pred(ctx, items[mid])) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
 // Queue blocks producers when full and consumers when empty.
 // Queue is thread safe.
 pub fn Queue(comptime T: type, comptime capacity: usize) type {

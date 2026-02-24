@@ -49,9 +49,7 @@ pub const Error = error{
 } || key.Error || buffers.Error || compress.Error || std.mem.Allocator.Error;
 
 pub const Config = struct {
-    // 32 KiB default target block size.
     target_block_size: usize = 32 * 1024,
-    // Compression codec applied to each block.
     codec: compress.Codec = .none,
 };
 
@@ -89,6 +87,7 @@ pub const Builder = struct {
     stale_data_size: u32,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Builder {
+        // TODO: Choose sane defaults for table_bytes and cur_block.
         return .{
             .allocator = allocator,
             .cfg = cfg,
@@ -116,6 +115,26 @@ pub const Builder = struct {
         self.cur_offsets.deinit(self.allocator);
         self.cur_block.deinit(self.allocator);
         self.table_bytes.deinit(self.allocator);
+    }
+
+    /// reset clears all state so the builder can produce a new table without
+    /// reallocating its backing buffers (especially table_bytes).
+    pub fn reset(self: *Builder) void {
+        for (self.block_infos.items) |info| {
+            self.allocator.free(info.base_key);
+        }
+
+        self.block_infos.clearRetainingCapacity();
+        self.last_key.clearRetainingCapacity();
+        self.cur_base_key.clearRetainingCapacity();
+        self.cur_offsets.clearRetainingCapacity();
+        self.cur_block.clearRetainingCapacity();
+        self.table_bytes.clearRetainingCapacity();
+        self.key_count = 0;
+        self.max_version = 0;
+        self.uncompressed_size = 0;
+        self.compressed_size = 0;
+        self.stale_data_size = 0;
     }
 
     pub fn add(self: *Builder, entry_key: []const u8, value: []const u8) Error!void {

@@ -5,7 +5,6 @@ pub const Error = error{
     InvalidMemtableSize,
     InvalidNumMemtables,
     InvalidBlockSize,
-    InvalidTableSize,
     InvalidMaxLevels,
     InvalidDirForInMemory,
 };
@@ -17,11 +16,21 @@ pub const Options = struct {
 
     memtable_size: usize = 64 * 1024 * 1024,
     num_memtables: u32 = 15,
-    block_size: usize = 4 * 1024,
-    table_size: usize = 8 * 1024 * 1024,
-    compression: utils.compression.Codec = .none,
-    max_levels: u8 = 7,
-    num_compactors: u8 = 4,
+
+    block_size: usize = 8 * 1024,
+    compression: utils.compression.Codec = .lz4,
+    num_compactors: u8 = 2,
+
+    // Level sizes
+    num_level_zero_tables: u32 = 5,
+    base_level_size: i64 = 800 * 1024 * 1024,
+    level_size_multiplier: i64 = 5,
+    max_levels: u8 = 5,
+
+    // Table sizes
+    base_table_size: i64 = 32 * 1024 * 1024,
+    table_size_multiplier: i64 = 2,
+    max_table_size: i64 = 128 * 1024 * 1024,
 
     pub fn validate(self: Options) Error!void {
         // Badger semantics: exactly one compactor causes pathological level behavior.
@@ -29,7 +38,6 @@ pub const Options = struct {
         if (self.memtable_size == 0) return error.InvalidMemtableSize;
         if (self.num_memtables == 0) return error.InvalidNumMemtables;
         if (self.block_size == 0) return error.InvalidBlockSize;
-        if (self.table_size == 0) return error.InvalidTableSize;
         if (self.max_levels == 0) return error.InvalidMaxLevels;
         if (self.in_memory and self.dir.len != 0) return error.InvalidDirForInMemory;
     }

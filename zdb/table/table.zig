@@ -23,23 +23,49 @@ pub const BlockLayout = struct {
 pub const Table = struct {
     allocator: std.mem.Allocator,
     buf: []const u8,
+    /// Non-null for file-backed tables opened with open(). deinit() calls
+    /// munmap on this. Null for in-memory tables (openMem()); deinit() calls
+    /// allocator.free(buf) instead.
+    mmap_buf: ?[]align(std.heap.page_size_min) u8,
     index: buffers.TableIndexReader,
     key_count: u32,
     max_version: u64,
     codec: compress.Codec,
     ref: std.atomic.Value(i32),
-    smallest: []const u8, // owned; empty until openTable() is called
-    biggest: []const u8, // owned; empty until openTable() is called
+    path: ?[]const u8, // owned; non-null for file-backed tables; deleted on last decrRef
+    smallest: []const u8, // owned; empty until open/openMem is called
+    biggest: []const u8, // owned; empty until open/openMem is called
 
-    /// open parses the table and initialises smallest/biggest by reading the
-    /// first and last entries. Caller gets one reference (ref = 1).
-    pub fn open(allocator: std.mem.Allocator, buf: []const u8) Error!Table {
-        var t = try parse(allocator, buf);
-        errdefer t.deinit();
+    /// open mmaps the SST file at path, parses the table, and initialises
+    /// smallest/biggest. Caller gets zero reference (ref = 0).
+    /// The returned pointer is heap-allocated with allocator; call decrRef when done.
+    pub fn open(allocator: std.mem.Allocator, path: []const u8) !*Table {
+        const file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
+        defer file.close();
+
+        const size: usize = @intCast(try file.getEndPos());
+        if (size == 0) return error.CorruptTable;
+
+        const mmap_buf = try std.posix.mmap(
+            null,
+            size,
+            std.posix.PROT.READ,
+            .{ .TYPE = .SHARED },
+            file.handle,
+            0,
+        );
+        errdefer std.posix.munmap(mmap_buf);
+
+        const t = try allocator.create(Table);
+        errdefer allocator.destroy(t);
+
+        t.* = try parse(allocator, mmap_buf[0..size]);
+        t.mmap_buf = mmap_buf;
+        t.path = try allocator.dupe(u8, path);
+        errdefer allocator.free(t.path.?);
 
         if (t.blockCount() == 0) return t;
 
-        // smallest = first key of block 0 (its base key IS the first entry).
         const first_base = try t.blockBaseKey(0);
         t.smallest = try allocator.dupe(u8, first_base);
         errdefer {
@@ -47,7 +73,36 @@ pub const Table = struct {
             t.smallest = &[_]u8{};
         }
 
-        // biggest = last_key stored in the TableIndex by the builder.
+        const last = t.index.lastKey();
+        if (last.len > 0) {
+            t.biggest = try allocator.dupe(u8, last);
+        }
+        return t;
+    }
+
+    /// openMem parses a table from an in-memory buffer. The buffer is
+    /// duplicated internally; caller retains ownership of buf.
+    /// Caller gets one reference (ref = 1). Call decrRef() then
+    /// allocator.destroy() when done.
+    pub fn openMem(allocator: std.mem.Allocator, buf: []const u8) !*Table {
+        const owned = try allocator.dupe(u8, buf);
+        errdefer allocator.free(owned);
+
+        const t = try allocator.create(Table);
+        errdefer allocator.destroy(t);
+
+        t.* = try parse(allocator, owned);
+        // mmap_buf is null (set by parse); t.buf = owned.
+
+        if (t.blockCount() == 0) return t;
+
+        const first_base = try t.blockBaseKey(0);
+        t.smallest = try allocator.dupe(u8, first_base);
+        errdefer {
+            allocator.free(t.smallest);
+            t.smallest = &[_]u8{};
+        }
+
         const last = t.index.lastKey();
         if (last.len > 0) {
             t.biggest = try allocator.dupe(u8, last);
@@ -82,19 +137,36 @@ pub const Table = struct {
         return .{
             .allocator = allocator,
             .buf = buf,
+            .mmap_buf = null,
+            .path = null,
             .index = index_reader,
             .key_count = index_reader.keyCount(),
             .max_version = index_reader.maxVersion(),
             .codec = codec,
-            .ref = std.atomic.Value(i32).init(1),
+            .ref = std.atomic.Value(i32).init(1), // ref = 1
             .smallest = &[_]u8{},
             .biggest = &[_]u8{},
         };
     }
 
-    pub fn deinit(self: *Table) void {
+    // No one should be calling this from outside.
+    fn deinit(self: *Table) void {
+        if (self.path) |p| self.allocator.free(p);
         if (self.smallest.len > 0) self.allocator.free(self.smallest);
         if (self.biggest.len > 0) self.allocator.free(self.biggest);
+        if (self.mmap_buf) |mb| {
+            std.posix.munmap(mb);
+        } else {
+            self.allocator.free(self.buf);
+        }
+    }
+
+    /// detach forgets the SST file path without deleting it.
+    /// Used by LevelHandler.deinit() (database close) so that the subsequent
+    /// decrRef at zero frees memory only, leaving the file on disk intact.
+    pub fn detach(self: *Table) void {
+        if (self.path) |p| self.allocator.free(p);
+        self.path = null;
     }
 
     /// Increment the reference count. Call this when sharing a Table pointer.
@@ -102,11 +174,17 @@ pub const Table = struct {
         _ = self.ref.fetchAdd(1, .monotonic);
     }
 
-    /// Decrement the reference count. When it reaches zero the table's resources are freed.
-    /// TODO: when file-backed, unmap/close the backing file and evict cached blocks here.
+    /// Decrement the reference count. When it reaches zero the table's resources are freed
+    /// and, for file-backed tables, the SST file is deleted from disk.
     pub fn decrRef(self: *Table) void {
         const prev = self.ref.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
+        if (prev == 1) {
+            if (self.path) |p| std.fs.deleteFileAbsolute(p) catch {};
+            const allocator = self.allocator;
+            self.deinit();
+            allocator.destroy(self);
+        }
     }
 
     pub fn getIndex(self: Table) buffers.TableIndexReader {
@@ -189,19 +267,19 @@ pub const BlockIterator = struct {
         // This should be a copy of that. If not, use builder.zig as the source of truth.
         //
         // Block layout is set as:
-        // | ------------------------------------------------------------------------|
+        // | ------------------------------------------------------------------------||
         // | --- entries_region --- | --- offsets to entries, each offset is u32 --- |
         // | --  entry count u32 -- | -- block crc u32 -- |
-        // | ------------------------------------------------------------------------|
+        // | ------------------------------------------------------------------------||
         //
         // Note that we only store the start offset of each entry i, not the end, because
         // the end offset of entry i = the start offset of entry i+1.
         //
         // Each entry is stored as such:
-        // | ----------------------------------------------------------------------|
+        // | ----------------------------------------------------------------------||
         // | -- u16 key overlap with base -- | -- u16 key diff length from base -- |
         // | -- key diff bytes -- | -- value bytes ------------------------------- |
-        // | ----------------------------------------------------------------------|
+        // | ----------------------------------------------------------------------||
         const layout = try parseBlockLayout(block);
 
         return .{
@@ -306,13 +384,14 @@ pub const BlockIterator = struct {
 /// TableIterator navigates all entries across all blocks in a table.
 pub const TableIterator = struct {
     allocator: std.mem.Allocator,
-    table: *const Table,
+    table: *Table,
     scratch: std.heap.ArenaAllocator,
     bpos: usize,
     bi: ?BlockIterator,
     valid: bool,
 
-    pub fn init(allocator: std.mem.Allocator, table: *const Table) TableIterator {
+    pub fn init(allocator: std.mem.Allocator, table: *Table) TableIterator {
+        table.incrRef();
         return .{
             .allocator = allocator,
             .table = table,
@@ -324,6 +403,7 @@ pub const TableIterator = struct {
     }
 
     pub fn deinit(self: *TableIterator) void {
+        self.table.decrRef();
         if (self.bi) |*bi| bi.deinit();
         self.scratch.deinit();
     }

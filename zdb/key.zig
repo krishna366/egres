@@ -20,14 +20,14 @@ pub fn setKeyTs(key_with_ts: []u8, ts: u64) Error!void {
 }
 
 pub fn parseTs(key_with_ts: []const u8) u64 {
-    if (key_with_ts.len <= ts_len) return 0;
+    std.debug.assert(key_with_ts.len > ts_len);
     const start = key_with_ts.len - ts_len;
     const raw = std.mem.readInt(u64, key_with_ts[start..][0..ts_len], .big);
     return ~raw;
 }
 
 pub fn parseKey(key_with_ts: []const u8) []const u8 {
-    if (key_with_ts.len < ts_len) return key_with_ts;
+    std.debug.assert(key_with_ts.len > ts_len);
     return key_with_ts[0 .. key_with_ts.len - ts_len];
 }
 
@@ -42,4 +42,3 @@ pub fn compareKeys(a: []const u8, b: []const u8) std.math.Order {
     if (key_order != .eq) return key_order;
     return std.mem.order(u8, a[a.len - ts_len ..], b[b.len - ts_len ..]);
 }
-

@@ -58,14 +58,14 @@ test "table builder/reader roundtrip and seek" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    var r = try Table.open(std.testing.allocator, tb.bytes);
-    defer r.deinit();
+    const r = try Table.openMem(std.testing.allocator, tb.bytes);
+    defer r.decrRef();
 
     try std.testing.expectEqual(@as(u32, 4), r.key_count);
     try std.testing.expectEqual(@as(u64, 9), r.max_version);
     try std.testing.expect(r.blockCount() >= 1);
 
-    var it = TableIterator.init(std.testing.allocator, &r);
+    var it = TableIterator.init(std.testing.allocator, r);
     defer it.deinit();
     try it.seekToFirst();
     try std.testing.expectEqualStrings("va9", it.itemRef().?.value);
@@ -90,13 +90,13 @@ test "table checksum mismatch is detected" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    var r = try Table.open(std.testing.allocator, tb.bytes);
-    defer r.deinit();
+    const r = try Table.openMem(std.testing.allocator, tb.bytes);
+    defer r.decrRef();
 
     const first_meta = try r.index.blocksAt(0);
     const block_start: usize = first_meta.offset();
     const block_end = block_start + first_meta.len();
-    tb.bytes[block_end - 5] ^= 0x01;
+    @constCast(r.buf)[block_end - 5] ^= 0x01;
 
     var block_buf = std.ArrayList(u8).empty;
     defer block_buf.deinit(std.testing.allocator);
@@ -126,28 +126,28 @@ test "merge iterator merges sorted streams" {
     var t2 = try b2.finish();
     defer t2.deinit();
 
-    var r1 = try Table.open(std.testing.allocator, t1.bytes);
-    defer r1.deinit();
-    var r2 = try Table.open(std.testing.allocator, t2.bytes);
-    defer r2.deinit();
+    const r1 = try Table.openMem(std.testing.allocator, t1.bytes);
+    defer r1.decrRef();
+    const r2 = try Table.openMem(std.testing.allocator, t2.bytes);
+    defer r2.decrRef();
 
-    var iters = [_]TableIterator{
-        TableIterator.init(std.testing.allocator, &r1),
-        TableIterator.init(std.testing.allocator, &r2),
+    var iters = [_]zdb.table.merge_iterator.Iterator{
+        .{ .table = TableIterator.init(std.testing.allocator, r1) },
+        .{ .table = TableIterator.init(std.testing.allocator, r2) },
     };
-    var m = zdb.table.merge_iterator.MergeIterator.init(iters[0..]);
+    var m = zdb.table.merge_iterator.MergeIterator.init(std.testing.allocator, iters[0..]);
     defer m.deinit();
 
     try m.seekToFirst();
-    try std.testing.expectEqualStrings("a5", m.item().?.value);
+    try std.testing.expectEqualStrings("a5", m.itemRef().?.value);
     try m.next();
-    try std.testing.expectEqualStrings("b4", m.item().?.value);
+    try std.testing.expectEqualStrings("b4", m.itemRef().?.value);
     try m.next();
-    try std.testing.expectEqualStrings("c1", m.item().?.value);
+    try std.testing.expectEqualStrings("c1", m.itemRef().?.value);
     try m.next();
-    try std.testing.expectEqualStrings("d1", m.item().?.value);
+    try std.testing.expectEqualStrings("d1", m.itemRef().?.value);
     try m.next();
-    try std.testing.expect(m.item() == null);
+    try std.testing.expect(m.itemRef() == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -159,10 +159,10 @@ test "table iterator: forward scan" {
     for ([_]usize{ 99, 100, 101 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        var tbl = try Table.open(alloc, tb.bytes);
-        defer tbl.deinit();
+        const tbl = try Table.openMem(alloc, tb.bytes);
+        defer tbl.decrRef();
 
-        var it = TableIterator.init(alloc, &tbl);
+        var it = TableIterator.init(alloc, tbl);
         defer it.deinit();
 
         var count: usize = 0;
@@ -191,10 +191,10 @@ test "seek to first" {
     for ([_]usize{ 99, 100, 101, 199, 200, 250, 9999, 10000 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        var tbl = try Table.open(alloc, tb.bytes);
-        defer tbl.deinit();
+        const tbl = try Table.openMem(alloc, tb.bytes);
+        defer tbl.decrRef();
 
-        var it = TableIterator.init(alloc, &tbl);
+        var it = TableIterator.init(alloc, tbl);
         defer it.deinit();
 
         try it.seekToFirst();
@@ -212,10 +212,10 @@ test "seek: various targets" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "k", 10000, 4096);
     defer tb.deinit();
-    var tbl = try Table.open(alloc, tb.bytes);
-    defer tbl.deinit();
+    const tbl = try Table.openMem(alloc, tb.bytes);
+    defer tbl.decrRef();
 
-    var it = TableIterator.init(alloc, &tbl);
+    var it = TableIterator.init(alloc, tbl);
     defer it.deinit();
 
     const Case = struct { in: []const u8, valid: bool, out: []const u8 };
@@ -251,10 +251,10 @@ test "iterate from start: full scan" {
     for ([_]usize{ 99, 100, 101, 199, 200, 250, 9999, 10000 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        var tbl = try Table.open(alloc, tb.bytes);
-        defer tbl.deinit();
+        const tbl = try Table.openMem(alloc, tb.bytes);
+        defer tbl.decrRef();
 
-        var it = TableIterator.init(alloc, &tbl);
+        var it = TableIterator.init(alloc, tbl);
         defer it.deinit();
 
         var count: usize = 0;
@@ -274,10 +274,10 @@ test "table: seek and iterate to end" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "key", 10000, 4096);
     defer tb.deinit();
-    var tbl = try Table.open(alloc, tb.bytes);
-    defer tbl.deinit();
+    const tbl = try Table.openMem(alloc, tb.bytes);
+    defer tbl.decrRef();
 
-    var it = TableIterator.init(alloc, &tbl);
+    var it = TableIterator.init(alloc, tbl);
     defer it.deinit();
 
     // Seek to key1010, iterate to end — should visit keys 1010..9999.
@@ -328,22 +328,22 @@ test "table: max_version" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    var tbl = try Table.open(alloc, tb.bytes);
-    defer tbl.deinit();
+    const tbl = try Table.openMem(alloc, tb.bytes);
+    defer tbl.decrRef();
 
     try std.testing.expectEqual(@as(u64, n), tbl.max_version);
 }
 
 // ---------------------------------------------------------------------------
-// Smallest/biggest: Table.open() fills these from the index
+// Smallest/biggest: Table.openMem() fills these from the index
 // ---------------------------------------------------------------------------
 
 test "table: smallest and biggest keys" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "key", 200, 256);
     defer tb.deinit();
-    var tbl = try Table.open(alloc, tb.bytes);
-    defer tbl.deinit();
+    const tbl = try Table.openMem(alloc, tb.bytes);
+    defer tbl.decrRef();
 
     try std.testing.expectEqualStrings("key0000", zdb.key.parseKey(tbl.smallest));
     try std.testing.expectEqualStrings("key0199", zdb.key.parseKey(tbl.biggest));
@@ -376,12 +376,12 @@ test "table: big values" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    var tbl = try Table.open(alloc, tb.bytes);
-    defer tbl.deinit();
+    const tbl = try Table.openMem(alloc, tb.bytes);
+    defer tbl.decrRef();
 
     try std.testing.expectEqual(@as(u32, n), tbl.key_count);
 
-    var it = TableIterator.init(alloc, &tbl);
+    var it = TableIterator.init(alloc, tbl);
     defer it.deinit();
     try it.seekToFirst();
 
