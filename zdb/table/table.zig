@@ -1,10 +1,11 @@
 const std = @import("std");
-const key_mod = @import("../key.zig");
+const key = @import("../key.zig");
 const idx = @import("index.zig");
 const buffers = @import("../buffers.gen.zig");
 const compress = @import("utils").compression;
+const binaryfuse = @import("../binaryfusefilter.zig");
 
-pub const Error = idx.Error || buffers.Error || compress.Error || key_mod.Error ||
+pub const Error = idx.Error || buffers.Error || compress.Error || key.Error ||
     std.mem.Allocator.Error || error{
     ChecksumMismatch,
     CorruptTable,
@@ -31,6 +32,7 @@ pub const Table = struct {
     key_count: u32,
     max_version: u64,
     codec: compress.Codec,
+    binary_fuse: ?binaryfuse.BinaryFuse(u16),
     ref: std.atomic.Value(i32),
     path: ?[]const u8, // owned; non-null for file-backed tables; deleted on last decrRef
     smallest: []const u8, // owned; empty until open/openMem is called
@@ -143,6 +145,7 @@ pub const Table = struct {
             .key_count = index_reader.keyCount(),
             .max_version = index_reader.maxVersion(),
             .codec = codec,
+            .binary_fuse = try loadBinaryFuse(allocator, index_reader),
             .ref = std.atomic.Value(i32).init(1), // ref = 1
             .smallest = &[_]u8{},
             .biggest = &[_]u8{},
@@ -154,6 +157,7 @@ pub const Table = struct {
         if (self.path) |p| self.allocator.free(p);
         if (self.smallest.len > 0) self.allocator.free(self.smallest);
         if (self.biggest.len > 0) self.allocator.free(self.biggest);
+        if (self.binary_fuse) |bf| bf.deinit(self.allocator);
         if (self.mmap_buf) |mb| {
             std.posix.munmap(mb);
         } else {
@@ -191,6 +195,14 @@ pub const Table = struct {
         return self.index;
     }
 
+    pub fn containsKey(self: *const Table, key_no_ts: []const u8) bool {
+        if (self.binary_fuse) |bf| {
+            const h = key.hashNoTs(key_no_ts);
+            return bf.contain(h);
+        }
+        return true;
+    }
+
     pub fn blockCount(self: Table) usize {
         return @intCast(self.index.blocksLen());
     }
@@ -220,6 +232,19 @@ pub const Table = struct {
         const got_checksum = std.hash.crc.Crc32Iscsi.hash(block[0..checksum_off]);
         if (stored_checksum != got_checksum) return error.ChecksumMismatch;
         return block;
+    }
+
+    fn loadBinaryFuse(allocator: std.mem.Allocator, index_reader: buffers.TableIndexReader) !?binaryfuse.BinaryFuse(u16) {
+        const bf_reader = index_reader.binaryFuse() orelse return null;
+        const fingerprints = try bf_reader.fingerprintsToSliceAlloc(allocator);
+        return binaryfuse.BinaryFuse(u16){
+            .seed = bf_reader.seed(),
+            .segment_length = bf_reader.segmentLength(),
+            .segment_length_mask = bf_reader.segmentLengthMask(),
+            .segment_count = bf_reader.segmentCount(),
+            .segment_count_length = bf_reader.segmentCountLength(),
+            .fingerprints = fingerprints,
+        };
     }
 };
 
@@ -324,7 +349,7 @@ pub const BlockIterator = struct {
                 hi = mid;
                 continue;
             }
-            if (key_mod.compareKeys(self.key_buf.items, target) == .lt) {
+            if (key.compareWithTs(self.key_buf.items, target) == .lt) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -429,7 +454,7 @@ pub const TableIterator = struct {
         while (lo + 1 < hi) {
             const mid = lo + (hi - lo) / 2;
             const base = try self.table.blockBaseKey(mid);
-            if (key_mod.compareKeys(base, target) == .gt) {
+            if (key.compareWithTs(base, target) == .gt) {
                 hi = mid;
             } else {
                 lo = mid;

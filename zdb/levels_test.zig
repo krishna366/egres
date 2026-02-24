@@ -39,7 +39,7 @@ fn buildTable(
     var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer b.deinit();
     for (entries) |e| {
-        const k = try key_mod.keyWithTs(alloc, e.key, e.ts);
+        const k = try key_mod.withTs(alloc, e.key, e.ts);
         defer alloc.free(k);
         try b.add(k, e.val);
     }
@@ -166,9 +166,9 @@ test "overlapping tables L1" {
     }
 
     // Query range c-g should overlap tables c-d, e-f, g-h → indices 1..4.
-    const ck = try key_mod.keyWithTs(alloc, "c", 0);
+    const ck = try key_mod.withTs(alloc, "c", 0);
     defer alloc.free(ck);
-    const gk = try key_mod.keyWithTs(alloc, "g", 0);
+    const gk = try key_mod.withTs(alloc, "g", 0);
     defer alloc.free(gk);
 
     const result = try lh.overlappingTables(alloc, .{ .left = ck, .right = gk });
@@ -203,7 +203,7 @@ test "overlapping tables L0" {
     try lh.addEntry(2, t2);
     try lh.addEntry(3, t3);
 
-    const ck = try key_mod.keyWithTs(alloc, "x", 0);
+    const ck = try key_mod.withTs(alloc, "x", 0);
     defer alloc.free(ck);
 
     // L0 always returns all tables regardless of the query.
@@ -237,7 +237,7 @@ test "get L0 newest wins" {
     try lh.addEntry(2, t2);
 
     // Search with max ts to find the newest version.
-    const search = try key_mod.keyWithTs(alloc, "k", std.math.maxInt(u64));
+    const search = try key_mod.withTs(alloc, "k", std.math.maxInt(u64));
     defer alloc.free(search);
 
     const item = try lh.get(search);
@@ -276,7 +276,7 @@ test "get L1 hit" {
     try lh.addEntry(2, tb);
     try lh.addEntry(3, tc);
 
-    const search = try key_mod.keyWithTs(alloc, "b", 0);
+    const search = try key_mod.withTs(alloc, "b", 0);
     defer alloc.free(search);
 
     const item = try lh.get(search);
@@ -304,7 +304,7 @@ test "get miss" {
     defer lh.deinit();
     try lh.addEntry(1, ta);
 
-    const search = try key_mod.keyWithTs(alloc, "z", 0);
+    const search = try key_mod.withTs(alloc, "z", 0);
     defer alloc.free(search);
 
     const item = try lh.get(search);
@@ -456,7 +456,7 @@ test "do compact L0->L1" {
 
     // All three keys must be retrievable via get.
     for (l0_data) |d| {
-        const sk = try key_mod.keyWithTs(alloc, d.key, std.math.maxInt(u64));
+        const sk = try key_mod.withTs(alloc, d.key, std.math.maxInt(u64));
         defer alloc.free(sk);
         const item = try lc.get(sk);
         try std.testing.expect(item != null);
@@ -543,7 +543,7 @@ test "do compact L0->L1 with dest overlap" {
         .{ .key = "dd", .val = "vdd" },
     };
     for (expected) |e| {
-        const sk = try key_mod.keyWithTs(alloc, e.key, std.math.maxInt(u64));
+        const sk = try key_mod.withTs(alloc, e.key, std.math.maxInt(u64));
         defer alloc.free(sk);
         const item = try lc.get(sk);
         try std.testing.expect(item != null);
@@ -613,7 +613,7 @@ test "do compact L1->L2" {
         .{ .key = "cc", .val = "vcc" },
     };
     for (expected) |e| {
-        const sk = try key_mod.keyWithTs(alloc, e.key, std.math.maxInt(u64));
+        const sk = try key_mod.withTs(alloc, e.key, std.math.maxInt(u64));
         defer alloc.free(sk);
         const item = try lc.get(sk);
         try std.testing.expect(item != null);
@@ -661,7 +661,7 @@ test "levels get: L0 shadows L1" {
     // Searching with maxInt ts seeks to the very beginning of "foo" entries;
     // L0 is checked first → the ts=5 version wins.
     {
-        const sk = try key_mod.keyWithTs(alloc, "foo", std.math.maxInt(u64));
+        const sk = try key_mod.withTs(alloc, "foo", std.math.maxInt(u64));
         defer alloc.free(sk);
         const item = try lc.get(sk);
         try std.testing.expect(item != null);
@@ -676,7 +676,7 @@ test "levels get: L0 shadows L1" {
     // (higher ts ↔ smaller suffix), so the L0 seek lands past it → L0 miss.
     // L1's ts=1 entry sorts *after* ts=3, so the L1 seek lands on it → hit.
     {
-        const sk = try key_mod.keyWithTs(alloc, "foo", 3);
+        const sk = try key_mod.withTs(alloc, "foo", 3);
         defer alloc.free(sk);
         const item = try lc.get(sk);
         try std.testing.expect(item != null);

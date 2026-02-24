@@ -38,7 +38,7 @@ pub const Iterator = union(enum) {
 fn iterLessThan(iters: []const Iterator, a: usize, b: usize) std.math.Order {
     const item_a = iters[a].itemRef().?;
     const item_b = iters[b].itemRef().?;
-    return key.compareKeys(item_a.key, item_b.key);
+    return key.compareWithTs(item_a.key, item_b.key);
 }
 
 pub const MergeIterator = struct {

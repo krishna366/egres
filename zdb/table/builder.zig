@@ -2,6 +2,7 @@ const std = @import("std");
 const key = @import("../key.zig");
 const buffers = @import("../buffers.gen.zig");
 const compress = @import("utils").compression;
+const binaryfuse = @import("../binaryfusefilter.zig");
 
 // Table layout (Badger-inspired, with zbuf for TableIndex/BlockOffset):
 //
@@ -46,7 +47,7 @@ pub const Error = error{
     ValueTooLarge,
     TooManyBlocks,
     IntegerOverflow,
-} || key.Error || buffers.Error || compress.Error || std.mem.Allocator.Error;
+} || key.Error || buffers.Error || compress.Error || std.mem.Allocator.Error || binaryfuse.Error;
 
 pub const Config = struct {
     target_block_size: usize = 32 * 1024,
@@ -80,6 +81,7 @@ pub const Builder = struct {
     cur_base_key: std.ArrayList(u8),
     block_infos: std.ArrayList(BlockInfo),
     last_key: std.ArrayList(u8),
+    bf_hashes: std.ArrayList(u64),
     key_count: u32,
     max_version: u64,
     uncompressed_size: u32,
@@ -97,6 +99,7 @@ pub const Builder = struct {
             .cur_base_key = .empty,
             .block_infos = .empty,
             .last_key = .empty,
+            .bf_hashes = .empty,
             .key_count = 0,
             .max_version = 0,
             .uncompressed_size = 0,
@@ -111,6 +114,7 @@ pub const Builder = struct {
         }
         self.block_infos.deinit(self.allocator);
         self.last_key.deinit(self.allocator);
+        self.bf_hashes.deinit(self.allocator);
         self.cur_base_key.deinit(self.allocator);
         self.cur_offsets.deinit(self.allocator);
         self.cur_block.deinit(self.allocator);
@@ -126,6 +130,7 @@ pub const Builder = struct {
 
         self.block_infos.clearRetainingCapacity();
         self.last_key.clearRetainingCapacity();
+        self.bf_hashes.clearRetainingCapacity();
         self.cur_base_key.clearRetainingCapacity();
         self.cur_offsets.clearRetainingCapacity();
         self.cur_block.clearRetainingCapacity();
@@ -142,10 +147,15 @@ pub const Builder = struct {
         if (value.len > std.math.maxInt(u32)) return error.ValueTooLarge;
 
         if (self.last_key.items.len > 0) {
-            if (key.compareKeys(entry_key, self.last_key.items) != .gt) {
+            if (key.compareWithTs(entry_key, self.last_key.items) != .gt) {
                 return error.KeyOrderViolation;
             }
         }
+
+        if (!key.sameKeyNoTs(entry_key, self.last_key.items)) {
+            try self.bf_hashes.append(self.allocator, key.hashWithTs(entry_key));
+        }
+
         // Keep last_key in scratch storage to avoid per-entry alloc/free churn.
         self.last_key.clearRetainingCapacity();
         try self.last_key.appendSlice(self.allocator, entry_key);
@@ -219,6 +229,25 @@ pub const Builder = struct {
             block_offsets[i] = block_buf.offset;
         }
 
+        var binary_fuse_off: ?u32 = null;
+        if (self.bf_hashes.items.len > 0) {
+            var filter = try binaryfuse.BinaryFuse(u16).init(self.allocator, self.bf_hashes.items.len);
+            defer filter.deinit(self.allocator);
+            try filter.populate(self.allocator, self.bf_hashes.items);
+
+            var bf_writer = try buffers.BinaryFuseFilterWriter.initWithBuf(self.allocator, &index_bytes);
+            try bf_writer.set(.{
+                .seed = filter.seed,
+                .segment_length = filter.segment_length,
+                .segment_length_mask = filter.segment_length_mask,
+                .segment_count = filter.segment_count,
+                .segment_count_length = filter.segment_count_length,
+                .fingerprints = filter.fingerprints,
+            });
+            const bf_buf = try bf_writer.finish();
+            binary_fuse_off = bf_buf.offset;
+        }
+
         try index_writer.set(.{
             .blocks = block_offsets,
             .last_key = self.last_key.items,
@@ -232,6 +261,9 @@ pub const Builder = struct {
             .is_lz4 = self.cfg.codec == .lz4,
             .is_zstd = self.cfg.codec == .zstd,
         });
+        if (binary_fuse_off) |off| {
+            try index_writer.setBinaryFuse(off);
+        }
 
         _ = try index_writer.finish();
 

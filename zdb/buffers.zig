@@ -9,6 +9,15 @@ pub const BlockIndex = schema.Table(.{
     .{ .id = 3, .name = "len", .ty = schema.U32 },
 });
 
+pub const BinaryFuseFilter = schema.Table(.{
+    .{ .id = 1, .name = "seed", .ty = schema.U64 },
+    .{ .id = 2, .name = "segment_length", .ty = schema.U32 },
+    .{ .id = 3, .name = "segment_length_mask", .ty = schema.U32 },
+    .{ .id = 4, .name = "segment_count", .ty = schema.U32 },
+    .{ .id = 5, .name = "segment_count_length", .ty = schema.U32 },
+    .{ .id = 6, .name = "fingerprints", .ty = schema.Array(schema.U16) },
+});
+
 pub const TableIndex = schema.Table(.{
     .{ .id = 1, .name = "max_version", .ty = schema.U64 },
     .{ .id = 2, .name = "key_count", .ty = schema.U32 },
@@ -23,7 +32,7 @@ pub const TableIndex = schema.Table(.{
 
     .{ .id = 7, .name = "last_key", .ty = schema.Bytes },
     .{ .id = 8, .name = "blocks", .ty = schema.Array(BlockIndex) },
-    .{ .id = 9, .name = "bloom_filter", .ty = schema.Bytes },
+    .{ .id = 9, .name = "binary_fuse", .ty = BinaryFuseFilter },
 });
 
 pub const ManifestChange = schema.Table(.{
@@ -47,6 +56,7 @@ fn tableId(comptime local_id: u16) u16 {
 pub const tables = .{
     .{ .name = "BlockIndex", .ty = BlockIndex, .id = tableId(1) },
     .{ .name = "TableIndex", .ty = TableIndex, .id = tableId(2) },
-    .{ .name = "ManifestChange", .ty = ManifestChange, .id = tableId(3) },
-    .{ .name = "ManifestChangeSet", .ty = ManifestChangeSet, .id = tableId(4) },
+    .{ .name = "BinaryFuseFilter", .ty = BinaryFuseFilter, .id = tableId(3) },
+    .{ .name = "ManifestChange", .ty = ManifestChange, .id = tableId(4) },
+    .{ .name = "ManifestChangeSet", .ty = ManifestChangeSet, .id = tableId(5) },
 };

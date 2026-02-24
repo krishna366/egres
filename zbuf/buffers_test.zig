@@ -205,6 +205,49 @@ test "multiple b64 backing fields stay independent" {
     try std.testing.expect(view.isRetiring());
 }
 
+test "array toSliceAlloc for u16/u32/u64" {
+    const alloc = std.testing.allocator;
+
+    {
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(alloc);
+        var w = try gen.U16ArrayOnlyWriter.initWithBuf(alloc, &buf);
+        const vals = [_]u16{ 1, 2, 65535 };
+        try w.setValues(&vals);
+        const res = try w.finish();
+        const r = try gen.U16ArrayOnlyReader.init(buf.items, res.offset);
+        const got = try r.valuesToSliceAlloc(alloc);
+        defer alloc.free(got);
+        try std.testing.expectEqualSlices(u16, &vals, got);
+    }
+
+    {
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(alloc);
+        var w = try gen.U32ArrayOnlyWriter.initWithBuf(alloc, &buf);
+        const vals = [_]u32{ 10, 20, 30 };
+        try w.setValues(&vals);
+        const res = try w.finish();
+        const r = try gen.U32ArrayOnlyReader.init(buf.items, res.offset);
+        const got = try r.valuesToSliceAlloc(alloc);
+        defer alloc.free(got);
+        try std.testing.expectEqualSlices(u32, &vals, got);
+    }
+
+    {
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(alloc);
+        var w = try gen.U64ArrayOnlyWriter.initWithBuf(alloc, &buf);
+        const vals = [_]u64{ 100, 200, 300 };
+        try w.setValues(&vals);
+        const res = try w.finish();
+        const r = try gen.U64ArrayOnlyReader.init(buf.items, res.offset);
+        const got = try r.valuesToSliceAlloc(alloc);
+        defer alloc.free(got);
+        try std.testing.expectEqualSlices(u64, &vals, got);
+    }
+}
+
 test "direct table null" {
     var buf = try buildTable(std.testing.allocator, false);
     defer buf.deinit();

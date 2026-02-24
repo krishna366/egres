@@ -37,10 +37,15 @@ pub const U64ArrayOnly = schema.Table(.{
     .{ .id = 1, .name = "values", .ty = schema.Array(schema.U64) },
 });
 
+pub const U16ArrayOnly = schema.Table(.{
+    .{ .id = 1, .name = "values", .ty = schema.Array(schema.U16) },
+});
+
 pub const tables = .{
     .{ .name = "Cell", .ty = Cell, .id = 1 },
     .{ .name = "Row", .ty = Row, .id = 2 },
     .{ .name = "Table", .ty = Table, .id = 3 },
     .{ .name = "U32ArrayOnly", .ty = U32ArrayOnly, .id = 4 },
     .{ .name = "U64ArrayOnly", .ty = U64ArrayOnly, .id = 5 },
+    .{ .name = "U16ArrayOnly", .ty = U16ArrayOnly, .id = 6 },
 };

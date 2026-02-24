@@ -27,7 +27,7 @@ fn buildTestTable(
         var val_buf: [20]u8 = undefined;
         const val = try std.fmt.bufPrint(&val_buf, "{d}", .{i});
 
-        const k = try zdb.key.keyWithTs(allocator, key_no_ts, 0);
+        const k = try zdb.key.withTs(allocator, key_no_ts, 0);
         defer allocator.free(k);
         try b.add(k, val);
     }
@@ -44,7 +44,7 @@ test "table builder/reader roundtrip and seek" {
 
     const addKV = struct {
         fn f(builder: *Builder, alloc: std.mem.Allocator, key_no_ts: []const u8, ts: u64, value: []const u8) !void {
-            const k = try zdb.key.keyWithTs(alloc, key_no_ts, ts);
+            const k = try zdb.key.withTs(alloc, key_no_ts, ts);
             defer alloc.free(k);
             try builder.add(k, value);
         }
@@ -70,20 +70,103 @@ test "table builder/reader roundtrip and seek" {
     try it.seekToFirst();
     try std.testing.expectEqualStrings("va9", it.itemRef().?.value);
 
-    const seek_key = try zdb.key.keyWithTs(std.testing.allocator, "b", 3);
+    const seek_key = try zdb.key.withTs(std.testing.allocator, "b", 3);
     defer std.testing.allocator.free(seek_key);
     try it.seek(seek_key);
     try std.testing.expectEqualStrings("vb3", it.itemRef().?.value);
+}
+
+test "table binary fuse contains keys" {
+    const alloc = std.testing.allocator;
+
+    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    defer b.deinit();
+
+    const entries = [_]struct { key: []const u8, ts: u64, val: []const u8 }{
+        .{ .key = "apple", .ts = 1, .val = "v1" },
+        .{ .key = "banana", .ts = 2, .val = "v2" },
+        .{ .key = "carrot", .ts = 3, .val = "v3" },
+    };
+
+    for (entries) |e| {
+        const k = try zdb.key.withTs(alloc, e.key, e.ts);
+        defer alloc.free(k);
+        try b.add(k, e.val);
+    }
+
+    var tb = try b.finish();
+    defer tb.deinit();
+
+    const t = try Table.openMem(alloc, tb.bytes);
+    defer t.decrRef();
+
+    try std.testing.expect(t.containsKey("apple"));
+    try std.testing.expect(t.containsKey("banana"));
+    try std.testing.expect(t.containsKey("carrot"));
+
+    try std.testing.expect(!t.containsKey("date"));
+    try std.testing.expect(!t.containsKey("eggplant"));
+    try std.testing.expect(!t.containsKey("fig"));
+}
+
+test "table binary fuse large keyset contains sampled keys" {
+    const alloc = std.testing.allocator;
+    const n: usize = 1_000_000;
+    const sample: usize = 10_000;
+
+    var b = Builder.init(alloc, .{ .target_block_size = 32 * 1024 });
+    defer b.deinit();
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key_no_ts = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
+        try zdb.key.setTs(key_buf[key_no_ts.len..], 0);
+
+        const k = key_buf[0 .. key_no_ts.len + 8];
+        try b.add(k, "v");
+    }
+
+    var tb = try b.finish();
+    defer tb.deinit();
+
+    const t = try Table.openMem(alloc, tb.bytes);
+    defer t.decrRef();
+
+    const seed: u64 = @intCast(std.time.nanoTimestamp());
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    i = 0;
+    while (i < sample) : (i += 1) {
+        const idx = rnd.uintAtMost(u64, n - 1);
+        var key_buf: [16]u8 = undefined;
+        const key_no_ts = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{idx});
+        try std.testing.expect(t.containsKey(key_no_ts));
+    }
+
+    var non_added_matches: usize = 0;
+    i = 0;
+    while (i < sample) : (i += 1) {
+        const idx = @as(u64, n) + rnd.uintAtMost(u64, n - 1);
+        var key_buf: [16]u8 = undefined;
+        const key_no_ts = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{idx});
+        if (t.containsKey(key_no_ts)) {
+            non_added_matches += 1;
+        }
+    }
+    // Some false positives are possible.
+    try std.testing.expect(non_added_matches < 10);
 }
 
 test "table checksum mismatch is detected" {
     var b = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b.deinit();
 
-    const k1 = try zdb.key.keyWithTs(std.testing.allocator, "k1", 1);
+    const k1 = try zdb.key.withTs(std.testing.allocator, "k1", 1);
     defer std.testing.allocator.free(k1);
     try b.add(k1, "v1");
-    const k2 = try zdb.key.keyWithTs(std.testing.allocator, "k2", 1);
+    const k2 = try zdb.key.withTs(std.testing.allocator, "k2", 1);
     defer std.testing.allocator.free(k2);
     try b.add(k2, "v2");
 
@@ -106,10 +189,10 @@ test "table checksum mismatch is detected" {
 test "merge iterator merges sorted streams" {
     var b1 = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b1.deinit();
-    const a5k = try zdb.key.keyWithTs(std.testing.allocator, "a", 5);
+    const a5k = try zdb.key.withTs(std.testing.allocator, "a", 5);
     defer std.testing.allocator.free(a5k);
     try b1.add(a5k, "a5");
-    const c1k = try zdb.key.keyWithTs(std.testing.allocator, "c", 1);
+    const c1k = try zdb.key.withTs(std.testing.allocator, "c", 1);
     defer std.testing.allocator.free(c1k);
     try b1.add(c1k, "c1");
     var t1 = try b1.finish();
@@ -117,10 +200,10 @@ test "merge iterator merges sorted streams" {
 
     var b2 = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b2.deinit();
-    const b4k = try zdb.key.keyWithTs(std.testing.allocator, "b", 4);
+    const b4k = try zdb.key.withTs(std.testing.allocator, "b", 4);
     defer std.testing.allocator.free(b4k);
     try b2.add(b4k, "b4");
-    const d1k = try zdb.key.keyWithTs(std.testing.allocator, "d", 1);
+    const d1k = try zdb.key.withTs(std.testing.allocator, "d", 1);
     defer std.testing.allocator.free(d1k);
     try b2.add(d1k, "d1");
     var t2 = try b2.finish();
@@ -230,7 +313,7 @@ test "seek: various targets" {
     };
 
     for (cases) |c| {
-        const sk = try zdb.key.keyWithTs(alloc, c.in, 0);
+        const sk = try zdb.key.withTs(alloc, c.in, 0);
         defer alloc.free(sk);
         try it.seek(sk);
         if (!c.valid) {
@@ -281,7 +364,7 @@ test "table: seek and iterate to end" {
     defer it.deinit();
 
     // Seek to key1010, iterate to end — should visit keys 1010..9999.
-    const sk1010 = try zdb.key.keyWithTs(alloc, "key1010", 0);
+    const sk1010 = try zdb.key.withTs(alloc, "key1010", 0);
     defer alloc.free(sk1010);
     try it.seek(sk1010);
     var kid: usize = 1010;
@@ -294,13 +377,13 @@ test "table: seek and iterate to end" {
     try std.testing.expectEqual(@as(usize, 10000), kid);
 
     // Seek past end → invalid.
-    const sk_end = try zdb.key.keyWithTs(alloc, "key99999", 0);
+    const sk_end = try zdb.key.withTs(alloc, "key99999", 0);
     defer alloc.free(sk_end);
     try it.seek(sk_end);
     try std.testing.expect(it.itemRef() == null);
 
     // Seek before start → first key.
-    const sk_before = try zdb.key.keyWithTs(alloc, "aaa", 0);
+    const sk_before = try zdb.key.withTs(alloc, "aaa", 0);
     defer alloc.free(sk_before);
     try it.seek(sk_before);
     const first = it.itemRef() orelse return error.UnexpectedNull;
@@ -321,7 +404,7 @@ test "table: max_version" {
     while (i < n) : (i += 1) {
         var buf: [32]u8 = undefined;
         const key_str = try std.fmt.bufPrint(&buf, "foo:{d:0>4}", .{i});
-        const k = try zdb.key.keyWithTs(alloc, key_str, i + 1);
+        const k = try zdb.key.withTs(alloc, key_str, i + 1);
         defer alloc.free(k);
         try b.add(k, "");
     }
@@ -368,7 +451,7 @@ test "table: big values" {
     while (i < n) : (i += 1) {
         var buf: [16]u8 = undefined;
         const key_str = try std.fmt.bufPrint(&buf, "{d:0>4}", .{i});
-        const k = try zdb.key.keyWithTs(alloc, key_str, @intCast(i + 1));
+        const k = try zdb.key.withTs(alloc, key_str, @intCast(i + 1));
         defer alloc.free(k);
         @memset(big_val, @intCast(i % 256));
         try b.add(k, big_val);

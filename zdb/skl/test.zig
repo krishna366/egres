@@ -21,9 +21,9 @@ test "skiplist basic operations and updates" {
     var sl = try skiplist.SkipList.init(testing.allocator);
     defer sl.release();
 
-    const k1 = try key_mod.keyWithTs(testing.allocator, "1", 0);
+    const k1 = try key_mod.withTs(testing.allocator, "1", 0);
     defer testing.allocator.free(k1);
-    const k2 = try key_mod.keyWithTs(testing.allocator, "2", 0);
+    const k2 = try key_mod.withTs(testing.allocator, "2", 0);
     defer testing.allocator.free(k2);
 
     try testing.expect(sl.get(k1) == null);
@@ -69,7 +69,7 @@ test "skiplist iterator ordering and seek" {
 
     var seek_it = sl.iterator();
     defer seek_it.deinit();
-    const seek_key = try key_mod.keyWithTs(testing.allocator, "4", 0);
+    const seek_key = try key_mod.withTs(testing.allocator, "4", 0);
     defer testing.allocator.free(seek_key);
     const seek_entry = seek_it.seek(seek_key).?;
     try testing.expectEqualStrings("5", key_mod.parseKey(seek_entry.key));
@@ -86,7 +86,7 @@ test "skiplist refcount usage with explicit acquire/release" {
     sl.acquire();
     sl.acquire();
 
-    const k1 = try key_mod.keyWithTs(testing.allocator, "1", 0);
+    const k1 = try key_mod.withTs(testing.allocator, "1", 0);
     defer testing.allocator.free(k1);
     try testing.expectEqualStrings("10", sl.get(k1).?);
 

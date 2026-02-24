@@ -20,25 +20,25 @@ test "options validate rejects single compactor and in-memory dir" {
     );
 }
 
-test "keyWithTs parseTs parseKey and compareKeys match badger ordering" {
+test "keyWithTs parseTs parseKey and compareWithTs match badger ordering" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     const alloc = arena.allocator();
 
-    const a_v9 = try zdb.key.keyWithTs(alloc, "a", 9);
-    const a_v7 = try zdb.key.keyWithTs(alloc, "a", 7);
-    const b_v1 = try zdb.key.keyWithTs(alloc, "b", 1);
+    const a_v9 = try zdb.key.withTs(alloc, "a", 9);
+    const a_v7 = try zdb.key.withTs(alloc, "a", 7);
+    const b_v1 = try zdb.key.withTs(alloc, "b", 1);
 
     try std.testing.expectEqual(@as(u64, 9), zdb.key.parseTs(a_v9));
     try std.testing.expectEqualStrings("a", zdb.key.parseKey(a_v9));
 
     // Same user key: larger version must sort first.
-    try std.testing.expectEqual(std.math.Order.lt, zdb.key.compareKeys(a_v9, a_v7));
-    try std.testing.expectEqual(std.math.Order.gt, zdb.key.compareKeys(a_v7, a_v9));
+    try std.testing.expectEqual(std.math.Order.lt, zdb.key.compareWithTs(a_v9, a_v7));
+    try std.testing.expectEqual(std.math.Order.gt, zdb.key.compareWithTs(a_v7, a_v9));
 
     // User key still sorts before timestamp suffix.
-    try std.testing.expectEqual(std.math.Order.lt, zdb.key.compareKeys(a_v7, b_v1));
+    try std.testing.expectEqual(std.math.Order.lt, zdb.key.compareWithTs(a_v7, b_v1));
 }
 
 test "entry flags and estimate size" {
