@@ -36,6 +36,27 @@ pub const MessageReader = union(enum) {
     ManifestChangeSet: ManifestChangeSetReader,
 };
 
+pub const BlockIndexStruct = struct {
+    key: []u8 = &.{},
+    offset: u32 = 0,
+    len: u32 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: BlockIndexReader) Error!BlockIndexStruct {
+        var s = BlockIndexStruct{
+            .offset = r.offset(),
+            .len = r.len(),
+        };
+        errdefer s.deinit(alloc);
+        s.key = try alloc.dupe(u8, r.key());
+        return s;
+    }
+
+    pub fn deinit(self: *BlockIndexStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.key);
+        self.key = &.{};
+    }
+};
+
 pub const BlockIndexReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -231,6 +252,60 @@ pub const BlockIndexWriter = struct {
     }
 };
 
+pub const TableIndexStruct = struct {
+    is_none: bool = false,
+    is_lz4: bool = false,
+    is_zstd: bool = false,
+    max_version: u64 = 0,
+    key_count: u32 = 0,
+    uncompressed_size: u32 = 0,
+    compressed_size: u32 = 0,
+    stale_data_size: u32 = 0,
+    compression: u64 = 0,
+    last_key: []u8 = &.{},
+    blocks: []BlockIndexStruct = &.{},
+    binary_fuse: ?BinaryFuseFilterStruct = null,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
+        var s = TableIndexStruct{
+            .is_none = r.isNone(),
+            .is_lz4 = r.isLz4(),
+            .is_zstd = r.isZstd(),
+            .max_version = r.maxVersion(),
+            .key_count = r.keyCount(),
+            .uncompressed_size = r.uncompressedSize(),
+            .compressed_size = r.compressedSize(),
+            .stale_data_size = r.staleDataSize(),
+            .compression = r.compression(),
+        };
+        errdefer s.deinit(alloc);
+        s.last_key = try alloc.dupe(u8, r.lastKey());
+        {
+            const _cnt = r.blocksLen();
+            s.blocks = try alloc.alloc(BlockIndexStruct, @intCast(_cnt));
+            @memset(s.blocks, .{});
+            for (0.._cnt) |_i| {
+                const _child = try r.blocksAt(@intCast(_i));
+                s.blocks[_i] = try BlockIndexStruct.fromReader(alloc, _child);
+            }
+        }
+        if (r.binaryFuse()) |_child| {
+            s.binary_fuse = try BinaryFuseFilterStruct.fromReader(alloc, _child);
+        }
+        return s;
+    }
+
+    pub fn deinit(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.last_key);
+        self.last_key = &.{};
+        for (self.blocks) |*_b| _b.deinit(alloc);
+        alloc.free(self.blocks);
+        self.blocks = &.{};
+        if (self.binary_fuse) |*_bf| _bf.deinit(alloc);
+        self.binary_fuse = null;
+    }
+};
+
 pub const TableIndexReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -341,30 +416,27 @@ pub const TableIndexReader = struct {
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
-    pub fn blocksLen(self: Self) u32 {
+    fn blocksSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 52;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 44)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 48)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 44)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 48)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn blocksLen(self: Self) u32 {
+        return @intCast(self.blocksSlice().len / 4);
     }
 
     pub fn blocksAt(self: Self, i: u32) Error!BlockIndexReader {
-        const slot_end = @as(u32, self.base) + 52;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 44));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 48));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
-        const child_off = try zbuf.readU32(self.buf, entry_off);
+        const s = self.blocksSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        const child_off = zbuf.readU32(s, off) catch unreachable;
         return BlockIndexReader.init(self.buf, child_off);
     }
 
@@ -694,6 +766,33 @@ pub const TableIndexWriter = struct {
     }
 };
 
+pub const BinaryFuseFilterStruct = struct {
+    seed: u64 = 0,
+    segment_length: u32 = 0,
+    segment_length_mask: u32 = 0,
+    segment_count: u32 = 0,
+    segment_count_length: u32 = 0,
+    fingerprints: []u16 = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: BinaryFuseFilterReader) Error!BinaryFuseFilterStruct {
+        var s = BinaryFuseFilterStruct{
+            .seed = r.seed(),
+            .segment_length = r.segmentLength(),
+            .segment_length_mask = r.segmentLengthMask(),
+            .segment_count = r.segmentCount(),
+            .segment_count_length = r.segmentCountLength(),
+        };
+        errdefer s.deinit(alloc);
+        s.fingerprints = try r.fingerprintsToSliceAlloc(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *BinaryFuseFilterStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.fingerprints);
+        self.fingerprints = &.{};
+    }
+};
+
 pub const BinaryFuseFilterReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -753,40 +852,36 @@ pub const BinaryFuseFilterReader = struct {
         return zbuf.readU32(self.buf, @as(usize, self.base + 24)) catch 0;
     }
 
-    pub fn fingerprintsLen(self: Self) u32 {
+    fn fingerprintsSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 36;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 28)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 32)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 28)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 32)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 2;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn fingerprintsLen(self: Self) u32 {
+        return @intCast(self.fingerprintsSlice().len / 2);
     }
 
     pub fn fingerprintsAt(self: Self, i: u32) Error!u16 {
-        const slot_end = @as(u32, self.base) + 36;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 28));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 32));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 2;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 2;
-        return try zbuf.readU16(self.buf, entry_off);
+        const s = self.fingerprintsSlice();
+        const off = @as(usize, i) * 2;
+        if (off + 2 > s.len) return zbuf.Error.OutOfBounds;
+        return zbuf.readU16(s, off) catch unreachable;
     }
 
     pub fn fingerprintsToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u16 {
-        const count: u32 = self.fingerprintsLen();
-        if (count == 0) return try alloc.alloc(u16, 0);
-        var out = try alloc.alloc(u16, @intCast(count));
+        const raw = self.fingerprintsSlice();
+        const count = raw.len / 2;
+        const out = try alloc.alloc(u16, count);
         errdefer alloc.free(out);
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            out[@intCast(i)] = try self.fingerprintsAt(i);
+        for (out, 0..) |*v, i| {
+            v.* = zbuf.readU16(raw, i * 2) catch unreachable;
         }
         return out;
     }
@@ -833,16 +928,9 @@ pub const BinaryFuseFilterBuffer = struct {
         try writer.setSegmentLengthMask(reader.segmentLengthMask());
         try writer.setSegmentCount(reader.segmentCount());
         try writer.setSegmentCountLength(reader.segmentCountLength());
-        const count_fingerprints: u32 = reader.fingerprintsLen();
-        if (count_fingerprints != 0) {
-            var values_fingerprints = try alloc.alloc(u16, @intCast(count_fingerprints));
-            defer alloc.free(values_fingerprints);
-            var i_fingerprints: u32 = 0;
-            while (i_fingerprints < count_fingerprints) : (i_fingerprints += 1) {
-                values_fingerprints[@intCast(i_fingerprints)] = try reader.fingerprintsAt(i_fingerprints);
-            }
-            try writer.setFingerprints(values_fingerprints);
-        }
+        const values_fingerprints = try reader.fingerprintsToSliceAlloc(alloc);
+        defer alloc.free(values_fingerprints);
+        if (values_fingerprints.len > 0) try writer.setFingerprints(values_fingerprints);
         const result = try writer.finish();
         return result.offset;
     }
@@ -966,6 +1054,27 @@ pub const BinaryFuseFilterWriter = struct {
             self.base = 0;
             self.owns_buf = false;
         }
+    }
+};
+
+pub const ManifestChangeStruct = struct {
+    op: u32 = 0,
+    table_id: u64 = 0,
+    level: u32 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: ManifestChangeReader) Error!ManifestChangeStruct {
+        var s = ManifestChangeStruct{
+            .op = r.op(),
+            .table_id = r.tableId(),
+            .level = r.level(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
     }
 };
 
@@ -1144,6 +1253,32 @@ pub const ManifestChangeWriter = struct {
     }
 };
 
+pub const ManifestChangeSetStruct = struct {
+    changes: []ManifestChangeStruct = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: ManifestChangeSetReader) Error!ManifestChangeSetStruct {
+        var s = ManifestChangeSetStruct{
+        };
+        errdefer s.deinit(alloc);
+        {
+            const _cnt = r.changesLen();
+            s.changes = try alloc.alloc(ManifestChangeStruct, @intCast(_cnt));
+            @memset(s.changes, .{});
+            for (0.._cnt) |_i| {
+                const _child = try r.changesAt(@intCast(_i));
+                s.changes[_i] = try ManifestChangeStruct.fromReader(alloc, _child);
+            }
+        }
+        return s;
+    }
+
+    pub fn deinit(self: *ManifestChangeSetStruct, alloc: std.mem.Allocator) void {
+        for (self.changes) |*_b| _b.deinit(alloc);
+        alloc.free(self.changes);
+        self.changes = &.{};
+    }
+};
+
 pub const ManifestChangeSetReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -1168,30 +1303,27 @@ pub const ManifestChangeSetReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn changesLen(self: Self) u32 {
+    fn changesSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn changesLen(self: Self) u32 {
+        return @intCast(self.changesSlice().len / 4);
     }
 
     pub fn changesAt(self: Self, i: u32) Error!ManifestChangeReader {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 4));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 8));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
-        const child_off = try zbuf.readU32(self.buf, entry_off);
+        const s = self.changesSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        const child_off = zbuf.readU32(s, off) catch unreachable;
         return ManifestChangeReader.init(self.buf, child_off);
     }
 

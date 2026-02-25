@@ -44,6 +44,35 @@ pub const MessageReader = union(enum) {
     JoinResponse: JoinResponseReader,
 };
 
+pub const ConfChangeStruct = struct {
+    add_voter: bool = false,
+    add_learner: bool = false,
+    to_voter: bool = false,
+    to_learner: bool = false,
+    remove_node: bool = false,
+    change_type: u64 = 0,
+    node_id: u64 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: ConfChangeReader) Error!ConfChangeStruct {
+        var s = ConfChangeStruct{
+            .add_voter = r.addVoter(),
+            .add_learner = r.addLearner(),
+            .to_voter = r.toVoter(),
+            .to_learner = r.toLearner(),
+            .remove_node = r.removeNode(),
+            .change_type = r.changeType(),
+            .node_id = r.nodeId(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *ConfChangeStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+};
+
 pub const ConfChangeReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -358,6 +387,39 @@ pub const ConfChangeWriter = struct {
             self.base = 0;
             self.owns_buf = false;
         }
+    }
+};
+
+pub const LogEntryStruct = struct {
+    is_normal: bool = false,
+    is_conf_change: bool = false,
+    index: u64 = 0,
+    term: u64 = 0,
+    data: []u8 = &.{},
+    entry_type: u64 = 0,
+    conf_change: ?ConfChangeStruct = null,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: LogEntryReader) Error!LogEntryStruct {
+        var s = LogEntryStruct{
+            .is_normal = r.isNormal(),
+            .is_conf_change = r.isConfChange(),
+            .index = r.index(),
+            .term = r.term(),
+            .entry_type = r.entryType(),
+        };
+        errdefer s.deinit(alloc);
+        s.data = try alloc.dupe(u8, r.data());
+        if (r.confChange()) |_child| {
+            s.conf_change = try ConfChangeStruct.fromReader(alloc, _child);
+        }
+        return s;
+    }
+
+    pub fn deinit(self: *LogEntryStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.data);
+        self.data = &.{};
+        if (self.conf_change) |*_bf| _bf.deinit(alloc);
+        self.conf_change = null;
     }
 };
 
@@ -679,6 +741,33 @@ pub const LogEntryWriter = struct {
     }
 };
 
+pub const RequestVoteStruct = struct {
+    is_prevote: bool = false,
+    term: u64 = 0,
+    candidate_id: u64 = 0,
+    last_log_index: u64 = 0,
+    last_log_term: u64 = 0,
+    status: u64 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: RequestVoteReader) Error!RequestVoteStruct {
+        var s = RequestVoteStruct{
+            .is_prevote = r.isPrevote(),
+            .term = r.term(),
+            .candidate_id = r.candidateId(),
+            .last_log_index = r.lastLogIndex(),
+            .last_log_term = r.lastLogTerm(),
+            .status = r.status(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *RequestVoteStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+};
+
 pub const RequestVoteReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -942,6 +1031,31 @@ pub const RequestVoteWriter = struct {
     }
 };
 
+pub const RequestVoteReplyStruct = struct {
+    is_prevote: bool = false,
+    vote_granted: bool = false,
+    term: u64 = 0,
+    from: u64 = 0,
+    status: u64 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: RequestVoteReplyReader) Error!RequestVoteReplyStruct {
+        var s = RequestVoteReplyStruct{
+            .is_prevote = r.isPrevote(),
+            .vote_granted = r.voteGranted(),
+            .term = r.term(),
+            .from = r.from(),
+            .status = r.status(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *RequestVoteReplyStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+};
+
 pub const RequestVoteReplyReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -1201,6 +1315,42 @@ pub const RequestVoteReplyWriter = struct {
     }
 };
 
+pub const AppendEntriesStruct = struct {
+    term: u64 = 0,
+    leader_id: u64 = 0,
+    leader_commit: u64 = 0,
+    prev_log_index: u64 = 0,
+    prev_log_term: u64 = 0,
+    entries: []LogEntryStruct = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: AppendEntriesReader) Error!AppendEntriesStruct {
+        var s = AppendEntriesStruct{
+            .term = r.term(),
+            .leader_id = r.leaderId(),
+            .leader_commit = r.leaderCommit(),
+            .prev_log_index = r.prevLogIndex(),
+            .prev_log_term = r.prevLogTerm(),
+        };
+        errdefer s.deinit(alloc);
+        {
+            const _cnt = r.entriesLen();
+            s.entries = try alloc.alloc(LogEntryStruct, @intCast(_cnt));
+            @memset(s.entries, .{});
+            for (0.._cnt) |_i| {
+                const _child = try r.entriesAt(@intCast(_i));
+                s.entries[_i] = try LogEntryStruct.fromReader(alloc, _child);
+            }
+        }
+        return s;
+    }
+
+    pub fn deinit(self: *AppendEntriesStruct, alloc: std.mem.Allocator) void {
+        for (self.entries) |*_b| _b.deinit(alloc);
+        alloc.free(self.entries);
+        self.entries = &.{};
+    }
+};
+
 pub const AppendEntriesReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -1260,30 +1410,27 @@ pub const AppendEntriesReader = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 36)) catch 0;
     }
 
-    pub fn entriesLen(self: Self) u32 {
+    fn entriesSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 52;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 44)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 48)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 44)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 48)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn entriesLen(self: Self) u32 {
+        return @intCast(self.entriesSlice().len / 4);
     }
 
     pub fn entriesAt(self: Self, i: u32) Error!LogEntryReader {
-        const slot_end = @as(u32, self.base) + 52;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 44));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 48));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
-        const child_off = try zbuf.readU32(self.buf, entry_off);
+        const s = self.entriesSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        const child_off = zbuf.readU32(s, off) catch unreachable;
         return LogEntryReader.init(self.buf, child_off);
     }
 
@@ -1481,6 +1628,35 @@ pub const AppendEntriesWriter = struct {
             self.base = 0;
             self.owns_buf = false;
         }
+    }
+};
+
+pub const AppendEntriesReplyStruct = struct {
+    success: bool = false,
+    term: u64 = 0,
+    status: u64 = 0,
+    from: u64 = 0,
+    match_index: u64 = 0,
+    conflict_term: u64 = 0,
+    conflict_index: u64 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: AppendEntriesReplyReader) Error!AppendEntriesReplyStruct {
+        var s = AppendEntriesReplyStruct{
+            .success = r.success(),
+            .term = r.term(),
+            .status = r.status(),
+            .from = r.from(),
+            .match_index = r.matchIndex(),
+            .conflict_term = r.conflictTerm(),
+            .conflict_index = r.conflictIndex(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *AppendEntriesReplyStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
     }
 };
 
@@ -1761,6 +1937,25 @@ pub const AppendEntriesReplyWriter = struct {
     }
 };
 
+pub const TransportHandshakeStruct = struct {
+    cluster_id: u64 = 0,
+    node_id: u64 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: TransportHandshakeReader) Error!TransportHandshakeStruct {
+        var s = TransportHandshakeStruct{
+            .cluster_id = r.clusterId(),
+            .node_id = r.nodeId(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *TransportHandshakeStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+};
+
 pub const TransportHandshakeReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -1919,6 +2114,27 @@ pub const TransportHandshakeWriter = struct {
             self.base = 0;
             self.owns_buf = false;
         }
+    }
+};
+
+pub const JoinRequestStruct = struct {
+    cluster_id: u64 = 0,
+    node_id: u64 = 0,
+    addr: []u8 = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: JoinRequestReader) Error!JoinRequestStruct {
+        var s = JoinRequestStruct{
+            .cluster_id = r.clusterId(),
+            .node_id = r.nodeId(),
+        };
+        errdefer s.deinit(alloc);
+        s.addr = try alloc.dupe(u8, r.addr());
+        return s;
+    }
+
+    pub fn deinit(self: *JoinRequestStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.addr);
+        self.addr = &.{};
     }
 };
 
@@ -2114,6 +2330,31 @@ pub const JoinRequestWriter = struct {
             self.base = 0;
             self.owns_buf = false;
         }
+    }
+};
+
+pub const JoinResponseStruct = struct {
+    accepted: bool = false,
+    status: u64 = 0,
+    leader_id: u64 = 0,
+    reason_code: u32 = 0,
+    leader_addr: []u8 = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: JoinResponseReader) Error!JoinResponseStruct {
+        var s = JoinResponseStruct{
+            .accepted = r.accepted(),
+            .status = r.status(),
+            .leader_id = r.leaderId(),
+            .reason_code = r.reasonCode(),
+        };
+        errdefer s.deinit(alloc);
+        s.leader_addr = try alloc.dupe(u8, r.leaderAddr());
+        return s;
+    }
+
+    pub fn deinit(self: *JoinResponseStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.leader_addr);
+        self.leader_addr = &.{};
     }
 };
 

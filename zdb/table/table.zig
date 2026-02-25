@@ -28,15 +28,11 @@ pub const Table = struct {
     /// munmap on this. Null for in-memory tables (openMem()); deinit() calls
     /// allocator.free(buf) instead.
     mmap_buf: ?[]align(std.heap.page_size_min) u8,
-    index: buffers.TableIndexReader,
-    key_count: u32,
-    max_version: u64,
+    index: buffers.TableIndexStruct,
     codec: compress.Codec,
     binary_fuse: ?binaryfuse.BinaryFuse(u16),
     ref: std.atomic.Value(i32),
     path: ?[]const u8, // owned; non-null for file-backed tables; deleted on last decrRef
-    smallest: []const u8, // owned; empty until open/openMem is called
-    biggest: []const u8, // owned; empty until open/openMem is called
 
     /// open mmaps the SST file at path, parses the table, and initialises
     /// smallest/biggest. Caller gets zero reference (ref = 0).
@@ -64,21 +60,6 @@ pub const Table = struct {
         t.* = try parse(allocator, mmap_buf[0..size]);
         t.mmap_buf = mmap_buf;
         t.path = try allocator.dupe(u8, path);
-        errdefer allocator.free(t.path.?);
-
-        if (t.blockCount() == 0) return t;
-
-        const first_base = try t.blockBaseKey(0);
-        t.smallest = try allocator.dupe(u8, first_base);
-        errdefer {
-            allocator.free(t.smallest);
-            t.smallest = &[_]u8{};
-        }
-
-        const last = t.index.lastKey();
-        if (last.len > 0) {
-            t.biggest = try allocator.dupe(u8, last);
-        }
         return t;
     }
 
@@ -95,20 +76,6 @@ pub const Table = struct {
 
         t.* = try parse(allocator, owned);
         // mmap_buf is null (set by parse); t.buf = owned.
-
-        if (t.blockCount() == 0) return t;
-
-        const first_base = try t.blockBaseKey(0);
-        t.smallest = try allocator.dupe(u8, first_base);
-        errdefer {
-            allocator.free(t.smallest);
-            t.smallest = &[_]u8{};
-        }
-
-        const last = t.index.lastKey();
-        if (last.len > 0) {
-            t.biggest = try allocator.dupe(u8, last);
-        }
         return t;
     }
 
@@ -129,35 +96,51 @@ pub const Table = struct {
         if (got_checksum != stored_checksum) return error.ChecksumMismatch;
 
         const index_reader = try buffers.TableIndexReader.init(index_bytes, 0);
-        const codec: compress.Codec = if (index_reader.isLz4())
+        var index = try buffers.TableIndexStruct.fromReader(allocator, index_reader);
+        errdefer index.deinit(allocator);
+
+        const codec: compress.Codec = if (index.is_lz4)
             .lz4
-        else if (index_reader.isZstd())
+        else if (index.is_zstd)
             .zstd
         else
             .none;
+
+        // Steal the fingerprints slice from the decoded index struct into a
+        // BinaryFuse(u16) that we keep for the lifetime of this Table.  After
+        // the transfer index.binary_fuse holds no heap memory (fingerprints is
+        // &.{}) so index.deinit() becomes a no-op for that field.
+        const binary_fuse: ?binaryfuse.BinaryFuse(u16) = if (index.binary_fuse) |*bf| blk: {
+            const filter = binaryfuse.BinaryFuse(u16){
+                .seed = bf.seed,
+                .segment_length = bf.segment_length,
+                .segment_length_mask = bf.segment_length_mask,
+                .segment_count = bf.segment_count,
+                .segment_count_length = bf.segment_count_length,
+                .fingerprints = bf.fingerprints,
+            };
+            bf.fingerprints = &.{};
+            index.binary_fuse = null;
+            break :blk filter;
+        } else null;
 
         return .{
             .allocator = allocator,
             .buf = buf,
             .mmap_buf = null,
             .path = null,
-            .index = index_reader,
-            .key_count = index_reader.keyCount(),
-            .max_version = index_reader.maxVersion(),
+            .index = index,
             .codec = codec,
-            .binary_fuse = try loadBinaryFuse(allocator, index_reader),
-            .ref = std.atomic.Value(i32).init(1), // ref = 1
-            .smallest = &[_]u8{},
-            .biggest = &[_]u8{},
+            .binary_fuse = binary_fuse,
+            .ref = std.atomic.Value(i32).init(1),
         };
     }
 
     // No one should be calling this from outside.
     fn deinit(self: *Table) void {
         if (self.path) |p| self.allocator.free(p);
-        if (self.smallest.len > 0) self.allocator.free(self.smallest);
-        if (self.biggest.len > 0) self.allocator.free(self.biggest);
-        if (self.binary_fuse) |bf| bf.deinit(self.allocator);
+        self.index.deinit(self.allocator);
+        if (self.binary_fuse) |*bf| bf.deinit(self.allocator);
         if (self.mmap_buf) |mb| {
             std.posix.munmap(mb);
         } else {
@@ -191,8 +174,17 @@ pub const Table = struct {
         }
     }
 
-    pub fn getIndex(self: Table) buffers.TableIndexReader {
-        return self.index;
+    pub fn getIndex(self: *const Table) *const buffers.TableIndexStruct {
+        return &self.index;
+    }
+
+    pub fn smallest(self: *const Table) []const u8 {
+        if (self.index.blocks.len == 0) return &.{};
+        return self.index.blocks[0].key;
+    }
+
+    pub fn biggest(self: *const Table) []const u8 {
+        return self.index.last_key;
     }
 
     pub fn containsKey(self: *const Table, key_no_ts: []const u8) bool {
@@ -204,21 +196,22 @@ pub const Table = struct {
     }
 
     pub fn blockCount(self: Table) usize {
-        return @intCast(self.index.blocksLen());
+        return self.index.blocks.len;
     }
 
     pub fn blockBaseKey(self: Table, block_idx: usize) Error![]const u8 {
-        const bi = try self.index.blocksAt(@intCast(block_idx));
-        return bi.key();
+        if (block_idx >= self.index.blocks.len) return error.CorruptTable;
+        return self.index.blocks[block_idx].key;
     }
 
     pub fn readBlock(self: Table, alloc: std.mem.Allocator, block_idx: usize, out: *std.ArrayList(u8)) Error![]const u8 {
-        const bi = try self.index.blocksAt(@intCast(block_idx));
+        if (block_idx >= self.index.blocks.len) return error.CorruptTable;
+        const bi = self.index.blocks[block_idx];
 
-        const start: usize = bi.offset();
-        const end = start + bi.len();
+        const start: usize = bi.offset;
+        const end = start + bi.len;
         if (end > self.buf.len) return error.CorruptTable;
-        if (bi.len() < 4) return error.CorruptTable;
+        if (bi.len < 4) return error.CorruptTable;
 
         const raw = self.buf[start..end];
 
@@ -232,19 +225,6 @@ pub const Table = struct {
         const got_checksum = std.hash.crc.Crc32Iscsi.hash(block[0..checksum_off]);
         if (stored_checksum != got_checksum) return error.ChecksumMismatch;
         return block;
-    }
-
-    fn loadBinaryFuse(allocator: std.mem.Allocator, index_reader: buffers.TableIndexReader) !?binaryfuse.BinaryFuse(u16) {
-        const bf_reader = index_reader.binaryFuse() orelse return null;
-        const fingerprints = try bf_reader.fingerprintsToSliceAlloc(allocator);
-        return binaryfuse.BinaryFuse(u16){
-            .seed = bf_reader.seed(),
-            .segment_length = bf_reader.segmentLength(),
-            .segment_length_mask = bf_reader.segmentLengthMask(),
-            .segment_count = bf_reader.segmentCount(),
-            .segment_count_length = bf_reader.segmentCountLength(),
-            .fingerprints = fingerprints,
-        };
     }
 };
 

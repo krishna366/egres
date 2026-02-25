@@ -289,7 +289,7 @@ pub const LevelsController = struct {
         // --- compute union key range of all src tables ---
         var kr = KeyRange{};
         for (src_entries_slice) |e| {
-            const tkr = KeyRange{ .left = e.table.smallest, .right = e.table.biggest };
+            const tkr = KeyRange{ .left = e.table.smallest(), .right = e.table.biggest() };
             kr.extend(tkr);
         }
 

@@ -38,6 +38,29 @@ pub const MessageReader = union(enum) {
     U16ArrayOnly: U16ArrayOnlyReader,
 };
 
+pub const CellStruct = struct {
+    cell_hot: bool = false,
+    tag: u32 = 0,
+    data: []u8 = &.{},
+    cell_flags: u64 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: CellReader) Error!CellStruct {
+        var s = CellStruct{
+            .cell_hot = r.cellHot(),
+            .tag = r.tag(),
+            .cell_flags = r.cellFlags(),
+        };
+        errdefer s.deinit(alloc);
+        s.data = try alloc.dupe(u8, r.data());
+        return s;
+    }
+
+    pub fn deinit(self: *CellStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.data);
+        self.data = &.{};
+    }
+};
+
 pub const CellReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -293,6 +316,64 @@ pub const CellWriter = struct {
     }
 };
 
+pub const RowStruct = struct {
+    is_active: bool = false,
+    is_draining: bool = false,
+    is_bootstrapping: bool = false,
+    is_retiring: bool = false,
+    name: []u8 = &.{},
+    value: u64 = 0,
+    cells: []CellStruct = &.{},
+    row_cell: ?CellStruct = null,
+    status: u64 = 0,
+    lifecycle: u64 = 0,
+    u32_values: []u32 = &.{},
+    u64_values: []u64 = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: RowReader) Error!RowStruct {
+        var s = RowStruct{
+            .is_active = r.isActive(),
+            .is_draining = r.isDraining(),
+            .is_bootstrapping = r.isBootstrapping(),
+            .is_retiring = r.isRetiring(),
+            .value = r.value(),
+            .status = r.status(),
+            .lifecycle = r.lifecycle(),
+        };
+        errdefer s.deinit(alloc);
+        s.name = try alloc.dupe(u8, r.name());
+        s.u32_values = try r.u32ValuesToSliceAlloc(alloc);
+        s.u64_values = try r.u64ValuesToSliceAlloc(alloc);
+        {
+            const _cnt = r.cellsLen();
+            s.cells = try alloc.alloc(CellStruct, @intCast(_cnt));
+            @memset(s.cells, .{});
+            for (0.._cnt) |_i| {
+                const _child = try r.cellsAt(@intCast(_i));
+                s.cells[_i] = try CellStruct.fromReader(alloc, _child);
+            }
+        }
+        if (r.rowCell()) |_child| {
+            s.row_cell = try CellStruct.fromReader(alloc, _child);
+        }
+        return s;
+    }
+
+    pub fn deinit(self: *RowStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        self.name = &.{};
+        for (self.cells) |*_b| _b.deinit(alloc);
+        alloc.free(self.cells);
+        self.cells = &.{};
+        if (self.row_cell) |*_bf| _bf.deinit(alloc);
+        self.row_cell = null;
+        alloc.free(self.u32_values);
+        self.u32_values = &.{};
+        alloc.free(self.u64_values);
+        self.u64_values = &.{};
+    }
+};
+
 pub const RowReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -370,30 +451,27 @@ pub const RowReader = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 12)) catch 0;
     }
 
-    pub fn cellsLen(self: Self) u32 {
+    fn cellsSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 28;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 20)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 24)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 20)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 24)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn cellsLen(self: Self) u32 {
+        return @intCast(self.cellsSlice().len / 4);
     }
 
     pub fn cellsAt(self: Self, i: u32) Error!CellReader {
-        const slot_end = @as(u32, self.base) + 28;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 20));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 24));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
-        const child_off = try zbuf.readU32(self.buf, entry_off);
+        const s = self.cellsSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        const child_off = zbuf.readU32(s, off) catch unreachable;
         return CellReader.init(self.buf, child_off);
     }
 
@@ -445,78 +523,70 @@ pub const RowReader = struct {
         return ((word >> bit) & 1) == 1;
     }
 
-    pub fn u32ValuesLen(self: Self) u32 {
+    fn u32ValuesSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 56;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 48)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 52)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 48)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 52)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn u32ValuesLen(self: Self) u32 {
+        return @intCast(self.u32ValuesSlice().len / 4);
     }
 
     pub fn u32ValuesAt(self: Self, i: u32) Error!u32 {
-        const slot_end = @as(u32, self.base) + 56;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 48));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 52));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
-        return try zbuf.readU32(self.buf, entry_off);
+        const s = self.u32ValuesSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        return zbuf.readU32(s, off) catch unreachable;
     }
 
     pub fn u32ValuesToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u32 {
-        const count: u32 = self.u32ValuesLen();
-        if (count == 0) return try alloc.alloc(u32, 0);
-        var out = try alloc.alloc(u32, @intCast(count));
+        const raw = self.u32ValuesSlice();
+        const count = raw.len / 4;
+        const out = try alloc.alloc(u32, count);
         errdefer alloc.free(out);
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            out[@intCast(i)] = try self.u32ValuesAt(i);
+        for (out, 0..) |*v, i| {
+            v.* = zbuf.readU32(raw, i * 4) catch unreachable;
         }
         return out;
     }
 
-    pub fn u64ValuesLen(self: Self) u32 {
+    fn u64ValuesSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 64;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 56)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 60)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 56)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 60)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 8;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn u64ValuesLen(self: Self) u32 {
+        return @intCast(self.u64ValuesSlice().len / 8);
     }
 
     pub fn u64ValuesAt(self: Self, i: u32) Error!u64 {
-        const slot_end = @as(u32, self.base) + 64;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 56));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 60));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 8;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 8;
-        return try zbuf.readU64(self.buf, entry_off);
+        const s = self.u64ValuesSlice();
+        const off = @as(usize, i) * 8;
+        if (off + 8 > s.len) return zbuf.Error.OutOfBounds;
+        return zbuf.readU64(s, off) catch unreachable;
     }
 
     pub fn u64ValuesToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u64 {
-        const count: u32 = self.u64ValuesLen();
-        if (count == 0) return try alloc.alloc(u64, 0);
-        var out = try alloc.alloc(u64, @intCast(count));
+        const raw = self.u64ValuesSlice();
+        const count = raw.len / 8;
+        const out = try alloc.alloc(u64, count);
         errdefer alloc.free(out);
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            out[@intCast(i)] = try self.u64ValuesAt(i);
+        for (out, 0..) |*v, i| {
+            v.* = zbuf.readU64(raw, i * 8) catch unreachable;
         }
         return out;
     }
@@ -618,26 +688,12 @@ pub const RowBuffer = struct {
         }
         try writer.statusSet(reader.status());
         try writer.lifecycleSet(reader.lifecycle());
-        const count_u32Values: u32 = reader.u32ValuesLen();
-        if (count_u32Values != 0) {
-            var values_u32Values = try alloc.alloc(u32, @intCast(count_u32Values));
-            defer alloc.free(values_u32Values);
-            var i_u32Values: u32 = 0;
-            while (i_u32Values < count_u32Values) : (i_u32Values += 1) {
-                values_u32Values[@intCast(i_u32Values)] = try reader.u32ValuesAt(i_u32Values);
-            }
-            try writer.setU32Values(values_u32Values);
-        }
-        const count_u64Values: u32 = reader.u64ValuesLen();
-        if (count_u64Values != 0) {
-            var values_u64Values = try alloc.alloc(u64, @intCast(count_u64Values));
-            defer alloc.free(values_u64Values);
-            var i_u64Values: u32 = 0;
-            while (i_u64Values < count_u64Values) : (i_u64Values += 1) {
-                values_u64Values[@intCast(i_u64Values)] = try reader.u64ValuesAt(i_u64Values);
-            }
-            try writer.setU64Values(values_u64Values);
-        }
+        const values_u32Values = try reader.u32ValuesToSliceAlloc(alloc);
+        defer alloc.free(values_u32Values);
+        if (values_u32Values.len > 0) try writer.setU32Values(values_u32Values);
+        const values_u64Values = try reader.u64ValuesToSliceAlloc(alloc);
+        defer alloc.free(values_u64Values);
+        if (values_u64Values.len > 0) try writer.setU64Values(values_u64Values);
         const result = try writer.finish();
         return result.offset;
     }
@@ -916,6 +972,44 @@ pub const RowWriter = struct {
     }
 };
 
+pub const TableStruct = struct {
+    rows: []RowStruct = &.{},
+    payload: []u8 = &.{},
+    count: u32 = 0,
+    table_row: ?RowStruct = null,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: TableReader) Error!TableStruct {
+        var s = TableStruct{
+            .count = r.count(),
+        };
+        errdefer s.deinit(alloc);
+        s.payload = try alloc.dupe(u8, r.payload());
+        {
+            const _cnt = r.rowsLen();
+            s.rows = try alloc.alloc(RowStruct, @intCast(_cnt));
+            @memset(s.rows, .{});
+            for (0.._cnt) |_i| {
+                const _child = try r.rowsAt(@intCast(_i));
+                s.rows[_i] = try RowStruct.fromReader(alloc, _child);
+            }
+        }
+        if (r.tableRow()) |_child| {
+            s.table_row = try RowStruct.fromReader(alloc, _child);
+        }
+        return s;
+    }
+
+    pub fn deinit(self: *TableStruct, alloc: std.mem.Allocator) void {
+        for (self.rows) |*_b| _b.deinit(alloc);
+        alloc.free(self.rows);
+        self.rows = &.{};
+        alloc.free(self.payload);
+        self.payload = &.{};
+        if (self.table_row) |*_bf| _bf.deinit(alloc);
+        self.table_row = null;
+    }
+};
+
 pub const TableReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -940,30 +1034,27 @@ pub const TableReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn rowsLen(self: Self) u32 {
+    fn rowsSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn rowsLen(self: Self) u32 {
+        return @intCast(self.rowsSlice().len / 4);
     }
 
     pub fn rowsAt(self: Self, i: u32) Error!RowReader {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 4));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 8));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
-        const child_off = try zbuf.readU32(self.buf, entry_off);
+        const s = self.rowsSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        const child_off = zbuf.readU32(s, off) catch unreachable;
         return RowReader.init(self.buf, child_off);
     }
 
@@ -1201,6 +1292,23 @@ pub const TableWriter = struct {
     }
 };
 
+pub const U32ArrayOnlyStruct = struct {
+    values: []u32 = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!U32ArrayOnlyStruct {
+        var s = U32ArrayOnlyStruct{
+        };
+        errdefer s.deinit(alloc);
+        s.values = try r.valuesToSliceAlloc(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *U32ArrayOnlyStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.values);
+        self.values = &.{};
+    }
+};
+
 pub const U32ArrayOnlyReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -1225,40 +1333,36 @@ pub const U32ArrayOnlyReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn valuesLen(self: Self) u32 {
+    fn valuesSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn valuesLen(self: Self) u32 {
+        return @intCast(self.valuesSlice().len / 4);
     }
 
     pub fn valuesAt(self: Self, i: u32) Error!u32 {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 4));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 8));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
-        return try zbuf.readU32(self.buf, entry_off);
+        const s = self.valuesSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        return zbuf.readU32(s, off) catch unreachable;
     }
 
     pub fn valuesToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u32 {
-        const count: u32 = self.valuesLen();
-        if (count == 0) return try alloc.alloc(u32, 0);
-        var out = try alloc.alloc(u32, @intCast(count));
+        const raw = self.valuesSlice();
+        const count = raw.len / 4;
+        const out = try alloc.alloc(u32, count);
         errdefer alloc.free(out);
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            out[@intCast(i)] = try self.valuesAt(i);
+        for (out, 0..) |*v, i| {
+            v.* = zbuf.readU32(raw, i * 4) catch unreachable;
         }
         return out;
     }
@@ -1300,16 +1404,9 @@ pub const U32ArrayOnlyBuffer = struct {
     pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         const reader = try self.initReader();
         var writer = try U32ArrayOnlyWriter.initWithBuf(alloc, out);
-        const count_values: u32 = reader.valuesLen();
-        if (count_values != 0) {
-            var values_values = try alloc.alloc(u32, @intCast(count_values));
-            defer alloc.free(values_values);
-            var i_values: u32 = 0;
-            while (i_values < count_values) : (i_values += 1) {
-                values_values[@intCast(i_values)] = try reader.valuesAt(i_values);
-            }
-            try writer.setValues(values_values);
-        }
+        const values_values = try reader.valuesToSliceAlloc(alloc);
+        defer alloc.free(values_values);
+        if (values_values.len > 0) try writer.setValues(values_values);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1406,6 +1503,23 @@ pub const U32ArrayOnlyWriter = struct {
     }
 };
 
+pub const U64ArrayOnlyStruct = struct {
+    values: []u64 = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!U64ArrayOnlyStruct {
+        var s = U64ArrayOnlyStruct{
+        };
+        errdefer s.deinit(alloc);
+        s.values = try r.valuesToSliceAlloc(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *U64ArrayOnlyStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.values);
+        self.values = &.{};
+    }
+};
+
 pub const U64ArrayOnlyReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -1430,40 +1544,36 @@ pub const U64ArrayOnlyReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn valuesLen(self: Self) u32 {
+    fn valuesSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 8;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn valuesLen(self: Self) u32 {
+        return @intCast(self.valuesSlice().len / 8);
     }
 
     pub fn valuesAt(self: Self, i: u32) Error!u64 {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 4));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 8));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 8;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 8;
-        return try zbuf.readU64(self.buf, entry_off);
+        const s = self.valuesSlice();
+        const off = @as(usize, i) * 8;
+        if (off + 8 > s.len) return zbuf.Error.OutOfBounds;
+        return zbuf.readU64(s, off) catch unreachable;
     }
 
     pub fn valuesToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u64 {
-        const count: u32 = self.valuesLen();
-        if (count == 0) return try alloc.alloc(u64, 0);
-        var out = try alloc.alloc(u64, @intCast(count));
+        const raw = self.valuesSlice();
+        const count = raw.len / 8;
+        const out = try alloc.alloc(u64, count);
         errdefer alloc.free(out);
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            out[@intCast(i)] = try self.valuesAt(i);
+        for (out, 0..) |*v, i| {
+            v.* = zbuf.readU64(raw, i * 8) catch unreachable;
         }
         return out;
     }
@@ -1505,16 +1615,9 @@ pub const U64ArrayOnlyBuffer = struct {
     pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         const reader = try self.initReader();
         var writer = try U64ArrayOnlyWriter.initWithBuf(alloc, out);
-        const count_values: u32 = reader.valuesLen();
-        if (count_values != 0) {
-            var values_values = try alloc.alloc(u64, @intCast(count_values));
-            defer alloc.free(values_values);
-            var i_values: u32 = 0;
-            while (i_values < count_values) : (i_values += 1) {
-                values_values[@intCast(i_values)] = try reader.valuesAt(i_values);
-            }
-            try writer.setValues(values_values);
-        }
+        const values_values = try reader.valuesToSliceAlloc(alloc);
+        defer alloc.free(values_values);
+        if (values_values.len > 0) try writer.setValues(values_values);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1611,6 +1714,23 @@ pub const U64ArrayOnlyWriter = struct {
     }
 };
 
+pub const U16ArrayOnlyStruct = struct {
+    values: []u16 = &.{},
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!U16ArrayOnlyStruct {
+        var s = U16ArrayOnlyStruct{
+        };
+        errdefer s.deinit(alloc);
+        s.values = try r.valuesToSliceAlloc(alloc);
+        return s;
+    }
+
+    pub fn deinit(self: *U16ArrayOnlyStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.values);
+        self.values = &.{};
+    }
+};
+
 pub const U16ArrayOnlyReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -1635,40 +1755,36 @@ pub const U16ArrayOnlyReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn valuesLen(self: Self) u32 {
+    fn valuesSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 2;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn valuesLen(self: Self) u32 {
+        return @intCast(self.valuesSlice().len / 2);
     }
 
     pub fn valuesAt(self: Self, i: u32) Error!u16 {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 4));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 8));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 2;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 2;
-        return try zbuf.readU16(self.buf, entry_off);
+        const s = self.valuesSlice();
+        const off = @as(usize, i) * 2;
+        if (off + 2 > s.len) return zbuf.Error.OutOfBounds;
+        return zbuf.readU16(s, off) catch unreachable;
     }
 
     pub fn valuesToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u16 {
-        const count: u32 = self.valuesLen();
-        if (count == 0) return try alloc.alloc(u16, 0);
-        var out = try alloc.alloc(u16, @intCast(count));
+        const raw = self.valuesSlice();
+        const count = raw.len / 2;
+        const out = try alloc.alloc(u16, count);
         errdefer alloc.free(out);
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            out[@intCast(i)] = try self.valuesAt(i);
+        for (out, 0..) |*v, i| {
+            v.* = zbuf.readU16(raw, i * 2) catch unreachable;
         }
         return out;
     }
@@ -1710,16 +1826,9 @@ pub const U16ArrayOnlyBuffer = struct {
     pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         const reader = try self.initReader();
         var writer = try U16ArrayOnlyWriter.initWithBuf(alloc, out);
-        const count_values: u32 = reader.valuesLen();
-        if (count_values != 0) {
-            var values_values = try alloc.alloc(u16, @intCast(count_values));
-            defer alloc.free(values_values);
-            var i_values: u32 = 0;
-            while (i_values < count_values) : (i_values += 1) {
-                values_values[@intCast(i_values)] = try reader.valuesAt(i_values);
-            }
-            try writer.setValues(values_values);
-        }
+        const values_values = try reader.valuesToSliceAlloc(alloc);
+        defer alloc.free(values_values);
+        if (values_values.len > 0) try writer.setValues(values_values);
         const result = try writer.finish();
         return result.offset;
     }

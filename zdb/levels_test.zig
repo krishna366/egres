@@ -120,9 +120,9 @@ test "level_handler L1 sort" {
     try lh.addEntry(2, tb); // "b"
 
     // L1 sorts by smallest key ascending.
-    const sk0 = key_mod.parseKey(lh.entries.items[0].table.smallest);
-    const sk1 = key_mod.parseKey(lh.entries.items[1].table.smallest);
-    const sk2 = key_mod.parseKey(lh.entries.items[2].table.smallest);
+    const sk0 = key_mod.parseKey(lh.entries.items[0].table.smallest());
+    const sk1 = key_mod.parseKey(lh.entries.items[1].table.smallest());
+    const sk2 = key_mod.parseKey(lh.entries.items[2].table.smallest());
     try std.testing.expectEqualStrings("a", sk0);
     try std.testing.expectEqualStrings("b", sk1);
     try std.testing.expectEqualStrings("c", sk2);

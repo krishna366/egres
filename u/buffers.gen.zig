@@ -30,6 +30,27 @@ pub const MessageReader = union(enum) {
     TableIndex: TableIndexReader,
 };
 
+pub const BlockOffsetStruct = struct {
+    key: []u8 = &.{},
+    offset: u32 = 0,
+    len: u32 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: BlockOffsetReader) Error!BlockOffsetStruct {
+        var s = BlockOffsetStruct{
+            .offset = r.offset(),
+            .len = r.len(),
+        };
+        errdefer s.deinit(alloc);
+        s.key = try alloc.dupe(u8, r.key());
+        return s;
+    }
+
+    pub fn deinit(self: *BlockOffsetStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.key);
+        self.key = &.{};
+    }
+};
+
 pub const BlockOffsetReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -225,6 +246,46 @@ pub const BlockOffsetWriter = struct {
     }
 };
 
+pub const TableIndexStruct = struct {
+    offsets: []BlockOffsetStruct = &.{},
+    bloom_filter: []u8 = &.{},
+    max_version: u64 = 0,
+    key_count: u32 = 0,
+    uncompressed_size: u32 = 0,
+    on_disk_size: u32 = 0,
+    stale_data_size: u32 = 0,
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
+        var s = TableIndexStruct{
+            .max_version = r.maxVersion(),
+            .key_count = r.keyCount(),
+            .uncompressed_size = r.uncompressedSize(),
+            .on_disk_size = r.onDiskSize(),
+            .stale_data_size = r.staleDataSize(),
+        };
+        errdefer s.deinit(alloc);
+        s.bloom_filter = try alloc.dupe(u8, r.bloomFilter());
+        {
+            const _cnt = r.offsetsLen();
+            s.offsets = try alloc.alloc(BlockOffsetStruct, @intCast(_cnt));
+            @memset(s.offsets, .{});
+            for (0.._cnt) |_i| {
+                const _child = try r.offsetsAt(@intCast(_i));
+                s.offsets[_i] = try BlockOffsetStruct.fromReader(alloc, _child);
+            }
+        }
+        return s;
+    }
+
+    pub fn deinit(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
+        for (self.offsets) |*_b| _b.deinit(alloc);
+        alloc.free(self.offsets);
+        self.offsets = &.{};
+        alloc.free(self.bloom_filter);
+        self.bloom_filter = &.{};
+    }
+};
+
 pub const TableIndexReader = struct {
     const Self = @This();
     buf: []const u8,
@@ -249,30 +310,27 @@ pub const TableIndexReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn offsetsLen(self: Self) u32 {
+    fn offsetsSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch 0;
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch 0;
-        if (elem_count == 0) return 0;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 4)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 8)) catch return &.{};
+        if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return 0;
-        return elem_count;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn offsetsLen(self: Self) u32 {
+        return @intCast(self.offsetsSlice().len / 4);
     }
 
     pub fn offsetsAt(self: Self, i: u32) Error!BlockOffsetReader {
-        const slot_end = @as(u32, self.base) + 12;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return zbuf.Error.OutOfBounds;
-        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 4));
-        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 8));
-        if (i >= elem_count) return zbuf.Error.OutOfBounds;
-        if (elem_count == 0) return zbuf.Error.OutOfBounds;
-        const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-        const entry_off = @as(usize, index_off) + @as(usize, i) * 4;
-        const child_off = try zbuf.readU32(self.buf, entry_off);
+        const s = self.offsetsSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        const child_off = zbuf.readU32(s, off) catch unreachable;
         return BlockOffsetReader.init(self.buf, child_off);
     }
 

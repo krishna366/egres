@@ -61,8 +61,8 @@ test "table builder/reader roundtrip and seek" {
     const r = try Table.openMem(std.testing.allocator, tb.bytes);
     defer r.decrRef();
 
-    try std.testing.expectEqual(@as(u32, 4), r.key_count);
-    try std.testing.expectEqual(@as(u64, 9), r.max_version);
+    try std.testing.expectEqual(@as(u32, 4), r.index.key_count);
+    try std.testing.expectEqual(@as(u64, 9), r.index.max_version);
     try std.testing.expect(r.blockCount() >= 1);
 
     var it = TableIterator.init(std.testing.allocator, r);
@@ -176,9 +176,9 @@ test "table checksum mismatch is detected" {
     const r = try Table.openMem(std.testing.allocator, tb.bytes);
     defer r.decrRef();
 
-    const first_meta = try r.index.blocksAt(0);
-    const block_start: usize = first_meta.offset();
-    const block_end = block_start + first_meta.len();
+    const first_meta = r.index.blocks[0];
+    const block_start: usize = first_meta.offset;
+    const block_end = block_start + first_meta.len;
     @constCast(r.buf)[block_end - 5] ^= 0x01;
 
     var block_buf = std.ArrayList(u8).empty;
@@ -414,7 +414,7 @@ test "table: max_version" {
     const tbl = try Table.openMem(alloc, tb.bytes);
     defer tbl.decrRef();
 
-    try std.testing.expectEqual(@as(u64, n), tbl.max_version);
+    try std.testing.expectEqual(@as(u64, n), tbl.index.max_version);
 }
 
 // ---------------------------------------------------------------------------
@@ -428,8 +428,8 @@ test "table: smallest and biggest keys" {
     const tbl = try Table.openMem(alloc, tb.bytes);
     defer tbl.decrRef();
 
-    try std.testing.expectEqualStrings("key0000", zdb.key.parseKey(tbl.smallest));
-    try std.testing.expectEqualStrings("key0199", zdb.key.parseKey(tbl.biggest));
+    try std.testing.expectEqualStrings("key0000", zdb.key.parseKey(tbl.smallest()));
+    try std.testing.expectEqualStrings("key0199", zdb.key.parseKey(tbl.biggest()));
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +462,7 @@ test "table: big values" {
     const tbl = try Table.openMem(alloc, tb.bytes);
     defer tbl.decrRef();
 
-    try std.testing.expectEqual(@as(u32, n), tbl.key_count);
+    try std.testing.expectEqual(@as(u32, n), tbl.index.key_count);
 
     var it = TableIterator.init(alloc, tbl);
     defer it.deinit();

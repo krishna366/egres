@@ -118,7 +118,7 @@ pub const LevelHandler = struct {
         } else {
             std.mem.sort(TableEntry, self.entries.items, {}, struct {
                 fn lt(_: void, a: TableEntry, b: TableEntry) bool {
-                    return key.compareWithTs(a.table.smallest, b.table.smallest) == .lt;
+                    return key.compareWithTs(a.table.smallest(), b.table.smallest()) == .lt;
                 }
             }.lt);
         }
@@ -198,13 +198,13 @@ pub const LevelHandler = struct {
             // First table where kr.left <= biggest (could overlap on the left).
             const left = utils.search(TableEntry, items, kr.left, struct {
                 fn f(kr_left: []const u8, e: TableEntry) bool {
-                    return key.compareWithTs(kr_left, e.table.biggest) != .gt;
+                    return key.compareWithTs(kr_left, e.table.biggest()) != .gt;
                 }
             }.f);
             // First table where kr.right < smallest (no longer overlapping).
             const right = utils.search(TableEntry, items, kr.right, struct {
                 fn f(kr_right: []const u8, e: TableEntry) bool {
-                    return key.compareWithTs(kr_right, e.table.smallest) == .lt;
+                    return key.compareWithTs(kr_right, e.table.smallest()) == .lt;
                 }
             }.f);
             break :blk items[left..right];
@@ -262,7 +262,7 @@ pub const LevelHandler = struct {
             // First table whose biggest key >= search_key.
             const lo = utils.search(TableEntry, self.entries.items, search_key, struct {
                 fn f(sk: []const u8, e: TableEntry) bool {
-                    return key.compareWithTs(e.table.biggest, sk) != .lt;
+                    return key.compareWithTs(e.table.biggest(), sk) != .lt;
                 }
             }.f);
             if (lo >= self.entries.items.len) return null;
@@ -272,7 +272,7 @@ pub const LevelHandler = struct {
             // Compare by user key only: a table whose smallest user key is
             // greater than the search user key cannot contain the key at any
             // timestamp, so skip it.
-            if (std.mem.order(u8, key.parseKey(e.table.smallest), searchKeyNoTs) == .gt) return null;
+            if (std.mem.order(u8, key.parseKey(e.table.smallest()), searchKeyNoTs) == .gt) return null;
             if (!e.table.containsKey(searchKeyNoTs)) return null;
 
             var it = TableIterator.init(self.allocator, e.table);
