@@ -333,12 +333,17 @@ fn addZdbTests(
     zdb_levels_tests.root_module.addImport("zdb", zdb_mod);
     zdb_levels_tests.step.dependOn(regen_buffers_step);
 
+    const zdb_cache_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb/cache.zig"),
+    });
+
     const zdb_test_step = b.step("test-zdb", "Run zdb core tests");
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_core_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_skl_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_table_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_manifest_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_levels_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(zdb_cache_tests).step);
     return zdb_test_step;
 }
 
