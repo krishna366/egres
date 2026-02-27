@@ -1,0 +1,11 @@
+.{
+    .name = .egres,
+    .version = "0.0.0",
+    .fingerprint = 0xb7f2c3c0a4a0fbdc,
+    .paths = .{ "" },
+    .dependencies = .{
+        .zio = .{
+            .path = "../source/zio",
+        },
+    },
+}

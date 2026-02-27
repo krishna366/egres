@@ -8,3 +8,5 @@ pub const manifest = @import("zdb/manifest.zig");
 pub const level_handler = @import("zdb/level_handler.zig");
 pub const levels = @import("zdb/levels.zig");
 pub const cache = @import("zdb/cache.zig");
+pub const vfs = @import("zdb/vfs.zig");
+pub const bandwidth = @import("zdb/bandwidth.zig");

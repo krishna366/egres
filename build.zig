@@ -85,6 +85,7 @@ pub fn build(b: *std.Build) void {
     const zbuf_test_step = addZbufTests(b, target, optimize, regen_buffers_step);
     const raft_test_steps = addRaftTests(b, target, optimize, regen_buffers_step, raft_mod);
     const multiproc_step = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
+    addBenchZio(b, target, optimize);
 
     const all_test_step = b.step("test", "Run all tests");
     all_test_step.dependOn(regen_buffers_step);
@@ -337,6 +338,25 @@ fn addZdbTests(
         .root_module = makeModule(b, target, optimize, "zdb/cache.zig"),
     });
 
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+    zdb_mod.addImport("zio", zio_mod);
+
+    const zdb_vfs_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb/vfs_test.zig"),
+    });
+    zdb_vfs_tests.root_module.addImport("zio", zio_mod);
+    zdb_vfs_tests.linkLibC();
+
+    const zdb_bw_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb/bandwidth_test.zig"),
+    });
+    zdb_bw_tests.root_module.addImport("zio", zio_mod);
+    zdb_bw_tests.linkLibC();
+
     const zdb_test_step = b.step("test-zdb", "Run zdb core tests");
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_core_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_skl_tests).step);
@@ -344,6 +364,8 @@ fn addZdbTests(
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_manifest_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_levels_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_cache_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(zdb_vfs_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(zdb_bw_tests).step);
     return zdb_test_step;
 }
 
@@ -515,6 +537,29 @@ fn addRaftTests(
         .default_step = raft_test_step,
         .all_step = raft_test_all_step,
     };
+}
+
+fn addBenchZio(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
+    const bench_exe = b.addExecutable(.{
+        .name = "zio-bench",
+        .root_module = makeModule(b, target, .ReleaseFast, "benchmarks/zio_bench.zig"),
+    });
+    bench_exe.root_module.addImport("zio", zio_mod);
+    bench_exe.linkLibC();
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench-zio", "Run zio vs std.Thread benchmarks");
+    bench_step.dependOn(&run_bench.step);
 }
 
 fn addVendoredCompressionSources(b: *std.Build, compile: *std.Build.Step.Compile) void {
