@@ -1,9 +1,21 @@
 const std = @import("std");
 const zdb = @import("zdb");
+const vfs = zdb.vfs;
 
 const Builder = zdb.table.builder.Builder;
 const Table = zdb.table.Table;
 const TableIterator = zdb.table.TableIterator;
+
+/// Test helper: create an in-memory FileHandle from a buffer (dupes the data).
+fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
+    const owned = try allocator.dupe(u8, buf);
+    return .{
+        .file_size = @intCast(owned.len),
+        .owned_buf = owned,
+        .buf_allocator = allocator,
+        .vfs = &vfs.instance,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -58,14 +70,14 @@ test "table builder/reader roundtrip and seek" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const r = try Table.openMem(std.testing.allocator, tb.bytes);
+    const r = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, tb.bytes), .p0);
     defer r.decrRef();
 
     try std.testing.expectEqual(@as(u32, 4), r.index.key_count);
     try std.testing.expectEqual(@as(u64, 9), r.index.max_version);
     try std.testing.expect(r.blockCount() >= 1);
 
-    var it = TableIterator.init(std.testing.allocator, r);
+    var it = TableIterator.init(std.testing.allocator, r, .p0);
     defer it.deinit();
     try it.seekToFirst();
     try std.testing.expectEqualStrings("va9", it.itemRef().?.value);
@@ -97,7 +109,7 @@ test "table binary fuse contains keys" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const t = try Table.openMem(alloc, tb.bytes);
+    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer t.decrRef();
 
     try std.testing.expect(t.containsKey("apple"));
@@ -130,7 +142,7 @@ test "table binary fuse large keyset contains sampled keys" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const t = try Table.openMem(alloc, tb.bytes);
+    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer t.decrRef();
 
     const seed: u64 = @intCast(std.time.nanoTimestamp());
@@ -173,17 +185,15 @@ test "table checksum mismatch is detected" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const r = try Table.openMem(std.testing.allocator, tb.bytes);
+    const r = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, tb.bytes), .p0);
     defer r.decrRef();
 
     const first_meta = r.index.blocks[0];
     const block_start: usize = first_meta.offset;
     const block_end = block_start + first_meta.len;
-    @constCast(r.buf)[block_end - 5] ^= 0x01;
+    r.handle.owned_buf.?[block_end - 5] ^= 0x01;
 
-    var block_buf = std.ArrayList(u8).empty;
-    defer block_buf.deinit(std.testing.allocator);
-    try std.testing.expectError(error.ChecksumMismatch, r.readBlock(std.testing.allocator, 0, &block_buf));
+    try std.testing.expectError(error.ChecksumMismatch, r.readBlock(0, .p0));
 }
 
 test "merge iterator merges sorted streams" {
@@ -209,14 +219,14 @@ test "merge iterator merges sorted streams" {
     var t2 = try b2.finish();
     defer t2.deinit();
 
-    const r1 = try Table.openMem(std.testing.allocator, t1.bytes);
+    const r1 = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, t1.bytes), .p0);
     defer r1.decrRef();
-    const r2 = try Table.openMem(std.testing.allocator, t2.bytes);
+    const r2 = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, t2.bytes), .p0);
     defer r2.decrRef();
 
     var iters = [_]zdb.table.merge_iterator.Iterator{
-        .{ .table = TableIterator.init(std.testing.allocator, r1) },
-        .{ .table = TableIterator.init(std.testing.allocator, r2) },
+        .{ .table = TableIterator.init(std.testing.allocator, r1, .p0) },
+        .{ .table = TableIterator.init(std.testing.allocator, r2, .p0) },
     };
     var m = zdb.table.merge_iterator.MergeIterator.init(std.testing.allocator, iters[0..]);
     defer m.deinit();
@@ -242,10 +252,10 @@ test "table iterator: forward scan" {
     for ([_]usize{ 99, 100, 101 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        const tbl = try Table.openMem(alloc, tb.bytes);
+        const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
         defer tbl.decrRef();
 
-        var it = TableIterator.init(alloc, tbl);
+        var it = TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
 
         var count: usize = 0;
@@ -274,10 +284,10 @@ test "seek to first" {
     for ([_]usize{ 99, 100, 101, 199, 200, 250, 9999, 10000 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        const tbl = try Table.openMem(alloc, tb.bytes);
+        const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
         defer tbl.decrRef();
 
-        var it = TableIterator.init(alloc, tbl);
+        var it = TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
 
         try it.seekToFirst();
@@ -295,10 +305,10 @@ test "seek: various targets" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "k", 10000, 4096);
     defer tb.deinit();
-    const tbl = try Table.openMem(alloc, tb.bytes);
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer tbl.decrRef();
 
-    var it = TableIterator.init(alloc, tbl);
+    var it = TableIterator.init(alloc, tbl, .p0);
     defer it.deinit();
 
     const Case = struct { in: []const u8, valid: bool, out: []const u8 };
@@ -334,10 +344,10 @@ test "iterate from start: full scan" {
     for ([_]usize{ 99, 100, 101, 199, 200, 250, 9999, 10000 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        const tbl = try Table.openMem(alloc, tb.bytes);
+        const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
         defer tbl.decrRef();
 
-        var it = TableIterator.init(alloc, tbl);
+        var it = TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
 
         var count: usize = 0;
@@ -357,10 +367,10 @@ test "table: seek and iterate to end" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "key", 10000, 4096);
     defer tb.deinit();
-    const tbl = try Table.openMem(alloc, tb.bytes);
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer tbl.decrRef();
 
-    var it = TableIterator.init(alloc, tbl);
+    var it = TableIterator.init(alloc, tbl, .p0);
     defer it.deinit();
 
     // Seek to key1010, iterate to end — should visit keys 1010..9999.
@@ -411,21 +421,21 @@ test "table: max_version" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    const tbl = try Table.openMem(alloc, tb.bytes);
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer tbl.decrRef();
 
     try std.testing.expectEqual(@as(u64, n), tbl.index.max_version);
 }
 
 // ---------------------------------------------------------------------------
-// Smallest/biggest: Table.openMem() fills these from the index
+// Smallest/biggest: Table open fills these from the index
 // ---------------------------------------------------------------------------
 
 test "table: smallest and biggest keys" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "key", 200, 256);
     defer tb.deinit();
-    const tbl = try Table.openMem(alloc, tb.bytes);
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer tbl.decrRef();
 
     try std.testing.expectEqualStrings("key0000", zdb.key.parseKey(tbl.smallest()));
@@ -459,12 +469,12 @@ test "table: big values" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    const tbl = try Table.openMem(alloc, tb.bytes);
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer tbl.decrRef();
 
     try std.testing.expectEqual(@as(u32, n), tbl.index.key_count);
 
-    var it = TableIterator.init(alloc, tbl);
+    var it = TableIterator.init(alloc, tbl, .p0);
     defer it.deinit();
     try it.seekToFirst();
 

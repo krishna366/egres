@@ -1,8 +1,11 @@
 const std = @import("std");
+const zio = @import("zio");
+const utils = @import("utils");
 const options = @import("options.zig");
 const manifest = @import("manifest.zig");
 const level_handler = @import("level_handler.zig");
 const table_mod = @import("table.zig");
+const vfs = @import("vfs.zig");
 
 const Table = table_mod.Table;
 const TableIterator = table_mod.TableIterator;
@@ -58,8 +61,9 @@ pub const LevelsController = struct {
     next_file_id: std.atomic.Value(u64),
 
     /// open builds a LevelsController from an existing manifest state.
-    /// It reads each SST file listed in ms.tables, opens the table in memory,
+    /// It reads each SST file listed in ms.tables, opens the table,
     /// and distributes tables across their corresponding level handlers.
+    /// Table opens are spread across zio fibers for parallelism.
     pub fn open(
         allocator: std.mem.Allocator,
         opts: options.Options,
@@ -73,23 +77,22 @@ pub const LevelsController = struct {
         errdefer for (handlers) |*h| h.deinit();
 
         var max_id: u64 = 0;
+        var tse: utils.ThreadSafeError = .{};
+        var group: zio.Group = .init;
+        defer group.cancel();
 
         var it = ms.tables.iterator();
         while (it.next()) |kv| {
-            const id = kv.key_ptr.*;
             const tm = kv.value_ptr.*;
-            if (id > max_id) max_id = id;
-
+            if (kv.key_ptr.* > max_id) max_id = kv.key_ptr.*;
             if (tm.level >= opts.max_levels) continue;
 
-            const path = try std.fmt.allocPrint(allocator, "{s}/{d:0>6}.sst", .{ opts.dir, id });
-            defer allocator.free(path);
-
-            const t = try Table.open(allocator, path); // ref = 1
-            defer t.decrRef(); // on return, ref -= 1, so handlers is the only owner.
-
-            try handlers[tm.level].addEntry(id, t); // incrRef → ref = 2
+            try group.spawn(openTableFiber, .{
+                allocator, opts.dir, kv.key_ptr.*, tm.level, handlers, &tse,
+            });
         }
+        group.wait() catch {};
+        if (tse.get()) |err| return err;
 
         return .{
             .allocator = allocator,
@@ -97,6 +100,32 @@ pub const LevelsController = struct {
             .ms = ms,
             .handlers = handlers,
             .next_file_id = std.atomic.Value(u64).init(max_id + 1),
+        };
+    }
+
+    /// Opens a single SST and adds it to the appropriate handler.
+    fn openTableFiber(
+        allocator: std.mem.Allocator,
+        dir: []const u8,
+        id: u64,
+        level: u8,
+        handlers: []LevelHandler,
+        tse: *utils.ThreadSafeError,
+    ) void {
+        const path = std.fmt.allocPrint(allocator, "{s}/{d:0>6}.sst", .{ dir, id }) catch |err| {
+            tse.set(err);
+            return;
+        };
+        defer allocator.free(path);
+
+        const t = Table.open(allocator, path, .p0) catch |err| {
+            tse.set(err);
+            return;
+        };
+        defer t.decrRef();
+
+        handlers[level].addEntry(id, t) catch |err| {
+            tse.set(err);
         };
     }
 
@@ -110,9 +139,9 @@ pub const LevelsController = struct {
     /// get checks each level from L0 upward and returns the first matching item,
     /// or null if the key is absent. The returned item's key and value are
     /// duplicated with self.allocator; the caller must free them.
-    pub fn get(self: *LevelsController, search_key: []const u8) !?Item {
+    pub fn get(self: *LevelsController, search_key: []const u8, priority: vfs.Priority) !?Item {
         for (self.handlers) |*h| {
-            if (try h.get(search_key)) |item| return item;
+            if (try h.get(search_key, priority)) |item| return item;
         }
         return null;
     }
@@ -265,6 +294,7 @@ pub const LevelsController = struct {
     /// commits the manifest, and updates the level handlers atomically.
     pub fn doCompact(self: *LevelsController, src_level: u8) !void {
         const src: usize = src_level;
+        const prio: vfs.Priority = if (src_level == 0) .p1 else .p2;
 
         var t = try self.levelTargets();
         defer t.deinit();
@@ -305,9 +335,9 @@ pub const LevelsController = struct {
         defer self.allocator.free(all_iters);
 
         for (src_entries_slice, 0..) |e, i|
-            all_iters[i] = .{ .table = TableIterator.init(self.allocator, e.table) };
+            all_iters[i] = .{ .table = TableIterator.init(self.allocator, e.table, prio) };
         for (bot_entries_slice, 0..) |e, i|
-            bot_iters[i] = TableIterator.init(self.allocator, e.table);
+            bot_iters[i] = TableIterator.init(self.allocator, e.table, prio);
         all_iters[src_entries_slice.len] = .{ .concat = ConcatIterator.init(bot_iters) };
 
         var merge = MergeIterator.init(self.allocator, all_iters);
@@ -325,33 +355,46 @@ pub const LevelsController = struct {
         const cfg = table_mod.builder.Config{
             .target_block_size = self.opts.block_size,
             .codec = self.opts.compression,
+            .priority = prio,
         };
         const file_sz: usize = @intCast(t.file_sz[dest]);
 
         var bld = Builder.init(self.allocator, cfg);
         defer bld.deinit();
 
+        const FlushHandle = zio.JoinHandle(?*Table);
+        var flush_handles: std.ArrayList(FlushHandle) = .empty;
+        defer {
+            for (flush_handles.items) |*h| {
+                if (h.join()) |tp| tp.decrRef();
+            }
+            flush_handles.deinit(self.allocator);
+        }
+
         while (merge.itemRef()) |item| {
             try bld.add(item.key, item.value);
 
             try merge.next();
             if (bld.table_bytes.items.len >= file_sz) {
-                try self.flushBuilderOutput(&bld, &output_tables);
+                try self.flushBuilderOutput(&bld, &flush_handles);
                 bld.reset();
             }
         }
 
         // Flush any remaining data.
-        try self.flushBuilderOutput(&bld, &output_tables);
+        try self.flushBuilderOutput(&bld, &flush_handles);
 
-        // Best-effort directory sync so new SST filenames are visible after a crash.
-        // Some filesystems (tmpfs, certain network mounts) return EINVAL or EBADF for
-        // directory fsync — that's fine, we just skip it on those.
-        {
-            var dir = try std.fs.openDirAbsolute(self.opts.dir, .{});
-            defer dir.close();
-            _ = std.posix.system.fsync(dir.fd);
+        // Join all sync+open fibers and collect output tables.
+        for (flush_handles.items) |*h| {
+            const table_ptr = h.join() orelse return error.FlushFailed;
+            errdefer table_ptr.decrRef();
+            try output_tables.append(self.allocator, .{ .id = table_ptr.file_id, .table = table_ptr });
         }
+        flush_handles.clearAndFree(self.allocator);
+
+        // Best-effort directory sync in a zio fiber, overlapping with manifest build.
+        var dir_sync = try zio.spawn(vfs.VFS.syncDir, .{self.opts.dir});
+        defer dir_sync.join();
 
         // --- build manifest changes ---
         var changes = try std.ArrayList(manifest.Change).initCapacity(
@@ -378,15 +421,15 @@ pub const LevelsController = struct {
         for (output_tables.items) |e| e.table.decrRef();
     }
 
-    /// flushBuilderOutput finishes the builder, writes the bytes to a new SST
-    /// file on disk, mmaps it as a Table, and appends the entry to output.
+    /// flushBuilderOutput finishes the builder, writes bytes to a new SST file,
+    /// then spawns a fiber to sync and open it. The JoinHandle is appended to handles.
     fn flushBuilderOutput(
         self: *LevelsController,
         bld: *Builder,
-        output: *std.ArrayList(TableEntry),
+        handles: *std.ArrayList(zio.JoinHandle(?*Table)),
     ) !void {
         var tb = try bld.finish();
-        defer tb.deinit(); // always free the in-memory bytes; the file on disk is the source of truth
+        defer tb.deinit();
         if (tb.bytes.len == 0) return;
 
         const id = self.next_file_id.fetchAdd(1, .monotonic);
@@ -395,21 +438,26 @@ pub const LevelsController = struct {
             "{s}/{d:0>6}.sst",
             .{ self.opts.dir, id },
         );
-        defer self.allocator.free(path);
+        errdefer self.allocator.free(path);
 
-        {
-            var buf: [4096]u8 = undefined;
-            const file = try std.fs.createFileAbsolute(path, .{});
-            defer file.close();
+        const wh = try vfs.instance.createFile(path, .direct);
+        try wh.write(tb.bytes, 0, bld.cfg.priority);
 
-            var w = file.writer(&buf);
-            try w.interface.writeAll(tb.bytes);
-            try w.interface.flush();
-            try file.sync();
-        }
-        // tb.bytes are now on disk; open the file via mmap for random access.
-        const table_ptr = try Table.open(self.allocator, path); // ref = 1
-        errdefer table_ptr.decrRef(); // on error: ref → 0 → deletes the file
-        try output.append(self.allocator, .{ .id = id, .table = table_ptr });
+        // Sync + open in a fiber; data is in page cache after write.
+        try handles.append(self.allocator, try zio.spawn(syncAndOpen, .{
+            self.allocator, wh, path, bld.cfg.priority,
+        }));
+    }
+
+    fn syncAndOpen(
+        allocator: std.mem.Allocator,
+        wh: vfs.FileHandle,
+        path: []const u8,
+        priority: vfs.Priority,
+    ) ?*Table {
+        wh.sync() catch {};
+        wh.close();
+        defer allocator.free(path);
+        return Table.open(allocator, path, priority) catch null;
     }
 };

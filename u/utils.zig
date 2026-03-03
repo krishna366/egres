@@ -32,6 +32,22 @@ pub fn search(
     return lo;
 }
 
+/// Lock-free, first-error-wins container. Safe to call set() from many threads;
+/// only the first error is retained.
+pub const ThreadSafeError = struct {
+    raw: std.atomic.Value(u16) = std.atomic.Value(u16).init(0),
+
+    pub fn set(self: *ThreadSafeError, e: anyerror) void {
+        _ = self.raw.cmpxchgStrong(0, @intFromError(e), .acq_rel, .monotonic);
+    }
+
+    pub fn get(self: *const ThreadSafeError) ?anyerror {
+        const v = self.raw.load(.acquire);
+        if (v == 0) return null;
+        return @errorFromInt(v);
+    }
+};
+
 // Queue blocks producers when full and consumers when empty.
 // Queue is thread safe.
 pub fn Queue(comptime T: type, comptime capacity: usize) type {

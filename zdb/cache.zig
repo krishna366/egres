@@ -15,13 +15,46 @@
 //! - Cache(K)        — single shard, not thread-safe.
 //! - ShardedCache(K) — N shards, each guarded by a Mutex; thread-safe.
 //!
-//! The cache owns every key (for []const u8) and every value slice passed via
-//! `putOwn`; both must have been allocated with the same allocator used to
-//! initialise the cache.  If `putOwn` returns an error, both key and value
-//! have already been freed; the caller must not free them.
+//! Values are ref-counted `*Value` structs. The cache incrRefs on put/get and
+//! decrRefs on eviction/deinit. Callers must decrRef values returned by get.
+//! For []const u8 keys, the cache takes ownership of the key on put.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+// ---------------------------------------------------------------------------
+// Value — heap-allocated, ref-counted cache entry
+// ---------------------------------------------------------------------------
+
+pub const Value = struct {
+    data: []u8,
+    allocator: Allocator,
+    ref: std.atomic.Value(i32),
+
+    pub fn init(allocator: Allocator, data: []u8) !*Value {
+        const v = try allocator.create(Value);
+        v.* = .{ .data = data, .allocator = allocator, .ref = std.atomic.Value(i32).init(1) };
+        return v;
+    }
+
+    pub fn incrRef(self: *Value) *Value {
+        _ = self.ref.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    pub fn decrRef(self: *Value) void {
+        const prev = self.ref.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev == 1) {
+            self.allocator.free(self.data);
+            self.allocator.destroy(self);
+        }
+    }
+
+    pub fn byteSize(self: *const Value) usize {
+        return self.data.len;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -66,7 +99,7 @@ pub fn Cache(comptime K: type) type {
         /// and frequency bit.  Keeping val + freq in the map means `get` never
         /// touches the ring buffers.
         const Entry = struct {
-            val: []u8,
+            val: *Value,
             slot: usize,
             freq: std.atomic.Value(bool),
             tag: Tag,
@@ -163,7 +196,7 @@ pub fn Cache(comptime K: type) type {
             var it = self.map.iterator();
             while (it.next()) |kv| {
                 self.freeKey(kv.key_ptr.*);
-                self.allocator.free(kv.value_ptr.val);
+                kv.value_ptr.val.decrRef();
             }
             self.map.deinit();
             self.ghost_set.deinit();
@@ -173,32 +206,30 @@ pub fn Cache(comptime K: type) type {
         }
 
         /// Returns the cached value for `key`, marking it as recently used.
-        /// The returned slice is valid until the next `putOwn` that evicts
-        /// this entry.  Only touches the map; no ring access needed.
-        pub fn get(self: *Self, key: K) ?[]u8 {
+        /// The returned *Value has been incrRef'd; the caller must decrRef
+        /// when done.  Only touches the map; no ring access needed.
+        pub fn get(self: *Self, key: K) ?*Value {
             const entry = self.map.getPtr(key) orelse return null;
             entry.freq.store(true, .release);
-            return entry.val;
+            return entry.val.incrRef();
         }
 
-        /// Inserts `key` → `val`, transferring ownership of both to the cache.
-        /// Both must have been allocated with the cache's allocator.
-        /// On any error both key and val are freed; the caller must not free
-        /// them afterwards.
-        pub fn putOwn(self: *Self, key: K, val: []u8) !void {
+        /// Inserts `key` → `val` into the cache. The cache takes its own
+        /// reference on `val` (incrRef); the caller retains their existing ref.
+        /// Key ownership is transferred for []const u8 keys.
+        /// On error, the key is freed (for []const u8) but val is NOT decrRef'd.
+        pub fn put(self: *Self, key: K, val: *Value) !void {
             // Key already present: update value in-place, adjusting byte counts.
             if (self.map.getPtr(key)) |entry| {
-                // The stored key is already owned; free the caller's copy immediately.
-                // TODO: Doesn't smell right. We should figure what we want to do with keys, who do they
-                // belong to. Or, should we just dupe both the key and value as needed.
                 self.freeKey(key);
 
-                const old_len = entry.val.len;
-                self.allocator.free(entry.val);
+                const old_len = entry.val.data.len;
+                entry.val.decrRef(); // release old
+                _ = val.incrRef(); // cache holds new
                 entry.val = val;
                 switch (entry.tag) {
-                    .s_queue => self.s_bytes = self.s_bytes - old_len + val.len,
-                    .m_queue => self.m_bytes = self.m_bytes - old_len + val.len,
+                    .s_queue => self.s_bytes = self.s_bytes - old_len + val.data.len,
+                    .m_queue => self.m_bytes = self.m_bytes - old_len + val.data.len,
                 }
                 return;
             }
@@ -206,34 +237,39 @@ pub fn Cache(comptime K: type) type {
             const h = hashKey(K, key);
             if (self.ghost_set.contains(h)) {
                 // Ghost hit: skip S, go directly to M.
-                return self.pushMain(key, val);
+                // pushMain takes ownership of a ref, so incrRef here.
+                _ = val.incrRef();
+                self.pushMain(key, val) catch |err| {
+                    val.decrRef(); // undo incrRef on error
+                    return err;
+                };
+                return;
             }
 
             // Regular S insertion with byte-based eviction.
-            const entry_bytes = keySize(K, key) + val.len;
+            const entry_bytes = keySize(K, key) + val.data.len;
             while (self.s_bytes + entry_bytes > self.s_cap_bytes and self.s_len > 0) {
                 self.evictSmall() catch |err| {
                     self.freeKey(key);
-                    self.allocator.free(val);
                     return err;
                 };
             }
             if (self.s_len == self.s_ring.items.len) {
                 self.growRing(.s_queue) catch |err| {
                     self.freeKey(key);
-                    self.allocator.free(val);
                     return err;
                 };
             }
             const slot = self.s_head;
+            _ = val.incrRef(); // cache's ref
             self.map.put(key, .{
                 .tag = .s_queue,
                 .slot = slot,
                 .val = val,
                 .freq = std.atomic.Value(bool).init(false),
             }) catch |err| {
+                val.decrRef(); // undo cache's ref
                 self.freeKey(key);
-                self.allocator.free(val);
                 return err;
             };
             self.s_ring.items[slot] = key;
@@ -313,16 +349,17 @@ pub fn Cache(comptime K: type) type {
         }
 
         /// Push (key, val) into M, evicting first if M is over byte budget.
-        /// Takes ownership of both key and val; frees them on error.
-        fn pushMain(self: *Self, key: K, val: []u8) !void {
-            const entry_bytes = keySize(K, key) + val.len;
+        /// Takes ownership of one ref on val AND key (for []const u8).
+        /// On error, val is decrRef'd and key is freed.
+        fn pushMain(self: *Self, key: K, val: *Value) !void {
+            const entry_bytes = keySize(K, key) + val.data.len;
             while (self.m_bytes + entry_bytes > self.m_cap_bytes and self.m_len > 0)
                 self.evictMain();
 
             if (self.m_len == self.m_ring.items.len) {
                 self.growRing(.m_queue) catch |err| {
                     self.freeKey(key);
-                    self.allocator.free(val);
+                    val.decrRef();
                     return err;
                 };
             }
@@ -333,8 +370,8 @@ pub fn Cache(comptime K: type) type {
                 .val = val,
                 .freq = std.atomic.Value(bool).init(false),
             }) catch |err| {
+                val.decrRef();
                 self.freeKey(key);
-                self.allocator.free(val);
                 return err;
             };
             self.m_ring.items[slot] = key;
@@ -353,13 +390,13 @@ pub fn Cache(comptime K: type) type {
 
             self.s_tail = (self.s_tail + 1) % self.s_ring.items.len;
             self.s_len -= 1;
-            self.s_bytes -= keySize(K, key) + entry.val.len;
+            self.s_bytes -= keySize(K, key) + entry.val.data.len;
             if (entry.freq.load(.acquire)) {
                 return self.pushMain(key, entry.val);
             } else {
                 self.pushGhost(hashKey(K, key)) catch {}; // best-effort
                 self.freeKey(key);
-                self.allocator.free(entry.val);
+                entry.val.decrRef();
             }
         }
 
@@ -386,8 +423,8 @@ pub fn Cache(comptime K: type) type {
                     self.m_len += 1;
                     // m_bytes unchanged — try the next tail.
                 } else {
-                    self.m_bytes -= keySize(K, key) + entry.val.len;
-                    self.allocator.free(entry.val);
+                    self.m_bytes -= keySize(K, key) + entry.val.data.len;
+                    entry.val.decrRef();
                     _ = self.map.remove(key);
                     self.freeKey(key);
                     return;
@@ -437,19 +474,19 @@ pub fn ShardedCache(comptime K: type) type {
             return &self.shards[hashKey(K, key) % self.shards.len];
         }
 
-        pub fn get(self: *Self, key: K) ?[]u8 {
+        pub fn get(self: *Self, key: K) ?*Value {
             const s = self.pickShard(key);
             s.lock.lockShared();
             defer s.lock.unlockShared();
             return s.cache.get(key);
         }
 
-        /// See `Cache.putOwn` for ownership semantics.
-        pub fn putOwn(self: *Self, key: K, val: []u8) !void {
+        /// See `Cache.put` for ownership semantics.
+        pub fn put(self: *Self, key: K, val: *Value) !void {
             const s = self.pickShard(key);
             s.lock.lock();
             defer s.lock.unlock();
-            return s.cache.putOwn(key, val);
+            return s.cache.put(key, val);
         }
 
         /// Approximate total count across shards.
@@ -484,12 +521,15 @@ test "Cache basic put/get round-trip" {
     var c = try Cache([]const u8).init(std.testing.allocator, 100);
     defer c.deinit();
 
-    try c.putOwn(
+    const val = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "hello"));
+    defer val.decrRef();
+    try c.put(
         try std.testing.allocator.dupe(u8, "key"),
-        try std.testing.allocator.dupe(u8, "hello"),
+        val,
     );
     const got = c.get("key") orelse return error.Missing;
-    try std.testing.expectEqualStrings("hello", got);
+    defer got.decrRef();
+    try std.testing.expectEqualStrings("hello", got.data);
     try std.testing.expectEqual(@as(usize, 1), c.count());
 }
 
@@ -497,10 +537,13 @@ test "Cache put/get round-trip with u64 key" {
     var c = try Cache(u64).init(std.testing.allocator, 100);
     defer c.deinit();
 
-    try c.putOwn(42, try std.testing.allocator.dupe(u8, "forty-two"));
+    const val = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "forty-two"));
+    defer val.decrRef();
+    try c.put(42, val);
     const got = c.get(42) orelse return error.Missing;
-    try std.testing.expectEqualStrings("forty-two", got);
-    try std.testing.expectEqual(@as(?[]u8, null), c.get(99));
+    defer got.decrRef();
+    try std.testing.expectEqualStrings("forty-two", got.data);
+    try std.testing.expectEqual(@as(?*Value, null), c.get(99));
 }
 
 test "Cache one-hit-wonder: evicted to ghost, not M" {
@@ -511,12 +554,20 @@ test "Cache one-hit-wonder: evicted to ghost, not M" {
     defer c.deinit();
 
     // k0 inserted, no get → freq stays false.
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k0"), try std.testing.allocator.dupe(u8, "v0"));
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v0"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k0"), v);
+    }
     // k1 triggers eviction of k0 from S; freq=false → k0 goes to ghost.
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k1"), try std.testing.allocator.dupe(u8, "v1"));
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v1"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k1"), v);
+    }
 
-    try std.testing.expectEqual(@as(?[]u8, null), c.get("k0")); // evicted
-    try std.testing.expect(c.get("k1") != null); // still present
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k0")); // evicted
+    if (c.get("k1")) |v| v.decrRef(); // still present
     try std.testing.expectEqual(@as(usize, 0), c.m_len); // k0 did NOT go to M
     const h0 = hashKey([]const u8, "k0");
     try std.testing.expect(c.ghost_set.contains(h0)); // hash in ghost
@@ -527,14 +578,23 @@ test "Cache reused key promoted S → M" {
     var c = try Cache([]const u8).init(std.testing.allocator, 10);
     defer c.deinit();
 
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k0"), try std.testing.allocator.dupe(u8, "v0"));
-    _ = c.get("k0"); // sets freq=true
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v0"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k0"), v);
+    }
+    if (c.get("k0")) |v| v.decrRef(); // sets freq=true
 
     // k1 evicts k0 from S; freq=true → k0 goes to M.
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k1"), try std.testing.allocator.dupe(u8, "v1"));
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v1"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k1"), v);
+    }
 
     const got = c.get("k0") orelse return error.Missing; // now in M
-    try std.testing.expectEqualStrings("v0", got);
+    defer got.decrRef();
+    try std.testing.expectEqualStrings("v0", got.data);
     try std.testing.expectEqual(@as(usize, 1), c.m_len);
 }
 
@@ -544,14 +604,27 @@ test "Cache ghost re-entry goes directly to M" {
     defer c.deinit();
 
     // Evict k0 to ghost (freq=false).
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k0"), try std.testing.allocator.dupe(u8, "v0"));
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k1"), try std.testing.allocator.dupe(u8, "v1")); // evicts k0 → ghost
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v0"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k0"), v);
+    }
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v1"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k1"), v); // evicts k0 → ghost
+    }
 
     // Re-insert k0: ghost hit → should land in M directly.
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k0"), try std.testing.allocator.dupe(u8, "v0b"));
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v0b"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k0"), v);
+    }
 
     const got = c.get("k0") orelse return error.Missing;
-    try std.testing.expectEqualStrings("v0b", got);
+    defer got.decrRef();
+    try std.testing.expectEqualStrings("v0b", got.data);
     try std.testing.expectEqual(@as(usize, 1), c.m_len);
 }
 
@@ -562,17 +635,17 @@ test "Cache S FIFO eviction order" {
     defer c.deinit();
 
     // Insert four keys without any gets (freq stays false throughout).
-    // Each insertion beyond the S byte budget evicts the oldest S entry.
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k0"), try std.testing.allocator.dupe(u8, "v0"));
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k1"), try std.testing.allocator.dupe(u8, "v1"));
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k2"), try std.testing.allocator.dupe(u8, "v2")); // evicts k0
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k3"), try std.testing.allocator.dupe(u8, "v3")); // evicts k1
+    inline for (.{ "k0", "k1", "k2", "k3" }, .{ "v0", "v1", "v2", "v3" }) |k, vdata| {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, vdata));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, k), v);
+    }
 
     // k0 and k1 were evicted (freq=false → ghost); k2 and k3 remain.
-    try std.testing.expectEqual(@as(?[]u8, null), c.get("k0"));
-    try std.testing.expectEqual(@as(?[]u8, null), c.get("k1"));
-    try std.testing.expect(c.get("k2") != null);
-    try std.testing.expect(c.get("k3") != null);
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k0"));
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k1"));
+    if (c.get("k2")) |v| v.decrRef();
+    if (c.get("k3")) |v| v.decrRef();
     try std.testing.expectEqual(@as(usize, 0), c.m_len); // no promotions
 }
 
@@ -583,36 +656,61 @@ test "Cache M freq reset on reinsertion" {
     defer c.deinit();
 
     // Promote k0 and k1 into M.
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k0"), try std.testing.allocator.dupe(u8, "v0"));
-    _ = c.get("k0"); // freq=true
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k1"), try std.testing.allocator.dupe(u8, "v1")); // k0 → M
-    _ = c.get("k1"); // freq=true in S
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k2"), try std.testing.allocator.dupe(u8, "v2")); // k1 → M; M has k0, k1
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v0"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k0"), v);
+    }
+    if (c.get("k0")) |v| v.decrRef(); // freq=true
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v1"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k1"), v); // k0 → M
+    }
+    if (c.get("k1")) |v| v.decrRef(); // freq=true in S
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v2"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k2"), v); // k1 → M; M has k0, k1
+    }
 
     // Mark both M entries as freq=true.
-    _ = c.get("k0");
-    _ = c.get("k1");
+    if (c.get("k0")) |v| v.decrRef();
+    if (c.get("k1")) |v| v.decrRef();
 
     // Promote k2 into M: M full by bytes → evictM cycles past freq=true entries,
     // reinserting with freq=false, until one is evicted (k0 comes around first).
-    _ = c.get("k2"); // freq=true in S
-    try c.putOwn(try std.testing.allocator.dupe(u8, "k3"), try std.testing.allocator.dupe(u8, "v3")); // k2 → M; evicts k0
+    if (c.get("k2")) |v| v.decrRef(); // freq=true in S
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v3"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "k3"), v); // k2 → M; evicts k0
+    }
 
-    try std.testing.expectEqual(@as(?[]u8, null), c.get("k0")); // evicted from M
-    try std.testing.expect(c.get("k1") != null);
-    try std.testing.expect(c.get("k2") != null);
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k0")); // evicted from M
+    if (c.get("k1")) |v| v.decrRef();
+    if (c.get("k2")) |v| v.decrRef();
 }
 
 test "Cache update existing key frees old value" {
     var c = try Cache([]const u8).init(std.testing.allocator, 100);
     defer c.deinit();
 
-    try c.putOwn(try std.testing.allocator.dupe(u8, "key"), try std.testing.allocator.dupe(u8, "old"));
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "old"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "key"), v);
+    }
     // Second put: owned key is freed immediately (entry exists); only val is replaced.
-    try c.putOwn(try std.testing.allocator.dupe(u8, "key"), try std.testing.allocator.dupe(u8, "new"));
+    {
+        const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "new"));
+        defer v.decrRef();
+        try c.put(try std.testing.allocator.dupe(u8, "key"), v);
+    }
 
     const got = c.get("key") orelse return error.Missing;
-    try std.testing.expectEqualStrings("new", got);
+    defer got.decrRef();
+    try std.testing.expectEqualStrings("new", got.data);
     try std.testing.expectEqual(@as(usize, 1), c.count()); // still one entry
 }
 
@@ -622,15 +720,24 @@ test "Cache byteSize reflects inserted bytes and respects capacity" {
     defer c.deinit();
 
     // u64 key = 8 bytes; val "hi" = 2 bytes → entry_bytes = 10.
-    try c.putOwn(1, try std.testing.allocator.dupe(u8, "hi"));
-    try c.putOwn(2, try std.testing.allocator.dupe(u8, "hi"));
+    {
+        const v1 = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "hi"));
+        defer v1.decrRef();
+        try c.put(1, v1);
+    }
+    {
+        const v2 = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "hi"));
+        defer v2.decrRef();
+        try c.put(2, v2);
+    }
     try std.testing.expectEqual(@as(usize, 20), c.byteSize());
 
     // Insert 100 more entries, each 18 bytes (8 + 10).
     // 102 total × 18 = 1836 > 1000 → evictions must fire to stay under budget.
     for (3..103) |i| {
-        const val = try std.testing.allocator.dupe(u8, "aaaaaaaaaa"); // 10 bytes
-        try c.putOwn(@intCast(i), val);
+        const val = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "aaaaaaaaaa"));
+        defer val.decrRef();
+        try c.put(@intCast(i), val);
     }
     try std.testing.expect(c.byteSize() <= 1000);
 }
@@ -639,12 +746,15 @@ test "ShardedCache basic get/put" {
     var sc = try ShardedCache([]const u8).init(std.testing.allocator, 200, 4);
     defer sc.deinit();
 
-    try sc.putOwn(
+    const val = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "xval"));
+    defer val.decrRef();
+    try sc.put(
         try std.testing.allocator.dupe(u8, "x"),
-        try std.testing.allocator.dupe(u8, "xval"),
+        val,
     );
     const got = sc.get("x") orelse return error.Missing;
-    try std.testing.expectEqualStrings("xval", got);
+    defer got.decrRef();
+    try std.testing.expectEqualStrings("xval", got.data);
 }
 
 test "ShardedCache concurrent puts and gets" {
@@ -668,13 +778,17 @@ test "ShardedCache concurrent puts and gets" {
             for (0..64) |i| {
                 const key_lit = static_keys[i % static_keys.len];
                 const key = ctx.alloc.dupe(u8, key_lit) catch continue;
-                const val = ctx.alloc.dupe(u8, key_lit) catch {
+                const data = ctx.alloc.dupe(u8, key_lit) catch {
                     ctx.alloc.free(key);
                     continue;
                 };
-                // putOwn takes ownership of key and val; frees both on error.
-                ctx.sc.putOwn(key, val) catch {};
-                _ = ctx.sc.get(key_lit); // get is a lookup; no ownership
+                const val = Value.init(ctx.alloc, data) catch {
+                    ctx.alloc.free(key);
+                    continue;
+                };
+                defer val.decrRef();
+                ctx.sc.put(key, val) catch {};
+                if (ctx.sc.get(key_lit)) |v| v.decrRef();
             }
         }
     };
@@ -708,15 +822,18 @@ test "Cache ring growth preserves all entries" {
         for (0..64) |_| {
             var buf: [20]u8 = undefined;
             const s = std.fmt.bufPrint(&buf, "val-{d}", .{next_key}) catch unreachable;
-            try c.putOwn(next_key, try alloc.dupe(u8, s));
+            const val = try Value.init(alloc, try alloc.dupe(u8, s));
+            defer val.decrRef();
+            try c.put(next_key, val);
             next_key += 1;
         }
 
         for (1..next_key) |key_i| {
             const got = c.get(@intCast(key_i)) orelse return error.Missing;
+            defer got.decrRef();
             var buf: [20]u8 = undefined;
             const expected = std.fmt.bufPrint(&buf, "val-{d}", .{key_i}) catch unreachable;
-            try std.testing.expectEqualStrings(expected, got);
+            try std.testing.expectEqualStrings(expected, got.data);
         }
 
         std.debug.print("s_ring {d} -> {d} . m_ring {d} -> {d}\n", .{

@@ -1,5 +1,7 @@
 const std = @import("std");
+const zio = @import("zio");
 const zdb = @import("zdb");
+const vfs = zdb.vfs;
 
 const key_mod = zdb.key;
 const table_mod = zdb.table;
@@ -19,6 +21,10 @@ const levels = zdb.levels;
 const LevelsController = levels.LevelsController;
 
 const options_mod = zdb.options;
+
+test {
+    _ = try zio.Runtime.init(std.heap.smp_allocator, .{});
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -46,10 +52,21 @@ fn buildTable(
     return b.finish();
 }
 
-/// Opens a heap-allocated Table from a TableBuffer. Duplicates tb.bytes
-/// internally; caller retains ownership of tb.
+/// Test helper: create an in-memory FileHandle from a buffer (dupes the data).
+fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
+    const owned = try allocator.dupe(u8, buf);
+    return .{
+        .file_size = @intCast(owned.len),
+        .owned_buf = owned,
+        .buf_allocator = allocator,
+        .vfs = &vfs.instance,
+    };
+}
+
+/// Opens a heap-allocated Table from a TableBuffer via VFS FileHandle.
+/// Duplicates tb.bytes internally; caller retains ownership of tb.
 fn openTableOwned(alloc: std.mem.Allocator, tb: *table_mod.builder.TableBuffer) !*Table {
-    return Table.openMem(alloc, tb.bytes);
+    return Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
 }
 
 fn freeTable(_: std.mem.Allocator, t: *Table) void {
@@ -240,7 +257,7 @@ test "get L0 newest wins" {
     const search = try key_mod.withTs(alloc, "k", std.math.maxInt(u64));
     defer alloc.free(search);
 
-    const item = try lh.get(search);
+    const item = try lh.get(search, .p0);
     try std.testing.expect(item != null);
     defer {
         alloc.free(item.?.key);
@@ -279,7 +296,7 @@ test "get L1 hit" {
     const search = try key_mod.withTs(alloc, "b", 0);
     defer alloc.free(search);
 
-    const item = try lh.get(search);
+    const item = try lh.get(search, .p0);
     try std.testing.expect(item != null);
     defer {
         alloc.free(item.?.key);
@@ -307,7 +324,7 @@ test "get miss" {
     const search = try key_mod.withTs(alloc, "z", 0);
     defer alloc.free(search);
 
-    const item = try lh.get(search);
+    const item = try lh.get(search, .p0);
     try std.testing.expect(item == null);
 }
 
@@ -317,6 +334,7 @@ test "get miss" {
 
 test "levels open" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
@@ -369,6 +387,7 @@ test "levels open" {
 
 test "pick compact level" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
@@ -409,6 +428,7 @@ test "pick compact level" {
 
 test "do compact L0->L1" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
@@ -458,7 +478,7 @@ test "do compact L0->L1" {
     for (l0_data) |d| {
         const sk = try key_mod.withTs(alloc, d.key, std.math.maxInt(u64));
         defer alloc.free(sk);
-        const item = try lc.get(sk);
+        const item = try lc.get(sk, .p0);
         try std.testing.expect(item != null);
         defer {
             alloc.free(item.?.key);
@@ -474,6 +494,7 @@ test "do compact L0->L1" {
 
 test "do compact L0->L1 with dest overlap" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
@@ -545,7 +566,7 @@ test "do compact L0->L1 with dest overlap" {
     for (expected) |e| {
         const sk = try key_mod.withTs(alloc, e.key, std.math.maxInt(u64));
         defer alloc.free(sk);
-        const item = try lc.get(sk);
+        const item = try lc.get(sk, .p0);
         try std.testing.expect(item != null);
         defer {
             alloc.free(item.?.key);
@@ -561,6 +582,7 @@ test "do compact L0->L1 with dest overlap" {
 
 test "do compact L1->L2" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
@@ -615,7 +637,7 @@ test "do compact L1->L2" {
     for (expected) |e| {
         const sk = try key_mod.withTs(alloc, e.key, std.math.maxInt(u64));
         defer alloc.free(sk);
-        const item = try lc.get(sk);
+        const item = try lc.get(sk, .p2);
         try std.testing.expect(item != null);
         defer {
             alloc.free(item.?.key);
@@ -631,6 +653,7 @@ test "do compact L1->L2" {
 
 test "levels get: L0 shadows L1" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
@@ -663,7 +686,7 @@ test "levels get: L0 shadows L1" {
     {
         const sk = try key_mod.withTs(alloc, "foo", std.math.maxInt(u64));
         defer alloc.free(sk);
-        const item = try lc.get(sk);
+        const item = try lc.get(sk, .p1);
         try std.testing.expect(item != null);
         defer {
             alloc.free(item.?.key);
@@ -678,7 +701,7 @@ test "levels get: L0 shadows L1" {
     {
         const sk = try key_mod.withTs(alloc, "foo", 3);
         defer alloc.free(sk);
-        const item = try lc.get(sk);
+        const item = try lc.get(sk, .p2);
         try std.testing.expect(item != null);
         defer {
             alloc.free(item.?.key);

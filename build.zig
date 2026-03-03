@@ -344,6 +344,7 @@ fn addZdbTests(
     });
     const zio_mod = zio_dep.module("zio");
     zdb_mod.addImport("zio", zio_mod);
+    zdb_levels_tests.root_module.addImport("zio", zio_mod);
 
     const zdb_vfs_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/vfs_test.zig"),

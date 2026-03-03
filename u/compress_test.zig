@@ -23,15 +23,17 @@ fn expectRoundTrip(
 ) !void {
     var enc_buf = std.ArrayList(u8).empty;
     defer enc_buf.deinit(alloc);
-    const encoded = try compress.compress(alloc, codec, data, &enc_buf);
+    const enc_sz = try compress.compress(alloc, codec, data, &enc_buf);
+    const encoded = enc_buf.items[enc_buf.items.len - enc_sz ..];
 
     var dec_buf = std.ArrayList(u8).empty;
     defer dec_buf.deinit(alloc);
-    const decoded = try compress.decompress(alloc, codec, encoded, &dec_buf);
+    const dec_sz = try compress.decompress(alloc, codec, encoded, &dec_buf);
+    const decoded = dec_buf.items[dec_buf.items.len - dec_sz ..];
 
     utils.testPrint(
         "[u.compress] codec={s} input_len={} compressed_len={} output_len={}\n",
-        .{ @tagName(codec), data.len, encoded.len, decoded.len },
+        .{ @tagName(codec), data.len, enc_sz, dec_sz },
     );
 
     try std.testing.expectEqualSlices(u8, data, decoded);
@@ -59,7 +61,8 @@ test "lz4 detects truncated frame" {
     const data = "hello world hello world hello world";
     var enc_buf = std.ArrayList(u8).empty;
     defer enc_buf.deinit(std.testing.allocator);
-    const encoded = try compress.compress(std.testing.allocator, .lz4, data, &enc_buf);
+    const enc_sz = try compress.compress(std.testing.allocator, .lz4, data, &enc_buf);
+    const encoded = enc_buf.items[enc_buf.items.len - enc_sz ..];
 
     const truncated = encoded[0 .. encoded.len - 1];
     var dec_buf = std.ArrayList(u8).empty;

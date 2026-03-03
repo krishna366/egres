@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const zio = @import("zio");
 const vfs = @import("vfs.zig");
 const bandwidth = @import("bandwidth.zig");
 const VFS = vfs.VFS;
@@ -22,8 +23,8 @@ test "open and close" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    const handle = try v.openFile(testing.allocator, path, .direct);
+    defer handle.close();
 
     try testing.expectEqual(@as(u64, 11), handle.file_size);
 }
@@ -40,11 +41,11 @@ test "readAligned at aligned offset" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    const handle = try v.openFile(testing.allocator, path, .direct);
+    defer handle.close();
 
     // Read 100 bytes at offset 0 (aligned).
-    const r = try v.readAligned(testing.allocator, handle, 0, 100, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 100, .p0);
     defer r.free();
 
     try testing.expectEqual(@as(usize, 100), r.data.len);
@@ -62,11 +63,11 @@ test "readAligned at unaligned offset" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    const handle = try v.openFile(testing.allocator, path, .direct);
+    defer handle.close();
 
     // Read 12 bytes at offset 5000 (unaligned).
-    const r = try v.readAligned(testing.allocator, handle, 5000, 12, .p1);
+    const r = try handle.readAligned(testing.allocator, 5000, 12, .p1);
     defer r.free();
 
     try testing.expectEqual(@as(usize, 12), r.data.len);
@@ -84,12 +85,12 @@ test "readAligned alignment math" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    const handle = try v.openFile(testing.allocator, path, .direct);
+    defer handle.close();
 
     // Read 12 bytes at offset 5000.
     // aligned_offset = 4096, prefix = 904, aligned_size = 4096.
-    const r = try v.readAligned(testing.allocator, handle, 5000, 12, .p2);
+    const r = try handle.readAligned(testing.allocator, 5000, 12, .p2);
     defer r.free();
 
     // Buffer must be 4KB-aligned.
@@ -111,13 +112,13 @@ test "O_DIRECT fallback on tmpfs" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    const handle = try v.openFile(testing.allocator, path, .direct);
+    defer handle.close();
 
     try testing.expectEqual(@as(u64, 13), handle.file_size);
 
     // Also verify we can read through the fallback fd.
-    const r = try v.readAligned(testing.allocator, handle, 0, 13, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 13, .p0);
     defer r.free();
 
     try testing.expectEqualSlices(u8, "fallback test", r.data);
@@ -137,11 +138,11 @@ test "bandwidth limiter deducts on read" {
     var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
     const tokens_before = limiter.tokens.load(.monotonic);
 
-    const v = VFS{ .bw = &limiter, .mode = .direct };
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    var v = VFS{ .bw = &limiter };
+    const handle = try v.openFile(testing.allocator, path, .direct);
+    defer handle.close();
 
-    const r = try v.readAligned(testing.allocator, handle, 0, 100, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 100, .p0);
     defer r.free();
 
     const tokens_after = limiter.tokens.load(.monotonic);
@@ -156,9 +157,9 @@ test "mmap open and close" {
     try writeTempFile(path, "mmap test data");
     defer std.fs.deleteFileAbsolute(path) catch {};
 
-    const v = VFS{ .bw = null, .mode = .mmap };
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    var v = VFS{ .bw = null };
+    const handle = try v.openFile(testing.allocator, path, .mmap);
+    defer handle.close();
 
     try testing.expectEqual(@as(u64, 14), handle.file_size);
     try testing.expect(handle.mapped != null);
@@ -174,17 +175,17 @@ test "mmap readAligned" {
     try writeTempFile(path, &data);
     defer std.fs.deleteFileAbsolute(path) catch {};
 
-    const v = VFS{ .bw = null, .mode = .mmap };
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    var v = VFS{ .bw = null };
+    const handle = try v.openFile(testing.allocator, path, .mmap);
+    defer handle.close();
 
     // Aligned offset.
-    const r1 = try v.readAligned(testing.allocator, handle, 0, 100, .p0);
+    const r1 = try handle.readAligned(testing.allocator, 0, 100, .p0);
     defer r1.free();
     try testing.expectEqualSlices(u8, data[0..100], r1.data);
 
     // Unaligned offset.
-    const r2 = try v.readAligned(testing.allocator, handle, 5000, 12, .p1);
+    const r2 = try handle.readAligned(testing.allocator, 5000, 12, .p1);
     defer r2.free();
     try testing.expectEqualSlices(u8, data[5000..5012], r2.data);
 }
@@ -196,11 +197,11 @@ test "mmap readAligned no allocation" {
     try writeTempFile(path, "no alloc test!");
     defer std.fs.deleteFileAbsolute(path) catch {};
 
-    const v = VFS{ .bw = null, .mode = .mmap };
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    var v = VFS{ .bw = null };
+    const handle = try v.openFile(testing.allocator, path, .mmap);
+    defer handle.close();
 
-    const r = try v.readAligned(testing.allocator, handle, 0, 14, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 14, .p0);
     defer r.free();
 
     try testing.expect(r.buf == null);
@@ -209,7 +210,7 @@ test "mmap readAligned no allocation" {
 
 // ── 10. mmap bandwidth ─────────────────────────────────────────────
 
-test "mmap bypasses bandwidth limiter" {
+test "mmap enforces bandwidth limiter" {
     const path = "/tmp/vfs_test_mmap_bw";
 
     var data: [8192]u8 = undefined;
@@ -220,16 +221,16 @@ test "mmap bypasses bandwidth limiter" {
     var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
     const tokens_before = limiter.tokens.load(.monotonic);
 
-    const v = VFS{ .bw = &limiter, .mode = .mmap };
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    var v = VFS{ .bw = &limiter };
+    const handle = try v.openFile(testing.allocator, path, .mmap);
+    defer handle.close();
 
-    const r = try v.readAligned(testing.allocator, handle, 0, 100, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 100, .p0);
     defer r.free();
 
-    // mmap reads don't go through the limiter — tokens unchanged.
+    // mmap reads now go through the limiter — tokens consumed.
     const tokens_after = limiter.tokens.load(.monotonic);
-    try testing.expectEqual(tokens_before, tokens_after);
+    try testing.expect(tokens_after < tokens_before);
 }
 
 // ── 11. Read bandwidth enforcement ──────────────────────────────────
@@ -252,9 +253,9 @@ test "read bandwidth enforcement" {
         .min_alloc = page_size,
     });
 
-    const v = VFS{ .bw = &limiter, .mode = .direct };
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    var v = VFS{ .bw = &limiter };
+    const handle = try v.openFile(testing.allocator, path, .direct);
+    defer handle.close();
 
     // Drain the initial bucket with a P0 read.
     _ = limiter.acquireAligned(.p0, rate, .read);
@@ -262,7 +263,7 @@ test "read bandwidth enforcement" {
 
     // Time a P1 read of the full file — must wait for refill.
     const start = std.time.milliTimestamp();
-    const r = try v.readAligned(testing.allocator, handle, 0, file_size, .p1);
+    const r = try handle.readAligned(testing.allocator, 0, file_size, .p1);
     defer r.free();
     const elapsed_ms = std.time.milliTimestamp() - start;
 
@@ -299,15 +300,15 @@ test "write bandwidth enforcement" {
     // Open for writing (need a real fd, not O_DIRECT for writes on tmpfs).
     const fd = try std.posix.open(path, .{ .ACCMODE = .WRONLY }, 0);
     defer std.posix.close(fd);
-    const fh = vfs.FileHandle{ .fd = fd, .file_size = file_size };
 
-    const v = VFS{ .bw = &limiter, .mode = .direct };
+    var v = VFS{ .bw = &limiter };
+    const fh = vfs.FileHandle{ .file = zio.File.fromFd(fd), .file_size = file_size, .vfs = &v };
 
     // Drain the bucket.
     _ = limiter.acquireAligned(.p0, rate, .read);
 
     const start = std.time.milliTimestamp();
-    try v.write(fh, data, 0, .p1);
+    try fh.write(data, 0, .p1);
     const elapsed_ms = std.time.milliTimestamp() - start;
 
     // Effective write rate ~4 MB/s. 2 MB should take ~500ms. Allow wide range.
@@ -318,14 +319,13 @@ test "write bandwidth enforcement" {
 // ── 13. P1 prioritized over P2 ──────────────────────────────────────
 
 const PriorityTestCtx = struct {
-    v: VFS,
     handle: vfs.FileHandle,
     bytes_read: std.atomic.Value(u64),
     finish_order: *std.atomic.Value(u32),
     my_order: std.atomic.Value(u32),
 
     fn readerFn(ctx: *PriorityTestCtx, priority: Priority) void {
-        const r = ctx.v.readAligned(testing.allocator, ctx.handle, 0, 128 * page_size, priority) catch return;
+        const r = ctx.handle.readAligned(testing.allocator, 0, 128 * page_size, priority) catch return;
         defer r.free();
         ctx.bytes_read.store(@intCast(r.data.len), .monotonic);
         // Record completion order: first finisher gets 0, second gets 1.
@@ -350,16 +350,16 @@ test "P1 prioritized over P2" {
         .min_alloc = page_size,
     });
 
-    const v = VFS{ .bw = &limiter, .mode = .direct };
-    const handle = try v.openFile(path);
-    defer VFS.close(handle);
+    var v = VFS{ .bw = &limiter };
+    const handle = try v.openFile(testing.allocator, path, .direct);
+    defer handle.close();
 
     // Drain the bucket so both threads must wait for refill.
     _ = limiter.acquireAligned(.p0, rate, .read);
 
     var finish_order = std.atomic.Value(u32).init(0);
-    var p1_ctx = PriorityTestCtx{ .v = v, .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
-    var p2_ctx = PriorityTestCtx{ .v = v, .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
+    var p1_ctx = PriorityTestCtx{ .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
+    var p2_ctx = PriorityTestCtx{ .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
 
     // Launch P2 first, then P1 — P1 should still finish first.
     const p2_thread = try std.Thread.spawn(.{}, PriorityTestCtx.readerFn, .{ &p2_ctx, .p2 });

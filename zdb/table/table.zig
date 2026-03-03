@@ -4,6 +4,12 @@ const idx = @import("index.zig");
 const buffers = @import("../buffers.gen.zig");
 const compress = @import("utils").compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
+const vfs = @import("../vfs.zig");
+const cache_mod = @import("../cache.zig");
+
+/// Module-level block cache singleton. Set before opening tables to enable caching.
+/// When null (default), readBlock always reads from disk.
+pub var block_cache: ?*cache_mod.ShardedCache(u64) = null;
 
 pub const Error = idx.Error || buffers.Error || compress.Error || key.Error ||
     std.mem.Allocator.Error || error{
@@ -23,94 +29,85 @@ pub const BlockLayout = struct {
 
 pub const Table = struct {
     allocator: std.mem.Allocator,
-    buf: []const u8,
-    /// Non-null for file-backed tables opened with open(). deinit() calls
-    /// munmap on this. Null for in-memory tables (openMem()); deinit() calls
-    /// allocator.free(buf) instead.
-    mmap_buf: ?[]align(std.heap.page_size_min) u8,
+    handle: vfs.FileHandle,
     index: buffers.TableIndexStruct,
     codec: compress.Codec,
     binary_fuse: ?binaryfuse.BinaryFuse(u16),
     ref: std.atomic.Value(i32),
+    file_id: u44, // parsed from SST filename; 0 for in-memory tables
     path: ?[]const u8, // owned; non-null for file-backed tables; deleted on last decrRef
 
-    /// open mmaps the SST file at path, parses the table, and initialises
-    /// smallest/biggest. Caller gets zero reference (ref = 0).
-    /// The returned pointer is heap-allocated with allocator; call decrRef when done.
-    pub fn open(allocator: std.mem.Allocator, path: []const u8) !*Table {
-        const file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
-        defer file.close();
+    pub fn fileSize(self: *const Table) u64 {
+        return self.handle.file_size;
+    }
 
-        const size: usize = @intCast(try file.getEndPos());
-        if (size == 0) return error.CorruptTable;
-
-        const mmap_buf = try std.posix.mmap(
-            null,
-            size,
-            std.posix.PROT.READ,
-            .{ .TYPE = .SHARED },
-            file.handle,
-            0,
-        );
-        errdefer std.posix.munmap(mmap_buf);
-
-        const t = try allocator.create(Table);
-        errdefer allocator.destroy(t);
-
-        t.* = try parse(allocator, mmap_buf[0..size]);
-        t.mmap_buf = mmap_buf;
+    /// open opens an SST file through the global VFS instance (vfs.instance).
+    /// The file loading mode is determined by vfs.instance; readAligned
+    /// transparently handles mmap, direct, and memory-backed file handles.
+    pub fn open(allocator: std.mem.Allocator, path: []const u8, priority: vfs.Priority) !*Table {
+        const handle = try vfs.instance.openFile(allocator, path, .default);
+        const t = try initFromHandle(allocator, handle, priority);
+        errdefer t.decrRef();
+        t.file_id = vfs.fileIdFromPath(path);
         t.path = try allocator.dupe(u8, path);
         return t;
     }
 
-    /// openMem parses a table from an in-memory buffer. The buffer is
-    /// duplicated internally; caller retains ownership of buf.
-    /// Caller gets one reference (ref = 1). Call decrRef() then
-    /// allocator.destroy() when done.
-    pub fn openMem(allocator: std.mem.Allocator, buf: []const u8) !*Table {
-        const owned = try allocator.dupe(u8, buf);
-        errdefer allocator.free(owned);
+    /// openHandle creates a Table from a pre-opened FileHandle.
+    /// Takes ownership of handle (closes it on error or when Table is freed).
+    /// The resulting table has no path (decrRef frees memory only, no file deletion).
+    pub fn openHandle(allocator: std.mem.Allocator, handle: vfs.FileHandle, priority: vfs.Priority) !*Table {
+        return initFromHandle(allocator, handle, priority);
+    }
+
+    /// Single code path: reads trailer + index via handle.readAligned.
+    fn initFromHandle(allocator: std.mem.Allocator, handle: vfs.FileHandle, priority: vfs.Priority) !*Table {
+        errdefer handle.close();
+
+        if (handle.file_size == 0) return error.CorruptTable;
+        const size: usize = @intCast(handle.file_size);
 
         const t = try allocator.create(Table);
         errdefer allocator.destroy(t);
 
-        t.* = try parse(allocator, owned);
-        // mmap_buf is null (set by parse); t.buf = owned.
-        return t;
-    }
+        // Read the last 8 bytes to get index_len and checksum.
+        if (size < 8) return error.CorruptTable;
+        const trailer_offset: u64 = @intCast(size - 8);
+        const trailer_result = try handle.readAligned(allocator, trailer_offset, 8, priority);
+        defer trailer_result.free();
 
-    fn parse(allocator: std.mem.Allocator, buf: []const u8) Error!Table {
-        if (buf.len < 8) return error.CorruptTable;
+        if (trailer_result.data.len < 8) return error.CorruptTable;
+        const index_len = idx.readU32LE(trailer_result.data, 0) catch return error.CorruptTable;
+        const stored_checksum = idx.readU32LE(trailer_result.data, 4) catch return error.CorruptTable;
 
-        var read_pos = buf.len;
-        const stored_checksum = try idx.readU32LE(buf, read_pos - 4);
-        read_pos -= 4;
+        // Read index bytes.
+        const index_end: u64 = @intCast(size - 8);
+        if (index_len > index_end) return error.CorruptTable;
+        const index_offset = index_end - index_len;
+        const index_result = try handle.readAligned(allocator, index_offset, index_len, priority);
+        defer index_result.free();
 
-        const index_len = try idx.readU32LE(buf, read_pos - 4);
-        read_pos -= 4;
-        if (index_len > read_pos) return error.CorruptTable;
-
-        const index_start = read_pos - index_len;
-        const index_bytes = buf[index_start..read_pos];
+        if (index_result.data.len < index_len) return error.CorruptTable;
+        const index_bytes = index_result.data[0..index_len];
         const got_checksum = std.hash.crc.Crc32Iscsi.hash(index_bytes);
         if (got_checksum != stored_checksum) return error.ChecksumMismatch;
 
         const index_reader = try buffers.TableIndexReader.init(index_bytes, 0);
-        var index = try buffers.TableIndexStruct.fromReader(allocator, index_reader);
-        errdefer index.deinit(allocator);
+        var table_index = try buffers.TableIndexStruct.fromReader(allocator, index_reader);
+        errdefer table_index.deinit(allocator);
 
-        const codec: compress.Codec = if (index.is_lz4)
+        const codec: compress.Codec = if (table_index.is_lz4)
             .lz4
-        else if (index.is_zstd)
+        else if (table_index.is_zstd)
             .zstd
         else
             .none;
 
         // Steal the fingerprints slice from the decoded index struct into a
         // BinaryFuse(u16) that we keep for the lifetime of this Table.  After
-        // the transfer index.binary_fuse holds no heap memory (fingerprints is
+        // the transfer table_index.binary_fuse holds no heap memory (fingerprints is
         // &.{}) so index.deinit() becomes a no-op for that field.
-        const binary_fuse: ?binaryfuse.BinaryFuse(u16) = if (index.binary_fuse) |*bf| blk: {
+        const binary_fuse: ?binaryfuse.BinaryFuse(u16) = if (table_index.binary_fuse) |*bf| blk: {
             const filter = binaryfuse.BinaryFuse(u16){
                 .seed = bf.seed,
                 .segment_length = bf.segment_length,
@@ -120,32 +117,28 @@ pub const Table = struct {
                 .fingerprints = bf.fingerprints,
             };
             bf.fingerprints = &.{};
-            index.binary_fuse = null;
+            table_index.binary_fuse = null;
             break :blk filter;
         } else null;
 
-        return .{
+        t.* = .{
             .allocator = allocator,
-            .buf = buf,
-            .mmap_buf = null,
-            .path = null,
-            .index = index,
+            .handle = handle,
+            .index = table_index,
             .codec = codec,
             .binary_fuse = binary_fuse,
             .ref = std.atomic.Value(i32).init(1),
+            .file_id = 0,
+            .path = null,
         };
+        return t;
     }
 
-    // No one should be calling this from outside.
     fn deinit(self: *Table) void {
         if (self.path) |p| self.allocator.free(p);
         self.index.deinit(self.allocator);
         if (self.binary_fuse) |*bf| bf.deinit(self.allocator);
-        if (self.mmap_buf) |mb| {
-            std.posix.munmap(mb);
-        } else {
-            self.allocator.free(self.buf);
-        }
+        self.handle.close();
     }
 
     /// detach forgets the SST file path without deleting it.
@@ -204,27 +197,58 @@ pub const Table = struct {
         return self.index.blocks[block_idx].key;
     }
 
-    pub fn readBlock(self: Table, alloc: std.mem.Allocator, block_idx: usize, out: *std.ArrayList(u8)) Error![]const u8 {
+    pub fn readBlock(self: *const Table, block_idx: usize, priority: vfs.Priority) Error!*cache_mod.Value {
         if (block_idx >= self.index.blocks.len) return error.CorruptTable;
-        const bi = self.index.blocks[block_idx];
 
-        const start: usize = bi.offset;
-        const end = start + bi.len;
-        if (end > self.buf.len) return error.CorruptTable;
+        // Cache key: 44 bits file_id (MSB) | 20 bits block_idx (LSB).
+        // null on overflow → cache_key = 0 → skip caching.
+        const fid: u64 = self.file_id;
+        const bidx: u64 = std.math.cast(u20, block_idx) orelse 0;
+        const cache_key: u64 = if (fid != 0 and bidx != 0) (fid << 20) | bidx else 0;
+
+        if (block_cache != null and cache_key != 0) {
+            if (block_cache.?.get(cache_key)) |val| return val; // incrRef'd by get.
+        }
+
+        const bi = self.index.blocks[block_idx];
         if (bi.len < 4) return error.CorruptTable;
 
-        const raw = self.buf[start..end];
+        // Read raw bytes (temporary)
+        const result = self.handle.readAligned(
+            self.allocator,
+            @intCast(bi.offset),
+            bi.len,
+            priority,
+        ) catch return error.CorruptTable;
+        defer result.free();
 
-        // Decompress into out (noop for .none), then verify checksum.
-        // CRC was computed before compression in the builder.
-        const block = try compress.decompress(alloc, self.codec, raw, out);
-        if (block.len < 4) return error.CorruptTable;
+        // Decompress (temporary)
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+        const sz = try compress.decompress(self.allocator, self.codec, result.data, &out);
+        if (sz < 4) return error.CorruptTable;
+        std.debug.assert(out.items.len == sz);
 
-        const checksum_off = block.len - 4;
-        const stored_checksum = try idx.readU32LE(block, checksum_off);
-        const got_checksum = std.hash.crc.Crc32Iscsi.hash(block[0..checksum_off]);
+        // Checksum
+        const checksum_off = sz - 4;
+        const stored_checksum = try idx.readU32LE(out.items, checksum_off);
+        const got_checksum = std.hash.crc.Crc32Iscsi.hash(out.items[0..checksum_off]);
         if (stored_checksum != got_checksum) return error.ChecksumMismatch;
-        return block;
+
+        // Create ref-counted Value with owned copy
+        const owned_data = try out.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned_data);
+
+        // val has ref=1
+        const val = cache_mod.Value.init(self.allocator, owned_data) catch return error.OutOfMemory;
+        errdefer val.decrRef();
+
+        // Cache insert (best-effort); put incrRefs on success → ref=2
+        if (block_cache != null and cache_key != 0) {
+            block_cache.?.put(cache_key, val) catch {};
+        }
+
+        return val; // caller holds ref (1 if not cached, or 1+cache_ref if cached)
     }
 };
 
@@ -390,27 +414,29 @@ pub const BlockIterator = struct {
 pub const TableIterator = struct {
     allocator: std.mem.Allocator,
     table: *Table,
-    scratch: std.heap.ArenaAllocator,
     bpos: usize,
     bi: ?BlockIterator,
+    current_block: ?*cache_mod.Value = null,
     valid: bool,
+    priority: vfs.Priority,
 
-    pub fn init(allocator: std.mem.Allocator, table: *Table) TableIterator {
+    pub fn init(allocator: std.mem.Allocator, table: *Table, priority: vfs.Priority) TableIterator {
         table.incrRef();
         return .{
             .allocator = allocator,
             .table = table,
-            .scratch = std.heap.ArenaAllocator.init(allocator),
             .bpos = 0,
             .bi = null,
+            .current_block = null,
             .valid = false,
+            .priority = priority,
         };
     }
 
     pub fn deinit(self: *TableIterator) void {
         self.table.decrRef();
         if (self.bi) |*bi| bi.deinit();
-        self.scratch.deinit();
+        if (self.current_block) |b| b.decrRef();
     }
 
     pub fn seekToFirst(self: *TableIterator) Error!void {
@@ -479,13 +505,14 @@ pub const TableIterator = struct {
 
     fn setBlock(self: *TableIterator, bpos: usize) Error!void {
         if (self.bi) |*bi| bi.deinit();
-        _ = self.scratch.reset(.free_all);
+        if (self.current_block) |b| b.decrRef();
+        self.current_block = null;
 
-        var block_buf = std.ArrayList(u8).empty;
-        const block = try self.table.readBlock(self.scratch.allocator(), bpos, &block_buf);
+        const val = try self.table.readBlock(bpos, self.priority);
+        self.current_block = val;
+
         const base_key = try self.table.blockBaseKey(bpos);
-
-        self.bi = try BlockIterator.init(self.allocator, block, base_key);
+        self.bi = try BlockIterator.init(self.allocator, val.data, base_key);
         self.bpos = bpos;
     }
 };

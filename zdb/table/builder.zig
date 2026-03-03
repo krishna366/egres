@@ -3,6 +3,7 @@ const key = @import("../key.zig");
 const buffers = @import("../buffers.gen.zig");
 const compress = @import("utils").compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
+const vfs = @import("../vfs.zig");
 
 // Table layout (Badger-inspired, with zbuf for TableIndex/BlockOffset):
 //
@@ -52,6 +53,7 @@ pub const Error = error{
 pub const Config = struct {
     target_block_size: usize = 32 * 1024,
     codec: compress.Codec = .none,
+    priority: vfs.Priority = .p2,
 };
 
 const BlockInfo = struct {
@@ -320,8 +322,7 @@ pub const Builder = struct {
         if (self.cfg.codec == .none) {
             try self.table_bytes.appendSlice(self.allocator, self.cur_block.items);
         } else {
-            const stored = try compress.compress(self.allocator, self.cfg.codec, self.cur_block.items, &self.table_bytes);
-            const clen: u32 = @intCast(stored.len);
+            const clen: u32 = @intCast(try compress.compress(self.allocator, self.cfg.codec, self.cur_block.items, &self.table_bytes));
             std.debug.assert(self.compressed_size <= std.math.maxInt(u32) - clen);
             self.compressed_size += clen;
         }

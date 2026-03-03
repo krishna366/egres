@@ -27,14 +27,14 @@ const shim = @cImport({
     @cInclude("u/compress_shim.h");
 });
 
-// Compresses input into out, appending the result. Returns a slice of the
-// appended bytes within out's buffer. No intermediate allocation is performed.
+/// Compresses input into out, appending the result. Returns the number of
+/// bytes appended. Access the data via out.items[out.items.len - sz ..].
 pub fn compress(
     alloc: std.mem.Allocator,
     codec: Codec,
     input: []const u8,
     out: *std.ArrayList(u8),
-) Error![]const u8 {
+) Error!usize {
     return switch (codec) {
         .none => noneInto(alloc, input, out),
         .zstd => compressZstdInto(alloc, input, out),
@@ -42,14 +42,14 @@ pub fn compress(
     };
 }
 
-// Decompresses input into out, appending the result. Returns a slice of the
-// appended bytes within out's buffer. No intermediate allocation is performed.
+/// Decompresses input into out, appending the result. Returns the number of
+/// bytes appended. Access the data via out.items[out.items.len - sz ..].
 pub fn decompress(
     alloc: std.mem.Allocator,
     codec: Codec,
     input: []const u8,
     out: *std.ArrayList(u8),
-) Error![]const u8 {
+) Error!usize {
     return switch (codec) {
         .none => noneInto(alloc, input, out),
         .zstd => decompressZstdInto(alloc, input, out),
@@ -61,17 +61,16 @@ fn noneInto(
     alloc: std.mem.Allocator,
     input: []const u8,
     out: *std.ArrayList(u8),
-) Error![]const u8 {
-    const start = out.items.len;
+) Error!usize {
     try out.appendSlice(alloc, input);
-    return out.items[start..];
+    return input.len;
 }
 
 fn compressZstdInto(
     alloc: std.mem.Allocator,
     input: []const u8,
     out: *std.ArrayList(u8),
-) Error![]const u8 {
+) Error!usize {
     const bound = zstd.ZSTD_compressBound(input.len);
     const start = out.items.len;
     try out.ensureUnusedCapacity(alloc, bound);
@@ -79,14 +78,14 @@ fn compressZstdInto(
     const written = zstd.ZSTD_compress(dst.ptr, dst.len, input.ptr, input.len, 1);
     if (zstd.ZSTD_isError(written) != 0) return error.CompressionFailed;
     out.items.len = start + written;
-    return out.items[start..];
+    return written;
 }
 
 fn decompressZstdInto(
     alloc: std.mem.Allocator,
     input: []const u8,
     out: *std.ArrayList(u8),
-) Error![]const u8 {
+) Error!usize {
     const frame_size = zstd.ZSTD_getFrameContentSize(input.ptr, input.len);
     if (frame_size == shim.egres_zstd_contentsize_error()) return error.DecompressionFailed;
     if (frame_size == shim.egres_zstd_contentsize_unknown()) return error.UnknownFrameSize;
@@ -99,14 +98,14 @@ fn decompressZstdInto(
     if (zstd.ZSTD_isError(written) != 0) return error.DecompressionFailed;
     if (written > needed) return error.DecompressionFailed;
     out.items.len = start + written;
-    return out.items[start..];
+    return written;
 }
 
 fn compressLz4Into(
     alloc: std.mem.Allocator,
     input: []const u8,
     out: *std.ArrayList(u8),
-) Error![]const u8 {
+) Error!usize {
     if (input.len > std.math.maxInt(i32)) return error.CompressionFailed;
     if (input.len > std.math.maxInt(u32)) return error.CompressionFailed;
     const bound_i32 = lz4.LZ4_compressBound(@intCast(input.len));
@@ -122,15 +121,16 @@ fn compressLz4Into(
         bound_i32,
     );
     if (written_i32 <= 0) return error.CompressionFailed;
-    out.items.len = start + 4 + @as(usize, @intCast(written_i32));
-    return out.items[start..];
+    const total = 4 + @as(usize, @intCast(written_i32));
+    out.items.len = start + total;
+    return total;
 }
 
 fn decompressLz4Into(
     alloc: std.mem.Allocator,
     input: []const u8,
     out: *std.ArrayList(u8),
-) Error![]const u8 {
+) Error!usize {
     if (input.len < 4) return error.CorruptFrame;
     const raw_len: usize = readU32LE(input[0..4]);
     if (raw_len > std.math.maxInt(i32)) return error.DecompressionFailed;
@@ -148,7 +148,7 @@ fn decompressLz4Into(
     if (written_i32 < 0) return error.DecompressionFailed;
     if (@as(usize, @intCast(written_i32)) != raw_len) return error.CorruptFrame;
     out.items.len = start + raw_len;
-    return out.items[start..];
+    return raw_len;
 }
 
 fn writeU32LE(dst: []u8, v: u32) void {

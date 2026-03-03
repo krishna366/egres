@@ -1,6 +1,7 @@
 const std = @import("std");
 const key = @import("key.zig");
 const table = @import("table.zig");
+const vfs = @import("vfs.zig");
 const utils = @import("utils");
 
 const Table = table.Table;
@@ -101,7 +102,7 @@ pub const LevelHandler = struct {
 
         self.total_size = 0;
         for (self.entries.items) |e| {
-            self.total_size += @intCast(e.table.buf.len);
+            self.total_size += @intCast(e.table.fileSize());
         }
     }
 
@@ -131,7 +132,7 @@ pub const LevelHandler = struct {
 
         try self.entries.append(self.allocator, .{ .id = id, .table = t });
         t.incrRef();
-        self.total_size += @intCast(t.buf.len);
+        self.total_size += @intCast(t.fileSize());
         self.sortEntries();
     }
 
@@ -158,7 +159,7 @@ pub const LevelHandler = struct {
 
             if (found) {
                 // TableEntry e is on the chopping board.
-                self.total_size -= @intCast(e.table.buf.len);
+                self.total_size -= @intCast(e.table.fileSize());
                 e.table.decrRef();
                 _ = self.entries.orderedRemove(i);
             }
@@ -176,7 +177,7 @@ pub const LevelHandler = struct {
         for (to_add) |e| {
             try self.entries.append(self.allocator, e);
             e.table.incrRef();
-            self.total_size += @intCast(e.table.buf.len);
+            self.total_size += @intCast(e.table.fileSize());
         }
 
         self.sortEntries();
@@ -231,7 +232,7 @@ pub const LevelHandler = struct {
     ///
     /// L0: back-to-front (highest id = newest); first match wins.
     /// L≥1: binary search for the one table that could contain the key.
-    pub fn get(self: *LevelHandler, search_key: []const u8) Error!?Item {
+    pub fn get(self: *LevelHandler, search_key: []const u8, priority: vfs.Priority) Error!?Item {
         const searchKeyNoTs = key.parseKey(search_key);
         if (self.level == 0) {
             self.mu.lockShared();
@@ -242,7 +243,7 @@ pub const LevelHandler = struct {
                 ri -= 1;
                 const e = self.entries.items[ri];
                 if (!e.table.containsKey(searchKeyNoTs)) continue;
-                var it = TableIterator.init(self.allocator, e.table);
+                var it = TableIterator.init(self.allocator, e.table, priority);
                 defer it.deinit();
 
                 try it.seek(search_key);
@@ -275,7 +276,7 @@ pub const LevelHandler = struct {
             if (std.mem.order(u8, key.parseKey(e.table.smallest()), searchKeyNoTs) == .gt) return null;
             if (!e.table.containsKey(searchKeyNoTs)) return null;
 
-            var it = TableIterator.init(self.allocator, e.table);
+            var it = TableIterator.init(self.allocator, e.table, priority);
             defer it.deinit();
 
             try it.seek(search_key);
