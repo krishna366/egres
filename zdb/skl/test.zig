@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const skiplist = @import("zdb").skl;
-const key_mod = @import("zdb").key;
+const Key = @import("zdb").key.Key;
 const u = @import("utils");
 
 fn writeKey(buf: []u8, idx: usize) ![]const u8 {
@@ -21,24 +21,22 @@ test "skiplist basic operations and updates" {
     var sl = try skiplist.SkipList.init(testing.allocator);
     defer sl.release();
 
-    const k1 = try key_mod.withTs(testing.allocator, "1", 0);
-    defer testing.allocator.free(k1);
-    const k2 = try key_mod.withTs(testing.allocator, "2", 0);
-    defer testing.allocator.free(k2);
+    const k1 = Key{ .primary = "1" };
+    const k2 = Key{ .primary = "2" };
 
     try testing.expect(sl.get(k1) == null);
     try testing.expect(!sl.contains(k1));
     try testing.expectEqual(@as(usize, 0), sl.numNodes());
 
-    try sl.put("1", 0, "100");
+    try sl.put(.{ .primary = "1" }, "100");
     try testing.expectEqualStrings("100", sl.get(k1).?);
     try testing.expect(sl.contains(k1));
     try testing.expectEqual(@as(usize, 1), sl.numNodes());
 
-    try sl.put("1", 0, "200");
+    try sl.put(.{ .primary = "1" }, "200");
     try testing.expectEqualStrings("200", sl.get(k1).?);
 
-    try sl.put("2", 0, "300");
+    try sl.put(.{ .primary = "2" }, "300");
     try testing.expectEqualStrings("300", sl.get(k2).?);
     try testing.expectEqual(@as(usize, 2), sl.numNodes());
 }
@@ -55,7 +53,7 @@ test "skiplist iterator ordering and seek" {
         .{ .key = "9", .value = "90" },
         .{ .key = "3", .value = "30" },
     };
-    for (data) |item| try sl.put(item.key, 0, item.value);
+    for (data) |item| try sl.put(.{ .primary = item.key }, item.value);
 
     var it = sl.iterator();
     defer it.deinit();
@@ -63,31 +61,28 @@ test "skiplist iterator ordering and seek" {
     const expected = [_][]const u8{ "1", "2", "3", "5", "8", "9" };
     for (expected) |k| {
         const e = it.next().?;
-        try testing.expectEqualStrings(k, key_mod.parseKey(e.key));
+        try testing.expectEqualStrings(k, e.key.primary);
     }
     try testing.expect(it.next() == null);
 
     var seek_it = sl.iterator();
     defer seek_it.deinit();
-    const seek_key = try key_mod.withTs(testing.allocator, "4", 0);
-    defer testing.allocator.free(seek_key);
-    const seek_entry = seek_it.seek(seek_key).?;
-    try testing.expectEqualStrings("5", key_mod.parseKey(seek_entry.key));
-    try testing.expectEqualStrings("8", key_mod.parseKey(seek_it.next().?.key));
+    const seek_entry = seek_it.seek(.{ .primary = "4" }).?;
+    try testing.expectEqualStrings("5", seek_entry.key.primary);
+    try testing.expectEqualStrings("8", seek_it.next().?.key.primary);
 }
 
 test "skiplist refcount usage with explicit acquire/release" {
     var sl = try skiplist.SkipList.init(testing.allocator);
     defer sl.release();
 
-    try sl.put("1", 0, "10");
-    try sl.put("2", 0, "20");
+    try sl.put(.{ .primary = "1" }, "10");
+    try sl.put(.{ .primary = "2" }, "20");
 
     sl.acquire();
     sl.acquire();
 
-    const k1 = try key_mod.withTs(testing.allocator, "1", 0);
-    defer testing.allocator.free(k1);
+    const k1 = Key{ .primary = "1" };
     try testing.expectEqualStrings("10", sl.get(k1).?);
 
     sl.release();
@@ -121,7 +116,7 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
         const key = try writeKey(&key_buf, inserted);
         const value = try fillValueForIndex(tmp_arena.allocator(), &value_rand);
 
-        try sl.put(key, 0, value);
+        try sl.put(.{ .primary = key }, value);
         try expected_values.append(testing.allocator, value);
 
         if ((inserted + 1) % 100 == 0) {
@@ -151,7 +146,7 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
 
         var expected_key_buf: [32]u8 = undefined;
         const expected_key = try writeKey(&expected_key_buf, idx);
-        try testing.expectEqualStrings(expected_key, key_mod.parseKey(entry.key));
+        try testing.expectEqualStrings(expected_key, entry.key.primary);
 
         const expected_value = expected_values.items[idx];
         try testing.expectEqualSlices(u8, expected_value, entry.value);

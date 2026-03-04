@@ -12,6 +12,7 @@ const TableIterator = table_mod.TableIterator;
 const Item = table_mod.table.Item;
 const LevelHandler = level_handler.LevelHandler;
 const TableEntry = level_handler.TableEntry;
+const Key = @import("key.zig").Key;
 const KeyRange = level_handler.KeyRange;
 const MergeIterator = table_mod.merge_iterator.MergeIterator;
 const ConcatIterator = table_mod.merge_iterator.ConcatIterator;
@@ -139,7 +140,7 @@ pub const LevelsController = struct {
     /// get checks each level from L0 upward and returns the first matching item,
     /// or null if the key is absent. The returned item's key and value are
     /// duplicated with self.allocator; the caller must free them.
-    pub fn get(self: *LevelsController, search_key: []const u8, priority: vfs.Priority) !?Item {
+    pub fn get(self: *LevelsController, search_key: Key, priority: vfs.Priority) !?Item {
         for (self.handlers) |*h| {
             if (try h.get(search_key, priority)) |item| return item;
         }
@@ -307,7 +308,7 @@ pub const LevelsController = struct {
             self.handlers[src].mu.lockShared();
             defer self.handlers[src].mu.unlockShared();
 
-            const items = self.handlers[src].entries.items;
+            const items = self.handlers[src].tables.items;
             if (items.len == 0) return;
 
             // TODO: This can be improved to consider which table to compact.
@@ -319,7 +320,7 @@ pub const LevelsController = struct {
         // --- compute union key range of all src tables ---
         var kr = KeyRange{};
         for (src_entries_slice) |e| {
-            const tkr = KeyRange{ .left = e.table.smallest(), .right = e.table.biggest() };
+            const tkr = KeyRange{ .left = e.table.smallest, .right = e.table.biggest };
             kr.extend(tkr);
         }
 
@@ -372,13 +373,20 @@ pub const LevelsController = struct {
         }
 
         while (merge.itemRef()) |item| {
-            try bld.add(item.key, item.value);
-
-            try merge.next();
             if (bld.table_bytes.items.len >= file_sz) {
-                try self.flushBuilderOutput(&bld, &flush_handles);
-                bld.reset();
+                // We are not going to break up a primary key across tables. All the versions for
+                // this key should live in the same table. This avoids a scenario where a table with
+                // a higher version key ends up getting compacted and living in a lower level. We
+                // expect that the flow of keys is from top to bottom levels, so we're expecting to
+                // find higher version keys at higher levels. This expectation is used by get fn to
+                // stop searching for key as soon as we're able to find a version >= search key.
+                if (item.key.orderPrimary(bld.lastKey()) != .eq) {
+                    try self.flushBuilderOutput(&bld, &flush_handles);
+                    bld.reset();
+                }
             }
+            try bld.add(item.key, item.value);
+            try merge.next();
         }
 
         // Flush any remaining data.

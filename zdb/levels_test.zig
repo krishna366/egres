@@ -3,7 +3,7 @@ const zio = @import("zio");
 const zdb = @import("zdb");
 const vfs = zdb.vfs;
 
-const key_mod = zdb.key;
+const Key = zdb.key.Key;
 const table_mod = zdb.table;
 const Builder = table_mod.builder.Builder;
 const Table = table_mod.Table;
@@ -45,9 +45,7 @@ fn buildTable(
     var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer b.deinit();
     for (entries) |e| {
-        const k = try key_mod.withTs(alloc, e.key, e.ts);
-        defer alloc.free(k);
-        try b.add(k, e.val);
+        try b.add(.{ .primary = e.key, .timestamp = e.ts }, e.val);
     }
     return b.finish();
 }
@@ -102,9 +100,9 @@ test "level_handler L0 sort" {
     try lh.addEntry(2, t2);
 
     // L0 sorts ascending by ID.
-    try std.testing.expectEqual(@as(u64, 1), lh.entries.items[0].id);
-    try std.testing.expectEqual(@as(u64, 2), lh.entries.items[1].id);
-    try std.testing.expectEqual(@as(u64, 3), lh.entries.items[2].id);
+    try std.testing.expectEqual(@as(u64, 1), lh.tables.items[0].id);
+    try std.testing.expectEqual(@as(u64, 2), lh.tables.items[1].id);
+    try std.testing.expectEqual(@as(u64, 3), lh.tables.items[2].id);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,9 +135,9 @@ test "level_handler L1 sort" {
     try lh.addEntry(2, tb); // "b"
 
     // L1 sorts by smallest key ascending.
-    const sk0 = key_mod.parseKey(lh.entries.items[0].table.smallest());
-    const sk1 = key_mod.parseKey(lh.entries.items[1].table.smallest());
-    const sk2 = key_mod.parseKey(lh.entries.items[2].table.smallest());
+    const sk0 = lh.tables.items[0].table.smallest.primary;
+    const sk1 = lh.tables.items[1].table.smallest.primary;
+    const sk2 = lh.tables.items[2].table.smallest.primary;
     try std.testing.expectEqualStrings("a", sk0);
     try std.testing.expectEqualStrings("b", sk1);
     try std.testing.expectEqualStrings("c", sk2);
@@ -183,12 +181,12 @@ test "overlapping tables L1" {
     }
 
     // Query range c-g should overlap tables c-d, e-f, g-h → indices 1..4.
-    const ck = try key_mod.withTs(alloc, "c", 0);
+    const ck = try (Key{ .primary = "c", .timestamp = 0 }).marshal(alloc);
     defer alloc.free(ck);
-    const gk = try key_mod.withTs(alloc, "g", 0);
+    const gk = try (Key{ .primary = "g", .timestamp = 0 }).marshal(alloc);
     defer alloc.free(gk);
 
-    const result = try lh.overlappingTables(alloc, .{ .left = ck, .right = gk });
+    const result = try lh.overlappingTables(alloc, .{ .left = Key.init(ck), .right = Key.init(gk) });
     defer alloc.free(result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
 }
@@ -220,11 +218,11 @@ test "overlapping tables L0" {
     try lh.addEntry(2, t2);
     try lh.addEntry(3, t3);
 
-    const ck = try key_mod.withTs(alloc, "x", 0);
+    const ck = try (Key{ .primary = "x", .timestamp = 0 }).marshal(alloc);
     defer alloc.free(ck);
 
     // L0 always returns all tables regardless of the query.
-    const result = try lh.overlappingTables(alloc, .{ .left = ck, .right = ck });
+    const result = try lh.overlappingTables(alloc, .{ .left = Key.init(ck), .right = Key.init(ck) });
     defer alloc.free(result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
 }
@@ -254,13 +252,10 @@ test "get L0 newest wins" {
     try lh.addEntry(2, t2);
 
     // Search with max ts to find the newest version.
-    const search = try key_mod.withTs(alloc, "k", std.math.maxInt(u64));
-    defer alloc.free(search);
-
-    const item = try lh.get(search, .p0);
+    const item = try lh.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0);
     try std.testing.expect(item != null);
     defer {
-        alloc.free(item.?.key);
+        alloc.free(item.?.key.primary);
         alloc.free(item.?.value);
     }
     try std.testing.expectEqualStrings("new", item.?.value);
@@ -293,13 +288,10 @@ test "get L1 hit" {
     try lh.addEntry(2, tb);
     try lh.addEntry(3, tc);
 
-    const search = try key_mod.withTs(alloc, "b", 0);
-    defer alloc.free(search);
-
-    const item = try lh.get(search, .p0);
+    const item = try lh.get(.{ .primary = "b", .timestamp = 0 }, .p0);
     try std.testing.expect(item != null);
     defer {
-        alloc.free(item.?.key);
+        alloc.free(item.?.key.primary);
         alloc.free(item.?.value);
     }
     try std.testing.expectEqualStrings("vb", item.?.value);
@@ -321,10 +313,7 @@ test "get miss" {
     defer lh.deinit();
     try lh.addEntry(1, ta);
 
-    const search = try key_mod.withTs(alloc, "z", 0);
-    defer alloc.free(search);
-
-    const item = try lh.get(search, .p0);
+    const item = try lh.get(.{ .primary = "z", .timestamp = 0 }, .p0);
     try std.testing.expect(item == null);
 }
 
@@ -476,12 +465,10 @@ test "do compact L0->L1" {
 
     // All three keys must be retrievable via get.
     for (l0_data) |d| {
-        const sk = try key_mod.withTs(alloc, d.key, std.math.maxInt(u64));
-        defer alloc.free(sk);
-        const item = try lc.get(sk, .p0);
+        const item = try lc.get(.{ .primary = d.key, .timestamp = std.math.maxInt(u64) }, .p0);
         try std.testing.expect(item != null);
         defer {
-            alloc.free(item.?.key);
+            alloc.free(item.?.key.primary);
             alloc.free(item.?.value);
         }
         try std.testing.expectEqualStrings(d.val, item.?.value);
@@ -564,12 +551,10 @@ test "do compact L0->L1 with dest overlap" {
         .{ .key = "dd", .val = "vdd" },
     };
     for (expected) |e| {
-        const sk = try key_mod.withTs(alloc, e.key, std.math.maxInt(u64));
-        defer alloc.free(sk);
-        const item = try lc.get(sk, .p0);
+        const item = try lc.get(.{ .primary = e.key, .timestamp = std.math.maxInt(u64) }, .p0);
         try std.testing.expect(item != null);
         defer {
-            alloc.free(item.?.key);
+            alloc.free(item.?.key.primary);
             alloc.free(item.?.value);
         }
         try std.testing.expectEqualStrings(e.val, item.?.value);
@@ -635,12 +620,10 @@ test "do compact L1->L2" {
         .{ .key = "cc", .val = "vcc" },
     };
     for (expected) |e| {
-        const sk = try key_mod.withTs(alloc, e.key, std.math.maxInt(u64));
-        defer alloc.free(sk);
-        const item = try lc.get(sk, .p2);
+        const item = try lc.get(.{ .primary = e.key, .timestamp = std.math.maxInt(u64) }, .p2);
         try std.testing.expect(item != null);
         defer {
-            alloc.free(item.?.key);
+            alloc.free(item.?.key.primary);
             alloc.free(item.?.value);
         }
         try std.testing.expectEqualStrings(e.val, item.?.value);
@@ -684,12 +667,10 @@ test "levels get: L0 shadows L1" {
     // Searching with maxInt ts seeks to the very beginning of "foo" entries;
     // L0 is checked first → the ts=5 version wins.
     {
-        const sk = try key_mod.withTs(alloc, "foo", std.math.maxInt(u64));
-        defer alloc.free(sk);
-        const item = try lc.get(sk, .p1);
+        const item = try lc.get(.{ .primary = "foo", .timestamp = std.math.maxInt(u64) }, .p1);
         try std.testing.expect(item != null);
         defer {
-            alloc.free(item.?.key);
+            alloc.free(item.?.key.primary);
             alloc.free(item.?.value);
         }
         try std.testing.expectEqualStrings("l0_val", item.?.value);
@@ -699,12 +680,10 @@ test "levels get: L0 shadows L1" {
     // (higher ts ↔ smaller suffix), so the L0 seek lands past it → L0 miss.
     // L1's ts=1 entry sorts *after* ts=3, so the L1 seek lands on it → hit.
     {
-        const sk = try key_mod.withTs(alloc, "foo", 3);
-        defer alloc.free(sk);
-        const item = try lc.get(sk, .p2);
+        const item = try lc.get(.{ .primary = "foo", .timestamp = 3 }, .p2);
         try std.testing.expect(item != null);
         defer {
-            alloc.free(item.?.key);
+            alloc.free(item.?.key.primary);
             alloc.free(item.?.value);
         }
         try std.testing.expectEqualStrings("l1_val", item.?.value);

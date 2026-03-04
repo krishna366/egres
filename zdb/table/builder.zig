@@ -1,5 +1,5 @@
 const std = @import("std");
-const key = @import("../key.zig");
+const Key = @import("../key.zig").Key;
 const buffers = @import("../buffers.gen.zig");
 const compress = @import("utils").compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
@@ -48,7 +48,7 @@ pub const Error = error{
     ValueTooLarge,
     TooManyBlocks,
     IntegerOverflow,
-} || key.Error || buffers.Error || compress.Error || std.mem.Allocator.Error || binaryfuse.Error;
+} || buffers.Error || compress.Error || std.mem.Allocator.Error || binaryfuse.Error;
 
 pub const Config = struct {
     target_block_size: usize = 32 * 1024,
@@ -144,23 +144,31 @@ pub const Builder = struct {
         self.stale_data_size = 0;
     }
 
-    pub fn add(self: *Builder, entry_key: []const u8, value: []const u8) Error!void {
-        if (entry_key.len > std.math.maxInt(u16)) return error.KeyTooLarge;
+    pub fn lastKey(self: *Builder) Key {
+        if (self.last_key.items.len == 0) return .{};
+        return Key.init(self.last_key.items);
+    }
+
+    pub fn add(self: *Builder, key: Key, value: []const u8) Error!void {
+        if (key.len() > std.math.maxInt(u16)) return error.KeyTooLarge;
         if (value.len > std.math.maxInt(u32)) return error.ValueTooLarge;
 
         if (self.last_key.items.len > 0) {
-            if (key.compareWithTs(entry_key, self.last_key.items) != .gt) {
+            const last = self.lastKey();
+            if (key.order(last) != .gt) {
                 return error.KeyOrderViolation;
             }
+            if (key.orderPrimary(last) != .eq) {
+                try self.bf_hashes.append(self.allocator, key.hash());
+            }
+        } else {
+            try self.bf_hashes.append(self.allocator, key.hash());
         }
 
-        if (!key.sameKeyNoTs(entry_key, self.last_key.items)) {
-            try self.bf_hashes.append(self.allocator, key.hashWithTs(entry_key));
-        }
-
-        // Keep last_key in scratch storage to avoid per-entry alloc/free churn.
+        // Marshal into last_key scratch buffer for prefix compression.
         self.last_key.clearRetainingCapacity();
-        try self.last_key.appendSlice(self.allocator, entry_key);
+        _ = try key.marshalTo(self.allocator, &self.last_key);
+        const entry_key = self.last_key.items;
 
         const overlap = if (self.cur_base_key.items.len == 0)
             0
@@ -195,8 +203,7 @@ pub const Builder = struct {
 
         if (self.key_count == std.math.maxInt(u32)) return error.IntegerOverflow;
         self.key_count += 1;
-        const version = key.parseTs(entry_key);
-        if (version > self.max_version) self.max_version = version;
+        if (key.timestamp > self.max_version) self.max_version = key.timestamp;
     }
 
     pub fn finish(self: *Builder) Error!TableBuffer {

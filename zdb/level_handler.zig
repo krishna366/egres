@@ -1,5 +1,5 @@
 const std = @import("std");
-const key = @import("key.zig");
+const Key = @import("key.zig").Key;
 const table = @import("table.zig");
 const vfs = @import("vfs.zig");
 const utils = @import("utils");
@@ -15,12 +15,12 @@ pub const Error = table.table.Error;
 // ---------------------------------------------------------------------------
 
 pub const KeyRange = struct {
-    left: []const u8 = "",
-    right: []const u8 = "",
+    left: Key = .{},
+    right: Key = .{},
     inf: bool = false,
 
     pub fn isEmpty(self: KeyRange) bool {
-        return self.left.len == 0 and self.right.len == 0 and !self.inf;
+        return self.left.primary.len == 0 and self.right.primary.len == 0 and !self.inf;
     }
 
     pub fn overlapsWith(self: KeyRange, other: KeyRange) bool {
@@ -28,9 +28,9 @@ pub const KeyRange = struct {
         if (other.isEmpty()) return false;
         if (self.inf or other.inf) return true;
         // [other.left, other.right] ... [self.left, self.right]
-        if (key.compareWithTs(other.right, self.left) == .lt) return false;
+        if (other.right.order(self.left) == .lt) return false;
         // [self.left, self.right] ... [other.left, other.right]
-        if (key.compareWithTs(self.right, other.left) == .lt) return false;
+        if (self.right.order(other.left) == .lt) return false;
         return true;
     }
 
@@ -40,10 +40,10 @@ pub const KeyRange = struct {
             self.* = other;
             return;
         }
-        if (self.left.len == 0 or key.compareWithTs(other.left, self.left) == .lt) {
+        if (self.left.primary.len == 0 or other.left.order(self.left) == .lt) {
             self.left = other.left;
         }
-        if (self.right.len == 0 or key.compareWithTs(other.right, self.right) == .gt) {
+        if (self.right.primary.len == 0 or other.right.order(self.right) == .gt) {
             self.right = other.right;
         }
         if (other.inf) self.inf = true;
@@ -65,7 +65,7 @@ pub const TableEntry = struct {
 
 pub const LevelHandler = struct {
     mu: std.Thread.RwLock,
-    entries: std.ArrayList(TableEntry),
+    tables: std.ArrayList(TableEntry),
     total_size: i64, // sum of each table's buf.len
     level: u8,
     allocator: std.mem.Allocator,
@@ -73,7 +73,7 @@ pub const LevelHandler = struct {
     pub fn init(allocator: std.mem.Allocator, level: u8) LevelHandler {
         return .{
             .mu = .{},
-            .entries = .{},
+            .tables = .{},
             .total_size = 0,
             .level = level,
             .allocator = allocator,
@@ -84,11 +84,11 @@ pub const LevelHandler = struct {
     /// Used by LevelsController.close(); detaches the path so decrRef at
     /// zero only frees memory.
     pub fn deinit(self: *LevelHandler) void {
-        for (self.entries.items) |e| {
+        for (self.tables.items) |e| {
             e.table.detach(); // clear path → decrRef won't delete the file
             e.table.decrRef();
         }
-        self.entries.deinit(self.allocator);
+        self.tables.deinit(self.allocator);
     }
 
     /// initEntries bulk-sets entries, sorts them, and recomputes total_size.
@@ -96,12 +96,12 @@ pub const LevelHandler = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        self.entries.clearRetainingCapacity();
-        try self.entries.appendSlice(self.allocator, new_entries);
+        self.tables.clearRetainingCapacity();
+        try self.tables.appendSlice(self.allocator, new_entries);
         self.sortEntries();
 
         self.total_size = 0;
-        for (self.entries.items) |e| {
+        for (self.tables.items) |e| {
             self.total_size += @intCast(e.table.fileSize());
         }
     }
@@ -111,15 +111,15 @@ pub const LevelHandler = struct {
     /// L1 and onwards would have non-overlapping tables.
     fn sortEntries(self: *LevelHandler) void {
         if (self.level == 0) {
-            std.mem.sort(TableEntry, self.entries.items, {}, struct {
+            std.mem.sort(TableEntry, self.tables.items, {}, struct {
                 fn lt(_: void, a: TableEntry, b: TableEntry) bool {
                     return a.id < b.id;
                 }
             }.lt);
         } else {
-            std.mem.sort(TableEntry, self.entries.items, {}, struct {
+            std.mem.sort(TableEntry, self.tables.items, {}, struct {
                 fn lt(_: void, a: TableEntry, b: TableEntry) bool {
-                    return key.compareWithTs(a.table.smallest(), b.table.smallest()) == .lt;
+                    return a.table.smallest.order(b.table.smallest) == .lt;
                 }
             }.lt);
         }
@@ -130,7 +130,7 @@ pub const LevelHandler = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        try self.entries.append(self.allocator, .{ .id = id, .table = t });
+        try self.tables.append(self.allocator, .{ .id = id, .table = t });
         t.incrRef();
         self.total_size += @intCast(t.fileSize());
         self.sortEntries();
@@ -147,10 +147,10 @@ pub const LevelHandler = struct {
     fn deleteEntriesLocked(self: *LevelHandler, to_del: []const TableEntry) void {
         // Iterate over the full list of tables we own, and see for each table whether
         // it's id is present in the ids list provided.
-        var i: usize = self.entries.items.len;
+        var i: usize = self.tables.items.len;
         while (i > 0) {
             i -= 1;
-            const e = self.entries.items[i];
+            const e = self.tables.items[i];
             // I think looping here is fine, given we expect ids to be small.
             // We can consider storing ids in a map as a micro-optimization.
             const found = for (to_del) |entry| {
@@ -161,7 +161,7 @@ pub const LevelHandler = struct {
                 // TableEntry e is on the chopping board.
                 self.total_size -= @intCast(e.table.fileSize());
                 e.table.decrRef();
-                _ = self.entries.orderedRemove(i);
+                _ = self.tables.orderedRemove(i);
             }
         }
     }
@@ -175,7 +175,7 @@ pub const LevelHandler = struct {
 
         // Add new entries.
         for (to_add) |e| {
-            try self.entries.append(self.allocator, e);
+            try self.tables.append(self.allocator, e);
             e.table.incrRef();
             self.total_size += @intCast(e.table.fileSize());
         }
@@ -190,7 +190,7 @@ pub const LevelHandler = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
-        const items = self.entries.items;
+        const items = self.tables.items;
         const slice: []TableEntry = if (self.level == 0)
             items
         else if (kr.isEmpty())
@@ -198,14 +198,14 @@ pub const LevelHandler = struct {
         else blk: {
             // First table where kr.left <= biggest (could overlap on the left).
             const left = utils.search(TableEntry, items, kr.left, struct {
-                fn f(kr_left: []const u8, e: TableEntry) bool {
-                    return key.compareWithTs(kr_left, e.table.biggest()) != .gt;
+                fn f(kl: Key, e: TableEntry) bool {
+                    return kl.order(e.table.biggest) != .gt;
                 }
             }.f);
             // First table where kr.right < smallest (no longer overlapping).
             const right = utils.search(TableEntry, items, kr.right, struct {
-                fn f(kr_right: []const u8, e: TableEntry) bool {
-                    return key.compareWithTs(kr_right, e.table.smallest()) == .lt;
+                fn f(right_key: Key, e: TableEntry) bool {
+                    return right_key.order(e.table.smallest) == .lt;
                 }
             }.f);
             break :blk items[left..right];
@@ -223,37 +223,33 @@ pub const LevelHandler = struct {
     pub fn numTables(self: *LevelHandler) usize {
         self.mu.lockShared();
         defer self.mu.unlockShared();
-        return self.entries.items.len;
+        return self.tables.items.len;
     }
 
     /// get seeks search_key within this level's tables.
-    /// Returns a heap-allocated Item (key + value duped with self.allocator) on hit,
-    /// or null on miss. Caller must free item.key and item.value with self.allocator.
+    /// Returns an Item with owned primary + value on hit, or null on miss.
+    /// Caller must free item with self.allocator.
     ///
     /// L0: back-to-front (highest id = newest); first match wins.
     /// L≥1: binary search for the one table that could contain the key.
-    pub fn get(self: *LevelHandler, search_key: []const u8, priority: vfs.Priority) Error!?Item {
-        const searchKeyNoTs = key.parseKey(search_key);
+    pub fn get(self: *LevelHandler, search_key: Key, priority: vfs.Priority) Error!?Item {
         if (self.level == 0) {
             self.mu.lockShared();
             defer self.mu.unlockShared();
 
-            var ri: usize = self.entries.items.len;
+            var ri: usize = self.tables.items.len;
             while (ri > 0) {
                 ri -= 1;
-                const e = self.entries.items[ri];
-                if (!e.table.containsKey(searchKeyNoTs)) continue;
+                const e = self.tables.items[ri];
+                if (!e.table.containsKey(search_key)) continue;
                 var it = TableIterator.init(self.allocator, e.table, priority);
                 defer it.deinit();
 
                 try it.seek(search_key);
                 const found = it.itemRef() orelse continue;
-                if (!std.mem.eql(u8, key.parseKey(found.key), searchKeyNoTs)) continue;
+                if (search_key.orderPrimary(found.key) != .eq) continue;
 
-                const k = try self.allocator.dupe(u8, found.key);
-                errdefer self.allocator.free(k);
-                const v = try self.allocator.dupe(u8, found.value);
-                return .{ .key = k, .value = v };
+                return try found.dupe(self.allocator);
             }
             return null;
         } else {
@@ -261,32 +257,29 @@ pub const LevelHandler = struct {
             defer self.mu.unlockShared();
 
             // First table whose biggest key >= search_key.
-            const lo = utils.search(TableEntry, self.entries.items, search_key, struct {
-                fn f(sk: []const u8, e: TableEntry) bool {
-                    return key.compareWithTs(e.table.biggest(), sk) != .lt;
+            const lo = utils.search(TableEntry, self.tables.items, search_key, struct {
+                fn f(sk: Key, e: TableEntry) bool {
+                    return e.table.biggest.order(sk) != .lt;
                 }
             }.f);
-            if (lo >= self.entries.items.len) return null;
+            if (lo >= self.tables.items.len) return null;
 
-            const e = self.entries.items[lo];
+            const e = self.tables.items[lo];
             // Verify the key can actually be in this table.
             // Compare by user key only: a table whose smallest user key is
             // greater than the search user key cannot contain the key at any
             // timestamp, so skip it.
-            if (std.mem.order(u8, key.parseKey(e.table.smallest()), searchKeyNoTs) == .gt) return null;
-            if (!e.table.containsKey(searchKeyNoTs)) return null;
+            if (e.table.smallest.orderPrimary(search_key) == .gt) return null;
+            if (!e.table.containsKey(search_key)) return null;
 
             var it = TableIterator.init(self.allocator, e.table, priority);
             defer it.deinit();
 
             try it.seek(search_key);
             const found = it.itemRef() orelse return null;
-            if (!std.mem.eql(u8, key.parseKey(found.key), searchKeyNoTs)) return null;
+            if (search_key.orderPrimary(found.key) != .eq) return null;
 
-            const k = try self.allocator.dupe(u8, found.key);
-            errdefer self.allocator.free(k);
-            const v = try self.allocator.dupe(u8, found.value);
-            return .{ .key = k, .value = v };
+            return try found.dupe(self.allocator);
         }
     }
 };

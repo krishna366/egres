@@ -1,7 +1,9 @@
 const std = @import("std");
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
-const key = @import("../key.zig");
+const key_mod = @import("../key.zig");
+const Key = key_mod.Key;
+const Item = key_mod.Item;
 
 pub const Error = error{
     OutOfMemory,
@@ -80,7 +82,7 @@ pub const SkipList = struct {
         exact: bool,
     };
 
-    fn findNode(self: *Self, key_with_ts: []const u8, lefties: ?*[max_height]?*Node) FindResult {
+    fn findNode(self: *Self, search_key: Key, lefties: ?*[max_height]?*Node) FindResult {
         var current = self.head;
         var level: i32 = @intCast(self.max_height_seen.load(.acquire) - 1);
 
@@ -93,7 +95,7 @@ pub const SkipList = struct {
             // But if we find an exact match, we don't care that lefties isn't being fully filled
             // because we're returning earlier (cmp == .eq).
             while (current.next[level_idx].load(.acquire)) |next| {
-                const cmp = key.compareWithTs(next.key, key_with_ts);
+                const cmp = Key.init(next.key).order(search_key);
                 if (cmp == .gt) break;
                 if (cmp == .eq) return .{ .node = next, .exact = true };
                 current = next;
@@ -109,24 +111,24 @@ pub const SkipList = struct {
         };
     }
 
-    pub fn get(self: *Self, key_with_ts: []const u8) ?[]const u8 {
+    pub fn get(self: *Self, key: Key) ?[]const u8 {
         self.acquire();
         defer self.release();
 
-        const result = self.findNode(key_with_ts, null);
+        const result = self.findNode(key, null);
         if (result.exact) return result.node.?.value;
         return null;
     }
 
-    pub fn put(self: *Self, key_no_ts: []const u8, ts: u64, value: []const u8) Error!void {
+    pub fn put(self: *Self, key: Key, value: []const u8) Error!void {
         const alloc = self.arena.allocator();
 
-        // Build full key for the findNode lookup. This key is allocated on areana.
-        const keyWithTs = try key.withTs(alloc, key_no_ts, ts);
-        const valOwn = try alloc.dupe(u8, value);
+        // Build full key for the findNode lookup. This key is allocated on arena.
+        const keyWithTs = key.marshal(alloc) catch return Error.ArenaFull;
+        const valOwn = alloc.dupe(u8, value) catch return Error.ArenaFull;
 
         var lefties = [_]?*Node{null} ** max_height;
-        const find_result = self.findNode(keyWithTs, &lefties);
+        const find_result = self.findNode(key, &lefties);
         if (find_result.exact) {
             var existing = find_result.node.?;
             // The previous value can't really be deallocated in arena allocator.
@@ -164,8 +166,8 @@ pub const SkipList = struct {
         _ = self.node_count.fetchAdd(1, .monotonic);
     }
 
-    pub fn contains(self: *Self, key_with_ts: []const u8) bool {
-        return self.get(key_with_ts) != null;
+    pub fn contains(self: *Self, key: Key) bool {
+        return self.get(key) != null;
     }
 
     pub fn numNodes(self: *Self) usize {
@@ -179,11 +181,6 @@ pub const SkipList = struct {
     pub fn memoryCapacity(self: *Self) usize {
         return self.arena.queryCapacity();
     }
-
-    pub const Entry = struct {
-        key: []const u8,
-        value: []const u8,
-    };
 
     pub const Iterator = struct {
         skiplist: *Self,
@@ -201,10 +198,10 @@ pub const SkipList = struct {
             self.skiplist.release();
         }
 
-        pub fn next(self: *Iterator) ?Entry {
+        pub fn next(self: *Iterator) ?Item {
             if (self.current) |node| {
-                const result = Entry{
-                    .key = node.key,
+                const result = Item{
+                    .key = Key.init(node.key),
                     .value = node.value,
                 };
                 self.current = node.next[0].load(.acquire);
@@ -213,11 +210,11 @@ pub const SkipList = struct {
             return null;
         }
 
-        pub fn seek(self: *Iterator, target: []const u8) ?Entry {
+        pub fn seek(self: *Iterator, target: Key) ?Item {
             const find_result = self.skiplist.findNode(target, null);
             if (find_result.node) |node| {
-                const result = Entry{
-                    .key = node.key,
+                const result = Item{
+                    .key = Key.init(node.key),
                     .value = node.value,
                 };
                 self.current = node.next[0].load(.acquire);

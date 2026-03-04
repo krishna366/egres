@@ -1,5 +1,7 @@
 const std = @import("std");
-const key = @import("../key.zig");
+const key_mod = @import("../key.zig");
+const Key = key_mod.Key;
+pub const Item = key_mod.Item;
 const idx = @import("index.zig");
 const buffers = @import("../buffers.gen.zig");
 const compress = @import("utils").compression;
@@ -11,15 +13,10 @@ const cache_mod = @import("../cache.zig");
 /// When null (default), readBlock always reads from disk.
 pub var block_cache: ?*cache_mod.ShardedCache(u64) = null;
 
-pub const Error = idx.Error || buffers.Error || compress.Error || key.Error ||
+pub const Error = idx.Error || buffers.Error || compress.Error ||
     std.mem.Allocator.Error || error{
     ChecksumMismatch,
     CorruptTable,
-};
-
-pub const Item = struct {
-    key: []const u8,
-    value: []const u8,
 };
 
 pub const BlockLayout = struct {
@@ -34,6 +31,8 @@ pub const Table = struct {
     codec: compress.Codec,
     binary_fuse: ?binaryfuse.BinaryFuse(u16),
     ref: std.atomic.Value(i32),
+    smallest: Key,
+    biggest: Key,
     file_id: u44, // parsed from SST filename; 0 for in-memory tables
     path: ?[]const u8, // owned; non-null for file-backed tables; deleted on last decrRef
 
@@ -121,12 +120,15 @@ pub const Table = struct {
             break :blk filter;
         } else null;
 
+        const smallest_raw = if (table_index.blocks.len > 0) table_index.blocks[0].key else &.{};
         t.* = .{
             .allocator = allocator,
             .handle = handle,
             .index = table_index,
             .codec = codec,
             .binary_fuse = binary_fuse,
+            .smallest = if (smallest_raw.len >= 16) Key.init(smallest_raw) else .{},
+            .biggest = if (table_index.last_key.len >= 16) Key.init(table_index.last_key) else .{},
             .ref = std.atomic.Value(i32).init(1),
             .file_id = 0,
             .path = null,
@@ -171,18 +173,9 @@ pub const Table = struct {
         return &self.index;
     }
 
-    pub fn smallest(self: *const Table) []const u8 {
-        if (self.index.blocks.len == 0) return &.{};
-        return self.index.blocks[0].key;
-    }
-
-    pub fn biggest(self: *const Table) []const u8 {
-        return self.index.last_key;
-    }
-
-    pub fn containsKey(self: *const Table, key_no_ts: []const u8) bool {
+    pub fn containsKey(self: *const Table, key: Key) bool {
         if (self.binary_fuse) |bf| {
-            const h = key.hashNoTs(key_no_ts);
+            const h = key.hash();
             return bf.contain(h);
         }
         return true;
@@ -341,7 +334,7 @@ pub const BlockIterator = struct {
     }
 
     /// Binary search for the first entry with key >= target.
-    pub fn seekGe(self: *BlockIterator, target: []const u8) Error!void {
+    pub fn seekGe(self: *BlockIterator, target: Key) Error!void {
         // This binary search is only possible because we're diffing keys
         // against the base key and not against the previous key.
         var lo: usize = 0;
@@ -353,7 +346,7 @@ pub const BlockIterator = struct {
                 hi = mid;
                 continue;
             }
-            if (key.compareWithTs(self.key_buf.items, target) == .lt) {
+            if (Key.init(self.key_buf.items).order(target) == .lt) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -368,7 +361,7 @@ pub const BlockIterator = struct {
 
     pub fn itemRef(self: *const BlockIterator) ?Item {
         if (!self.is_valid) return null;
-        return .{ .key = self.key_buf.items, .value = self.val };
+        return .{ .key = Key.init(self.key_buf.items), .value = self.val };
     }
 
     inline fn getOffset(self: *BlockIterator, i: usize) Error!usize {
@@ -449,7 +442,7 @@ pub const TableIterator = struct {
         self.valid = self.bi.?.is_valid;
     }
 
-    pub fn seek(self: *TableIterator, target: []const u8) Error!void {
+    pub fn seek(self: *TableIterator, target: Key) Error!void {
         self.valid = false;
         const block_count = self.table.blockCount();
         if (block_count == 0) return;
@@ -460,7 +453,7 @@ pub const TableIterator = struct {
         while (lo + 1 < hi) {
             const mid = lo + (hi - lo) / 2;
             const base = try self.table.blockBaseKey(mid);
-            if (key.compareWithTs(base, target) == .gt) {
+            if (Key.init(base).order(target) == .gt) {
                 hi = mid;
             } else {
                 lo = mid;

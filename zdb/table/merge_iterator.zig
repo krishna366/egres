@@ -1,8 +1,7 @@
 const std = @import("std");
-const key = @import("../key.zig");
 const table = @import("table.zig");
 
-pub const Error = table.Error || key.Error;
+pub const Error = table.Error;
 
 /// Iterator is a tagged union that lets MergeIterator accept both a single
 /// TableIterator and a ConcatIterator (for non-overlapping sorted tables).
@@ -35,22 +34,22 @@ pub const Iterator = union(enum) {
     }
 };
 
-fn iterLessThan(iters: []const Iterator, a: usize, b: usize) std.math.Order {
+fn iterOrder(iters: []const Iterator, a: usize, b: usize) std.math.Order {
     const item_a = iters[a].itemRef().?;
     const item_b = iters[b].itemRef().?;
-    return key.compareWithTs(item_a.key, item_b.key);
+    return item_a.key.order(item_b.key);
 }
 
 pub const MergeIterator = struct {
     allocator: std.mem.Allocator,
     iters: []Iterator, // caller-owned slice
-    heap: std.PriorityQueue(usize, []const Iterator, iterLessThan),
+    heap: std.PriorityQueue(usize, []const Iterator, iterOrder),
 
     pub fn init(allocator: std.mem.Allocator, iters: []Iterator) MergeIterator {
         return .{
             .allocator = allocator,
             .iters = iters,
-            .heap = std.PriorityQueue(usize, []const Iterator, iterLessThan).init(allocator, iters),
+            .heap = std.PriorityQueue(usize, []const Iterator, iterOrder).init(allocator, iters),
         };
     }
 

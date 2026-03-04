@@ -1,5 +1,6 @@
 const std = @import("std");
 const zdb = @import("zdb");
+const Key = zdb.key.Key;
 const vfs = zdb.vfs;
 
 const Builder = zdb.table.builder.Builder;
@@ -39,9 +40,7 @@ fn buildTestTable(
         var val_buf: [20]u8 = undefined;
         const val = try std.fmt.bufPrint(&val_buf, "{d}", .{i});
 
-        const k = try zdb.key.withTs(allocator, key_no_ts, 0);
-        defer allocator.free(k);
-        try b.add(k, val);
+        try b.add(.{ .primary = key_no_ts }, val);
     }
     return b.finish();
 }
@@ -54,18 +53,10 @@ test "table builder/reader roundtrip and seek" {
     var b = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b.deinit();
 
-    const addKV = struct {
-        fn f(builder: *Builder, alloc: std.mem.Allocator, key_no_ts: []const u8, ts: u64, value: []const u8) !void {
-            const k = try zdb.key.withTs(alloc, key_no_ts, ts);
-            defer alloc.free(k);
-            try builder.add(k, value);
-        }
-    }.f;
-
-    try addKV(&b, std.testing.allocator, "a", 9, "va9");
-    try addKV(&b, std.testing.allocator, "a", 7, "va7");
-    try addKV(&b, std.testing.allocator, "b", 3, "vb3");
-    try addKV(&b, std.testing.allocator, "c", 1, "vc1");
+    try b.add(.{ .primary = "a", .timestamp = 9 }, "va9");
+    try b.add(.{ .primary = "a", .timestamp = 7 }, "va7");
+    try b.add(.{ .primary = "b", .timestamp = 3 }, "vb3");
+    try b.add(.{ .primary = "c", .timestamp = 1 }, "vc1");
 
     var tb = try b.finish();
     defer tb.deinit();
@@ -82,9 +73,7 @@ test "table builder/reader roundtrip and seek" {
     try it.seekToFirst();
     try std.testing.expectEqualStrings("va9", it.itemRef().?.value);
 
-    const seek_key = try zdb.key.withTs(std.testing.allocator, "b", 3);
-    defer std.testing.allocator.free(seek_key);
-    try it.seek(seek_key);
+    try it.seek(.{ .primary = "b", .timestamp = 3 });
     try std.testing.expectEqualStrings("vb3", it.itemRef().?.value);
 }
 
@@ -101,9 +90,7 @@ test "table binary fuse contains keys" {
     };
 
     for (entries) |e| {
-        const k = try zdb.key.withTs(alloc, e.key, e.ts);
-        defer alloc.free(k);
-        try b.add(k, e.val);
+        try b.add(.{ .primary = e.key, .timestamp = e.ts }, e.val);
     }
 
     var tb = try b.finish();
@@ -112,13 +99,13 @@ test "table binary fuse contains keys" {
     const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer t.decrRef();
 
-    try std.testing.expect(t.containsKey("apple"));
-    try std.testing.expect(t.containsKey("banana"));
-    try std.testing.expect(t.containsKey("carrot"));
+    try std.testing.expect(t.containsKey(.{ .primary = "apple" }));
+    try std.testing.expect(t.containsKey(.{ .primary = "banana" }));
+    try std.testing.expect(t.containsKey(.{ .primary = "carrot" }));
 
-    try std.testing.expect(!t.containsKey("date"));
-    try std.testing.expect(!t.containsKey("eggplant"));
-    try std.testing.expect(!t.containsKey("fig"));
+    try std.testing.expect(!t.containsKey(.{ .primary = "date" }));
+    try std.testing.expect(!t.containsKey(.{ .primary = "eggplant" }));
+    try std.testing.expect(!t.containsKey(.{ .primary = "fig" }));
 }
 
 test "table binary fuse large keyset contains sampled keys" {
@@ -131,12 +118,9 @@ test "table binary fuse large keyset contains sampled keys" {
 
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        var key_buf: [32]u8 = undefined;
-        const key_no_ts = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
-        try zdb.key.setTs(key_buf[key_no_ts.len..], 0);
-
-        const k = key_buf[0 .. key_no_ts.len + 8];
-        try b.add(k, "v");
+        var key_buf: [16]u8 = undefined;
+        const primary = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
+        try b.add(.{ .primary = primary }, "v");
     }
 
     var tb = try b.finish();
@@ -154,7 +138,7 @@ test "table binary fuse large keyset contains sampled keys" {
         const idx = rnd.uintAtMost(u64, n - 1);
         var key_buf: [16]u8 = undefined;
         const key_no_ts = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{idx});
-        try std.testing.expect(t.containsKey(key_no_ts));
+        try std.testing.expect(t.containsKey(.{ .primary = key_no_ts }));
     }
 
     var non_added_matches: usize = 0;
@@ -163,7 +147,7 @@ test "table binary fuse large keyset contains sampled keys" {
         const idx = @as(u64, n) + rnd.uintAtMost(u64, n - 1);
         var key_buf: [16]u8 = undefined;
         const key_no_ts = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{idx});
-        if (t.containsKey(key_no_ts)) {
+        if (t.containsKey(.{ .primary = key_no_ts })) {
             non_added_matches += 1;
         }
     }
@@ -175,12 +159,8 @@ test "table checksum mismatch is detected" {
     var b = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b.deinit();
 
-    const k1 = try zdb.key.withTs(std.testing.allocator, "k1", 1);
-    defer std.testing.allocator.free(k1);
-    try b.add(k1, "v1");
-    const k2 = try zdb.key.withTs(std.testing.allocator, "k2", 1);
-    defer std.testing.allocator.free(k2);
-    try b.add(k2, "v2");
+    try b.add(.{ .primary = "k1", .timestamp = 1 }, "v1");
+    try b.add(.{ .primary = "k2", .timestamp = 1 }, "v2");
 
     var tb = try b.finish();
     defer tb.deinit();
@@ -199,23 +179,15 @@ test "table checksum mismatch is detected" {
 test "merge iterator merges sorted streams" {
     var b1 = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b1.deinit();
-    const a5k = try zdb.key.withTs(std.testing.allocator, "a", 5);
-    defer std.testing.allocator.free(a5k);
-    try b1.add(a5k, "a5");
-    const c1k = try zdb.key.withTs(std.testing.allocator, "c", 1);
-    defer std.testing.allocator.free(c1k);
-    try b1.add(c1k, "c1");
+    try b1.add(.{ .primary = "a", .timestamp = 5 }, "a5");
+    try b1.add(.{ .primary = "c", .timestamp = 1 }, "c1");
     var t1 = try b1.finish();
     defer t1.deinit();
 
     var b2 = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b2.deinit();
-    const b4k = try zdb.key.withTs(std.testing.allocator, "b", 4);
-    defer std.testing.allocator.free(b4k);
-    try b2.add(b4k, "b4");
-    const d1k = try zdb.key.withTs(std.testing.allocator, "d", 1);
-    defer std.testing.allocator.free(d1k);
-    try b2.add(d1k, "d1");
+    try b2.add(.{ .primary = "b", .timestamp = 4 }, "b4");
+    try b2.add(.{ .primary = "d", .timestamp = 1 }, "d1");
     var t2 = try b2.finish();
     defer t2.deinit();
 
@@ -263,7 +235,7 @@ test "table iterator: forward scan" {
         while (it.itemRef()) |entry| : (count += 1) {
             var key_buf: [32]u8 = undefined;
             const expected_key_no_ts = try std.fmt.bufPrint(&key_buf, "key{d:0>4}", .{count});
-            try std.testing.expectEqualStrings(expected_key_no_ts, zdb.key.parseKey(entry.key));
+            try std.testing.expectEqualStrings(expected_key_no_ts, entry.key.primary);
 
             var val_buf: [20]u8 = undefined;
             const expected_val = try std.fmt.bufPrint(&val_buf, "{d}", .{count});
@@ -293,7 +265,7 @@ test "seek to first" {
         try it.seekToFirst();
         const entry = it.itemRef() orelse return error.UnexpectedNull;
         try std.testing.expectEqualStrings("0", entry.value);
-        try std.testing.expectEqualStrings("key0000", zdb.key.parseKey(entry.key));
+        try std.testing.expectEqualStrings("key0000", entry.key.primary);
     }
 }
 
@@ -323,15 +295,13 @@ test "seek: various targets" {
     };
 
     for (cases) |c| {
-        const sk = try zdb.key.withTs(alloc, c.in, 0);
-        defer alloc.free(sk);
-        try it.seek(sk);
+        try it.seek(.{ .primary = c.in, .timestamp = 0 });
         if (!c.valid) {
             try std.testing.expect(it.itemRef() == null);
             continue;
         }
         const entry = it.itemRef() orelse return error.UnexpectedNull;
-        try std.testing.expectEqualStrings(c.out, zdb.key.parseKey(entry.key));
+        try std.testing.expectEqualStrings(c.out, entry.key.primary);
     }
 }
 
@@ -374,30 +344,24 @@ test "table: seek and iterate to end" {
     defer it.deinit();
 
     // Seek to key1010, iterate to end — should visit keys 1010..9999.
-    const sk1010 = try zdb.key.withTs(alloc, "key1010", 0);
-    defer alloc.free(sk1010);
-    try it.seek(sk1010);
+    try it.seek(.{ .primary = "key1010", .timestamp = 0 });
     var kid: usize = 1010;
     while (it.itemRef()) |entry| : (kid += 1) {
         var buf: [32]u8 = undefined;
         const expected = try std.fmt.bufPrint(&buf, "key{d:0>4}", .{kid});
-        try std.testing.expectEqualStrings(expected, zdb.key.parseKey(entry.key));
+        try std.testing.expectEqualStrings(expected, entry.key.primary);
         try it.next();
     }
     try std.testing.expectEqual(@as(usize, 10000), kid);
 
     // Seek past end → invalid.
-    const sk_end = try zdb.key.withTs(alloc, "key99999", 0);
-    defer alloc.free(sk_end);
-    try it.seek(sk_end);
+    try it.seek(.{ .primary = "key99999", .timestamp = 0 });
     try std.testing.expect(it.itemRef() == null);
 
     // Seek before start → first key.
-    const sk_before = try zdb.key.withTs(alloc, "aaa", 0);
-    defer alloc.free(sk_before);
-    try it.seek(sk_before);
+    try it.seek(.{ .primary = "aaa", .timestamp = 0 });
     const first = it.itemRef() orelse return error.UnexpectedNull;
-    try std.testing.expectEqualStrings("key0000", zdb.key.parseKey(first.key));
+    try std.testing.expectEqualStrings("key0000", first.key.primary);
 }
 
 // ---------------------------------------------------------------------------
@@ -414,9 +378,7 @@ test "table: max_version" {
     while (i < n) : (i += 1) {
         var buf: [32]u8 = undefined;
         const key_str = try std.fmt.bufPrint(&buf, "foo:{d:0>4}", .{i});
-        const k = try zdb.key.withTs(alloc, key_str, i + 1);
-        defer alloc.free(k);
-        try b.add(k, "");
+        try b.add(.{ .primary = key_str, .timestamp = i + 1 }, "");
     }
 
     var tb = try b.finish();
@@ -438,8 +400,8 @@ test "table: smallest and biggest keys" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer tbl.decrRef();
 
-    try std.testing.expectEqualStrings("key0000", zdb.key.parseKey(tbl.smallest()));
-    try std.testing.expectEqualStrings("key0199", zdb.key.parseKey(tbl.biggest()));
+    try std.testing.expectEqualStrings("key0000", tbl.smallest.primary);
+    try std.testing.expectEqualStrings("key0199", tbl.biggest.primary);
 }
 
 // ---------------------------------------------------------------------------
@@ -461,10 +423,8 @@ test "table: big values" {
     while (i < n) : (i += 1) {
         var buf: [16]u8 = undefined;
         const key_str = try std.fmt.bufPrint(&buf, "{d:0>4}", .{i});
-        const k = try zdb.key.withTs(alloc, key_str, @intCast(i + 1));
-        defer alloc.free(k);
         @memset(big_val, @intCast(i % 256));
-        try b.add(k, big_val);
+        try b.add(.{ .primary = key_str, .timestamp = @as(u64, @intCast(i + 1)) }, big_val);
     }
 
     var tb = try b.finish();
