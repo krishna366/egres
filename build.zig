@@ -334,6 +334,13 @@ fn addZdbTests(
     zdb_levels_tests.root_module.addImport("zdb", zdb_mod);
     zdb_levels_tests.step.dependOn(regen_buffers_step);
 
+    const zdb_forest_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb/forest_test.zig"),
+    });
+    addVendoredCompressionSources(b, zdb_forest_tests);
+    zdb_forest_tests.root_module.addImport("zdb", zdb_mod);
+    zdb_forest_tests.step.dependOn(regen_buffers_step);
+
     const zdb_cache_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/cache.zig"),
     });
@@ -345,6 +352,7 @@ fn addZdbTests(
     const zio_mod = zio_dep.module("zio");
     zdb_mod.addImport("zio", zio_mod);
     zdb_levels_tests.root_module.addImport("zio", zio_mod);
+    zdb_forest_tests.root_module.addImport("zio", zio_mod);
 
     const zdb_vfs_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/vfs_test.zig"),
@@ -364,6 +372,7 @@ fn addZdbTests(
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_table_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_manifest_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_levels_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(zdb_forest_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_cache_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_vfs_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_bw_tests).step);

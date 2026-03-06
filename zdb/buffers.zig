@@ -35,14 +35,28 @@ pub const TableIndex = schema.Table(.{
     .{ .id = 9, .name = "binary_fuse", .ty = BinaryFuseFilter },
 });
 
-pub const ManifestChange = schema.Table(.{
-    .{ .id = 1, .name = "op", .ty = schema.U32 }, // 0=CREATE, 1=DELETE
-    .{ .id = 2, .name = "table_id", .ty = schema.U64 },
-    .{ .id = 3, .name = "level", .ty = schema.U32 }, // 0 for DELETE
+// TreeChange is used to create a new tree, delete a tree or update a tree's range.
+pub const TreeChange = schema.Table(.{
+    .{ .id = 1, .name = "op", .ty = schema.U32 }, // 0=CREATE, 1=DELETE, 2=UPDATE
+    .{ .id = 2, .name = "namespace_id", .ty = schema.U32 },
+    .{ .id = 3, .name = "tree_id", .ty = schema.U64 },
+    .{ .id = 4, .name = "left_key", .ty = schema.Bytes },
+    .{ .id = 5, .name = "right_key", .ty = schema.Bytes },
 });
 
-pub const ManifestChangeSet = schema.Table(.{
-    .{ .id = 1, .name = "changes", .ty = schema.Array(ManifestChange) },
+// Table changes tell us which tree the table belongs to, and which level.
+// Note that a table can belong to multiple trees. Table deletion should
+// only happen when a table's ref count reaches 0.
+pub const TableChange = schema.Table(.{
+    .{ .id = 1, .name = "op", .ty = schema.U32 }, // 0=CREATE, 1=DELETE
+    .{ .id = 2, .name = "level", .ty = schema.U32 }, // 0 for DELETE
+    .{ .id = 3, .name = "table_id", .ty = schema.U64 },
+    .{ .id = 4, .name = "tree_id", .ty = schema.U64 },
+});
+
+pub const ManifestChange = schema.Table(.{
+    .{ .id = 1, .name = "tree_changes", .ty = schema.Array(TreeChange) },
+    .{ .id = 2, .name = "table_changes", .ty = schema.Array(TableChange) },
 });
 
 // zbuf tail stores table_id as u16, so use a module namespace in high bits and
@@ -57,6 +71,8 @@ pub const tables = .{
     .{ .name = "BlockIndex", .ty = BlockIndex, .id = tableId(1) },
     .{ .name = "TableIndex", .ty = TableIndex, .id = tableId(2) },
     .{ .name = "BinaryFuseFilter", .ty = BinaryFuseFilter, .id = tableId(3) },
-    .{ .name = "ManifestChange", .ty = ManifestChange, .id = tableId(4) },
-    .{ .name = "ManifestChangeSet", .ty = ManifestChangeSet, .id = tableId(5) },
+
+    .{ .name = "TreeChange", .ty = TreeChange, .id = tableId(4) },
+    .{ .name = "TableChange", .ty = TableChange, .id = tableId(5) },
+    .{ .name = "ManifestChange", .ty = ManifestChange, .id = tableId(6) },
 };

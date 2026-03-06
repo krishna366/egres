@@ -60,17 +60,17 @@ pub const TableEntry = struct {
 };
 
 // ---------------------------------------------------------------------------
-// LevelHandler
+// Level
 // ---------------------------------------------------------------------------
 
-pub const LevelHandler = struct {
+pub const Level = struct {
     mu: std.Thread.RwLock,
     tables: std.ArrayList(TableEntry),
     total_size: i64, // sum of each table's buf.len
     level: u8,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, level: u8) LevelHandler {
+    pub fn init(allocator: std.mem.Allocator, level: u8) Level {
         return .{
             .mu = .{},
             .tables = .{},
@@ -81,9 +81,9 @@ pub const LevelHandler = struct {
     }
 
     /// deinit releases each table's reference without deleting SST files.
-    /// Used by LevelsController.close(); detaches the path so decrRef at
+    /// Used by Tree.close(); detaches the path so decrRef at
     /// zero only frees memory.
-    pub fn deinit(self: *LevelHandler) void {
+    pub fn deinit(self: *Level) void {
         for (self.tables.items) |e| {
             e.table.detach(); // clear path → decrRef won't delete the file
             e.table.decrRef();
@@ -92,7 +92,7 @@ pub const LevelHandler = struct {
     }
 
     /// initEntries bulk-sets entries, sorts them, and recomputes total_size.
-    pub fn initEntries(self: *LevelHandler, new_entries: []const TableEntry) !void {
+    pub fn initEntries(self: *Level, new_entries: []const TableEntry) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -109,7 +109,7 @@ pub const LevelHandler = struct {
     /// sortEntries: L0 → by id ascending; L≥1 → by table.smallest key.
     /// L0 tables would overlap. Newer tables would have higher ids and would be at the end.
     /// L1 and onwards would have non-overlapping tables.
-    fn sortEntries(self: *LevelHandler) void {
+    fn sortEntries(self: *Level) void {
         if (self.level == 0) {
             std.mem.sort(TableEntry, self.tables.items, {}, struct {
                 fn lt(_: void, a: TableEntry, b: TableEntry) bool {
@@ -126,7 +126,7 @@ pub const LevelHandler = struct {
     }
 
     /// addEntry appends an entry, sorts, and increments the table's ref count.
-    pub fn addEntry(self: *LevelHandler, id: u64, t: *Table) !void {
+    pub fn addEntry(self: *Level, id: u64, t: *Table) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -137,14 +137,14 @@ pub const LevelHandler = struct {
     }
 
     /// deleteEntries removes entries by id and decrements each removed table's ref.
-    pub fn deleteEntries(self: *LevelHandler, to_del: []const TableEntry) void {
+    pub fn deleteEntries(self: *Level, to_del: []const TableEntry) void {
         self.mu.lock();
         defer self.mu.unlock();
 
         return self.deleteEntriesLocked(to_del);
     }
 
-    fn deleteEntriesLocked(self: *LevelHandler, to_del: []const TableEntry) void {
+    fn deleteEntriesLocked(self: *Level, to_del: []const TableEntry) void {
         // Iterate over the full list of tables we own, and see for each table whether
         // it's id is present in the ids list provided.
         var i: usize = self.tables.items.len;
@@ -167,7 +167,7 @@ pub const LevelHandler = struct {
     }
 
     /// replaceEntries is write-locked: deletes del_ids, appends to_add, then sorts.
-    pub fn replaceEntries(self: *LevelHandler, to_del: []const TableEntry, to_add: []const TableEntry) !void {
+    pub fn replaceEntries(self: *Level, to_del: []const TableEntry, to_add: []const TableEntry) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -186,7 +186,7 @@ pub const LevelHandler = struct {
     /// overlappingTables returns a heap-allocated slice of TableEntry whose key
     /// range overlaps kr. The caller must free the slice when done.
     /// L0: always all tables; L≥1: binary search on both ends.
-    pub fn overlappingTables(self: *LevelHandler, allocator: std.mem.Allocator, kr: KeyRange) ![]TableEntry {
+    pub fn overlappingTables(self: *Level, allocator: std.mem.Allocator, kr: KeyRange) ![]TableEntry {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -214,13 +214,13 @@ pub const LevelHandler = struct {
         return allocator.dupe(TableEntry, slice);
     }
 
-    pub fn getTotalSize(self: *LevelHandler) i64 {
+    pub fn getTotalSize(self: *Level) i64 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.total_size;
     }
 
-    pub fn numTables(self: *LevelHandler) usize {
+    pub fn numTables(self: *Level) usize {
         self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.tables.items.len;
@@ -232,7 +232,7 @@ pub const LevelHandler = struct {
     ///
     /// L0: back-to-front (highest id = newest); first match wins.
     /// L≥1: binary search for the one table that could contain the key.
-    pub fn get(self: *LevelHandler, search_key: Key, priority: vfs.Priority) Error!?Item {
+    pub fn get(self: *Level, search_key: Key, priority: vfs.Priority) Error!?Item {
         if (self.level == 0) {
             self.mu.lockShared();
             defer self.mu.unlockShared();

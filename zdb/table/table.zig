@@ -44,7 +44,7 @@ pub const Table = struct {
     /// The file loading mode is determined by vfs.instance; readAligned
     /// transparently handles mmap, direct, and memory-backed file handles.
     pub fn open(allocator: std.mem.Allocator, path: []const u8, priority: vfs.Priority) !*Table {
-        const handle = try vfs.instance.openFile(allocator, path, .default);
+        const handle = try vfs.instance.openFile(allocator, path, .{});
         const t = try initFromHandle(allocator, handle, priority);
         errdefer t.decrRef();
         t.file_id = vfs.fileIdFromPath(path);
@@ -144,7 +144,7 @@ pub const Table = struct {
     }
 
     /// detach forgets the SST file path without deleting it.
-    /// Used by LevelHandler.deinit() (database close) so that the subsequent
+    /// Used by Level.deinit() (database close) so that the subsequent
     /// decrRef at zero frees memory only, leaving the file on disk intact.
     pub fn detach(self: *Table) void {
         if (self.path) |p| self.allocator.free(p);

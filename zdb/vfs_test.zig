@@ -23,7 +23,7 @@ test "open and close" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(testing.allocator, path, .direct);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
     try testing.expectEqual(@as(u64, 11), handle.file_size);
@@ -41,7 +41,7 @@ test "readAligned at aligned offset" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(testing.allocator, path, .direct);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
     // Read 100 bytes at offset 0 (aligned).
@@ -63,7 +63,7 @@ test "readAligned at unaligned offset" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(testing.allocator, path, .direct);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
     // Read 12 bytes at offset 5000 (unaligned).
@@ -85,7 +85,7 @@ test "readAligned alignment math" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(testing.allocator, path, .direct);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
     // Read 12 bytes at offset 5000.
@@ -112,7 +112,7 @@ test "O_DIRECT fallback on tmpfs" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const v = VFS.init;
-    const handle = try v.openFile(testing.allocator, path, .direct);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
     try testing.expectEqual(@as(u64, 13), handle.file_size);
@@ -139,7 +139,7 @@ test "bandwidth limiter deducts on read" {
     const tokens_before = limiter.tokens.load(.monotonic);
 
     var v = VFS{ .bw = &limiter };
-    const handle = try v.openFile(testing.allocator, path, .direct);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
     const r = try handle.readAligned(testing.allocator, 0, 100, .p0);
@@ -158,7 +158,7 @@ test "mmap open and close" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     var v = VFS{ .bw = null };
-    const handle = try v.openFile(testing.allocator, path, .mmap);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
     defer handle.close();
 
     try testing.expectEqual(@as(u64, 14), handle.file_size);
@@ -176,7 +176,7 @@ test "mmap readAligned" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     var v = VFS{ .bw = null };
-    const handle = try v.openFile(testing.allocator, path, .mmap);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
     defer handle.close();
 
     // Aligned offset.
@@ -198,7 +198,7 @@ test "mmap readAligned no allocation" {
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     var v = VFS{ .bw = null };
-    const handle = try v.openFile(testing.allocator, path, .mmap);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
     defer handle.close();
 
     const r = try handle.readAligned(testing.allocator, 0, 14, .p0);
@@ -222,7 +222,7 @@ test "mmap enforces bandwidth limiter" {
     const tokens_before = limiter.tokens.load(.monotonic);
 
     var v = VFS{ .bw = &limiter };
-    const handle = try v.openFile(testing.allocator, path, .mmap);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
     defer handle.close();
 
     const r = try handle.readAligned(testing.allocator, 0, 100, .p0);
@@ -254,7 +254,7 @@ test "read bandwidth enforcement" {
     });
 
     var v = VFS{ .bw = &limiter };
-    const handle = try v.openFile(testing.allocator, path, .direct);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
     // Drain the initial bucket with a P0 read.
@@ -351,7 +351,7 @@ test "P1 prioritized over P2" {
     });
 
     var v = VFS{ .bw = &limiter };
-    const handle = try v.openFile(testing.allocator, path, .direct);
+    const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
     // Drain the bucket so both threads must wait for refill.

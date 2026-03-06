@@ -3,14 +3,14 @@ const zio = @import("zio");
 const utils = @import("utils");
 const options = @import("options.zig");
 const manifest = @import("manifest.zig");
-const level_handler = @import("level_handler.zig");
+const level_handler = @import("level.zig");
 const table_mod = @import("table.zig");
 const vfs = @import("vfs.zig");
 
 const Table = table_mod.Table;
 const TableIterator = table_mod.TableIterator;
 const Item = table_mod.table.Item;
-const LevelHandler = level_handler.LevelHandler;
+const Level = level_handler.Level;
 const TableEntry = level_handler.TableEntry;
 const Key = @import("key.zig").Key;
 const KeyRange = level_handler.KeyRange;
@@ -42,7 +42,7 @@ const LevelPriority = struct {
 };
 
 // ---------------------------------------------------------------------------
-// LevelsController
+// Tree
 // ---------------------------------------------------------------------------
 //
 // The terminology used here is that data starts flowing in Level 0 (top most)
@@ -54,54 +54,57 @@ const LevelPriority = struct {
 // If it helps, we can think of L1..n as basement levels, where i is the ith floor
 // below ground. DB Infrastructure works way under the API surface, so this is apt.
 
-pub const LevelsController = struct {
+pub const CompactCandidate = struct { level: u8, score: f64 };
+
+pub const Tree = struct {
     allocator: std.mem.Allocator,
     opts: options.Options,
-    ms: *manifest.ManifestState,
-    handlers: []LevelHandler,
-    next_file_id: std.atomic.Value(u64),
+    tree_id: u64,
+    ms: *manifest.ForestState,
+    levels: []Level,
+    compact_candidate: ?CompactCandidate = null,
 
-    /// open builds a LevelsController from an existing manifest state.
-    /// It reads each SST file listed in ms.tables, opens the table,
-    /// and distributes tables across their corresponding level handlers.
+    /// open builds an Tree from an existing manifest state.
+    /// It reads the tree's own levels and opens only tables belonging to this tree.
     /// Table opens are spread across zio fibers for parallelism.
-    pub fn open(
-        allocator: std.mem.Allocator,
-        opts: options.Options,
-        ms: *manifest.ManifestState,
-    ) !LevelsController {
-        const handlers = try allocator.alloc(LevelHandler, opts.max_levels);
-        errdefer allocator.free(handlers);
-        for (handlers, 0..) |*h, i| {
-            h.* = LevelHandler.init(allocator, @intCast(i));
+    pub fn open(allocator: std.mem.Allocator, opts: options.Options, tree_id: u64, ms: *manifest.ForestState) !Tree {
+        const levels = try allocator.alloc(Level, opts.max_levels);
+        errdefer allocator.free(levels);
+        for (levels, 0..) |*l, i| {
+            l.* = Level.init(allocator, @intCast(i));
         }
-        errdefer for (handlers) |*h| h.deinit();
+        errdefer for (levels) |*l| l.deinit();
 
-        var max_id: u64 = 0;
         var tse: utils.ThreadSafeError = .{};
         var group: zio.Group = .init;
         defer group.cancel();
 
-        var it = ms.tables.iterator();
-        while (it.next()) |kv| {
-            const tm = kv.value_ptr.*;
-            if (kv.key_ptr.* > max_id) max_id = kv.key_ptr.*;
-            if (tm.level >= opts.max_levels) continue;
+        // Iterate the tree's own levels to find which tables belong to this tree.
+        if (ms.trees.getPtr(tree_id)) |tree| {
+            for (tree.levels.items, 0..) |lm, level_idx| {
+                if (level_idx >= opts.max_levels) continue;
+                var tit = lm.tables.iterator();
+                while (tit.next()) |tkv| {
+                    const table_id = tkv.key_ptr.*;
 
-            try group.spawn(openTableFiber, .{
-                allocator, opts.dir, kv.key_ptr.*, tm.level, handlers, &tse,
-            });
+                    try group.spawn(openTableFiber, .{
+                        allocator, opts.dir, table_id, level_idx, levels, &tse,
+                    });
+                }
+            }
         }
         group.wait() catch {};
         if (tse.get()) |err| return err;
 
-        return .{
+        var tree: Tree = .{
             .allocator = allocator,
             .opts = opts,
+            .tree_id = tree_id,
             .ms = ms,
-            .handlers = handlers,
-            .next_file_id = std.atomic.Value(u64).init(max_id + 1),
+            .levels = levels,
         };
+        try tree.updateCompactCandidate();
+        return tree;
     }
 
     /// Opens a single SST and adds it to the appropriate handler.
@@ -109,8 +112,8 @@ pub const LevelsController = struct {
         allocator: std.mem.Allocator,
         dir: []const u8,
         id: u64,
-        level: u8,
-        handlers: []LevelHandler,
+        level: usize,
+        levels: []Level,
         tse: *utils.ThreadSafeError,
     ) void {
         const path = std.fmt.allocPrint(allocator, "{s}/{d:0>6}.sst", .{ dir, id }) catch |err| {
@@ -125,23 +128,23 @@ pub const LevelsController = struct {
         };
         defer t.decrRef();
 
-        handlers[level].addEntry(id, t) catch |err| {
+        levels[level].addEntry(id, t) catch |err| {
             tse.set(err);
         };
     }
 
-    /// close tears down all level handlers, freeing each table's memory without
+    /// close tears down all level levels, freeing each table's memory without
     /// deleting SST files (which are managed by the manifest).
-    pub fn close(self: *LevelsController) void {
-        for (self.handlers) |*h| h.deinit();
-        self.allocator.free(self.handlers);
+    pub fn close(self: *Tree) void {
+        for (self.levels) |*h| h.deinit();
+        self.allocator.free(self.levels);
     }
 
     /// get checks each level from L0 upward and returns the first matching item,
     /// or null if the key is absent. The returned item's key and value are
     /// duplicated with self.allocator; the caller must free them.
-    pub fn get(self: *LevelsController, search_key: Key, priority: vfs.Priority) !?Item {
-        for (self.handlers) |*h| {
+    pub fn get(self: *Tree, search_key: Key, priority: vfs.Priority) !?Item {
+        for (self.levels) |*h| {
             if (try h.get(search_key, priority)) |item| return item;
         }
         return null;
@@ -151,7 +154,7 @@ pub const LevelsController = struct {
     // Level sizing
     // -----------------------------------------------------------------------
 
-    fn levelTargets(self: *LevelsController) !Targets {
+    fn levelTargets(self: *Tree) !Targets {
         const n = self.opts.max_levels;
         const target_sz = try self.allocator.alloc(i64, n);
         errdefer self.allocator.free(target_sz);
@@ -162,7 +165,7 @@ pub const LevelsController = struct {
         @memset(file_sz, 0);
 
         var base_level: u8 = 0;
-        var db_size: i64 = self.handlers[n - 1].getTotalSize();
+        var db_size: i64 = self.levels[n - 1].getTotalSize();
 
         // Compute target sizes from the last level down to L0.
         var i: usize = n - 1;
@@ -181,7 +184,7 @@ pub const LevelsController = struct {
         // set base_level to that level — L0 compaction can't skip over a non-empty level.
         if (base_level > 1) {
             for (1..base_level) |j| {
-                if (self.handlers[j].getTotalSize() > 0) {
+                if (self.levels[j].getTotalSize() > 0) {
                     base_level = @intCast(j);
                     break;
                 }
@@ -212,9 +215,10 @@ pub const LevelsController = struct {
     // Compaction selection
     // -----------------------------------------------------------------------
 
-    /// pickCompactLevel returns the level that most needs compaction, or null
-    /// if no level has exceeded its target (score < 1.0 for all levels).
-    pub fn pickCompactLevel(self: *LevelsController) !?u8 {
+    /// updateCompactCandidate recomputes which level most needs compaction and
+    /// stores the result in self.compact_candidate. Called after open and after
+    /// every doCompact so the candidate is always fresh.
+    pub fn updateCompactCandidate(self: *Tree) !void {
         var t = try self.levelTargets();
         defer t.deinit();
 
@@ -223,22 +227,21 @@ pub const LevelsController = struct {
         defer self.allocator.free(prios);
 
         // L0: count-based score.
-        {
-            const l0_score = @as(f64, @floatFromInt(self.handlers[0].numTables())) /
-                @as(f64, @floatFromInt(self.opts.num_level_zero_tables));
-            prios[0] = .{ .level = 0, .score = l0_score, .adjusted = l0_score };
+        const l0_score = @as(f64, @floatFromInt(self.levels[0].numTables())) /
+            @as(f64, @floatFromInt(self.opts.num_level_zero_tables));
+        prios[0] = .{ .level = 0, .score = l0_score, .adjusted = l0_score };
 
-            // If L0 needs compaction, execute it. We don't want to block writes because lower
-            // levels are out of shape. Lower levels being out of shape is not as bad as blocking
-            // user facing writes.
-            if (l0_score >= 2.5) {
-                return 0;
-            }
+        // If L0 needs compaction, execute it. We don't want to block writes because lower
+        // levels are out of shape. Lower levels being out of shape is not as bad as blocking
+        // user facing writes.
+        if (l0_score >= 2.5) {
+            self.compact_candidate = .{ .level = 0, .score = l0_score };
+            return;
         }
 
         // L≥1: size-based score.
         for (1..n) |j| {
-            const sz = self.handlers[j].getTotalSize();
+            const sz = self.levels[j].getTotalSize();
             const target = t.target_sz[j];
             const score = if (target > 0)
                 @as(f64, @floatFromInt(sz)) / @as(f64, @floatFromInt(target))
@@ -274,7 +277,10 @@ pub const LevelsController = struct {
         for (prios[0 .. n - 1]) |p| {
             if (p.score >= 1.0) try filtered.append(self.allocator, p);
         }
-        if (filtered.items.len == 0) return null;
+        if (filtered.items.len == 0) {
+            self.compact_candidate = null;
+            return;
+        }
 
         // Sort descending by adjusted score.
         std.mem.sort(LevelPriority, filtered.items, {}, struct {
@@ -283,7 +289,12 @@ pub const LevelsController = struct {
             }
         }.gt);
 
-        return @intCast(filtered.items[0].level);
+        const winner = filtered.items[0];
+        if (winner.adjusted <= 1.0) {
+            self.compact_candidate = null;
+        } else {
+            self.compact_candidate = .{ .level = @intCast(winner.level), .score = winner.adjusted };
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -292,8 +303,8 @@ pub const LevelsController = struct {
 
     /// doCompact compacts src_level into dest (src+1, or Lbase when src==0).
     /// It merges src tables with any overlapping dest tables, writes new SSTs,
-    /// commits the manifest, and updates the level handlers atomically.
-    pub fn doCompact(self: *LevelsController, src_level: u8) !void {
+    /// commits the manifest, and updates the level levels atomically.
+    pub fn doCompact(self: *Tree, src_level: u8, next_file_id: *std.atomic.Value(u64)) !void {
         const src: usize = src_level;
         const prio: vfs.Priority = if (src_level == 0) .p1 else .p2;
 
@@ -305,10 +316,10 @@ pub const LevelsController = struct {
 
         // --- collect src entries (all of L0; first entry of L≥1) ---
         const src_entries_slice = blk: {
-            self.handlers[src].mu.lockShared();
-            defer self.handlers[src].mu.unlockShared();
+            self.levels[src].mu.lockShared();
+            defer self.levels[src].mu.unlockShared();
 
-            const items = self.handlers[src].tables.items;
+            const items = self.levels[src].tables.items;
             if (items.len == 0) return;
 
             // TODO: This can be improved to consider which table to compact.
@@ -325,7 +336,7 @@ pub const LevelsController = struct {
         }
 
         // --- collect overlapping dest (bot) entries ---
-        const bot_entries_slice = try self.handlers[dest].overlappingTables(self.allocator, kr);
+        const bot_entries_slice = try self.levels[dest].overlappingTables(self.allocator, kr);
         defer self.allocator.free(bot_entries_slice);
 
         // --- build single MergeIterator over src tables + one ConcatIterator for bot ---
@@ -381,7 +392,7 @@ pub const LevelsController = struct {
                 // find higher version keys at higher levels. This expectation is used by get fn to
                 // stop searching for key as soon as we're able to find a version >= search key.
                 if (item.key.orderPrimary(bld.lastKey()) != .eq) {
-                    try self.flushBuilderOutput(&bld, &flush_handles);
+                    try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
                     bld.reset();
                 }
             }
@@ -390,7 +401,7 @@ pub const LevelsController = struct {
         }
 
         // Flush any remaining data.
-        try self.flushBuilderOutput(&bld, &flush_handles);
+        try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
 
         // Join all sync+open fibers and collect output tables.
         for (flush_handles.items) |*h| {
@@ -405,42 +416,45 @@ pub const LevelsController = struct {
         defer dir_sync.join();
 
         // --- build manifest changes ---
-        var changes = try std.ArrayList(manifest.Change).initCapacity(
+        var changes = try std.ArrayList(manifest.TableChange).initCapacity(
             self.allocator,
             src_entries_slice.len + bot_entries_slice.len + output_tables.items.len,
         );
         defer changes.deinit(self.allocator);
 
-        for (src_entries_slice) |e| try changes.append(self.allocator, manifest.Change.delete(e.id));
-        for (bot_entries_slice) |e| try changes.append(self.allocator, manifest.Change.delete(e.id));
+        for (src_entries_slice) |e| try changes.append(self.allocator, manifest.deleteTableChange(e.id, self.tree_id));
+        for (bot_entries_slice) |e| try changes.append(self.allocator, manifest.deleteTableChange(e.id, self.tree_id));
         for (output_tables.items) |e| {
-            try changes.append(self.allocator, manifest.Change.create(e.id, @intCast(dest)));
+            try changes.append(self.allocator, manifest.createTableChange(e.id, self.tree_id, @intCast(dest))); // usize → u32
         }
 
-        // Commit to manifest (durable) before touching the handlers.
-        try self.ms.commit(changes.items);
+        // Commit to manifest (durable) before touching the levels.
+        try self.ms.commit(changes.items, &.{});
         committed = true;
 
-        // --- update handlers ---
-        self.handlers[src].deleteEntries(src_entries_slice);
-        try self.handlers[dest].replaceEntries(bot_entries_slice, output_tables.items);
+        // --- update levels ---
+        self.levels[src].deleteEntries(src_entries_slice);
+        try self.levels[dest].replaceEntries(bot_entries_slice, output_tables.items);
 
-        // Release our refs on output tables; handlers have taken their own refs via replaceEntries.
+        // Release our refs on output tables; levels have taken their own refs via replaceEntries.
         for (output_tables.items) |e| e.table.decrRef();
+
+        try self.updateCompactCandidate();
     }
 
     /// flushBuilderOutput finishes the builder, writes bytes to a new SST file,
     /// then spawns a fiber to sync and open it. The JoinHandle is appended to handles.
     fn flushBuilderOutput(
-        self: *LevelsController,
+        self: *Tree,
         bld: *Builder,
         handles: *std.ArrayList(zio.JoinHandle(?*Table)),
+        next_file_id: *std.atomic.Value(u64),
     ) !void {
         var tb = try bld.finish();
         defer tb.deinit();
         if (tb.bytes.len == 0) return;
 
-        const id = self.next_file_id.fetchAdd(1, .monotonic);
+        const id = next_file_id.fetchAdd(1, .monotonic);
         const path = try std.fmt.allocPrint(
             self.allocator,
             "{s}/{d:0>6}.sst",
@@ -448,7 +462,7 @@ pub const LevelsController = struct {
         );
         errdefer self.allocator.free(path);
 
-        const wh = try vfs.instance.createFile(path, .direct);
+        const wh = try vfs.instance.createFile(path, .{ .mode = .direct });
         try wh.write(tb.bytes, 0, bld.cfg.priority);
 
         // Sync + open in a fiber; data is in page cache after write.

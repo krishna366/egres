@@ -4,6 +4,18 @@ const posix = std.posix;
 const zio = @import("zio");
 const bandwidth = @import("bandwidth.zig");
 
+pub const Flags = struct {
+    /// Open for reading and writing instead of read-only.
+    writable: bool = false,
+    /// Truncate an existing file instead of failing with O_EXCL.
+    truncate: bool = false,
+};
+
+pub const FileOptions = struct {
+    mode: Mode = .default,
+    flags: Flags = .{},
+};
+
 pub const page_size: usize = 4096;
 pub const page_alignment = std.mem.Alignment.fromByteUnits(page_size);
 
@@ -148,6 +160,10 @@ pub const FileHandle = struct {
         if (self.file) |f| f.sync(.{}) catch {};
     }
 
+    pub fn truncate(self: FileHandle, size: u64) !void {
+        try self.file.?.setSize(size);
+    }
+
     pub fn close(self: FileHandle) void {
         if (self.owned_buf) |b| {
             if (self.buf_allocator) |a| a.free(b);
@@ -166,11 +182,11 @@ pub const VFS = struct {
 
     pub const init: VFS = .{ .bw = null };
 
-    pub fn openFile(self: *const VFS, allocator: std.mem.Allocator, path: []const u8, mode: Mode) !FileHandle {
+    pub fn openFile(self: *const VFS, allocator: std.mem.Allocator, path: []const u8, opts: FileOptions) !FileHandle {
         const fid = fileIdFromPath(path);
-        switch (mode) {
+        switch (opts.mode) {
             .mmap => {
-                const fd = try openDirect(path, false);
+                const fd = try openDirect(path, false, false);
                 errdefer posix.close(fd);
 
                 const file_size = try (std.fs.File{ .handle = fd }).getEndPos();
@@ -178,14 +194,14 @@ pub const VFS = struct {
                 return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .file_id = fid, .mapped = mapped, .vfs = self };
             },
             .default, .direct => {
-                const fd = try openDirect(path, mode == .direct);
+                const fd = try openDirect(path, opts.mode == .direct, opts.flags.writable);
                 errdefer posix.close(fd);
 
                 const file_size = try (std.fs.File{ .handle = fd }).getEndPos();
                 return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .file_id = fid, .vfs = self };
             },
             .memory => {
-                const fd = try openDirect(path, false);
+                const fd = try openDirect(path, false, false);
                 defer posix.close(fd); // closed after reading; FileHandle won't own it
 
                 const file = std.fs.File{ .handle = fd };
@@ -205,23 +221,32 @@ pub const VFS = struct {
         }
     }
 
-    pub fn createFile(self: *const VFS, path: []const u8, mode: Mode) !FileHandle {
-        if (mode == .mmap or mode == .memory) return error.InvalidMode;
+    pub fn createFile(self: *const VFS, path: []const u8, opts: FileOptions) !FileHandle {
+        if (opts.mode == .mmap or opts.mode == .memory) return error.InvalidMode;
 
-        var flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true };
-        if (builtin.os.tag == .linux and mode == .direct) flags.DIRECT = true;
+        var open_flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true };
+        if (opts.flags.truncate) {
+            open_flags.TRUNC = true;
+        } else {
+            open_flags.EXCL = true;
+        }
+        if (builtin.os.tag == .linux and opts.mode == .direct) open_flags.DIRECT = true;
 
-        const fd = posix.open(path, flags, 0o644) catch |err| switch (err) {
+        const fd = posix.open(path, open_flags, 0o644) catch |err| switch (err) {
             // tmpfs doesn't support O_DIRECT — fall back to plain open.
-            error.BadPathName => return self.createFile(path, .default),
+            error.BadPathName => return self.createFile(path, .{ .flags = opts.flags }),
             else => return err,
         };
 
-        if (builtin.os.tag == .macos and mode == .direct) {
+        if (builtin.os.tag == .macos and opts.mode == .direct) {
             _ = posix.fcntl(fd, 48, 1) catch {};
         }
 
         return .{ .file = zio.File.fromFd(fd), .file_size = 0, .vfs = self };
+    }
+
+    pub fn renameFile(old_path: []const u8, new_path: []const u8) !void {
+        try zio.Dir.cwd().rename(old_path, zio.Dir.cwd(), new_path);
     }
 
     /// Best-effort directory fsync so newly created filenames are durable.
@@ -234,19 +259,20 @@ pub const VFS = struct {
     }
 
     pub fn deleteFile(path: []const u8) !void {
-        try std.fs.deleteFileAbsolute(path);
+        try zio.Dir.cwd().deleteFile(path);
     }
 };
 
 /// When direct_io is set, open read-only with O_DIRECT on Linux. Falls back to plain open if the
 /// filesystem doesn't support it (e.g. tmpfs returns EINVAL → BadPathName).
-fn openDirect(path: []const u8, direct_io: bool) !posix.fd_t {
-    var flags: posix.O = .{ .ACCMODE = .RDONLY };
+fn openDirect(path: []const u8, direct_io: bool, writable: bool) !posix.fd_t {
+    const accmode: posix.ACCMODE = if (writable) .RDWR else .RDONLY;
+    var flags: posix.O = .{ .ACCMODE = accmode };
     if (builtin.os.tag == .linux and direct_io) flags.DIRECT = true;
 
     const fd = posix.open(path, flags, 0) catch |err| switch (err) {
         // EINVAL is mapped to error.BadPathName
-        error.BadPathName => return posix.open(path, .{ .ACCMODE = .RDONLY }, 0),
+        error.BadPathName => return posix.open(path, .{ .ACCMODE = accmode }, 0),
         else => return err,
     };
 

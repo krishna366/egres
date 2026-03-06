@@ -1,5 +1,7 @@
 const std = @import("std");
 const buffers = @import("buffers.gen.zig");
+const Key = @import("key.zig").Key;
+const vfs = @import("vfs.zig");
 
 // -------------------------------------------------------------------------
 // Constants
@@ -13,6 +15,7 @@ const default_deletions_rewrite_threshold: u32 = 10_000;
 const deletions_ratio: u32 = 10;
 const op_create: u32 = 0;
 const op_delete: u32 = 1;
+const op_update: u32 = 2;
 
 // -------------------------------------------------------------------------
 // Error set
@@ -23,283 +26,387 @@ pub const ManifestError = error{
     UnsupportedVersion,
     ChecksumMismatch,
     CorruptManifest,
-    DuplicateTableId, // CREATE when table already exists
-    TableNotFound, // DELETE on unknown table_id
+    TreeNotFound,
 };
 
 // -------------------------------------------------------------------------
 // State types
 // -------------------------------------------------------------------------
 
-pub const TableManifest = struct {
-    level: u8,
-};
-
-pub const LevelManifest = struct {
+pub const LevelState = struct {
     tables: std.AutoHashMap(u64, void), // set of table_ids at this level
 };
 
-pub const ManifestState = struct {
+pub const TreeState = struct {
+    namespace_id: u32 = 0,
+    levels: std.ArrayList(LevelState),
+    left: Key = .{},
+    right: Key = .{},
+};
+
+pub const ForestState = struct {
     allocator: std.mem.Allocator,
-    tables: std.AutoHashMap(u64, TableManifest),
-    levels: std.ArrayList(LevelManifest),
+    trees: std.AutoHashMap(u64, TreeState),
     creations: u32,
     deletions: u32,
     // I/O fields — null/undefined until openOrCreate sets them.
-    file: ?std.fs.File,
-    dir: std.fs.Dir,
+    handle: ?vfs.FileHandle,
+    dir_path: []const u8,
+    write_pos: u64,
     deletions_rewrite_threshold: u32,
     mu: std.Thread.Mutex,
 
-    // Initialises the map state only. I/O fields are left undefined and
-    // must be filled in by openOrCreate before the value is returned.
-    fn initMaps(allocator: std.mem.Allocator) ManifestState {
+    fn initMaps(allocator: std.mem.Allocator) ForestState {
         return .{
             .allocator = allocator,
-            .tables = std.AutoHashMap(u64, TableManifest).init(allocator),
-            .levels = std.ArrayList(LevelManifest).empty,
+            .trees = std.AutoHashMap(u64, TreeState).init(allocator),
             .creations = 0,
             .deletions = 0,
-            .file = null,
-            .dir = undefined,
+            .handle = null,
+            .dir_path = undefined,
+            .write_pos = 0,
             .deletions_rewrite_threshold = undefined,
             .mu = undefined,
         };
     }
 
-    // Frees map memory only. Used on error paths before I/O fields are set.
-    fn freeMaps(self: *ManifestState) void {
-        for (self.levels.items) |*lm| {
-            lm.tables.deinit();
-        }
-        self.levels.deinit(self.allocator);
-        self.tables.deinit();
+    fn freeTree(self: *ForestState, tree: *TreeState) void {
+        for (tree.levels.items) |*lm| lm.tables.deinit();
+        tree.levels.deinit(self.allocator);
+        if (tree.left.primary.len > 0) self.allocator.free(tree.left.primary);
+        if (tree.right.primary.len > 0) self.allocator.free(tree.right.primary);
     }
 
-    pub fn close(self: *ManifestState) void {
-        if (self.file) |f| f.close();
-        self.dir.close();
+    fn freeMaps(self: *ForestState) void {
+        var it = self.trees.iterator();
+        while (it.next()) |kv| self.freeTree(kv.value_ptr);
+        self.trees.deinit();
+    }
+
+    pub fn close(self: *ForestState) void {
+        if (self.handle) |h| h.close();
+        self.allocator.free(self.dir_path);
         self.freeMaps();
     }
 
-    /// Applies a single CREATE or DELETE operation to this state.
-    pub fn applyChange(self: *ManifestState, op: u32, table_id: u64, level: u8) !void {
-        if (op == op_create) {
-            if (self.tables.contains(table_id)) return ManifestError.DuplicateTableId;
-
-            // Grow levels list if needed.
-            while (self.levels.items.len <= @as(usize, level)) {
-                // An empty AutoHashMap doesn't allocate; safe to drop on append failure.
-                const lm = LevelManifest{ .tables = std.AutoHashMap(u64, void).init(self.allocator) };
-                try self.levels.append(self.allocator, lm);
+    /// Applies a single table CREATE or DELETE to the tree's levels.
+    pub fn applyTableChange(self: *ForestState, tc: TableChange) !void {
+        if (tc.op == op_create) {
+            const tree = self.trees.getPtr(tc.tree_id) orelse return ManifestError.TreeNotFound;
+            while (tree.levels.items.len <= @as(usize, tc.level)) {
+                const lm = LevelState{ .tables = std.AutoHashMap(u64, void).init(self.allocator) };
+                try tree.levels.append(self.allocator, lm);
             }
-
-            try self.tables.put(table_id, .{ .level = level });
-            try self.levels.items[level].tables.put(table_id, {});
+            try tree.levels.items[tc.level].tables.put(tc.table_id, {});
             self.creations += 1;
-        } else if (op == op_delete) {
-            const tm = self.tables.get(table_id) orelse return ManifestError.TableNotFound;
-            if (tm.level >= self.levels.items.len) return ManifestError.CorruptManifest;
-            _ = self.tables.remove(table_id);
-            _ = self.levels.items[tm.level].tables.remove(table_id);
+        } else if (tc.op == op_delete) {
+            const tree = self.trees.getPtr(tc.tree_id) orelse return ManifestError.TreeNotFound;
+            // Scan levels to find and remove the table.
+            for (tree.levels.items) |*lm| {
+                if (lm.tables.remove(tc.table_id)) {
+                    break;
+                }
+            }
             self.deletions += 1;
         }
     }
 
-    /// Reads self.file into memory, validates the header, applies all valid records,
-    /// then truncates and seeks to the end of the last complete record, discarding
-    /// any partial tail.
-    fn replay(self: *ManifestState) !void {
-        std.debug.assert(self.tables.count() == 0);
-        std.debug.assert(self.levels.items.len == 0);
+    /// Applies a tree CREATE, DELETE, or UPDATE.
+    /// DELETE automatically removes all tables owned by the tree.
+    /// UPDATE changes the tree's key range.
+    pub fn applyTreeChange(self: *ForestState, tc: TreeChange) !void {
+        if (tc.op == op_create) {
+            try self.trees.put(tc.tree_id, .{
+                .namespace_id = tc.namespace_id,
+                .levels = std.ArrayList(LevelState).empty,
+                .left = try parseKey(self.allocator, tc.left_key),
+                .right = try parseKey(self.allocator, tc.right_key),
+            });
+        } else if (tc.op == op_delete) {
+            if (self.trees.fetchRemove(tc.tree_id)) |kv| {
+                var tree = kv.value;
+                self.freeTree(&tree);
+            }
+        } else if (tc.op == op_update) {
+            const tree = self.trees.getPtr(tc.tree_id) orelse return ManifestError.TreeNotFound;
+            if (tree.left.primary.len > 0) self.allocator.free(tree.left.primary);
+            if (tree.right.primary.len > 0) self.allocator.free(tree.right.primary);
+            tree.left = try parseKey(self.allocator, tc.left_key);
+            tree.right = try parseKey(self.allocator, tc.right_key);
+        }
+    }
 
-        const file = self.file.?;
-        const file_size = try file.getEndPos();
+    /// Parse raw marshaled bytes into a Key, duping the primary slice.
+    fn parseKey(allocator: std.mem.Allocator, raw: []const u8) !Key {
+        if (raw.len == 0) return .{};
+        var k = Key.init(raw);
+        k.primary = try allocator.dupe(u8, k.primary);
+        return k;
+    }
 
-        var read_buf: [4096]u8 = undefined;
-        var r = file.reader(&read_buf);
-        const data = try r.interface.readAlloc(self.allocator, file_size);
-        defer self.allocator.free(data);
+    fn marshalKeyOrEmpty(allocator: std.mem.Allocator, k: Key) ![]const u8 {
+        if (k.primary.len == 0 and k.namespace == 0 and k.timestamp == 0) return try allocator.alloc(u8, 0);
+        return k.marshal(allocator);
+    }
+
+    /// Count total table entries across all trees and levels.
+    pub fn tableCount(self: *ForestState) u32 {
+        var count: u32 = 0;
+        var it = self.trees.iterator();
+        while (it.next()) |kv| {
+            for (kv.value_ptr.levels.items) |lm| {
+                count += @intCast(lm.tables.count());
+            }
+        }
+        return count;
+    }
+
+    fn replay(self: *ForestState) !void {
+        std.debug.assert(self.trees.count() == 0);
+
+        const handle = self.handle.?;
+        const file_size = handle.file_size;
+
+        const result = try handle.readAligned(self.allocator, 0, @intCast(file_size), .p1);
+        defer result.free();
+        const data = result.data;
 
         if (data.len < 8) return ManifestError.BadMagic;
 
         const magic = std.mem.readInt(u32, data[0..4], .little);
         if (magic != manifest_magic) return ManifestError.BadMagic;
 
-        // data[4..6] = external_magic (reserved, not validated)
         const version = std.mem.readInt(u16, data[6..8], .little);
         if (version != manifest_version) return ManifestError.UnsupportedVersion;
 
         var pos: usize = 8;
-        var trunc_offset: usize = 8; // valid through end of header
+        var trunc_offset: usize = 8;
 
         while (true) {
-            // Snapshot position at start of this record.
             trunc_offset = pos;
 
-            if (pos + 8 > data.len) break; // no room for record header — truncate here
+            if (pos + 8 > data.len) break;
 
             const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
             const stored_crc = std.mem.readInt(u32, data[pos + 4 ..][0..4], .little);
             pos += 8;
 
-            if (pos + payload_len > data.len) break; // short payload — truncate at record start
+            if (pos + payload_len > data.len) break;
 
             const payload = data[pos .. pos + payload_len];
             pos += payload_len;
 
-            // Verify CRC32C (iSCSI / Castagnoli polynomial).
             const computed_crc = std.hash.crc.Crc32Iscsi.hash(payload);
             if (computed_crc != stored_crc) return ManifestError.ChecksumMismatch;
 
-            // Decode ManifestChangeSet and apply each change.
-            const set_reader = try buffers.ManifestChangeSetReader.parseRoot(payload);
-            const changes_len = set_reader.changesLen();
+            const reader = try buffers.ManifestChangeReader.parseRoot(payload);
+
+            const tc_len = reader.treeChangesLen();
             var i: u32 = 0;
-            while (i < changes_len) : (i += 1) {
-                const change = try set_reader.changesAt(i);
-                try self.applyChange(change.op(), change.tableId(), @intCast(change.level()));
+            while (i < tc_len) : (i += 1) {
+                const tc = try reader.treeChangesAt(i);
+                try self.applyTreeChange(.{
+                    .op = tc.op(),
+                    .tree_id = tc.treeId(),
+                    .namespace_id = tc.namespaceId(),
+                    .left_key = @constCast(tc.leftKey()),
+                    .right_key = @constCast(tc.rightKey()),
+                });
             }
 
-            // Advance trunc_offset past this fully-consumed record.
+            const tbl_len = reader.tableChangesLen();
+            i = 0;
+            while (i < tbl_len) : (i += 1) {
+                const tc = try reader.tableChangesAt(i);
+                try self.applyTableChange(.{
+                    .op = tc.op(),
+                    .table_id = tc.tableId(),
+                    .tree_id = tc.treeId(),
+                    .level = tc.level(),
+                });
+            }
+
             trunc_offset = pos;
         }
 
-        // Truncate any partial tail and position at end for appending.
-        try file.setEndPos(trunc_offset);
-        try file.seekTo(trunc_offset);
+        try handle.truncate(trunc_offset);
+        self.write_pos = trunc_offset;
     }
 
-    /// Compacts the manifest to a single record of live CREATEs, atomically replaces
-    /// the MANIFEST file, and updates self.file to the new handle.
-    /// The caller is responsible for holding a mutex lock.
-    fn rewrite(self: *ManifestState) !void {
-        {
-            const tmp = try self.dir.createFile(manifest_rewrite_filename, .{ .truncate = true });
-            defer tmp.close();
-            errdefer self.dir.deleteFile(manifest_rewrite_filename) catch {};
+    fn rewrite(self: *ForestState) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
 
-            try writeHeader(tmp);
-            if (self.tables.count() > 0) {
-                var entries: std.ArrayList(Change) = .empty;
-                defer entries.deinit(self.allocator);
+        const rewrite_path = try std.fs.path.join(alloc, &.{ self.dir_path, manifest_rewrite_filename });
+        const manifest_path = try std.fs.path.join(alloc, &.{ self.dir_path, manifest_filename });
 
-                var it = self.tables.iterator();
-                while (it.next()) |kv| {
-                    try entries.append(self.allocator, .{
-                        .op = op_create,
-                        .table_id = kv.key_ptr.*,
-                        .level = @as(u32, kv.value_ptr.*.level),
-                    });
+        // Build the entire file contents in memory before touching the filesystem.
+        var out: std.ArrayList(u8) = .empty;
+
+        var file_header: [8]u8 = undefined;
+        std.mem.writeInt(u32, file_header[0..4], manifest_magic, .little);
+        std.mem.writeInt(u16, file_header[4..6], 0, .little);
+        std.mem.writeInt(u16, file_header[6..8], manifest_version, .little);
+        try out.appendSlice(alloc, &file_header);
+
+        if (self.trees.count() > 0) {
+            var tree_changes: std.ArrayList(TreeChange) = .empty;
+            var table_changes: std.ArrayList(TableChange) = .empty;
+
+            var it = self.trees.iterator();
+            while (it.next()) |kv| {
+                const tree_id = kv.key_ptr.*;
+                const tree = kv.value_ptr.*;
+                const left_raw = try marshalKeyOrEmpty(alloc, tree.left);
+                const right_raw = try marshalKeyOrEmpty(alloc, tree.right);
+                try tree_changes.append(alloc, createTreeChange(tree_id, tree.namespace_id, left_raw, right_raw));
+
+                for (tree.levels.items, 0..) |lm, level_idx| {
+                    var tit = lm.tables.iterator();
+                    while (tit.next()) |tkv| {
+                        try table_changes.append(alloc, createTableChange(
+                            tkv.key_ptr.*,
+                            tree_id,
+                            @intCast(level_idx),
+                        ));
+                    }
                 }
-
-                const payload = try encodeChangeSet(self.allocator, entries.items);
-                defer self.allocator.free(payload);
-
-                try writeRecord(tmp, payload);
             }
 
-            try tmp.sync();
+            const payload = try encodeChangeSet(alloc, table_changes.items, tree_changes.items);
+            var record_header: [8]u8 = undefined;
+            std.mem.writeInt(u32, record_header[0..4], @intCast(payload.len), .little);
+            std.mem.writeInt(u32, record_header[4..8], std.hash.crc.Crc32Iscsi.hash(payload), .little);
+
+            try out.ensureUnusedCapacity(alloc, 8 + payload.len);
+            out.appendSliceAssumeCapacity(&record_header);
+            out.appendSliceAssumeCapacity(payload);
         }
 
-        try std.fs.rename(self.dir, manifest_rewrite_filename, self.dir, manifest_filename);
+        // Create file, write everything in one call, sync, then rename into place.
+        const tmp = try vfs.instance.createFile(rewrite_path, .{ .flags = .{ .truncate = true } });
+        errdefer vfs.VFS.deleteFile(rewrite_path) catch {};
+        try tmp.write(out.items, 0, .p0);
+        try tmp.sync();
+        tmp.close();
 
-        const new_file = try self.dir.openFile(manifest_filename, .{ .mode = .read_write });
-        errdefer new_file.close();
-        try new_file.seekFromEnd(0);
+        try vfs.VFS.renameFile(rewrite_path, manifest_path);
 
-        if (self.file) |f| {
-            f.close();
-        }
-        self.file = new_file;
-        self.creations = @intCast(self.tables.count());
+        // openFile should use the self.allocator, so it's valid after returning from this func.
+        const new_handle = try vfs.instance.openFile(self.allocator, manifest_path, .{ .flags = .{ .writable = true } });
+        errdefer new_handle.close();
+
+        if (self.handle) |h| h.close();
+        self.handle = new_handle;
+        self.write_pos = new_handle.file_size;
+        self.creations = self.tableCount();
         self.deletions = 0;
     }
 
-    /// Writes changes as a single record to the manifest file, then applies them to state.
-    /// Triggers a compaction rewrite if the deletion threshold is exceeded.
-    pub fn commit(self: *ManifestState, changes: []const Change) !void {
-        if (changes.len == 0) return;
+    pub fn commit(
+        self: *ForestState,
+        table_changes: []const TableChange,
+        tree_changes: []const TreeChange,
+    ) !void {
+        if (table_changes.len == 0 and tree_changes.len == 0) return;
 
         self.mu.lock();
         defer self.mu.unlock();
 
-        // Write to file first; state is only updated after the write succeeds.
-        // A write failure therefore leaves in-memory state consistent with the file.
-        const payload = try encodeChangeSet(self.allocator, changes);
-        defer self.allocator.free(payload);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
 
-        try writeRecord(self.file.?, payload);
-        try self.file.?.sync();
+        const payload = try encodeChangeSet(alloc, table_changes, tree_changes);
 
-        // Apply changes to state now that the write is durable.
-        for (changes) |c| {
-            try self.applyChange(c.op, c.table_id, @intCast(c.level));
+        var out = std.ArrayList(u8).empty;
+        try out.ensureTotalCapacity(alloc, 8 + payload.len);
+
+        out.appendNTimesAssumeCapacity(0, 8);
+        std.mem.writeInt(u32, out.items[0..4], @intCast(payload.len), .little);
+        const crc = std.hash.crc.Crc32Iscsi.hash(payload);
+        std.mem.writeInt(u32, out.items[4..8], crc, .little);
+        out.appendSliceAssumeCapacity(payload);
+
+        try self.handle.?.write(out.items, self.write_pos, .p0);
+        self.write_pos += out.items.len;
+        try self.handle.?.sync();
+        _ = arena.reset(.free_all); // reclaim memory
+
+        for (tree_changes) |tc| {
+            try self.applyTreeChange(tc);
+        }
+        for (table_changes) |tc| {
+            try self.applyTableChange(tc);
         }
 
-        // Trigger a compaction rewrite if the deletion ratio warrants it.
         const live = self.creations -| self.deletions;
         const should_rewrite = self.deletions > self.deletions_rewrite_threshold and
             self.deletions > deletions_ratio *| live;
 
         if (should_rewrite) {
-            try self.rewrite(); // sets self.file to the new handle
+            try self.rewrite();
         }
     }
 };
 
 // -------------------------------------------------------------------------
-// Change
+// Change types — aliases to generated structs
 // -------------------------------------------------------------------------
 
-pub const Change = struct {
-    op: u32,
-    table_id: u64,
-    level: u32,
+pub const TableChange = buffers.TableChangeStruct;
+pub const TreeChange = buffers.TreeChangeStruct;
 
-    pub fn create(table_id: u64, level: u8) Change {
-        return .{ .op = op_create, .table_id = table_id, .level = level };
-    }
+pub fn createTableChange(table_id: u64, tree_id: u64, level: u32) TableChange {
+    return .{ .op = op_create, .table_id = table_id, .tree_id = tree_id, .level = level };
+}
 
-    pub fn delete(table_id: u64) Change {
-        return .{ .op = op_delete, .table_id = table_id, .level = 0 };
-    }
-};
+pub fn deleteTableChange(table_id: u64, tree_id: u64) TableChange {
+    return .{ .op = op_delete, .table_id = table_id, .tree_id = tree_id, .level = 0 };
+}
+
+pub fn createTreeChange(tree_id: u64, namespace_id: u32, left_key: []const u8, right_key: []const u8) TreeChange {
+    return .{ .op = op_create, .tree_id = tree_id, .namespace_id = namespace_id, .left_key = @constCast(left_key), .right_key = @constCast(right_key) };
+}
+
+pub fn deleteTreeChange(tree_id: u64) TreeChange {
+    return .{ .op = op_delete, .tree_id = tree_id };
+}
+
+pub fn updateTreeChange(tree_id: u64, left_key: []const u8, right_key: []const u8) TreeChange {
+    return .{ .op = op_update, .tree_id = tree_id, .left_key = @constCast(left_key), .right_key = @constCast(right_key) };
+}
 
 // -------------------------------------------------------------------------
 // openOrCreate
 // -------------------------------------------------------------------------
 
-/// Opens an existing MANIFEST or creates a fresh one.
-/// The returned ManifestState owns the file and directory handles; call close() when done.
 pub fn openOrCreate(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
-) !ManifestState {
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
-    errdefer dir.close();
-
-    var state = ManifestState.initMaps(allocator);
+) !ForestState {
+    var state = ForestState.initMaps(allocator);
     errdefer state.freeMaps();
 
-    // Set I/O fields before any call that needs them (rewrite uses self.dir).
-    state.dir = dir;
+    state.dir_path = try allocator.dupe(u8, dir_path);
+    errdefer allocator.free(state.dir_path);
     state.deletions_rewrite_threshold = default_deletions_rewrite_threshold;
     state.mu = .{};
 
-    // Attempt to open existing manifest.
-    const file = dir.openFile(manifest_filename, .{ .mode = .read_write }) catch |err| {
-        if (err != error.FileNotFound) return err;
+    const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, manifest_filename });
+    defer allocator.free(manifest_path);
 
-        // No manifest on disk — write a fresh one.
-        // rewrite sets state.file.
+    const handle = vfs.instance.openFile(allocator, manifest_path, .{
+        .flags = .{ .writable = true },
+    }) catch |err| {
+        if (err != error.FileNotFound) return err;
         try state.rewrite();
         return state;
     };
-    errdefer file.close();
+    errdefer handle.close();
 
-    // Assign first so replay can use self.file.
-    state.file = file;
+    state.handle = handle;
     try state.replay();
     return state;
 }
@@ -308,47 +415,51 @@ pub fn openOrCreate(
 // Encoding helpers
 // -------------------------------------------------------------------------
 
-fn encodeChangeSet(allocator: std.mem.Allocator, entries: []const Change) ![]u8 {
+fn encodeChangeSet(
+    allocator: std.mem.Allocator,
+    table_changes: []const TableChange,
+    tree_changes: []const TreeChange,
+) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    var sw = try buffers.ManifestChangeSetWriter.initWithBuf(allocator, &buf);
+    var mw = try buffers.ManifestChangeWriter.initWithBuf(allocator, &buf);
 
-    if (entries.len > 0) {
-        const offsets = try allocator.alloc(u32, entries.len);
+    if (tree_changes.len > 0) {
+        const offsets = try allocator.alloc(u32, tree_changes.len);
         defer allocator.free(offsets);
 
-        for (entries, 0..) |entry, i| {
-            var cw = try buffers.ManifestChangeWriter.initWithBuf(allocator, &buf);
-            try cw.setOp(entry.op);
-            try cw.setTableId(entry.table_id);
-            try cw.setLevel(entry.level);
-            const result = try cw.finish();
+        for (tree_changes, 0..) |tc, i| {
+            var tw = try buffers.TreeChangeWriter.initWithBuf(allocator, &buf);
+            try tw.setOp(tc.op);
+            try tw.setTreeId(tc.tree_id);
+            if (tc.namespace_id != 0) try tw.setNamespaceId(tc.namespace_id);
+            if (tc.left_key.len > 0) try tw.setLeftKey(tc.left_key);
+            if (tc.right_key.len > 0) try tw.setRightKey(tc.right_key);
+            const result = try tw.finish();
             offsets[i] = result.offset;
         }
 
-        try sw.setChanges(offsets);
+        try mw.setTreeChanges(offsets);
     }
 
-    _ = try sw.finishWithTail();
+    if (table_changes.len > 0) {
+        const offsets = try allocator.alloc(u32, table_changes.len);
+        defer allocator.free(offsets);
+
+        for (table_changes, 0..) |tc, i| {
+            var tw = try buffers.TableChangeWriter.initWithBuf(allocator, &buf);
+            try tw.setOp(tc.op);
+            try tw.setLevel(tc.level);
+            try tw.setTableId(tc.table_id);
+            try tw.setTreeId(tc.tree_id);
+            const result = try tw.finish();
+            offsets[i] = result.offset;
+        }
+
+        try mw.setTableChanges(offsets);
+    }
+
+    _ = try mw.finishWithTail();
     return buf.toOwnedSlice(allocator);
-}
-
-fn writeRecord(file: std.fs.File, payload: []const u8) !void {
-    var record_header: [8]u8 = undefined;
-    std.mem.writeInt(u32, record_header[0..4], @intCast(payload.len), .little);
-
-    const crc = std.hash.crc.Crc32Iscsi.hash(payload);
-    std.mem.writeInt(u32, record_header[4..8], crc, .little);
-
-    try file.writeAll(&record_header);
-    try file.writeAll(payload);
-}
-
-fn writeHeader(file: std.fs.File) !void {
-    var header: [8]u8 = undefined;
-    std.mem.writeInt(u32, header[0..4], manifest_magic, .little);
-    std.mem.writeInt(u16, header[4..6], 0, .little); // external_magic reserved
-    std.mem.writeInt(u16, header[6..8], manifest_version, .little);
-    try file.writeAll(&header);
 }
