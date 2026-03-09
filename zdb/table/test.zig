@@ -7,6 +7,13 @@ const Builder = zdb.table.builder.Builder;
 const Table = zdb.table.Table;
 const TableIterator = zdb.table.TableIterator;
 
+/// Test helper: decrRef + destroy the Table allocation.
+fn destroyTable(t: *Table) void {
+    const allocator = t.allocator;
+    t.decrRef();
+    allocator.destroy(t);
+}
+
 /// Test helper: create an in-memory FileHandle from a buffer (dupes the data).
 fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
     const owned = try allocator.dupe(u8, buf);
@@ -21,6 +28,30 @@ fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build a TableBuffer with entries keyed as "{prefix}{i:0>4}" for i in [start, end),
+/// at ts=0, with value "{i}". block_size controls how many entries land per block.
+fn buildRangeTable(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    start: usize,
+    end: usize,
+    block_size: u32,
+) !zdb.table.builder.TableBuffer {
+    var b = Builder.init(allocator, .{ .target_block_size = block_size });
+    defer b.deinit();
+
+    var i: usize = start;
+    while (i < end) : (i += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key_no_ts = try std.fmt.bufPrint(&key_buf, "{s}{d:0>4}", .{ prefix, i });
+        var val_buf: [20]u8 = undefined;
+        const val = try std.fmt.bufPrint(&val_buf, "{d}", .{i});
+
+        try b.add(.{ .primary = key_no_ts }, val);
+    }
+    return b.finish();
+}
 
 /// Build a TableBuffer with n entries keyed as "{prefix}{i:0>4}" at ts=0,
 /// with value "{i}". block_size controls how many entries land per block.
@@ -62,7 +93,7 @@ test "table builder/reader roundtrip and seek" {
     defer tb.deinit();
 
     const r = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, tb.bytes), .p0);
-    defer r.decrRef();
+    defer destroyTable(r);
 
     try std.testing.expectEqual(@as(u32, 4), r.index.key_count);
     try std.testing.expectEqual(@as(u64, 9), r.index.max_version);
@@ -70,10 +101,10 @@ test "table builder/reader roundtrip and seek" {
 
     var it = TableIterator.init(std.testing.allocator, r, .p0);
     defer it.deinit();
-    try it.seekToFirst();
+    try it.seekRange(.{}, .{});
     try std.testing.expectEqualStrings("va9", it.itemRef().?.value);
 
-    try it.seek(.{ .primary = "b", .timestamp = 3 });
+    try it.seekRange(.{ .primary = "b", .timestamp = 3 }, .{});
     try std.testing.expectEqualStrings("vb3", it.itemRef().?.value);
 }
 
@@ -97,7 +128,7 @@ test "table binary fuse contains keys" {
     defer tb.deinit();
 
     const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-    defer t.decrRef();
+    defer destroyTable(t);
 
     try std.testing.expect(t.containsKey(.{ .primary = "apple" }));
     try std.testing.expect(t.containsKey(.{ .primary = "banana" }));
@@ -127,7 +158,7 @@ test "table binary fuse large keyset contains sampled keys" {
     defer tb.deinit();
 
     const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-    defer t.decrRef();
+    defer destroyTable(t);
 
     const seed: u64 = @intCast(std.time.nanoTimestamp());
     var prng = std.Random.DefaultPrng.init(seed);
@@ -166,7 +197,7 @@ test "table checksum mismatch is detected" {
     defer tb.deinit();
 
     const r = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, tb.bytes), .p0);
-    defer r.decrRef();
+    defer destroyTable(r);
 
     const first_meta = r.index.blocks[0];
     const block_start: usize = first_meta.offset;
@@ -192,9 +223,9 @@ test "merge iterator merges sorted streams" {
     defer t2.deinit();
 
     const r1 = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, t1.bytes), .p0);
-    defer r1.decrRef();
+    defer destroyTable(r1);
     const r2 = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, t2.bytes), .p0);
-    defer r2.decrRef();
+    defer destroyTable(r2);
 
     var iters = [_]zdb.table.merge_iterator.Iterator{
         .{ .table = TableIterator.init(std.testing.allocator, r1, .p0) },
@@ -203,7 +234,7 @@ test "merge iterator merges sorted streams" {
     var m = zdb.table.merge_iterator.MergeIterator.init(std.testing.allocator, iters[0..]);
     defer m.deinit();
 
-    try m.seekToFirst();
+    try m.seekRange(.{}, .{});
     try std.testing.expectEqualStrings("a5", m.itemRef().?.value);
     try m.next();
     try std.testing.expectEqualStrings("b4", m.itemRef().?.value);
@@ -225,13 +256,13 @@ test "table iterator: forward scan" {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
         const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-        defer tbl.decrRef();
+        defer destroyTable(tbl);
 
         var it = TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
 
         var count: usize = 0;
-        try it.seekToFirst();
+        try it.seekRange(.{}, .{});
         while (it.itemRef()) |entry| : (count += 1) {
             var key_buf: [32]u8 = undefined;
             const expected_key_no_ts = try std.fmt.bufPrint(&key_buf, "key{d:0>4}", .{count});
@@ -257,12 +288,12 @@ test "seek to first" {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
         const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-        defer tbl.decrRef();
+        defer destroyTable(tbl);
 
         var it = TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
 
-        try it.seekToFirst();
+        try it.seekRange(.{}, .{});
         const entry = it.itemRef() orelse return error.UnexpectedNull;
         try std.testing.expectEqualStrings("0", entry.value);
         try std.testing.expectEqualStrings("key0000", entry.key.primary);
@@ -278,7 +309,7 @@ test "seek: various targets" {
     var tb = try buildTestTable(alloc, "k", 10000, 4096);
     defer tb.deinit();
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-    defer tbl.decrRef();
+    defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0);
     defer it.deinit();
@@ -295,7 +326,7 @@ test "seek: various targets" {
     };
 
     for (cases) |c| {
-        try it.seek(.{ .primary = c.in, .timestamp = 0 });
+        try it.seekRange(.{ .primary = c.in, .timestamp = 0 }, .{});
         if (!c.valid) {
             try std.testing.expect(it.itemRef() == null);
             continue;
@@ -315,13 +346,13 @@ test "iterate from start: full scan" {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
         const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-        defer tbl.decrRef();
+        defer destroyTable(tbl);
 
         var it = TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
 
         var count: usize = 0;
-        try it.seekToFirst();
+        try it.seekRange(.{}, .{});
         while (it.itemRef() != null) : (count += 1) {
             try it.next();
         }
@@ -338,13 +369,13 @@ test "table: seek and iterate to end" {
     var tb = try buildTestTable(alloc, "key", 10000, 4096);
     defer tb.deinit();
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-    defer tbl.decrRef();
+    defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0);
     defer it.deinit();
 
     // Seek to key1010, iterate to end — should visit keys 1010..9999.
-    try it.seek(.{ .primary = "key1010", .timestamp = 0 });
+    try it.seekRange(.{ .primary = "key1010", .timestamp = 0 }, .{});
     var kid: usize = 1010;
     while (it.itemRef()) |entry| : (kid += 1) {
         var buf: [32]u8 = undefined;
@@ -355,11 +386,11 @@ test "table: seek and iterate to end" {
     try std.testing.expectEqual(@as(usize, 10000), kid);
 
     // Seek past end → invalid.
-    try it.seek(.{ .primary = "key99999", .timestamp = 0 });
+    try it.seekRange(.{ .primary = "key99999", .timestamp = 0 }, .{});
     try std.testing.expect(it.itemRef() == null);
 
     // Seek before start → first key.
-    try it.seek(.{ .primary = "aaa", .timestamp = 0 });
+    try it.seekRange(.{ .primary = "aaa", .timestamp = 0 }, .{});
     const first = it.itemRef() orelse return error.UnexpectedNull;
     try std.testing.expectEqualStrings("key0000", first.key.primary);
 }
@@ -384,7 +415,7 @@ test "table: max_version" {
     var tb = try b.finish();
     defer tb.deinit();
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-    defer tbl.decrRef();
+    defer destroyTable(tbl);
 
     try std.testing.expectEqual(@as(u64, n), tbl.index.max_version);
 }
@@ -398,7 +429,7 @@ test "table: smallest and biggest keys" {
     var tb = try buildTestTable(alloc, "key", 200, 256);
     defer tb.deinit();
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-    defer tbl.decrRef();
+    defer destroyTable(tbl);
 
     try std.testing.expectEqualStrings("key0000", tbl.smallest.primary);
     try std.testing.expectEqualStrings("key0199", tbl.biggest.primary);
@@ -430,13 +461,13 @@ test "table: big values" {
     var tb = try b.finish();
     defer tb.deinit();
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
-    defer tbl.decrRef();
+    defer destroyTable(tbl);
 
     try std.testing.expectEqual(@as(u32, n), tbl.index.key_count);
 
     var it = TableIterator.init(alloc, tbl, .p0);
     defer it.deinit();
-    try it.seekToFirst();
+    try it.seekRange(.{}, .{});
 
     var count: usize = 0;
     while (it.itemRef()) |entry| : (count += 1) {
@@ -446,4 +477,206 @@ test "table: big values" {
         try it.next();
     }
     try std.testing.expectEqual(n, count);
+}
+
+// ---------------------------------------------------------------------------
+// endBefore tests
+// ---------------------------------------------------------------------------
+
+test "seekRange: end truncates iteration" {
+    const alloc = std.testing.allocator;
+    // 100 keys: k0000..k0099
+    var tb = try buildTestTable(alloc, "k", 100, 4096);
+    defer tb.deinit();
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(tbl);
+
+    var it = TableIterator.init(alloc, tbl, .p0);
+    defer it.deinit();
+
+    // Stop before k0050.
+    try it.seekRange(.{}, .{ .primary = "k0050" });
+
+    var count: usize = 0;
+    while (it.itemRef()) |_| : (count += 1) {
+        try it.next();
+    }
+    try std.testing.expectEqual(@as(usize, 50), count);
+}
+
+test "seekRange: end after all keys returns everything" {
+    const alloc = std.testing.allocator;
+    var tb = try buildTestTable(alloc, "k", 100, 4096);
+    defer tb.deinit();
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(tbl);
+
+    var it = TableIterator.init(alloc, tbl, .p0);
+    defer it.deinit();
+
+    try it.seekRange(.{}, .{ .primary = "z" });
+
+    var count: usize = 0;
+    while (it.itemRef()) |_| : (count += 1) {
+        try it.next();
+    }
+    try std.testing.expectEqual(@as(usize, 100), count);
+}
+
+test "seekRange: end before all keys returns nothing" {
+    const alloc = std.testing.allocator;
+    var tb = try buildTestTable(alloc, "k", 100, 4096);
+    defer tb.deinit();
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(tbl);
+
+    var it = TableIterator.init(alloc, tbl, .p0);
+    defer it.deinit();
+
+    try it.seekRange(.{}, .{ .primary = "a" });
+
+    try std.testing.expect(it.itemRef() == null);
+}
+
+test "seekRange: no end restores full iteration" {
+    const alloc = std.testing.allocator;
+    var tb = try buildTestTable(alloc, "k", 100, 4096);
+    defer tb.deinit();
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(tbl);
+
+    var it = TableIterator.init(alloc, tbl, .p0);
+    defer it.deinit();
+
+    // Set a bound, then clear it with a new seekRange.
+    try it.seekRange(.{}, .{ .primary = "k0010" });
+    try it.seekRange(.{}, .{});
+
+    var count: usize = 0;
+    while (it.itemRef()) |_| : (count += 1) {
+        try it.next();
+    }
+    try std.testing.expectEqual(@as(usize, 100), count);
+}
+
+test "seekRange: start + end combined" {
+    const alloc = std.testing.allocator;
+    var tb = try buildTestTable(alloc, "k", 100, 4096);
+    defer tb.deinit();
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(tbl);
+
+    var it = TableIterator.init(alloc, tbl, .p0);
+    defer it.deinit();
+
+    // Iterate only k0020..k0029.
+    try it.seekRange(.{ .primary = "k0020" }, .{ .primary = "k0030" });
+
+    var count: usize = 0;
+    while (it.itemRef()) |entry| : (count += 1) {
+        var buf: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&buf, "k{d:0>4}", .{count + 20});
+        try std.testing.expectEqualStrings(expected, entry.key.primary);
+        try it.next();
+    }
+    try std.testing.expectEqual(@as(usize, 10), count);
+}
+
+// ---------------------------------------------------------------------------
+// seekRange across multiple blocks and multiple tables (ConcatIterator)
+// ---------------------------------------------------------------------------
+
+test "seekRange: multiple blocks within a single table" {
+    const alloc = std.testing.allocator;
+    // 200 keys with tiny block size → many blocks.
+    var tb = try buildTestTable(alloc, "k", 200, 64);
+    defer tb.deinit();
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(tbl);
+
+    // Sanity: we have more than one block.
+    try std.testing.expect(tbl.blockCount() > 1);
+
+    var it = TableIterator.init(alloc, tbl, .p0);
+    defer it.deinit();
+
+    // Range: k0050..k0150 (exclusive), spanning multiple blocks.
+    try it.seekRange(.{ .primary = "k0050" }, .{ .primary = "k0150" });
+
+    var count: usize = 0;
+    while (it.itemRef()) |entry| : (count += 1) {
+        var buf: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&buf, "k{d:0>4}", .{count + 50});
+        try std.testing.expectEqualStrings(expected, entry.key.primary);
+        try it.next();
+    }
+    try std.testing.expectEqual(@as(usize, 100), count);
+}
+
+test "seekRange: ConcatIterator across multiple tables" {
+    const alloc = std.testing.allocator;
+    const merge_iterator = zdb.table.merge_iterator;
+
+    // Build 3 non-overlapping tables with small blocks:
+    //   t0: k0000..k0099
+    //   t1: k0100..k0199
+    //   t2: k0200..k0299
+    var tb0 = try buildTestTable(alloc, "k", 100, 64);
+    defer tb0.deinit();
+    var tb1 = try buildRangeTable(alloc, "k", 100, 200, 64);
+    defer tb1.deinit();
+    var tb2 = try buildRangeTable(alloc, "k", 200, 300, 64);
+    defer tb2.deinit();
+
+    const tbl0 = try Table.openHandle(alloc, try fromBuf(alloc, tb0.bytes), .p0);
+    defer destroyTable(tbl0);
+    const tbl1 = try Table.openHandle(alloc, try fromBuf(alloc, tb1.bytes), .p0);
+    defer destroyTable(tbl1);
+    const tbl2 = try Table.openHandle(alloc, try fromBuf(alloc, tb2.bytes), .p0);
+    defer destroyTable(tbl2);
+
+    var table_iters = [_]TableIterator{
+        TableIterator.init(alloc, tbl0, .p0),
+        TableIterator.init(alloc, tbl1, .p0),
+        TableIterator.init(alloc, tbl2, .p0),
+    };
+
+    var concat = merge_iterator.ConcatIterator.init(&table_iters);
+    defer concat.deinit();
+
+    // Range spanning all 3 tables: k0050..k0250 (exclusive).
+    try concat.seekRange(.{ .primary = "k0050" }, .{ .primary = "k0250" });
+
+    var count: usize = 0;
+    while (concat.itemRef()) |entry| : (count += 1) {
+        var buf: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&buf, "k{d:0>4}", .{count + 50});
+        try std.testing.expectEqualStrings(expected, entry.key.primary);
+        try concat.next();
+    }
+    try std.testing.expectEqual(@as(usize, 200), count);
+
+    // Range within a single middle table: k0120..k0180.
+    try concat.seekRange(.{ .primary = "k0120" }, .{ .primary = "k0180" });
+
+    count = 0;
+    while (concat.itemRef()) |entry| : (count += 1) {
+        var buf: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&buf, "k{d:0>4}", .{count + 120});
+        try std.testing.expectEqualStrings(expected, entry.key.primary);
+        try concat.next();
+    }
+    try std.testing.expectEqual(@as(usize, 60), count);
+
+    // Range past all tables.
+    try concat.seekRange(.{ .primary = "z" }, .{});
+    try std.testing.expect(concat.itemRef() == null);
+
+    // Range before all tables with end inside first table.
+    try concat.seekRange(.{}, .{ .primary = "k0010" });
+    count = 0;
+    while (concat.itemRef()) |_| : (count += 1) {
+        try concat.next();
+    }
+    try std.testing.expectEqual(@as(usize, 10), count);
 }

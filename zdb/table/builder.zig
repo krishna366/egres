@@ -158,7 +158,7 @@ pub const Builder = struct {
             if (key.order(last) != .gt) {
                 return error.KeyOrderViolation;
             }
-            if (key.orderPrimary(last) != .eq) {
+            if (!key.equalPrimary(last)) {
                 try self.bf_hashes.append(self.allocator, key.hash());
             }
         } else {

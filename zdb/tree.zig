@@ -42,6 +42,158 @@ const LevelPriority = struct {
 };
 
 // ---------------------------------------------------------------------------
+// TableCache
+// ---------------------------------------------------------------------------
+
+pub const TableNeed = struct { id: u64, level: usize };
+
+/// TableCache is a Forest-owned registry of open *Table objects keyed by table_id.
+/// Tree.open() calls loadTables() instead of opening SST files itself, so a table
+/// opened for one tree is reused when the same file is needed by another tree
+/// (e.g. shared tables after a split).
+pub const TableCache = struct {
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    tables: std.AutoHashMap(u64, *Table),
+    mu: std.Thread.RwLock,
+
+    pub fn init(allocator: std.mem.Allocator, dir: []const u8) TableCache {
+        return .{
+            .allocator = allocator,
+            .dir = dir,
+            .tables = std.AutoHashMap(u64, *Table).init(allocator),
+            .mu = .{},
+        };
+    }
+
+    pub fn deinit(self: *TableCache) void {
+        var it = self.tables.iterator();
+        while (it.next()) |kv| {
+            const table = kv.value_ptr.*;
+            self.allocator.destroy(table);
+        }
+        self.tables.deinit();
+    }
+
+    /// own hands ownership of a *Table to the cache. The cache will destroy the
+    /// struct in deinit/clearStale. Caller must not destroy t after this call.
+    pub fn own(self: *TableCache, id: u64, t: *Table) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        std.debug.assert(!self.tables.contains(id));
+        try self.tables.put(id, t);
+    }
+
+    pub fn clearStale(self: *TableCache) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        var to_evict: std.ArrayList(u64) = .{};
+        defer to_evict.deinit(self.allocator);
+
+        var it = self.tables.iterator();
+        while (it.next()) |entry| {
+            const table = entry.value_ptr.*;
+            if (table.ref.load(.acquire) == 0) {
+                to_evict.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (to_evict.items) |id| {
+            if (self.tables.fetchRemove(id)) |entry| {
+                self.allocator.destroy(entry.value);
+            }
+        }
+    }
+
+    /// loadTables serves each TableNeed from cache (read lock) or opens it
+    /// concurrently via zio fibers (write lock per miss). Each served table
+    /// is added to levels[need.level] via Level.addEntry (which incrRef's).
+    pub fn loadTables(self: *TableCache, needed: []const TableNeed, levels: []Level) !void {
+        // Phase 1: serve cache hits under read lock.
+        var misses: std.ArrayList(TableNeed) = .{};
+        defer misses.deinit(self.allocator);
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            for (needed) |n| {
+                if (self.tables.get(n.id)) |t| {
+                    std.debug.assert(t.ref.load(.acquire) > 0);
+                    // addEntry acquires Level.mu; lock order TableCache.mu(R) → Level.mu is safe.
+                    try levels[n.level].addEntry(n.id, t);
+                } else {
+                    try misses.append(self.allocator, n);
+                }
+            }
+        }
+        if (misses.items.len == 0) return;
+
+        // Phase 2: open misses concurrently.
+        var tse: utils.ThreadSafeError = .{};
+        var group: zio.Group = .init;
+        defer group.cancel();
+        for (misses.items) |n| {
+            try group.spawn(openFiber, .{ self, n, levels, &tse });
+        }
+        group.wait() catch {};
+        if (tse.get()) |err| return err;
+    }
+
+    fn openFiber(
+        self: *TableCache,
+        need: TableNeed,
+        levels: []Level,
+        tse: *utils.ThreadSafeError,
+    ) void {
+        // Phase A: check under write lock (brief — no I/O).
+        self.mu.lock();
+        if (self.tables.get(need.id)) |t| {
+            self.mu.unlock();
+            levels[need.level].addEntry(need.id, t) catch |err| tse.set(err);
+            return;
+        }
+        self.mu.unlock();
+
+        // Phase B: open the SST file WITHOUT holding the lock.
+        // Table.open may yield the fiber (async I/O); holding the lock here
+        // would deadlock cooperative fibers on the same OS thread (EDEADLK).
+        const path = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{d:0>6}.sst",
+            .{ self.dir, need.id },
+        ) catch |err| {
+            tse.set(err);
+            return;
+        };
+        defer self.allocator.free(path);
+        const t = Table.open(self.allocator, path, .p0) catch |err| {
+            tse.set(err);
+            return;
+        };
+        defer t.decrRef(); // We shouldn't own a ref.
+        errdefer self.allocator.free(t);
+
+        // Phase C: re-acquire write lock to insert; handle race with another fiber.
+        self.mu.lock();
+        if (self.tables.get(need.id)) |existing| {
+            // Another fiber opened the same table while we were in phase B.
+            self.mu.unlock();
+            levels[need.level].addEntry(need.id, existing) catch |err| tse.set(err);
+            return;
+        }
+        // Cache holds its own ref (Table.open starts at refcount 1).
+        self.tables.put(need.id, t) catch |err| {
+            self.mu.unlock();
+            tse.set(err);
+            return;
+        };
+        self.mu.unlock();
+        // Level takes its own ref via addEntry.
+        levels[need.level].addEntry(need.id, t) catch |err| tse.set(err);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tree
 // ---------------------------------------------------------------------------
 //
@@ -61,13 +213,15 @@ pub const Tree = struct {
     opts: options.Options,
     tree_id: u64,
     ms: *manifest.ForestState,
+    cache: *TableCache,
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
+    key_range: KeyRange,
 
-    /// open builds an Tree from an existing manifest state.
-    /// It reads the tree's own levels and opens only tables belonging to this tree.
-    /// Table opens are spread across zio fibers for parallelism.
-    pub fn open(allocator: std.mem.Allocator, opts: options.Options, tree_id: u64, ms: *manifest.ForestState) !Tree {
+    /// open builds a Tree from an existing manifest state.
+    /// Tables are loaded via cache, which opens SST files concurrently for misses
+    /// and reuses already-open *Table objects for cache hits.
+    pub fn open(allocator: std.mem.Allocator, opts: options.Options, tree_id: u64, ms: *manifest.ForestState, cache: *TableCache) !Tree {
         const levels = try allocator.alloc(Level, opts.max_levels);
         errdefer allocator.free(levels);
         for (levels, 0..) |*l, i| {
@@ -75,62 +229,42 @@ pub const Tree = struct {
         }
         errdefer for (levels) |*l| l.deinit();
 
-        var tse: utils.ThreadSafeError = .{};
-        var group: zio.Group = .init;
-        defer group.cancel();
+        var kr: KeyRange = .{};
+        errdefer {
+            kr.left.free(allocator);
+            kr.right.free(allocator);
+        }
 
-        // Iterate the tree's own levels to find which tables belong to this tree.
         if (ms.trees.getPtr(tree_id)) |tree| {
+            kr.left = try tree.left.dupe(allocator);
+            kr.right = try tree.right.dupe(allocator);
+            if (kr.left.len() == 0 and kr.right.len() == 0) {
+                kr.inf = true;
+            }
+
+            var needed: std.ArrayList(TableNeed) = .{};
+            defer needed.deinit(allocator);
             for (tree.levels.items, 0..) |lm, level_idx| {
                 if (level_idx >= opts.max_levels) continue;
-                var tit = lm.tables.iterator();
-                while (tit.next()) |tkv| {
-                    const table_id = tkv.key_ptr.*;
-
-                    try group.spawn(openTableFiber, .{
-                        allocator, opts.dir, table_id, level_idx, levels, &tse,
-                    });
+                var tit = lm.tables.keyIterator();
+                while (tit.next()) |tid| {
+                    try needed.append(allocator, .{ .id = tid.*, .level = level_idx });
                 }
             }
+            try cache.loadTables(needed.items, levels);
         }
-        group.wait() catch {};
-        if (tse.get()) |err| return err;
 
         var tree: Tree = .{
             .allocator = allocator,
             .opts = opts,
             .tree_id = tree_id,
             .ms = ms,
+            .cache = cache,
             .levels = levels,
+            .key_range = kr,
         };
         try tree.updateCompactCandidate();
         return tree;
-    }
-
-    /// Opens a single SST and adds it to the appropriate handler.
-    fn openTableFiber(
-        allocator: std.mem.Allocator,
-        dir: []const u8,
-        id: u64,
-        level: usize,
-        levels: []Level,
-        tse: *utils.ThreadSafeError,
-    ) void {
-        const path = std.fmt.allocPrint(allocator, "{s}/{d:0>6}.sst", .{ dir, id }) catch |err| {
-            tse.set(err);
-            return;
-        };
-        defer allocator.free(path);
-
-        const t = Table.open(allocator, path, .p0) catch |err| {
-            tse.set(err);
-            return;
-        };
-        defer t.decrRef();
-
-        levels[level].addEntry(id, t) catch |err| {
-            tse.set(err);
-        };
     }
 
     /// close tears down all level levels, freeing each table's memory without
@@ -138,6 +272,8 @@ pub const Tree = struct {
     pub fn close(self: *Tree) void {
         for (self.levels) |*h| h.deinit();
         self.allocator.free(self.levels);
+        self.key_range.left.free(self.allocator);
+        self.key_range.right.free(self.allocator);
     }
 
     /// get checks each level from L0 upward and returns the first matching item,
@@ -148,6 +284,51 @@ pub const Tree = struct {
             if (try h.get(search_key, priority)) |item| return item;
         }
         return null;
+    }
+
+    pub fn totalSize(self: *Tree) i64 {
+        var total: i64 = 0;
+        for (self.levels) |*l| total += l.getTotalSize();
+        return total;
+    }
+
+    pub fn lowestLevelSize(self: *Tree) struct {
+        level: u32,
+        size: i64,
+    } {
+        var idx: usize = self.levels.len;
+        while (idx > 0) {
+            idx -= 1;
+            const sz = self.levels[idx].getTotalSize();
+            if (sz > 0) return .{ .level = @intCast(idx), .size = sz };
+        }
+        return .{ .level = 0, .size = 0 };
+    }
+
+    pub fn findSplitKey(self: *Tree, allocator: std.mem.Allocator) !Key {
+        const linfo = self.lowestLevelSize();
+        if (linfo.level == 0) {
+            return .{};
+        }
+        const level = &self.levels[linfo.level];
+
+        level.mu.lockShared();
+        defer level.mu.unlockShared();
+
+        const items = level.tables.items;
+        if (items.len < 2) {
+            return .{};
+        }
+        const mid = items.len / 2;
+        var key = try items[mid].table.smallest.dupe(allocator);
+        std.debug.assert(key.len() > 0);
+
+        // This is the smallest key in the table. We do not want that any primary key gets split
+        // across trees. So, we'd take the absolutely max possible timestamp in the split key. That
+        // way, all the timestamps would fall to the right of this key, and fully belong to the
+        // newly split tree on the right.
+        key.timestamp = std.math.maxInt(u64);
+        return key;
     }
 
     // -----------------------------------------------------------------------
@@ -354,7 +535,7 @@ pub const Tree = struct {
 
         var merge = MergeIterator.init(self.allocator, all_iters);
         defer merge.deinit();
-        try merge.seekToFirst();
+        try merge.seekRange(self.key_range.left, self.key_range.right);
 
         // --- output table entries produced by this compaction ---
         var output_tables: std.ArrayList(TableEntry) = .{};
@@ -391,7 +572,7 @@ pub const Tree = struct {
                 // expect that the flow of keys is from top to bottom levels, so we're expecting to
                 // find higher version keys at higher levels. This expectation is used by get fn to
                 // stop searching for key as soon as we're able to find a version >= search key.
-                if (item.key.orderPrimary(bld.lastKey()) != .eq) {
+                if (!item.key.equalPrimary(bld.lastKey())) {
                     try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
                     bld.reset();
                 }
@@ -436,8 +617,11 @@ pub const Tree = struct {
         self.levels[src].deleteEntries(src_entries_slice);
         try self.levels[dest].replaceEntries(bot_entries_slice, output_tables.items);
 
-        // Release our refs on output tables; levels have taken their own refs via replaceEntries.
-        for (output_tables.items) |e| e.table.decrRef();
+        // Hand struct ownership to cache; release our refs (levels hold their own via replaceEntries).
+        for (output_tables.items) |e| {
+            try self.cache.own(e.id, e.table);
+            e.table.decrRef();
+        }
 
         try self.updateCompactCandidate();
     }

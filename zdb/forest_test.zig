@@ -140,6 +140,84 @@ test "forest tree persists across reopen" {
 // 5. Forest route table lookup
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 6. Tree splitting
+// ---------------------------------------------------------------------------
+
+// Helper: build a minimal SST table containing one key and write it to disk.
+fn buildAndWriteTable(alloc: std.mem.Allocator, path: []const u8, primary: []const u8) !void {
+    var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    defer bld.deinit();
+    try bld.add(.{ .primary = primary }, "v");
+    var tb = try bld.finish();
+    defer tb.deinit();
+    const f = try std.fs.createFileAbsolute(path, .{});
+    defer f.close();
+    try f.writeAll(tb.bytes);
+}
+
+test "forest split tree" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Phase 1: set up manifest + 3 SST files at L1 of tree 1 (namespace 42).
+    // Keys: "aaa", "mmm", "zzz" — sorted, non-overlapping, one key per table.
+    {
+        var ms = try manifest.openOrCreate(alloc, dir_path);
+        defer ms.close();
+
+        try ms.commit(&.{}, &.{manifest.createTreeChange(1, 42, &.{}, &.{})});
+
+        const table_keys = [_][]const u8{ "aaa", "mmm", "zzz" };
+        for (table_keys, 1..) |key, tbl_id| {
+            const path = try std.fmt.allocPrint(alloc, "{s}/{d:0>6}.sst", .{ dir_path, tbl_id });
+            defer alloc.free(path);
+            try buildAndWriteTable(alloc, path, key);
+            try ms.commit(&.{manifest.createTableChange(tbl_id, 1, 1)}, &.{});
+        }
+    }
+
+    // Phase 2: open forest, verify 3 tables loaded, then split.
+    {
+        const f = try Forest.open(alloc, .{ .dir = dir_path });
+        defer f.close();
+
+        const tree = f.getTree(1).?;
+        try std.testing.expectEqual(@as(usize, 3), tree.levels[1].numTables());
+
+        // splitTree requires the write lock.
+        f.mu.lock();
+        defer f.mu.unlock();
+        try f.splitTree(1);
+
+        // Now 2 trees should exist.
+        try std.testing.expectEqual(@as(usize, 2), f.trees.count());
+
+        // The split key is "mmm" (middle table, index 1 of 3).
+        // Old tree (id=1): tables ["aaa"] — left side.
+        // New tree (id=2): tables ["mmm","zzz"] — right side.
+        const old_tree = f.trees.get(1).?;
+        const new_tree = f.trees.get(2).?;
+        try std.testing.expectEqual(@as(usize, 1), old_tree.levels[1].numTables());
+        try std.testing.expectEqual(@as(usize, 2), new_tree.levels[1].numTables());
+
+        // Key ranges: old right = "mmm", new left = "mmm".
+        try std.testing.expectEqualStrings("mmm", old_tree.key_range.right.primary);
+        try std.testing.expectEqualStrings("mmm", new_tree.key_range.left.primary);
+
+        // Route table for namespace 42 should have 2 entries.
+        const rt = f.ns_routes.get(42).?;
+        try std.testing.expectEqual(@as(usize, 2), rt.entries.items.len);
+
+        // Routing: "aaa" → old tree (1), "zzz" → new tree (2).
+        try std.testing.expectEqual(@as(u64, 1), rt.lookup(.{ .primary = "aaa" }).?);
+        try std.testing.expectEqual(@as(u64, 2), rt.lookup(.{ .primary = "zzz" }).?);
+    }
+}
+
 test "forest routes to correct tree" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -1,5 +1,15 @@
 # TODO.md
 
+### PROJECT: MANIFEST to be run via Raft
+
+- All MANIFEST changes should be run via Raft.
+- To achieve this we might want to have a monotonically increasing counter which
+  tracks how many changes have been made to MANIFEST. This would allow a
+  follower to also propose changes, while proving that it has the latest copy of
+  MANIFEST -- equivalent of atomic.compareAndSwap.
+- At a cursory look, commit might be the entry point, where we can do a propose
+  and wait for Raft commit to happen.
+
 ### PROJECT: Make zdb values smarter
 *Mar 3, 2026*
 

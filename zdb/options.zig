@@ -32,6 +32,9 @@ pub const Options = struct {
     table_size_multiplier: i64 = 2,
     max_table_size: i64 = 128 * 1024 * 1024,
 
+    // Tree split threshold: split a tree into two when it exceeds this size.
+    tree_split_size: i64 = 6 * 1024 * 1024 * 1024, // 6 GiB
+
     pub fn validate(self: Options) Error!void {
         // Badger semantics: exactly one compactor causes pathological level behavior.
         if (self.num_compactors == 1) return error.InvalidNumCompactors;

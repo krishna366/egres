@@ -36,6 +36,9 @@ pub const Key = struct {
     /// For keys without the full prefix/suffix, construct Key directly via
     /// Key{ .primary = ... }.
     pub fn init(raw: []const u8) Key {
+        if (raw.len == 0) {
+            return .{};
+        }
         const ts_idx = raw.len - 8;
         return .{
             .namespace = std.mem.readInt(u32, raw[0..4], .big),
@@ -45,13 +48,37 @@ pub const Key = struct {
         };
     }
 
+    pub fn initAlloc(allocator: std.mem.Allocator, raw: []const u8) !Key {
+        var k = init(raw);
+        k.primary = try allocator.dupe(u8, k.primary);
+        return k;
+    }
+
+    pub fn dupe(self: Key, allocator: std.mem.Allocator) !Key {
+        var out = self;
+        out.primary = try allocator.dupe(u8, self.primary);
+        return out;
+    }
+
+    pub fn free(self: Key, allocator: std.mem.Allocator) void {
+        if (self.primary.len > 0) {
+            allocator.free(self.primary);
+        }
+    }
+
     pub fn marshal(self: Key, allocator: std.mem.Allocator) ![]const u8 {
+        if (self.primary.len == 0) {
+            return allocator.alloc(u8, 0);
+        }
         const buf = try allocator.alloc(u8, 8 + self.primary.len + 8);
         self.writeTo(buf);
         return buf;
     }
 
     pub fn marshalTo(self: Key, allocator: std.mem.Allocator, data: *std.ArrayList(u8)) ![]const u8 {
+        if (self.primary.len == 0) {
+            return allocator.alloc(u8, 0);
+        }
         const start = data.items.len;
         try data.appendNTimes(allocator, 0, 8 + self.primary.len + 8);
         const buf = data.items[start..];
@@ -71,13 +98,7 @@ pub const Key = struct {
     }
 
     pub fn order(self: Key, other: Key) std.math.Order {
-        if (self.namespace != 0 and other.namespace != 0 and self.namespace != other.namespace) {
-            return if (self.namespace < other.namespace) .lt else .gt;
-        }
-        if (self.table_id != 0 and other.table_id != 0 and self.table_id != other.table_id) {
-            return if (self.table_id < other.table_id) .lt else .gt;
-        }
-        const cmp = std.mem.order(u8, self.primary, other.primary);
+        const cmp = self.orderWithoutTs(other);
         if (cmp != .eq) return cmp;
 
         if (self.timestamp == other.timestamp) return .eq;
@@ -85,7 +106,22 @@ pub const Key = struct {
         return if (self.timestamp > other.timestamp) .lt else .gt;
     }
 
+    pub fn orderWithoutTs(self: Key, other: Key) std.math.Order {
+        if (self.namespace != 0 and other.namespace != 0) {
+            const ns_ord = std.math.order(self.namespace, other.namespace);
+            if (ns_ord != .eq) return ns_ord;
+        }
+        if (self.table_id != 0 and other.table_id != 0) {
+            const tid_ord = std.math.order(self.table_id, other.table_id);
+            if (tid_ord != .eq) return tid_ord;
+        }
+        return std.mem.order(u8, self.primary, other.primary);
+    }
+
     pub inline fn len(self: Key) usize {
+        if (self.primary.len == 0) {
+            return 0;
+        }
         return 8 + self.primary.len + 8;
     }
 
@@ -95,7 +131,7 @@ pub const Key = struct {
     }
 
     /// Same primary key, ignoring namespace/table_id/timestamp.
-    pub fn orderPrimary(self: Key, other: Key) std.math.Order {
-        return std.mem.order(u8, self.primary, other.primary);
+    pub fn equalPrimary(self: Key, other: Key) bool {
+        return std.mem.eql(u8, self.primary, other.primary);
     }
 };

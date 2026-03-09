@@ -11,6 +11,7 @@ const tree_mod = @import("tree.zig");
 const Key = @import("key.zig").Key;
 const KeyRange = level.KeyRange;
 const Tree = tree_mod.Tree;
+const TableCache = tree_mod.TableCache;
 const Table = table_mod.Table;
 const Item = table_mod.table.Item;
 
@@ -114,8 +115,10 @@ pub const Forest = struct {
     opts: options.Options,
     ms: manifest.ForestState,
     next_tree_id: std.atomic.Value(u64),
+    next_file_id: std.atomic.Value(u64),
     trees: std.AutoHashMap(u64, *Tree),
     ns_routes: std.AutoHashMap(u32, *RouteTable),
+    table_cache: TableCache,
     mu: std.Thread.RwLock,
 
     /// Open or create a forest from a directory.
@@ -134,14 +137,18 @@ pub const Forest = struct {
             .opts = opts,
             .ms = ms,
             .next_tree_id = std.atomic.Value(u64).init(1),
+            .next_file_id = std.atomic.Value(u64).init(1),
             .trees = std.AutoHashMap(u64, *Tree).init(allocator),
             .ns_routes = std.AutoHashMap(u32, *RouteTable).init(allocator),
+            .table_cache = TableCache.init(allocator, opts.dir),
             .mu = .{},
         };
         errdefer self.trees.deinit();
         errdefer self.ns_routes.deinit();
+        errdefer self.table_cache.deinit();
 
         var max_tid: u64 = 0;
+        var max_fid: u64 = 0;
         {
             var it = self.ms.trees.iterator();
             while (it.next()) |kv| {
@@ -149,7 +156,15 @@ pub const Forest = struct {
                 const tree_state = kv.value_ptr.*;
                 if (tree_id > max_tid) max_tid = tree_id;
 
-                var tree = try Tree.open(allocator, opts, tree_id, &self.ms);
+                // Track the highest table ID to seed next_file_id.
+                for (tree_state.levels.items) |lm| {
+                    var fit = lm.tables.keyIterator();
+                    while (fit.next()) |fid| {
+                        if (fid.* > max_fid) max_fid = fid.*;
+                    }
+                }
+
+                var tree = try Tree.open(allocator, opts, tree_id, &self.ms, &self.table_cache);
                 errdefer tree.close();
 
                 const tree_ptr = try allocator.create(Tree);
@@ -165,6 +180,7 @@ pub const Forest = struct {
         }
 
         self.next_tree_id = std.atomic.Value(u64).init(max_tid + 1);
+        self.next_file_id = std.atomic.Value(u64).init(max_fid + 1);
         return self;
     }
 
@@ -184,6 +200,7 @@ pub const Forest = struct {
         self.ns_routes.deinit();
 
         self.ms.close();
+        self.table_cache.deinit();
         self.allocator.destroy(self);
     }
 
@@ -216,7 +233,7 @@ pub const Forest = struct {
         try self.ms.commit(&.{}, &.{manifest.createTreeChange(tree_id, namespace_id, left_raw, right_raw)});
 
         // Create in-memory tree (empty — no tables yet).
-        var tree = try Tree.open(self.allocator, self.opts, tree_id, &self.ms);
+        var tree = try Tree.open(self.allocator, self.opts, tree_id, &self.ms, &self.table_cache);
         errdefer tree.close();
 
         const tree_ptr = try self.allocator.create(Tree);
@@ -241,7 +258,7 @@ pub const Forest = struct {
     /// compaction on it. Returns true if a compaction was executed, false if
     /// no tree needs compaction.
     pub fn compact(self: *Forest) !bool {
-        const Best = struct { tree: *Tree, candidate: tree_mod.CompactCandidate };
+        const Best = struct { tree: *Tree, tree_id: u64, candidate: tree_mod.CompactCandidate };
         var best: ?Best = null;
 
         {
@@ -253,14 +270,129 @@ pub const Forest = struct {
                 const tree = kv.value_ptr.*;
                 const candidate = tree.compact_candidate orelse continue;
                 if (best == null or candidate.score > best.?.candidate.score) {
-                    best = .{ .tree = tree, .candidate = candidate };
+                    best = .{ .tree = tree, .tree_id = kv.key_ptr.*, .candidate = candidate };
                 }
             }
         }
 
         const b = best orelse return false;
-        try b.tree.doCompact(b.candidate.level);
+        try b.tree.doCompact(b.candidate.level, &self.next_file_id);
+        self.table_cache.clearStale();
+
+        const linfo = b.tree.lowestLevelSize();
+        if (linfo.size > self.opts.tree_split_size) {
+            self.mu.lock();
+            defer self.mu.unlock();
+            try self.splitTree(b.tree_id);
+        }
+
         return true;
+    }
+
+    /// splitTree splits the given tree at the median key of its bottommost level.
+    /// Caller must hold the write lock.
+    pub fn splitTree(self: *Forest, tree_id: u64) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const left_tree = self.trees.get(tree_id) orelse return;
+
+        // Find split key from the lowest level in old tree.
+        const split_key = try left_tree.findSplitKey(alloc);
+        if (split_key.len() == 0) {
+            return;
+        }
+
+        // Capture old tree state before the manifest commit.
+        const left_tree_state = self.ms.trees.get(tree_id) orelse return;
+        const new_tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
+
+        // Classify tables per level and build manifest changes.
+        var table_changes: std.ArrayList(manifest.TableChange) = .{};
+
+        // Track tables which go entirely to right tree. These tables would be removed from
+        // left tree. We will rearrange the tables after MANIFEST commit.
+        const TablesAtLevel = struct { level_idx: usize, entries: []level.TableEntry };
+        var left_tree_remove: std.ArrayList(TablesAtLevel) = .{};
+
+        for (left_tree.levels, 0..) |*llv, llv_idx| {
+            var remove_at_level: std.ArrayList(level.TableEntry) = .{};
+
+            {
+                llv.mu.lockShared();
+                defer llv.mu.unlockShared();
+
+                for (llv.tables.items) |tbe| {
+                    if (tbe.table.smallest.order(split_key) != .lt) { // .eq or .gt
+                        // Right-only: remove from old tree, add to new tree.
+                        try remove_at_level.append(alloc, tbe);
+                        try table_changes.append(alloc, manifest.deleteTableChange(
+                            tbe.id,
+                            tree_id,
+                        ));
+                        try table_changes.append(alloc, manifest.createTableChange(
+                            tbe.id,
+                            new_tree_id,
+                            @intCast(llv_idx),
+                        ));
+                    } else if (tbe.table.biggest.order(split_key) != .lt) { // .eq or .gt
+                        // order: smallest key < split key <= biggest key
+                        // Therefore, the split key falls within the table.
+                        // Shared: keep in old tree, also add to new tree.
+                        try table_changes.append(alloc, manifest.createTableChange(tbe.id, new_tree_id, @intCast(llv_idx)));
+                    }
+                    // Left-only: no manifest change needed.
+                }
+            }
+
+            const owned = try remove_at_level.toOwnedSlice(alloc);
+            try left_tree_remove.append(alloc, .{ .level_idx = llv_idx, .entries = owned });
+        }
+
+        const left_left_raw_key = try left_tree_state.left.marshal(alloc);
+        const right_right_raw_key = try left_tree_state.right.marshal(alloc);
+        const split_raw = try split_key.marshal(alloc);
+        const namespace_id = left_tree_state.namespace_id;
+        std.debug.assert(namespace_id > 0);
+
+        const tree_changes = [2]manifest.TreeChange{
+            manifest.updateTreeChange(tree_id, left_left_raw_key, split_raw),
+            manifest.createTreeChange(new_tree_id, namespace_id, split_raw, right_right_raw_key),
+        };
+        // Commit MANIFEST so we can recover from a crash.
+        try self.ms.commit(table_changes.items, &tree_changes);
+
+        // Open the new right tree BEFORE deleting from old tree, so that
+        // loadTables finds the shared tables in the cache with ref > 0.
+        // It would use MANIFEST state to figure out which tables it owns.
+        var new_tree = try Tree.open(self.allocator, self.opts, new_tree_id, &self.ms, &self.table_cache);
+        errdefer new_tree.close();
+
+        // Update old key range and remove tables.
+        const spkey = try split_key.dupe(left_tree.allocator);
+        errdefer spkey.free(left_tree.allocator);
+
+        left_tree.key_range.right.free(left_tree.allocator);
+        left_tree.key_range.right = spkey;
+        left_tree.key_range.inf = false;
+
+        for (left_tree_remove.items) |lr| {
+            left_tree.levels[lr.level_idx].deleteEntries(lr.entries);
+        }
+
+        // Add new tree to the forest.
+        const new_ptr = try self.allocator.create(Tree);
+        errdefer self.allocator.destroy(new_ptr);
+        new_ptr.* = new_tree;
+        try self.trees.put(new_tree_id, new_ptr);
+
+        // Update route table using manifest-owned Keys (post-commit).
+        const rt = try self.getOrCreateRouteTable(namespace_id);
+        const ms_tree_left = self.ms.trees.getPtr(tree_id).?;
+        const ms_tree_right = self.ms.trees.getPtr(new_tree_id).?;
+        rt.updateRange(tree_id, .{ .left = ms_tree_left.left, .right = ms_tree_left.right });
+        try rt.addRoute(new_tree_id, .{ .left = ms_tree_right.left, .right = ms_tree_right.right });
     }
 
     fn getOrCreateRouteTable(self: *Forest, namespace_id: u32) !*RouteTable {

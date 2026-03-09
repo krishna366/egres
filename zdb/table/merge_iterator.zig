@@ -1,5 +1,7 @@
 const std = @import("std");
 const table = @import("table.zig");
+const Key = @import("../key.zig").Key;
+const utils = @import("utils");
 
 pub const Error = table.Error;
 
@@ -9,9 +11,9 @@ pub const Iterator = union(enum) {
     table: table.TableIterator,
     concat: ConcatIterator,
 
-    pub fn seekToFirst(self: *Iterator) Error!void {
+    pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
         switch (self.*) {
-            inline else => |*it| try it.seekToFirst(),
+            inline else => |*it| try it.seekRange(start, end),
         }
     }
 
@@ -58,9 +60,9 @@ pub const MergeIterator = struct {
         for (self.iters) |*it| it.deinit();
     }
 
-    pub fn seekToFirst(self: *MergeIterator) Error!void {
+    pub fn seekRange(self: *MergeIterator, start: Key, end: Key) !void {
         while (self.heap.removeOrNull() != null) {}
-        for (self.iters) |*it| try it.seekToFirst();
+        for (self.iters) |*it| try it.seekRange(start, end);
         for (self.iters, 0..) |*it, i| {
             if (it.itemRef() != null) try self.heap.add(i);
         }
@@ -90,10 +92,27 @@ pub const ConcatIterator = struct {
         for (self.iters) |*it| it.deinit();
     }
 
-    pub fn seekToFirst(self: *ConcatIterator) Error!void {
-        self.current = 0;
-        if (self.current < self.iters.len) {
-            try self.iters[self.current].seekToFirst();
+    pub fn seekRange(self: *ConcatIterator, start: Key, end: Key) !void {
+        if (self.iters.len == 0) return;
+
+        if (start.len() == 0) {
+            self.current = 0;
+            try self.iters[0].seekRange(.{}, end);
+            return;
+        }
+
+        // First table whose biggest key >= start.
+        const idx = utils.search(table.TableIterator, self.iters, start, struct {
+            fn f(sk: Key, it: table.TableIterator) bool {
+                return it.table.biggest.order(sk) != .lt;
+            }
+        }.f);
+        self.current = idx;
+        if (self.current >= self.iters.len) return;
+
+        try self.iters[self.current].seekRange(start, end);
+        for (self.iters[self.current + 1 ..]) |*itr| {
+            try itr.seekRange(.{}, end);
         }
     }
 
@@ -111,11 +130,7 @@ pub const ConcatIterator = struct {
         // This loop can skip over empty iterators, even though we don't expect them.
         while (self.iters[self.current].itemRef() == null) {
             self.current += 1;
-            if (self.current < self.iters.len) {
-                try self.iters[self.current].seekToFirst();
-            } else {
-                return;
-            }
+            if (self.current >= self.iters.len) return;
         }
     }
 };

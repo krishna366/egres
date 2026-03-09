@@ -4,7 +4,8 @@ const Key = key_mod.Key;
 pub const Item = key_mod.Item;
 const idx = @import("index.zig");
 const buffers = @import("../buffers.gen.zig");
-const compress = @import("utils").compression;
+const utils = @import("utils");
+const compress = utils.compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("../vfs.zig");
 const cache_mod = @import("../cache.zig");
@@ -34,7 +35,10 @@ pub const Table = struct {
     smallest: Key,
     biggest: Key,
     file_id: u44, // parsed from SST filename; 0 for in-memory tables
-    path: ?[]const u8, // owned; non-null for file-backed tables; deleted on last decrRef
+    // Owned path split into atomic pointer + length for thread-safe detach.
+    // Use getPath() to read, claimPath() to atomically take ownership.
+    path_ptr: std.atomic.Value(?[*]const u8),
+    path_len: usize,
 
     pub fn fileSize(self: *const Table) u64 {
         return self.handle.file_size;
@@ -48,7 +52,9 @@ pub const Table = struct {
         const t = try initFromHandle(allocator, handle, priority);
         errdefer t.decrRef();
         t.file_id = vfs.fileIdFromPath(path);
-        t.path = try allocator.dupe(u8, path);
+        const duped = try allocator.dupe(u8, path);
+        t.path_ptr = std.atomic.Value(?[*]const u8).init(duped.ptr);
+        t.path_len = duped.len;
         return t;
     }
 
@@ -131,13 +137,21 @@ pub const Table = struct {
             .biggest = if (table_index.last_key.len >= 16) Key.init(table_index.last_key) else .{},
             .ref = std.atomic.Value(i32).init(1),
             .file_id = 0,
-            .path = null,
+            .path_ptr = std.atomic.Value(?[*]const u8).init(null),
+            .path_len = 0,
         };
         return t;
     }
 
+    /// Atomically claim ownership of the path, returning the slice if we won the race.
+    fn claimPath(self: *Table) ?[]const u8 {
+        const ptr = self.path_ptr.swap(null, .acq_rel);
+        if (ptr) |p| return p[0..self.path_len];
+        return null;
+    }
+
     fn deinit(self: *Table) void {
-        if (self.path) |p| self.allocator.free(p);
+        if (self.claimPath()) |p| self.allocator.free(p);
         self.index.deinit(self.allocator);
         if (self.binary_fuse) |*bf| bf.deinit(self.allocator);
         self.handle.close();
@@ -146,9 +160,9 @@ pub const Table = struct {
     /// detach forgets the SST file path without deleting it.
     /// Used by Level.deinit() (database close) so that the subsequent
     /// decrRef at zero frees memory only, leaving the file on disk intact.
+    /// Thread-safe: concurrent calls race on an atomic swap; only the winner frees.
     pub fn detach(self: *Table) void {
-        if (self.path) |p| self.allocator.free(p);
-        self.path = null;
+        if (self.claimPath()) |p| self.allocator.free(p);
     }
 
     /// Increment the reference count. Call this when sharing a Table pointer.
@@ -162,10 +176,11 @@ pub const Table = struct {
         const prev = self.ref.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
         if (prev == 1) {
-            if (self.path) |p| std.fs.deleteFileAbsolute(p) catch {};
-            const allocator = self.allocator;
+            if (self.claimPath()) |p| {
+                std.fs.deleteFileAbsolute(p) catch {};
+                self.allocator.free(p);
+            }
             self.deinit();
-            allocator.destroy(self);
         }
     }
 
@@ -412,6 +427,8 @@ pub const TableIterator = struct {
     current_block: ?*cache_mod.Value = null,
     valid: bool,
     priority: vfs.Priority,
+    end_key: ?Key = null, // exclusive upper bound; owned (duped)
+    end_bpos: usize = 0, // block index where end_key lives
 
     pub fn init(allocator: std.mem.Allocator, table: *Table, priority: vfs.Priority) TableIterator {
         table.incrRef();
@@ -427,12 +444,49 @@ pub const TableIterator = struct {
     }
 
     pub fn deinit(self: *TableIterator) void {
+        if (self.end_key) |ek| ek.free(self.allocator);
         self.table.decrRef();
         if (self.bi) |*bi| bi.deinit();
         if (self.current_block) |b| b.decrRef();
     }
 
-    pub fn seekToFirst(self: *TableIterator) Error!void {
+    /// Seek to the first entry >= start, stopping before any entry with key >= end.
+    /// Empty start means seek to first; empty end means no upper bound.
+    /// Dupes end so it remains valid for the lifetime of this iterator.
+    pub fn seekRange(self: *TableIterator, start: Key, end: Key) !void {
+        // Set up end bound.
+        if (self.end_key) |ek| ek.free(self.allocator);
+        self.end_key = null;
+
+        if (end.len() > 0) {
+            if (end.order(self.table.smallest) != .gt) {
+                // end <= smallest: nothing to return.
+                self.valid = false;
+                return;
+            }
+            if (end.order(self.table.biggest) != .gt) {
+                // The end key is within this table's key range.
+                self.end_key = try end.dupe(self.allocator);
+                // Find the block containing end_key: last block with base key <= end.
+                const blocks = self.table.index.blocks;
+                const ei = utils.search(buffers.BlockIndexStruct, blocks, end, struct {
+                    fn f(ek: Key, b: buffers.BlockIndexStruct) bool {
+                        return Key.init(b.key).order(ek) == .gt;
+                    }
+                }.f);
+                self.end_bpos = if (ei > 0) ei - 1 else 0;
+            }
+        }
+
+        // Seek.
+        if (start.len() == 0) {
+            try self.seekToFirst();
+        } else {
+            try self.seekForward(start);
+        }
+    }
+
+    fn seekToFirst(self: *TableIterator) Error!void {
         if (self.table.blockCount() == 0) {
             self.valid = false;
             return;
@@ -442,23 +496,21 @@ pub const TableIterator = struct {
         self.valid = self.bi.?.is_valid;
     }
 
-    pub fn seek(self: *TableIterator, target: Key) Error!void {
+    fn seekForward(self: *TableIterator, target: Key) Error!void {
         self.valid = false;
-        const block_count = self.table.blockCount();
-        if (block_count == 0) return;
+        const blocks = self.table.index.blocks;
+        if (blocks.len == 0) return;
 
-        // Binary search: find the last block whose base key <= target.
-        var lo: usize = 0;
-        var hi: usize = block_count;
-        while (lo + 1 < hi) {
-            const mid = lo + (hi - lo) / 2;
-            const base = try self.table.blockBaseKey(mid);
-            if (Key.init(base).order(target) == .gt) {
-                hi = mid;
-            } else {
-                lo = mid;
+        // First block whose base key > target.
+        const bi_idx = utils.search(buffers.BlockIndexStruct, blocks, target, struct {
+            fn f(sk: Key, b: buffers.BlockIndexStruct) bool {
+                return Key.init(b.key).order(sk) == .gt;
             }
-        }
+        }.f);
+
+        // The block we want is idx-1 (last block with base key <= target),
+        // or 0 if all base keys are > target.
+        const lo = if (bi_idx > 0) bi_idx - 1 else 0;
 
         try self.setBlock(lo);
         try self.bi.?.seekGe(target);
@@ -468,7 +520,7 @@ pub const TableIterator = struct {
         }
 
         // Not found in block lo — target may sit at the start of the next block.
-        if (lo + 1 < block_count) {
+        if (lo + 1 < blocks.len) {
             try self.setBlock(lo + 1);
             try self.bi.?.seekToFirst();
             self.valid = self.bi.?.is_valid;
@@ -477,12 +529,20 @@ pub const TableIterator = struct {
 
     pub fn next(self: *TableIterator) Error!void {
         if (!self.valid) return;
+        defer self.checkEndKey(); // Always do it.
 
         try self.bi.?.next();
-        if (self.bi.?.is_valid) return;
+        if (self.bi.?.is_valid) {
+            return;
+        }
 
         // End of current block — advance to the next.
         const next_bpos = self.bpos + 1;
+        if (self.end_key != null and next_bpos > self.end_bpos) {
+            // No need to fetch the block.
+            self.valid = false;
+            return;
+        }
         if (next_bpos >= self.table.blockCount()) {
             self.valid = false;
             return;
@@ -492,7 +552,26 @@ pub const TableIterator = struct {
         self.valid = self.bi.?.is_valid;
     }
 
+    /// Invalidates the iterator if current item >= end_key.
+    inline fn checkEndKey(self: *TableIterator) void {
+        if (!self.valid) return;
+        const ek = self.end_key orelse return;
+
+        if (self.bpos > self.end_bpos) {
+            self.valid = false;
+            return;
+        }
+        if (self.bpos < self.end_bpos) {
+            return;
+        }
+        const item = self.bi.?.itemRef() orelse return;
+        if (item.key.order(ek) != .lt) {
+            self.valid = false;
+        }
+    }
+
     pub fn itemRef(self: *const TableIterator) ?Item {
+        if (!self.valid) return null;
         return self.bi.?.itemRef();
     }
 

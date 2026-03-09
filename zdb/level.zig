@@ -245,9 +245,9 @@ pub const Level = struct {
                 var it = TableIterator.init(self.allocator, e.table, priority);
                 defer it.deinit();
 
-                try it.seek(search_key);
+                try it.seekRange(search_key, .{});
                 const found = it.itemRef() orelse continue;
-                if (search_key.orderPrimary(found.key) != .eq) continue;
+                if (!search_key.equalPrimary(found.key)) continue;
 
                 return try found.dupe(self.allocator);
             }
@@ -265,19 +265,21 @@ pub const Level = struct {
             if (lo >= self.tables.items.len) return null;
 
             const e = self.tables.items[lo];
-            // Verify the key can actually be in this table.
-            // Compare by user key only: a table whose smallest user key is
-            // greater than the search user key cannot contain the key at any
-            // timestamp, so skip it.
-            if (e.table.smallest.orderPrimary(search_key) == .gt) return null;
+
+            // Verify the key can actually be in this table. Compare without considering timestamp.
+            // A table whose smallest primary is greater than the search primary cannot contain the
+            // key at any timestamp. Note that full Key.order includes reversed timestamp which
+            // would give wrong results when the search key uses timestamp = maxInt as a "find any
+            // version" sentinel. So, we don't use "order". Instead use "orderWithoutTs".
+            if (e.table.smallest.orderWithoutTs(search_key) == .gt) return null;
             if (!e.table.containsKey(search_key)) return null;
 
             var it = TableIterator.init(self.allocator, e.table, priority);
             defer it.deinit();
 
-            try it.seek(search_key);
+            try it.seekRange(search_key, .{});
             const found = it.itemRef() orelse return null;
-            if (search_key.orderPrimary(found.key) != .eq) return null;
+            if (!search_key.equalPrimary(found.key)) return null;
 
             return try found.dupe(self.allocator);
         }

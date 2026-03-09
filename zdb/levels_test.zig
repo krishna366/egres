@@ -19,6 +19,7 @@ const TableEntry = level_mod.TableEntry;
 const KeyRange = level_mod.KeyRange;
 
 const Tree = zdb.tree.Tree;
+const TableCache = zdb.tree.TableCache;
 
 const options_mod = zdb.options;
 
@@ -67,8 +68,10 @@ fn openTableOwned(alloc: std.mem.Allocator, tb: *table_mod.builder.TableBuffer) 
     return Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
 }
 
-fn freeTable(_: std.mem.Allocator, t: *Table) void {
+fn destroyTable(t: *Table) void {
+    const allocator = t.allocator;
     t.decrRef();
+    allocator.destroy(t);
 }
 
 // ---------------------------------------------------------------------------
@@ -86,11 +89,11 @@ test "level_handler L0 sort" {
     defer tb2.deinit();
 
     const t3 = try openTableOwned(alloc, &tb3);
-    defer freeTable(alloc, t3);
+    defer destroyTable(t3);
     const t1 = try openTableOwned(alloc, &tb1);
-    defer freeTable(alloc, t1);
+    defer destroyTable(t1);
     const t2 = try openTableOwned(alloc, &tb2);
-    defer freeTable(alloc, t2);
+    defer destroyTable(t2);
 
     var level = Level.init(alloc, 0);
     defer level.deinit();
@@ -121,11 +124,11 @@ test "level_handler L1 sort" {
     defer tbb.deinit();
 
     const tc = try openTableOwned(alloc, &tbc);
-    defer freeTable(alloc, tc);
+    defer destroyTable(tc);
     const ta = try openTableOwned(alloc, &tba);
-    defer freeTable(alloc, ta);
+    defer destroyTable(ta);
     const tb = try openTableOwned(alloc, &tbb);
-    defer freeTable(alloc, tb);
+    defer destroyTable(tb);
 
     var level = Level.init(alloc, 1);
     defer level.deinit();
@@ -170,7 +173,7 @@ test "overlapping tables L1" {
     }
     defer for (&tbs) |*tb| tb.deinit();
     defer for (tables, 0..) |t, i| {
-        freeTable(alloc, t);
+        destroyTable(t);
         _ = i;
     };
 
@@ -206,11 +209,11 @@ test "overlapping tables L0" {
     defer tb3.deinit();
 
     const t1 = try openTableOwned(alloc, &tb1);
-    defer freeTable(alloc, t1);
+    defer destroyTable(t1);
     const t2 = try openTableOwned(alloc, &tb2);
-    defer freeTable(alloc, t2);
+    defer destroyTable(t2);
     const t3 = try openTableOwned(alloc, &tb3);
-    defer freeTable(alloc, t3);
+    defer destroyTable(t3);
 
     var level = Level.init(alloc, 0);
     defer level.deinit();
@@ -242,9 +245,9 @@ test "get L0 newest wins" {
     defer tb2.deinit();
 
     const t1 = try openTableOwned(alloc, &tb1);
-    defer freeTable(alloc, t1);
+    defer destroyTable(t1);
     const t2 = try openTableOwned(alloc, &tb2);
-    defer freeTable(alloc, t2);
+    defer destroyTable(t2);
 
     var level = Level.init(alloc, 0);
     defer level.deinit();
@@ -276,11 +279,11 @@ test "get L1 hit" {
     defer tbc.deinit();
 
     const ta = try openTableOwned(alloc, &tba);
-    defer freeTable(alloc, ta);
+    defer destroyTable(ta);
     const tb = try openTableOwned(alloc, &tbb);
-    defer freeTable(alloc, tb);
+    defer destroyTable(tb);
     const tc = try openTableOwned(alloc, &tbc);
-    defer freeTable(alloc, tc);
+    defer destroyTable(tc);
 
     var level = Level.init(alloc, 1);
     defer level.deinit();
@@ -307,7 +310,7 @@ test "get miss" {
     var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "va" }});
     defer tba.deinit();
     const ta = try openTableOwned(alloc, &tba);
-    defer freeTable(alloc, ta);
+    defer destroyTable(ta);
 
     var level = Level.init(alloc, 1);
     defer level.deinit();
@@ -361,7 +364,9 @@ test "levels open" {
     }, &.{});
 
     const opts = options_mod.Options{ .dir = dir_path };
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms);
+    var cache = TableCache.init(alloc, opts.dir);
+    defer cache.deinit();
+    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
     defer tree.close();
 
     try std.testing.expectEqual(@as(usize, 1), tree.levels[0].numTables());
@@ -396,7 +401,9 @@ test "pick compact level" {
         .num_level_zero_tables = 5,
     };
 
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms);
+    var cache = TableCache.init(alloc, opts.dir);
+    defer cache.deinit();
+    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
     defer tree.close();
 
     // Manually plant a large table in L1.
@@ -406,8 +413,9 @@ test "pick compact level" {
     });
     defer tb.deinit();
     const t = try openTableOwned(alloc, &tb);
-    defer freeTable(alloc, t);
+    try cache.own(999, t);
     try tree.levels[1].addEntry(999, t);
+    t.decrRef(); // now levels owns the table.
 
     try tree.updateCompactCandidate();
     try std.testing.expect(tree.compact_candidate != null);
@@ -455,7 +463,9 @@ test "do compact L0->L1" {
 
     // Use max_levels=2 so base_level=1 and doCompact(0) goes L0→L1.
     const opts = options_mod.Options{ .dir = dir_path, .max_levels = 2 };
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms);
+    var cache = TableCache.init(alloc, opts.dir);
+    defer cache.deinit();
+    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
     defer tree.close();
 
     // All three tables should be in L0 before compaction.
@@ -539,7 +549,9 @@ test "do compact L0->L1 with dest overlap" {
 
     // max_levels=2: L0 compacts directly to L1 (base_level=1).
     const opts = options_mod.Options{ .dir = dir_path, .max_levels = 2 };
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms);
+    var cache = TableCache.init(alloc, opts.dir);
+    defer cache.deinit();
+    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
     defer tree.close();
 
     try std.testing.expectEqual(@as(usize, 2), tree.levels[0].numTables());
@@ -616,7 +628,9 @@ test "do compact L1->L2" {
 
     // max_levels=3: doCompact(1) goes L1→L2 (dest = src + 1 = 2).
     const opts = options_mod.Options{ .dir = dir_path, .max_levels = 3 };
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms);
+    var cache = TableCache.init(alloc, opts.dir);
+    defer cache.deinit();
+    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
     defer tree.close();
 
     try std.testing.expectEqual(@as(usize, 1), tree.levels[1].numTables());
@@ -662,7 +676,9 @@ test "levels get: L0 shadows L1" {
     defer ms.close();
 
     const opts = options_mod.Options{ .dir = dir_path };
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms);
+    var cache = TableCache.init(alloc, opts.dir);
+    defer cache.deinit();
+    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
     defer tree.close();
 
     // Plant in-memory tables directly into the level handlers.
@@ -670,15 +686,17 @@ test "levels get: L0 shadows L1" {
     var tb_l1 = try buildTable(alloc, &.{.{ .key = "foo", .ts = 1, .val = "l1_val" }});
     defer tb_l1.deinit();
     const t_l1 = try openTableOwned(alloc, &tb_l1);
-    defer freeTable(alloc, t_l1);
+    try cache.own(1, t_l1);
     try tree.levels[1].addEntry(1, t_l1);
+    t_l1.decrRef();
 
     // L0: foo at ts=5 (newer version; higher ts sorts earlier in byte order).
     var tb_l0 = try buildTable(alloc, &.{.{ .key = "foo", .ts = 5, .val = "l0_val" }});
     defer tb_l0.deinit();
     const t_l0 = try openTableOwned(alloc, &tb_l0);
-    defer freeTable(alloc, t_l0);
+    try cache.own(2, t_l0);
     try tree.levels[0].addEntry(2, t_l0);
+    t_l0.decrRef();
 
     // Searching with maxInt ts seeks to the very beginning of "foo" entries;
     // L0 is checked first → the ts=5 version wins.

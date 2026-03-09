@@ -119,8 +119,8 @@ pub const ForestState = struct {
             try self.trees.put(tc.tree_id, .{
                 .namespace_id = tc.namespace_id,
                 .levels = std.ArrayList(LevelState).empty,
-                .left = try parseKey(self.allocator, tc.left_key),
-                .right = try parseKey(self.allocator, tc.right_key),
+                .left = try Key.initAlloc(self.allocator, tc.left_key),
+                .right = try Key.initAlloc(self.allocator, tc.right_key),
             });
         } else if (tc.op == op_delete) {
             if (self.trees.fetchRemove(tc.tree_id)) |kv| {
@@ -129,24 +129,12 @@ pub const ForestState = struct {
             }
         } else if (tc.op == op_update) {
             const tree = self.trees.getPtr(tc.tree_id) orelse return ManifestError.TreeNotFound;
-            if (tree.left.primary.len > 0) self.allocator.free(tree.left.primary);
-            if (tree.right.primary.len > 0) self.allocator.free(tree.right.primary);
-            tree.left = try parseKey(self.allocator, tc.left_key);
-            tree.right = try parseKey(self.allocator, tc.right_key);
+            tree.left.free(self.allocator);
+            tree.right.free(self.allocator);
+
+            tree.left = try Key.initAlloc(self.allocator, tc.left_key);
+            tree.right = try Key.initAlloc(self.allocator, tc.right_key);
         }
-    }
-
-    /// Parse raw marshaled bytes into a Key, duping the primary slice.
-    fn parseKey(allocator: std.mem.Allocator, raw: []const u8) !Key {
-        if (raw.len == 0) return .{};
-        var k = Key.init(raw);
-        k.primary = try allocator.dupe(u8, k.primary);
-        return k;
-    }
-
-    fn marshalKeyOrEmpty(allocator: std.mem.Allocator, k: Key) ![]const u8 {
-        if (k.primary.len == 0 and k.namespace == 0 and k.timestamp == 0) return try allocator.alloc(u8, 0);
-        return k.marshal(allocator);
     }
 
     /// Count total table entries across all trees and levels.
@@ -258,8 +246,8 @@ pub const ForestState = struct {
             while (it.next()) |kv| {
                 const tree_id = kv.key_ptr.*;
                 const tree = kv.value_ptr.*;
-                const left_raw = try marshalKeyOrEmpty(alloc, tree.left);
-                const right_raw = try marshalKeyOrEmpty(alloc, tree.right);
+                const left_raw = try tree.left.marshal(alloc);
+                const right_raw = try tree.right.marshal(alloc);
                 try tree_changes.append(alloc, createTreeChange(tree_id, tree.namespace_id, left_raw, right_raw));
 
                 for (tree.levels.items, 0..) |lm, level_idx| {
