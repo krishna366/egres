@@ -345,13 +345,14 @@ pub const ForestState = struct {
 
 pub const TableChange = buffers.TableChangeStruct;
 pub const TreeChange = buffers.TreeChangeStruct;
+pub const ManifestChange = buffers.ManifestChangeStruct;
 
 pub fn createTableChange(table_id: u64, tree_id: u64, level: u32) TableChange {
     return .{ .op = op_create, .table_id = table_id, .tree_id = tree_id, .level = level };
 }
 
-pub fn deleteTableChange(table_id: u64, tree_id: u64) TableChange {
-    return .{ .op = op_delete, .table_id = table_id, .tree_id = tree_id, .level = 0 };
+pub fn deleteTableChange(table_id: u64, tree_id: u64, level: u32) TableChange {
+    return .{ .op = op_delete, .table_id = table_id, .tree_id = tree_id, .level = level };
 }
 
 pub fn createTreeChange(tree_id: u64, namespace_id: u32, left_key: []const u8, right_key: []const u8) TreeChange {

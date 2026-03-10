@@ -52,11 +52,15 @@ pub const TableChange = schema.Table(.{
     .{ .id = 2, .name = "level", .ty = schema.U32 }, // 0 for DELETE
     .{ .id = 3, .name = "table_id", .ty = schema.U64 },
     .{ .id = 4, .name = "tree_id", .ty = schema.U64 },
+    .{ .id = 5, .name = "checksum", .ty = schema.U32 }, // CRC32 of SST file (CREATE only)
+    .{ .id = 6, .name = "size", .ty = schema.U64 }, // file size in bytes (CREATE only)
 });
 
 pub const ManifestChange = schema.Table(.{
     .{ .id = 1, .name = "tree_changes", .ty = schema.Array(TreeChange) },
     .{ .id = 2, .name = "table_changes", .ty = schema.Array(TableChange) },
+    .{ .id = 3, .name = "cmd", .ty = schema.U32 }, // 0=local, 1=flush, 2=compaction, 3=tree_split
+    .{ .id = 4, .name = "memtable_id", .ty = schema.U64 }, // for flush: which memtable was flushed
 });
 
 // zbuf tail stores table_id as u16, so use a module namespace in high bits and

@@ -195,7 +195,7 @@ test "manifest rewrite trigger" {
         // Delete tables 1..11 — this commit should trigger the rewrite.
         var deletes: std.ArrayList(manifest.TableChange) = .empty;
         defer deletes.deinit(alloc);
-        for (1..12) |id| try deletes.append(alloc, deleteTableChange(@intCast(id), tree_id));
+        for (1..12) |id| try deletes.append(alloc, deleteTableChange(@intCast(id), tree_id, 0));
         try ms.commit(deletes.items, &.{});
     }
 
@@ -330,12 +330,12 @@ test "manifest multi-tree table" {
         }, &.{});
 
         // Delete from tree 1 — table should still exist in tree 2.
-        try ms.commit(&.{deleteTableChange(100, 1)}, &.{});
+        try ms.commit(&.{deleteTableChange(100, 1, 0)}, &.{});
         try std.testing.expect(!ms.trees.get(1).?.levels.items[0].tables.contains(100));
         try std.testing.expect(ms.trees.get(2).?.levels.items[0].tables.contains(100));
 
         // Delete from tree 2 — now table should be gone from all trees.
-        try ms.commit(&.{deleteTableChange(100, 2)}, &.{});
+        try ms.commit(&.{deleteTableChange(100, 2, 0)}, &.{});
         try std.testing.expectEqual(@as(u32, 0), ms.tableCount());
     }
 }

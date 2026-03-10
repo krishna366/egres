@@ -482,10 +482,20 @@ pub const Tree = struct {
     // Compaction execution
     // -----------------------------------------------------------------------
 
-    /// doCompact compacts src_level into dest (src+1, or Lbase when src==0).
-    /// It merges src tables with any overlapping dest tables, writes new SSTs,
-    /// commits the manifest, and updates the level levels atomically.
+    /// doCompact runs the full compaction pipeline: buildCompaction (Phase A)
+    /// then applyCompaction (Phase B). For Raft integration, callers can use
+    /// buildCompaction and applyCompaction separately.
     pub fn doCompact(self: *Tree, src_level: u8, next_file_id: *std.atomic.Value(u64)) !void {
+        var changes = try self.buildCompaction(src_level, next_file_id);
+        defer changes.deinit(self.allocator);
+        try self.applyCompaction(changes.items);
+    }
+
+    /// buildCompaction is Phase A: merges src tables with overlapping dest tables,
+    /// writes new SST files, and returns the manifest TableChange list describing
+    /// the result. The caller is responsible for proposing these changes (e.g.
+    /// through Raft) and then calling applyCompaction.
+    pub fn buildCompaction(self: *Tree, src_level: u8, next_file_id: *std.atomic.Value(u64)) !std.ArrayList(manifest.TableChange) {
         const src: usize = src_level;
         const prio: vfs.Priority = if (src_level == 0) .p1 else .p2;
 
@@ -493,7 +503,7 @@ pub const Tree = struct {
         defer t.deinit();
 
         const dest: usize = if (src_level == 0) t.base_level else @as(usize, src_level) + 1;
-        if (dest >= self.opts.max_levels) return;
+        if (dest >= self.opts.max_levels) return .{};
 
         // --- collect src entries (all of L0; first entry of L≥1) ---
         const src_entries_slice = blk: {
@@ -501,7 +511,7 @@ pub const Tree = struct {
             defer self.levels[src].mu.unlockShared();
 
             const items = self.levels[src].tables.items;
-            if (items.len == 0) return;
+            if (items.len == 0) return .{};
 
             // TODO: This can be improved to consider which table to compact.
             const take = if (src_level == 0) items else items[0..1];
@@ -537,12 +547,9 @@ pub const Tree = struct {
         defer merge.deinit();
         try merge.seekRange(self.key_range.left, self.key_range.right);
 
-        // --- output table entries produced by this compaction ---
-        var output_tables: std.ArrayList(TableEntry) = .{};
-        defer output_tables.deinit(self.allocator);
-        // On error before manifest commit, decrRef to 0 → deletes the partial output files.
-        var committed = false;
-        errdefer if (!committed) for (output_tables.items) |e| e.table.decrRef();
+        // --- output file IDs produced by this compaction ---
+        var output_file_ids: std.ArrayList(u64) = .{};
+        defer output_file_ids.deinit(self.allocator);
 
         // --- merge loop ---
         const cfg = table_mod.builder.Config{
@@ -555,12 +562,10 @@ pub const Tree = struct {
         var bld = Builder.init(self.allocator, cfg);
         defer bld.deinit();
 
-        const FlushHandle = zio.JoinHandle(?*Table);
+        const FlushHandle = zio.JoinHandle(?FlushResult);
         var flush_handles: std.ArrayList(FlushHandle) = .empty;
         defer {
-            for (flush_handles.items) |*h| {
-                if (h.join()) |tp| tp.decrRef();
-            }
+            for (flush_handles.items) |*h| _ = h.join();
             flush_handles.deinit(self.allocator);
         }
 
@@ -584,11 +589,10 @@ pub const Tree = struct {
         // Flush any remaining data.
         try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
 
-        // Join all sync+open fibers and collect output tables.
+        // Join all sync fibers and collect output file IDs.
         for (flush_handles.items) |*h| {
-            const table_ptr = h.join() orelse return error.FlushFailed;
-            errdefer table_ptr.decrRef();
-            try output_tables.append(self.allocator, .{ .id = table_ptr.file_id, .table = table_ptr });
+            const result = h.join() orelse return error.FlushFailed;
+            try output_file_ids.append(self.allocator, result.file_id);
         }
         flush_handles.clearAndFree(self.allocator);
 
@@ -599,39 +603,65 @@ pub const Tree = struct {
         // --- build manifest changes ---
         var changes = try std.ArrayList(manifest.TableChange).initCapacity(
             self.allocator,
-            src_entries_slice.len + bot_entries_slice.len + output_tables.items.len,
+            src_entries_slice.len + bot_entries_slice.len + output_file_ids.items.len,
         );
-        defer changes.deinit(self.allocator);
 
-        for (src_entries_slice) |e| try changes.append(self.allocator, manifest.deleteTableChange(e.id, self.tree_id));
-        for (bot_entries_slice) |e| try changes.append(self.allocator, manifest.deleteTableChange(e.id, self.tree_id));
-        for (output_tables.items) |e| {
-            try changes.append(self.allocator, manifest.createTableChange(e.id, self.tree_id, @intCast(dest))); // usize → u32
+        for (src_entries_slice) |e| try changes.append(
+            self.allocator,
+            manifest.deleteTableChange(e.id, self.tree_id, @intCast(src)),
+        );
+        for (bot_entries_slice) |e| try changes.append(
+            self.allocator,
+            manifest.deleteTableChange(e.id, self.tree_id, @intCast(dest)),
+        );
+        for (output_file_ids.items) |fid| {
+            try changes.append(self.allocator, manifest.createTableChange(fid, self.tree_id, @intCast(dest))); // usize → u32
         }
 
+        return changes;
+    }
+
+    /// applyCompaction is Phase B: commits the manifest changes and updates the
+    /// in-memory levels by opening tables from the SST directory.
+    /// Called after Raft commit on all nodes (leader and followers).
+    pub fn applyCompaction(self: *Tree, changes: []const manifest.TableChange) !void {
+        if (changes.len == 0) return;
+
         // Commit to manifest (durable) before touching the levels.
-        try self.ms.commit(changes.items, &.{});
-        committed = true;
+        try self.ms.commit(changes, &.{});
 
-        // --- update levels ---
-        self.levels[src].deleteEntries(src_entries_slice);
-        try self.levels[dest].replaceEntries(bot_entries_slice, output_tables.items);
-
-        // Hand struct ownership to cache; release our refs (levels hold their own via replaceEntries).
-        for (output_tables.items) |e| {
-            try self.cache.own(e.id, e.table);
-            e.table.decrRef();
+        // Apply level changes: delete old entries, add new ones.
+        for (changes) |c| {
+            if (c.op == 1) { // DELETE
+                self.levels[c.level].deleteEntries(&.{.{ .id = c.table_id, .table = undefined }});
+            } else if (c.op == 0) { // CREATE
+                const path = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/{d:0>6}.sst",
+                    .{ self.opts.dir, c.table_id },
+                );
+                defer self.allocator.free(path);
+                const t = try Table.open(self.allocator, path, .p0);
+                errdefer t.decrRef();
+                try self.cache.own(c.table_id, t);
+                try self.levels[c.level].addEntry(c.table_id, t);
+                // cache.own takes struct ownership; addEntry incrRef'd.
+                // Drop the open ref so only the level holds a live ref.
+                t.decrRef();
+            }
         }
 
         try self.updateCompactCandidate();
     }
 
+    const FlushResult = struct { file_id: u64 };
+
     /// flushBuilderOutput finishes the builder, writes bytes to a new SST file,
-    /// then spawns a fiber to sync and open it. The JoinHandle is appended to handles.
+    /// then spawns a fiber to sync it. The JoinHandle is appended to handles.
     fn flushBuilderOutput(
         self: *Tree,
         bld: *Builder,
-        handles: *std.ArrayList(zio.JoinHandle(?*Table)),
+        handles: *std.ArrayList(zio.JoinHandle(?FlushResult)),
         next_file_id: *std.atomic.Value(u64),
     ) !void {
         var tb = try bld.finish();
@@ -649,21 +679,21 @@ pub const Tree = struct {
         const wh = try vfs.instance.createFile(path, .{ .mode = .direct });
         try wh.write(tb.bytes, 0, bld.cfg.priority);
 
-        // Sync + open in a fiber; data is in page cache after write.
-        try handles.append(self.allocator, try zio.spawn(syncAndOpen, .{
-            self.allocator, wh, path, bld.cfg.priority,
+        // Sync in a fiber; data is in page cache after write.
+        try handles.append(self.allocator, try zio.spawn(syncFile, .{
+            self.allocator, wh, path, id,
         }));
     }
 
-    fn syncAndOpen(
+    fn syncFile(
         allocator: std.mem.Allocator,
         wh: vfs.FileHandle,
         path: []const u8,
-        priority: vfs.Priority,
-    ) ?*Table {
-        wh.sync() catch {};
-        wh.close();
+        file_id: u64,
+    ) ?FlushResult {
         defer allocator.free(path);
-        return Table.open(allocator, path, priority) catch null;
+        wh.sync() catch return null;
+        wh.close();
+        return .{ .file_id = file_id };
     }
 };

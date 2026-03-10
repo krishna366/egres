@@ -1,5 +1,18 @@
 # TODO.md
 
+### PROJECT: Implement priority based and multiplexing TCP connections
+
+- For all internal comms, we should have 3 tcp conns per pair of servers.
+- For .p0, .p1, and .p2.
+- p0 is used for heartbeats and voting
+- p1 is for proposals
+- p2 is for background jobs like compactions
+- Also implementing framing, so we can multiplex multiple requests and responses
+  over the same connection via streams.
+- We don't need to throttle a stream -- the overall connection can just get
+  throttled if the receiver isn't able to process it. So, there's natural
+  backpressure.
+
 ### PROJECT: MANIFEST to be run via Raft
 
 - All MANIFEST changes should be run via Raft.
@@ -38,6 +51,7 @@ be aware of how to handle these values, and how to pick and convert them.
 
 ### PROJECT: MANIFEST to be namespace aware
 *Mar 3, 2026*
+DONE: Mar 6, 2026
 
 We share in-memory tables across namespaces to decrease memory pressure. But, as
 soon as we hit L0, the in-memory file is broken across namespaces, and belong to
@@ -46,6 +60,7 @@ be under the namespace. We should get this done soon, so we're namespace aware.
 
 ### PROJECT: Add guards within the LSM tree
 *Mar 3, 2026*
+DONE: Mar 9, 2026 - "Ability to split a tree"
 
 We should add guards within the LSM tree, so we can split it up into two. This
 is for the LSM corresponding to just one namespace. So, essentially, within the
