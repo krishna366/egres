@@ -95,7 +95,7 @@ pub const TableCache = struct {
         while (it.next()) |entry| {
             const table = entry.value_ptr.*;
             if (table.ref.load(.acquire) == 0) {
-                to_evict.append(self.allocator, entry.key_ptr.*);
+                to_evict.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 

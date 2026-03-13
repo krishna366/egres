@@ -1,8 +1,8 @@
 const std = @import("std");
+const zio = @import("zio");
 const raftwal_mod = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const utils = @import("utils");
-const linux = std.os.linux;
 const raft_log = std.log.scoped(.raft);
 
 pub const NodeId = raftwal_mod.NodeId;
@@ -76,18 +76,13 @@ pub const CommitStatus = enum {
     shutdown,
 };
 
-pub const CommitCallback = *const fn (
+pub const ApplyCallback = *const fn (
     ctx: *anyopaque,
     entry: ProposalEntry,
     status: CommitStatus,
 ) void;
 
 pub const Node = struct {
-    pub const DebugOutput = enum {
-        debug_print,
-        none,
-    };
-
     const TimeoutResetReason = enum {
         init,
         grant_vote,
@@ -97,13 +92,8 @@ pub const Node = struct {
         step_down,
     };
 
-    pub var debug_output_mode: DebugOutput = .none;
-
     fn dbg(comptime format: []const u8, args: anytype) void {
-        switch (debug_output_mode) {
-            .debug_print => std.debug.print("[raft] " ++ format ++ "\n", args),
-            .none => return,
-        }
+        raft_log.debug(format, args);
     }
 
     id: NodeId,
@@ -114,8 +104,9 @@ pub const Node = struct {
     log: RaftWAL,
 
     state: State,
-    commit_index: u64,
-    last_applied: std.atomic.Value(u64),
+    commit_index: std.atomic.Value(u64),
+    apply_index: std.atomic.Value(u64),
+    conf_applied_index: u64,
     leader_id: ?NodeId,
     pending_conf_change: bool,
     quorum_size: usize,
@@ -133,23 +124,21 @@ pub const Node = struct {
 
     outbox: std.ArrayList(Outbound),
     prng: std.Random.DefaultPrng,
-    proposal_wake_fd: std.posix.fd_t,
     proposal_requests: ProposalQueue,
-    pending_commit_callbacks: PendingCommitQueue,
+    apply_callbacks: zio.Channel(PendingApply) = undefined,
+    event_ch: zio.Channel(u8) = undefined,
+    commit_ch: zio.Channel(u8) = undefined,
     shutting_down: std.atomic.Value(bool),
-    commit_wait_mutex: std.Thread.Mutex,
-    commit_wait_cond: std.Thread.Condition,
 
     const ProposalQueue = utils.Queue(ProposalRequest, 4096);
-    const PendingCommitQueue = utils.Queue(PendingCommit, 4096);
     const ProposalRequest = struct {
         data: []u8,
-        cb: CommitCallback,
+        cb: ApplyCallback,
         ctx: *anyopaque,
     };
-    const PendingCommit = struct {
+    const PendingApply = struct {
         entry: ProposalEntry,
-        cb: CommitCallback,
+        cb: ApplyCallback,
         ctx: *anyopaque,
     };
 
@@ -160,19 +149,21 @@ pub const Node = struct {
         log: RaftWAL,
         config: Config,
         self_role: PeerRole,
-    ) !Node {
+    ) !*Node {
         try config.validate();
         const seed = @as(u64, @intCast(std.time.nanoTimestamp())) ^ id;
         const prng = std.Random.DefaultPrng.init(seed);
-        var node = Node{
+        const node = try allocator.create(Node);
+        node.* = .{
             .id = id,
             .peers = std.AutoHashMap(NodeId, Peer).init(allocator),
             .current_term = 0,
             .voted_for = null,
             .log = log,
             .state = .follower,
-            .commit_index = 0,
-            .last_applied = std.atomic.Value(u64).init(0),
+            .commit_index = std.atomic.Value(u64).init(0),
+            .apply_index = std.atomic.Value(u64).init(0),
+            .conf_applied_index = 0,
             .leader_id = null,
             .pending_conf_change = false,
             .quorum_size = 1,
@@ -185,13 +176,13 @@ pub const Node = struct {
             .allocator = allocator,
             .outbox = std.ArrayList(Outbound).empty,
             .prng = prng,
-            .proposal_wake_fd = try std.posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK),
             .proposal_requests = .{},
-            .pending_commit_callbacks = .{},
             .shutting_down = std.atomic.Value(bool).init(false),
-            .commit_wait_mutex = .{},
-            .commit_wait_cond = .{},
         };
+        node.apply_callbacks = try zio.Channel(PendingApply).initAlloc(allocator, 1024);
+        node.event_ch = try zio.Channel(u8).initAlloc(allocator, 1);
+        node.commit_ch = try zio.Channel(u8).initAlloc(allocator, 1);
+        errdefer allocator.destroy(node);
         for (peers) |peer| {
             try node.peers.put(peer.id, peer);
         }
@@ -221,25 +212,25 @@ pub const Node = struct {
             req.cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
         }
         self.failAllPendingCallbacks(.shutdown);
-        self.pending_commit_callbacks.close();
-        std.posix.close(self.proposal_wake_fd);
+        self.apply_callbacks.close(.immediate);
+        self.apply_callbacks.deinit();
+        self.event_ch.close(.immediate);
+        self.event_ch.deinit();
+        self.commit_ch.close(.immediate);
+        self.commit_ch.deinit();
         self.clearOutbox();
         self.votes_received.deinit();
         self.prevotes_received.deinit();
         self.peers.deinit();
         self.outbox.deinit(self.allocator);
-    }
-
-    pub fn proposalWakeFd(self: *const Node) std.posix.fd_t {
-        return self.proposal_wake_fd;
+        self.allocator.destroy(self);
     }
 
     pub fn startShutdown(self: *Node) void {
         self.shutting_down.store(true, .seq_cst);
         self.proposal_requests.close();
-        self.notifyCommitCallbacks();
-        var one: u64 = 1;
-        _ = std.posix.write(self.proposal_wake_fd, std.mem.asBytes(&one)) catch {};
+        self.event_ch.close(.graceful);
+        self.commit_ch.close(.graceful);
     }
 
     pub fn isShuttingDown(self: *const Node) bool {
@@ -298,6 +289,11 @@ pub const Node = struct {
         self.prevotes_received.clearRetainingCapacity();
         try self.prevotes_received.put(self.id, {});
 
+        // Single-node cluster: self-vote is already quorum.
+        if (self.prevotes_received.count() >= self.quorumSize()) {
+            return try self.startElection();
+        }
+
         var it = self.peers.iterator();
         while (it.next()) |kv| {
             try self.sendRequestVote(kv.key_ptr.*, true);
@@ -321,6 +317,11 @@ pub const Node = struct {
         try self.votes_received.put(self.id, {});
 
         try self.persistHardState();
+
+        // Single-node cluster: self-vote is already quorum.
+        if (self.votes_received.count() >= self.quorumSize()) {
+            return try self.becomeLeader();
+        }
 
         var it = self.peers.iterator();
         while (it.next()) |kv| {
@@ -386,7 +387,7 @@ pub const Node = struct {
             .prev_log_index = prev_index,
             .prev_log_term = prev_term,
             .entries = entry_offsets.items,
-            .leader_commit = self.commit_index,
+            .leader_commit = self.commit_index.load(.seq_cst),
         });
         _ = try ae_writer.finishWithTail();
         const bytes = try buf.toOwnedSlice(self.allocator);
@@ -590,11 +591,13 @@ pub const Node = struct {
             }
         }
 
-        if (ae.leaderCommit() > self.commit_index) {
+        if (ae.leaderCommit() > self.commit_index.load(.seq_cst)) {
             const last_index = self.log.lastIndex();
-            self.commit_index = if (ae.leaderCommit() < last_index) ae.leaderCommit() else last_index;
+            const new_ci = if (ae.leaderCommit() < last_index) ae.leaderCommit() else last_index;
+            self.commit_index.store(new_ci, .seq_cst);
         }
-        self.applyCommitted();
+        self.applyConfChanges();
+        self.notifyApplyCallbacks();
 
         try self.sendAppendEntriesReply(leader_id, .{
             .success = true,
@@ -667,7 +670,7 @@ pub const Node = struct {
     pub fn proposeWithCallback(
         self: *Node,
         data: []const u8,
-        cb: CommitCallback,
+        cb: ApplyCallback,
         ctx: *anyopaque,
     ) RaftError!void {
         if (self.isShuttingDown()) return error.QueueClosed;
@@ -678,8 +681,7 @@ pub const Node = struct {
             .cb = cb,
             .ctx = ctx,
         });
-        var one: u64 = 1;
-        _ = std.posix.write(self.proposal_wake_fd, std.mem.asBytes(&one)) catch {};
+        self.event_ch.trySend(1) catch {};
     }
 
     pub fn processProposalRequests(self: *Node, max_batch: usize) RaftError!usize {
@@ -717,49 +719,55 @@ pub const Node = struct {
                 .term = term,
                 .index = first_index + @as(u64, @intCast(i)),
             };
-            self.pending_commit_callbacks.pushOrClosed(.{
+            self.apply_callbacks.trySend(.{
                 .entry = entry,
                 .cb = req.cb,
                 .ctx = req.ctx,
-            }) catch |err| switch (err) {
-                error.QueueClosed => req.cb(req.ctx, entry, .shutdown),
+            }) catch {
+                req.cb(req.ctx, entry, .shutdown);
             };
         }
-        self.notifyCommitCallbacks();
 
         return batch.items.len;
     }
 
-    pub fn processCommitCallbacks(self: *Node, max_callbacks: usize) usize {
-        var count: usize = 0;
-        while (count < max_callbacks) : (count += 1) {
-            const head = self.pending_commit_callbacks.peek() orelse break;
-            if (head.entry.index > self.last_applied.load(.seq_cst)) break;
+    fn notifyApplyCallbacks(self: *Node) void {
+        // DO NOT BLOCK
+        self.commit_ch.trySend(1) catch {};
+    }
 
-            const ready = self.pending_commit_callbacks.tryPop() orelse break;
+    pub fn applyCommits(self: *Node) void {
+        const ci = self.commit_index.load(.seq_cst);
+        while (true) {
+            const head = self.apply_callbacks.peek() catch break;
+            if (head.entry.index > ci) break;
+
+            const ready = self.apply_callbacks.tryReceive() catch break;
+            if (ready.entry.index <= self.apply_index.load(.seq_cst)) {
+                // Already applied (e.g. after leader step-down); skip.
+                continue;
+            }
             ready.cb(ready.ctx, ready.entry, .committed);
-        }
-        return count;
-    }
-
-    fn hasReadyCommitCallback(self: *Node) bool {
-        const head = self.pending_commit_callbacks.peek() orelse return false;
-        return head.entry.index <= self.last_applied.load(.seq_cst);
-    }
-
-    fn notifyCommitCallbacks(self: *Node) void {
-        self.commit_wait_mutex.lock();
-        defer self.commit_wait_mutex.unlock();
-        self.commit_wait_cond.broadcast();
-    }
-
-    pub fn waitForCommitCallbacks(self: *Node) void {
-        self.commit_wait_mutex.lock();
-        defer self.commit_wait_mutex.unlock();
-        while (!self.isShuttingDown() and !self.hasReadyCommitCallback()) {
-            self.commit_wait_cond.wait(&self.commit_wait_mutex);
+            self.apply_index.store(ready.entry.index, .seq_cst);
         }
     }
+
+    pub fn applyLoop(self: *Node) void {
+        while (!self.isShuttingDown()) {
+            _ = self.commit_ch.receive() catch return;
+            self.applyCommits();
+        }
+    }
+
+    /// Tick loop: periodically signals event_ch to trigger raft processing.
+    pub fn tickLoop(self: *Node, tick_interval_ms: u32) void {
+        const tick_dur = zio.Duration.fromMilliseconds(tick_interval_ms);
+        while (!self.isShuttingDown()) {
+            zio.sleep(tick_dur) catch return;
+            self.event_ch.trySend(1) catch {};
+        }
+    }
+
 
     pub fn proposeConfChange(self: *Node, cc: ConfChange) RaftError!u64 {
         if (self.state != .leader) return RaftError.NotLeader;
@@ -824,7 +832,7 @@ pub const Node = struct {
         try self.log.setHardState(.{
             .current_term = self.current_term,
             .voted_for = self.voted_for orelse 0,
-            .commit_index = self.commit_index,
+            .commit_index = self.commit_index.load(.seq_cst),
         });
         try self.log.sync();
     }
@@ -939,19 +947,48 @@ pub const Node = struct {
         return self.quorum_size;
     }
 
-    pub fn advance(self: *Node) void {
-        self.advanceCommitIndex();
-        self.applyCommitted();
+    fn advanceCommitIndex(self: *Node) void {
+        if (self.state != .leader) return;
+
+        var matches = std.ArrayList(u64).empty;
+        defer matches.deinit(self.allocator);
+
+        // Leader always has its own log up to lastIndex.
+        matches.append(self.allocator, self.log.lastIndex()) catch return;
+
+        var it = self.peers.valueIterator();
+        while (it.next()) |peer| {
+            if (peer.role != .voter) continue;
+            matches.append(self.allocator, peer.match_index) catch return;
+        }
+
+        if (matches.items.len == 0) return;
+
+        std.mem.sort(u64, matches.items, {}, comptime std.sort.asc(u64));
+
+        const quorum_pos = matches.items.len - self.quorum_size;
+        const candidate = matches.items[quorum_pos];
+        if (candidate <= self.commit_index.load(.seq_cst)) return;
+
+        const term = self.log.term(candidate) catch return orelse return;
+        if (term != self.current_term) return;
+        self.commit_index.store(candidate, .seq_cst);
     }
 
-    pub fn applyCommitted(self: *Node) void {
-        var applied = self.last_applied.load(.seq_cst);
-        var advanced = false;
-        while (applied < self.commit_index) {
-            applied += 1;
-            self.last_applied.store(applied, .seq_cst);
-            advanced = true;
-            const entry = (self.log.entryRef(applied) catch continue) orelse continue;
+    // commit_index advances when leader sees a quorum match.
+    // apply_index advances when entries are applied to the state machine (via callbacks).
+    // conf_applied_index advances when conf changes are applied to raft membership.
+    pub fn advance(self: *Node) void {
+        self.advanceCommitIndex();
+        self.applyConfChanges();
+        self.notifyApplyCallbacks();
+    }
+
+    fn applyConfChanges(self: *Node) void {
+        const ci = self.commit_index.load(.seq_cst);
+        while (self.conf_applied_index < ci) {
+            self.conf_applied_index += 1;
+            const entry = (self.log.entryRef(self.conf_applied_index) catch continue) orelse continue;
             const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
             if (reader.confChange()) |cc_reader| {
                 const cc = self.decodeConfChange(cc_reader) catch continue;
@@ -959,7 +996,6 @@ pub const Node = struct {
                 self.pending_conf_change = false;
             }
         }
-        if (advanced) self.notifyCommitCallbacks();
     }
 
     fn applyConfChange(self: *Node, cc: ConfChange) void {
@@ -1072,7 +1108,8 @@ pub const Node = struct {
     }
 
     fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {
-        while (self.pending_commit_callbacks.tryPop()) |head| {
+        while (true) {
+            const head = self.apply_callbacks.tryReceive() catch break;
             head.cb(head.ctx, head.entry, status);
         }
     }
@@ -1117,33 +1154,5 @@ pub const Node = struct {
             try self.sendAppendEntries(kv.key_ptr.*);
         }
         return first_index;
-    }
-
-    fn advanceCommitIndex(self: *Node) void {
-        if (self.state != .leader) return;
-
-        var matches = std.ArrayList(u64).empty;
-        defer matches.deinit(self.allocator);
-
-        // Leader always has its own log up to lastIndex.
-        matches.append(self.allocator, self.log.lastIndex()) catch return;
-
-        var it = self.peers.valueIterator();
-        while (it.next()) |peer| {
-            if (peer.role != .voter) continue;
-            matches.append(self.allocator, peer.match_index) catch return;
-        }
-
-        if (matches.items.len == 0) return;
-
-        std.mem.sort(u64, matches.items, {}, comptime std.sort.asc(u64));
-
-        const quorum_pos = matches.items.len - self.quorum_size;
-        const candidate = matches.items[quorum_pos];
-        if (candidate <= self.commit_index) return;
-
-        const term = self.log.term(candidate) catch return orelse return;
-        if (term != self.current_term) return;
-        self.commit_index = candidate;
     }
 };

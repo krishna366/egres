@@ -63,7 +63,7 @@ pub const TestCluster = struct {
     tick_count: u64,
 
     pub const MetaNode = struct {
-        node: Node,
+        node: *Node,
         wal: TestLog,
         inbox: std.ArrayList(Inbound),
         peers: []const raft.Peer,
@@ -198,7 +198,7 @@ pub const TestCluster = struct {
 
     pub fn getNode(self: *TestCluster, id: NodeId) ?*Node {
         const entry = self.nodes.get(id) orelse return null;
-        return &entry.node;
+        return entry.node;
     }
 
     pub fn setDropFrom(self: *TestCluster, id: NodeId, drop: bool) void {

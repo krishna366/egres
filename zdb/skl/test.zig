@@ -17,43 +17,108 @@ fn fillValueForIndex(allocator: std.mem.Allocator, rand: *std.Random) ![]u8 {
     return value;
 }
 
-test "skiplist basic operations and updates" {
+test "skiplist basic put and get with timestamps" {
     var sl = try skiplist.SkipList.init(testing.allocator);
     defer sl.release();
 
-    const k1 = Key{ .primary = "1" };
-    const k2 = Key{ .primary = "2" };
-
-    try testing.expect(sl.get(k1) == null);
-    try testing.expect(!sl.contains(k1));
-    try testing.expectEqual(@as(usize, 0), sl.numNodes());
-
-    try sl.put(.{ .primary = "1" }, "100");
-    try testing.expectEqualStrings("100", sl.get(k1).?);
-    try testing.expect(sl.contains(k1));
+    // Put at ts=1, get at ts=1 should find it.
+    try sl.put(.{ .primary = "key1", .timestamp = 1 }, "val1");
     try testing.expectEqual(@as(usize, 1), sl.numNodes());
 
-    try sl.put(.{ .primary = "1" }, "200");
-    try testing.expectEqualStrings("200", sl.get(k1).?);
+    const item = sl.get(.{ .primary = "key1", .timestamp = 1 }).?;
+    try testing.expectEqualStrings("val1", item.value);
+    try testing.expectEqual(@as(u64, 1), item.key.timestamp);
 
-    try sl.put(.{ .primary = "2" }, "300");
-    try testing.expectEqualStrings("300", sl.get(k2).?);
-    try testing.expectEqual(@as(usize, 2), sl.numNodes());
+    // Get at higher ts should also find it.
+    const item2 = sl.get(.{ .primary = "key1", .timestamp = 100 }).?;
+    try testing.expectEqualStrings("val1", item2.value);
+
+    // Get at lower ts should miss.
+    try testing.expect(sl.get(.{ .primary = "key1", .timestamp = 0 }) == null);
+
+    // Different key should miss.
+    try testing.expect(sl.get(.{ .primary = "key2", .timestamp = 100 }) == null);
+}
+
+test "skiplist update same key same timestamp" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+
+    try sl.put(.{ .primary = "key1", .timestamp = 5 }, "first");
+    try sl.put(.{ .primary = "key1", .timestamp = 5 }, "second");
+
+    // Should return the updated value.
+    const item = sl.get(.{ .primary = "key1", .timestamp = 5 }).?;
+    try testing.expectEqualStrings("second", item.value);
+    try testing.expectEqual(@as(usize, 1), sl.numNodes());
+}
+
+test "skiplist multiple versions of same key" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+
+    try sl.put(.{ .primary = "key1", .timestamp = 10 }, "v10");
+    try sl.put(.{ .primary = "key1", .timestamp = 20 }, "v20");
+    try sl.put(.{ .primary = "key1", .timestamp = 30 }, "v30");
+    try testing.expectEqual(@as(usize, 3), sl.numNodes());
+
+    // Get at exact timestamps returns that version.
+    try testing.expectEqualStrings("v30", sl.get(.{ .primary = "key1", .timestamp = 30 }).?.value);
+    try testing.expectEqualStrings("v20", sl.get(.{ .primary = "key1", .timestamp = 20 }).?.value);
+    try testing.expectEqualStrings("v10", sl.get(.{ .primary = "key1", .timestamp = 10 }).?.value);
+
+    // Get at ts between versions returns the latest version <= ts.
+    try testing.expectEqualStrings("v20", sl.get(.{ .primary = "key1", .timestamp = 25 }).?.value);
+    try testing.expectEqualStrings("v10", sl.get(.{ .primary = "key1", .timestamp = 15 }).?.value);
+
+    // Get at ts > all versions returns the latest.
+    try testing.expectEqualStrings("v30", sl.get(.{ .primary = "key1", .timestamp = 100 }).?.value);
+
+    // Get at ts < all versions misses.
+    try testing.expect(sl.get(.{ .primary = "key1", .timestamp = 5 }) == null);
+}
+
+test "skiplist contains with timestamps" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+
+    try sl.put(.{ .primary = "key1", .timestamp = 10 }, "val");
+    try testing.expect(sl.contains(.{ .primary = "key1", .timestamp = 10 }));
+    try testing.expect(sl.contains(.{ .primary = "key1", .timestamp = 100 }));
+    try testing.expect(!sl.contains(.{ .primary = "key1", .timestamp = 5 }));
+    try testing.expect(!sl.contains(.{ .primary = "key2", .timestamp = 100 }));
+}
+
+test "skiplist namespace isolation" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+
+    try sl.put(.{ .namespace = 1, .primary = "key1", .timestamp = 10 }, "ns1");
+    try sl.put(.{ .namespace = 2, .primary = "key1", .timestamp = 10 }, "ns2");
+
+    const item1 = sl.get(.{ .namespace = 1, .primary = "key1", .timestamp = 10 }).?;
+    try testing.expectEqualStrings("ns1", item1.value);
+
+    const item2 = sl.get(.{ .namespace = 2, .primary = "key1", .timestamp = 10 }).?;
+    try testing.expectEqualStrings("ns2", item2.value);
+
+    // Wrong namespace misses.
+    try testing.expect(sl.get(.{ .namespace = 3, .primary = "key1", .timestamp = 10 }) == null);
 }
 
 test "skiplist iterator ordering and seek" {
     var sl = try skiplist.SkipList.init(testing.allocator);
     defer sl.release();
 
-    const data = [_]struct { key: []const u8, value: []const u8 }{
-        .{ .key = "5", .value = "50" },
-        .{ .key = "2", .value = "20" },
-        .{ .key = "8", .value = "80" },
-        .{ .key = "1", .value = "10" },
-        .{ .key = "9", .value = "90" },
-        .{ .key = "3", .value = "30" },
+    const data = [_]struct { key: []const u8, ts: u64, value: []const u8 }{
+        .{ .key = "5", .ts = 1, .value = "50" },
+        .{ .key = "2", .ts = 2, .value = "20" },
+        .{ .key = "8", .ts = 3, .value = "80" },
+        .{ .key = "1", .ts = 4, .value = "10" },
+        .{ .key = "9", .ts = 5, .value = "90" },
+        .{ .key = "3", .ts = 6, .value = "30" },
     };
-    for (data) |item| try sl.put(.{ .primary = item.key }, item.value);
+    for (data) |item| try sl.put(.{ .primary = item.key, .timestamp = item.ts }, item.value);
 
     var it = sl.iterator();
     defer it.deinit();
@@ -67,7 +132,7 @@ test "skiplist iterator ordering and seek" {
 
     var seek_it = sl.iterator();
     defer seek_it.deinit();
-    const seek_entry = seek_it.seek(.{ .primary = "4" }).?;
+    const seek_entry = seek_it.seek(.{ .primary = "4", .timestamp = 1 }).?;
     try testing.expectEqualStrings("5", seek_entry.key.primary);
     try testing.expectEqualStrings("8", seek_it.next().?.key.primary);
 }
@@ -76,19 +141,20 @@ test "skiplist refcount usage with explicit acquire/release" {
     var sl = try skiplist.SkipList.init(testing.allocator);
     defer sl.release();
 
-    try sl.put(.{ .primary = "1" }, "10");
-    try sl.put(.{ .primary = "2" }, "20");
+    try sl.put(.{ .primary = "1", .timestamp = 1 }, "10");
+    try sl.put(.{ .primary = "2", .timestamp = 2 }, "20");
 
     sl.acquire();
     sl.acquire();
 
-    const k1 = Key{ .primary = "1" };
-    try testing.expectEqualStrings("10", sl.get(k1).?);
+    const item = sl.get(.{ .primary = "1", .timestamp = 1 }).?;
+    try testing.expectEqualStrings("10", item.value);
 
     sl.release();
     sl.release();
 
-    try testing.expectEqualStrings("10", sl.get(k1).?);
+    const item2 = sl.get(.{ .primary = "1", .timestamp = 1 }).?;
+    try testing.expectEqualStrings("10", item2.value);
 }
 
 test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
@@ -111,12 +177,14 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
 
     const insert_start_ns = std.time.nanoTimestamp();
     var inserted: usize = 0;
+    var ts: u64 = 1;
     while (sl.memoryCapacity() < target_capacity) : (inserted += 1) {
         var key_buf: [32]u8 = undefined;
         const key = try writeKey(&key_buf, inserted);
         const value = try fillValueForIndex(tmp_arena.allocator(), &value_rand);
 
-        try sl.put(.{ .primary = key }, value);
+        try sl.put(.{ .primary = key, .timestamp = ts }, value);
+        ts += 1;
         try expected_values.append(testing.allocator, value);
 
         if ((inserted + 1) % 100 == 0) {

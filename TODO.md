@@ -1,5 +1,16 @@
 # TODO.md
 
+### PROJECT: Switch over diskwal to VFS and zio
+
+- We're currently doing mmap for the wal. We should switch over to VFS
+mechanism. The only problem is we need to use a cache, and we don't know how
+much cache to allocate to this. Or, could be as simple as the last 100 entries
+or something.
+
+### PROJECT: Add Context to all requests
+
+- That way, we can cancel a context and stop extra work that's going on.
+
 ### PROJECT: Implement priority based and multiplexing TCP connections
 
 - For all internal comms, we should have 3 tcp conns per pair of servers.

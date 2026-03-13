@@ -50,6 +50,7 @@ pub const ThreadSafeError = struct {
 
 // Queue blocks producers when full and consumers when empty.
 // Queue is thread safe.
+// TODO: Switch with a channel which works nicely with zio.
 pub fn Queue(comptime T: type, comptime capacity: usize) type {
     return struct {
         const Self = @This();

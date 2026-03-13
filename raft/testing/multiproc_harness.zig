@@ -122,7 +122,9 @@ fn probeLeaderId(
     node_addr: std.net.Address,
     cluster_id: u64,
 ) ?raft.NodeId {
-    var resp = raft.requestJoin(allocator, node_addr, cluster_id + 1, 9_999, "127.0.0.1:1") catch {
+    var addr_buf: [64]u8 = undefined;
+    const addr_str = std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{node_addr.getPort()}) catch return null;
+    var resp = raft.requestJoin(allocator, addr_str, cluster_id + 1, 9_999, "127.0.0.1:1") catch {
         return null;
     };
     defer resp.deinit();
@@ -227,8 +229,10 @@ pub fn main() !void {
         }
     }
     const addr = leader_addr orelse return error.NoLeader;
+    var addr_buf: [64]u8 = undefined;
+    const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{addr.getPort()});
 
-    var join_resp = try raft.requestJoin(allocator, addr, cluster_id, 4, "127.0.0.1:19044");
+    var join_resp = try raft.requestJoin(allocator, addr_str, cluster_id, 4, "127.0.0.1:19044");
     defer join_resp.deinit();
     const join_reader = try join_resp.initReader();
     if (!join_reader.accepted()) return error.JoinRejected;

@@ -26,6 +26,8 @@ pub const SkipList = struct {
     // - single writer calls `put`
     // - many readers may call `get`/iterate
     // - ownership is refcounted via `acquire`/`release`
+    id: u64,
+    allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     head: *Node,
     max_height_seen: Atomic(u8),
@@ -33,7 +35,7 @@ pub const SkipList = struct {
     ref_count: Atomic(u32),
     node_count: Atomic(usize),
 
-    pub fn init(allocator: Allocator) !Self {
+    pub fn init(allocator: Allocator) !*Self {
         var arena = std.heap.ArenaAllocator.init(allocator);
         // Preheat first chunk so we start near the old 64 MiB capacity behavior.
         const warmup = try arena.allocator().alloc(u8, max_arena_size);
@@ -45,7 +47,10 @@ pub const SkipList = struct {
         const head = try arena.allocator().create(Node);
         head.* = .{ .key = &[_]u8{}, .value = &[_]u8{}, .next = next_arr };
 
-        return Self{
+        const self = try allocator.create(Self);
+        self.* = .{
+            .id = 0,
+            .allocator = allocator,
             .arena = arena,
             .head = head,
             .max_height_seen = Atomic(u8).init(1),
@@ -53,6 +58,7 @@ pub const SkipList = struct {
             .ref_count = Atomic(u32).init(1),
             .node_count = Atomic(usize).init(0),
         };
+        return self;
     }
 
     pub fn acquire(self: *Self) void {
@@ -64,7 +70,9 @@ pub const SkipList = struct {
         const old_count = self.ref_count.fetchSub(1, .release);
         std.debug.assert(old_count > 0);
         if (old_count == 1) {
+            const allocator = self.allocator;
             self.arena.deinit();
+            allocator.destroy(self);
         }
     }
 
@@ -111,13 +119,18 @@ pub const SkipList = struct {
         };
     }
 
-    pub fn get(self: *Self, key: Key) ?[]const u8 {
-        self.acquire();
-        defer self.release();
-
+    /// Look up a key. Returns an Item whose slices point into arena memory.
+    /// Caller must ensure the skiplist stays alive (via acquire/release) while
+    /// using the returned Item, or dupe it.
+    pub fn get(self: *Self, key: Key) ?Item {
         const result = self.findNode(key, null);
-        if (result.exact) return result.node.?.value;
-        return null;
+        const node = result.node orelse return null;
+        const found = Key.init(node.key);
+        if (found.namespace != key.namespace) return null;
+        if (!found.equalPrimary(key)) return null;
+        if (found.timestamp > key.timestamp) return null;
+
+        return .{ .key = found, .value = node.value };
     }
 
     pub fn put(self: *Self, key: Key, value: []const u8) Error!void {

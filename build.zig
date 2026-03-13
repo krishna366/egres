@@ -79,13 +79,17 @@ pub fn build(b: *std.Build) void {
     const raft_mod = makeRaftModule(b, target, optimize);
 
     addZbufCli(b, target, optimize, schema_mod);
-    addRaftDaemon(b, target, optimize, raft_mod);
+
+    addZdbServer(b, target, optimize, raft_mod, regen_buffers_step);
+    addZdbClient(b, target, optimize);
     const zdb_test_step = addZdbTests(b, target, optimize, regen_buffers_step);
     const utils_test_step = addUCompressTests(b, target, optimize);
     const zbuf_test_step = addZbufTests(b, target, optimize, regen_buffers_step);
     const raft_test_steps = addRaftTests(b, target, optimize, regen_buffers_step, raft_mod);
-    const multiproc_step = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
+    // TODO: rewrite multiproc harness to use zdb-server
+    _ = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
     addBenchZio(b, target, optimize);
+    const net_test_step = addNetTests(b, target, optimize);
 
     const all_test_step = b.step("test", "Run all tests");
     all_test_step.dependOn(regen_buffers_step);
@@ -93,7 +97,9 @@ pub fn build(b: *std.Build) void {
     all_test_step.dependOn(utils_test_step);
     all_test_step.dependOn(zbuf_test_step);
     all_test_step.dependOn(raft_test_steps.all_step);
-    all_test_step.dependOn(multiproc_step);
+    // TODO: rewrite multiproc harness to use zdb-server
+    // all_test_step.dependOn(multiproc_step);
+    all_test_step.dependOn(net_test_step);
 }
 
 fn makeModule(
@@ -425,29 +431,107 @@ fn makeRaftModule(
     const raft_buffers_gen_mod = makeModule(b, target, optimize, "raft/buffers.gen.zig");
     raft_buffers_gen_mod.addImport("zbuf", zbuf_mod);
 
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
+    const mux_mod = makeModule(b, target, optimize, "net/mux.zig");
+    mux_mod.addImport("zio", zio_mod);
+
+    const transport_mod = makeModule(b, target, optimize, "net/transport.zig");
+    transport_mod.addImport("zio", zio_mod);
+    transport_mod.addImport("mux", mux_mod);
+
     const raft_mod = makeModule(b, target, optimize, "raft/raft.zig");
     raft_mod.addImport("buffers_gen", raft_buffers_gen_mod);
     raft_mod.addImport("zbuf", zbuf_mod);
     raft_mod.addImport("utils", utils_mod);
+    raft_mod.addImport("zio", zio_mod);
+    raft_mod.addImport("mux", mux_mod);
+    raft_mod.addImport("transport", transport_mod);
     return raft_mod;
 }
 
-fn addRaftDaemon(
+
+fn addZdbServer(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     raft_mod: *std.Build.Module,
+    regen_buffers_step: *std.Build.Step,
 ) void {
-    const raftd_exe = b.addExecutable(.{
-        .name = "raftd",
-        .root_module = makeModule(b, target, optimize, "raftd.zig"),
-    });
-    addVendoredCompressionSources(b, raftd_exe);
-    raftd_exe.root_module.addImport("raft", raft_mod);
-    b.installArtifact(raftd_exe);
+    // Reuse modules already created inside raft_mod to avoid duplicate-file errors.
+    const zio_mod = raft_mod.import_table.get("zio").?;
+    const zbuf_mod = raft_mod.import_table.get("zbuf").?;
+    const utils_mod = raft_mod.import_table.get("utils").?;
+    // utils needs C include paths for compress.zig (lz4/zstd headers).
+    utils_mod.addIncludePath(b.path("."));
+    utils_mod.addIncludePath(b.path("third_party/lz4/lib"));
+    utils_mod.addIncludePath(b.path("third_party/zstd/lib"));
 
-    const raftd_step = b.step("raftd", "Build raft daemon binary");
-    raftd_step.dependOn(&raftd_exe.step);
+    const runtime_mod = makeModule(b, target, optimize, "runtime.zig");
+    runtime_mod.addImport("zio", zio_mod);
+
+    const zdb_mod = makeModule(b, target, optimize, "zdb.zig");
+    zdb_mod.addImport("zbuf", zbuf_mod);
+    zdb_mod.addImport("utils", utils_mod);
+    zdb_mod.addImport("zio", zio_mod);
+
+    const zdb_srv_buffers_gen_mod = makeModule(b, target, optimize, "zdb_server/buffers.gen.zig");
+    zdb_srv_buffers_gen_mod.addImport("zbuf", zbuf_mod);
+
+    const wait_group_mod = makeModule(b, target, optimize, "u/wait_group.zig");
+    wait_group_mod.addImport("zio", zio_mod);
+
+    const zdb_server_mod = makeModule(b, target, optimize, "zdb_server/server.zig");
+    zdb_server_mod.addImport("zio", zio_mod);
+    zdb_server_mod.addImport("raft", raft_mod);
+    zdb_server_mod.addImport("zdb", zdb_mod);
+    zdb_server_mod.addImport("runtime", runtime_mod);
+    zdb_server_mod.addImport("buffers_gen", zdb_srv_buffers_gen_mod);
+    zdb_server_mod.addImport("wait_group", wait_group_mod);
+
+    const exe = b.addExecutable(.{
+        .name = "zdb-server",
+        .root_module = makeModule(b, target, optimize, "zdb_server.zig"),
+    });
+    addVendoredCompressionSources(b, exe);
+    exe.root_module.addImport("zio", zio_mod);
+    exe.root_module.addImport("raft", raft_mod);
+    exe.root_module.addImport("zdb", zdb_mod);
+    exe.root_module.addImport("runtime", runtime_mod);
+    exe.root_module.addImport("zdb_server", zdb_server_mod);
+    exe.step.dependOn(regen_buffers_step);
+    b.installArtifact(exe);
+
+    const install = b.addInstallArtifact(exe, .{});
+    const zdb_server_step = b.step("zdb-server", "Build zdb server binary");
+    zdb_server_step.dependOn(&install.step);
+}
+
+fn addZdbClient(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
+    const exe = b.addExecutable(.{
+        .name = "zdb-client",
+        .root_module = makeModule(b, target, optimize, "zdb_client.zig"),
+    });
+    exe.root_module.addImport("zio", zio_mod);
+    b.installArtifact(exe);
+
+    const install = b.addInstallArtifact(exe, .{});
+    const step = b.step("zdb-client", "Build zdb YCSB benchmark client");
+    step.dependOn(&install.step);
 }
 
 fn addRaftMultiprocHarness(
@@ -484,11 +568,17 @@ fn addRaftTests(
     regen_buffers_step: *std.Build.Step,
     raft_mod: *std.Build.Module,
 ) RaftTestSteps {
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const raft_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "raft/testing/tests.zig"),
     });
     addVendoredCompressionSources(b, raft_tests);
     raft_tests.root_module.addImport("raft", raft_mod);
+    raft_tests.root_module.addImport("zio", zio_dep.module("zio"));
     raft_tests.step.dependOn(regen_buffers_step);
 
     const run_raft_tests = b.addRunArtifact(raft_tests);
@@ -570,6 +660,43 @@ fn addBenchZio(
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench-zio", "Run zio vs std.Thread benchmarks");
     bench_step.dependOn(&run_bench.step);
+}
+
+fn addNetTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step {
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
+    const mux_mod = makeModule(b, target, optimize, "net/mux.zig");
+    mux_mod.addImport("zio", zio_mod);
+
+    const transport_mod = makeModule(b, target, optimize, "net/transport.zig");
+    transport_mod.addImport("zio", zio_mod);
+    transport_mod.addImport("mux", mux_mod);
+
+    const mux_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "net/mux_test.zig"),
+    });
+    mux_tests.root_module.addImport("zio", zio_mod);
+    mux_tests.root_module.addImport("mux", mux_mod);
+
+    const transport_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "net/transport_test.zig"),
+    });
+    transport_tests.root_module.addImport("zio", zio_mod);
+    transport_tests.root_module.addImport("mux", mux_mod);
+    transport_tests.root_module.addImport("transport", transport_mod);
+
+    const net_test_step = b.step("test-net", "Run net tests");
+    net_test_step.dependOn(&b.addRunArtifact(mux_tests).step);
+    net_test_step.dependOn(&b.addRunArtifact(transport_tests).step);
+    return net_test_step;
 }
 
 fn addVendoredCompressionSources(b: *std.Build, compile: *std.Build.Step.Compile) void {

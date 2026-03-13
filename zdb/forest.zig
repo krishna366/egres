@@ -110,22 +110,88 @@ pub const RouteTable = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Memtable
-// ---------------------------------------------------------------------------
 
-pub const Memtable = struct {
-    id: u64,
-    sl: *SkipList,
+pub const Memtables = struct {
+    allocator: std.mem.Allocator,
+    mu: std.Thread.RwLock,
+    current: *SkipList,
+    immutables: std.ArrayList(*SkipList), // oldest at index 0
 
-    pub fn init(allocator: std.mem.Allocator, id: u64) !Memtable {
-        const sl = try allocator.create(SkipList);
-        sl.* = try SkipList.init(allocator);
-        return .{ .id = id, .sl = sl };
+    pub fn init(allocator: std.mem.Allocator, current: *SkipList) Memtables {
+        return .{
+            .allocator = allocator,
+            .mu = .{},
+            .current = current,
+            .immutables = .{},
+        };
     }
 
-    pub fn deinit(self: *Memtable, allocator: std.mem.Allocator) void {
-        self.sl.release();
-        allocator.destroy(self.sl);
+    pub fn deinit(self: *Memtables) void {
+        self.current.release();
+        for (self.immutables.items) |imm| imm.release();
+        self.immutables.deinit(self.allocator);
+    }
+
+    pub fn put(self: *Memtables, key: Key, value: []const u8) !void {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        try self.current.put(key, value);
+    }
+
+    pub fn memoryUsage(self: *Memtables) usize {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.current.memoryUsage();
+    }
+
+    /// Look up a key across current and immutable memtables.
+    /// Returns a duped Item owned by the caller.
+    pub fn get(self: *Memtables, allocator: std.mem.Allocator, search_key: Key) !?Item {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        if (self.current.get(search_key)) |item| {
+            return try item.dupe(allocator);
+        }
+        // Newest first (highest index).
+        var i: usize = self.immutables.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.immutables.items[i].get(search_key)) |item| {
+                return try item.dupe(allocator);
+            }
+        }
+        return null;
+    }
+
+    /// Freeze the current memtable: move it to immutables, create a new current.
+    pub fn swapCurrentOut(self: *Memtables, new_id: u64) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        try self.immutables.append(self.allocator, self.current);
+        const new_mt = try SkipList.init(self.allocator);
+        new_mt.id = new_id;
+        self.current = new_mt;
+    }
+
+    /// Remove and return the oldest immutable memtable (for flushing).
+    /// Returns null if there are no immutables.
+    pub fn popOldest(self: *Memtables) ?*SkipList {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        if (self.immutables.items.len == 0) return null;
+        return self.immutables.orderedRemove(0);
+    }
+
+    /// Return the oldest immutable memtable without removing it.
+    pub fn peekOldest(self: *Memtables) ?*SkipList {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        if (self.immutables.items.len == 0) return null;
+        return self.immutables.items[0];
     }
 };
 
@@ -143,8 +209,7 @@ pub const Forest = struct {
     ns_routes: std.AutoHashMap(u32, *RouteTable),
     table_cache: TableCache,
     mu: std.Thread.RwLock,
-    memtable: Memtable,
-    imm_memtables: std.ArrayList(Memtable),
+    memtables: Memtables,
 
     /// Open or create a forest from a directory.
     /// Rebuilds trees from the manifest state.
@@ -157,9 +222,9 @@ pub const Forest = struct {
         const self = try allocator.create(Forest);
         errdefer allocator.destroy(self);
 
-        // Allocate memtable_id=0 initially; will be updated after scanning max IDs.
-        var mt = try Memtable.init(allocator, 0);
-        errdefer mt.deinit(allocator);
+        // Allocate memtable; id will be updated after scanning max IDs.
+        const mt = try SkipList.init(allocator);
+        errdefer mt.release();
 
         self.* = .{
             .allocator = allocator,
@@ -171,8 +236,7 @@ pub const Forest = struct {
             .ns_routes = std.AutoHashMap(u32, *RouteTable).init(allocator),
             .table_cache = TableCache.init(allocator, opts.dir),
             .mu = .{},
-            .memtable = mt,
-            .imm_memtables = .{},
+            .memtables = Memtables.init(allocator, mt),
         };
         errdefer self.trees.deinit();
         errdefer self.ns_routes.deinit();
@@ -214,16 +278,12 @@ pub const Forest = struct {
         self.next_file_id = std.atomic.Value(u64).init(max_fid + 1);
 
         // Assign the first memtable a proper file ID.
-        self.memtable.id = self.next_file_id.fetchAdd(1, .monotonic);
+        self.memtables.current.id = self.next_file_id.fetchAdd(1, .monotonic);
         return self;
     }
 
     pub fn close(self: *Forest) void {
-        self.memtable.deinit(self.allocator);
-        for (self.imm_memtables.items) |*imm| {
-            imm.deinit(self.allocator);
-        }
-        self.imm_memtables.deinit(self.allocator);
+        self.memtables.deinit();
 
         var tree_it = self.trees.iterator();
         while (tree_it.next()) |kv| {
@@ -249,26 +309,24 @@ pub const Forest = struct {
     /// should be proposed via Raft.
     pub fn put(self: *Forest, items: []const Item) !bool {
         for (items) |item| {
-            try self.memtable.sl.put(item.key, item.value);
+            try self.memtables.put(item.key, item.value);
         }
-        return self.memtable.sl.memoryUsage() >= self.opts.memtable_size;
+        return self.memtables.memoryUsage() >= self.opts.memtable_size;
     }
 
     /// Freeze the current memtable and create a new one.
     /// Called when the memtable freeze is committed via Raft.
     pub fn freezeMemtable(self: *Forest) !void {
-        try self.imm_memtables.append(self.allocator, self.memtable);
-        self.memtable = try Memtable.init(self.allocator, self.next_file_id.fetchAdd(1, .monotonic));
+        const new_id = self.next_file_id.fetchAdd(1, .monotonic);
+        try self.memtables.swapCurrentOut(new_id);
     }
 
     /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen
     /// memtable, routes each key to its tree, builds one L0 SST per tree,
     /// and returns the manifest changes. The caller proposes these through Raft.
     pub fn buildFlush(self: *Forest) !std.ArrayList(manifest.TableChange) {
-        if (self.imm_memtables.items.len == 0) return .{};
-
-        const mt = &self.imm_memtables.items[0]; // oldest first
-        var iter = mt.sl.iterator();
+        const mt = self.memtables.peekOldest() orelse return .{};
+        var iter = mt.iterator();
         defer iter.deinit();
 
         // Per-tree builders. Keys within each tree are already in sorted order
@@ -404,13 +462,10 @@ pub const Forest = struct {
             t.decrRef(); // drop open ref; level holds its own
         }
 
-        // Remove the flushed memtable from immutable list.
-        for (self.imm_memtables.items, 0..) |*imm, i| {
-            if (imm.id == memtable_id) {
-                imm.deinit(self.allocator);
-                _ = self.imm_memtables.orderedRemove(i);
-                break;
-            }
+        // Remove the oldest flushed memtable.
+        if (self.memtables.popOldest()) |imm| {
+            std.debug.assert(imm.id == memtable_id);
+            imm.release();
         }
 
         // Update compaction candidates for affected trees.
@@ -428,21 +483,10 @@ pub const Forest = struct {
 
     /// Get a value by key. Checks memtables first (current, then immutables
     /// newest-to-oldest), then routes to the correct tree.
-    pub fn get(self: *Forest, search_key: Key, priority: vfs.Priority) !?Item {
-        // Check current memtable.
-        if (self.memtable.sl.get(search_key)) |value| {
-            return .{ .key = search_key, .value = value };
-        }
-
-        // Check immutable memtables, newest first.
-        {
-            var i: usize = self.imm_memtables.items.len;
-            while (i > 0) {
-                i -= 1;
-                if (self.imm_memtables.items[i].sl.get(search_key)) |value| {
-                    return .{ .key = search_key, .value = value };
-                }
-            }
+    /// Returned Item is owned by the caller; call item.free(allocator) when done.
+    pub fn get(self: *Forest, allocator: std.mem.Allocator, search_key: Key, priority: vfs.Priority) !?Item {
+        if (try self.memtables.get(allocator, search_key)) |item| {
+            return item;
         }
 
         self.mu.lockShared();
