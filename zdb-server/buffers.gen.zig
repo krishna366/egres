@@ -30,11 +30,11 @@ pub const MessageReader = union(enum) {
 
 pub const MutationStruct = struct {
     namespace: u32 = 0,
-    key: []u8 = &.{},
-    value: []u8 = &.{},
+    key: []const u8 = &.{},
+    value: []const u8 = &.{},
     timestamp: u64 = 0,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: MutationReader) Error!MutationStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: MutationReader) Error!MutationStruct {
         var s = MutationStruct{
             .namespace = r.namespace(),
             .timestamp = r.timestamp(),
@@ -45,11 +45,51 @@ pub const MutationStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: MutationReader) Error!*MutationStruct {
+        const ptr = try alloc.create(MutationStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *MutationStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         self.key = &.{};
         alloc.free(self.value);
         self.value = &.{};
+    }
+
+    pub fn destroy(self: *MutationStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: MutationStruct, alloc: std.mem.Allocator) Error!MutationStruct {
+        var s = MutationStruct{
+            .namespace = self.namespace,
+            .timestamp = self.timestamp,
+        };
+        errdefer s.deinit(alloc);
+        s.key = try alloc.dupe(u8, self.key);
+        s.value = try alloc.dupe(u8, self.value);
+        return s;
+    }
+
+    pub fn clone(self: MutationStruct, alloc: std.mem.Allocator) Error!*MutationStruct {
+        const ptr = try alloc.create(MutationStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: MutationStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try MutationWriter.initWithBuf(alloc, out);
+        try writer.setNamespace(self.namespace);
+        try writer.setKey(self.key);
+        try writer.setValue(self.value);
+        try writer.setTimestamp(self.timestamp);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 

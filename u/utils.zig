@@ -1,6 +1,47 @@
 const std = @import("std");
+const zio = @import("zio");
 const builtin = @import("builtin");
 pub const compression = @import("compress.zig");
+
+/// WaitGroup provides Go-style Add/Done/Wait synchronization for zio coroutines.
+///
+/// Usage:
+///   var wg: WaitGroup = .{};
+///   wg.init();  // must be called at final address (no moves after this)
+///   wg.add(1);
+///   // ... pass &wg to another coroutine/callback ...
+///   try wg.wait();  // blocks until counter reaches 0
+///
+/// The callback side calls wg.done() to decrement the counter.
+/// When the counter reaches zero, all coroutines blocked in wait() are unblocked.
+///
+/// Safe to call done() from any zio runtime or coroutine.
+/// Not reusable — create a new WaitGroup for each synchronization point.
+pub const WaitGroup = struct {
+    counter: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    ch_buf: [1]u8 = undefined,
+    ch: zio.Channel(u8) = undefined,
+
+    pub fn init(self: *WaitGroup) void {
+        self.ch = zio.Channel(u8).init(&self.ch_buf);
+    }
+
+    pub fn add(self: *WaitGroup, delta: i32) void {
+        const prev = self.counter.fetchAdd(delta, .acq_rel);
+        if (prev + delta == 0) {
+            self.ch.close(.graceful);
+        }
+    }
+
+    pub fn done(self: *WaitGroup) void {
+        self.add(-1);
+    }
+
+    pub fn wait(self: *WaitGroup) !void {
+        if (self.counter.load(.acquire) == 0) return;
+        _ = self.ch.receive() catch return;
+    }
+};
 
 // testPrint helps emit debugging output from tests without affecting non-test builds.
 pub fn testPrint(comptime fmt: []const u8, args: anytype) void {
@@ -8,6 +49,18 @@ pub fn testPrint(comptime fmt: []const u8, args: anytype) void {
     // std.debug.print(fmt, args);
     _ = fmt;
     _ = args;
+}
+
+/// Rate-limited log: each call site (unique comptime instantiation) logs at most once per interval.
+pub fn logEvery(comptime interval_secs: i64, comptime fmt: []const u8, args: anytype) void {
+    const S = struct {
+        var last: i64 = 0;
+    };
+    const now = std.time.microTimestamp();
+    if (now - S.last > interval_secs * 1_000_000) {
+        std.log.debug(fmt, args);
+        S.last = now;
+    }
 }
 
 /// search finds the first index in [0, items.len) for which pred(ctx, items[i]) is true,

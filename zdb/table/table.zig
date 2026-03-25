@@ -28,7 +28,7 @@ pub const BlockLayout = struct {
 pub const Table = struct {
     allocator: std.mem.Allocator,
     handle: vfs.FileHandle,
-    index: buffers.TableIndexStruct,
+    index: *buffers.TableIndexStruct,
     codec: compress.Codec,
     binary_fuse: ?binaryfuse.BinaryFuse(u16),
     ref: std.atomic.Value(i32),
@@ -152,7 +152,7 @@ pub const Table = struct {
 
     fn deinit(self: *Table) void {
         if (self.claimPath()) |p| self.allocator.free(p);
-        self.index.deinit(self.allocator);
+        self.index.destroy(self.allocator);
         if (self.binary_fuse) |*bf| bf.deinit(self.allocator);
         self.handle.close();
     }

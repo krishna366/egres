@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const raftlog = @import("raftwal.zig");
+const zen = @import("buffers_gen");
 
 fn readInt(comptime T: type, buf: []const u8, endian: std.builtin.Endian) T {
     const n = @divExact(@typeInfo(T).int.bits, 8);
@@ -95,7 +96,7 @@ pub const Error = error{
     std.fs.Dir.OpenError || std.fs.Dir.MakeError || std.fs.File.OpenError ||
     std.fs.Dir.DeleteFileError ||
     std.fs.File.StatError || std.fs.File.SetEndPosError ||
-    std.mem.Allocator.Error || std.fmt.BufPrintError;
+    std.mem.Allocator.Error || std.fmt.BufPrintError || zen.Error;
 
 pub const err_not_found = error{NotFound};
 
@@ -207,35 +208,42 @@ pub const metaFile = struct {
         return self.data[idx .. idx + 8];
     }
 
-    pub fn hardState(self: *metaFile) Error!raftlog.HardState {
-        if (self.data.len < hard_state_offset + 24) return error.CorruptMeta;
-        return .{
-            .current_term = readInt(u64, self.u64Buf(.hard_state, 0), .little),
-            .voted_for = readInt(u64, self.u64Buf(.hard_state, 8), .little),
-            .commit_index = readInt(u64, self.u64Buf(.hard_state, 16), .little),
-        };
+    pub fn hardState(self: *metaFile) Error!*raftlog.HardState {
+        const blob = try readSlice(self.data[hard_state_offset..]);
+        if (blob.len == 0) {
+            const hs = try self.alloc.create(raftlog.HardState);
+            hs.* = .{};
+            return hs;
+        }
+        const reader = try zen.HardStateReader.parseRoot(blob);
+        return raftlog.HardState.fromReader(self.alloc, reader);
     }
 
-    pub fn storeHardState(self: *metaFile, hs: raftlog.HardState) Error!void {
-        if (self.data.len < hard_state_offset + 24) return error.CorruptMeta;
-        writeInt(u64, self.u64Buf(.hard_state, 0), hs.current_term, .little);
-        writeInt(u64, self.u64Buf(.hard_state, 8), hs.voted_for, .little);
-        writeInt(u64, self.u64Buf(.hard_state, 16), hs.commit_index, .little);
+    pub fn storeHardState(self: *metaFile, hs: *const raftlog.HardState) Error!void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+        const offset = try hs.marshalTo(self.alloc, &buf);
+        try zen.addTail(self.alloc, &buf, zen.HardStateReader, offset);
+        try writeSlice(self.data[hard_state_offset..], buf.items);
     }
 
-    pub fn snapshot(self: *metaFile) Error!raftlog.Snapshot {
-        const snap_data = try readSlice(self.data[snapshot_offset + 16 ..]);
-        return .{
-            .index = readInt(u64, self.u64Buf(.snapshot, 0), .little),
-            .term = readInt(u64, self.u64Buf(.snapshot, 8), .little),
-            .data = if (snap_data.len == 0) &[_]u8{} else try self.alloc.dupe(u8, snap_data),
-        };
+    pub fn snapshot(self: *metaFile) Error!*raftlog.Snapshot {
+        const blob = try readSlice(self.data[snapshot_offset..]);
+        if (blob.len == 0) {
+            const snap = try self.alloc.create(raftlog.Snapshot);
+            snap.* = .{};
+            return snap;
+        }
+        const reader = try zen.SnapshotReader.parseRoot(blob);
+        return raftlog.Snapshot.fromReader(self.alloc, reader);
     }
 
-    pub fn storeSnapshot(self: *metaFile, snap: raftlog.Snapshot) Error!void {
-        writeInt(u64, self.u64Buf(.snapshot, 0), snap.index, .little);
-        writeInt(u64, self.u64Buf(.snapshot, 8), snap.term, .little);
-        try writeSlice(self.data[snapshot_offset + 16 ..], snap.data);
+    pub fn storeSnapshot(self: *metaFile, snap: *const raftlog.Snapshot) Error!void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+        const offset = try snap.marshalTo(self.alloc, &buf);
+        try zen.addTail(self.alloc, &buf, zen.SnapshotReader, offset);
+        try writeSlice(self.data[snapshot_offset..], buf.items);
     }
 };
 
@@ -980,8 +988,8 @@ pub const DiskWAL = struct {
     allocator: std.mem.Allocator,
     meta: metaFile,
     wal_store: wal,
-    hard_state_cache: raftlog.HardState,
-    snapshot_cache: raftlog.Snapshot,
+    hard_state_cache: *raftlog.HardState,
+    snapshot_cache: *raftlog.Snapshot,
     scratch_entries: std.ArrayList(raftlog.StoredEntry),
 
     pub fn openPath(path: []const u8, allocator: std.mem.Allocator) Error!DiskWAL {
@@ -992,26 +1000,19 @@ pub const DiskWAL = struct {
         errdefer wf.deinit();
 
         const hs = try mf.hardState();
+        errdefer hs.destroy(allocator);
         const snap = try mf.snapshot();
-        errdefer if (snap.data.len != 0) allocator.free(@constCast(snap.data));
+        errdefer snap.destroy(allocator);
         if (snap.index > 0 and wf.firstIndex() != snap.index + 1) {
             return error.CorruptLogFile;
         }
-        const snap_data: []const u8 = if (snap.data.len == 0)
-            &[_]u8{}
-        else
-            snap.data;
 
         return .{
             .allocator = allocator,
             .meta = mf,
             .wal_store = wf,
             .hard_state_cache = hs,
-            .snapshot_cache = .{
-                .index = snap.index,
-                .term = snap.term,
-                .data = snap_data,
-            },
+            .snapshot_cache = snap,
             .scratch_entries = std.ArrayList(raftlog.StoredEntry).empty,
         };
     }
@@ -1019,9 +1020,8 @@ pub const DiskWAL = struct {
     pub fn deinit(self: *DiskWAL) void {
         self.clearScratchEntries();
         self.scratch_entries.deinit(self.allocator);
-        if (self.snapshot_cache.data.len != 0) {
-            self.allocator.free(self.snapshot_cache.data);
-        }
+        self.snapshot_cache.destroy(self.allocator);
+        self.hard_state_cache.destroy(self.allocator);
         self.wal_store.deinit();
         self.meta.deinit();
     }
@@ -1069,39 +1069,30 @@ pub const DiskWAL = struct {
         return self.scratch_entries.items;
     }
 
-    fn hardState(ctx: *anyopaque) raftlog.HardState {
+    fn hardState(ctx: *anyopaque) *const raftlog.HardState {
         const self = fromCtx(ctx);
         return self.hard_state_cache;
     }
 
     fn setHardState(ctx: *anyopaque, hs: raftlog.HardState) raftlog.RaftLogError!void {
         const self = fromCtx(ctx);
-        self.hard_state_cache = hs;
-        self.meta.storeHardState(hs) catch |err| return mapToRaftLogError(err);
+        self.meta.storeHardState(&hs) catch |err| return mapToRaftLogError(err);
+        const copy = hs.clone(self.allocator) catch return error.OutOfMemory;
+        self.hard_state_cache.destroy(self.allocator);
+        self.hard_state_cache = copy;
     }
 
-    fn snapshot(ctx: *anyopaque) raftlog.Snapshot {
+    fn snapshot(ctx: *anyopaque) *const raftlog.Snapshot {
         const self = fromCtx(ctx);
         return self.snapshot_cache;
     }
 
     fn setSnapshot(ctx: *anyopaque, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
         const self = fromCtx(ctx);
-        const snap_copy: []const u8 = if (snap.data.len == 0)
-            &[_]u8{}
-        else
-            try self.allocator.dupe(u8, snap.data);
-        errdefer if (snap_copy.len != 0) self.allocator.free(snap_copy);
-
-        self.meta.storeSnapshot(snap) catch |err| return mapToRaftLogError(err);
-        if (self.snapshot_cache.data.len != 0) {
-            self.allocator.free(self.snapshot_cache.data);
-        }
-        self.snapshot_cache = .{
-            .index = snap.index,
-            .term = snap.term,
-            .data = snap_copy,
-        };
+        self.meta.storeSnapshot(&snap) catch |err| return mapToRaftLogError(err);
+        const copy = snap.clone(self.allocator) catch return error.OutOfMemory;
+        self.snapshot_cache.destroy(self.allocator);
+        self.snapshot_cache = copy;
     }
 
     fn firstIndex(ctx: *anyopaque) u64 {
@@ -1139,6 +1130,11 @@ pub const DiskWAL = struct {
         return items[0];
     }
 
+    // TODO: We should remove this one. And then, let's switch over this entire file to use VFS
+    // and not use MMAP. Also, we should set a cache here, and store the "slots" in memory for every
+    // file. And when appending to the current file, we should NOT be writing to the slot region.
+    // Instead, when we rotate it out, only then we should write the slot region, sync, and rename
+    // the "CURRENT" wal file to a log file.
     fn entriesFromRef(
         ctx: *anyopaque,
         start_index: u64,

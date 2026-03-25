@@ -140,12 +140,28 @@ pub const Mux = struct {
     }
 
     pub fn deinit(self: *Mux) void {
-        // group.cancel would wait for all the pending coroutines to cancel first.
-        self.group.cancel();
+        log.info("Mux.deinit", .{});
+        self.closeConn();
+        self.closeChannels(); // close all channels, so we can exit the handlers.
+
+        log.info("Mux.deinit. tcp closed", .{});
+        self.group.wait() catch |err| {
+            log.err("Mux.deinit group.wait err: {}", .{err});
+        };
+        log.info("Mux.deinit. group wait done", .{});
         self.destroyStreams();
         self.streams.deinit();
-        self.tcp_stream.close();
         self.allocator.destroy(self);
+        log.info("Mux.deinit OK", .{});
+    }
+
+    pub fn closeConn(self: *Mux) void {
+        self.mu.lockUncancelable();
+        self.mu.unlock();
+
+        if (self.closed) return;
+        self.tcp_stream.close();
+        self.closed = true;
     }
 
     /// Create a new outbound stream. The first send() will include the syn flag.
@@ -154,25 +170,36 @@ pub const Mux = struct {
         return try self.createStream(sid, false);
     }
 
-    /// Run the reader loop. Blocks until the connection is closed or errors.
     pub fn run(self: *Mux) void {
-        self.readerLoop() catch {};
-        self.destroyStreams();
+        self.readerLoop() catch |err| {
+            log.err("Mux.readerLoop exited with err: {}", .{err});
+        };
     }
 
-    fn readerLoop(self: *Mux) !void {
+    pub fn readerLoop(self: *Mux) !void {
         defer std.debug.print("returning from readerLoop\n", .{});
+
+        const tcp_buf = try self.allocator.alloc(u8, 4096);
+        defer self.allocator.free(tcp_buf);
+        // Not setting any timeouts here. channel.Send below can block if we're unable to process
+        // the incoming data as fast as it is arriving. Instead, we have an OS level keepalive
+        // mechanism in place via configureSocket.
+        var buf_reader = self.tcp_stream.reader(tcp_buf);
+        const reader = &buf_reader.interface;
+        var hdr_buf: [FrameHeader.encoded_size]u8 = @splat(0);
+
         while (true) {
-            var hdr_buf: [FrameHeader.encoded_size]u8 = undefined;
-            self.tcp_stream.readAll(&hdr_buf, .none) catch |err| {
+            reader.readSliceAll(&hdr_buf) catch |err| {
                 std.debug.print("readAll for hdr_buf caught: {}\n", .{err});
                 return;
             };
 
             const header = FrameHeader.decode(&hdr_buf);
+            log.debug("got header raw={any} decoded={any}", .{ hdr_buf, header });
+
             const payload: []u8 = if (header.length > 0) blk: {
                 const buf = self.allocator.alloc(u8, header.length) catch return error.OutOfMemory;
-                self.tcp_stream.readAll(buf, .none) catch {
+                reader.readSliceAll(buf) catch {
                     self.allocator.free(buf);
                     return;
                 };
@@ -183,6 +210,7 @@ pub const Mux = struct {
                 .header = header,
                 .payload = payload,
             };
+            log.debug("got frame with payload.len {d}", .{payload.len});
 
             var stream: ?*Stream = null;
             if (header.hasSyn()) {
@@ -196,7 +224,7 @@ pub const Mux = struct {
                     continue;
                 };
 
-                self.group.spawn(dispatchStream, .{ self, stream.? }) catch {
+                self.group.spawn(handleInbound, .{ self, stream.? }) catch {
                     // do nothing
                 };
             } else {
@@ -221,7 +249,7 @@ pub const Mux = struct {
         }
     }
 
-    fn dispatchStream(self: *Mux, stream: *Stream) void {
+    fn handleInbound(self: *Mux, stream: *Stream) void {
         self.on_stream(stream);
         self.destroyStream(stream.stream_id);
     }
@@ -232,6 +260,10 @@ pub const Mux = struct {
 
         var hdr_buf: [FrameHeader.encoded_size]u8 = undefined;
         header.encode(&hdr_buf);
+        // We are not setting any timeouts here. If we have a big payload, then
+        // adding timeouts won't make sense -- particularly if the receiver is applying
+        // backpressure. Instead, configureSocket is doing OS level keep alive checking to ensure
+        // that the connection is still alive.
         self.tcp_stream.writeAll(&hdr_buf, .none) catch return error.BrokenPipe;
         if (payload.len > 0) {
             self.tcp_stream.writeAll(payload, .none) catch return error.BrokenPipe;
@@ -261,15 +293,27 @@ pub const Mux = struct {
         }
     }
 
+    fn closeChannels(self: *Mux) void {
+        self.mu.lockUncancelable();
+        defer self.mu.unlock();
+
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| {
+            s.*.channel.close(.immediate);
+        }
+    }
+
     fn destroyStreams(self: *Mux) void {
         self.mu.lockUncancelable();
         defer self.mu.unlock();
 
-        if (self.closed) return;
-        self.closed = true;
-
         var it = self.streams.valueIterator();
         while (it.next()) |s| {
+            // Drain unconsumed frames to free their payloads.
+            while (s.*.channel.tryReceive()) |f| {
+                var frame = f;
+                frame.deinit(self.allocator);
+            } else |_| {}
             self.allocator.destroy(s.*);
         }
         self.streams.clearAndFree();

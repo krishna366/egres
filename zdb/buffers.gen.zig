@@ -39,11 +39,11 @@ pub const MessageReader = union(enum) {
 };
 
 pub const BlockIndexStruct = struct {
-    key: []u8 = &.{},
+    key: []const u8 = &.{},
     offset: u32 = 0,
     len: u32 = 0,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: BlockIndexReader) Error!BlockIndexStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: BlockIndexReader) Error!BlockIndexStruct {
         var s = BlockIndexStruct{
             .offset = r.offset(),
             .len = r.len(),
@@ -53,9 +53,47 @@ pub const BlockIndexStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: BlockIndexReader) Error!*BlockIndexStruct {
+        const ptr = try alloc.create(BlockIndexStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *BlockIndexStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         self.key = &.{};
+    }
+
+    pub fn destroy(self: *BlockIndexStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: BlockIndexStruct, alloc: std.mem.Allocator) Error!BlockIndexStruct {
+        var s = BlockIndexStruct{
+            .offset = self.offset,
+            .len = self.len,
+        };
+        errdefer s.deinit(alloc);
+        s.key = try alloc.dupe(u8, self.key);
+        return s;
+    }
+
+    pub fn clone(self: BlockIndexStruct, alloc: std.mem.Allocator) Error!*BlockIndexStruct {
+        const ptr = try alloc.create(BlockIndexStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: BlockIndexStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try BlockIndexWriter.initWithBuf(alloc, out);
+        try writer.setKey(self.key);
+        try writer.setOffset(self.offset);
+        try writer.setLen(self.len);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -264,11 +302,11 @@ pub const TableIndexStruct = struct {
     compressed_size: u32 = 0,
     stale_data_size: u32 = 0,
     compression: u64 = 0,
-    last_key: []u8 = &.{},
+    last_key: []const u8 = &.{},
     blocks: []BlockIndexStruct = &.{},
     binary_fuse: ?BinaryFuseFilterStruct = null,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
         var s = TableIndexStruct{
             .is_none = r.isNone(),
             .is_lz4 = r.isLz4(),
@@ -288,13 +326,20 @@ pub const TableIndexStruct = struct {
             @memset(s.blocks, .{});
             for (0.._cnt) |_i| {
                 const _child = try r.blocksAt(@intCast(_i));
-                s.blocks[_i] = try BlockIndexStruct.fromReader(alloc, _child);
+                s.blocks[_i] = try BlockIndexStruct.fromReaderValue(alloc, _child);
             }
         }
         if (r.binaryFuse()) |_child| {
-            s.binary_fuse = try BinaryFuseFilterStruct.fromReader(alloc, _child);
+            s.binary_fuse = try BinaryFuseFilterStruct.fromReaderValue(alloc, _child);
         }
         return s;
+    }
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: TableIndexReader) Error!*TableIndexStruct {
+        const ptr = try alloc.create(TableIndexStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
     }
 
     pub fn deinit(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
@@ -305,6 +350,73 @@ pub const TableIndexStruct = struct {
         self.blocks = &.{};
         if (self.binary_fuse) |*_bf| _bf.deinit(alloc);
         self.binary_fuse = null;
+    }
+
+    pub fn destroy(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: TableIndexStruct, alloc: std.mem.Allocator) Error!TableIndexStruct {
+        var s = TableIndexStruct{
+            .is_none = self.is_none,
+            .is_lz4 = self.is_lz4,
+            .is_zstd = self.is_zstd,
+            .max_version = self.max_version,
+            .key_count = self.key_count,
+            .uncompressed_size = self.uncompressed_size,
+            .compressed_size = self.compressed_size,
+            .stale_data_size = self.stale_data_size,
+            .compression = self.compression,
+        };
+        errdefer s.deinit(alloc);
+        s.last_key = try alloc.dupe(u8, self.last_key);
+        {
+            s.blocks = try alloc.alloc(BlockIndexStruct, self.blocks.len);
+            @memset(s.blocks, .{});
+            for (self.blocks, 0..) |_child, _i| {
+                s.blocks[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        if (self.binary_fuse) |_child| {
+            s.binary_fuse = try _child.cloneValue(alloc);
+        }
+        return s;
+    }
+
+    pub fn clone(self: TableIndexStruct, alloc: std.mem.Allocator) Error!*TableIndexStruct {
+        const ptr = try alloc.create(TableIndexStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: TableIndexStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TableIndexWriter.initWithBuf(alloc, out);
+        try writer.setIsNone(self.is_none);
+        try writer.setIsLz4(self.is_lz4);
+        try writer.setIsZstd(self.is_zstd);
+        try writer.setMaxVersion(self.max_version);
+        try writer.setKeyCount(self.key_count);
+        try writer.setUncompressedSize(self.uncompressed_size);
+        try writer.setCompressedSize(self.compressed_size);
+        try writer.setStaleDataSize(self.stale_data_size);
+        try writer.compressionSet(self.compression);
+        try writer.setLastKey(self.last_key);
+        if (self.blocks.len > 0) {
+            const offsets = try alloc.alloc(u32, self.blocks.len);
+            defer alloc.free(offsets);
+            for (self.blocks, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setBlocks(offsets);
+        }
+        if (self.binary_fuse) |child| {
+            const child_off = try child.marshalTo(alloc, out);
+            try writer.setBinaryFuse(child_off);
+        }
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -776,7 +888,7 @@ pub const BinaryFuseFilterStruct = struct {
     segment_count_length: u32 = 0,
     fingerprints: []u16 = &.{},
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: BinaryFuseFilterReader) Error!BinaryFuseFilterStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: BinaryFuseFilterReader) Error!BinaryFuseFilterStruct {
         var s = BinaryFuseFilterStruct{
             .seed = r.seed(),
             .segment_length = r.segmentLength(),
@@ -789,9 +901,53 @@ pub const BinaryFuseFilterStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: BinaryFuseFilterReader) Error!*BinaryFuseFilterStruct {
+        const ptr = try alloc.create(BinaryFuseFilterStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *BinaryFuseFilterStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.fingerprints);
         self.fingerprints = &.{};
+    }
+
+    pub fn destroy(self: *BinaryFuseFilterStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: BinaryFuseFilterStruct, alloc: std.mem.Allocator) Error!BinaryFuseFilterStruct {
+        var s = BinaryFuseFilterStruct{
+            .seed = self.seed,
+            .segment_length = self.segment_length,
+            .segment_length_mask = self.segment_length_mask,
+            .segment_count = self.segment_count,
+            .segment_count_length = self.segment_count_length,
+        };
+        errdefer s.deinit(alloc);
+        s.fingerprints = try alloc.dupe(u16, self.fingerprints);
+        return s;
+    }
+
+    pub fn clone(self: BinaryFuseFilterStruct, alloc: std.mem.Allocator) Error!*BinaryFuseFilterStruct {
+        const ptr = try alloc.create(BinaryFuseFilterStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: BinaryFuseFilterStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try BinaryFuseFilterWriter.initWithBuf(alloc, out);
+        try writer.setSeed(self.seed);
+        try writer.setSegmentLength(self.segment_length);
+        try writer.setSegmentLengthMask(self.segment_length_mask);
+        try writer.setSegmentCount(self.segment_count);
+        try writer.setSegmentCountLength(self.segment_count_length);
+        if (self.fingerprints.len > 0) try writer.setFingerprints(self.fingerprints);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -1063,10 +1219,10 @@ pub const TreeChangeStruct = struct {
     op: u32 = 0,
     namespace_id: u32 = 0,
     tree_id: u64 = 0,
-    left_key: []u8 = &.{},
-    right_key: []u8 = &.{},
+    left_key: []const u8 = &.{},
+    right_key: []const u8 = &.{},
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: TreeChangeReader) Error!TreeChangeStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: TreeChangeReader) Error!TreeChangeStruct {
         var s = TreeChangeStruct{
             .op = r.op(),
             .namespace_id = r.namespaceId(),
@@ -1078,11 +1234,53 @@ pub const TreeChangeStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: TreeChangeReader) Error!*TreeChangeStruct {
+        const ptr = try alloc.create(TreeChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.left_key);
         self.left_key = &.{};
         alloc.free(self.right_key);
         self.right_key = &.{};
+    }
+
+    pub fn destroy(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: TreeChangeStruct, alloc: std.mem.Allocator) Error!TreeChangeStruct {
+        var s = TreeChangeStruct{
+            .op = self.op,
+            .namespace_id = self.namespace_id,
+            .tree_id = self.tree_id,
+        };
+        errdefer s.deinit(alloc);
+        s.left_key = try alloc.dupe(u8, self.left_key);
+        s.right_key = try alloc.dupe(u8, self.right_key);
+        return s;
+    }
+
+    pub fn clone(self: TreeChangeStruct, alloc: std.mem.Allocator) Error!*TreeChangeStruct {
+        const ptr = try alloc.create(TreeChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: TreeChangeStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TreeChangeWriter.initWithBuf(alloc, out);
+        try writer.setOp(self.op);
+        try writer.setNamespaceId(self.namespace_id);
+        try writer.setTreeId(self.tree_id);
+        try writer.setLeftKey(self.left_key);
+        try writer.setRightKey(self.right_key);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -1336,7 +1534,7 @@ pub const TableChangeStruct = struct {
     checksum: u32 = 0,
     size: u64 = 0,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: TableChangeReader) Error!TableChangeStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: TableChangeReader) Error!TableChangeStruct {
         var s = TableChangeStruct{
             .op = r.op(),
             .level = r.level(),
@@ -1349,9 +1547,53 @@ pub const TableChangeStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: TableChangeReader) Error!*TableChangeStruct {
+        const ptr = try alloc.create(TableChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *TableChangeStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
+    }
+
+    pub fn destroy(self: *TableChangeStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: TableChangeStruct, alloc: std.mem.Allocator) Error!TableChangeStruct {
+        var s = TableChangeStruct{
+            .op = self.op,
+            .level = self.level,
+            .table_id = self.table_id,
+            .tree_id = self.tree_id,
+            .checksum = self.checksum,
+            .size = self.size,
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn clone(self: TableChangeStruct, alloc: std.mem.Allocator) Error!*TableChangeStruct {
+        const ptr = try alloc.create(TableChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: TableChangeStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TableChangeWriter.initWithBuf(alloc, out);
+        try writer.setOp(self.op);
+        try writer.setLevel(self.level);
+        try writer.setTableId(self.table_id);
+        try writer.setTreeId(self.tree_id);
+        try writer.setChecksum(self.checksum);
+        try writer.setSize(self.size);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -1578,7 +1820,7 @@ pub const ManifestChangeStruct = struct {
     cmd: u32 = 0,
     memtable_id: u64 = 0,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: ManifestChangeReader) Error!ManifestChangeStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: ManifestChangeReader) Error!ManifestChangeStruct {
         var s = ManifestChangeStruct{
             .cmd = r.cmd(),
             .memtable_id = r.memtableId(),
@@ -1590,7 +1832,7 @@ pub const ManifestChangeStruct = struct {
             @memset(s.tree_changes, .{});
             for (0.._cnt) |_i| {
                 const _child = try r.treeChangesAt(@intCast(_i));
-                s.tree_changes[_i] = try TreeChangeStruct.fromReader(alloc, _child);
+                s.tree_changes[_i] = try TreeChangeStruct.fromReaderValue(alloc, _child);
             }
         }
         {
@@ -1599,10 +1841,17 @@ pub const ManifestChangeStruct = struct {
             @memset(s.table_changes, .{});
             for (0.._cnt) |_i| {
                 const _child = try r.tableChangesAt(@intCast(_i));
-                s.table_changes[_i] = try TableChangeStruct.fromReader(alloc, _child);
+                s.table_changes[_i] = try TableChangeStruct.fromReaderValue(alloc, _child);
             }
         }
         return s;
+    }
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: ManifestChangeReader) Error!*ManifestChangeStruct {
+        const ptr = try alloc.create(ManifestChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
     }
 
     pub fn deinit(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
@@ -1612,6 +1861,65 @@ pub const ManifestChangeStruct = struct {
         for (self.table_changes) |*_b| _b.deinit(alloc);
         alloc.free(self.table_changes);
         self.table_changes = &.{};
+    }
+
+    pub fn destroy(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: ManifestChangeStruct, alloc: std.mem.Allocator) Error!ManifestChangeStruct {
+        var s = ManifestChangeStruct{
+            .cmd = self.cmd,
+            .memtable_id = self.memtable_id,
+        };
+        errdefer s.deinit(alloc);
+        {
+            s.tree_changes = try alloc.alloc(TreeChangeStruct, self.tree_changes.len);
+            @memset(s.tree_changes, .{});
+            for (self.tree_changes, 0..) |_child, _i| {
+                s.tree_changes[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        {
+            s.table_changes = try alloc.alloc(TableChangeStruct, self.table_changes.len);
+            @memset(s.table_changes, .{});
+            for (self.table_changes, 0..) |_child, _i| {
+                s.table_changes[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        return s;
+    }
+
+    pub fn clone(self: ManifestChangeStruct, alloc: std.mem.Allocator) Error!*ManifestChangeStruct {
+        const ptr = try alloc.create(ManifestChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: ManifestChangeStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try ManifestChangeWriter.initWithBuf(alloc, out);
+        if (self.tree_changes.len > 0) {
+            const offsets = try alloc.alloc(u32, self.tree_changes.len);
+            defer alloc.free(offsets);
+            for (self.tree_changes, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setTreeChanges(offsets);
+        }
+        if (self.table_changes.len > 0) {
+            const offsets = try alloc.alloc(u32, self.table_changes.len);
+            defer alloc.free(offsets);
+            for (self.table_changes, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setTableChanges(offsets);
+        }
+        try writer.setCmd(self.cmd);
+        try writer.setMemtableId(self.memtable_id);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 

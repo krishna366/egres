@@ -41,10 +41,10 @@ pub const MessageReader = union(enum) {
 pub const CellStruct = struct {
     cell_hot: bool = false,
     tag: u32 = 0,
-    data: []u8 = &.{},
+    data: []const u8 = &.{},
     cell_flags: u64 = 0,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: CellReader) Error!CellStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: CellReader) Error!CellStruct {
         var s = CellStruct{
             .cell_hot = r.cellHot(),
             .tag = r.tag(),
@@ -55,9 +55,49 @@ pub const CellStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: CellReader) Error!*CellStruct {
+        const ptr = try alloc.create(CellStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *CellStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.data = &.{};
+    }
+
+    pub fn destroy(self: *CellStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: CellStruct, alloc: std.mem.Allocator) Error!CellStruct {
+        var s = CellStruct{
+            .cell_hot = self.cell_hot,
+            .tag = self.tag,
+            .cell_flags = self.cell_flags,
+        };
+        errdefer s.deinit(alloc);
+        s.data = try alloc.dupe(u8, self.data);
+        return s;
+    }
+
+    pub fn clone(self: CellStruct, alloc: std.mem.Allocator) Error!*CellStruct {
+        const ptr = try alloc.create(CellStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: CellStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try CellWriter.initWithBuf(alloc, out);
+        try writer.setCellHot(self.cell_hot);
+        try writer.setTag(self.tag);
+        try writer.setData(self.data);
+        try writer.cellFlagsSet(self.cell_flags);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -321,7 +361,7 @@ pub const RowStruct = struct {
     is_draining: bool = false,
     is_bootstrapping: bool = false,
     is_retiring: bool = false,
-    name: []u8 = &.{},
+    name: []const u8 = &.{},
     value: u64 = 0,
     cells: []CellStruct = &.{},
     row_cell: ?CellStruct = null,
@@ -330,7 +370,7 @@ pub const RowStruct = struct {
     u32_values: []u32 = &.{},
     u64_values: []u64 = &.{},
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: RowReader) Error!RowStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: RowReader) Error!RowStruct {
         var s = RowStruct{
             .is_active = r.isActive(),
             .is_draining = r.isDraining(),
@@ -350,13 +390,20 @@ pub const RowStruct = struct {
             @memset(s.cells, .{});
             for (0.._cnt) |_i| {
                 const _child = try r.cellsAt(@intCast(_i));
-                s.cells[_i] = try CellStruct.fromReader(alloc, _child);
+                s.cells[_i] = try CellStruct.fromReaderValue(alloc, _child);
             }
         }
         if (r.rowCell()) |_child| {
-            s.row_cell = try CellStruct.fromReader(alloc, _child);
+            s.row_cell = try CellStruct.fromReaderValue(alloc, _child);
         }
         return s;
+    }
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: RowReader) Error!*RowStruct {
+        const ptr = try alloc.create(RowStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
     }
 
     pub fn deinit(self: *RowStruct, alloc: std.mem.Allocator) void {
@@ -371,6 +418,73 @@ pub const RowStruct = struct {
         self.u32_values = &.{};
         alloc.free(self.u64_values);
         self.u64_values = &.{};
+    }
+
+    pub fn destroy(self: *RowStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: RowStruct, alloc: std.mem.Allocator) Error!RowStruct {
+        var s = RowStruct{
+            .is_active = self.is_active,
+            .is_draining = self.is_draining,
+            .is_bootstrapping = self.is_bootstrapping,
+            .is_retiring = self.is_retiring,
+            .value = self.value,
+            .status = self.status,
+            .lifecycle = self.lifecycle,
+        };
+        errdefer s.deinit(alloc);
+        s.name = try alloc.dupe(u8, self.name);
+        s.u32_values = try alloc.dupe(u32, self.u32_values);
+        s.u64_values = try alloc.dupe(u64, self.u64_values);
+        {
+            s.cells = try alloc.alloc(CellStruct, self.cells.len);
+            @memset(s.cells, .{});
+            for (self.cells, 0..) |_child, _i| {
+                s.cells[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        if (self.row_cell) |_child| {
+            s.row_cell = try _child.cloneValue(alloc);
+        }
+        return s;
+    }
+
+    pub fn clone(self: RowStruct, alloc: std.mem.Allocator) Error!*RowStruct {
+        const ptr = try alloc.create(RowStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: RowStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try RowWriter.initWithBuf(alloc, out);
+        try writer.setIsActive(self.is_active);
+        try writer.setIsDraining(self.is_draining);
+        try writer.setIsBootstrapping(self.is_bootstrapping);
+        try writer.setIsRetiring(self.is_retiring);
+        try writer.setName(self.name);
+        try writer.setValue(self.value);
+        if (self.cells.len > 0) {
+            const offsets = try alloc.alloc(u32, self.cells.len);
+            defer alloc.free(offsets);
+            for (self.cells, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setCells(offsets);
+        }
+        if (self.row_cell) |child| {
+            const child_off = try child.marshalTo(alloc, out);
+            try writer.setRowCell(child_off);
+        }
+        try writer.statusSet(self.status);
+        try writer.lifecycleSet(self.lifecycle);
+        if (self.u32_values.len > 0) try writer.setU32Values(self.u32_values);
+        if (self.u64_values.len > 0) try writer.setU64Values(self.u64_values);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -974,11 +1088,11 @@ pub const RowWriter = struct {
 
 pub const TableStruct = struct {
     rows: []RowStruct = &.{},
-    payload: []u8 = &.{},
+    payload: []const u8 = &.{},
     count: u32 = 0,
     table_row: ?RowStruct = null,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: TableReader) Error!TableStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: TableReader) Error!TableStruct {
         var s = TableStruct{
             .count = r.count(),
         };
@@ -990,13 +1104,20 @@ pub const TableStruct = struct {
             @memset(s.rows, .{});
             for (0.._cnt) |_i| {
                 const _child = try r.rowsAt(@intCast(_i));
-                s.rows[_i] = try RowStruct.fromReader(alloc, _child);
+                s.rows[_i] = try RowStruct.fromReaderValue(alloc, _child);
             }
         }
         if (r.tableRow()) |_child| {
-            s.table_row = try RowStruct.fromReader(alloc, _child);
+            s.table_row = try RowStruct.fromReaderValue(alloc, _child);
         }
         return s;
+    }
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: TableReader) Error!*TableStruct {
+        const ptr = try alloc.create(TableStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
     }
 
     pub fn deinit(self: *TableStruct, alloc: std.mem.Allocator) void {
@@ -1007,6 +1128,57 @@ pub const TableStruct = struct {
         self.payload = &.{};
         if (self.table_row) |*_bf| _bf.deinit(alloc);
         self.table_row = null;
+    }
+
+    pub fn destroy(self: *TableStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: TableStruct, alloc: std.mem.Allocator) Error!TableStruct {
+        var s = TableStruct{
+            .count = self.count,
+        };
+        errdefer s.deinit(alloc);
+        s.payload = try alloc.dupe(u8, self.payload);
+        {
+            s.rows = try alloc.alloc(RowStruct, self.rows.len);
+            @memset(s.rows, .{});
+            for (self.rows, 0..) |_child, _i| {
+                s.rows[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        if (self.table_row) |_child| {
+            s.table_row = try _child.cloneValue(alloc);
+        }
+        return s;
+    }
+
+    pub fn clone(self: TableStruct, alloc: std.mem.Allocator) Error!*TableStruct {
+        const ptr = try alloc.create(TableStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: TableStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TableWriter.initWithBuf(alloc, out);
+        if (self.rows.len > 0) {
+            const offsets = try alloc.alloc(u32, self.rows.len);
+            defer alloc.free(offsets);
+            for (self.rows, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setRows(offsets);
+        }
+        try writer.setPayload(self.payload);
+        try writer.setCount(self.count);
+        if (self.table_row) |child| {
+            const child_off = try child.marshalTo(alloc, out);
+            try writer.setTableRow(child_off);
+        }
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -1295,7 +1467,7 @@ pub const TableWriter = struct {
 pub const U32ArrayOnlyStruct = struct {
     values: []u32 = &.{},
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!U32ArrayOnlyStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!U32ArrayOnlyStruct {
         var s = U32ArrayOnlyStruct{
         };
         errdefer s.deinit(alloc);
@@ -1303,9 +1475,43 @@ pub const U32ArrayOnlyStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!*U32ArrayOnlyStruct {
+        const ptr = try alloc.create(U32ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *U32ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
         self.values = &.{};
+    }
+
+    pub fn destroy(self: *U32ArrayOnlyStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: U32ArrayOnlyStruct, alloc: std.mem.Allocator) Error!U32ArrayOnlyStruct {
+        var s = U32ArrayOnlyStruct{
+        };
+        errdefer s.deinit(alloc);
+        s.values = try alloc.dupe(u32, self.values);
+        return s;
+    }
+
+    pub fn clone(self: U32ArrayOnlyStruct, alloc: std.mem.Allocator) Error!*U32ArrayOnlyStruct {
+        const ptr = try alloc.create(U32ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: U32ArrayOnlyStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try U32ArrayOnlyWriter.initWithBuf(alloc, out);
+        if (self.values.len > 0) try writer.setValues(self.values);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -1506,7 +1712,7 @@ pub const U32ArrayOnlyWriter = struct {
 pub const U64ArrayOnlyStruct = struct {
     values: []u64 = &.{},
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!U64ArrayOnlyStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!U64ArrayOnlyStruct {
         var s = U64ArrayOnlyStruct{
         };
         errdefer s.deinit(alloc);
@@ -1514,9 +1720,43 @@ pub const U64ArrayOnlyStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!*U64ArrayOnlyStruct {
+        const ptr = try alloc.create(U64ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *U64ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
         self.values = &.{};
+    }
+
+    pub fn destroy(self: *U64ArrayOnlyStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: U64ArrayOnlyStruct, alloc: std.mem.Allocator) Error!U64ArrayOnlyStruct {
+        var s = U64ArrayOnlyStruct{
+        };
+        errdefer s.deinit(alloc);
+        s.values = try alloc.dupe(u64, self.values);
+        return s;
+    }
+
+    pub fn clone(self: U64ArrayOnlyStruct, alloc: std.mem.Allocator) Error!*U64ArrayOnlyStruct {
+        const ptr = try alloc.create(U64ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: U64ArrayOnlyStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try U64ArrayOnlyWriter.initWithBuf(alloc, out);
+        if (self.values.len > 0) try writer.setValues(self.values);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -1717,7 +1957,7 @@ pub const U64ArrayOnlyWriter = struct {
 pub const U16ArrayOnlyStruct = struct {
     values: []u16 = &.{},
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!U16ArrayOnlyStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!U16ArrayOnlyStruct {
         var s = U16ArrayOnlyStruct{
         };
         errdefer s.deinit(alloc);
@@ -1725,9 +1965,43 @@ pub const U16ArrayOnlyStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!*U16ArrayOnlyStruct {
+        const ptr = try alloc.create(U16ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *U16ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
         self.values = &.{};
+    }
+
+    pub fn destroy(self: *U16ArrayOnlyStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: U16ArrayOnlyStruct, alloc: std.mem.Allocator) Error!U16ArrayOnlyStruct {
+        var s = U16ArrayOnlyStruct{
+        };
+        errdefer s.deinit(alloc);
+        s.values = try alloc.dupe(u16, self.values);
+        return s;
+    }
+
+    pub fn clone(self: U16ArrayOnlyStruct, alloc: std.mem.Allocator) Error!*U16ArrayOnlyStruct {
+        const ptr = try alloc.create(U16ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: U16ArrayOnlyStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try U16ArrayOnlyWriter.initWithBuf(alloc, out);
+        if (self.values.len > 0) try writer.setValues(self.values);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 

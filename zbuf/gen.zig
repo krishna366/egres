@@ -745,7 +745,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
             .u64 => try w.print("    {s}: u64 = 0,\n", .{info.name}),
             .b64 => try w.print("    {s}: u64 = 0,\n", .{info.name}),
             .bool => try w.print("    {s}: bool = false,\n", .{info.name}),
-            .bytes => try w.print("    {s}: []u8 = &.{{}},\n", .{info.name}),
+            .bytes => try w.print("    {s}: []const u8 = &.{{}},\n", .{info.name}),
             .array => {
                 const child = comptime schema.childOfArray(info.ty);
                 const child_kind = comptime schema.kindOf(child);
@@ -767,8 +767,8 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         }
     }
 
-    // fromReader: decode everything from reader into owned struct.
-    try w.print("\n    pub fn fromReader(alloc: std.mem.Allocator, r: {s}Reader) Error!{s}Struct {{\n", .{ table_name, table_name });
+    // fromReaderValue: decode reader into owned struct by value (internal, used by fromReader and parent structs).
+    try w.print("\n    fn fromReaderValue(alloc: std.mem.Allocator, r: {s}Reader) Error!{s}Struct {{\n", .{ table_name, table_name });
 
     // Step 1: inline-init scalars and bools (no allocation).
     try w.print("        var s = {s}Struct{{\n", .{table_name});
@@ -830,7 +830,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         }
     }
 
-    // Step 5: table array fields — alloc slice, zero-init, then fromReader each child.
+    // Step 5: table array fields — alloc slice, zero-init, then fromReaderValue each child.
     inline for (infos) |info| {
         const name_camel = try schema.camelName(alloc, info.name);
         defer alloc.free(name_camel);
@@ -846,7 +846,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                     try w.print("            @memset(s.{s}, .{{}});\n", .{info.name});
                     try w.writeAll("            for (0.._cnt) |_i| {\n");
                     try w.print("                const _child = try r.{s}At(@intCast(_i));\n", .{name_camel});
-                    try w.print("                s.{s}[_i] = try {s}Struct.fromReader(alloc, _child);\n", .{ info.name, child_name });
+                    try w.print("                s.{s}[_i] = try {s}Struct.fromReaderValue(alloc, _child);\n", .{ info.name, child_name });
                     try w.writeAll("            }\n");
                     try w.writeAll("        }\n");
                 }
@@ -863,7 +863,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
             .table => {
                 const child_name = tableNameForType(info.ty);
                 try w.print("        if (r.{s}()) |_child| {{\n", .{name_camel});
-                try w.print("            s.{s} = try {s}Struct.fromReader(alloc, _child);\n", .{ info.name, child_name });
+                try w.print("            s.{s} = try {s}Struct.fromReaderValue(alloc, _child);\n", .{ info.name, child_name });
                 try w.writeAll("        }\n");
             },
             else => {},
@@ -871,6 +871,14 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
     }
 
     try w.writeAll("        return s;\n");
+    try w.writeAll("    }\n");
+
+    // fromReader: heap-allocate and decode reader into owned struct, returning a pointer.
+    try w.print("\n    pub fn fromReader(alloc: std.mem.Allocator, r: {s}Reader) Error!*{s}Struct {{\n", .{ table_name, table_name });
+    try w.print("        const ptr = try alloc.create({s}Struct);\n", .{table_name});
+    try w.writeAll("        errdefer alloc.destroy(ptr);\n");
+    try w.writeAll("        ptr.* = try fromReaderValue(alloc, r);\n");
+    try w.writeAll("        return ptr;\n");
     try w.writeAll("    }\n\n");
 
     // deinit: free all allocated fields.
@@ -918,6 +926,156 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         }
     }
     try w.writeAll("    }\n");
+
+    // destroy: free all owned fields and then free the struct itself (for heap-allocated structs from clone).
+    try w.print("\n    pub fn destroy(self: *{s}Struct, alloc: std.mem.Allocator) void {{\n", .{table_name});
+    try w.writeAll("        self.deinit(alloc);\n");
+    try w.writeAll("        alloc.destroy(self);\n");
+    try w.writeAll("    }\n");
+
+    // cloneValue: deep-copy the struct by value (internal, used by clone and parent structs).
+    try w.print("\n    fn cloneValue(self: {s}Struct, alloc: std.mem.Allocator) Error!{s}Struct {{\n", .{ table_name, table_name });
+
+    // Step 1: inline-init scalars and bools (no allocation).
+    try w.print("        var s = {s}Struct{{\n", .{table_name});
+    inline for (infos) |info| {
+        switch (comptime schema.kindOf(info.ty)) {
+            .u16, .u32, .u64, .b64, .bool => {
+                try w.print("            .{s} = self.{s},\n", .{ info.name, info.name });
+            },
+            else => {},
+        }
+    }
+    try w.writeAll("        };\n");
+
+    // Step 2: errdefer before any allocation so partial failures are safe.
+    try w.writeAll("        errdefer s.deinit(alloc);\n");
+
+    // Step 3: bytes fields — dupe the slice.
+    inline for (infos) |info| {
+        switch (comptime schema.kindOf(info.ty)) {
+            .bytes => {
+                try w.print("        s.{s} = try alloc.dupe(u8, self.{s});\n", .{ info.name, info.name });
+            },
+            else => {},
+        }
+    }
+
+    // Step 4: scalar/b64 array fields — dupe the slice.
+    inline for (infos) |info| {
+        switch (comptime schema.kindOf(info.ty)) {
+            .array => {
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                switch (child_kind) {
+                    .u16 => {
+                        try w.print("        s.{s} = try alloc.dupe(u16, self.{s});\n", .{ info.name, info.name });
+                    },
+                    .u32 => {
+                        try w.print("        s.{s} = try alloc.dupe(u32, self.{s});\n", .{ info.name, info.name });
+                    },
+                    .u64, .b64 => {
+                        try w.print("        s.{s} = try alloc.dupe(u64, self.{s});\n", .{ info.name, info.name });
+                    },
+                    .table => {}, // handled in step 5
+                    else => @compileError("unsupported array child kind in struct clone"),
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Step 5: table array fields — alloc slice, then recursively clone each child by value.
+    inline for (infos) |info| {
+        switch (comptime schema.kindOf(info.ty)) {
+            .array => {
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                if (child_kind == .table) {
+                    const child_name = tableNameForType(child);
+                    try w.writeAll("        {\n");
+                    try w.print("            s.{s} = try alloc.alloc({s}Struct, self.{s}.len);\n", .{ info.name, child_name, info.name });
+                    try w.print("            @memset(s.{s}, .{{}});\n", .{info.name});
+                    try w.print("            for (self.{s}, 0..) |_child, _i| {{\n", .{info.name});
+                    try w.print("                s.{s}[_i] = try _child.cloneValue(alloc);\n", .{info.name});
+                    try w.writeAll("            }\n");
+                    try w.writeAll("        }\n");
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Step 6: optional nested table fields.
+    inline for (infos) |info| {
+        switch (comptime schema.kindOf(info.ty)) {
+            .table => {
+                try w.print("        if (self.{s}) |_child| {{\n", .{info.name});
+                try w.print("            s.{s} = try _child.cloneValue(alloc);\n", .{info.name});
+                try w.writeAll("        }\n");
+            },
+            else => {},
+        }
+    }
+
+    try w.writeAll("        return s;\n");
+    try w.writeAll("    }\n");
+
+    // clone: heap-allocate a deep copy of the struct, returning a pointer.
+    try w.print("\n    pub fn clone(self: {s}Struct, alloc: std.mem.Allocator) Error!*{s}Struct {{\n", .{ table_name, table_name });
+    try w.print("        const ptr = try alloc.create({s}Struct);\n", .{table_name});
+    try w.writeAll("        errdefer alloc.destroy(ptr);\n");
+    try w.writeAll("        ptr.* = try self.cloneValue(alloc);\n");
+    try w.writeAll("        return ptr;\n");
+    try w.writeAll("    }\n");
+
+    // marshalTo: serialize struct fields into a shared output buffer, return offset.
+    try w.print("\n    pub fn marshalTo(self: {s}Struct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {{\n", .{table_name});
+    try w.print("        var writer = try {s}Writer.initWithBuf(alloc, out);\n", .{table_name});
+    inline for (infos) |info| {
+        const name_camel = try schema.camelNameCapitalized(alloc, info.name);
+        defer alloc.free(name_camel);
+        const name_lower = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_lower);
+        switch (comptime schema.kindOf(info.ty)) {
+            .u16, .u32, .u64, .bytes, .bool => {
+                try w.print("        try writer.set{s}(self.{s});\n", .{ name_camel, info.name });
+            },
+            .b64 => {
+                try w.print("        try writer.{s}Set(self.{s});\n", .{ name_lower, info.name });
+            },
+            .table => {
+                try w.print("        if (self.{s}) |child| {{\n", .{info.name});
+                try w.writeAll("            const child_off = try child.marshalTo(alloc, out);\n");
+                try w.print("            try writer.set{s}(child_off);\n", .{name_camel});
+                try w.writeAll("        }\n");
+            },
+            .array => {
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                switch (child_kind) {
+                    .table => {
+                        try w.print("        if (self.{s}.len > 0) {{\n", .{info.name});
+                        try w.print("            const offsets = try alloc.alloc(u32, self.{s}.len);\n", .{info.name});
+                        try w.writeAll("            defer alloc.free(offsets);\n");
+                        try w.print("            for (self.{s}, 0..) |child, ci| {{\n", .{info.name});
+                        try w.writeAll("                offsets[ci] = try child.marshalTo(alloc, out);\n");
+                        try w.writeAll("            }\n");
+                        try w.print("            try writer.set{s}(offsets);\n", .{name_camel});
+                        try w.writeAll("        }\n");
+                    },
+                    .u16, .u32, .u64, .b64 => {
+                        try w.print("        if (self.{s}.len > 0) try writer.set{s}(self.{s});\n", .{ info.name, name_camel, info.name });
+                    },
+                    else => @compileError("unsupported array child kind in struct marshalTo"),
+                }
+            },
+        }
+    }
+    try w.writeAll("        const result = try writer.finish();\n");
+    try w.writeAll("        return result.offset;\n");
+    try w.writeAll("    }\n");
+
     try w.writeAll("};\n\n");
 }
 

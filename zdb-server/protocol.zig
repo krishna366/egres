@@ -4,6 +4,7 @@ const zio = @import("zio");
 pub const Command = union(enum) {
     set: SetCmd,
     get: GetCmd,
+    conf: ConfCmd,
 };
 
 pub const SetCmd = struct {
@@ -17,6 +18,19 @@ pub const GetCmd = struct {
     ns: u32,
     key: []const u8,
     ts: u64,
+};
+
+pub const ConfCmd = struct {
+    action: Action,
+    node_id: u64,
+    addr: []const u8 = "",
+
+    pub const Action = enum {
+        add,
+        to_voter,
+        to_learner,
+        remove,
+    };
 };
 
 const max_line_len = 64 * 1024;
@@ -74,6 +88,28 @@ fn parseLine(line: []const u8) !Command {
             .ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace,
             .key = key,
             .ts = std.fmt.parseInt(u64, ts_str, 10) catch return error.InvalidTimestamp,
+        } };
+    } else if (std.mem.eql(u8, cmd, "conf")) {
+        const action_str = it.next() orelse return error.MissingAction;
+        const node_id_str = it.next() orelse return error.MissingNodeId;
+        const action: ConfCmd.Action = if (std.mem.eql(u8, action_str, "add"))
+            .add
+        else if (std.mem.eql(u8, action_str, "to_voter"))
+            .to_voter
+        else if (std.mem.eql(u8, action_str, "to_learner"))
+            .to_learner
+        else if (std.mem.eql(u8, action_str, "remove"))
+            .remove
+        else
+            return error.InvalidAction;
+
+        const node_id = std.fmt.parseInt(u64, node_id_str, 10) catch return error.InvalidNodeId;
+        const addr = if (action == .add) (it.next() orelse return error.MissingAddr) else "";
+
+        return .{ .conf = .{
+            .action = action,
+            .node_id = node_id,
+            .addr = addr,
         } };
     } else {
         return error.UnknownCommand;

@@ -1,6 +1,15 @@
 # TODO.md
 
+### PROJECT: Improve zbuf APIs
+
+The buffer should be a simple wrapper over the bytes. Right now, it's too
+complex. And the whole "tail" thingy -- I'm not liking it. Let's remove it.
+
+Also, *Struct.fromReader, should probably also have a fromBuf(...), or
+"unmarshal".
+
 ### PROJECT: Switch over diskwal to VFS and zio
+Mar 18, 2026
 
 - We're currently doing mmap for the wal. We should switch over to VFS
 mechanism. The only problem is we need to use a cache, and we don't know how
@@ -8,10 +17,18 @@ much cache to allocate to this. Or, could be as simple as the last 100 entries
 or something.
 
 ### PROJECT: Add Context to all requests
+Mar 18, 2026
 
 - That way, we can cancel a context and stop extra work that's going on.
+- We also need to track metrics, particularly the ones for disk fetches.
 
 ### PROJECT: Implement priority based and multiplexing TCP connections
+DONE: Mar 18, 2026
+
+Update: I had done this, but realized that multiplexing isn't that useful for
+internal Raft communication, because we need to process it all in a single loop
+anyway. And for external requests, we can't use this custom format, if we want
+to allow current Postgres clients to be able to communicate.
 
 - For all internal comms, we should have 3 tcp conns per pair of servers.
 - For .p0, .p1, and .p2.

@@ -12,25 +12,20 @@ pub const ConfChangeType = enum(u8) {
 pub const ConfChange = struct {
     change_type: ConfChangeType,
     node_id: NodeId,
+    addr: []const u8 = "",
 };
 pub const LogEntryBuffer = zen.LogEntryBuffer;
-pub const HardState = struct {
-    current_term: u64,
-    voted_for: u64,
-    commit_index: u64,
-};
+pub const HardState = zen.HardStateStruct;
+pub const Snapshot = zen.SnapshotStruct;
+pub const ConfState = zen.ConfStateStruct;
+pub const ConfStatePeer = zen.ConfStatePeerStruct;
+
 pub const StoredEntry = struct {
     index: u64,
     term: u64,
     data_len: u32,
     // Borrowed/owned payload bytes. Callers must treat this as read-only.
     bytes: []const u8,
-};
-
-pub const Snapshot = struct {
-    index: u64,
-    term: u64,
-    data: []const u8,
 };
 
 pub const RaftLogError = error{
@@ -43,9 +38,9 @@ pub const RaftWAL = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        hardState: *const fn (*anyopaque) HardState,
+        hardState: *const fn (*anyopaque) *const HardState,
         setHardState: *const fn (*anyopaque, HardState) RaftLogError!void,
-        snapshot: *const fn (*anyopaque) Snapshot,
+        snapshot: *const fn (*anyopaque) *const Snapshot,
         setSnapshot: *const fn (*anyopaque, Snapshot) RaftLogError!void,
         firstIndex: *const fn (*anyopaque) u64,
         lastIndex: *const fn (*anyopaque) u64,
@@ -64,7 +59,7 @@ pub const RaftWAL = struct {
         sync: *const fn (*anyopaque) RaftLogError!void,
     };
 
-    pub fn hardState(self: RaftWAL) HardState {
+    pub fn hardState(self: RaftWAL) *const HardState {
         return self.vtable.hardState(self.ctx);
     }
 
@@ -72,7 +67,7 @@ pub const RaftWAL = struct {
         return self.vtable.setHardState(self.ctx, hs);
     }
 
-    pub fn snapshot(self: RaftWAL) Snapshot {
+    pub fn snapshot(self: RaftWAL) *const Snapshot {
         return self.vtable.snapshot(self.ctx);
     }
 
@@ -145,23 +140,27 @@ pub fn deinitOwnedEntries(alloc: std.mem.Allocator, entries: []LogEntryBuffer) v
 pub const MemWAL = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(StoredEntry),
-    hard_state: HardState,
-    snapshot_info: Snapshot,
+    hard_state: *HardState,
+    snapshot_info: *Snapshot,
 
-    pub fn init(allocator: std.mem.Allocator) MemWAL {
+    pub fn init(allocator: std.mem.Allocator) !MemWAL {
+        const hs = try allocator.create(HardState);
+        hs.* = .{};
+        const snap = try allocator.create(Snapshot);
+        snap.* = .{};
         return .{
             .allocator = allocator,
             .entries = std.ArrayList(StoredEntry).empty,
-            .hard_state = .{ .current_term = 0, .voted_for = 0, .commit_index = 0 },
-            .snapshot_info = .{ .index = 0, .term = 0, .data = &[_]u8{} },
+            .hard_state = hs,
+            .snapshot_info = snap,
         };
     }
 
     pub fn deinit(self: *MemWAL) void {
         self.clearEntries();
-        if (self.snapshot_info.data.len != 0) {
-            self.allocator.free(self.snapshot_info.data);
-        }
+        self.snapshot_info.deinit(self.allocator);
+        self.allocator.destroy(self.snapshot_info);
+        self.allocator.destroy(self.hard_state);
         self.entries.deinit(self.allocator);
     }
 
@@ -173,28 +172,28 @@ pub const MemWAL = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    fn hardState(ctx: *anyopaque) HardState {
+    fn hardState(ctx: *anyopaque) *const HardState {
         const self = fromCtx(ctx);
         return self.hard_state;
     }
 
     fn setHardState(ctx: *anyopaque, hs: HardState) RaftLogError!void {
         const self = fromCtx(ctx);
-        self.hard_state = hs;
+        const copy = hs.clone(self.allocator) catch return error.OutOfMemory;
+        self.hard_state.destroy(self.allocator);
+        self.hard_state = copy;
     }
 
-    fn snapshot(ctx: *anyopaque) Snapshot {
+    fn snapshot(ctx: *anyopaque) *const Snapshot {
         const self = fromCtx(ctx);
         return self.snapshot_info;
     }
 
     fn setSnapshot(ctx: *anyopaque, snap: Snapshot) RaftLogError!void {
         const self = fromCtx(ctx);
-        if (self.snapshot_info.data.len != 0) {
-            self.allocator.free(self.snapshot_info.data);
-        }
-        const data_copy = if (snap.data.len == 0) &[_]u8{} else try self.allocator.dupe(u8, snap.data);
-        self.snapshot_info = .{ .index = snap.index, .term = snap.term, .data = data_copy };
+        const copy = snap.clone(self.allocator) catch return error.OutOfMemory;
+        self.snapshot_info.destroy(self.allocator);
+        self.snapshot_info = copy;
     }
 
     fn firstIndex(ctx: *anyopaque) u64 {

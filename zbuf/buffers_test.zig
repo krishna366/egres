@@ -382,3 +382,156 @@ test "u64 array roundtrip and bounds" {
     try std.testing.expectEqual(std.math.maxInt(u64), try reader.valuesAt(3));
     try std.testing.expectError(zbuf.Error.OutOfBounds, reader.valuesAt(4));
 }
+
+test "clone deep copies nested struct" {
+    const alloc = std.testing.allocator;
+
+    // Build a table with nested rows, cells, optional table, bytes, scalar arrays.
+    var buf = try buildTable(alloc, true);
+    defer buf.deinit();
+    const bytes = buf.bytes orelse return error.Invalid;
+
+    const msg = try gen.parseMessageWithTail(bytes);
+    const root = switch (msg) {
+        .Table => |v| v,
+        else => return error.Invalid,
+    };
+    const original = try gen.TableStruct.fromReader(alloc, root);
+    defer original.destroy(alloc);
+
+    // Clone — returns heap-allocated pointer, cleaned up via destroy.
+    const cloned = try original.clone(alloc);
+    defer cloned.destroy(alloc);
+
+    // Scalars.
+    try std.testing.expectEqual(original.count, cloned.count);
+    try std.testing.expectEqualSlices(u8, original.payload, cloned.payload);
+
+    // Bytes are independent allocations.
+    try std.testing.expect(original.payload.ptr != cloned.payload.ptr);
+
+    // Nested rows array.
+    try std.testing.expectEqual(original.rows.len, cloned.rows.len);
+    try std.testing.expect(original.rows.ptr != cloned.rows.ptr);
+
+    // Row 0: scalars, bytes, nested cell arrays, optional table, scalar arrays.
+    const r0_orig = original.rows[0];
+    const r0_clone = cloned.rows[0];
+    try std.testing.expectEqual(r0_orig.value, r0_clone.value);
+    try std.testing.expect(r0_orig.is_active == r0_clone.is_active);
+    try std.testing.expect(r0_orig.is_bootstrapping == r0_clone.is_bootstrapping);
+    try std.testing.expectEqualSlices(u8, r0_orig.name, r0_clone.name);
+    try std.testing.expect(r0_orig.name.ptr != r0_clone.name.ptr);
+
+    // Cells array — deep copied.
+    try std.testing.expectEqual(r0_orig.cells.len, r0_clone.cells.len);
+    try std.testing.expect(r0_orig.cells.ptr != r0_clone.cells.ptr);
+    try std.testing.expectEqual(r0_orig.cells[0].tag, r0_clone.cells[0].tag);
+    try std.testing.expectEqualSlices(u8, r0_orig.cells[0].data, r0_clone.cells[0].data);
+    try std.testing.expect(r0_orig.cells[0].data.ptr != r0_clone.cells[0].data.ptr);
+    try std.testing.expect(r0_orig.cells[0].cell_hot == r0_clone.cells[0].cell_hot);
+    try std.testing.expectEqual(r0_orig.cells[1].tag, r0_clone.cells[1].tag);
+
+    // Optional nested table (row_cell).
+    try std.testing.expect(r0_clone.row_cell != null);
+    try std.testing.expectEqual(r0_orig.row_cell.?.tag, r0_clone.row_cell.?.tag);
+    try std.testing.expectEqualSlices(u8, r0_orig.row_cell.?.data, r0_clone.row_cell.?.data);
+    try std.testing.expect(r0_orig.row_cell.?.data.ptr != r0_clone.row_cell.?.data.ptr);
+
+    // Scalar arrays — u32 and u64.
+    try std.testing.expectEqualSlices(u32, r0_orig.u32_values, r0_clone.u32_values);
+    try std.testing.expect(r0_orig.u32_values.ptr != r0_clone.u32_values.ptr);
+    try std.testing.expectEqualSlices(u64, r0_orig.u64_values, r0_clone.u64_values);
+    try std.testing.expect(r0_orig.u64_values.ptr != r0_clone.u64_values.ptr);
+
+    // Row 1: null row_cell, empty cells, b64 fields.
+    const r1_orig = original.rows[1];
+    const r1_clone = cloned.rows[1];
+    try std.testing.expectEqual(r1_orig.value, r1_clone.value);
+    try std.testing.expect(r1_orig.is_draining == r1_clone.is_draining);
+    try std.testing.expectEqual(r1_orig.cells.len, r1_clone.cells.len);
+    try std.testing.expect(r1_clone.row_cell == null);
+    try std.testing.expectEqual(r1_orig.status, r1_clone.status);
+    try std.testing.expectEqual(r1_orig.lifecycle, r1_clone.lifecycle);
+
+    // Optional nested table on the root.
+    try std.testing.expect(cloned.table_row != null);
+    try std.testing.expectEqualSlices(u8, original.table_row.?.name, cloned.table_row.?.name);
+    try std.testing.expect(original.table_row.?.name.ptr != cloned.table_row.?.name.ptr);
+}
+
+test "clone of struct with null optional table" {
+    const alloc = std.testing.allocator;
+
+    var buf = try buildTable(alloc, false);
+    defer buf.deinit();
+    const bytes = buf.bytes orelse return error.Invalid;
+
+    const msg = try gen.parseMessageWithTail(bytes);
+    const root = switch (msg) {
+        .Table => |v| v,
+        else => return error.Invalid,
+    };
+    const original = try gen.TableStruct.fromReader(alloc, root);
+    defer original.destroy(alloc);
+
+    try std.testing.expect(original.table_row == null);
+
+    const cloned = try original.clone(alloc);
+    defer cloned.destroy(alloc);
+
+    try std.testing.expect(cloned.table_row == null);
+    try std.testing.expectEqual(original.count, cloned.count);
+    try std.testing.expectEqualSlices(u8, original.payload, cloned.payload);
+}
+
+test "clone of simple scalar-only struct" {
+    const alloc = std.testing.allocator;
+
+    var original = gen.CellStruct{
+        .tag = 42,
+        .cell_hot = true,
+        .cell_flags = 0xFF,
+    };
+
+    const cloned = try original.clone(alloc);
+    defer cloned.destroy(alloc);
+
+    try std.testing.expectEqual(@as(u32, 42), cloned.tag);
+    try std.testing.expect(cloned.cell_hot);
+    try std.testing.expectEqual(@as(u64, 0xFF), cloned.cell_flags);
+    try std.testing.expectEqualSlices(u8, &.{}, cloned.data);
+}
+
+test "clone roundtrip matches marshal" {
+    const alloc = std.testing.allocator;
+
+    // Build, read, convert to struct.
+    var buf = try buildTable(alloc, true);
+    defer buf.deinit();
+    const bytes = buf.bytes orelse return error.Invalid;
+
+    const msg = try gen.parseMessageWithTail(bytes);
+    const root = switch (msg) {
+        .Table => |v| v,
+        else => return error.Invalid,
+    };
+    const original = try gen.TableStruct.fromReader(alloc, root);
+    defer original.destroy(alloc);
+
+    // Clone, then marshal both and compare.
+    const cloned = try original.clone(alloc);
+    defer cloned.destroy(alloc);
+
+    var out_orig: std.ArrayList(u8) = .{};
+    defer out_orig.deinit(alloc);
+    const off_orig = try original.marshalTo(alloc, &out_orig);
+
+    var out_clone: std.ArrayList(u8) = .{};
+    defer out_clone.deinit(alloc);
+    const off_clone = try cloned.marshalTo(alloc, &out_clone);
+
+    // Both should produce identical wire bytes.
+    try std.testing.expectEqual(off_orig, off_clone);
+    try std.testing.expectEqualSlices(u8, out_orig.items, out_clone.items);
+}

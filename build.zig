@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
     addZbufCli(b, target, optimize, schema_mod);
 
     addZdbServer(b, target, optimize, raft_mod, regen_buffers_step);
-    addZdbClient(b, target, optimize);
+    addZdbBench(b, target, optimize);
     const zdb_test_step = addZdbTests(b, target, optimize, regen_buffers_step);
     const utils_test_step = addUCompressTests(b, target, optimize);
     const zbuf_test_step = addZbufTests(b, target, optimize, regen_buffers_step);
@@ -426,10 +426,6 @@ fn makeRaftModule(
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Module {
     const zbuf_mod = makeModule(b, target, optimize, "zbuf.zig");
-    const utils_mod = makeModule(b, target, optimize, "u/utils.zig");
-
-    const raft_buffers_gen_mod = makeModule(b, target, optimize, "raft/buffers.gen.zig");
-    raft_buffers_gen_mod.addImport("zbuf", zbuf_mod);
 
     const zio_dep = b.dependency("zio", .{
         .target = target,
@@ -437,19 +433,25 @@ fn makeRaftModule(
     });
     const zio_mod = zio_dep.module("zio");
 
-    const mux_mod = makeModule(b, target, optimize, "net/mux.zig");
-    mux_mod.addImport("zio", zio_mod);
+    const utils_mod = makeModule(b, target, optimize, "u/utils.zig");
+    utils_mod.addImport("zio", zio_mod);
+
+    const raft_buffers_gen_mod = makeModule(b, target, optimize, "raft/buffers.gen.zig");
+    raft_buffers_gen_mod.addImport("zbuf", zbuf_mod);
+
+    const serial_mod = makeModule(b, target, optimize, "net/serial.zig");
+    serial_mod.addImport("zio", zio_mod);
 
     const transport_mod = makeModule(b, target, optimize, "net/transport.zig");
     transport_mod.addImport("zio", zio_mod);
-    transport_mod.addImport("mux", mux_mod);
+    transport_mod.addImport("serial", serial_mod);
 
     const raft_mod = makeModule(b, target, optimize, "raft/raft.zig");
     raft_mod.addImport("buffers_gen", raft_buffers_gen_mod);
     raft_mod.addImport("zbuf", zbuf_mod);
     raft_mod.addImport("utils", utils_mod);
     raft_mod.addImport("zio", zio_mod);
-    raft_mod.addImport("mux", mux_mod);
+    raft_mod.addImport("serial", serial_mod);
     raft_mod.addImport("transport", transport_mod);
     return raft_mod;
 }
@@ -479,23 +481,19 @@ fn addZdbServer(
     zdb_mod.addImport("utils", utils_mod);
     zdb_mod.addImport("zio", zio_mod);
 
-    const zdb_srv_buffers_gen_mod = makeModule(b, target, optimize, "zdb_server/buffers.gen.zig");
+    const zdb_srv_buffers_gen_mod = makeModule(b, target, optimize, "zdb-server/buffers.gen.zig");
     zdb_srv_buffers_gen_mod.addImport("zbuf", zbuf_mod);
 
-    const wait_group_mod = makeModule(b, target, optimize, "u/wait_group.zig");
-    wait_group_mod.addImport("zio", zio_mod);
-
-    const zdb_server_mod = makeModule(b, target, optimize, "zdb_server/server.zig");
+    const zdb_server_mod = makeModule(b, target, optimize, "zdb-server/server.zig");
     zdb_server_mod.addImport("zio", zio_mod);
     zdb_server_mod.addImport("raft", raft_mod);
     zdb_server_mod.addImport("zdb", zdb_mod);
     zdb_server_mod.addImport("runtime", runtime_mod);
     zdb_server_mod.addImport("buffers_gen", zdb_srv_buffers_gen_mod);
-    zdb_server_mod.addImport("wait_group", wait_group_mod);
 
     const exe = b.addExecutable(.{
         .name = "zdb-server",
-        .root_module = makeModule(b, target, optimize, "zdb_server.zig"),
+        .root_module = makeModule(b, target, optimize, "zdb-server/main.zig"),
     });
     addVendoredCompressionSources(b, exe);
     exe.root_module.addImport("zio", zio_mod);
@@ -511,7 +509,7 @@ fn addZdbServer(
     zdb_server_step.dependOn(&install.step);
 }
 
-fn addZdbClient(
+fn addZdbBench(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -523,14 +521,14 @@ fn addZdbClient(
     const zio_mod = zio_dep.module("zio");
 
     const exe = b.addExecutable(.{
-        .name = "zdb-client",
-        .root_module = makeModule(b, target, optimize, "zdb_client.zig"),
+        .name = "zdb-bench",
+        .root_module = makeModule(b, target, optimize, "benchmark.zig"),
     });
     exe.root_module.addImport("zio", zio_mod);
     b.installArtifact(exe);
 
     const install = b.addInstallArtifact(exe, .{});
-    const step = b.step("zdb-client", "Build zdb YCSB benchmark client");
+    const step = b.step("zdb-bench", "Build zdb YCSB benchmark client");
     step.dependOn(&install.step);
 }
 
@@ -673,29 +671,15 @@ fn addNetTests(
     });
     const zio_mod = zio_dep.module("zio");
 
-    const mux_mod = makeModule(b, target, optimize, "net/mux.zig");
-    mux_mod.addImport("zio", zio_mod);
+    const serial_mod_test = makeModule(b, target, optimize, "net/serial.zig");
+    serial_mod_test.addImport("zio", zio_mod);
 
     const transport_mod = makeModule(b, target, optimize, "net/transport.zig");
     transport_mod.addImport("zio", zio_mod);
-    transport_mod.addImport("mux", mux_mod);
+    transport_mod.addImport("serial", serial_mod_test);
 
-    const mux_tests = b.addTest(.{
-        .root_module = makeModule(b, target, optimize, "net/mux_test.zig"),
-    });
-    mux_tests.root_module.addImport("zio", zio_mod);
-    mux_tests.root_module.addImport("mux", mux_mod);
-
-    const transport_tests = b.addTest(.{
-        .root_module = makeModule(b, target, optimize, "net/transport_test.zig"),
-    });
-    transport_tests.root_module.addImport("zio", zio_mod);
-    transport_tests.root_module.addImport("mux", mux_mod);
-    transport_tests.root_module.addImport("transport", transport_mod);
-
+    // TODO: Rewrite transport_test.zig to use Serial instead of Mux.
     const net_test_step = b.step("test-net", "Run net tests");
-    net_test_step.dependOn(&b.addRunArtifact(mux_tests).step);
-    net_test_step.dependOn(&b.addRunArtifact(transport_tests).step);
     return net_test_step;
 }
 

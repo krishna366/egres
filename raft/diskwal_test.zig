@@ -390,33 +390,35 @@ test "diskwal meta file adapted from dgraph" {
     defer mf.deinit();
 
     const hs0 = try mf.hardState();
+    defer hs0.destroy(alloc);
     try std.testing.expectEqual(@as(u64, 0), hs0.current_term);
     try std.testing.expectEqual(@as(u64, 0), hs0.voted_for);
     try std.testing.expectEqual(@as(u64, 0), hs0.commit_index);
 
-    try mf.storeHardState(.{
+    try mf.storeHardState(&.{
         .current_term = 10,
         .voted_for = 20,
         .commit_index = 30,
     });
     const hs1 = try mf.hardState();
+    defer hs1.destroy(alloc);
     try std.testing.expectEqual(@as(u64, 10), hs1.current_term);
     try std.testing.expectEqual(@as(u64, 20), hs1.voted_for);
     try std.testing.expectEqual(@as(u64, 30), hs1.commit_index);
 
     const snap0 = try mf.snapshot();
-    defer if (snap0.data.len != 0) alloc.free(@constCast(snap0.data));
+    defer snap0.destroy(alloc);
     try std.testing.expectEqual(@as(u64, 0), snap0.index);
     try std.testing.expectEqual(@as(u64, 0), snap0.term);
     try std.testing.expectEqual(@as(usize, 0), snap0.data.len);
 
-    try mf.storeSnapshot(.{
+    try mf.storeSnapshot(&.{
         .index = 12,
         .term = 200,
         .data = "foo",
     });
     const snap1 = try mf.snapshot();
-    defer if (snap1.data.len != 0) alloc.free(@constCast(snap1.data));
+    defer snap1.destroy(alloc);
     try std.testing.expectEqual(@as(u64, 12), snap1.index);
     try std.testing.expectEqual(@as(u64, 200), snap1.term);
     try std.testing.expectEqualSlices(u8, "foo", snap1.data);

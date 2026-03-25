@@ -15,29 +15,26 @@ const ParsedArgs = struct {
     raft_addr: []const u8,
     client_addr: []const u8,
     data_dir: []const u8,
-    peers: []PeerSpec,
+    seeds: []const []const u8,
     tick_ms: u32,
-};
-
-const PeerSpec = struct {
-    id: raft.NodeId,
-    addr: []const u8,
 };
 
 fn usage() void {
     std.debug.print(
         "usage: zdb-server --id <n> --cluster-id <n> --raft-addr <ip:port> " ++
-            "--client-addr <ip:port> --data-dir <path> [--peer <id@ip:port>] [--tick-ms <n>]\n",
+            "--client-addr <ip:port> --data-dir <path> [--seeds <addr1,addr2,...>] [--tick-ms <n>]\n",
         .{},
     );
 }
 
-fn parsePeerSpec(text: []const u8) !PeerSpec {
-    const at = std.mem.indexOfScalar(u8, text, '@') orelse return error.InvalidArgs;
-    const id_text = text[0..at];
-    const addr_text = text[at + 1 ..];
-    const id = try std.fmt.parseInt(raft.NodeId, id_text, 10);
-    return .{ .id = id, .addr = addr_text };
+fn parseSeeds(text: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
+    var seeds = std.ArrayList([]const u8).empty;
+    errdefer seeds.deinit(allocator);
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |s| {
+        if (s.len > 0) try seeds.append(allocator, s);
+    }
+    return seeds.toOwnedSlice(allocator);
 }
 
 fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
@@ -46,8 +43,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     var raft_addr: ?[]const u8 = null;
     var client_addr: ?[]const u8 = null;
     var data_dir: ?[]const u8 = null;
-    var peers = std.ArrayList(PeerSpec).empty;
-    errdefer peers.deinit(allocator);
+    var seeds: []const []const u8 = &.{};
     var tick_ms: u32 = 20;
 
     var i: usize = 1;
@@ -73,10 +69,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             i += 1;
             if (i >= argv.len) return error.InvalidArgs;
             data_dir = argv[i];
-        } else if (std.mem.eql(u8, arg, "--peer")) {
+        } else if (std.mem.eql(u8, arg, "--seeds")) {
             i += 1;
             if (i >= argv.len) return error.InvalidArgs;
-            try peers.append(allocator, try parsePeerSpec(argv[i]));
+            seeds = try parseSeeds(argv[i], allocator);
         } else if (std.mem.eql(u8, arg, "--tick-ms")) {
             i += 1;
             if (i >= argv.len) return error.InvalidArgs;
@@ -93,14 +89,20 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         .raft_addr = raft_addr orelse return error.InvalidArgs,
         .client_addr = client_addr orelse return error.InvalidArgs,
         .data_dir = data_dir orelse return error.InvalidArgs,
-        .peers = try peers.toOwnedSlice(allocator),
+        .seeds = seeds,
         .tick_ms = tick_ms,
     };
 }
 
 const log = std.log.scoped(.zdb_main);
 
+fn deinitWithLog(comptime msg: []const u8, ptr: anytype) void {
+    ptr.deinit();
+    log.info("deinit: " ++ msg ++ " done", .{});
+}
+
 pub fn main() !void {
+    defer log.info("shutdown complete", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -112,72 +114,90 @@ pub fn main() !void {
         usage();
         return err;
     };
-    defer allocator.free(args.peers);
+    defer allocator.free(args.seeds);
 
-    log.info("starting zdb-server id={d} cluster={d} raft={s} client={s} data={s} tick={d}ms peers={d}", .{
-        args.id, args.cluster_id, args.raft_addr, args.client_addr, args.data_dir, args.tick_ms, args.peers.len,
+    log.info("starting zdb-server id={d} cluster={d} raft={s} client={s} data={s} tick={d}ms seeds={d}", .{
+        args.id, args.cluster_id, args.raft_addr, args.client_addr, args.data_dir, args.tick_ms, args.seeds.len,
     });
 
     // Runtime pool singleton — created first so all runtimes are available.
     const pool = try runtime.Pool.init(allocator, .{});
-    defer pool.deinit();
+    defer deinitWithLog("pool", pool);
     log.info("runtime pool initialized", .{});
-
-    // Build raft peer lists.
-    var raft_peers = std.ArrayList(raft.Peer).empty;
-    defer raft_peers.deinit(allocator);
-    var transport_peers = std.ArrayList(raft.PeerSpec).empty;
-    defer transport_peers.deinit(allocator);
-
-    for (args.peers) |p| {
-        if (p.id == args.id) continue;
-        try raft_peers.append(allocator, .{
-            .id = p.id,
-            .next_index = 1,
-            .match_index = 0,
-            .role = .voter,
-        });
-        try transport_peers.append(allocator, .{ .id = p.id, .addr = p.addr });
-    }
 
     // Open raft WAL.
     log.info("opening raft WAL at {s}", .{args.data_dir});
     var wal = try raft.DiskWAL.openPath(args.data_dir, allocator);
-    defer wal.deinit();
+    defer deinitWithLog("wal", &wal);
 
-    // Initialize raft node.
+    const wal_iface = wal.asRaftWAL();
+    const is_restart = wal_iface.lastIndex() > 0;
+
+    // Determine initial role: on join start as learner, otherwise voter.
+    // On restart, restoreConfState will correct the role from persisted state.
+    const initial_role: raft.PeerRole = if (!is_restart and args.seeds.len > 0) .learner else .voter;
+
+    if (is_restart) {
+        log.info("RESTART mode: WAL has entries, restoring state", .{});
+    } else if (args.seeds.len > 0) {
+        log.info("JOIN mode: fresh node, will join via seeds", .{});
+    } else {
+        log.info("BOOTSTRAP mode: fresh single-node cluster", .{});
+    }
+
+    // Initialize raft node (no static peers — learned from WAL or join).
     const node = try raft.Node.init(
         allocator,
-        args.id,
-        raft_peers.items,
-        wal.asRaftWAL(),
-        .{},
-        .voter,
+        &.{},
+        wal_iface,
+        .{
+            .id = args.id,
+            .cluster_id = args.cluster_id,
+            .listen_addr = args.raft_addr,
+            .tick_interval_ms = args.tick_ms,
+        },
+        initial_role,
     );
-    defer node.deinit();
-    log.info("raft node initialized id={d} peers={d}", .{ args.id, raft_peers.items.len });
+    defer deinitWithLog("node", node);
+
+    // On restart, restore persisted state from WAL.
+    if (is_restart) {
+        node.restoreState();
+        node.restoreConfState();
+        log.info("raft state restored from WAL", .{});
+    }
+
+    log.info("raft node initialized id={d}", .{args.id});
 
     // Open zdb forest.
     log.info("opening forest at {s}", .{args.data_dir});
     var forest = try zdb.forest.Forest.open(allocator, .{
         .dir = args.data_dir,
     });
-    defer forest.close();
+    defer {
+        forest.close();
+        log.info("deinit: forest done", .{});
+    }
     log.info("forest opened", .{});
 
     // Storage applier bridges raft commits to forest.
     var applier = zdb.applier.StorageApplier.init(allocator, forest);
-    defer applier.deinit();
+    defer deinitWithLog("applier", &applier);
 
-    // Raft runtime.
-    var raft_rt = raft.RaftRuntime.init(allocator, node, .{
-        .self_id = args.id,
-        .cluster_id = args.cluster_id,
-        .listen_addr = args.raft_addr,
-        .peers = transport_peers.items,
-        .tick_interval_ms = args.tick_ms,
-    });
-    defer raft_rt.deinit();
+    // Register state machine apply callback so both leader and followers apply committed entries.
+    node.on_apply = &zdb_server.applyEntryToStorage;
+    node.on_apply_ctx = @ptrCast(&applier);
+
+    // zio runtime must be created before raft_rt so its defer (deinit) runs last,
+    // after all coroutines are cleaned up.
+    const rt = try zio.Runtime.init(
+        allocator,
+        .{ .executors = .exact(1) },
+    );
+    defer deinitWithLog("zio_rt", rt);
+
+    var raft_rt = raft.RaftRuntime.init(allocator, node);
+    defer deinitWithLog("raft_rt", &raft_rt);
 
     // ZDB server (client-facing).
     var zdb_srv = try zdb_server.ZdbServer.init(
@@ -187,34 +207,34 @@ pub fn main() !void {
         node,
         args.client_addr,
     );
-    defer zdb_srv.deinit();
+    defer deinitWithLog("zdb_srv", &zdb_srv);
 
-    log.info("all components initialized, spawning on raft pool", .{});
+    log.info("all components initialized", .{});
 
-    var rt = try zio.Runtime.init(
-        allocator,
-        .{ .executors = .exact(1) },
-    );
-    defer rt.deinit();
-
-    appMain(&raft_rt, &zdb_srv, node);
+    appMain(&raft_rt, &zdb_srv, node, &args);
     // // Entry point: spawn appMain on the raft pool. It orchestrates everything.
-    // var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node });
+    // var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node, &args });
     // handle.join();
 
-    log.info("shutdown complete", .{});
+    log.info("shutting down...", .{});
 }
 
 /// Runs on the raft pool. Spawns raft runtime, client server (on query pool
 /// via runtime.pool() singleton), compaction loop (on background pool),
 /// and waits for SIGINT to shut down.
-fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node) void {
+fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const ParsedArgs) void {
     log.info("inside appMain", .{});
     var group: zio.Group = .init;
     defer group.cancel();
 
     log.info("appMain: spawning raft runtime on raft pool", .{});
     group.spawn(runRaft, .{raft_rt}) catch return;
+
+    // If we have seeds and this is a fresh node, spawn the join procedure.
+    if (args.seeds.len > 0) {
+        log.info("appMain: spawning cluster join via seeds", .{});
+        group.spawn(runJoin, .{ args, raft_rt }) catch return;
+    }
 
     log.info("appMain: spawning client server on query pool", .{});
     group.spawn(runServer, .{zdb_srv}) catch return;
@@ -233,18 +253,48 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
 
 fn runRaft(r: *raft.RaftRuntime) void {
     r.run() catch |err| {
-        std.log.err("raft runtime stopped: {s}", .{@errorName(err)});
+        if (err == error.Canceled) return;
+        std.log.err("raft runtime error: {s}", .{@errorName(err)});
+        if (@errorReturnTrace()) |trace| {
+            std.debug.dumpStackTrace(trace.*);
+        }
     };
 }
 
+/// Spawn the client TCP accept loop on the query runtime pool.
+/// Must be called from a zio coroutine. Blocks until cancelled.
 fn runServer(s: *zdb_server.ZdbServer) void {
-    s.runOnQueryPool() catch |err| {
-        std.log.err("zdb server stopped: {s}", .{@errorName(err)});
+    var handle = runtime.pool().get(.query).spawn(
+        zdb_server.ZdbServer.runClientLoop,
+        .{s},
+    ) catch |err| {
+        log.err("runServer err: {}", .{err});
+        return;
     };
+    handle.join();
 }
 
+/// Spawn the compaction loop on the background runtime pool.
+/// Must be called from a zio coroutine. Blocks until cancelled.
 fn runCompaction(s: *zdb_server.ZdbServer) void {
-    s.runCompactionOnBackgroundPool() catch |err| {
-        std.log.err("compaction loop stopped: {s}", .{@errorName(err)});
+    var handle = runtime.pool().get(.background).spawn(
+        zdb_server.ZdbServer.runCompactionLoop,
+        .{s},
+    ) catch |err| {
+        log.err("runCompaction err: {}", .{err});
+        return;
+    };
+    handle.join();
+}
+
+fn runJoin(args: *const ParsedArgs, raft_rt: *raft.RaftRuntime) void {
+    raft.joinCluster(
+        raft_rt.allocator,
+        args.seeds,
+        args.cluster_id,
+        args.id,
+        args.raft_addr,
+    ) catch |err| {
+        std.log.err("cluster join failed: {s}", .{@errorName(err)});
     };
 }

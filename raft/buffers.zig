@@ -9,6 +9,32 @@ pub const ConfChange = schema.Table(.{
     .{ .name = "to_learner", .ty = schema.Bool(.{ .field_id = 1, .bit = 3 }) },
     .{ .name = "remove_node", .ty = schema.Bool(.{ .field_id = 1, .bit = 4 }) },
     .{ .id = 2, .name = "node_id", .ty = schema.U64 },
+    .{ .id = 3, .name = "addr", .ty = schema.Bytes },
+});
+
+pub const ConfStatePeer = schema.Table(.{
+    .{ .id = 1, .name = "id", .ty = schema.U64 },
+    .{ .id = 2, .name = "addr", .ty = schema.Bytes },
+    .{ .id = 3, .name = "role", .ty = schema.B64 },
+    .{ .name = "is_voter", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
+    .{ .name = "is_learner", .ty = schema.Bool(.{ .field_id = 3, .bit = 1 }) },
+});
+
+pub const ConfState = schema.Table(.{
+    .{ .id = 1, .name = "peers", .ty = schema.Array(ConfStatePeer) },
+});
+
+pub const HardState = schema.Table(.{
+    .{ .id = 1, .name = "current_term", .ty = schema.U64 },
+    .{ .id = 2, .name = "voted_for", .ty = schema.U64 },
+    .{ .id = 3, .name = "commit_index", .ty = schema.U64 },
+});
+
+pub const Snapshot = schema.Table(.{
+    .{ .id = 1, .name = "index", .ty = schema.U64 },
+    .{ .id = 2, .name = "term", .ty = schema.U64 },
+    .{ .id = 3, .name = "data", .ty = schema.Bytes },
+    .{ .id = 4, .name = "conf_state", .ty = ConfState },
 });
 
 pub const LogEntry = schema.Table(.{
@@ -97,4 +123,8 @@ pub const tables = .{
     .{ .name = "TransportHandshake", .ty = TransportHandshake, .id = tableId(7) },
     .{ .name = "JoinRequest", .ty = JoinRequest, .id = tableId(8) },
     .{ .name = "JoinResponse", .ty = JoinResponse, .id = tableId(9) },
+    .{ .name = "ConfStatePeer", .ty = ConfStatePeer, .id = tableId(10) },
+    .{ .name = "ConfState", .ty = ConfState, .id = tableId(11) },
+    .{ .name = "HardState", .ty = HardState, .id = tableId(12) },
+    .{ .name = "Snapshot", .ty = Snapshot, .id = tableId(13) },
 };

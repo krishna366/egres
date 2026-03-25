@@ -31,11 +31,11 @@ pub const MessageReader = union(enum) {
 };
 
 pub const BlockOffsetStruct = struct {
-    key: []u8 = &.{},
+    key: []const u8 = &.{},
     offset: u32 = 0,
     len: u32 = 0,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: BlockOffsetReader) Error!BlockOffsetStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: BlockOffsetReader) Error!BlockOffsetStruct {
         var s = BlockOffsetStruct{
             .offset = r.offset(),
             .len = r.len(),
@@ -45,9 +45,47 @@ pub const BlockOffsetStruct = struct {
         return s;
     }
 
+    pub fn fromReader(alloc: std.mem.Allocator, r: BlockOffsetReader) Error!*BlockOffsetStruct {
+        const ptr = try alloc.create(BlockOffsetStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
     pub fn deinit(self: *BlockOffsetStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         self.key = &.{};
+    }
+
+    pub fn destroy(self: *BlockOffsetStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: BlockOffsetStruct, alloc: std.mem.Allocator) Error!BlockOffsetStruct {
+        var s = BlockOffsetStruct{
+            .offset = self.offset,
+            .len = self.len,
+        };
+        errdefer s.deinit(alloc);
+        s.key = try alloc.dupe(u8, self.key);
+        return s;
+    }
+
+    pub fn clone(self: BlockOffsetStruct, alloc: std.mem.Allocator) Error!*BlockOffsetStruct {
+        const ptr = try alloc.create(BlockOffsetStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: BlockOffsetStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try BlockOffsetWriter.initWithBuf(alloc, out);
+        try writer.setKey(self.key);
+        try writer.setOffset(self.offset);
+        try writer.setLen(self.len);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 
@@ -248,14 +286,14 @@ pub const BlockOffsetWriter = struct {
 
 pub const TableIndexStruct = struct {
     offsets: []BlockOffsetStruct = &.{},
-    bloom_filter: []u8 = &.{},
+    bloom_filter: []const u8 = &.{},
     max_version: u64 = 0,
     key_count: u32 = 0,
     uncompressed_size: u32 = 0,
     on_disk_size: u32 = 0,
     stale_data_size: u32 = 0,
 
-    pub fn fromReader(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
+    fn fromReaderValue(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
         var s = TableIndexStruct{
             .max_version = r.maxVersion(),
             .key_count = r.keyCount(),
@@ -271,10 +309,17 @@ pub const TableIndexStruct = struct {
             @memset(s.offsets, .{});
             for (0.._cnt) |_i| {
                 const _child = try r.offsetsAt(@intCast(_i));
-                s.offsets[_i] = try BlockOffsetStruct.fromReader(alloc, _child);
+                s.offsets[_i] = try BlockOffsetStruct.fromReaderValue(alloc, _child);
             }
         }
         return s;
+    }
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: TableIndexReader) Error!*TableIndexStruct {
+        const ptr = try alloc.create(TableIndexStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
     }
 
     pub fn deinit(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
@@ -283,6 +328,58 @@ pub const TableIndexStruct = struct {
         self.offsets = &.{};
         alloc.free(self.bloom_filter);
         self.bloom_filter = &.{};
+    }
+
+    pub fn destroy(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: TableIndexStruct, alloc: std.mem.Allocator) Error!TableIndexStruct {
+        var s = TableIndexStruct{
+            .max_version = self.max_version,
+            .key_count = self.key_count,
+            .uncompressed_size = self.uncompressed_size,
+            .on_disk_size = self.on_disk_size,
+            .stale_data_size = self.stale_data_size,
+        };
+        errdefer s.deinit(alloc);
+        s.bloom_filter = try alloc.dupe(u8, self.bloom_filter);
+        {
+            s.offsets = try alloc.alloc(BlockOffsetStruct, self.offsets.len);
+            @memset(s.offsets, .{});
+            for (self.offsets, 0..) |_child, _i| {
+                s.offsets[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        return s;
+    }
+
+    pub fn clone(self: TableIndexStruct, alloc: std.mem.Allocator) Error!*TableIndexStruct {
+        const ptr = try alloc.create(TableIndexStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: TableIndexStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TableIndexWriter.initWithBuf(alloc, out);
+        if (self.offsets.len > 0) {
+            const offsets = try alloc.alloc(u32, self.offsets.len);
+            defer alloc.free(offsets);
+            for (self.offsets, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setOffsets(offsets);
+        }
+        try writer.setBloomFilter(self.bloom_filter);
+        try writer.setMaxVersion(self.max_version);
+        try writer.setKeyCount(self.key_count);
+        try writer.setUncompressedSize(self.uncompressed_size);
+        try writer.setOnDiskSize(self.on_disk_size);
+        try writer.setStaleDataSize(self.stale_data_size);
+        const result = try writer.finish();
+        return result.offset;
     }
 };
 

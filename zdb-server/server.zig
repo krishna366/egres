@@ -5,7 +5,7 @@ const zdb = @import("zdb");
 const runtime = @import("runtime");
 const zen = @import("buffers_gen");
 const proto = @import("protocol.zig");
-const WaitGroup = @import("wait_group").WaitGroup;
+const WaitGroup = @import("raft").utils.WaitGroup;
 
 const Forest = zdb.forest.Forest;
 const StorageApplier = zdb.applier.StorageApplier;
@@ -37,26 +37,14 @@ pub const ZdbServer = struct {
         };
     }
 
-    /// Spawn the client TCP accept loop on the query runtime pool.
-    /// Must be called from a zio coroutine. Blocks until cancelled.
-    pub fn runOnQueryPool(self: *ZdbServer) !void {
-        var handle = try runtime.pool().get(.query).spawn(runClientLoop, .{self});
-        handle.join();
-    }
-
-    /// Spawn the compaction loop on the background runtime pool.
-    /// Must be called from a zio coroutine. Blocks until cancelled.
-    pub fn runCompactionOnBackgroundPool(self: *ZdbServer) !void {
-        var handle = try runtime.pool().get(.background).spawn(runCompactionLoop, .{self});
-        handle.join();
-    }
-
     pub fn deinit(self: *ZdbServer) void {
         _ = self;
     }
 
-    fn runClientLoop(self: *ZdbServer) void {
+    pub fn runClientLoop(self: *ZdbServer) void {
         log.info("inside runClientLoop", .{});
+        defer log.info("client loop exiting (shutdown)", .{});
+
         const listener = self.listen_addr.listen(.{ .reuse_address = true }) catch |err| {
             log.err("failed to listen on client addr: {}", .{err});
             return;
@@ -71,7 +59,7 @@ pub const ZdbServer = struct {
         var conn_id: u64 = 0;
         while (!self.node.isShuttingDown()) {
             const stream = listener.accept() catch |err| {
-                log.err("accept failed: {}", .{err});
+                log.err("runClientLoop: accept failed: {}", .{err});
                 return;
             };
             stream.socket.setNoDelay(true) catch {};
@@ -82,10 +70,9 @@ pub const ZdbServer = struct {
                 stream.close();
             };
         }
-        log.info("client loop exiting (shutdown)", .{});
     }
 
-    fn runCompactionLoop(self: *ZdbServer) void {
+    pub fn runCompactionLoop(self: *ZdbServer) void {
         log.info("compaction loop started", .{});
         const interval = zio.Duration.fromMilliseconds(500);
         while (!self.node.isShuttingDown()) {
@@ -131,6 +118,10 @@ pub const ZdbServer = struct {
                     log.debug("GET ns={d} key={s} ts={d}", .{ req.ns, req.key, req.ts });
                     self.handleGet(stream, req) catch return;
                 },
+                .conf => |req| {
+                    log.info("CONF {s} node={d}", .{ @tagName(req.action), req.node_id });
+                    self.handleConf(stream, req) catch return;
+                },
             }
         }
         log.info("client handler exiting after {d} ops (shutdown)", .{ops});
@@ -150,19 +141,19 @@ pub const ZdbServer = struct {
         defer mutation_buf.deinit();
         const proposal_bytes = mutation_buf.bytes orelse return error.EncodeFailed;
 
+        // TODO: Fire callback at commit time (quorum achieved) instead of after apply.
+        // Currently the client blocks until both commit + apply are done. To fix:
+        // 1. Move callback fire before on_apply in applyCommits
+        // 2. For reads, track applied_timestamp in StorageApplier and block reads
+        //    until applied_timestamp >= read timestamp for linearizability.
         // Set up the commit context with WaitGroup.
         var ctx = CommitCtx{
-            .applier = self.applier,
             .status = .committed,
-            .ns = req.ns,
-            .key = req.key,
-            .value = req.value,
-            .ts = req.ts,
         };
         ctx.wg.init();
         ctx.wg.add(1);
 
-        self.node.proposeWithCallback(proposal_bytes, &onCommit, @ptrCast(&ctx)) catch |err| {
+        self.node.proposeDataChange(proposal_bytes, &onCommit, @ptrCast(&ctx)) catch |err| {
             log.err("propose failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, "propose failed");
             return;
@@ -212,36 +203,87 @@ pub const ZdbServer = struct {
             try proto.writeNotFound(stream);
         }
     }
+
+    fn handleConf(self: *ZdbServer, stream: zio.net.Stream, req: proto.ConfCmd) !void {
+        const change_type: raft.ConfChangeType = switch (req.action) {
+            .add => .add_learner,
+            .to_voter => .to_voter,
+            .to_learner => .to_learner,
+            .remove => .remove_node,
+        };
+
+        // Validate address for add commands.
+        if (req.action == .add) {
+            _ = zio.net.IpAddress.parseIpAndPort(req.addr) catch {
+                try proto.writeErr(stream, "invalid address");
+                return;
+            };
+        }
+
+        var ctx = CommitCtx{ .status = .committed };
+        ctx.wg.init();
+        ctx.wg.add(1);
+
+        self.node.proposeConfChange(.{
+            .change_type = change_type,
+            .node_id = req.node_id,
+            .addr = req.addr,
+        }, &onCommit, @ptrCast(&ctx)) catch |err| {
+            log.err("conf change failed: {s}", .{@errorName(err)});
+            try proto.writeErr(stream, @errorName(err));
+            return;
+        };
+
+        ctx.wg.wait() catch {
+            try proto.writeErr(stream, "cancelled");
+            return;
+        };
+
+        switch (ctx.status) {
+            .committed => try proto.writeOk(stream),
+            .not_leader => {
+                const leader = self.node.getLeaderId() orelse 0;
+                try proto.writeNotLeader(stream, leader);
+            },
+            else => try proto.writeErr(stream, @tagName(ctx.status)),
+        }
+    }
 };
 
 const CommitCtx = struct {
     wg: WaitGroup = .{},
-    applier: *StorageApplier,
     status: raft.CommitStatus,
-    ns: u32,
-    key: []const u8,
-    value: []const u8,
-    ts: u64,
 };
 
-fn onCommit(ctx_raw: *anyopaque, entry: raft.ProposalEntry, status: raft.CommitStatus) void {
+fn onCommit(ctx_raw: *anyopaque, _entry: raft.ProposalEntry, status: raft.CommitStatus) void {
+    _ = _entry;
     const ctx: *CommitCtx = @ptrCast(@alignCast(ctx_raw));
     ctx.status = status;
-    if (status == .committed) {
-        const items = [_]Item{.{
-            .key = .{
-                .namespace = ctx.ns,
-                .primary = ctx.key,
-                .timestamp = ctx.ts,
-            },
-            .value = ctx.value,
-        }};
-        _ = ctx.applier.applyMutations(entry.index, &items) catch |err| {
-            log.err("applyMutations failed at index={d}: {s}", .{ entry.index, @errorName(err) });
-        };
-        log.debug("onCommit: applied index={d}", .{entry.index});
-    } else {
-        log.debug("onCommit: status={s} index={d}", .{ @tagName(status), entry.index });
-    }
     ctx.wg.done();
+}
+
+/// Called by raft node's applyCommits for each committed normal entry.
+/// Decodes the mutation and applies it to the storage engine.
+pub fn applyEntryToStorage(ctx_raw: *anyopaque, index: u64, _term: u64, data: []const u8) void {
+    _ = _term;
+    const applier: *StorageApplier = @ptrCast(@alignCast(ctx_raw));
+    const parsed = zen.parseMessageWithTail(data) catch |err| {
+        log.err("on_apply: failed to parse entry at index={d}: {s}", .{ index, @errorName(err) });
+        return;
+    };
+    switch (parsed) {
+        .Mutation => |mutation| {
+            const items = [_]Item{.{
+                .key = .{
+                    .namespace = mutation.namespace(),
+                    .primary = mutation.key(),
+                    .timestamp = mutation.timestamp(),
+                },
+                .value = mutation.value(),
+            }};
+            _ = applier.applyMutations(index, &items) catch |err| {
+                log.err("on_apply: applyMutations failed at index={d}: {s}", .{ index, @errorName(err) });
+            };
+        },
+    }
 }

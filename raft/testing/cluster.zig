@@ -1,8 +1,8 @@
 const std = @import("std");
+const zio = @import("zio");
 const raft = @import("raft");
 pub const Node = raft.Node;
 pub const NodeId = raft.NodeId;
-pub const Inbound = raft.Inbound;
 pub const Config = raft.Config;
 
 pub const TestWalBackend = enum {
@@ -60,13 +60,12 @@ pub const TestCluster = struct {
     nodes: std.AutoHashMap(NodeId, *MetaNode),
     drop_from: std.AutoHashMap(NodeId, void),
     drop_to: std.AutoHashMap(NodeId, void),
-    tick_count: u64,
 
     pub const MetaNode = struct {
         node: *Node,
         wal: TestLog,
-        inbox: std.ArrayList(Inbound),
         peers: []const raft.Peer,
+        group: zio.Group,
     };
 
     pub fn init(
@@ -74,7 +73,7 @@ pub const TestCluster = struct {
         ids: []const NodeId,
         learners: []const NodeId,
         config: Config,
-    ) !TestCluster {
+    ) !*TestCluster {
         var nodes = std.AutoHashMap(NodeId, *MetaNode).init(allocator);
         const drop_from = std.AutoHashMap(NodeId, void).init(allocator);
         const drop_to = std.AutoHashMap(NodeId, void).init(allocator);
@@ -88,111 +87,111 @@ pub const TestCluster = struct {
             entry.* = .{
                 .node = undefined,
                 .wal = try TestLog.init(allocator, id),
-                .inbox = std.ArrayList(Inbound).empty,
                 .peers = peers,
+                .group = .init,
             };
+            var ncfg = config;
+            ncfg.id = id;
+            ncfg.tick_interval_ms = 1; // Fast ticks for tests.
             entry.node = try Node.init(
                 allocator,
-                id,
                 peers,
                 entry.wal.asRaftWAL(),
-                config,
+                ncfg,
                 self_role,
             );
 
             try nodes.put(id, entry);
         }
 
-        return .{
+        const cluster = try allocator.create(TestCluster);
+        cluster.* = .{
             .allocator = allocator,
             .nodes = nodes,
             .drop_from = drop_from,
             .drop_to = drop_to,
-            .tick_count = 0,
         };
+
+        // Register on_send and start coroutines for each node.
+        var node_it = cluster.nodes.valueIterator();
+        while (node_it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            entry.node.on_send = &testSend;
+            entry.node.on_send_ctx = @ptrCast(cluster);
+            entry.group.spawn(Node.tickLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
+            entry.group.spawn(Node.mainLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
+            entry.group.spawn(Node.applyLoop, .{entry.node}) catch {};
+        }
+        return cluster;
+    }
+
+    fn testSend(ctx: *anyopaque, from: NodeId, to: NodeId, payload: []const u8) void {
+        const self: *TestCluster = @ptrCast(@alignCast(ctx));
+        if (self.drop_from.contains(from)) return;
+        if (self.drop_to.contains(to)) return;
+        const dest = self.nodes.get(to) orelse return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        dest.node.inbound_ch.send(.{
+            .message_type = raft.msg_type_raft,
+            .payload = owned,
+        }) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        dest.node.event_ch.trySend(1) catch {};
     }
 
     pub fn deinit(self: *TestCluster) void {
+        // Shut down all nodes — this makes mainLoop/tickLoop/applyLoop exit.
+        var shutdown_it = self.nodes.valueIterator();
+        while (shutdown_it.next()) |entry_ptr| {
+            entry_ptr.*.node.startShutdown();
+        }
+        // Wait for ALL coroutines to finish before any cleanup.
+        var wait_it = self.nodes.valueIterator();
+        while (wait_it.next()) |entry_ptr| {
+            entry_ptr.*.group.wait() catch {};
+        }
+        // Now safe to clean up — no coroutines are running.
         var it = self.nodes.valueIterator();
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
-            for (entry.inbox.items) |msg| {
-                self.allocator.free(msg);
-            }
             entry.node.deinit();
             entry.wal.deinit(self.allocator);
-            entry.inbox.deinit(self.allocator);
             self.allocator.free(entry.peers);
             self.allocator.destroy(entry);
         }
         self.nodes.deinit();
         self.drop_from.deinit();
         self.drop_to.deinit();
+        self.allocator.destroy(self);
     }
 
-    pub fn tickAll(self: *TestCluster) !void {
+    /// Wait until every node has advanced by at least `n` ticks.
+    pub fn waitForTicks(self: *TestCluster, n: u64) void {
+        // Record starting tick counts.
+        var starts: [16]u64 = undefined;
+        var count: usize = 0;
         var it = self.nodes.valueIterator();
         while (it.next()) |entry_ptr| {
-            try entry_ptr.*.node.tick();
+            starts[count] = entry_ptr.*.node.tick_count;
+            count += 1;
         }
-        self.deliverOutbox();
-    }
 
-    pub fn deliverOutbox(self: *TestCluster) void {
-        var it = self.nodes.valueIterator();
-        while (it.next()) |entry_ptr| {
-            const entry = entry_ptr.*;
-            if (self.drop_from.contains(entry.node.id)) {
-                // std.debug.print(
-                //     "[raft] cluster tick={d} drop-from node={d} outbox={d}\n",
-                //     .{ self.tick_count, entry.node.id, entry.node.takeOutbox().len },
-                // );
-                entry.node.clearOutbox();
-                continue;
-            }
-            const outbox = entry.node.takeOutbox();
-            if (outbox.len == 0) continue;
-            for (outbox) |msg| {
-                // std.debug.print(
-                //     "[raft] cluster tick={d} deliver {d}->{d} kind={s} term={d}\n",
-                //     .{ self.tick_count, entry.node.id, msg.to, @tagName(msg.msg), msg.msg.term() },
-                // );
-                if (self.nodes.get(msg.to)) |dest| {
-                    if (self.drop_to.contains(msg.to)) continue;
-                    const inbound: Inbound = self.allocator.dupe(u8, msg.payload) catch {
-                        @panic("raft: encoded message dup failed");
-                    };
-                    _ = dest.inbox.append(self.allocator, inbound) catch {
-                        self.allocator.free(inbound);
-                        @panic("raft: inbox append failed");
-                    };
+        // Poll until all nodes have advanced by n ticks.
+        while (true) {
+            var all_done = true;
+            var i: usize = 0;
+            var it2 = self.nodes.valueIterator();
+            while (it2.next()) |entry_ptr| {
+                if (entry_ptr.*.node.tick_count < starts[i] + n) {
+                    all_done = false;
+                    break;
                 }
+                i += 1;
             }
-            entry.node.clearOutbox();
-        }
-    }
-
-    pub fn deliverInbox(self: *TestCluster) !void {
-        var it = self.nodes.valueIterator();
-        while (it.next()) |entry_ptr| {
-            const entry = entry_ptr.*;
-            if (entry.inbox.items.len == 0) continue;
-            for (entry.inbox.items) |msg| {
-                try entry.node.handleInbound(msg);
-                self.allocator.free(msg);
-            }
-            entry.inbox.clearRetainingCapacity();
-        }
-        self.deliverOutbox();
-    }
-
-    pub fn runTicks(self: *TestCluster, ticks: u32) !void {
-        var i: u32 = 0;
-        while (i < ticks) : (i += 1) {
-            self.tick_count += 1;
-            // std.debug.print("[raft] cluster tick={d} begin\n", .{self.tick_count});
-            try self.tickAll();
-            try self.deliverInbox();
+            if (all_done) return;
+            zio.sleep(zio.Duration.fromMilliseconds(1)) catch return;
         }
     }
 
@@ -203,9 +202,7 @@ pub const TestCluster = struct {
 
     pub fn setDropFrom(self: *TestCluster, id: NodeId, drop: bool) void {
         if (drop) {
-            _ = self.drop_from.put(id, {}) catch {
-                @panic("raft: drop_from insert failed");
-            };
+            _ = self.drop_from.put(id, {}) catch {};
         } else {
             _ = self.drop_from.remove(id);
         }
@@ -213,9 +210,7 @@ pub const TestCluster = struct {
 
     pub fn setDropTo(self: *TestCluster, id: NodeId, drop: bool) void {
         if (drop) {
-            _ = self.drop_to.put(id, {}) catch {
-                @panic("raft: drop_to insert failed");
-            };
+            _ = self.drop_to.put(id, {}) catch {};
         } else {
             _ = self.drop_to.remove(id);
         }
