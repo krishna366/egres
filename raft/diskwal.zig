@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const raftlog = @import("raftwal.zig");
 const zen = @import("buffers_gen");
+const vfs_mod = @import("vfs");
+const zio = @import("zio");
 
 fn readInt(comptime T: type, buf: []const u8, endian: std.builtin.Endian) T {
     const n = @divExact(@typeInfo(T).int.bits, 8);
@@ -92,6 +94,8 @@ pub const Error = error{
     CorruptLogFile,
     InvalidLogOffset,
     InvalidLogHeader,
+    WriteFailed,
+    CrcMismatch,
 } || std.posix.MMapError || std.posix.MSyncError || std.posix.SyncError ||
     std.fs.Dir.OpenError || std.fs.Dir.MakeError || std.fs.File.OpenError ||
     std.fs.Dir.DeleteFileError ||
@@ -123,12 +127,14 @@ fn readSlice(src: []const u8) Error![]const u8 {
     return src[4 .. 4 + size];
 }
 
+pub const EntryType = raftlog.EntryType;
+
 pub const entry = struct {
-    term: u64,
-    index: u64,
-    data_offset: u32,
-    data_len: u32,
-    ty: u16,
+    term: u64 = 0,
+    index: u64 = 0,
+    data_offset: u32 = 0,
+    data_len: u32 = 0,
+    ty: EntryType = .any,
 };
 
 pub const metaFile = struct {
@@ -249,263 +255,392 @@ pub const metaFile = struct {
 
 pub const logFile = struct {
     fid: u64,
-    file: std.fs.File,
-    data: []align(std.heap.page_size_min) u8,
-    base_entry: entry,
+    handle: vfs_mod.FileHandle,
+    allocator: std.mem.Allocator,
+    slots: std.ArrayList(entry), // slots[0] = base entry, slots[1..] = data entries
+    write_offset: u64, // next write position (meaningful for current file)
+    is_current: bool,
 
     fn fname(fid: u64, buf: *[32]u8) Error![]const u8 {
         return std.fmt.bufPrint(buf, "{d:0>5}" ++ log_suffix, .{fid});
     }
 
-    pub fn openPath(path: []const u8, fid: u64) Error!logFile {
-        const cwd = std.fs.cwd();
-        var dir = cwd.openDir(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                try cwd.makePath(path);
-                break :blk try cwd.openDir(path, .{});
-            },
-            else => return err,
-        };
-        defer dir.close();
-        return openInDir(dir, fid);
+    fn fullPath(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, name });
     }
 
-    pub fn openInDir(dir: std.fs.Dir, fid: u64) Error!logFile {
+    /// Open a rotated <fid>.wal file. Reads header to populate in-memory slots.
+    pub fn openRotated(
+        vfs_inst: *const vfs_mod.VFS,
+        alloc: std.mem.Allocator,
+        dir_path: []const u8,
+        fid: u64,
+    ) !logFile {
         var name_buf: [32]u8 = undefined;
         const name = try fname(fid, &name_buf);
+        const path = try fullPath(alloc, dir_path, name);
+        defer alloc.free(path);
 
-        var created = false;
-        var file = dir.openFile(name, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                created = true;
-                break :blk try dir.createFile(name, .{ .read = true, .truncate = false });
-            },
-            else => return err,
-        };
-        errdefer file.close();
+        var handle = try vfs_inst.openFile(alloc, path, .{
+            .mode = .default,
+            .flags = .{ .writable = true },
+        });
+        errdefer handle.close();
 
-        // TODO: logFile sizes are fixed right now to log_file_size. This is easier to reason
-        // about because I'm mmap'ing the files. Later, if I switch to using a io_uring style
-        // or Zig's async await system, it might be better to switch to just files, so we can
-        // better batch up our reads and writes.
-        const st = try file.stat();
-        if (st.size < log_file_size) {
-            try file.setEndPos(log_file_size);
-        }
+        // Read header region to get base entry and slots.
+        const hdr_result = try handle.readAligned(alloc, 0, log_file_offset, .p0);
+        defer hdr_result.free();
+        const hdr = hdr_result.data;
 
-        const map = try std.posix.mmap(
-            null,
-            log_file_size,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
-            .{ .TYPE = .SHARED },
-            file.handle,
-            0,
-        );
-        errdefer std.posix.munmap(map);
-
-        if (created) {
-            // Zero slot area so restart can detect the first empty slot.
-            @memset(map[0..log_file_offset], 0);
-            writeInt(u32, map[0..4], log_header_magic, .little);
-            writeInt(u32, map[4..8], log_header_version, .little);
-            writeInt(u64, map[8..16], 0, .little);
-            writeInt(u64, map[16..24], 0, .little);
-        }
-
-        const magic = readInt(u32, map[0..4], .little);
-        const version = readInt(u32, map[4..8], .little);
+        if (hdr.len < log_header_size) return error.InvalidLogHeader;
+        const magic = readInt(u32, hdr[0..4], .little);
+        const version = readInt(u32, hdr[4..8], .little);
         if (magic != log_header_magic or version != log_header_version) {
             return error.InvalidLogHeader;
         }
+
         const base = entry{
-            .index = readInt(u64, map[8..16], .little),
-            .term = readInt(u64, map[16..24], .little),
+            .index = readInt(u64, hdr[8..16], .little),
+            .term = readInt(u64, hdr[16..24], .little),
             .data_offset = 0,
             .data_len = 0,
-            .ty = 0,
+            .ty = .any,
         };
+
+        // slots[0] = base entry, slots[1..] = data entries decoded from header.
+        var slots_list = std.ArrayList(entry).empty;
+        errdefer slots_list.deinit(alloc);
+        try slots_list.append(alloc, base);
+
+        var slot_idx: usize = first_data_slot;
+        while (slot_idx < max_num_entries) : (slot_idx += 1) {
+            const off = log_header_size + slot_idx * entry_size;
+            if (off + entry_size > hdr.len) break;
+
+            const slot = hdr[off .. off + entry_size];
+            const index_delta = readInt(u16, slot[4..6], .little);
+            if (index_delta == 0) break;
+
+            try slots_list.append(alloc, .{
+                .term = base.term + readInt(u32, slot[0..4], .little),
+                .index = base.index + index_delta,
+                .ty = @enumFromInt(readInt(u16, slot[6..8], .little)),
+                .data_offset = readInt(u32, slot[8..12], .little),
+                .data_len = readInt(u32, slot[12..16], .little),
+            });
+        }
+
+        var wo: u64 = log_file_offset;
+        if (slots_list.items.len > 1) {
+            const last = slots_list.items[slots_list.items.len - 1];
+            wo = last.data_offset + record_header_size + last.data_len;
+        }
 
         return .{
             .fid = fid,
-            .file = file,
-            .data = map,
-            .base_entry = base,
+            .handle = handle,
+            .allocator = alloc,
+            .slots = slots_list,
+            .write_offset = wo,
+            .is_current = false,
+        };
+    }
+
+    /// Open the current (highest fid) WAL file and recover entries by scanning
+    /// CRC-framed records. Reads the entire payload region in one read, then scans in-memory.
+    pub fn openCurrent(
+        vfs_inst: *const vfs_mod.VFS,
+        alloc: std.mem.Allocator,
+        dir_path: []const u8,
+        fid: u64,
+        base: entry,
+    ) !logFile {
+        var name_buf: [32]u8 = undefined;
+        const path = try fullPath(alloc, dir_path, try fname(fid, &name_buf));
+        defer alloc.free(path);
+
+        var handle = try vfs_inst.openFile(alloc, path, .{
+            .mode = .default,
+            .flags = .{ .writable = true },
+        });
+        errdefer handle.close();
+
+        // If the file is smaller than the header region, it was partially created
+        // (crash during createCurrent). Re-create it.
+        if (handle.file_size < log_file_offset) {
+            handle.close();
+            return createCurrent(vfs_inst, alloc, dir_path, fid, base);
+        }
+
+        var slots_list = std.ArrayList(entry).empty;
+        errdefer slots_list.deinit(alloc);
+        try slots_list.append(alloc, base);
+
+        // Single read of entire payload region.
+        const payload_region_size: usize = @intCast(handle.file_size - log_file_offset);
+        const result = handle.readAligned(alloc, log_file_offset, payload_region_size, .p0) catch {
+            return .{
+                .fid = fid,
+                .handle = handle,
+                .allocator = alloc,
+                .slots = slots_list,
+                .write_offset = log_file_offset,
+                .is_current = true,
+            };
+        };
+        defer result.free();
+        const data = result.data;
+
+        // Scan CRC-framed records in the buffer.
+        var pos: usize = 0;
+        while (pos + record_header_size <= data.len) {
+            const stored_crc = readInt(u32, data[pos .. pos + 4], .little);
+            const payload_len = readInt(u32, data[pos + 4 .. pos + 8], .little);
+            if (payload_len == 0) break;
+            if (pos + record_header_size + payload_len > data.len) break;
+
+            const payload = data[pos + record_header_size .. pos + record_header_size + payload_len];
+            if (computeCrc(payload) != stored_crc) {
+                // CRC mismatch — truncate file here.
+                handle.truncate(log_file_offset + pos) catch {};
+                break;
+            }
+
+            const reader = zen.LogEntryReader.parseRoot(payload) catch break;
+            try slots_list.append(alloc, .{
+                .term = reader.term(),
+                .index = reader.index(),
+                .data_offset = @intCast(log_file_offset + pos),
+                .data_len = payload_len,
+                .ty = if (reader.isConfChange()) .conf else .data,
+            });
+
+            pos += record_header_size + payload_len;
+        }
+
+        return .{
+            .fid = fid,
+            .handle = handle,
+            .allocator = alloc,
+            .slots = slots_list,
+            .write_offset = log_file_offset + pos,
+            .is_current = true,
+        };
+    }
+
+    /// Create a new <fid>.wal file with zeroed header region.
+    pub fn createCurrent(
+        vfs_inst: *const vfs_mod.VFS,
+        alloc: std.mem.Allocator,
+        dir_path: []const u8,
+        fid: u64,
+        base: entry,
+    ) !logFile {
+        var name_buf: [32]u8 = undefined;
+        const path = try fullPath(alloc, dir_path, try fname(fid, &name_buf));
+        defer alloc.free(path);
+
+        var handle = try vfs_inst.createFile(path, .{
+            .mode = .default,
+            .flags = .{ .writable = true, .truncate = true },
+        });
+        errdefer handle.close();
+
+        // Write header with magic, version, and base entry. Slot region stays zeroed.
+        const hdr = try alloc.alloc(u8, log_file_offset);
+        defer alloc.free(hdr);
+        @memset(hdr, 0);
+        writeInt(u32, hdr[0..4], log_header_magic, .little);
+        writeInt(u32, hdr[4..8], log_header_version, .little);
+        writeInt(u64, hdr[8..16], base.index, .little);
+        writeInt(u64, hdr[16..24], base.term, .little);
+        try handle.write(hdr, 0, .p0);
+
+        var slots_list = std.ArrayList(entry).empty;
+        try slots_list.append(alloc, base);
+        return .{
+            .fid = fid,
+            .handle = handle,
+            .allocator = alloc,
+            .slots = slots_list,
+            .write_offset = log_file_offset,
+            .is_current = true,
         };
     }
 
     pub fn deinit(self: *logFile) void {
-        std.posix.munmap(self.data);
-        self.file.close();
+        self.slots.deinit(self.allocator);
+        self.handle.close();
     }
 
-    pub fn sync(self: *logFile, hard: bool) Error!void {
-        try std.posix.msync(self.data, if (hard) std.posix.MSF.SYNC else std.posix.MSF.ASYNC);
-        if (hard) {
-            try std.posix.fdatasync(self.file.handle);
-        }
+    pub fn syncFile(self: *logFile) !void {
+        try self.handle.sync();
     }
 
-    pub fn truncate(self: *logFile, size: usize) Error!void {
-        try self.file.setEndPos(size);
+    pub fn truncateFile(self: *logFile, size: u64) !void {
+        try self.handle.truncate(size);
     }
 
-    pub fn entrySlot(self: *const logFile, slot_index: usize) []u8 {
-        std.debug.assert(slot_index < max_num_entries);
-        const off = log_header_size + slot_index * entry_size;
-        return self.data[off .. off + entry_size];
+    /// Number of data entries (excludes base at slots[0]).
+    pub fn numEntries(self: *const logFile) usize {
+        if (self.slots.items.len == 0) return 0;
+        return self.slots.items.len - 1;
     }
+
+    // --- In-memory slot access (no disk I/O) ---
 
     pub fn getEntry(self: *const logFile, slot_index: usize) entry {
-        if (slot_index == 0) return self.base_entry;
-
-        const slot = self.entrySlot(slot_index);
-        const term_delta = readInt(u32, slot[0..4], .little);
-        const index_delta = readInt(u16, slot[4..6], .little);
-        if (index_delta == 0) {
-            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .ty = 0 };
+        if (slot_index >= self.slots.items.len) {
+            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .ty = .any };
         }
-        return .{
-            .term = self.base_entry.term + term_delta,
-            .index = self.base_entry.index + index_delta,
-            .ty = readInt(u16, slot[6..8], .little),
-            .data_offset = readInt(u32, slot[8..12], .little),
-            .data_len = readInt(u32, slot[12..16], .little),
-        };
+        return self.slots.items[slot_index];
     }
 
-    pub fn getIndex(self: *const logFile, slot_index: usize) u64 {
-        std.debug.assert(slot_index < max_num_entries);
-        if (slot_index == 0) return self.base_entry.index;
-
-        const slot = self.entrySlot(slot_index);
-        const index_delta = readInt(u16, slot[4..6], .little);
-        if (index_delta == 0) return 0;
-
-        return self.base_entry.index + index_delta;
-    }
-
-    pub fn setEntry(self: *logFile, slot_index: usize, e: entry) void {
-        if (slot_index == 0) {
-            self.setBaseEntry(e);
-            return;
-        }
-
-        if (e.index == 0) {
-            @memset(self.entrySlot(slot_index), 0);
-            return;
-        }
-
-        std.debug.assert(e.index > self.base_entry.index);
-        std.debug.assert(e.term >= self.base_entry.term);
-        const index_delta = e.index - self.base_entry.index;
-        const term_delta = e.term - self.base_entry.term;
-        std.debug.assert(index_delta <= std.math.maxInt(u16));
-        std.debug.assert(term_delta <= std.math.maxInt(u32));
-        std.debug.assert(e.data_offset <= std.math.maxInt(u32));
-        std.debug.assert(e.data_len <= std.math.maxInt(u32));
-
-        const slot = self.entrySlot(slot_index);
-        writeInt(u32, slot[0..4], @intCast(term_delta), .little);
-        writeInt(u16, slot[4..6], @intCast(index_delta), .little);
-        writeInt(u16, slot[6..8], e.ty, .little);
-        writeInt(u32, slot[8..12], e.data_offset, .little);
-        writeInt(u32, slot[12..16], e.data_len, .little);
-    }
-
-    pub fn setBaseEntry(self: *logFile, e: entry) void {
-        self.base_entry = .{
-            .term = e.term,
-            .index = e.index,
-            .data_offset = 0,
-            .data_len = 0,
-            .ty = 0,
-        };
-        writeInt(u64, self.data[8..16], self.base_entry.index, .little);
-        writeInt(u64, self.data[16..24], self.base_entry.term, .little);
+    pub fn baseEntry(self: *const logFile) entry {
+        return self.slots.items[0];
     }
 
     pub fn firstIndex(self: *const logFile) u64 {
-        return self.base_entry.index + 1;
+        return self.baseEntry().index + 1;
     }
 
     pub fn firstEmptySlot(self: *const logFile) usize {
-        // Slots are contiguous from `first_data_slot` until first empty slot, then zero.
-        // Use lower-bound to find first slot where index == 0.
-        var lo: usize = first_data_slot;
-        var hi: usize = max_num_entries;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.getIndex(mid) == 0) {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        return lo;
+        return self.slots.items.len;
     }
 
     pub fn lastEntry(self: *const logFile) entry {
-        const first_empty = self.firstEmptySlot();
-        if (first_empty <= first_data_slot) return self.base_entry;
-        if (first_empty >= max_num_entries) return self.getEntry(max_num_entries - 1);
-        return self.getEntry(first_empty - 1);
+        return self.slots.items[self.slots.items.len - 1];
     }
 
-    // Returns:
-    // - `-1` if raft_index is before file range
-    // - `[0, max_num_entries)` if found/insert position inside this file
-    // - `max_num_entries` if raft_index is beyond this file range
-    pub fn slotGe(self: *const logFile, raft_index: u64) isize {
-        const base = self.base_entry.index;
-        if (raft_index <= base) return -1;
+    /// Returns slot position for a raft index.
+    /// 0 = before file range (compacted), max_num_entries = beyond file range.
+    pub fn slotGe(self: *const logFile, raft_index: u64) usize {
+        if (raft_index <= self.baseEntry().index) return 0;
 
-        // Slot 0 is reserved for base. Real entries start at slot 1 and map to:
-        // slot = raft_index - base_index.
-        const diff = raft_index - base;
-        if (diff >= max_num_entries) return max_num_entries;
-
-        const idx: usize = @intCast(diff);
-        const stored = self.getIndex(idx);
-        if (stored == 0) return @intCast(idx);
-        std.debug.assert(stored == raft_index);
-        return @intCast(idx);
+        const slot: usize = @intCast(raft_index - self.baseEntry().index);
+        if (slot >= self.slots.items.len) return max_num_entries;
+        std.debug.assert(self.slots.items[slot].index == raft_index);
+        return slot;
     }
 
-    // Returns payload bytes from `[offset, offset + len)`.
-    pub fn sliceAt(self: *const logFile, offset: usize, len: usize) Error![]const u8 {
-        if (offset < log_file_offset or offset >= self.data.len) return error.InvalidLogOffset;
-        if (offset + len > self.data.len) return error.InvalidLogOffset;
-        return self.data[offset .. offset + len];
+    /// Truncate slots and file from slot_index onward.
+    pub fn truncateFromSlot(self: *logFile, from_slot: usize) void {
+        if (from_slot <= first_data_slot) {
+            self.slots.shrinkRetainingCapacity(1); // keep base at [0]
+            self.write_offset = log_file_offset;
+        } else if (from_slot < self.slots.items.len) {
+            self.write_offset = self.slots.items[from_slot].data_offset;
+            self.slots.shrinkRetainingCapacity(from_slot);
+        } else {
+            return;
+        }
+        self.truncateFile(self.write_offset) catch {};
     }
 
-    // Allocates payload region in-place and returns destination bytes plus next offset.
-    pub fn allocateSlice(
+    // --- Disk I/O ---
+
+    /// Append a CRC-framed record to a write buffer (no I/O). Updates in-memory slots.
+    pub fn appendRecordToBuffer(
         self: *logFile,
-        offset: usize,
-        payload_len: usize,
-    ) Error!struct { dst: []u8, next: usize } {
-        if (offset < log_file_offset or offset >= self.data.len) return error.InvalidLogOffset;
-        if (offset + payload_len > self.data.len) return error.InvalidLogOffset;
-        return .{
-            .dst = self.data[offset .. offset + payload_len],
-            .next = offset + payload_len,
-        };
+        buf: *std.ArrayList(u8),
+        entry_bytes: []const u8,
+        reader: zen.LogEntryReader,
+    ) !void {
+        const payload_len: u32 = @intCast(entry_bytes.len);
+        const crc = computeCrc(entry_bytes);
+
+        // Append [crc32c][payload_len][payload_bytes] to buffer.
+        const needed = record_header_size + entry_bytes.len;
+        try buf.ensureUnusedCapacity(self.allocator, needed);
+        var hdr_buf: [record_header_size]u8 = undefined;
+        writeInt(u32, hdr_buf[0..4], crc, .little);
+        writeInt(u32, hdr_buf[4..8], payload_len, .little);
+        buf.appendSliceAssumeCapacity(&hdr_buf);
+        buf.appendSliceAssumeCapacity(entry_bytes);
+
+        // Update in-memory slot table.
+        try self.slots.append(self.allocator, .{
+            .term = reader.term(),
+            .index = reader.index(),
+            .data_offset = @intCast(self.write_offset),
+            .data_len = payload_len,
+            .ty = if (reader.isConfChange()) .conf else .data,
+        });
+        self.write_offset += needed;
+    }
+
+    /// Flush a write buffer to disk in one call.
+    pub fn flushWriteBuffer(self: *logFile, buf: []const u8) !void {
+        if (buf.len == 0) return;
+        try self.handle.write(buf, self.write_offset - buf.len, .p0);
+    }
+
+    /// Extract and verify a single entry's payload from a pre-read buffer.
+    /// `buf` starts at `buf_offset` in the file. Returns a slice into `buf` (no copy).
+    pub fn readPayloadFromBuf(
+        self: *const logFile,
+        slot_index: usize,
+        buf: []const u8,
+        buf_offset: u64,
+    ) ![]const u8 {
+        const ent = self.getEntry(slot_index);
+        if (ent.index == 0) return error.InvalidLogOffset;
+
+        const rec_start = ent.data_offset - @as(u32, @intCast(buf_offset));
+        const rec_end = rec_start + record_header_size + ent.data_len;
+        if (rec_end > buf.len) return error.InvalidLogOffset;
+
+        // const stored_crc = readInt(u32, buf[rec_start .. rec_start + 4], .little);
+        const payload = buf[rec_start + record_header_size .. rec_end];
+        // if (stored_crc != computeCrc(payload)) return error.CrcMismatch;
+
+        return payload;
+    }
+
+    /// Write the header region for rotation: magic, version, base entry, delta-encoded slots.
+    pub fn writeHeader(self: *logFile) !void {
+        var hdr_buf = try self.allocator.alloc(u8, log_file_offset);
+        defer self.allocator.free(hdr_buf);
+        @memset(hdr_buf, 0);
+
+        writeInt(u32, hdr_buf[0..4], log_header_magic, .little);
+        writeInt(u32, hdr_buf[4..8], log_header_version, .little);
+        writeInt(u64, hdr_buf[8..16], self.baseEntry().index, .little);
+        writeInt(u64, hdr_buf[16..24], self.baseEntry().term, .little);
+
+        // Write data entries (skip base at [0]).
+        for (1..self.slots.items.len) |si| {
+            const off = log_header_size + si * entry_size;
+            if (off + entry_size > hdr_buf.len) break;
+            const ent = self.slots.items[si];
+
+            writeInt(u32, hdr_buf[off .. off + 4], @intCast(ent.term - self.baseEntry().term), .little);
+            writeInt(u16, hdr_buf[off + 4 .. off + 6], @intCast(ent.index - self.baseEntry().index), .little);
+            writeInt(u16, hdr_buf[off + 6 .. off + 8], @intFromEnum(ent.ty), .little);
+            writeInt(u32, hdr_buf[off + 8 .. off + 12], ent.data_offset, .little);
+            writeInt(u32, hdr_buf[off + 12 .. off + 16], ent.data_len, .little);
+        }
+
+        try self.handle.write(hdr_buf, 0, .p0);
     }
 };
 
 pub const wal = struct {
     allocator: std.mem.Allocator,
+    vfs_inst: *const vfs_mod.VFS,
     dir_path: []u8,
-    files: std.ArrayList(logFile),
-    current: logFile,
-    next_entry_idx: usize,
+    files: std.ArrayList(logFile), // all files; last is current
+    current: *logFile, // points to files.items[files.items.len - 1]
+    cache: EntryCache,
+    next_fid: u64,
+    mu: zio.RwLock,
 
     const Pos = struct {
-        file_idx: isize, // -1 means current
-        slot_idx: isize,
+        file_idx: usize,
+        slot_idx: usize, // 0 = not found / compacted
     };
 
-    fn parseWalFid(name: []const u8) ?u64 {
+    pub fn parseWalFid(name: []const u8) ?u64 {
         if (!std.mem.endsWith(u8, name, log_suffix)) return null;
         const base = name[0 .. name.len - log_suffix.len];
         if (base.len == 0) return null;
@@ -517,24 +652,32 @@ pub const wal = struct {
         return if (fid == 0) null else fid;
     }
 
+    fn deleteFileByName(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8) void {
+        const path = logFile.fullPath(alloc, dir_path, name) catch return;
+        defer alloc.free(path);
+        vfs_mod.VFS.deleteFile(path) catch {};
+    }
+
     fn deleteFileByFid(self: *wal, fid: u64) void {
         var name_buf: [32]u8 = undefined;
         const name = logFile.fname(fid, &name_buf) catch return;
-        const cwd = std.fs.cwd();
-        var dir = cwd.openDir(self.dir_path, .{}) catch return;
-        defer dir.close();
-        dir.deleteFile(name) catch {};
+        deleteFileByName(self.allocator, self.dir_path, name);
     }
 
-    fn deleteFidFiles(dir: std.fs.Dir, fids: []const u64) void {
-        var name_buf: [32]u8 = undefined;
+    fn deleteFidFiles(alloc: std.mem.Allocator, dir_path: []const u8, fids: []const u64) void {
         for (fids) |fid| {
+            var name_buf: [32]u8 = undefined;
             const name = logFile.fname(fid, &name_buf) catch continue;
-            dir.deleteFile(name) catch {};
+            deleteFileByName(alloc, dir_path, name);
         }
     }
 
-    pub fn openPath(path: []const u8, alloc: std.mem.Allocator) Error!wal {
+    pub fn openPath(
+        path: []const u8,
+        alloc: std.mem.Allocator,
+        vfs_inst: *const vfs_mod.VFS,
+        cache_capacity: usize,
+    ) !wal {
         const cwd = std.fs.cwd();
         cwd.access(path, .{}) catch |err| switch (err) {
             error.FileNotFound => try cwd.makePath(path),
@@ -546,33 +689,43 @@ pub const wal = struct {
         var dir = try cwd.openDir(path, .{ .iterate = true });
         defer dir.close();
 
-        // Discover all segment file ids and sort ascending for replay/recovery.
+        // Discover all segment file ids, sorted ascending.
         var found_fids = std.ArrayList(u64).empty;
         defer found_fids.deinit(alloc);
 
         var it = dir.iterate();
         while (try it.next()) |entry_dir| {
             if (entry_dir.kind != .file) continue;
-
             const fid = parseWalFid(entry_dir.name) orelse continue;
             try found_fids.append(alloc, fid);
         }
         std.mem.sort(u64, found_fids.items, {}, comptime std.sort.asc(u64));
 
-        // No segments yet: initialize first file as current.
+        // No files: create the first one.
         if (found_fids.items.len == 0) {
-            var cur = try logFile.openPath(path, 1);
-            errdefer cur.deinit();
+            const base = entry{};
+            var files = std.ArrayList(logFile).empty;
+            errdefer {
+                for (files.items) |*lf| lf.deinit();
+                files.deinit(alloc);
+            }
+            try files.append(alloc, try logFile.createCurrent(vfs_inst, alloc, path, 1, base));
+            var entry_cache = try EntryCache.init(alloc, cache_capacity);
+            errdefer entry_cache.deinit();
             return .{
                 .allocator = alloc,
+                .vfs_inst = vfs_inst,
                 .dir_path = dir_copy,
-                .files = std.ArrayList(logFile).empty,
-                .current = cur,
-                .next_entry_idx = cur.firstEmptySlot(),
+                .files = files,
+                .current = &files.items[files.items.len - 1],
+                .cache = entry_cache,
+                .next_fid = 2,
+                .mu = .init,
             };
         }
 
-        // Open all segments in order, and drop malformed trailing files.
+        // Open all files except the last as rotated (read slots from header).
+        // The last (highest fid) is the current file (scan CRC from data).
         var opened = std.ArrayList(logFile).empty;
         errdefer {
             for (opened.items) |*lf| lf.deinit();
@@ -580,8 +733,10 @@ pub const wal = struct {
         }
         var first_bad: ?usize = null;
         var prev_entry: ?entry = null;
-        for (found_fids.items, 0..) |fid, idx| {
-            var lf = logFile.openInDir(dir, fid) catch |err| switch (err) {
+        // Open all files except the one with highest fid -- that's the current file.
+        for (0..found_fids.items.len - 1) |idx| {
+            const fid = found_fids.items[idx];
+            var lf = logFile.openRotated(vfs_inst, alloc, path, fid) catch |err| switch (err) {
                 error.InvalidLogHeader, error.CorruptLogFile => {
                     first_bad = idx;
                     break;
@@ -591,16 +746,16 @@ pub const wal = struct {
 
             // Every next file must chain from previous file's last entry.
             if (prev_entry) |prev| {
-                if (lf.base_entry.index != prev.index or lf.base_entry.term != prev.term) {
+                if (lf.baseEntry().index != prev.index or lf.baseEntry().term != prev.term) {
                     lf.deinit();
                     first_bad = idx;
                     break;
                 }
             }
 
-            // If this segment has no data entry at slot 1, but there are newer files,
+            // If this segment has no data entries but there are newer files,
             // treat this and later files as invalid trailing data.
-            if (lf.getIndex(first_data_slot) == 0 and idx + 1 < found_fids.items.len) {
+            if (lf.numEntries() == 0 and idx + 1 < found_fids.items.len - 1) {
                 lf.deinit();
                 first_bad = idx;
                 break;
@@ -617,56 +772,84 @@ pub const wal = struct {
                     .{ found_fids.items[bad_idx], path },
                 );
             }
-            deleteFidFiles(dir, found_fids.items[bad_idx..]);
-        }
+            // Delete malformed file. This would also delete the would-be current file
+            // (highest fid) since it's in the bad range.
+            deleteFidFiles(alloc, path, found_fids.items[bad_idx..]);
 
-        // If all discovered files were malformed, start fresh with file 1.
-        if (opened.items.len == 0) {
-            var cur = try logFile.openPath(path, 1);
-            errdefer cur.deinit();
+            // Good rotated files remain. Create a new current file after them.
+            if (opened.items.len > 0) {
+                const last = opened.items[opened.items.len - 1];
+                const current = try logFile.createCurrent(vfs_inst, alloc, path, last.fid + 1, last.lastEntry());
+                try opened.append(alloc, current);
+
+                var entry_cache = try EntryCache.init(alloc, cache_capacity);
+                errdefer entry_cache.deinit();
+                return .{
+                    .allocator = alloc,
+                    .vfs_inst = vfs_inst,
+                    .dir_path = dir_copy,
+                    .files = opened,
+                    .current = &opened.items[opened.items.len - 1],
+                    .cache = entry_cache,
+                    .next_fid = current.fid + 1,
+                    .mu = .init,
+                };
+            }
+
+            // All files were malformed — start fresh.
+            const base = entry{};
+            var files = std.ArrayList(logFile).empty;
+            errdefer {
+                for (files.items) |*lf| lf.deinit();
+                files.deinit(alloc);
+            }
+            try files.append(alloc, try logFile.createCurrent(vfs_inst, alloc, path, 1, base));
+            var entry_cache = try EntryCache.init(alloc, cache_capacity);
+            errdefer entry_cache.deinit();
             return .{
                 .allocator = alloc,
+                .vfs_inst = vfs_inst,
                 .dir_path = dir_copy,
-                .files = std.ArrayList(logFile).empty,
-                .current = cur,
-                .next_entry_idx = cur.firstEmptySlot(),
+                .files = files,
+                .current = &files.items[files.items.len - 1],
+                .cache = entry_cache,
+                .next_fid = 2,
+                .mu = .init,
             };
         }
 
-        // Last opened file is the active segment. Earlier ones are immutable history.
-        var cur = opened.pop().?;
-        var files = std.ArrayList(logFile).empty;
-        errdefer {
-            for (files.items) |*lf| lf.deinit();
-            files.deinit(alloc);
-            cur.deinit();
-        }
-        try files.ensureTotalCapacity(alloc, opened.items.len);
-        for (opened.items) |lf| {
-            files.appendAssumeCapacity(lf);
-        }
-        opened.deinit(alloc);
+        // Open the highest fid as the current file (CRC scan recovery).
+        const cur_fid = found_fids.items[found_fids.items.len - 1];
+        const cur_base = if (opened.items.len > 0)
+            opened.items[opened.items.len - 1].lastEntry()
+        else
+            entry{};
+
+        try opened.append(alloc, try logFile.openCurrent(vfs_inst, alloc, path, cur_fid, cur_base));
+
+        var entry_cache = try EntryCache.init(alloc, cache_capacity);
+        errdefer entry_cache.deinit();
 
         return .{
             .allocator = alloc,
+            .vfs_inst = vfs_inst,
             .dir_path = dir_copy,
-            .files = files,
-            .current = cur,
-            .next_entry_idx = cur.firstEmptySlot(),
+            .files = opened,
+            .current = &opened.items[opened.items.len - 1],
+            .cache = entry_cache,
+            .next_fid = cur_fid + 1,
+            .mu = .init,
         };
     }
 
     pub fn deinit(self: *wal) void {
-        var i: usize = 0;
-        while (i < self.files.items.len) : (i += 1) {
-            self.files.items[i].deinit();
-        }
+        self.cache.deinit();
+        for (self.files.items) |*lf| lf.deinit();
         self.files.deinit(self.allocator);
-        self.current.deinit();
         self.allocator.free(self.dir_path);
     }
 
-    pub fn firstIndex(self: *const wal) u64 {
+    pub fn firstIndex(self: *wal) u64 {
         const fi = if (self.files.items.len == 0)
             self.current.firstIndex()
         else
@@ -674,9 +857,9 @@ pub const wal = struct {
         return if (fi == 0) 1 else fi;
     }
 
-    pub fn lastIndex(self: *const wal) u64 {
-        if (self.next_entry_idx > first_data_slot) {
-            return self.current.getIndex(self.next_entry_idx - 1);
+    pub fn lastIndex(self: *wal) u64 {
+        if (self.current.slots.items.len > 0) {
+            return self.current.slots.items[self.current.slots.items.len - 1].index;
         }
         var i = self.files.items.len;
         while (i > 0) : (i -= 1) {
@@ -686,23 +869,19 @@ pub const wal = struct {
         return 0;
     }
 
-    fn getEntryFile(self: *wal, file_idx: isize) ?*logFile {
-        if (file_idx == -1) return &self.current;
-        if (file_idx < 0) return null;
-        const idx: usize = @intCast(file_idx);
-        if (idx >= self.files.items.len) return null;
-        return &self.files.items[idx];
+    fn getEntryFile(self: *wal, file_idx: usize) ?*logFile {
+        if (file_idx >= self.files.items.len) return null;
+        return &self.files.items[file_idx];
     }
 
-    fn slotGe(self: *const wal, raft_index: u64) Pos {
-        // Fast path: most reads hit the active log file.
-        const off_cur = self.current.slotGe(raft_index);
-        if (off_cur >= 0) return .{ .file_idx = -1, .slot_idx = off_cur };
+    fn slotGe(self: *wal, raft_index: u64) Pos {
+        if (self.files.items.len == 0) return .{ .file_idx = 0, .slot_idx = 0 };
 
-        if (self.files.items.len == 0) return .{ .file_idx = -1, .slot_idx = -1 };
+        // Fast path: most reads hit the current (last) file.
+        const cur_off = self.current.slotGe(raft_index);
+        if (cur_off > 0) return .{ .file_idx = self.files.items.len - 1, .slot_idx = cur_off };
 
-        // Binary-search historical files by their first index to find the first
-        // file whose range can contain `raft_index`.
+        // Binary-search all files by their first index.
         var lo: usize = 0;
         var hi: usize = self.files.items.len;
         while (lo < hi) {
@@ -713,29 +892,25 @@ pub const wal = struct {
                 lo = mid + 1;
             }
         }
-        var file_idx: usize = lo;
-        // Exact boundary hit: first real entry is at slot 1.
-        if (file_idx < self.files.items.len and self.files.items[file_idx].firstIndex() == raft_index) {
-            return .{ .file_idx = @intCast(file_idx), .slot_idx = first_data_slot };
+        if (lo < self.files.items.len and self.files.items[lo].firstIndex() == raft_index) {
+            return .{ .file_idx = lo, .slot_idx = first_data_slot };
         }
 
-        // Otherwise, step back to the previous file and do an in-file lower-bound.
-        if (file_idx > 0) file_idx -= 1;
-        const off = self.files.items[file_idx].slotGe(raft_index);
-        return .{ .file_idx = @intCast(file_idx), .slot_idx = off };
+        if (lo > 0) lo -= 1;
+        return .{ .file_idx = lo, .slot_idx = self.files.items[lo].slotGe(raft_index) };
     }
 
     fn seekEntry(self: *wal, raft_index: u64) (Error || raftlog.RaftLogError || err_not_found)!entry {
         if (raft_index == 0) {
-            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .ty = 0 };
+            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .ty = .any };
         }
 
         const pos = self.slotGe(raft_index);
-        if (pos.slot_idx < 0) return raftlog.RaftLogError.Compacted;
+        if (pos.slot_idx == 0) return raftlog.RaftLogError.Compacted;
         if (pos.slot_idx >= max_num_entries) return raftlog.RaftLogError.Unavailable;
 
         const lf = self.getEntryFile(pos.file_idx) orelse return raftlog.RaftLogError.Unavailable;
-        const ent = lf.getEntry(@intCast(pos.slot_idx));
+        const ent = lf.getEntry(pos.slot_idx);
         if (ent.index == 0) return raftlog.RaftLogError.Unavailable;
         if (ent.index != raft_index) return err_not_found.NotFound;
         return ent;
@@ -746,142 +921,229 @@ pub const wal = struct {
         return ent.term;
     }
 
+    const ReadPlan = struct {
+        scan_start: usize,
+        scan_end: usize,
+        match_count: usize,
+        disk_first_offset: u32,
+        disk_end_offset: u32,
+        disk_bytes: u64,
+        hit_hi: bool, // stopped because we reached opts.hi
+        hit_budget: bool, // stopped because of max_bytes
+    };
+
+    /// Scan a file's in-memory slots to plan the read strategy.
+    /// Checks type filter, cache, and byte budget. No I/O.
+    fn planFileRead(
+        self: *wal,
+        lf: *const logFile,
+        start: usize,
+        opts: raftlog.EntriesRangeOpts,
+        bytes_so_far: u64,
+    ) ReadPlan {
+        var plan = ReadPlan{
+            .scan_start = start,
+            .scan_end = start, // scan_end points one past valid entry
+            .match_count = 0,
+            .disk_first_offset = 0,
+            .disk_end_offset = 0,
+            .disk_bytes = 0,
+            .hit_hi = false,
+            .hit_budget = false,
+        };
+
+        const last_slot = lf.firstEmptySlot();
+        var scan_idx = start;
+        while (scan_idx < last_slot) : (scan_idx += 1) {
+            const ent = lf.getEntry(scan_idx);
+            if (ent.index == 0) break;
+            if (ent.index >= opts.hi) {
+                plan.hit_hi = true;
+                break;
+            }
+
+            // Apply type filter.
+            if (opts.ty != .any and ent.ty != opts.ty) continue;
+
+            // Check budget before including this entry.
+            if (plan.match_count > 0 and opts.max_bytes > 0 and
+                bytes_so_far + plan.disk_bytes + ent.data_len > opts.max_bytes)
+            {
+                plan.hit_budget = true;
+                break;
+            }
+
+            plan.match_count += 1;
+
+            // Only count toward disk span if not in cache.
+            if (self.cache.lookup(ent.index) == null) {
+                const rec_end: u32 = ent.data_offset + @as(u32, record_header_size) + ent.data_len;
+                if (plan.disk_bytes == 0) plan.disk_first_offset = ent.data_offset;
+                plan.disk_end_offset = rec_end;
+                plan.disk_bytes += ent.data_len;
+            }
+        }
+        plan.scan_end = scan_idx;
+
+        return plan;
+    }
+
+    /// Read entries matching opts. Returns EntriesResult backed by an arena.
+    /// Two-pass approach per file:
+    ///   1. Plan: scan in-memory slots, check cache, compute disk span.
+    ///   2. Read: bulk read if disk matches are dense (>= 50% of span),
+    ///      individual reads if sparse. Cache hits copied into arena.
+    /// Caller must call result.deinit() when done.
     pub fn allEntries(
         self: *wal,
-        alloc: std.mem.Allocator,
-        lo: u64,
-        hi: u64,
-        max_size: u64,
-    ) (Error || raftlog.RaftLogError)![]raftlog.StoredEntry {
+        parent_alloc: std.mem.Allocator,
+        opts: raftlog.EntriesRangeOpts,
+    ) !raftlog.EntriesResult {
+        var arena = std.heap.ArenaAllocator.init(parent_alloc);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
         var out = std.ArrayList(raftlog.StoredEntry).empty;
-        errdefer out.deinit(alloc);
+        var eof = true;
 
-        var pos = self.slotGe(lo);
-        if (pos.slot_idx < 0) pos.slot_idx = first_data_slot;
+        var pos = self.slotGe(opts.lo);
+        if (pos.slot_idx == 0) pos.slot_idx = first_data_slot;
 
-        var size: u64 = 0;
+        var total_size: u64 = 0;
         var file_idx = pos.file_idx;
         var slot_idx = pos.slot_idx;
-        var lf = self.getEntryFile(file_idx) orelse return out.toOwnedSlice(alloc);
 
-        while (true) {
-            if (slot_idx >= max_num_entries) {
-                if (file_idx == -1) break;
+        outer: while (file_idx < self.files.items.len) {
+            const lf = &self.files.items[file_idx];
+
+            if (slot_idx >= lf.firstEmptySlot()) {
                 file_idx += 1;
-                if (@as(usize, @intCast(file_idx)) >= self.files.items.len) {
-                    file_idx = -1;
-                }
                 slot_idx = first_data_slot;
-                lf = self.getEntryFile(file_idx) orelse break;
-            }
-
-            const ent = lf.getEntry(@intCast(slot_idx));
-            if (ent.index == 0) {
-                slot_idx = max_num_entries;
                 continue;
             }
-            if (ent.index >= hi) break;
 
-            const payload = try lf.sliceAt(ent.data_offset, ent.data_len);
-            size += payload.len;
-            if (out.items.len > 0 and max_size > 0 and size > max_size) break;
+            // === Pass 1: Plan — scan this file's slots, check cache, compute disk span ===
+            const plan = self.planFileRead(lf, @intCast(slot_idx), opts, total_size);
+            if (plan.hit_budget) eof = false;
 
-            try out.append(alloc, .{
-                .index = ent.index,
-                .term = ent.term,
-                .data_len = @intCast(payload.len),
-                // Borrow payload directly from mmap. Caller must not free these bytes.
-                .bytes = payload,
-            });
-            slot_idx += 1;
+            if (plan.match_count == 0) {
+                slot_idx = @intCast(plan.scan_end);
+                if (plan.hit_hi) break :outer;
+                continue;
+            }
+
+            // === Pass 2: Read — bulk or individual based on density of uncached entries ===
+            var bulk_buf: ?[]const u8 = null;
+
+            if (plan.disk_bytes > 0) {
+                const span = plan.disk_end_offset - plan.disk_first_offset;
+                const use_bulk = (span <= 2 * plan.disk_bytes);
+                if (use_bulk) {
+                    // One read for the whole span of uncached entries.
+                    const result = try lf.handle.readAligned(alloc, plan.disk_first_offset, span, .p0);
+                    // result.buf (if any) lives in the arena, so no need to free.
+                    bulk_buf = result.data;
+                }
+            }
+
+            // Resolve cache/bulk hits and collect disk read requests in one pass.
+            var requests = std.ArrayList(vfs_mod.FileHandle.ReadRequest).empty;
+            for (plan.scan_start..plan.scan_end) |si| {
+                const ent = lf.getEntry(si);
+                if (ent.index == 0) continue;
+                if (opts.ty != .any and ent.ty != opts.ty) continue;
+
+                // Re-check budget (rounding safety).
+                if (out.items.len > 0 and opts.max_bytes > 0 and total_size + ent.data_len > opts.max_bytes) {
+                    eof = false;
+                    break :outer;
+                }
+                total_size += ent.data_len;
+
+                try out.append(alloc, .{ .index = ent.index, .term = ent.term });
+                const sep = &out.items[out.items.len - 1];
+
+                if (self.cache.lookup(ent.index)) |ce| {
+                    sep.bytes = try alloc.dupe(u8, ce.bytes);
+                } else if (bulk_buf) |buf| {
+                    sep.bytes = lf.readPayloadFromBuf(si, buf, plan.disk_first_offset) catch |err| {
+                        const e = lf.getEntry(si);
+                        std.log.err("readPayloadFromBuf failed si={d} idx={d} data_off={d} data_len={d} buf_off={d} buf_len={d} err={}", .{
+                            si, e.index, e.data_offset, e.data_len, plan.disk_first_offset, buf.len, err,
+                        });
+                        return err;
+                    };
+                } else {
+                    // Needs disk read. Append placeholder, queue a read request
+                    // with ctx pointing at the StoredEntry to fill later.
+                    try requests.append(alloc, .{
+                        .offset = ent.data_offset,
+                        .len = record_header_size + ent.data_len,
+                        .ctx = sep,
+                    });
+                }
+            }
+
+            // Batch read all entries needing disk I/O.
+            if (requests.items.len > 0) {
+                try lf.handle.batchRead(&arena, requests.items, .p0);
+                for (requests.items) |req| {
+                    const se: *raftlog.StoredEntry = @ptrCast(@alignCast(req.ctx.?));
+                    se.bytes = req.data[record_header_size..];
+                }
+            }
+
+            slot_idx = @intCast(plan.scan_end);
+            if (plan.hit_hi) break :outer;
         }
-        return out.toOwnedSlice(alloc);
+        return .{
+            .entries = try out.toOwnedSlice(alloc),
+            .arena = arena,
+            .eof = eof,
+        };
     }
 
-    fn zeroEntrySlots(lf: *logFile, start_slot: usize, end_slot: usize) void {
-        const start = @max(start_slot, first_data_slot);
-        if (end_slot <= start) return;
-        const from = log_header_size + start * entry_size;
-        const to = log_header_size + end_slot * entry_size;
-        @memset(lf.data[from..to], 0);
+    /// Flush pending writes, write header to current file, then create a new file.
+    fn rotate(self: *wal, write_buf: *std.ArrayList(u8)) !void {
+        // Flush any pending writes before rotation.
+        try self.current.flushWriteBuffer(write_buf.items);
+        write_buf.shrinkRetainingCapacity(0);
+
+        const prev = self.current.lastEntry();
+
+        // Write header with slot metadata, truncate to actual data, sync.
+        try self.current.writeHeader();
+        try self.current.truncateFile(self.current.write_offset);
+        try self.current.syncFile();
+
+        // Mark current as rotated.
+        self.current.is_current = false;
+
+        // Create the next WAL file and append to list.
+        try self.files.append(self.allocator, try logFile.createCurrent(self.vfs_inst, self.allocator, self.dir_path, self.next_fid, prev));
+        self.current = &self.files.items[self.files.items.len - 1];
+        self.next_fid += 1;
     }
 
-    fn rotate(self: *wal, first_index: u64, payload_offset: usize) Error!void {
-        std.debug.assert(first_index > 0);
-        try self.current.truncate(payload_offset);
-        try self.current.sync(true);
-
-        const prev = self.current.getEntry(self.next_entry_idx - 1);
-        // Invariant: `current` always has the highest file id.
-        for (self.files.items) |lf| {
-            std.debug.assert(lf.fid < self.current.fid);
-        }
-        const next_fid = self.current.fid + 1;
-
-        var next = try logFile.openPath(self.dir_path, next_fid);
-        next.setBaseEntry(prev);
-        try self.files.append(self.allocator, self.current);
-        self.current = next;
-        self.next_entry_idx = first_data_slot;
-    }
-
-    pub fn addEntries(self: *wal, entries: []const raftlog.LogEntryBuffer) (Error || raftlog.RaftLogError)!void {
+    pub fn addEntries(self: *wal, entries: []const raftlog.LogEntryBuffer) !void {
         if (entries.len == 0) return;
 
-        // Find where this batch begins in WAL space. If the leader is overwriting
-        // conflicting suffix entries, this points to the replacement position.
+        // If the leader is overwriting conflicting suffix entries,
+        // truncate from the first new entry's index onward.
         const first_reader = try entries[0].initReader();
         const first_index = first_reader.index();
-        const pos = self.slotGe(first_index);
-
-        if (pos.slot_idx >= 0) {
-            const slot: usize = @intCast(pos.slot_idx);
-            if (pos.file_idx == -1) {
-                // Overwrite in current file: clear suffix [slot, next_entry_idx).
-                if (self.next_entry_idx > slot) {
-                    zeroEntrySlots(&self.current, slot, self.next_entry_idx);
-                }
-                self.next_entry_idx = slot;
-            } else {
-                // Overwrite in an older file: make that file current, drop newer files,
-                // and clear suffix from overwrite slot to end of file.
-                const fidx: usize = @intCast(pos.file_idx);
-                const new_current = self.files.orderedRemove(fidx);
-                while (self.files.items.len > fidx) {
-                    var extra = self.files.pop().?;
-                    self.deleteFileByFid(extra.fid);
-                    extra.deinit();
-                }
-                // We are rolling current back to an older segment. Drop the
-                // previous current segment file from disk so reopen cannot
-                // resurrect stale tail entries.
-                self.deleteFileByFid(self.current.fid);
-                self.current.deinit();
-                self.current = new_current;
-                zeroEntrySlots(&self.current, slot, max_num_entries);
-                self.next_entry_idx = slot;
-            }
+        if (first_index <= self.lastIndex()) {
+            self.truncateFrom(first_index);
         }
 
         // Raft invariant: written indices must be strictly contiguous.
-        // - if we already have data, batch must start at last_index + 1
-        // - within batch, every entry must be previous + 1
-        if (self.next_entry_idx > first_data_slot) {
-            const prev_index = self.current.getIndex(self.next_entry_idx - 1);
-            if (prev_index == 0 or first_index != prev_index + 1) return raftlog.RaftLogError.Invalid;
-        } else if (first_index != self.current.base_entry.index + 1) {
-            return raftlog.RaftLogError.Invalid;
-        }
+        if (first_index != self.current.lastEntry().index + 1) return raftlog.RaftLogError.Invalid;
 
-        // Compute payload append position from the previous entry payload tail.
-        var payload_offset: usize = log_file_offset;
-        if (self.next_entry_idx > first_data_slot) {
-            const prev = self.current.getEntry(self.next_entry_idx - 1);
-            payload_offset = prev.data_offset + prev.data_len;
-        }
+        // Batch writes into a single buffer, flush once (or per rotation boundary).
+        var write_buf = std.ArrayList(u8).empty;
+        defer write_buf.deinit(self.allocator);
 
-        // This loop validates batch-internal continuity. The check above validates
-        // continuity against already persisted WAL state, while also writing the entries to the log.
+        // This loop validates batch-internal continuity while buffering writes.
         var expected_index = first_index;
         for (entries) |entry_buf| {
             const reader = try entry_buf.initReader();
@@ -889,98 +1151,74 @@ pub const wal = struct {
             expected_index += 1;
 
             const bytes = entry_buf.bytes orelse return raftlog.RaftLogError.Invalid;
-            if (self.next_entry_idx >= max_num_entries or payload_offset + bytes.len > log_file_size) {
-                // Segment full: persist and rotate, then continue writes in new file.
-                try self.rotate(reader.index(), payload_offset);
-                payload_offset = log_file_offset;
+            if (self.current.firstEmptySlot() >= max_num_entries or
+                self.current.write_offset + record_header_size + bytes.len > log_file_size)
+            {
+                // Segment full: flush buffer, rotate, continue in new file.
+                // rotate() flushes write_buf and resets it.
+                try self.rotate(&write_buf);
             }
 
-            // Write raw encoded log-entry bytes in payload area and place fixed entry
-            // metadata into slot region for fast index/term lookups.
-            const alloc_res = try self.current.allocateSlice(payload_offset, bytes.len);
-            @memcpy(alloc_res.dst, bytes);
+            // Buffer the CRC-framed record (no I/O), update in-memory slots.
+            try self.current.appendRecordToBuffer(&write_buf, bytes, reader);
 
-            self.current.setEntry(self.next_entry_idx, .{
-                .term = reader.term(),
-                .index = reader.index(),
-                .data_offset = @intCast(payload_offset),
-                .data_len = @intCast(bytes.len),
-                .ty = if (reader.isConfChange()) 1 else 0,
-            });
-            self.next_entry_idx += 1;
-            payload_offset = alloc_res.next;
+            // Populate cache.
+            self.cache.append(reader.index(), reader.term(), bytes) catch {};
         }
+
+        // Flush remaining writes in one call.
+        try self.current.flushWriteBuffer(write_buf.items);
     }
 
     pub fn deleteBefore(self: *wal, raft_index: u64) void {
         const pos = self.slotGe(raft_index);
-        if (pos.slot_idx < 0) return;
+        if (pos.slot_idx == 0) return;
 
-        if (pos.file_idx == -1) {
-            while (self.files.items.len > 0) {
-                var ef = self.files.pop().?;
-                ef.deinit();
-            }
-            return;
+        for (self.files.items[0..pos.file_idx]) |*lf| {
+            self.deleteFileByFid(lf.fid);
+            lf.deinit();
         }
-
-        const keep_from: usize = @intCast(pos.file_idx);
-        var i: usize = 0;
-        while (i < keep_from and i < self.files.items.len) : (i += 1) {
-            self.files.items[i].deinit();
-        }
-        if (keep_from > 0 and keep_from <= self.files.items.len) {
-            const remain = self.files.items[keep_from..];
-            std.mem.copyForwards(logFile, self.files.items[0..remain.len], remain);
-            self.files.items.len = remain.len;
-        }
+        self.files.replaceRangeAssumeCapacity(0, pos.file_idx, &.{});
+        self.current = &self.files.items[self.files.items.len - 1];
+        self.cache.evictBefore(raft_index);
     }
 
     pub fn reset(self: *wal) void {
         while (self.files.items.len > 0) {
             var ef = self.files.pop().?;
+            self.deleteFileByFid(ef.fid);
             ef.deinit();
         }
-        @memset(self.current.data[0..log_file_offset], 0);
-        writeInt(u32, self.current.data[0..4], log_header_magic, .little);
-        writeInt(u32, self.current.data[4..8], log_header_version, .little);
-        self.current.setBaseEntry(.{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .ty = 0 });
-        self.next_entry_idx = first_data_slot;
+        self.current.slots.items[0] = .{};
+        self.current.slots.shrinkRetainingCapacity(1);
+        self.current.write_offset = log_file_offset;
+        self.cache.clear();
     }
 
     // Drops entries from `from_index` onward, keeping prefix entries intact.
     // This is used by Raft conflict resolution when a leader overwrites suffix.
-    pub fn truncateFrom(self: *wal, from_index: u64) Error!void {
+    pub fn truncateFrom(self: *wal, from_index: u64) void {
         const pos = self.slotGe(from_index);
-        if (pos.slot_idx < 0) return;
+        if (pos.slot_idx == 0) return;
 
-        const slot: usize = @intCast(pos.slot_idx);
-        if (pos.file_idx == -1) {
-            if (self.next_entry_idx > slot) {
-                zeroEntrySlots(&self.current, slot, self.next_entry_idx);
-            }
-            self.next_entry_idx = slot;
-            return;
-        }
-
-        const fidx: usize = @intCast(pos.file_idx);
-        const new_current = self.files.orderedRemove(fidx);
-        while (self.files.items.len > fidx) {
+        // Delete all files after the target file.
+        while (self.files.items.len > pos.file_idx + 1) {
             var extra = self.files.pop().?;
             self.deleteFileByFid(extra.fid);
             extra.deinit();
         }
-        // Same rollback rule as addEntries: old current must be removed on disk.
-        self.deleteFileByFid(self.current.fid);
-        self.current.deinit();
-        self.current = new_current;
-        zeroEntrySlots(&self.current, slot, max_num_entries);
-        self.next_entry_idx = slot;
+
+        // Truncate the target file's slots and update current pointer.
+        self.current = &self.files.items[pos.file_idx];
+        self.current.truncateFromSlot(pos.slot_idx);
+        self.current.is_current = true;
+        self.cache.truncateFrom(from_index);
     }
 
-    pub fn sync(self: *wal, hard: bool) Error!void {
+    pub fn sync(self: *wal, _: bool) !void {
+
         // The other files should have already been synced. No need to resync them.
-        try self.current.sync(hard);
+        try self.current.syncFile();
     }
 };
 
@@ -990,13 +1228,17 @@ pub const DiskWAL = struct {
     wal_store: wal,
     hard_state_cache: *raftlog.HardState,
     snapshot_cache: *raftlog.Snapshot,
-    scratch_entries: std.ArrayList(raftlog.StoredEntry),
 
-    pub fn openPath(path: []const u8, allocator: std.mem.Allocator) Error!DiskWAL {
+    pub fn openPath(
+        path: []const u8,
+        allocator: std.mem.Allocator,
+        vfs_inst: *const vfs_mod.VFS,
+        cache_capacity: usize,
+    ) !DiskWAL {
         var mf = try metaFile.openPath(path, allocator);
         errdefer mf.deinit();
 
-        var wf = try wal.openPath(path, allocator);
+        var wf = try wal.openPath(path, allocator, vfs_inst, cache_capacity);
         errdefer wf.deinit();
 
         const hs = try mf.hardState();
@@ -1013,13 +1255,10 @@ pub const DiskWAL = struct {
             .wal_store = wf,
             .hard_state_cache = hs,
             .snapshot_cache = snap,
-            .scratch_entries = std.ArrayList(raftlog.StoredEntry).empty,
         };
     }
 
     pub fn deinit(self: *DiskWAL) void {
-        self.clearScratchEntries();
-        self.scratch_entries.deinit(self.allocator);
         self.snapshot_cache.destroy(self.allocator);
         self.hard_state_cache.destroy(self.allocator);
         self.wal_store.deinit();
@@ -1040,81 +1279,53 @@ pub const DiskWAL = struct {
             raftlog.RaftLogError.Unavailable => raftlog.RaftLogError.Unavailable,
             err_not_found.NotFound => raftlog.RaftLogError.Unavailable,
             error.OutOfMemory => error.OutOfMemory,
-            else => raftlog.RaftLogError.Unavailable,
+            else => {
+                std.log.err("mapToRaftLogError: unmapped error: {}", .{err});
+                return raftlog.RaftLogError.Unavailable;
+            },
         };
     }
 
-    fn clearScratchEntries(self: *DiskWAL) void {
-        // Scratch entries borrow payload bytes from mmap-backed WAL segments.
-        // Only clear metadata here; do not free the payload slices.
-        self.scratch_entries.shrinkRetainingCapacity(0);
-    }
+    // --- Implementation methods (no locking, caller must hold appropriate lock) ---
 
-    fn refillScratch(
-        self: *DiskWAL,
-        lo: u64,
-        hi: u64,
-        max_bytes: u64,
-    ) raftlog.RaftLogError![]const raftlog.StoredEntry {
-        self.clearScratchEntries();
-        const fetched = self.wal_store.allEntries(self.allocator, lo, hi, max_bytes) catch |err| {
-            return mapToRaftLogError(err);
-        };
-        defer self.allocator.free(fetched);
-
-        try self.scratch_entries.ensureTotalCapacity(self.allocator, fetched.len);
-        for (fetched) |stored| {
-            self.scratch_entries.appendAssumeCapacity(stored);
-        }
-        return self.scratch_entries.items;
-    }
-
-    fn hardState(ctx: *anyopaque) *const raftlog.HardState {
-        const self = fromCtx(ctx);
+    fn hardState(self: *DiskWAL) *const raftlog.HardState {
         return self.hard_state_cache;
     }
 
-    fn setHardState(ctx: *anyopaque, hs: raftlog.HardState) raftlog.RaftLogError!void {
-        const self = fromCtx(ctx);
+    fn setHardState(self: *DiskWAL, hs: raftlog.HardState) raftlog.RaftLogError!void {
         self.meta.storeHardState(&hs) catch |err| return mapToRaftLogError(err);
         const copy = hs.clone(self.allocator) catch return error.OutOfMemory;
         self.hard_state_cache.destroy(self.allocator);
         self.hard_state_cache = copy;
     }
 
-    fn snapshot(ctx: *anyopaque) *const raftlog.Snapshot {
-        const self = fromCtx(ctx);
+    fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
         return self.snapshot_cache;
     }
 
-    fn setSnapshot(ctx: *anyopaque, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
-        const self = fromCtx(ctx);
+    fn setSnapshot(self: *DiskWAL, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
         self.meta.storeSnapshot(&snap) catch |err| return mapToRaftLogError(err);
         const copy = snap.clone(self.allocator) catch return error.OutOfMemory;
         self.snapshot_cache.destroy(self.allocator);
         self.snapshot_cache = copy;
     }
 
-    fn firstIndex(ctx: *anyopaque) u64 {
-        const self = fromCtx(ctx);
+    fn firstIndex(self: *DiskWAL) u64 {
         return self.wal_store.firstIndex();
     }
 
-    fn lastIndex(ctx: *anyopaque) u64 {
-        const self = fromCtx(ctx);
+    fn lastIndex(self: *DiskWAL) u64 {
         return self.wal_store.lastIndex();
     }
 
-    fn lastTerm(ctx: *anyopaque) u64 {
-        const self = fromCtx(ctx);
+    fn lastTerm(self: *DiskWAL) u64 {
         const last_idx = self.wal_store.lastIndex();
         if (last_idx == 0) return self.snapshot_cache.term;
         return self.wal_store.term(last_idx) catch self.snapshot_cache.term;
     }
 
-    fn term(ctx: *anyopaque, idx: u64) raftlog.RaftLogError!?u64 {
+    fn term(self: *DiskWAL, idx: u64) raftlog.RaftLogError!?u64 {
         if (idx == 0) return 0;
-        const self = fromCtx(ctx);
         return self.wal_store.term(idx) catch |err| switch (err) {
             raftlog.RaftLogError.Compacted => null,
             raftlog.RaftLogError.Unavailable => null,
@@ -1123,42 +1334,13 @@ pub const DiskWAL = struct {
         };
     }
 
-    fn entryRef(ctx: *anyopaque, idx: u64) raftlog.RaftLogError!?raftlog.StoredEntry {
-        const self = fromCtx(ctx);
-        const items = try self.refillScratch(idx, idx + 1, 0);
-        if (items.len == 0) return null;
-        return items[0];
+    fn entriesRange(self: *DiskWAL, opts: raftlog.EntriesRangeOpts) raftlog.RaftLogError!raftlog.EntriesResult {
+        return self.wal_store.allEntries(self.allocator, opts) catch |err| {
+            return mapToRaftLogError(err);
+        };
     }
 
-    // TODO: We should remove this one. And then, let's switch over this entire file to use VFS
-    // and not use MMAP. Also, we should set a cache here, and store the "slots" in memory for every
-    // file. And when appending to the current file, we should NOT be writing to the slot region.
-    // Instead, when we rotate it out, only then we should write the slot region, sync, and rename
-    // the "CURRENT" wal file to a log file.
-    fn entriesFromRef(
-        ctx: *anyopaque,
-        start_index: u64,
-        max_count: u32,
-    ) raftlog.RaftLogError![]const raftlog.StoredEntry {
-        const self = fromCtx(ctx);
-        if (max_count == 0) return &[_]raftlog.StoredEntry{};
-        const hi = start_index + @as(u64, max_count);
-        return self.refillScratch(start_index, hi, 0);
-    }
-
-    fn entriesRangeRef(
-        ctx: *anyopaque,
-        lo: u64,
-        hi: u64,
-        max_bytes: u64,
-    ) raftlog.RaftLogError![]const raftlog.StoredEntry {
-        const self = fromCtx(ctx);
-        if (lo >= hi) return &[_]raftlog.StoredEntry{};
-        return self.refillScratch(lo, hi, max_bytes);
-    }
-
-    fn firstIndexOfTerm(ctx: *anyopaque, term_value: u64) u64 {
-        const self = fromCtx(ctx);
+    fn firstIndexOfTerm(self: *DiskWAL, term_value: u64) u64 {
         var idx = self.wal_store.firstIndex();
         const last = self.wal_store.lastIndex();
         while (idx <= last) : (idx += 1) {
@@ -1168,55 +1350,222 @@ pub const DiskWAL = struct {
         return 0;
     }
 
-    fn lastIndexOfTerm(ctx: *anyopaque, term_value: u64) u64 {
-        const self = fromCtx(ctx);
-        var idx = self.wal_store.lastIndex();
-        const first = self.wal_store.firstIndex();
-        while (idx >= first and idx > 0) : (idx -= 1) {
-            const t = self.wal_store.term(idx) catch continue;
-            if (t == term_value) return idx;
-        }
-        return 0;
-    }
-
-    fn append(ctx: *anyopaque, entries: []const raftlog.LogEntryBuffer) raftlog.RaftLogError!void {
-        const self = fromCtx(ctx);
+    fn append(self: *DiskWAL, entries: []const raftlog.LogEntryBuffer) raftlog.RaftLogError!void {
         self.wal_store.addEntries(entries) catch |err| return mapToRaftLogError(err);
     }
 
-    fn truncateFrom(ctx: *anyopaque, from_index: u64) void {
-        const self = fromCtx(ctx);
-        self.wal_store.truncateFrom(from_index) catch {};
+    fn truncateFrom(self: *DiskWAL, from_index: u64) raftlog.RaftLogError!void {
+        self.wal_store.truncateFrom(from_index);
     }
 
-    fn compactUntil(ctx: *anyopaque, index: u64) void {
-        const self = fromCtx(ctx);
+    fn compactUntil(self: *DiskWAL, index: u64) raftlog.RaftLogError!void {
         self.wal_store.deleteBefore(index);
     }
 
-    fn sync(ctx: *anyopaque) raftlog.RaftLogError!void {
-        const self = fromCtx(ctx);
+    fn sync(self: *DiskWAL) raftlog.RaftLogError!void {
         self.meta.sync(true) catch |err| return mapToRaftLogError(err);
         self.wal_store.sync(true) catch |err| return mapToRaftLogError(err);
     }
 
     const vtable = raftlog.RaftWAL.VTable{
-        .hardState = hardState,
-        .setHardState = setHardState,
-        .snapshot = snapshot,
-        .setSnapshot = setSnapshot,
-        .firstIndex = firstIndex,
-        .lastIndex = lastIndex,
-        .lastTerm = lastTerm,
-        .term = term,
-        .entryRef = entryRef,
-        .entriesFromRef = entriesFromRef,
-        .entriesRangeRef = entriesRangeRef,
-        .firstIndexOfTerm = firstIndexOfTerm,
-        .lastIndexOfTerm = lastIndexOfTerm,
-        .append = append,
-        .truncateFrom = truncateFrom,
-        .compactUntil = compactUntil,
-        .sync = sync,
+        .hardState = withLock(.shared_uncancelable, hardState),
+        .setHardState = withLock(.exclusive, setHardState),
+        .snapshot = withLock(.shared_uncancelable, snapshot),
+        .setSnapshot = withLock(.exclusive, setSnapshot),
+        .firstIndex = withLock(.shared_uncancelable, firstIndex),
+        .lastIndex = withLock(.shared_uncancelable, lastIndex),
+        .lastTerm = withLock(.shared_uncancelable, lastTerm),
+        .term = withLock(.shared, term),
+        .entriesRange = withLock(.shared, entriesRange),
+        .firstIndexOfTerm = withLock(.shared_uncancelable, firstIndexOfTerm),
+        .append = withLock(.exclusive, append),
+        .truncateFrom = withLock(.exclusive, truncateFrom),
+        .compactUntil = withLock(.exclusive, compactUntil),
+        .sync = withLock(.shared, sync),
     };
+
+    /// Generate a vtable-compatible function pointer that acquires a lock,
+    /// casts ctx to *DiskWAL, calls the implementation fn, then releases.
+    /// The impl fn takes (*DiskWAL, ...extra args) and returns RaftLogError!T.
+    /// The generated fn takes (*anyopaque, ...extra args) and returns RaftLogError!T.
+    fn VtableFn(comptime Impl: type) type {
+        const info = @typeInfo(Impl).@"fn";
+        const RetType = info.return_type.?;
+        // Build vtable param types: replace first param (*DiskWAL) with *anyopaque.
+        var vtable_params: [info.params.len]std.builtin.Type.Fn.Param = undefined;
+        for (info.params, 0..) |p, i| {
+            vtable_params[i] = if (i == 0) .{ .is_generic = false, .is_noalias = false, .type = *anyopaque } else p;
+        }
+        return *const @Type(.{ .@"fn" = .{
+            .calling_convention = .auto,
+            .is_generic = false,
+            .is_var_args = false,
+            .return_type = RetType,
+            .params = &vtable_params,
+        } });
+    }
+
+    const LockMode = enum { shared, shared_uncancelable, exclusive };
+
+    fn withLock(comptime mode: LockMode, comptime impl: anytype) VtableFn(@TypeOf(impl)) {
+        const Impl = @TypeOf(impl);
+        const param_count = @typeInfo(Impl).@"fn".params.len;
+
+        const Wrapper = struct {
+            fn acquire(self: *DiskWAL) switch (mode) {
+                .shared => zio.Cancelable!void,
+                .shared_uncancelable => void,
+                .exclusive => zio.Cancelable!void,
+            } {
+                switch (mode) {
+                    .shared => try self.wal_store.mu.lockShared(),
+                    .shared_uncancelable => self.wal_store.mu.lockSharedUncancelable(),
+                    .exclusive => try self.wal_store.mu.lock(),
+                }
+            }
+            fn release(self: *DiskWAL) void {
+                switch (mode) {
+                    .shared, .shared_uncancelable => self.wal_store.mu.unlockShared(),
+                    .exclusive => self.wal_store.mu.unlock(),
+                }
+            }
+        };
+
+        return switch (param_count) {
+            1 => &struct {
+                fn f(ctx: *anyopaque) @typeInfo(Impl).@"fn".return_type.? {
+                    const self = fromCtx(ctx);
+                    if (mode == .shared_uncancelable) Wrapper.acquire(self) else try Wrapper.acquire(self);
+                    defer Wrapper.release(self);
+                    return @call(.auto, impl, .{self});
+                }
+            }.f,
+            2 => &struct {
+                fn f(ctx: *anyopaque, a1: @typeInfo(Impl).@"fn".params[1].type.?) @typeInfo(Impl).@"fn".return_type.? {
+                    const self = fromCtx(ctx);
+                    if (mode == .shared_uncancelable) Wrapper.acquire(self) else try Wrapper.acquire(self);
+                    defer Wrapper.release(self);
+                    return @call(.auto, impl, .{ self, a1 });
+                }
+            }.f,
+            else => @compileError("withLockImpl: unsupported arity"),
+        };
+    }
+};
+
+// =========================================================================
+// New types for VFS-based WAL (used in upcoming refactor)
+// =========================================================================
+
+pub const record_header_size: usize = 8; // crc32c (4) + payload_len (4)
+
+pub fn computeCrc(payload: []const u8) u32 {
+    return std.hash.crc.Crc32Iscsi.hash(payload);
+}
+
+/// Fixed-capacity ring buffer of recent WAL entries. Entries are contiguous
+/// by raft index — append at tail, evict from head. O(1) append, O(1) lookup.
+pub const EntryCache = struct {
+    allocator: std.mem.Allocator,
+    buf: []CachedEntry,
+    head: usize, // index of oldest entry in buf
+    len: usize, // number of live entries
+    hits: u64,
+    misses: u64,
+
+    pub const CachedEntry = struct {
+        index: u64,
+        term: u64,
+        bytes: []const u8, // allocator-owned
+    };
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) !EntryCache {
+        const buf = try allocator.alloc(CachedEntry, capacity);
+        return .{
+            .allocator = allocator,
+            .buf = buf,
+            .head = 0,
+            .len = 0,
+            .hits = 0,
+            .misses = 0,
+        };
+    }
+
+    pub fn deinit(self: *EntryCache) void {
+        self.clear();
+        self.allocator.free(self.buf);
+    }
+
+    pub fn clear(self: *EntryCache) void {
+        for (0..self.len) |i| {
+            self.allocator.free(self.buf[(self.head + i) % self.buf.len].bytes);
+        }
+        self.head = 0;
+        self.len = 0;
+    }
+
+    pub fn append(self: *EntryCache, index: u64, term_val: u64, bytes: []const u8) !void {
+        if (self.buf.len == 0) return;
+
+        const owned = try self.allocator.dupe(u8, bytes);
+
+        if (self.len == self.buf.len) {
+            // Ring full — overwrite oldest.
+            self.allocator.free(self.buf[self.head].bytes);
+            self.buf[self.head] = .{ .index = index, .term = term_val, .bytes = owned };
+            self.head = (self.head + 1) % self.buf.len;
+        } else {
+            const tail = (self.head + self.len) % self.buf.len;
+            self.buf[tail] = .{ .index = index, .term = term_val, .bytes = owned };
+            self.len += 1;
+        }
+    }
+
+    /// O(1) lookup by raft index.
+    pub fn lookup(self: *EntryCache, index: u64) ?CachedEntry {
+        if (self.len == 0) {
+            self.misses += 1;
+            return null;
+        }
+        const base = self.buf[self.head].index;
+        if (index < base or index - base >= self.len) {
+            self.misses += 1;
+            return null;
+        }
+        const ce = self.buf[(self.head + @as(usize, @intCast(index - base))) % self.buf.len];
+        if (ce.index != index) {
+            self.misses += 1;
+            return null;
+        }
+        self.hits += 1;
+        return ce;
+    }
+
+    /// Drop all entries with index >= from_index.
+    pub fn truncateFrom(self: *EntryCache, from_index: u64) void {
+        if (self.len == 0) return;
+        const base = self.buf[self.head].index;
+        if (from_index <= base) {
+            self.clear();
+            return;
+        }
+        const keep: usize = @intCast(@min(from_index - base, self.len));
+        for (keep..self.len) |i| {
+            self.allocator.free(self.buf[(self.head + i) % self.buf.len].bytes);
+        }
+        self.len = keep;
+    }
+
+    /// Drop all entries with index < before_index.
+    pub fn evictBefore(self: *EntryCache, before_index: u64) void {
+        if (self.len == 0) return;
+        const base = self.buf[self.head].index;
+        if (before_index <= base) return;
+        const drop: usize = @intCast(@min(before_index - base, self.len));
+        for (0..drop) |i| {
+            self.allocator.free(self.buf[(self.head + i) % self.buf.len].bytes);
+        }
+        self.head = (self.head + drop) % self.buf.len;
+        self.len -= drop;
+    }
 };

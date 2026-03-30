@@ -1,7 +1,7 @@
 const std = @import("std");
 const Key = @import("key.zig").Key;
 const table = @import("table.zig");
-const vfs = @import("vfs.zig");
+const vfs = @import("vfs");
 const utils = @import("utils");
 
 const Table = table.Table;

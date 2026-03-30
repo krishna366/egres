@@ -7,7 +7,7 @@ const buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
 const compress = utils.compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
-const vfs = @import("../vfs.zig");
+const vfs = @import("vfs");
 const cache_mod = @import("../cache.zig");
 
 /// Module-level block cache singleton. Set before opening tables to enable caching.

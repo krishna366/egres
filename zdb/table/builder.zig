@@ -3,7 +3,7 @@ const Key = @import("../key.zig").Key;
 const buffers = @import("../buffers.gen.zig");
 const compress = @import("utils").compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
-const vfs = @import("../vfs.zig");
+const vfs = @import("vfs");
 
 // Table layout (Badger-inspired, with zbuf for TableIndex/BlockOffset):
 //

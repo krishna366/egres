@@ -650,9 +650,11 @@ fn logReplicationImpl() !void {
         const node = entry.*.node;
         if (node.id == leader) continue;
         try std.testing.expectEqual(@as(u64, @intCast(expected.items.len)), node.log.lastIndex());
+        var log_result = try node.log.entriesRange(.{ .lo = 1, .hi = node.log.lastIndex() + 1 });
+        defer log_result.deinit();
         for (expected.items, 0..) |data, idx| {
-            const log_entry = (try node.log.entryRef(@intCast(idx + 1))) orelse return error.MissingEntry;
-            const reader = try zen.LogEntryReader.parseRoot(log_entry.bytes);
+            if (idx >= log_result.entries.len) return error.MissingEntry;
+            const reader = try zen.LogEntryReader.parseRoot(log_result.entries[idx].bytes);
             try std.testing.expectEqualSlices(u8, data, reader.data());
         }
     }
@@ -722,15 +724,16 @@ fn followerCatchUpImpl() !void {
         return error.MissingNode;
     try std.testing.expectEqual(final_leader.log.lastIndex(), lagging.log.lastIndex());
 
-    var idx: u64 = 1;
-    while (idx <= final_leader.log.lastIndex()) : (idx += 1) {
-        const leader_entry = (try final_leader.log.entryRef(idx)) orelse
-            return error.MissingEntry;
-        const lagging_entry = (try lagging.log.entryRef(idx)) orelse
-            return error.MissingEntry;
+    const last = final_leader.log.lastIndex();
+    var leader_result = try final_leader.log.entriesRange(.{ .lo = 1, .hi = last + 1 });
+    defer leader_result.deinit();
+    var lagging_result = try lagging.log.entriesRange(.{ .lo = 1, .hi = last + 1 });
+    defer lagging_result.deinit();
 
-        const leader_reader = try zen.LogEntryReader.parseRoot(leader_entry.bytes);
-        const lagging_reader = try zen.LogEntryReader.parseRoot(lagging_entry.bytes);
+    if (leader_result.entries.len != lagging_result.entries.len) return error.MissingEntry;
+    for (leader_result.entries, lagging_result.entries) |le, lag| {
+        const leader_reader = try zen.LogEntryReader.parseRoot(le.bytes);
+        const lagging_reader = try zen.LogEntryReader.parseRoot(lag.bytes);
         try std.testing.expectEqual(leader_reader.term(), lagging_reader.term());
         try std.testing.expectEqualSlices(u8, leader_reader.data(), lagging_reader.data());
     }

@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const zio = @import("zio");
-const bandwidth = @import("bandwidth.zig");
+pub const bandwidth = @import("bandwidth.zig");
 
 pub const Flags = struct {
     /// Open for reading and writing instead of read-only.
@@ -129,6 +129,92 @@ pub const FileHandle = struct {
         };
     }
 
+    pub const ReadRequest = struct {
+        offset: u64,
+        len: usize,
+        data: []const u8 = "", // filled by batchRead
+        ctx: ?*anyopaque = null, // opaque pointer for caller use
+    };
+
+    /// Batch multiple reads into a single io_uring submission.
+    /// Allocates page-aligned buffers from the arena for O_DIRECT compatibility.
+    /// Fills each request's .data field with the read result.
+    /// Arena owns all internal buffers — no manual cleanup needed.
+    // Max requests per io_uring submission. Must stay under the default SQ depth (256)
+    // to avoid a race where flushing the SQ mid-add triggers completions that prematurely
+    // signal the group.
+    // Must stay under io_uring SQ depth (default 256). getSqe retries once
+    // on SubmissionQueueFull, but if all SQEs are still in-flight, the retry
+    // also fails. Keep a margin below 256 for other concurrent I/O.
+    const max_batch_size: usize = 200;
+
+    pub fn batchRead(
+        self: FileHandle,
+        arena: *std.heap.ArenaAllocator,
+        requests: []ReadRequest,
+        priority: Priority,
+    ) !void {
+        if (requests.len == 0) return;
+
+        // Process in chunks to stay within io_uring SQ depth.
+        var offset: usize = 0;
+        while (offset < requests.len) {
+            const end = @min(offset + max_batch_size, requests.len);
+            try self.batchReadChunk(arena, requests[offset..end], priority);
+            offset = end;
+        }
+    }
+
+    fn batchReadChunk(
+        self: FileHandle,
+        arena: *std.heap.ArenaAllocator,
+        requests: []ReadRequest,
+        priority: Priority,
+    ) !void {
+        const alloc = arena.allocator();
+
+        // Bandwidth: acquire total bytes for this chunk before submitting.
+        if (self.vfs.bw) |bw| {
+            var total: usize = 0;
+            for (requests) |r| total += r.len;
+            var acquired: usize = 0;
+            while (acquired < total) {
+                acquired += bw.acquireAligned(priority, total - acquired, .read);
+            }
+        }
+
+        const ev = zio.ev;
+        const fd = self.file.?.fd;
+
+        // Heap-allocate from the arena (zio fiber stacks are small).
+        const reads = try alloc.alloc(ev.FileRead, requests.len);
+        const iovs = try alloc.alloc([1]zio.os.iovec, requests.len);
+        const bufs = try alloc.alloc([]u8, requests.len);
+
+        var group: ev.Group = .init(.gather);
+        for (requests, 0..) |*req, i| {
+            // Page-aligned offset and size for O_DIRECT compatibility.
+            const aligned_offset = req.offset & ~@as(u64, page_size - 1);
+            const prefix: usize = @intCast(req.offset - aligned_offset);
+            const aligned_size = std.mem.alignForward(usize, prefix + req.len, page_size);
+
+            bufs[i] = try alloc.alignedAlloc(u8, page_alignment, aligned_size);
+            reads[i] = ev.FileRead.init(fd, .fromSlice(bufs[i], &iovs[i]), aligned_offset);
+            group.add(&reads[i].c);
+        }
+
+        // Single io_uring submission for this chunk.
+        try zio.waitForIo(&group.c);
+        try group.c.getResult(.group);
+
+        // Fill request .data fields from the aligned read buffers.
+        for (requests, 0..) |*req, i| {
+            _ = try reads[i].getResult();
+            const prefix: usize = @intCast(req.offset & (page_size - 1));
+            req.data = bufs[i][prefix .. prefix + req.len];
+        }
+    }
+
     const default_write_chunk: usize = 256 * page_size; // 1 MB
 
     pub fn write(
@@ -224,7 +310,7 @@ pub const VFS = struct {
     pub fn createFile(self: *const VFS, path: []const u8, opts: FileOptions) !FileHandle {
         if (opts.mode == .mmap or opts.mode == .memory) return error.InvalidMode;
 
-        var open_flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true };
+        var open_flags: posix.O = .{ .ACCMODE = .RDWR, .CREAT = true };
         if (opts.flags.truncate) {
             open_flags.TRUNC = true;
         } else {

@@ -300,9 +300,20 @@ fn addZdbTests(
     utils_mod.addIncludePath(b.path("."));
     utils_mod.addIncludePath(b.path("third_party/lz4/lib"));
     utils_mod.addIncludePath(b.path("third_party/zstd/lib"));
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
+    const vfs_mod = makeModule(b, target, optimize, "vfs/vfs.zig");
+    vfs_mod.addImport("zio", zio_mod);
+
     const zdb_mod = makeModule(b, target, optimize, "zdb.zig");
     zdb_mod.addImport("zbuf", zbuf_mod);
     zdb_mod.addImport("utils", utils_mod);
+    zdb_mod.addImport("zio", zio_mod);
+    zdb_mod.addImport("vfs", vfs_mod);
 
     const zdb_core_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/core_test.zig"),
@@ -351,23 +362,17 @@ fn addZdbTests(
         .root_module = makeModule(b, target, optimize, "zdb/cache.zig"),
     });
 
-    const zio_dep = b.dependency("zio", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const zio_mod = zio_dep.module("zio");
-    zdb_mod.addImport("zio", zio_mod);
     zdb_levels_tests.root_module.addImport("zio", zio_mod);
     zdb_forest_tests.root_module.addImport("zio", zio_mod);
 
     const zdb_vfs_tests = b.addTest(.{
-        .root_module = makeModule(b, target, optimize, "zdb/vfs_test.zig"),
+        .root_module = makeModule(b, target, optimize, "vfs/vfs_test.zig"),
     });
     zdb_vfs_tests.root_module.addImport("zio", zio_mod);
     zdb_vfs_tests.linkLibC();
 
     const zdb_bw_tests = b.addTest(.{
-        .root_module = makeModule(b, target, optimize, "zdb/bandwidth_test.zig"),
+        .root_module = makeModule(b, target, optimize, "vfs/bandwidth_test.zig"),
     });
     zdb_bw_tests.root_module.addImport("zio", zio_mod);
     zdb_bw_tests.linkLibC();
@@ -415,6 +420,8 @@ fn addDiskwalTestRun(
     });
     addVendoredCompressionSources(b, test_artifact);
     test_artifact.root_module.addImport("raft", raft_mod);
+    test_artifact.root_module.addImport("vfs", raft_mod.import_table.get("vfs").?);
+    test_artifact.root_module.addImport("zio", raft_mod.import_table.get("zio").?);
     test_artifact.root_module.addImport("build_options", build_options_mod);
     test_artifact.step.dependOn(regen_buffers_step);
     return &b.addRunArtifact(test_artifact).step;
@@ -446,6 +453,9 @@ fn makeRaftModule(
     transport_mod.addImport("zio", zio_mod);
     transport_mod.addImport("serial", serial_mod);
 
+    const vfs_mod = makeModule(b, target, optimize, "vfs/vfs.zig");
+    vfs_mod.addImport("zio", zio_mod);
+
     const raft_mod = makeModule(b, target, optimize, "raft/raft.zig");
     raft_mod.addImport("buffers_gen", raft_buffers_gen_mod);
     raft_mod.addImport("zbuf", zbuf_mod);
@@ -453,6 +463,7 @@ fn makeRaftModule(
     raft_mod.addImport("zio", zio_mod);
     raft_mod.addImport("serial", serial_mod);
     raft_mod.addImport("transport", transport_mod);
+    raft_mod.addImport("vfs", vfs_mod);
     return raft_mod;
 }
 
@@ -476,10 +487,13 @@ fn addZdbServer(
     const runtime_mod = makeModule(b, target, optimize, "runtime.zig");
     runtime_mod.addImport("zio", zio_mod);
 
+    const vfs_mod = raft_mod.import_table.get("vfs").?;
+
     const zdb_mod = makeModule(b, target, optimize, "zdb.zig");
     zdb_mod.addImport("zbuf", zbuf_mod);
     zdb_mod.addImport("utils", utils_mod);
     zdb_mod.addImport("zio", zio_mod);
+    zdb_mod.addImport("vfs", vfs_mod);
 
     const zdb_srv_buffers_gen_mod = makeModule(b, target, optimize, "zdb-server/buffers.gen.zig");
     zdb_srv_buffers_gen_mod.addImport("zbuf", zbuf_mod);
@@ -576,6 +590,7 @@ fn addRaftTests(
     });
     addVendoredCompressionSources(b, raft_tests);
     raft_tests.root_module.addImport("raft", raft_mod);
+    raft_tests.root_module.addImport("vfs", raft_mod.import_table.get("vfs").?);
     raft_tests.root_module.addImport("zio", zio_dep.module("zio"));
     raft_tests.step.dependOn(regen_buffers_step);
 

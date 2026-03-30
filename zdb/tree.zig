@@ -5,7 +5,7 @@ const options = @import("options.zig");
 const manifest = @import("manifest.zig");
 const level_handler = @import("level.zig");
 const table_mod = @import("table.zig");
-const vfs = @import("vfs.zig");
+const vfs = @import("vfs");
 
 const Table = table_mod.Table;
 const TableIterator = table_mod.TableIterator;

@@ -5,7 +5,7 @@ const options = @import("options.zig");
 const manifest = @import("manifest.zig");
 const level = @import("level.zig");
 const table_mod = @import("table.zig");
-const vfs = @import("vfs.zig");
+const vfs = @import("vfs");
 const tree_mod = @import("tree.zig");
 const skl = @import("skl/skiplist.zig");
 

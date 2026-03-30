@@ -1,7 +1,7 @@
 const std = @import("std");
 const buffers = @import("buffers.gen.zig");
 const Key = @import("key.zig").Key;
-const vfs = @import("vfs.zig");
+const vfs = @import("vfs");
 
 // -------------------------------------------------------------------------
 // Constants

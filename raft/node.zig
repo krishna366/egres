@@ -288,7 +288,6 @@ pub const Node = struct {
         }
 
         // Replay conf changes from snapshot to commit_index.
-        // TODO: pass a flag to entriesRangeRef to only return conf change entries.
         const ci = self.commit_index.load(.seq_cst);
         const start = if (snap.index > 0) snap.index + 1 else self.log.firstIndex();
         if (start > ci) {
@@ -296,12 +295,15 @@ pub const Node = struct {
             self.recomputeQuorum();
             return;
         }
-        const entries = self.log.entriesRangeRef(start, ci + 1, 0) catch {
-            self.conf_applied_index = ci;
-            self.recomputeQuorum();
-            return;
+        var result = while (true) {
+            break self.log.entriesRange(.{ .lo = start, .hi = ci + 1, .ty = .conf }) catch |err| {
+                std.log.err("restoreConfState: entriesRange failed: {}, retrying...", .{err});
+                zio.sleep(.fromSeconds(1)) catch return;
+                continue;
+            };
         };
-        for (entries) |entry| {
+        defer result.deinit();
+        for (result.entries) |entry| {
             // TODO: Also apply the data entries.
             const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
             if (reader.confChange()) |cc_reader| {
@@ -494,7 +496,12 @@ pub const Node = struct {
         const state = self.peers.getPtr(peer) orelse return;
         const prev_index = if (state.next_index == 0) 0 else state.next_index - 1;
         const prev_term: u64 = if (prev_index == 0) 0 else (try self.log.term(prev_index)) orelse 0;
-        const entries = try self.log.entriesFromRef(state.next_index, self.config.max_entries_per_msg);
+        var result = try self.log.entriesRange(.{
+            .lo = state.next_index,
+            .hi = state.next_index + self.config.max_entries_per_msg,
+            .max_bytes = 32 * 1024 * 1024, // 32 MiB
+        });
+        defer result.deinit();
 
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
@@ -504,9 +511,9 @@ pub const Node = struct {
 
         var entry_offsets = std.ArrayList(u32).empty;
         defer entry_offsets.deinit(self.allocator);
-        try entry_offsets.ensureTotalCapacity(self.allocator, entries.len);
+        try entry_offsets.ensureTotalCapacity(self.allocator, result.entries.len);
 
-        for (entries) |entry_ref| {
+        for (result.entries) |entry_ref| {
             var entry_buf = try zen.LogEntryBuffer.initWithTail(
                 self.allocator,
                 @constCast(entry_ref.bytes),
@@ -994,17 +1001,20 @@ pub const Node = struct {
     }
 
     pub fn applyLoop(self: *Node) void {
+        // TODO: Use this loop to replay all the logs from last snapshot.
+        // Actually, if we just set the apply index to the last snapshot index, then this would
+        // automatically apply all the pending entries anyway. We just need to trigger it.
         while (!self.isShuttingDown()) {
-            _ = self.commit_ch.receive() catch return;
             self.applyCommits();
+            _ = self.commit_ch.receive() catch return;
         }
     }
 
     const max_apply_bytes: u64 = 16 * 1024 * 1024; // 16 MiB per batch
 
     pub fn applyCommits(self: *Node) void {
-        const ci = self.commit_index.load(.seq_cst);
         var ai = self.apply_index.load(.seq_cst);
+        const ci = self.commit_index.load(.seq_cst);
         if (ai >= ci) {
             return;
         }
@@ -1014,10 +1024,11 @@ pub const Node = struct {
         );
 
         while (ai < ci) {
-            const entries = self.log.entriesRangeRef(ai + 1, ci + 1, max_apply_bytes) catch return;
-            if (entries.len == 0) return;
+            var result = self.log.entriesRange(.{ .lo = ai + 1, .hi = ci + 1, .max_bytes = max_apply_bytes }) catch return;
+            defer result.deinit();
+            if (result.entries.len == 0) return;
 
-            for (entries) |entry| {
+            for (result.entries) |entry| {
                 const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
 
                 if (reader.isNormal()) {
@@ -1246,19 +1257,31 @@ pub const Node = struct {
 
     fn applyConfChanges(self: *Node) void {
         const ci = self.commit_index.load(.seq_cst);
-        if (self.conf_applied_index < ci) {
-            dbg("applyConfChanges node={d} conf_applied={d} ci={d}", .{ self.id, self.conf_applied_index, ci });
-        }
+        if (self.conf_applied_index >= ci) return;
+        dbg("applyConfChanges node={d} conf_applied={d} ci={d}", .{ self.id, self.conf_applied_index, ci });
+
         while (self.conf_applied_index < ci) {
-            self.conf_applied_index += 1;
-            // TODO: Quickly find all the conf change requests between conf_applied_index and ci.
-            // And just loop over them, instead of fetching entry for every index.
-            const entry = (self.log.entryRef(self.conf_applied_index) catch continue) orelse continue;
-            const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
-            if (reader.confChange()) |cc_reader| {
-                const cc = self.decodeConfChange(cc_reader) catch continue;
-                self.applyConfChange(cc);
-                self.pending_conf_change = false;
+            var result = self.log.entriesRange(.{
+                .lo = self.conf_applied_index + 1,
+                .hi = ci + 1,
+                .ty = .conf,
+            }) catch return;
+            defer result.deinit();
+
+            for (result.entries) |entry| {
+                self.conf_applied_index = entry.index;
+                const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
+                if (reader.confChange()) |cc_reader| {
+                    const cc = self.decodeConfChange(cc_reader) catch continue;
+                    self.applyConfChange(cc);
+                    self.pending_conf_change = false;
+                }
+            }
+
+            // All conf entries in the range were returned — we're caught up.
+            if (result.eof) {
+                self.conf_applied_index = ci;
+                return;
             }
         }
     }

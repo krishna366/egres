@@ -379,3 +379,61 @@ test "P1 prioritized over P2" {
     const p2_order = p2_ctx.my_order.load(.seq_cst);
     try testing.expect(p1_order < p2_order);
 }
+
+// ── batchRead tests ─────────────────────────────────────────────────
+
+fn batchReadTestImpl() !void {
+    const alloc = testing.allocator;
+    const path = "/tmp/vfs_test_batch_read";
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    // Write a 2 MiB file. Each page filled with a byte derived from page index.
+    const num_pages = 512;
+    {
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        var buf: [page_size]u8 = undefined;
+        for (0..num_pages) |i| {
+            @memset(&buf, @intCast(i % 251)); // distinct fill per page (mod 251 to stay in u8)
+            try file.writeAll(&buf);
+        }
+    }
+
+    const v = VFS.init;
+    const handle = try v.openFile(alloc, path, .{ .mode = .default });
+    defer handle.close();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    // Build 512 read requests — exceeds io_uring SQ depth (256), tests chunking.
+    const num_requests = 512;
+    const read_len = 100;
+    const intra_page_offset = 10;
+    var requests = try alloc.alloc(vfs.FileHandle.ReadRequest, num_requests);
+    defer alloc.free(requests);
+    for (0..num_requests) |i| {
+        requests[i] = .{
+            .offset = @as(u64, i) * page_size + intra_page_offset,
+            .len = read_len,
+        };
+    }
+
+    try handle.batchRead(&arena, requests, .p0);
+
+    // Verify each read got the correct fill byte.
+    for (0..num_requests) |i| {
+        try testing.expectEqual(@as(usize, read_len), requests[i].data.len);
+        const expected_fill: u8 = @intCast(i % 251);
+        for (requests[i].data) |b| {
+            try testing.expectEqual(expected_fill, b);
+        }
+    }
+}
+
+test "batchRead 512 requests" {
+    const rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(batchReadTestImpl, .{});
+    try handle.join();
+}

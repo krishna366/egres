@@ -10,5 +10,5 @@ pub const tree = @import("zdb/tree.zig");
 pub const forest = @import("zdb/forest.zig");
 pub const applier = @import("zdb/applier.zig");
 pub const cache = @import("zdb/cache.zig");
-pub const vfs = @import("zdb/vfs.zig");
-pub const bandwidth = @import("zdb/bandwidth.zig");
+pub const vfs = @import("vfs");
+pub const bandwidth = vfs.bandwidth;

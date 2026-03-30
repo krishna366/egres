@@ -20,18 +20,43 @@ pub const Snapshot = zen.SnapshotStruct;
 pub const ConfState = zen.ConfStateStruct;
 pub const ConfStatePeer = zen.ConfStatePeerStruct;
 
+pub const EntryType = enum(u16) {
+    any = 0,
+    data = 1,
+    conf = 2,
+};
+
 pub const StoredEntry = struct {
     index: u64,
     term: u64,
-    data_len: u32,
-    // Borrowed/owned payload bytes. Callers must treat this as read-only.
-    bytes: []const u8,
+    bytes: []const u8 = "",
 };
 
 pub const RaftLogError = error{
     Compacted,
     Unavailable,
+    Canceled,
 } || std.mem.Allocator.Error || zen.Error;
+
+pub const EntriesRangeOpts = struct {
+    lo: u64,
+    hi: u64 = std.math.maxInt(u64),
+    max_bytes: u64 = 64 * 1024 * 1024, // 64 MiB
+    ty: EntryType = .any,
+};
+
+/// Result of an entries range query. All entry bytes live in the arena.
+/// Caller must call deinit() when done.
+pub const EntriesResult = struct {
+    entries: []StoredEntry,
+    arena: std.heap.ArenaAllocator,
+    /// True if all matching entries in the range were returned (not truncated by max_bytes).
+    eof: bool = true,
+
+    pub fn deinit(self: *EntriesResult) void {
+        self.arena.deinit();
+    }
+};
 
 pub const RaftWAL = struct {
     ctx: *anyopaque,
@@ -46,16 +71,12 @@ pub const RaftWAL = struct {
         lastIndex: *const fn (*anyopaque) u64,
         lastTerm: *const fn (*anyopaque) u64,
         term: *const fn (*anyopaque, u64) RaftLogError!?u64,
-        // `Ref` APIs return borrowed views. Implementations may invalidate these
-        // views after the next ref call or after any mutating log operation.
-        entryRef: *const fn (*anyopaque, u64) RaftLogError!?StoredEntry,
-        entriesFromRef: *const fn (*anyopaque, u64, u32) RaftLogError![]const StoredEntry,
-        entriesRangeRef: *const fn (*anyopaque, u64, u64, u64) RaftLogError![]const StoredEntry,
+        // Returns entries in an arena. Caller must call result.deinit() when done.
+        entriesRange: *const fn (*anyopaque, EntriesRangeOpts) RaftLogError!EntriesResult,
         firstIndexOfTerm: *const fn (*anyopaque, u64) u64,
-        lastIndexOfTerm: *const fn (*anyopaque, u64) u64,
         append: *const fn (*anyopaque, []const LogEntryBuffer) RaftLogError!void,
-        truncateFrom: *const fn (*anyopaque, u64) void,
-        compactUntil: *const fn (*anyopaque, u64) void,
+        truncateFrom: *const fn (*anyopaque, u64) RaftLogError!void,
+        compactUntil: *const fn (*anyopaque, u64) RaftLogError!void,
         sync: *const fn (*anyopaque) RaftLogError!void,
     };
 
@@ -91,37 +112,24 @@ pub const RaftWAL = struct {
         return self.vtable.term(self.ctx, index);
     }
 
-    pub fn entryRef(self: RaftWAL, index: u64) RaftLogError!?StoredEntry {
-        return self.vtable.entryRef(self.ctx, index);
-    }
-
-    // Borrowed refs, valid only per implementation contract (typically until
-    // the next ref call or mutating operation on the same log instance).
-    pub fn entriesFromRef(self: RaftWAL, start_index: u64, max_count: u32) RaftLogError![]const StoredEntry {
-        return self.vtable.entriesFromRef(self.ctx, start_index, max_count);
-    }
-
-    pub fn entriesRangeRef(self: RaftWAL, lo: u64, hi: u64, max_bytes: u64) RaftLogError![]const StoredEntry {
-        return self.vtable.entriesRangeRef(self.ctx, lo, hi, max_bytes);
+    // Returns entries in an arena. Caller must call result.deinit() when done.
+    pub fn entriesRange(self: RaftWAL, opts: EntriesRangeOpts) RaftLogError!EntriesResult {
+        return self.vtable.entriesRange(self.ctx, opts);
     }
 
     pub fn firstIndexOfTerm(self: RaftWAL, term_value: u64) u64 {
         return self.vtable.firstIndexOfTerm(self.ctx, term_value);
     }
 
-    pub fn lastIndexOfTerm(self: RaftWAL, term_value: u64) u64 {
-        return self.vtable.lastIndexOfTerm(self.ctx, term_value);
-    }
-
     pub fn append(self: RaftWAL, entries: []const LogEntryBuffer) RaftLogError!void {
         return self.vtable.append(self.ctx, entries);
     }
 
-    pub fn truncateFrom(self: RaftWAL, from_index: u64) void {
+    pub fn truncateFrom(self: RaftWAL, from_index: u64) RaftLogError!void {
         return self.vtable.truncateFrom(self.ctx, from_index);
     }
 
-    pub fn compactUntil(self: RaftWAL, index: u64) void {
+    pub fn compactUntil(self: RaftWAL, index: u64) RaftLogError!void {
         return self.vtable.compactUntil(self.ctx, index);
     }
 
@@ -223,49 +231,50 @@ pub const MemWAL = struct {
         return found.term;
     }
 
-    fn entryRef(ctx: *anyopaque, index: u64) RaftLogError!?StoredEntry {
+    fn entriesRange(ctx: *anyopaque, opts: EntriesRangeOpts) RaftLogError!EntriesResult {
         const self = fromCtx(ctx);
-        const stored = self.findStored(index) orelse return null;
-        return stored;
-    }
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
 
-    fn entriesFromRef(ctx: *anyopaque, start_index: u64, max_count: u32) RaftLogError![]const StoredEntry {
-        const self = fromCtx(ctx);
-        if (self.entries.items.len == 0) return &[_]StoredEntry{};
-
+        if (opts.lo >= opts.hi or self.entries.items.len == 0) {
+            return .{ .entries = try alloc.alloc(StoredEntry, 0), .arena = arena };
+        }
         const base = self.entries.items[0].index;
-        if (start_index < base) return &[_]StoredEntry{};
-
-        const offset: usize = @intCast(start_index - base);
-        if (offset >= self.entries.items.len) return &[_]StoredEntry{};
-
-        const start = offset;
-        const max: usize = @intCast(max_count);
-        const end = if (start + max <= self.entries.items.len) start + max else self.entries.items.len;
-        return self.entries.items[start..end];
-    }
-
-    fn entriesRangeRef(ctx: *anyopaque, lo: u64, hi: u64, max_bytes: u64) RaftLogError![]const StoredEntry {
-        const self = fromCtx(ctx);
-        if (lo >= hi) return &[_]StoredEntry{};
-        if (self.entries.items.len == 0) return &[_]StoredEntry{};
-        const base = self.entries.items[0].index;
-        if (hi <= base) return &[_]StoredEntry{};
-        const start_index = if (lo > base) lo else base;
+        if (opts.hi <= base) {
+            return .{ .entries = try alloc.alloc(StoredEntry, 0), .arena = arena };
+        }
+        const start_index = if (opts.lo > base) opts.lo else base;
         const start_offset: usize = @intCast(start_index - base);
-        if (start_offset >= self.entries.items.len) return &[_]StoredEntry{};
+        if (start_offset >= self.entries.items.len) {
+            return .{ .entries = try alloc.alloc(StoredEntry, 0), .arena = arena };
+        }
 
+        // MemWAL doesn't track entry types, so ty filter is ignored here.
         var end_offset: usize = start_offset;
         var size: u64 = 0;
         while (end_offset < self.entries.items.len) : (end_offset += 1) {
             const stored = self.entries.items[end_offset];
-            if (stored.index >= hi) break;
-            size += stored.data_len;
-            if (max_bytes > 0 and end_offset > start_offset and size > max_bytes) break;
+            if (stored.index >= opts.hi) break;
+            size += stored.bytes.len;
+            if (opts.max_bytes > 0 and end_offset > start_offset and size > opts.max_bytes) break;
         }
 
-        if (end_offset <= start_offset) return &[_]StoredEntry{};
-        return self.entries.items[start_offset..end_offset];
+        if (end_offset <= start_offset) {
+            return .{ .entries = try alloc.alloc(StoredEntry, 0), .arena = arena };
+        }
+
+        // Copy entries into arena so they have uniform lifetime.
+        const src = self.entries.items[start_offset..end_offset];
+        const entries = try alloc.alloc(StoredEntry, src.len);
+        for (src, 0..) |se, i| {
+            entries[i] = .{
+                .index = se.index,
+                .term = se.term,
+                .bytes = try alloc.dupe(u8, se.bytes),
+            };
+        }
+        return .{ .entries = entries, .arena = arena };
     }
 
     fn firstIndexOfTerm(ctx: *anyopaque, term_value: u64) u64 {
@@ -309,7 +318,6 @@ pub const MemWAL = struct {
             try self.entries.append(self.allocator, .{
                 .index = reader.index(),
                 .term = reader.term(),
-                .data_len = @as(u32, @intCast(reader.data().len)),
                 .bytes = encoded,
             });
         }
@@ -377,11 +385,8 @@ pub const MemWAL = struct {
         .lastIndex = lastIndex,
         .lastTerm = lastTerm,
         .term = term,
-        .entryRef = entryRef,
-        .entriesFromRef = entriesFromRef,
-        .entriesRangeRef = entriesRangeRef,
+        .entriesRange = entriesRange,
         .firstIndexOfTerm = firstIndexOfTerm,
-        .lastIndexOfTerm = lastIndexOfTerm,
         .append = append,
         .truncateFrom = truncateFrom,
         .compactUntil = compactUntil,
