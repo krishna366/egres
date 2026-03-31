@@ -87,21 +87,21 @@ pub const FileHandle = struct {
         if (self.mapped) |mapped| {
             // MMAP: slice from mapped memory. Fault in pages under bandwidth
             // control so mmap I/O respects the same rate limits as pread.
-            var total_read: usize = 0;
-            while (total_read < aligned_size) {
-                const remaining = aligned_size - total_read;
-                const read_len = if (self.vfs.bw) |bw| bw.acquireAligned(priority, remaining, .read) else remaining;
-
+            var s = self.vfs.bw.spinner(priority, aligned_size, .read);
+            defer s.deinit();
+            var sink: u8 = 0;
+            var total_touched: usize = 0;
+            while (true) {
+                const read_len = s.acquireBytes();
+                if (read_len == 0) break;
                 // Touch one byte per page to trigger page faults.
-                // XOR into a sink so we need only one doNotOptimizeAway per chunk.
-                var sink: u8 = 0;
-                var pos: usize = total_read;
-                while (pos < total_read + read_len) : (pos += page_size) {
+                var pos: usize = total_touched;
+                while (pos < total_touched + read_len) : (pos += page_size) {
                     sink ^= mapped[aligned_offset + pos];
                 }
-                std.mem.doNotOptimizeAway(sink);
-                total_read += read_len;
+                total_touched += read_len;
             }
+            std.mem.doNotOptimizeAway(sink);
             return .{ .buf = null, .data = mapped[offset .. offset + len], .allocator = allocator };
         }
 
@@ -110,10 +110,12 @@ pub const FileHandle = struct {
         errdefer allocator.free(buf);
 
         const f = self.file.?;
+        var s = self.vfs.bw.spinner(priority, aligned_size, .read);
+        defer s.deinit();
         var total_read: usize = 0;
-        while (total_read < aligned_size) {
-            const remaining = aligned_size - total_read;
-            const read_len = if (self.vfs.bw) |bw| bw.acquireAligned(priority, remaining, .read) else remaining;
+        while (true) {
+            const read_len = s.acquireBytes();
+            if (read_len == 0) break;
             const n = try f.read(buf[total_read .. total_read + read_len], aligned_offset + total_read);
             if (n == 0) break; // EOF
             total_read += n;
@@ -174,12 +176,13 @@ pub const FileHandle = struct {
         const alloc = arena.allocator();
 
         // Bandwidth: acquire total bytes for this chunk before submitting.
-        if (self.vfs.bw) |bw| {
+        {
             var total: usize = 0;
             for (requests) |r| total += r.len;
-            var acquired: usize = 0;
-            while (acquired < total) {
-                acquired += bw.acquireAligned(priority, total - acquired, .read);
+            var s = self.vfs.bw.spinner(priority, total, .read);
+            defer s.deinit();
+            while (true) {
+                if (s.acquireBytes() == 0) break;
             }
         }
 
@@ -224,14 +227,12 @@ pub const FileHandle = struct {
         priority: Priority,
     ) !void {
         const f = self.file.?;
+        var s = self.vfs.bw.spinner(priority, data.len, .write);
+        defer s.deinit();
         var written: usize = 0;
-        while (written < data.len) {
-            const remaining = data.len - written;
-            const chunk_len = if (self.vfs.bw) |bw|
-                bw.acquireAligned(priority, @min(remaining, default_write_chunk), .write)
-            else
-                @min(remaining, default_write_chunk);
-
+        while (true) {
+            const chunk_len = s.acquireBytes();
+            if (chunk_len == 0) break;
             var chunk_written: usize = 0;
             while (chunk_written < chunk_len) {
                 const n = try f.write(data[written + chunk_written .. written + chunk_len], offset + written + chunk_written);
@@ -260,13 +261,37 @@ pub const FileHandle = struct {
     }
 };
 
-/// Module-level singleton. Configure via vfs.instance before opening tables.
-pub var instance: VFS = .{ .bw = null };
+var g_limiter: bandwidth.Limiter = undefined;
+var g_vfs: VFS = undefined;
+var g_initialized = false;
+
+/// Returns the global VFS instance. Lazily initialized with unlimited bandwidth.
+/// Call `VFS.initGlobal()` before this to configure bandwidth.
+pub fn g() *VFS {
+    if (!g_initialized) {
+        g_limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = std.math.maxInt(u64) });
+        g_vfs = .{ .bw = &g_limiter };
+        g_initialized = true;
+    }
+    return &g_vfs;
+}
 
 pub const VFS = struct {
-    bw: ?*bandwidth.Limiter,
+    bw: *bandwidth.Limiter,
 
-    pub const init: VFS = .{ .bw = null };
+    pub const Config = bandwidth.Config;
+
+    /// Initialize the global VFS instance with a specific bandwidth config.
+    pub fn initGlobal(config: Config) void {
+        g_limiter = bandwidth.Limiter.init(config);
+        g_vfs = .{ .bw = &g_limiter };
+        g_initialized = true;
+    }
+
+    /// Create a VFS with a caller-owned limiter.
+    pub fn new(limiter: *bandwidth.Limiter) VFS {
+        return .{ .bw = limiter };
+    }
 
     pub fn openFile(self: *const VFS, allocator: std.mem.Allocator, path: []const u8, opts: FileOptions) !FileHandle {
         const fid = fileIdFromPath(path);

@@ -24,8 +24,7 @@ pub const TestLog = struct {
             .disk => {
                 const wal_dir = try makeWalDir(allocator, id);
                 out.wal_dir = wal_dir;
-                const vfs = @import("vfs");
-                out.disk = try raft.DiskWAL.openPath(wal_dir, allocator, &vfs.VFS.init, 1024);
+                out.disk = try raft.DiskWAL.openPath(wal_dir, allocator, @import("vfs").g(), 1024);
             },
         }
         return out;

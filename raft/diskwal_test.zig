@@ -1,9 +1,11 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const raft = @import("raft");
+const vfs = @import("vfs");
 const zio = @import("zio");
 const zen = raft.buffers;
 const u = raft.utils;
+
 
 fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
@@ -139,7 +141,7 @@ test "diskwal term and index basics" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
     defer ds.deinit();
     const log = ds.asRaftWAL();
 
@@ -166,7 +168,7 @@ test "diskwal entriesRange max_bytes keeps at least one" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
     defer ds.deinit();
     const log = ds.asRaftWAL();
 
@@ -195,7 +197,7 @@ test "diskwal append overwrites conflicting suffix" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
     defer ds.deinit();
     const log = ds.asRaftWAL();
 
@@ -227,7 +229,7 @@ test "diskwal truncateFrom drops suffix" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
     defer ds.deinit();
     const log = ds.asRaftWAL();
 
@@ -250,7 +252,7 @@ test "diskwal persists hardstate and entries across reopen" {
     }
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
         try log.setHardState(.{
@@ -264,7 +266,7 @@ test "diskwal persists hardstate and entries across reopen" {
     }
 
     {
-        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds2.deinit();
         const log2 = ds2.asRaftWAL();
         try std.testing.expectEqual(@as(u64, 2), log2.lastIndex());
@@ -290,7 +292,7 @@ test "diskwal drops malformed trailing wal files on reopen" {
 
     // Write enough entries to trigger a rotation, producing at least 2 WAL files.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
         for (1..70) |i| {
@@ -328,7 +330,7 @@ test "diskwal drops malformed trailing wal files on reopen" {
     // Reopen — the malformed current file should be dropped. The previous
     // rotated file becomes current and its entries should survive.
     {
-        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds2.deinit();
         const log = ds2.asRaftWAL();
         // Should have entries from the rotated file (at least the first segment's worth).
@@ -345,7 +347,7 @@ test "diskwal rejects snapshot-log firstIndex mismatch on reopen" {
     }
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
         try log.setSnapshot(.{ .index = 5, .term = 2, .data = "snap" });
@@ -354,7 +356,7 @@ test "diskwal rejects snapshot-log firstIndex mismatch on reopen" {
 
     try std.testing.expectError(
         error.CorruptLogFile,
-        raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024),
+        raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024),
     );
 }
 
@@ -370,7 +372,7 @@ fn bigTestStorageImpl() !void {
     const N: u64 = 62_000;
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
 
@@ -405,7 +407,7 @@ fn bigTestStorageImpl() !void {
     }
 
     {
-        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds2.deinit();
         const log2 = ds2.asRaftWAL();
         try std.testing.expectEqual(@as(u64, 60_099), log2.lastIndex());
@@ -493,7 +495,7 @@ fn bigTestTruncateStorageImpl() !void {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
     defer ds.deinit();
     const log = ds.asRaftWAL();
 
@@ -535,7 +537,7 @@ fn bigTestLargePayloadRotationImpl() !void {
     defer alloc.free(payload);
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
 
@@ -586,7 +588,7 @@ fn bigTestLargePayloadRotationImpl() !void {
 
     // Reopen and verify recovery paths over the same boundary ranges.
     {
-        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, &@import("vfs").VFS.init, 1024);
+        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds2.deinit();
         const log2 = ds2.asRaftWAL();
 
@@ -776,7 +778,6 @@ test "entry cache wraparound with truncateFrom and evictBefore" {
 // =========================================================================
 
 const diskwal = raft.diskwal;
-const vfs = @import("vfs");
 
 test "diskwal CURRENT.wal recovery after clean close" {
     // Append entries without rotating, close, reopen — all entries should be
@@ -790,7 +791,7 @@ test "diskwal CURRENT.wal recovery after clean close" {
 
     // Write 5 entries and close.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &vfs.VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
         try appendRange(alloc, log, 1, 5, 1);
@@ -799,7 +800,7 @@ test "diskwal CURRENT.wal recovery after clean close" {
 
     // Reopen — CURRENT.wal should be recovered via CRC scan.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &vfs.VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
 
@@ -822,7 +823,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
 
     // Write 5 entries.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &vfs.VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
         try appendRange(alloc, log, 1, 5, 1);
@@ -861,7 +862,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
 
     // Reopen — should recover only entries 1 and 2.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &vfs.VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
 
@@ -890,7 +891,7 @@ test "diskwal rotation creates numbered file and new CURRENT.wal" {
     const num_entries: u64 = 70; // enough to trigger at least one rotation
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &vfs.VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
 
@@ -911,7 +912,7 @@ test "diskwal rotation creates numbered file and new CURRENT.wal" {
 
     // Reopen and verify all entries survived rotation + recovery.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, &vfs.VFS.init, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, vfs.g(), 1024);
         defer ds.deinit();
         const log = ds.asRaftWAL();
 

@@ -428,7 +428,7 @@ pub const Forest = struct {
         var mtb = tb;
         defer mtb.deinit();
 
-        const wh = vfs.instance.createFile(path, .{ .mode = .direct }) catch return null;
+        const wh = vfs.g().createFile(path, .{ .mode = .direct }) catch return null;
         wh.write(mtb.bytes, 0, .p0) catch return null;
         wh.sync() catch return null;
         wh.close();

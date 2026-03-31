@@ -44,11 +44,11 @@ pub const Table = struct {
         return self.handle.file_size;
     }
 
-    /// open opens an SST file through the global VFS instance (vfs.instance).
-    /// The file loading mode is determined by vfs.instance; readAligned
+    /// open opens an SST file through the global VFS instance (vfs.g).
+    /// The file loading mode is determined by vfs.g(); readAligned
     /// transparently handles mmap, direct, and memory-backed file handles.
     pub fn open(allocator: std.mem.Allocator, path: []const u8, priority: vfs.Priority) !*Table {
-        const handle = try vfs.instance.openFile(allocator, path, .{});
+        const handle = try vfs.g().openFile(allocator, path, .{});
         const t = try initFromHandle(allocator, handle, priority);
         errdefer t.decrRef();
         t.file_id = vfs.fileIdFromPath(path);

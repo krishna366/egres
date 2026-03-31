@@ -58,7 +58,7 @@ fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
         .file_size = @intCast(owned.len),
         .owned_buf = owned,
         .buf_allocator = allocator,
-        .vfs = &vfs.instance,
+        .vfs = vfs.g(),
     };
 }
 

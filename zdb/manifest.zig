@@ -273,7 +273,7 @@ pub const ForestState = struct {
         }
 
         // Create file, write everything in one call, sync, then rename into place.
-        const tmp = try vfs.instance.createFile(rewrite_path, .{ .flags = .{ .truncate = true } });
+        const tmp = try vfs.g().createFile(rewrite_path, .{ .flags = .{ .truncate = true } });
         errdefer vfs.VFS.deleteFile(rewrite_path) catch {};
         try tmp.write(out.items, 0, .p0);
         try tmp.sync();
@@ -282,7 +282,7 @@ pub const ForestState = struct {
         try vfs.VFS.renameFile(rewrite_path, manifest_path);
 
         // openFile should use the self.allocator, so it's valid after returning from this func.
-        const new_handle = try vfs.instance.openFile(self.allocator, manifest_path, .{ .flags = .{ .writable = true } });
+        const new_handle = try vfs.g().openFile(self.allocator, manifest_path, .{ .flags = .{ .writable = true } });
         errdefer new_handle.close();
 
         if (self.handle) |h| h.close();
@@ -386,7 +386,7 @@ pub fn openOrCreate(
     const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, manifest_filename });
     defer allocator.free(manifest_path);
 
-    const handle = vfs.instance.openFile(allocator, manifest_path, .{
+    const handle = vfs.g().openFile(allocator, manifest_path, .{
         .flags = .{ .writable = true },
     }) catch |err| {
         if (err != error.FileNotFound) return err;
