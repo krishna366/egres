@@ -24,7 +24,7 @@ pub const TestLog = struct {
             .disk => {
                 const wal_dir = try makeWalDir(allocator, id);
                 out.wal_dir = wal_dir;
-                out.disk = try raft.DiskWAL.openPath(wal_dir, allocator, @import("vfs").g(), 1024);
+                out.disk = try raft.DiskWAL.openPath(wal_dir, allocator, 1024);
             },
         }
         return out;
@@ -79,29 +79,46 @@ pub const TestCluster = struct {
         const drop_to = std.AutoHashMap(NodeId, void).init(allocator);
         try nodes.ensureTotalCapacity(@intCast(ids.len));
 
+        // Phase 1: Create all nodes with localhost transport.
         for (ids) |id| {
             const peers = try buildPeers(allocator, ids, learners, id);
-            const self_role: raft.PeerRole = if (containsNode(learners, id)) .learner else .voter;
-
             var entry = try allocator.create(MetaNode);
             entry.* = .{
                 .node = undefined,
                 .wal = try TestLog.init(allocator, id),
                 .peers = peers,
-                .group = .init,
+                .group = zio.group(),
             };
             var ncfg = config;
             ncfg.id = id;
+            ncfg.listen_addr = "127.0.0.1:0";
             ncfg.tick_interval_ms = 1; // Fast ticks for tests.
             entry.node = try Node.init(
                 allocator,
                 peers,
                 entry.wal.asRaftWAL(),
                 ncfg,
-                self_role,
             );
-
+            if (containsNode(learners, id)) {
+                entry.node.state = .learner;
+            }
+            try entry.node.initTransport();
             try nodes.put(id, entry);
+        }
+
+        // Phase 2: Exchange actual bound addresses between nodes.
+        var addr_it = nodes.iterator();
+        while (addr_it.next()) |kv| {
+            const node_id = kv.key_ptr.*;
+            const port = kv.value_ptr.*.node.transport.?.getListenPort();
+            const addr = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
+            defer allocator.free(addr);
+
+            var peer_it = nodes.iterator();
+            while (peer_it.next()) |pkv| {
+                if (pkv.key_ptr.* == node_id) continue;
+                pkv.value_ptr.*.node.transport.?.addPeer(node_id, addr) catch {};
+            }
         }
 
         const cluster = try allocator.create(TestCluster);
@@ -112,33 +129,16 @@ pub const TestCluster = struct {
             .drop_to = drop_to,
         };
 
-        // Register on_send and start coroutines for each node.
+        // Phase 3: Start coroutines for each node.
         var node_it = cluster.nodes.valueIterator();
         while (node_it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
-            entry.node.on_send = &testSend;
-            entry.node.on_send_ctx = @ptrCast(cluster);
             entry.group.spawn(Node.tickLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
             entry.group.spawn(Node.mainLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
             entry.group.spawn(Node.applyLoop, .{entry.node}) catch {};
         }
+        std.debug.print("TestCluster.init: done\n", .{});
         return cluster;
-    }
-
-    fn testSend(ctx: *anyopaque, from: NodeId, to: NodeId, payload: []const u8) void {
-        const self: *TestCluster = @ptrCast(@alignCast(ctx));
-        if (self.drop_from.contains(from)) return;
-        if (self.drop_to.contains(to)) return;
-        const dest = self.nodes.get(to) orelse return;
-        const owned = self.allocator.dupe(u8, payload) catch return;
-        dest.node.inbound_ch.send(.{
-            .message_type = raft.msg_type_raft,
-            .payload = owned,
-        }) catch {
-            self.allocator.free(owned);
-            return;
-        };
-        dest.node.event_ch.trySend(1) catch {};
     }
 
     pub fn deinit(self: *TestCluster) void {
@@ -156,6 +156,7 @@ pub const TestCluster = struct {
         var it = self.nodes.valueIterator();
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
+            entry.node.deinitTransport();
             entry.node.deinit();
             entry.wal.deinit(self.allocator);
             self.allocator.free(entry.peers);
@@ -169,6 +170,7 @@ pub const TestCluster = struct {
 
     /// Wait until every node has advanced by at least `n` ticks.
     pub fn waitForTicks(self: *TestCluster, n: u64) void {
+        std.debug.print("waitForTicks: waiting for {d} ticks\n", .{n});
         // Record starting tick counts.
         var starts: [16]u64 = undefined;
         var count: usize = 0;
@@ -200,19 +202,18 @@ pub const TestCluster = struct {
         return entry.node;
     }
 
+    /// Drop all messages sent by this node.
     pub fn setDropFrom(self: *TestCluster, id: NodeId, drop: bool) void {
-        if (drop) {
-            _ = self.drop_from.put(id, {}) catch {};
-        } else {
-            _ = self.drop_from.remove(id);
-        }
+        const entry = self.nodes.get(id) orelse return;
+        if (entry.node.transport) |tr| tr.setDropAll(drop);
     }
 
+    /// Drop all messages destined to this node (from every other node's perspective).
     pub fn setDropTo(self: *TestCluster, id: NodeId, drop: bool) void {
-        if (drop) {
-            _ = self.drop_to.put(id, {}) catch {};
-        } else {
-            _ = self.drop_to.remove(id);
+        var it = self.nodes.iterator();
+        while (it.next()) |kv| {
+            if (kv.key_ptr.* == id) continue;
+            if (kv.value_ptr.*.node.transport) |tr| tr.setDropForPeer(id, drop);
         }
     }
 

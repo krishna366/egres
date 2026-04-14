@@ -9,13 +9,8 @@ const TestLog = cluster_mod.TestLog;
 const Config = raft.Config;
 const NodeId = raft.NodeId;
 
-fn reserveLocalPort() !u16 {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{
-        .reuse_address = true,
-    });
-    defer server.deinit();
-    return server.listen_address.getPort();
+test "all" {
+    try raft.utils.runTestsInZioRuntime(@This());
 }
 
 fn noopCb(_: *anyopaque, _: raft.ProposalEntry, _: raft.CommitStatus) void {}
@@ -50,14 +45,7 @@ fn countLeaders(cluster: *TestCluster) usize {
     return count;
 }
 
-test "leader election" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(leaderElectionImpl, .{});
-    try handle.join();
-}
-
-fn leaderElectionImpl() !void {
+pub fn testLeaderElection() !void {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3 };
 
@@ -71,14 +59,7 @@ fn leaderElectionImpl() !void {
     try std.testing.expectEqual(@as(usize, 1), countLeaders(cluster));
 }
 
-test "heartbeats keep followers stable" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(heartbeatsStableImpl, .{});
-    try handle.join();
-}
-
-fn heartbeatsStableImpl() !void {
+pub fn testHeartbeatsKeepFollowersStable() !void {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3 };
 
@@ -94,14 +75,7 @@ fn heartbeatsStableImpl() !void {
     try std.testing.expectEqual(@as(usize, 1), countLeaders(cluster));
 }
 
-test "leader re-election after isolation" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(reElectionImpl, .{});
-    try handle.join();
-}
-
-fn reElectionImpl() !void {
+pub fn testLeaderReElectionAfterIsolation() !void {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3 };
 
@@ -119,14 +93,7 @@ fn reElectionImpl() !void {
     try std.testing.expectEqual(@as(usize, 1), countLeaders(cluster));
 }
 
-test "learner never votes or becomes leader" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(learnerNeverLeaderImpl, .{});
-    try handle.join();
-}
-
-fn learnerNeverLeaderImpl() !void {
+pub fn testLearnerNeverVotesOrBecomesLeader() !void {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3, 4 };
     var learners = [_]NodeId{4};
@@ -147,14 +114,7 @@ fn learnerNeverLeaderImpl() !void {
     }
 }
 
-test "pre-vote avoids term bump without quorum" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(prevoteImpl, .{});
-    try handle.join();
-}
-
-fn prevoteImpl() !void {
+pub fn testPreVoteAvoidsTermBumpWithoutQuorum() !void {
     var ids = [_]NodeId{ 1, 2, 3 };
 
     var cfg_pre = defaultConfig();
@@ -183,14 +143,7 @@ fn prevoteImpl() !void {
     try std.testing.expect(node1_no.current_term > term_before);
 }
 
-test "convert to voter and learner adjust quorum" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(confChangeQuorumImpl, .{});
-    try handle.join();
-}
-
-fn confChangeQuorumImpl() !void {
+pub fn testConvertToVoterAndLearnerAdjustQuorum() !void {
     var cfg = defaultConfig();
     cfg.enable_prevote = false;
     var ids = [_]NodeId{ 1, 2, 3 };
@@ -217,14 +170,7 @@ fn confChangeQuorumImpl() !void {
     try std.testing.expectEqual(quorum_before, leader.quorum_size);
 }
 
-test "candidate steps down on higher term" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(candidateStepDownImpl, .{});
-    try handle.join();
-}
-
-fn candidateStepDownImpl() !void {
+pub fn testCandidateStepsDownOnHigherTerm() !void {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3 };
 
@@ -272,7 +218,7 @@ fn candidateStepDownImpl() !void {
     try std.testing.expect(leader_node.current_term >= higher_term);
 }
 
-test "proposal callback fires on commit" {
+pub fn testProposalCallbackFiresOnCommit() !void {
     var cfg = defaultConfig();
     cfg.enable_prevote = false;
 
@@ -285,7 +231,6 @@ test "proposal callback fires on commit" {
         &[_]raft.Peer{},
         test_wal.asRaftWAL(),
         ncfg,
-        .voter,
     );
     defer node.deinit();
     try node.becomeLeader();
@@ -323,14 +268,7 @@ fn runRaftRuntime(t: *raft.RaftRuntime) void {
 
 // ---- Transport tests (zio-based) ----
 
-test "transport starts and stops cleanly" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(transportStartStopImpl, .{});
-    try handle.join();
-}
-
-fn transportStartStopImpl() !void {
+pub fn testTransportStartsAndStopsCleanly() !void {
     var cfg = defaultConfig();
     cfg.enable_prevote = false;
     cfg.cluster_id = 1001;
@@ -344,7 +282,6 @@ fn transportStartStopImpl() !void {
         &[_]raft.Peer{},
         test_wal.asRaftWAL(),
         cfg,
-        .voter,
     );
     defer node.deinit();
     try node.becomeLeader();
@@ -352,7 +289,7 @@ fn transportStartStopImpl() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.wait() catch {};
     try group.spawn(runRaftRuntime, .{&rt});
 
@@ -360,14 +297,7 @@ fn transportStartStopImpl() !void {
     node.startShutdown();
 }
 
-test "transport processes proposal" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(transportProposalImpl, .{});
-    try handle.join();
-}
-
-fn transportProposalImpl() !void {
+pub fn testTransportProcessesProposal() !void {
     var cfg = defaultConfig();
     cfg.enable_prevote = false;
     cfg.id = 1;
@@ -382,7 +312,6 @@ fn transportProposalImpl() !void {
         &[_]raft.Peer{},
         test_wal.asRaftWAL(),
         cfg,
-        .voter,
     );
     defer node.deinit();
     try node.becomeLeader();
@@ -390,7 +319,7 @@ fn transportProposalImpl() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.wait() catch {};
     try group.spawn(runRaftRuntime, .{&rt});
 
@@ -420,14 +349,7 @@ fn transportProposalImpl() !void {
     node.startShutdown();
 }
 
-test "transport stop is clean" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(transportStopImpl, .{});
-    try handle.join();
-}
-
-fn transportStopImpl() !void {
+pub fn testTransportStopIsClean() !void {
     var cfg = defaultConfig();
     cfg.id = 1;
     cfg.cluster_id = 1003;
@@ -441,14 +363,13 @@ fn transportStopImpl() !void {
         &[_]raft.Peer{},
         test_wal.asRaftWAL(),
         cfg,
-        .voter,
     );
     defer node.deinit();
 
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.wait() catch {};
     try group.spawn(runRaftRuntime, .{&rt});
 
@@ -456,7 +377,7 @@ fn transportStopImpl() !void {
     node.startShutdown();
 }
 
-test "propose after shutdown returns QueueClosed" {
+pub fn testProposeAfterShutdownReturnsQueueClosed() !void {
     const cfg = defaultConfig();
 
     var test_wal = try TestLog.init(std.testing.allocator, 1);
@@ -468,7 +389,6 @@ test "propose after shutdown returns QueueClosed" {
         &[_]raft.Peer{},
         test_wal.asRaftWAL(),
         ncfg,
-        .voter,
     );
     defer node.deinit();
 
@@ -482,136 +402,7 @@ test "propose after shutdown returns QueueClosed" {
     );
 }
 
-test "join request is rejected by non-leader" {
-    if (true) {
-        return;
-    }
-    const port = try reserveLocalPort();
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(joinRejectedImpl, .{port});
-    try handle.join();
-}
-
-fn joinRejectedImpl(port: u16) !void {
-    const alloc = std.testing.allocator;
-    var addr_buf: [32]u8 = undefined;
-    const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
-
-    var cfg = defaultConfig();
-    cfg.id = 1;
-    cfg.cluster_id = 42;
-    cfg.listen_addr = addr_str;
-    cfg.tick_interval_ms = 1;
-
-    var test_wal = try TestLog.init(alloc, 1);
-    defer test_wal.deinit(alloc);
-    const node = try raft.Node.init(
-        alloc,
-        &[_]raft.Peer{},
-        test_wal.asRaftWAL(),
-        cfg,
-        .voter,
-    );
-    defer node.deinit();
-    // Node is a follower, not a leader.
-
-    var rt = raft.RaftRuntime.init(alloc, node);
-    defer rt.deinit();
-
-    var group: zio.Group = .init;
-    defer group.wait() catch {};
-    try group.spawn(runRaftRuntime, .{&rt});
-
-    // Retry requestJoin until the transport is listening.
-    var join_buf: ?zen.JoinResponseBuffer = null;
-    for (0..100) |_| {
-        join_buf = raft.requestJoin(alloc, addr_str, 42, 2, "127.0.0.1:0") catch {
-            zio.sleep(zio.Duration.fromMilliseconds(20)) catch return error.Cancelled;
-            continue;
-        };
-        break;
-    }
-    var resp = join_buf orelse return error.ConnectionFailed;
-    defer resp.deinit();
-    const res_reader = try resp.initReader();
-    try std.testing.expect(!res_reader.accepted());
-
-    node.startShutdown();
-}
-
-test "leader accepts join request" {
-    if (true) {
-        return;
-    }
-    const port = try reserveLocalPort();
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(joinAcceptedImpl, .{port});
-    try handle.join();
-}
-
-fn joinAcceptedImpl(port: u16) !void {
-    const alloc = std.testing.allocator;
-    var addr_buf: [32]u8 = undefined;
-    const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
-
-    var cfg = defaultConfig();
-    cfg.id = 1;
-    cfg.cluster_id = 43;
-    cfg.listen_addr = addr_str;
-    cfg.tick_interval_ms = 1;
-
-    var test_wal = try TestLog.init(alloc, 1);
-    defer test_wal.deinit(alloc);
-    const node = try raft.Node.init(
-        alloc,
-        &[_]raft.Peer{},
-        test_wal.asRaftWAL(),
-        cfg,
-        .voter,
-    );
-    defer node.deinit();
-    try node.becomeLeader();
-
-    var rt = raft.RaftRuntime.init(alloc, node);
-    defer rt.deinit();
-
-    var group: zio.Group = .init;
-    defer group.wait() catch {};
-    try group.spawn(runRaftRuntime, .{&rt});
-
-    // Retry requestJoin until the transport is listening.
-    var join_buf: ?zen.JoinResponseBuffer = null;
-    for (0..100) |_| {
-        join_buf = raft.requestJoin(alloc, addr_str, 43, 2, "127.0.0.1:19002") catch {
-            zio.sleep(zio.Duration.fromMilliseconds(20)) catch return error.Cancelled;
-            continue;
-        };
-        break;
-    }
-    var resp = join_buf orelse return error.ConnectionFailed;
-    defer resp.deinit();
-    const res_reader = try resp.initReader();
-    try std.testing.expect(res_reader.accepted());
-
-    node.startShutdown();
-}
-
-// TODO: Rewrite once the g_transport global is replaced with per-transport state,
-// allowing two transports to run in the same process.
-test "single-node leader adds joiner as learner" {
-    return error.SkipZigTest;
-}
-
-test "log replication" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(logReplicationImpl, .{});
-    try handle.join();
-}
-
-fn logReplicationImpl() !void {
+pub fn testLogReplication() !void {
     const cfg = defaultConfig();
     var ids = [_]NodeId{ 1, 2, 3 };
 
@@ -660,14 +451,7 @@ fn logReplicationImpl() !void {
     }
 }
 
-test "follower catches up after disconnect and reconnect" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(followerCatchUpImpl, .{});
-    try handle.join();
-}
-
-fn followerCatchUpImpl() !void {
+pub fn testFollowerCatchesUpAfterDisconnectAndReconnect() !void {
     var cfg = defaultConfig();
     cfg.enable_prevote = false;
 

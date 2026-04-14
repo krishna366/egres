@@ -98,7 +98,7 @@ fn muxExchangeTest() !void {
 
     const bound_addr = server.socket.address;
 
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.cancel();
 
     // Server side: accept one connection, run mux reader.
@@ -195,7 +195,7 @@ fn muxMultiFrameTest() !void {
 
     const bound_addr = server.socket.address;
 
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.cancel();
 
     try group.spawn(concatServerSide, .{ server, alloc });
@@ -234,7 +234,7 @@ fn muxMultiStreamTest() !void {
 
     const bound_addr = server.socket.address;
 
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.cancel();
 
     try group.spawn(serverSide, .{ server, alloc });

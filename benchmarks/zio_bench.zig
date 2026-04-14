@@ -89,7 +89,7 @@ fn benchThreadCpu(num_workers: usize, ops_per_worker: usize) Stats {
 }
 
 fn benchFiberCpu(num_workers: usize, ops_per_worker: usize) !Stats {
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.cancel();
     const t0 = std.time.nanoTimestamp();
     for (0..num_workers) |_| try group.spawn(fiberCpuWorker, .{ops_per_worker});
@@ -134,7 +134,7 @@ fn benchFiberIo(
     const ops_per = total_ops / num_fibers;
     const latencies = try allocator.alloc(u64, num_fibers * ops_per);
 
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.cancel();
 
     const t0 = std.time.nanoTimestamp();

@@ -120,6 +120,9 @@ pub fn main() !void {
         args.id, args.cluster_id, args.raft_addr, args.client_addr, args.data_dir, args.tick_ms, args.seeds.len,
     });
 
+    // Initialize VFS with 500 MB/s bandwidth limit.
+    zdb.vfs.VFS.initGlobal(.{ .bytes_per_sec = 500 * 1024 * 1024 });
+
     // Runtime pool singleton — created first so all runtimes are available.
     const pool = try runtime.Pool.init(allocator, .{});
     defer deinitWithLog("pool", pool);
@@ -127,25 +130,11 @@ pub fn main() !void {
 
     // Open raft WAL.
     log.info("opening raft WAL at {s}", .{args.data_dir});
-    var wal = try raft.DiskWAL.openPath(args.data_dir, allocator);
+    var wal = try raft.DiskWAL.openPath(args.data_dir, allocator, 1024);
     defer deinitWithLog("wal", &wal);
 
     const wal_iface = wal.asRaftWAL();
-    const is_restart = wal_iface.lastIndex() > 0;
 
-    // Determine initial role: on join start as learner, otherwise voter.
-    // On restart, restoreConfState will correct the role from persisted state.
-    const initial_role: raft.PeerRole = if (!is_restart and args.seeds.len > 0) .learner else .voter;
-
-    if (is_restart) {
-        log.info("RESTART mode: WAL has entries, restoring state", .{});
-    } else if (args.seeds.len > 0) {
-        log.info("JOIN mode: fresh node, will join via seeds", .{});
-    } else {
-        log.info("BOOTSTRAP mode: fresh single-node cluster", .{});
-    }
-
-    // Initialize raft node (no static peers — learned from WAL or join).
     const node = try raft.Node.init(
         allocator,
         &.{},
@@ -156,16 +145,8 @@ pub fn main() !void {
             .listen_addr = args.raft_addr,
             .tick_interval_ms = args.tick_ms,
         },
-        initial_role,
     );
     defer deinitWithLog("node", node);
-
-    // On restart, restore persisted state from WAL.
-    if (is_restart) {
-        node.restoreState();
-        node.restoreConfState();
-        log.info("raft state restored from WAL", .{});
-    }
 
     log.info("raft node initialized id={d}", .{args.id});
 
@@ -211,10 +192,10 @@ pub fn main() !void {
 
     log.info("all components initialized", .{});
 
-    appMain(&raft_rt, &zdb_srv, node, &args);
+    // appMain(&raft_rt, &zdb_srv, node, &args);
     // // Entry point: spawn appMain on the raft pool. It orchestrates everything.
-    // var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node, &args });
-    // handle.join();
+    var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node, &args });
+    handle.join();
 
     log.info("shutting down...", .{});
 }
@@ -224,17 +205,25 @@ pub fn main() !void {
 /// and waits for SIGINT to shut down.
 fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const ParsedArgs) void {
     log.info("inside appMain", .{});
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.cancel();
+
+    // Initialize transport (needed for both join and raft loops).
+    node.initTransport() catch |err| {
+        log.err("failed to init transport: {s}", .{@errorName(err)});
+        return;
+    };
+
+    // If we have seeds, join the cluster before starting raft loops.
+    // This ensures the node receives its add_learner entry and doesn't
+    // accidentally bootstrap as a single-node cluster.
+    if (args.seeds.len > 0) {
+        log.info("appMain: joining cluster via seeds", .{});
+        runJoin(args, raft_rt);
+    }
 
     log.info("appMain: spawning raft runtime on raft pool", .{});
     group.spawn(runRaft, .{raft_rt}) catch return;
-
-    // If we have seeds and this is a fresh node, spawn the join procedure.
-    if (args.seeds.len > 0) {
-        log.info("appMain: spawning cluster join via seeds", .{});
-        group.spawn(runJoin, .{ args, raft_rt }) catch return;
-    }
 
     log.info("appMain: spawning client server on query pool", .{});
     group.spawn(runServer, .{zdb_srv}) catch return;

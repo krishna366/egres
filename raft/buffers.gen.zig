@@ -58,6 +58,7 @@ pub const ConfChangeStruct = struct {
     to_voter: bool = false,
     to_learner: bool = false,
     remove_node: bool = false,
+    update_addr: bool = false,
     change_type: u64 = 0,
     node_id: u64 = 0,
     addr: []const u8 = &.{},
@@ -69,6 +70,7 @@ pub const ConfChangeStruct = struct {
             .to_voter = r.toVoter(),
             .to_learner = r.toLearner(),
             .remove_node = r.removeNode(),
+            .update_addr = r.updateAddr(),
             .change_type = r.changeType(),
             .node_id = r.nodeId(),
         };
@@ -101,6 +103,7 @@ pub const ConfChangeStruct = struct {
             .to_voter = self.to_voter,
             .to_learner = self.to_learner,
             .remove_node = self.remove_node,
+            .update_addr = self.update_addr,
             .change_type = self.change_type,
             .node_id = self.node_id,
         };
@@ -123,6 +126,7 @@ pub const ConfChangeStruct = struct {
         try writer.setToVoter(self.to_voter);
         try writer.setToLearner(self.to_learner);
         try writer.setRemoveNode(self.remove_node);
+        try writer.setUpdateAddr(self.update_addr);
         try writer.changeTypeSet(self.change_type);
         try writer.setNodeId(self.node_id);
         try writer.setAddr(self.addr);
@@ -200,6 +204,15 @@ pub const ConfChangeReader = struct {
         return ((word >> bit) & 1) == 1;
     }
 
+    pub fn updateAddr(self: Self) bool {
+        const slot_end = @as(u32, self.base) + 12;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return false;
+        const word = zbuf.readU64(self.buf, @as(usize, self.base + 4)) catch 0;
+        const bit = @as(u6, @intCast(5));
+        return ((word >> bit) & 1) == 1;
+    }
+
     pub fn changeType(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 12;
         const header_end = @as(u32, self.base) + self.size_bytes;
@@ -272,6 +285,7 @@ pub const ConfChangeBuffer = struct {
         try writer.setToVoter(reader.toVoter());
         try writer.setToLearner(reader.toLearner());
         try writer.setRemoveNode(reader.removeNode());
+        try writer.setUpdateAddr(reader.updateAddr());
         try writer.changeTypeSet(reader.changeType());
         try writer.setNodeId(reader.nodeId());
         try writer.setAddr(reader.addr());
@@ -384,6 +398,19 @@ pub const ConfChangeWriter = struct {
         try zbuf.patchU64(out.items, word_off, word);
     }
 
+    pub fn setUpdateAddr(self: *Self, v: bool) Error!void {
+        const out = self.bufMut();
+        const word_off = self.base + 4;
+        var word = try zbuf.readU64(out.items, @as(usize, word_off));
+        const bit = @as(u6, @intCast(5));
+        if (v) {
+            word |= (@as(u64, 1) << bit);
+        } else {
+            word &= ~(@as(u64, 1) << bit);
+        }
+        try zbuf.patchU64(out.items, word_off, word);
+    }
+
     pub fn changeTypeSet(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 4, v);
@@ -446,6 +473,7 @@ pub const ConfChangeWriter = struct {
         if (@hasField(Values, "to_voter")) try self.setToVoter(@field(values, "to_voter"));
         if (@hasField(Values, "to_learner")) try self.setToLearner(@field(values, "to_learner"));
         if (@hasField(Values, "remove_node")) try self.setRemoveNode(@field(values, "remove_node"));
+        if (@hasField(Values, "update_addr")) try self.setUpdateAddr(@field(values, "update_addr"));
         if (@hasField(Values, "change_type")) try self.changeTypeSet(@field(values, "change_type"));
         if (@hasField(Values, "node_id")) try self.setNodeId(@field(values, "node_id"));
         if (@hasField(Values, "addr")) try self.setAddr(@field(values, "addr"));
@@ -3707,13 +3735,11 @@ pub const ConfStateWriter = struct {
 pub const HardStateStruct = struct {
     current_term: u64 = 0,
     voted_for: u64 = 0,
-    commit_index: u64 = 0,
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: HardStateReader) Error!HardStateStruct {
         var s = HardStateStruct{
             .current_term = r.currentTerm(),
             .voted_for = r.votedFor(),
-            .commit_index = r.commitIndex(),
         };
         errdefer s.deinit(alloc);
         return s;
@@ -3740,7 +3766,6 @@ pub const HardStateStruct = struct {
         var s = HardStateStruct{
             .current_term = self.current_term,
             .voted_for = self.voted_for,
-            .commit_index = self.commit_index,
         };
         errdefer s.deinit(alloc);
         return s;
@@ -3757,7 +3782,6 @@ pub const HardStateStruct = struct {
         var writer = try HardStateWriter.initWithBuf(alloc, out);
         try writer.setCurrentTerm(self.current_term);
         try writer.setVotedFor(self.voted_for);
-        try writer.setCommitIndex(self.commit_index);
         const result = try writer.finish();
         return result.offset;
     }
@@ -3771,7 +3795,7 @@ pub const HardStateReader = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42252;
-    pub const SIZE_BYTES: u16 = 28;
+    pub const SIZE_BYTES: u16 = 20;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -3799,13 +3823,6 @@ pub const HardStateReader = struct {
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 12)) catch 0;
-    }
-
-    pub fn commitIndex(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 28;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 20)) catch 0;
     }
 
     pub fn verify(self: Self) Error!void {
@@ -3837,7 +3854,6 @@ pub const HardStateBuffer = struct {
         var writer = try HardStateWriter.initWithBuf(alloc, out);
         try writer.setCurrentTerm(reader.currentTerm());
         try writer.setVotedFor(reader.votedFor());
-        try writer.setCommitIndex(reader.commitIndex());
         const result = try writer.finish();
         return result.offset;
     }
@@ -3859,7 +3875,7 @@ pub const HardStateWriter = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42252;
-    pub const SIZE_BYTES: u16 = 28;
+    pub const SIZE_BYTES: u16 = 20;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -3892,11 +3908,6 @@ pub const HardStateWriter = struct {
         try zbuf.patchU64(out.items, self.base + 12, v);
     }
 
-    pub fn setCommitIndex(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 20, v);
-    }
-
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -3904,7 +3915,6 @@ pub const HardStateWriter = struct {
         }
         if (@hasField(Values, "current_term")) try self.setCurrentTerm(@field(values, "current_term"));
         if (@hasField(Values, "voted_for")) try self.setVotedFor(@field(values, "voted_for"));
-        if (@hasField(Values, "commit_index")) try self.setCommitIndex(@field(values, "commit_index"));
     }
 
     pub fn finish(self: *Self) Error!HardStateBuffer {

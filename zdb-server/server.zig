@@ -53,7 +53,7 @@ pub const ZdbServer = struct {
 
         log.info("client TCP listener started, accepting connections", .{});
 
-        var group: zio.Group = .init;
+        var group = zio.group();
         defer group.cancel();
 
         var conn_id: u64 = 0;
@@ -210,10 +210,11 @@ pub const ZdbServer = struct {
             .to_voter => .to_voter,
             .to_learner => .to_learner,
             .remove => .remove_node,
+            .addr => .update_addr,
         };
 
-        // Validate address for add commands.
-        if (req.action == .add) {
+        // Validate address for commands that require it.
+        if (req.action == .add or req.action == .addr) {
             _ = zio.net.IpAddress.parseIpAndPort(req.addr) catch {
                 try proto.writeErr(stream, "invalid address");
                 return;

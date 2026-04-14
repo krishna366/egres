@@ -23,9 +23,8 @@ const TableCache = zdb.tree.TableCache;
 
 const options_mod = zdb.options;
 
-test {
-    _ = try zio.Runtime.init(std.heap.smp_allocator, .{});
-}
+const utils = @import("utils");
+test { try utils.runTestsInZioRuntime(@This()); }
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -78,7 +77,7 @@ fn destroyTable(t: *Table) void {
 // 1. level_handler L0 sort
 // ---------------------------------------------------------------------------
 
-test "level_handler L0 sort" {
+pub fn testLevelHandlerL0Sort() !void {
     const alloc = std.testing.allocator;
 
     var tb3 = try buildTable(alloc, &.{.{ .key = "c", .ts = 0, .val = "v" }});
@@ -112,7 +111,7 @@ test "level_handler L0 sort" {
 // 2. level_handler L1 sort
 // ---------------------------------------------------------------------------
 
-test "level_handler L1 sort" {
+pub fn testLevelHandlerL1Sort() !void {
     const alloc = std.testing.allocator;
 
     // Three tables at L1 with non-overlapping key ranges (added out of order).
@@ -150,7 +149,7 @@ test "level_handler L1 sort" {
 // 3. overlapping tables L1
 // ---------------------------------------------------------------------------
 
-test "overlapping tables L1" {
+pub fn testOverlappingTablesL1() !void {
     const alloc = std.testing.allocator;
 
     // 5 tables with ranges: a-b, c-d, e-f, g-h, i-j
@@ -198,7 +197,7 @@ test "overlapping tables L1" {
 // 4. overlapping tables L0
 // ---------------------------------------------------------------------------
 
-test "overlapping tables L0" {
+pub fn testOverlappingTablesL0() !void {
     const alloc = std.testing.allocator;
 
     var tb1 = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "v" }});
@@ -234,7 +233,7 @@ test "overlapping tables L0" {
 // 5. get L0 newest wins
 // ---------------------------------------------------------------------------
 
-test "get L0 newest wins" {
+pub fn testGetL0NewestWins() !void {
     const alloc = std.testing.allocator;
 
     // Table ID=1: key "k" at ts=3 → "old"
@@ -268,7 +267,7 @@ test "get L0 newest wins" {
 // 6. get L1 hit
 // ---------------------------------------------------------------------------
 
-test "get L1 hit" {
+pub fn testGetL1Hit() !void {
     const alloc = std.testing.allocator;
 
     var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "va" }});
@@ -304,7 +303,7 @@ test "get L1 hit" {
 // 7. get miss
 // ---------------------------------------------------------------------------
 
-test "get miss" {
+pub fn testGetMiss() !void {
     const alloc = std.testing.allocator;
 
     var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "va" }});
@@ -324,7 +323,7 @@ test "get miss" {
 // 8. levels open
 // ---------------------------------------------------------------------------
 
-test "levels open" {
+pub fn testLevelsOpen() !void {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -381,7 +380,7 @@ test "levels open" {
 // 9. pick compact level
 // ---------------------------------------------------------------------------
 
-test "pick compact level" {
+pub fn testPickCompactLevel() !void {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -426,7 +425,7 @@ test "pick compact level" {
 // 10. do compact L0→L1
 // ---------------------------------------------------------------------------
 
-test "do compact L0->L1" {
+pub fn testDoCompactL0L1() !void {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -495,7 +494,7 @@ test "do compact L0->L1" {
 // 11. do compact L0→L1 with dest overlap
 // ---------------------------------------------------------------------------
 
-test "do compact L0->L1 with dest overlap" {
+pub fn testDoCompactL0L1WithDestOverlap() !void {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -586,7 +585,7 @@ test "do compact L0->L1 with dest overlap" {
 // 12. do compact L1→L2
 // ---------------------------------------------------------------------------
 
-test "do compact L1->L2" {
+pub fn testDoCompactL1L2() !void {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -663,7 +662,7 @@ test "do compact L1->L2" {
 // 13. levels get: L0 shadows L1
 // ---------------------------------------------------------------------------
 
-test "levels get: L0 shadows L1" {
+pub fn testLevelsGetL0ShadowsL1() !void {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});

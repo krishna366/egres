@@ -36,8 +36,9 @@ pub const Transport = struct {
         self_id: u64,
         cluster_id: u64,
         listen_addr: []const u8, // "ip:port"
-        on_message_p0: *const fn (*Serial, u16, []const u8) void,
-        on_message_p1: *const fn (*Serial, u16, []const u8) void,
+        ctx: *anyopaque,
+        on_message_p0: serial_mod.Serial.OnMessageFn,
+        on_message_p1: serial_mod.Serial.OnMessageFn,
     };
 
     const PeerSlot = struct {
@@ -76,7 +77,7 @@ pub const Transport = struct {
             .listen_addr = listen_addr,
             .mu = .init,
             .peers = peers,
-            .group = .init,
+            .group = zio.group(),
             .listener = null,
         };
     }
@@ -119,6 +120,7 @@ pub const Transport = struct {
     pub fn addPeer(self: *Transport, id: u64, addr: []const u8) !void {
         self.mu.lock() catch return error.Cancelled;
         defer self.mu.unlock();
+        log.debug("addPeer for {d} {s}\n", .{ id, addr });
 
         if (self.peers.get(id)) |slot| {
             if (slot.addr) |existing| {
@@ -139,6 +141,7 @@ pub const Transport = struct {
                 return;
             }
             // First time we have an address — set it and start dial loops.
+            log.debug("addPeer got address {s} for peer {d}\n", .{ addr, id });
             slot.addr = try self.allocator.dupe(u8, addr);
             for ([_]Priority{ .p0, .p1 }) |pri| {
                 self.group.spawn(dialLoop, .{ self, id, pri }) catch |err| {
@@ -200,6 +203,34 @@ pub const Transport = struct {
         defer self.mu.unlock();
         const slot = self.peers.get(peer_id) orelse return null;
         return slot.conn[@intFromEnum(priority)];
+    }
+
+    /// Set drop_messages on all connections for a specific peer.
+    pub fn setDropForPeer(self: *Transport, peer_id: u64, drop: bool) void {
+        self.mu.lock() catch return;
+        defer self.mu.unlock();
+        const slot = self.peers.get(peer_id) orelse return;
+        for (&slot.conn) |c| {
+            if (c) |s| s.drop_messages.store(drop, .release);
+        }
+    }
+
+    /// Set drop_messages on all connections for all peers.
+    pub fn setDropAll(self: *Transport, drop: bool) void {
+        self.mu.lock() catch return;
+        defer self.mu.unlock();
+        var it = self.peers.valueIterator();
+        while (it.next()) |slot_ptr| {
+            for (&slot_ptr.*.conn) |c| {
+                if (c) |s| s.drop_messages.store(drop, .release);
+            }
+        }
+    }
+
+    /// Return the actual bound port (useful when listening on port 0).
+    pub fn getListenPort(self: *Transport) u16 {
+        const listener = self.listener orelse return 0;
+        return listener.socket.address.ip.getPort();
     }
 
     /// Queue a message for sending to a peer. Non-blocking.
@@ -268,7 +299,7 @@ pub const Transport = struct {
                 return;
             };
             defer if (msg.payload.len > 0) self.allocator.free(msg.payload);
-            on_message(s, msg.message_type, msg.payload);
+            on_message(self.cfg.ctx, s, msg.message_type, msg.payload);
             return;
         }
 
@@ -288,7 +319,7 @@ pub const Transport = struct {
         log.info("node {d}: inbound conn established with node {d} pri={s}", .{
             self.cfg.self_id, hs.node_id, @tagName(hs.priority),
         });
-        s.run(on_message);
+        s.run(self.cfg.ctx, on_message);
 
         log.info("node {d}: inbound conn disconnected from node {d} pri={s}", .{
             self.cfg.self_id, hs.node_id, @tagName(hs.priority),
@@ -390,7 +421,7 @@ pub const Transport = struct {
                 self.cfg.self_id, peer_id, @tagName(priority),
             });
 
-            s.run(on_message);
+            s.run(self.cfg.ctx, on_message);
             log.info("node {d}: outbound conn disconnected from peer {d} pri={s}", .{
                 self.cfg.self_id, peer_id, @tagName(priority),
             });

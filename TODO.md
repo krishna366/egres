@@ -23,6 +23,7 @@ Mar 18, 2026
 - We also need to track metrics, particularly the ones for disk fetches.
 
 ### PROJECT: Implement priority based and multiplexing TCP connections
+Mar 3, 2026
 DONE: Mar 18, 2026
 
 Update: I had done this, but realized that multiplexing isn't that useful for

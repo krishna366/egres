@@ -130,7 +130,7 @@ pub const TableCache = struct {
 
         // Phase 2: open misses concurrently.
         var tse: utils.ThreadSafeError = .{};
-        var group: zio.Group = .init;
+        var group = zio.group();
         defer group.cancel();
         for (misses.items) |n| {
             try group.spawn(openFiber, .{ self, n, levels, &tse });

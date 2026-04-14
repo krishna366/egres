@@ -8,6 +8,7 @@ pub const ConfChangeType = enum(u8) {
     to_voter,
     to_learner,
     remove_node,
+    update_addr,
 };
 pub const ConfChange = struct {
     change_type: ConfChangeType,

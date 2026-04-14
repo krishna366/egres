@@ -30,6 +30,7 @@ pub const ConfCmd = struct {
         to_voter,
         to_learner,
         remove,
+        addr,
     };
 };
 
@@ -100,11 +101,13 @@ fn parseLine(line: []const u8) !Command {
             .to_learner
         else if (std.mem.eql(u8, action_str, "remove"))
             .remove
+        else if (std.mem.eql(u8, action_str, "addr"))
+            .addr
         else
             return error.InvalidAction;
 
         const node_id = std.fmt.parseInt(u64, node_id_str, 10) catch return error.InvalidNodeId;
-        const addr = if (action == .add) (it.next() orelse return error.MissingAddr) else "";
+        const addr = if (action == .add or action == .addr) (it.next() orelse return error.MissingAddr) else "";
 
         return .{ .conf = .{
             .action = action,

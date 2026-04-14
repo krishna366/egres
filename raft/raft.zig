@@ -22,7 +22,6 @@ pub const Snapshot = @import("raftwal.zig").Snapshot;
 pub const buffers = @import("buffers_gen");
 pub const runtime = @import("runtime.zig");
 pub const RaftRuntime = runtime.RaftRuntime;
-pub const RaftRuntimeConfig = runtime.Config;
 pub const requestJoin = runtime.requestJoin;
 pub const joinCluster = runtime.joinCluster;
 pub const msg_type_raft = @import("node.zig").msg_type_raft;

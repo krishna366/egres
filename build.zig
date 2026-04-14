@@ -296,15 +296,17 @@ fn addZdbTests(
     regen_buffers_step: *std.Build.Step,
 ) *std.Build.Step {
     const zbuf_mod = makeModule(b, target, optimize, "zbuf.zig");
-    const utils_mod = makeModule(b, target, optimize, "u/utils.zig");
-    utils_mod.addIncludePath(b.path("."));
-    utils_mod.addIncludePath(b.path("third_party/lz4/lib"));
-    utils_mod.addIncludePath(b.path("third_party/zstd/lib"));
     const zio_dep = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
     });
     const zio_mod = zio_dep.module("zio");
+
+    const utils_mod = makeModule(b, target, optimize, "u/utils.zig");
+    utils_mod.addIncludePath(b.path("."));
+    utils_mod.addIncludePath(b.path("third_party/lz4/lib"));
+    utils_mod.addIncludePath(b.path("third_party/zstd/lib"));
+    utils_mod.addImport("zio", zio_mod);
 
     const vfs_mod = makeModule(b, target, optimize, "vfs/vfs.zig");
     vfs_mod.addImport("zio", zio_mod);
@@ -363,7 +365,9 @@ fn addZdbTests(
     });
 
     zdb_levels_tests.root_module.addImport("zio", zio_mod);
+    zdb_levels_tests.root_module.addImport("utils", utils_mod);
     zdb_forest_tests.root_module.addImport("zio", zio_mod);
+    zdb_forest_tests.root_module.addImport("utils", utils_mod);
 
     const zdb_vfs_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "vfs/vfs_test.zig"),

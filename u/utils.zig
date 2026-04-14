@@ -199,3 +199,32 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         }
     };
 }
+
+/// Run all pub test functions (fn names starting with "test") in a module
+/// inside a zio runtime. Test functions must be `pub fn testXxx() !void`.
+///
+/// Usage in a test file:
+///   test { try utils.runTestsInZioRuntime(@This()); }
+pub fn runTestsInZioRuntime(comptime Module: type) !void {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Runner = struct {
+        fn run() !void {
+            const decls = @typeInfo(Module).@"struct".decls;
+            inline for (decls) |d| {
+                if (comptime std.mem.startsWith(u8, d.name, "test")) {
+                    const func = @field(Module, d.name);
+                    const F = @TypeOf(func);
+                    if (F == fn () anyerror!void) {
+                        std.debug.print("  running {s}...\n", .{d.name});
+                        try func();
+                    }
+                }
+            }
+        }
+    };
+
+    var handle = try rt.spawn(Runner.run, .{});
+    try handle.join();
+}

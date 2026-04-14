@@ -113,7 +113,7 @@ fn singleTransportEchoTest() !void {
     const client_mux = try Mux.init(alloc, conn, 0, &echoHandler);
     defer client_mux.deinit();
 
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.cancel();
     try group.spawn(Mux.run, .{client_mux});
 

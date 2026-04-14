@@ -28,6 +28,7 @@ pub const Serial = struct {
     outbound: zio.Channel(OutboundMsg),
     last_recv_ms: std.atomic.Value(i64),
     closed: bool,
+    drop_messages: std.atomic.Value(bool),
 
     pub fn init(allocator: Allocator, tcp_stream: zio.net.Stream) !*Serial {
         const write_buf = try allocator.alloc(u8, buf_size);
@@ -45,6 +46,7 @@ pub const Serial = struct {
             .outbound = try zio.Channel(OutboundMsg).initAlloc(allocator, 256),
             .last_recv_ms = std.atomic.Value(i64).init(std.time.milliTimestamp()),
             .closed = false,
+            .drop_messages = std.atomic.Value(bool).init(false),
         };
         return self;
     }
@@ -71,6 +73,10 @@ pub const Serial = struct {
 
     /// Queue an outbound message. Non-blocking; drops on full channel.
     pub fn queueMsg(self: *Serial, message_type: u16, payload: []u8) void {
+        if (self.drop_messages.load(.acquire)) {
+            self.allocator.free(payload);
+            return;
+        }
         self.outbound.trySend(.{ .message_type = message_type, .payload = payload }) catch |err| {
             log.err("queueMsg: channel full, dropping message: {s}", .{@errorName(err)});
             self.allocator.free(payload);
@@ -122,18 +128,20 @@ pub const Serial = struct {
         return .{ .message_type = message_type, .payload = payload };
     }
 
+    pub const OnMessageFn = *const fn (*anyopaque, *Serial, u16, []const u8) void;
+
     /// Run reader + writer loops. Blocks until TCP closes or errors.
     /// Reader calls on_message for each inbound frame.
     /// Writer drains the outbound channel and sends frames.
-    pub fn run(self: *Serial, on_message: *const fn (*Serial, u16, []const u8) void) void {
-        var group: zio.Group = .init;
+    pub fn run(self: *Serial, ctx: *anyopaque, on_message: OnMessageFn) void {
+        var group = zio.group();
         group.spawn(writerLoop, .{self}) catch |err| {
             log.err("failed to spawn writer loop: {s}", .{@errorName(err)});
             return;
         };
 
         // Reader loop runs inline.
-        self.readerLoop(on_message);
+        self.readerLoop(ctx, on_message);
 
         // Reader exited (TCP closed). Close outbound channel so writer exits too.
         self.outbound.close(.graceful);
@@ -142,7 +150,7 @@ pub const Serial = struct {
         };
     }
 
-    fn readerLoop(self: *Serial, on_message: *const fn (*Serial, u16, []const u8) void) void {
+    fn readerLoop(self: *Serial, ctx: *anyopaque, on_message: OnMessageFn) void {
         while (true) {
             const msg = self.recvOne() catch |err| {
                 log.debug("reader exited: {s}", .{@errorName(err)});
@@ -160,7 +168,9 @@ pub const Serial = struct {
                 continue;
             }
 
-            on_message(self, msg.message_type, msg.payload);
+            if (!self.drop_messages.load(.acquire)) {
+                on_message(ctx, self, msg.message_type, msg.payload);
+            }
         }
     }
 

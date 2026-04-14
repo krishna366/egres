@@ -8,6 +8,7 @@ pub const ConfChange = schema.Table(.{
     .{ .name = "to_voter", .ty = schema.Bool(.{ .field_id = 1, .bit = 2 }) },
     .{ .name = "to_learner", .ty = schema.Bool(.{ .field_id = 1, .bit = 3 }) },
     .{ .name = "remove_node", .ty = schema.Bool(.{ .field_id = 1, .bit = 4 }) },
+    .{ .name = "update_addr", .ty = schema.Bool(.{ .field_id = 1, .bit = 5 }) },
     .{ .id = 2, .name = "node_id", .ty = schema.U64 },
     .{ .id = 3, .name = "addr", .ty = schema.Bytes },
 });
@@ -27,7 +28,6 @@ pub const ConfState = schema.Table(.{
 pub const HardState = schema.Table(.{
     .{ .id = 1, .name = "current_term", .ty = schema.U64 },
     .{ .id = 2, .name = "voted_for", .ty = schema.U64 },
-    .{ .id = 3, .name = "commit_index", .ty = schema.U64 },
 });
 
 pub const Snapshot = schema.Table(.{

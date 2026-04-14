@@ -675,9 +675,9 @@ pub const wal = struct {
     pub fn openPath(
         path: []const u8,
         alloc: std.mem.Allocator,
-        vfs_inst: *const vfs_mod.VFS,
         cache_capacity: usize,
     ) !wal {
+        const vfs_inst = vfs_mod.g();
         const cwd = std.fs.cwd();
         cwd.access(path, .{}) catch |err| switch (err) {
             error.FileNotFound => try cwd.makePath(path),
@@ -1232,13 +1232,12 @@ pub const DiskWAL = struct {
     pub fn openPath(
         path: []const u8,
         allocator: std.mem.Allocator,
-        vfs_inst: *const vfs_mod.VFS,
         cache_capacity: usize,
     ) !DiskWAL {
         var mf = try metaFile.openPath(path, allocator);
         errdefer mf.deinit();
 
-        var wf = try wal.openPath(path, allocator, vfs_inst, cache_capacity);
+        var wf = try wal.openPath(path, allocator, cache_capacity);
         errdefer wf.deinit();
 
         const hs = try mf.hardState();

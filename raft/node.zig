@@ -3,6 +3,10 @@ const zio = @import("zio");
 const raftwal_mod = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const utils = @import("utils");
+const transport_mod = @import("transport");
+const Transport = transport_mod.Transport;
+const serial_mod = @import("serial");
+const Serial = serial_mod.Serial;
 const raft_log = std.log.scoped(.raft);
 
 pub const NodeId = raftwal_mod.NodeId;
@@ -64,10 +68,6 @@ pub const Peer = struct {
     addr: []const u8 = "",
 };
 
-/// fn(ctx, from, to, payload)
-pub const SendFn = *const fn (*anyopaque, NodeId, NodeId, []const u8) void;
-
-const serial_mod = @import("serial");
 pub const msg_type_raft = serial_mod.msg_type_raft;
 pub const msg_type_join_request = serial_mod.msg_type_join_request;
 
@@ -149,14 +149,13 @@ pub const Node = struct {
     inbound_ch: zio.Channel(InboundMsg) = undefined,
     shutting_down: std.atomic.Value(bool),
 
+    transport: ?*Transport = null,
+
     on_conf_applied: ?*const fn (*anyopaque, ConfChange) void = null,
     on_conf_applied_ctx: ?*anyopaque = null,
 
     on_apply: ?*const fn (*anyopaque, u64, u64, []const u8) void = null,
     on_apply_ctx: ?*anyopaque = null,
-
-    on_send: ?SendFn = null,
-    on_send_ctx: ?*anyopaque = null,
 
     pub const ProposalType = enum { data, conf };
     const ProposalQueue = utils.Queue(ProposalRequest, 4096);
@@ -177,7 +176,6 @@ pub const Node = struct {
         peers: []const Peer,
         log: RaftWAL,
         config: Config,
-        self_role: PeerRole,
     ) !*Node {
         try config.validate();
         const seed = @as(u64, @intCast(std.time.nanoTimestamp())) ^ config.id;
@@ -215,11 +213,19 @@ pub const Node = struct {
         for (peers) |peer| {
             try node.peers.put(peer.id, peer);
         }
-        if (self_role == .learner) {
-            node.state = .learner;
-        }
         node.recomputeQuorum();
         node.resetElectionTimeout(.init);
+
+        // Restore persisted state from WAL if present.
+        if (node.log.lastIndex() > 0) {
+            raft_log.info("node {d}: restoring state from WAL", .{node.id});
+            node.restoreState();
+            node.restoreConfState();
+            raft_log.info("node {d}: state restored, term={d} peers={d} quorum={d}", .{
+                node.id, node.current_term, node.peers.count(), node.quorum_size,
+            });
+        }
+
         dbg(
             "init node={d} state={s} term={d} election_timeout={d} quorum={d} seed=0x{x}",
             .{
@@ -255,18 +261,191 @@ pub const Node = struct {
         self.inbound_ch.deinit();
         self.votes_received.deinit();
         self.prevotes_received.deinit();
+        var pit = self.peers.valueIterator();
+        while (pit.next()) |p| {
+            if (p.addr.len > 0) self.allocator.free(p.addr);
+        }
         self.peers.deinit();
         self.allocator.destroy(self);
     }
 
-    /// Restore hard state (term, voted_for, commit_index) from WAL on restart.
+    /// Create and start the transport. Must be called inside a zio coroutine.
+    pub fn initTransport(self: *Node) !void {
+        const tr = try self.allocator.create(Transport);
+        tr.* = try Transport.init(self.allocator, .{
+            .self_id = self.id,
+            .cluster_id = self.config.cluster_id,
+            .listen_addr = self.config.listen_addr,
+            .ctx = @ptrCast(self),
+            .on_message_p0 = &handleP0Message,
+            .on_message_p1 = &handleP1Message,
+        });
+        self.transport = tr;
+
+        // run() starts accept/dial loops. addPeer after run() so dial loops
+        // are only spawned once (run() spawns for existing peers, addPeer
+        // spawns for new ones).
+        try tr.run();
+
+        // Register existing peers so dial loops start.
+        var peer_it = self.peers.iterator();
+        while (peer_it.next()) |kv| {
+            const peer = kv.value_ptr.*;
+            if (peer.addr.len > 0) {
+                tr.addPeer(peer.id, peer.addr) catch |err| {
+                    raft_log.err("failed to add restored peer {d}: {s}", .{ peer.id, @errorName(err) });
+                };
+            }
+        }
+    }
+
+    pub fn deinitTransport(self: *Node) void {
+        if (self.transport) |tr| {
+            tr.deinit();
+            self.allocator.destroy(tr);
+            self.transport = null;
+        }
+    }
+
+    // handleP0Message would be called concurrently via multiple Serial listener coroutines.
+    fn handleP0Message(ctx: *anyopaque, conn: *Serial, message_type: u16, payload: []const u8) void {
+        const self: *Node = @ptrCast(@alignCast(ctx));
+        switch (message_type) {
+            serial_mod.msg_type_raft => {
+                const owned = self.allocator.dupe(u8, payload) catch return;
+                self.inbound_ch.send(.{
+                    .message_type = message_type,
+                    .payload = owned,
+                }) catch {
+                    self.allocator.free(owned);
+                    return;
+                };
+                self.event_ch.trySend(1) catch {};
+            },
+            serial_mod.msg_type_join_request => {
+                // Handle join requests in the Serial reader's coroutine directly.
+                // This blocks the reader until the join is processed, which is fine —
+                // the joiner waits for a response anyway.
+                self.handleJoinRequest(conn, payload);
+            },
+            else => {},
+        }
+    }
+
+    // -- join request handling (server side) --
+
+    pub const JoinReason = struct {
+        pub const ok: u32 = 0;
+        pub const not_leader: u32 = 1;
+        pub const cluster_mismatch: u32 = 2;
+        pub const conf_change_rejected: u32 = 3;
+        pub const invalid_addr: u32 = 4;
+    };
+
+    const JoinCtx = struct {
+        done: zio.Channel(u8) = undefined,
+        status: CommitStatus = .committed,
+
+        fn init(self: *JoinCtx, alloc: std.mem.Allocator) !void {
+            self.done = try zio.Channel(u8).initAlloc(alloc, 1);
+        }
+
+        fn deinit(self: *JoinCtx) void {
+            self.done.deinit();
+        }
+    };
+
+    fn onJoinCommit(ctx_raw: *anyopaque, _: ProposalEntry, status: CommitStatus) void {
+        const ctx: *JoinCtx = @ptrCast(@alignCast(ctx_raw));
+        ctx.status = status;
+        ctx.done.send(1) catch {};
+    }
+
+    fn handleJoinRequest(self: *Node, conn: *Serial, payload: []const u8) void {
+        const parsed = zen.parseMessageWithTail(payload) catch return;
+        switch (parsed) {
+            .JoinRequest => |req| {
+                if (req.clusterId() != self.config.cluster_id) {
+                    self.sendJoinResponse(conn, false, self.getLeaderId(), JoinReason.cluster_mismatch);
+                    return;
+                }
+                if (!self.isLeader()) {
+                    self.sendJoinResponse(conn, false, self.getLeaderId(), JoinReason.not_leader);
+                    return;
+                }
+
+                const peer_id: NodeId = @intCast(req.nodeId());
+                if (peer_id == self.id or self.peers.contains(peer_id)) {
+                    dbg("handleJoinRequest: peer {d} already part of the cluster", .{peer_id});
+                    self.sendJoinResponse(conn, true, self.id, JoinReason.ok);
+                    return;
+                }
+
+                var ctx = JoinCtx{};
+                ctx.init(self.allocator) catch {
+                    self.sendJoinResponse(conn, false, self.id, JoinReason.conf_change_rejected);
+                    return;
+                };
+                defer ctx.deinit();
+
+                self.proposeConfChange(.{
+                    .change_type = .add_learner,
+                    .node_id = @intCast(req.nodeId()),
+                    .addr = req.addr(),
+                }, &onJoinCommit, @ptrCast(&ctx)) catch |err| {
+                    raft_log.err("join proposeConfChange failed: {s}", .{@errorName(err)});
+                    self.sendJoinResponse(conn, false, self.id, JoinReason.conf_change_rejected);
+                    return;
+                };
+
+                _ = ctx.done.receive() catch {
+                    self.sendJoinResponse(conn, false, self.id, JoinReason.conf_change_rejected);
+                    return;
+                };
+
+                const accepted = ctx.status == .committed or ctx.status == .existing_node;
+                self.sendJoinResponse(conn, accepted, self.id, if (accepted) JoinReason.ok else JoinReason.conf_change_rejected);
+            },
+            else => {},
+        }
+    }
+
+    fn sendJoinResponse(self: *Node, conn: *Serial, accepted: bool, leader_id: ?NodeId, reason_code: u32) void {
+        const leader_addr: []const u8 = if (leader_id) |lid| blk: {
+            if (lid == self.id) break :blk self.config.listen_addr;
+            if (self.peers.get(lid)) |peer| break :blk peer.addr;
+            break :blk "";
+        } else "";
+        var writer = zen.JoinResponseWriter.init(self.allocator) catch return;
+        defer writer.deinit();
+        writer.set(.{
+            .accepted = accepted,
+            .leader_id = if (leader_id) |lid| lid else 0,
+            .reason_code = reason_code,
+            .leader_addr = leader_addr,
+        }) catch return;
+        var reply_buf = writer.finishWithTail() catch return;
+        defer reply_buf.deinit();
+        const bytes = reply_buf.bytes orelse return;
+        conn.send(serial_mod.msg_type_join_request, bytes) catch |err| {
+            raft_log.err("sendJoinResponse failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    // --- join handling end
+
+    fn handleP1Message(_: *anyopaque, _: *Serial, _: u16, _: []const u8) void {
+        // Filled in Phase B for file distribution.
+    }
+
+    /// Restore hard state (term, voted_for) from WAL on restart.
+    /// commit_index is not persisted — the leader re-sends it via AppendEntries.
     pub fn restoreState(self: *Node) void {
         const hs = self.log.hardState();
         self.current_term = hs.current_term;
         self.voted_for = if (hs.voted_for == 0) null else hs.voted_for;
-        self.commit_index.store(hs.commit_index, .seq_cst);
-        dbg("restoreState node={d} term={d} voted_for={?d} commit={d}", .{
-            self.id, self.current_term, self.voted_for, hs.commit_index,
+        dbg("restoreState node={d} term={d} voted_for={?d}", .{
+            self.id, self.current_term, self.voted_for,
         });
     }
 
@@ -287,31 +466,36 @@ pub const Node = struct {
             }
         }
 
-        // Replay conf changes from snapshot to commit_index.
-        const ci = self.commit_index.load(.seq_cst);
+        // Replay all conf changes from snapshot to lastIndex. All entries in
+        // our log were received from the leader and represent correct state.
+        const last = self.log.lastIndex();
         const start = if (snap.index > 0) snap.index + 1 else self.log.firstIndex();
-        if (start > ci) {
-            self.conf_applied_index = ci;
+        if (start > last) {
+            self.conf_applied_index = last;
             self.recomputeQuorum();
             return;
         }
-        var result = while (true) {
-            break self.log.entriesRange(.{ .lo = start, .hi = ci + 1, .ty = .conf }) catch |err| {
-                std.log.err("restoreConfState: entriesRange failed: {}, retrying...", .{err});
-                zio.sleep(.fromSeconds(1)) catch return;
-                continue;
+        var lo = start;
+        while (lo <= last) {
+            var result = while (true) {
+                break self.log.entriesRange(.{ .lo = lo, .hi = last + 1, .ty = .conf }) catch |err| {
+                    std.log.err("restoreConfState: entriesRange failed: {}, retrying...", .{err});
+                    zio.sleep(.fromSeconds(1)) catch return;
+                    continue;
+                };
             };
-        };
-        defer result.deinit();
-        for (result.entries) |entry| {
-            // TODO: Also apply the data entries.
-            const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
-            if (reader.confChange()) |cc_reader| {
-                const cc = self.decodeConfChange(cc_reader) catch continue;
-                self.applyConfChange(cc);
+            defer result.deinit();
+            for (result.entries) |entry| {
+                const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
+                if (reader.confChange()) |cc_reader| {
+                    const cc = self.decodeConfChange(cc_reader) catch continue;
+                    self.applyConfChange(cc);
+                }
+                lo = entry.index + 1;
             }
+            if (result.eof) break;
         }
-        self.conf_applied_index = ci;
+        self.conf_applied_index = last;
         self.recomputeQuorum();
         dbg("restoreConfState node={d} peers={d} quorum={d}", .{
             self.id, self.peers.count(), self.quorum_size,
@@ -398,7 +582,7 @@ pub const Node = struct {
         return false;
     }
 
-    // handleInbound would be called concurrently. It's up to us to serialize them.
+    // handleInbound would be called serially by mainLoop.
     pub fn handleInbound(self: *Node, buf: Inbound) RaftError!void {
         switch (zen.parseMessageWithTail(buf) catch return RaftError.InvalidMessage) {
             .RequestVote => |rv| try self.handleRequestVote(rv),
@@ -461,6 +645,8 @@ pub const Node = struct {
         }
     }
 
+    fn noopCommitCb(_: *anyopaque, _: ProposalEntry, _: CommitStatus) void {}
+
     pub fn becomeLeader(self: *Node) RaftError!void {
         if (self.state == .learner) return;
         self.state = .leader;
@@ -472,6 +658,19 @@ pub const Node = struct {
         while (it.next()) |kv| {
             kv.value_ptr.next_index = 1;
             kv.value_ptr.match_index = 0;
+        }
+
+        // On bootstrap (first leader election, no conf changes yet), register
+        // ourselves via a conf change so joiners learn our address from the log.
+        if (self.log.lastIndex() == 0) {
+            raft_log.info("node {d}: bootstrap self-add as voter with addr={s}", .{ self.id, self.config.listen_addr });
+            self.proposeConfChange(.{
+                .change_type = .add_voter,
+                .node_id = self.id,
+                .addr = self.config.listen_addr,
+            }, &noopCommitCb, undefined) catch |err| {
+                raft_log.err("node {d}: bootstrap self-add failed: {s}", .{ self.id, @errorName(err) });
+            };
         }
 
         self.maybeBroadcast(true);
@@ -559,7 +758,26 @@ pub const Node = struct {
 
         if (self.state == .learner) {
             dbg(
-                "vote-reject tick={d} node={d} candidate={d} reason=learner",
+                "vote-reject tick={d} node={d} candidate={d} reason=self_is_learner",
+                .{ self.tick_count, self.id, candidate_id },
+            );
+            try self.sendRequestVoteReply(candidate_id, false, is_prevote);
+            return;
+        }
+
+        // Only vote for known voter peers.
+        if (self.peers.get(candidate_id)) |peer| {
+            if (peer.role == .learner) {
+                dbg(
+                    "vote-reject tick={d} node={d} candidate={d} reason=candidate_is_learner",
+                    .{ self.tick_count, self.id, candidate_id },
+                );
+                try self.sendRequestVoteReply(candidate_id, false, is_prevote);
+                return;
+            }
+        } else {
+            dbg(
+                "vote-reject tick={d} node={d} candidate={d} reason=unknown_peer",
                 .{ self.tick_count, self.id, candidate_id },
             );
             try self.sendRequestVoteReply(candidate_id, false, is_prevote);
@@ -807,6 +1025,7 @@ pub const Node = struct {
             .to_voter = cc.change_type == .to_voter,
             .to_learner = cc.change_type == .to_learner,
             .remove_node = cc.change_type == .remove_node,
+            .update_addr = cc.change_type == .update_addr,
             .node_id = cc.node_id,
             .addr = cc.addr,
         });
@@ -871,7 +1090,7 @@ pub const Node = struct {
 
                 const cc = try zen.ConfChangeReader.init(req.data, 0);
                 // TODO: Switch to enum here.
-                if (!cc.addVoter() and !cc.addLearner() and !cc.toVoter() and !cc.toLearner() and !cc.removeNode()) {
+                if (!cc.addVoter() and !cc.addLearner() and !cc.toVoter() and !cc.toLearner() and !cc.removeNode() and !cc.updateAddr()) {
                     req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_req);
                     continue;
                 }
@@ -881,9 +1100,21 @@ pub const Node = struct {
                         req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_addr);
                         continue;
                     };
-                    if (cc.nodeId() == self.id or self.peers.contains(cc.nodeId())) {
-                        // This node is already part of the group.
+                    // Allow self-add (bootstrap), reject if peer already exists.
+                    // Use update_addr to change an existing peer's address.
+                    if (cc.nodeId() != self.id and self.peers.contains(cc.nodeId())) {
                         req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .existing_node);
+                        continue;
+                    }
+                }
+
+                if (cc.updateAddr()) {
+                    _ = zio.net.IpAddress.parseIpAndPort(cc.addr()) catch {
+                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_addr);
+                        continue;
+                    };
+                    if (cc.nodeId() != self.id and !self.peers.contains(cc.nodeId())) {
+                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .unknown_node);
                         continue;
                     }
                 }
@@ -949,6 +1180,7 @@ pub const Node = struct {
     // processProposalRequests is just checking for proposals in proposal_requests queue, and
     // proposing them. This is only relevant to the leader node. Followers won't have this.
     pub fn processProposalRequests(self: *Node, max_batch: usize) RaftError!usize {
+        _ = max_batch;
         if (self.isShuttingDown()) {
             while (self.proposal_requests.tryPop()) |req| {
                 self.allocator.free(req.data);
@@ -959,7 +1191,7 @@ pub const Node = struct {
         var batch = std.ArrayList(ProposalRequest).empty;
         defer batch.deinit(self.allocator);
 
-        while (batch.items.len < max_batch) {
+        while (true) {
             const req = self.proposal_requests.tryPop() orelse break;
             try batch.append(self.allocator, req);
         }
@@ -1116,7 +1348,6 @@ pub const Node = struct {
         try self.log.setHardState(.{
             .current_term = self.current_term,
             .voted_for = self.voted_for orelse 0,
-            .commit_index = self.commit_index.load(.seq_cst),
         });
         try self.log.sync();
     }
@@ -1134,8 +1365,10 @@ pub const Node = struct {
     }
 
     fn sendEncoded(self: *Node, to: NodeId, payload: []u8) void {
-        if (self.on_send) |send_fn| {
-            send_fn(self.on_send_ctx.?, self.id, to, payload);
+        if (self.transport) |tr| {
+            tr.sendMsg(to, .p0, serial_mod.msg_type_raft, payload) catch |err| {
+                utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ to, @errorName(err) });
+            };
         }
         self.allocator.free(payload);
     }
@@ -1152,6 +1385,8 @@ pub const Node = struct {
             .to_learner
         else if (reader.removeNode())
             .remove_node
+        else if (reader.updateAddr())
+            .update_addr
         else
             return RaftError.InvalidMessage;
         return .{
@@ -1287,6 +1522,9 @@ pub const Node = struct {
     }
 
     fn applyConfChange(self: *Node, cc: ConfChange) void {
+        raft_log.info("node {d}: applyConfChange type={s} target={d} addr={s}", .{
+            self.id, @tagName(cc.change_type), cc.node_id, cc.addr,
+        });
         if (cc.node_id == self.id) {
             // Update our own role.
             switch (cc.change_type) {
@@ -1299,6 +1537,7 @@ pub const Node = struct {
                     dbg("node {d} removed from cluster, shutting down", .{self.id});
                     self.startShutdown();
                 },
+                .update_addr => {}, // Our own address — nothing to do locally.
             }
         } else {
             switch (cc.change_type) {
@@ -1307,6 +1546,23 @@ pub const Node = struct {
                 .to_voter => self.setPeerRole(cc.node_id, .voter),
                 .to_learner => self.setPeerRole(cc.node_id, .learner),
                 .remove_node => self.removePeer(cc.node_id),
+                .update_addr => self.updatePeerAddr(cc.node_id, cc.addr),
+            }
+        }
+        // Manage transport peers directly.
+        if (self.transport) |tr| {
+            switch (cc.change_type) {
+                .add_voter, .add_learner => {
+                    if (cc.addr.len > 0 and cc.node_id != self.id) {
+                        tr.addPeer(cc.node_id, cc.addr) catch |err| {
+                            raft_log.err("addPeer for {d} failed: {}", .{ cc.node_id, err });
+                        };
+                    }
+                },
+                .remove_node => {
+                    if (cc.node_id != self.id) tr.removePeer(cc.node_id);
+                },
+                else => {},
             }
         }
         if (self.on_conf_applied) |cb| {
@@ -1320,23 +1576,41 @@ pub const Node = struct {
 
     fn addPeer(self: *Node, id: NodeId, role: PeerRole, addr: []const u8) void {
         if (self.hasPeer(id)) return;
+        const owned_addr = self.allocator.dupe(u8, addr) catch {
+            @panic("raft: addPeer out of memory");
+        };
         _ = self.peers.put(id, .{
             .id = id,
             .next_index = self.log.lastIndex() + 1,
             .match_index = 0,
             .role = role,
-            .addr = addr,
+            .addr = owned_addr,
         }) catch {
+            self.allocator.free(owned_addr);
             @panic("raft: addPeer out of memory");
         };
         self.recomputeQuorum();
     }
 
     fn removePeer(self: *Node, id: NodeId) void {
-        _ = self.peers.remove(id);
+        if (self.peers.fetchRemove(id)) |kv| {
+            if (kv.value.addr.len > 0) self.allocator.free(kv.value.addr);
+        }
         self.recomputeQuorum();
         if (id == self.id) {
             self.state = .learner;
+        }
+    }
+
+    fn updatePeerAddr(self: *Node, id: NodeId, addr: []const u8) void {
+        const peer = self.peers.getPtr(id) orelse return;
+        if (peer.addr.len > 0) self.allocator.free(peer.addr);
+        peer.addr = self.allocator.dupe(u8, addr) catch return;
+        // Update transport connection if running.
+        if (self.transport) |tr| {
+            tr.addPeer(id, addr) catch |err| {
+                raft_log.err("updatePeerAddr: transport addPeer for {d} failed: {s}", .{ id, @errorName(err) });
+            };
         }
     }
 

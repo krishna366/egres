@@ -17,8 +17,9 @@ const RouteTable = forest_mod.RouteTable;
 
 const options_mod = zdb.options;
 
-test {
-    _ = try zio.Runtime.init(std.heap.smp_allocator, .{});
+const utils = @import("utils");
+test "all" {
+    try utils.runTestsInZioRuntime(@This());
 }
 
 // ---------------------------------------------------------------------------
@@ -33,7 +34,7 @@ fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
 // 1. RouteTable lookup
 // ---------------------------------------------------------------------------
 
-test "route table single entry" {
+pub fn testRouteTableSingleEntry() !void {
     const alloc = std.testing.allocator;
     var rt = RouteTable.init(alloc, 1);
     defer rt.deinit();
@@ -43,7 +44,7 @@ test "route table single entry" {
     try std.testing.expectEqual(@as(u64, 10), rt.lookup(.{ .namespace = 1, .primary = "anything" }).?);
 }
 
-test "route table multi entry" {
+pub fn testRouteTableMultiEntry() !void {
     const alloc = std.testing.allocator;
     var rt = RouteTable.init(alloc, 1);
     defer rt.deinit();
@@ -71,7 +72,7 @@ test "route table multi entry" {
 // 2. Forest open/close
 // ---------------------------------------------------------------------------
 
-test "forest open close empty" {
+pub fn testForestOpenCloseEmpty() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -86,7 +87,7 @@ test "forest open close empty" {
 // 3. Forest create tree + get
 // ---------------------------------------------------------------------------
 
-test "forest create tree and get" {
+pub fn testForestCreateTreeAndGet() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -110,7 +111,7 @@ test "forest create tree and get" {
 // 4. Forest create tree survives reopen
 // ---------------------------------------------------------------------------
 
-test "forest tree persists across reopen" {
+pub fn testForestTreePersistsAcrossReopen() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -156,7 +157,7 @@ fn buildAndWriteTable(alloc: std.mem.Allocator, path: []const u8, primary: []con
     try f.writeAll(tb.bytes);
 }
 
-test "forest split tree" {
+pub fn testForestSplitTree() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -218,7 +219,7 @@ test "forest split tree" {
     }
 }
 
-test "forest routes to correct tree" {
+pub fn testForestRoutesToCorrectTree() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

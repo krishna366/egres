@@ -489,7 +489,7 @@ fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) void {
     log.info("spawning {d} worker(s)", .{args.clients});
 
     // Spawn all workers.
-    var group: zio.Group = .init;
+    var group = zio.group();
     defer group.cancel();
 
     for (contexts) |*ctx| {
