@@ -115,6 +115,33 @@ pub const Node = struct {
         raft_log.debug(format, args);
     }
 
+    /// The replicated state machine interface. The application implements
+    /// this (e.g. with forest/applier) and sets node.state_machine.
+    pub const StateMachine = struct {
+        ctx: *anyopaque,
+        applyFn: *const fn (*anyopaque, u64, u64, []const u8) void,
+        writeFileFn: ?*const fn (*anyopaque, u64, []const u8) void = null,
+        readFileFn: ?*const fn (*anyopaque, std.mem.Allocator, u64) ?[]const u8 = null,
+        hasFileFn: ?*const fn (*anyopaque, u64) bool = null,
+        preAppendFn: ?*const fn (*anyopaque, *Node, []const zen.LogEntryBuffer) void = null,
+
+        pub fn apply(self: *StateMachine, index: u64, term: u64, data: []const u8) void {
+            self.applyFn(self.ctx, index, term, data);
+        }
+        pub fn writeFile(self: *StateMachine, file_id: u64, data: []const u8) void {
+            (self.writeFileFn orelse @panic("StateMachine.writeFile not implemented"))(self.ctx, file_id, data);
+        }
+        pub fn readFile(self: *StateMachine, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
+            return (self.readFileFn orelse @panic("StateMachine.readFile not implemented"))(self.ctx, allocator, file_id);
+        }
+        pub fn hasFile(self: *StateMachine, file_id: u64) bool {
+            return (self.hasFileFn orelse @panic("StateMachine.hasFile not implemented"))(self.ctx, file_id);
+        }
+        pub fn preAppend(self: *StateMachine, node: *Node, entries: []const zen.LogEntryBuffer) void {
+            if (self.preAppendFn) |f| f(self.ctx, node, entries);
+        }
+    };
+
     id: NodeId,
     peers: std.AutoHashMap(NodeId, Peer),
 
@@ -154,8 +181,18 @@ pub const Node = struct {
     on_conf_applied: ?*const fn (*anyopaque, ConfChange) void = null,
     on_conf_applied_ctx: ?*anyopaque = null,
 
-    on_apply: ?*const fn (*anyopaque, u64, u64, []const u8) void = null,
-    on_apply_ctx: ?*anyopaque = null,
+    state_machine: ?*StateMachine = null,
+
+    // File distribution quorum tracking (leader side).
+    file_acks: utils.SafeHashMap(u64, *PendingFileAck),
+    // File request tracking (follower side).
+    file_requests: utils.SafeHashMap(u64, *utils.WaitGroup),
+
+    pub const FileData = struct { file_id: u64, data: []const u8 };
+
+    const PendingFileAck = struct {
+        acks: std.AutoHashMap(u64, void),
+    };
 
     pub const ProposalType = enum { data, conf };
     const ProposalQueue = utils.Queue(ProposalRequest, 4096);
@@ -204,6 +241,8 @@ pub const Node = struct {
             .prng = prng,
             .proposal_requests = .{},
             .shutting_down = std.atomic.Value(bool).init(false),
+            .file_acks = utils.SafeHashMap(u64, *PendingFileAck).init(allocator),
+            .file_requests = utils.SafeHashMap(u64, *utils.WaitGroup).init(allocator),
         };
         node.apply_callbacks = try zio.Channel(PendingApply).initAlloc(allocator, 1024);
         node.event_ch = try zio.Channel(u8).initAlloc(allocator, 1);
@@ -434,8 +473,169 @@ pub const Node = struct {
 
     // --- join handling end
 
-    fn handleP1Message(_: *anyopaque, _: *Serial, _: u16, _: []const u8) void {
-        // Filled in Phase B for file distribution.
+    fn handleP1Message(ctx: *anyopaque, conn: *Serial, message_type: u16, payload: []const u8) void {
+        const self: *Node = @ptrCast(@alignCast(ctx));
+        switch (message_type) {
+            serial_mod.msg_type_file_push => {
+                if (payload.len < 12) return;
+                const file_id = std.mem.readInt(u64, payload[0..8], .little);
+                const crc = std.mem.readInt(u32, payload[8..12], .little);
+                const data = payload[12..];
+                if (std.hash.crc.Crc32Iscsi.hash(data) != crc) {
+                    raft_log.err("file_push crc mismatch for file {d}", .{file_id});
+                    return;
+                }
+                if (self.state_machine) |s| {
+                    if (!s.hasFile(file_id)) s.writeFile(file_id, data);
+                }
+                // Signal any pending file request (follower pull).
+                if (self.file_requests.get(file_id)) |wg| wg.done();
+                // Ack back to leader (for quorum tracking).
+                var ack: [16]u8 = undefined;
+                std.mem.writeInt(u64, ack[0..8], file_id, .little);
+                std.mem.writeInt(u64, ack[8..16], self.id, .little);
+                conn.send(serial_mod.msg_type_file_ack, &ack) catch |err| {
+                    raft_log.err("file_ack send failed: {s}", .{@errorName(err)});
+                };
+            },
+            serial_mod.msg_type_file_ack => {
+                if (payload.len < 16) return;
+                const file_id = std.mem.readInt(u64, payload[0..8], .little);
+                const node_id = std.mem.readInt(u64, payload[8..16], .little);
+                self.onFileAck(file_id, node_id);
+            },
+            serial_mod.msg_type_file_request => {
+                // Leader: read and push each requested file back to requester.
+                const s = self.state_machine orelse return;
+                if (payload.len < 8 or payload.len % 8 != 0) return;
+                const count = payload.len / 8;
+                for (0..count) |i| {
+                    const fid = std.mem.readInt(u64, payload[i * 8 ..][0..8], .little);
+                    const file_data = s.readFile(self.allocator, fid) orelse {
+                        raft_log.err("file_request: file {d} not found", .{fid});
+                        continue;
+                    };
+                    defer self.allocator.free(file_data);
+                    // Build file_push: [8B file_id][4B crc32][data]
+                    const push_payload = self.allocator.alloc(u8, 12 + file_data.len) catch continue;
+                    defer self.allocator.free(push_payload);
+                    std.mem.writeInt(u64, push_payload[0..8], fid, .little);
+                    std.mem.writeInt(u32, push_payload[8..12], std.hash.crc.Crc32Iscsi.hash(file_data), .little);
+                    @memcpy(push_payload[12..], file_data);
+                    conn.send(serial_mod.msg_type_file_push, push_payload) catch |err| {
+                        raft_log.err("file_request: push failed for {d}: {s}", .{ fid, @errorName(err) });
+                    };
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Read files via state machine, send to all peers, and wait for quorum acks.
+    /// Cleans up ack trackers on return (success or error).
+    pub fn sendAndWaitForFileQuorum(self: *Node, file_ids: []const u64) !void {
+        const tr = self.transport orelse return error.NoTransport;
+        const sm = self.state_machine orelse return error.NoStateMachine;
+
+        defer {
+            for (file_ids) |fid| {
+                if (self.file_acks.fetchRemove(fid)) |kv| {
+                    kv.value.acks.deinit();
+                    self.allocator.destroy(kv.value);
+                }
+            }
+        }
+
+        // Read each file via state machine, send to all peers.
+        for (file_ids) |file_id| {
+            const data = sm.readFile(self.allocator, file_id) orelse return error.FileNotFound;
+            defer self.allocator.free(data);
+
+            const pending = try self.allocator.create(PendingFileAck);
+            pending.* = .{
+                .acks = std.AutoHashMap(u64, void).init(self.allocator),
+            };
+            self.file_acks.put(file_id, pending) catch {
+                self.allocator.destroy(pending);
+                return error.OutOfMemory;
+            };
+
+            // Build payload: [8B file_id][4B crc32][data]
+            const payload = try self.allocator.alloc(u8, 12 + data.len);
+            defer self.allocator.free(payload);
+            std.mem.writeInt(u64, payload[0..8], file_id, .little);
+            std.mem.writeInt(u32, payload[8..12], std.hash.crc.Crc32Iscsi.hash(data), .little);
+            @memcpy(payload[12..], data);
+
+            var peer_it = self.peers.iterator();
+            while (peer_it.next()) |kv| {
+                tr.sendMsg(kv.key_ptr.*, .p1, serial_mod.msg_type_file_push, payload) catch {};
+            }
+        }
+
+        // Wait for quorum on all files.
+        for (file_ids) |fid| {
+            const p = self.file_acks.get(fid) orelse continue;
+            while (true) {
+                if (!self.isLeader()) return error.NotLeader;
+                if (p.acks.count() + 1 >= self.quorum_size) break;
+                zio.sleep(zio.Duration.fromMilliseconds(10)) catch return error.Cancelled;
+            }
+        }
+    }
+
+    /// Fetch missing files from the leader and block until all arrive via P1.
+    /// Caller should only pass file IDs confirmed missing on disk.
+    pub fn fetchFiles(self: *Node, file_ids: []const u64) !void {
+        if (file_ids.len == 0) return;
+        const leader = self.leader_id orelse return error.NotLeader;
+        const tr = self.transport orelse return error.NoTransport;
+
+        // Register pending wait entries.
+        for (file_ids) |fid| {
+            const wg = try self.allocator.create(utils.WaitGroup);
+            wg.* = .{};
+            wg.init();
+            wg.add(1);
+            if (self.file_requests.contains(fid)) {
+                self.allocator.destroy(wg);
+                raft_log.err("requestFiles: file_id {d} already pending", .{fid});
+                return error.DuplicateFileRequest;
+            }
+            self.file_requests.put(fid, wg) catch {
+                self.allocator.destroy(wg);
+                return error.OutOfMemory;
+            };
+        }
+
+        defer {
+            for (file_ids) |fid| {
+                if (self.file_requests.fetchRemove(fid)) |kv| {
+                    self.allocator.destroy(kv.value);
+                }
+            }
+        }
+
+        // Send all requested IDs in one message: [N * 8B file_ids]
+        const payload = try self.allocator.alloc(u8, file_ids.len * 8);
+        defer self.allocator.free(payload);
+        for (file_ids, 0..) |fid, i| {
+            std.mem.writeInt(u64, payload[i * 8 ..][0..8], fid, .little);
+        }
+        tr.sendMsg(leader, .p1, serial_mod.msg_type_file_request, payload) catch |err| {
+            raft_log.err("requestFiles: send failed: {s}", .{@errorName(err)});
+        };
+
+        // Wait for all files to arrive.
+        for (file_ids) |fid| {
+            const w = self.file_requests.get(fid) orelse continue;
+            w.wait() catch return error.Cancelled;
+        }
+    }
+
+    fn onFileAck(self: *Node, file_id: u64, node_id: u64) void {
+        const pending = self.file_acks.get(file_id) orelse return;
+        pending.acks.put(node_id, {}) catch return;
     }
 
     /// Restore hard state (term, voted_for) from WAL on restart.
@@ -948,6 +1148,8 @@ pub const Node = struct {
                 try entries_to_append.append(self.allocator, entry);
             }
             if (entries_to_append.items.len > 0) {
+                // Ensure referenced files are on disk before WAL append.
+                if (self.state_machine) |s| s.preAppend(self, entries_to_append.items);
                 dbg("node {d}: appending {d} entries to log", .{ self.id, entries_to_append.items.len });
                 try self.log.append(entries_to_append.items);
                 try self.log.sync();
@@ -1264,9 +1466,9 @@ pub const Node = struct {
                 const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
 
                 if (reader.isNormal()) {
-                    if (self.on_apply) |cb| {
+                    if (self.state_machine) |s| {
                         if (reader.data().len > 0) {
-                            cb(self.on_apply_ctx.?, entry.index, entry.term, reader.data());
+                            s.apply(entry.index, entry.term, reader.data());
                         }
                     }
                 }

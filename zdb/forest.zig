@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.forest);
 const zio = @import("zio");
 const utils = @import("utils");
 const options = @import("options.zig");
@@ -305,27 +306,42 @@ pub const Forest = struct {
     }
 
     /// Put a batch of key-value pairs into the current memtable.
-    /// Returns true if the memtable size exceeds the threshold and a freeze
-    /// should be proposed via Raft.
-    pub fn put(self: *Forest, items: []const Item) !bool {
+    /// Callers can use shouldFreeze() afterward to decide whether to propose
+    /// a memtable freeze through Raft.
+    pub fn put(self: *Forest, items: []const Item) !void {
         for (items) |item| {
             try self.memtables.put(item.key, item.value);
         }
-        return self.memtables.memoryUsage() >= self.opts.memtable_size;
     }
 
-    /// Freeze the current memtable and create a new one.
-    /// Called when the memtable freeze is committed via Raft.
-    pub fn freezeMemtable(self: *Forest) !void {
-        const new_id = self.next_file_id.fetchAdd(1, .monotonic);
+    /// Create a new memtable, freezing the current one.
+    /// Called when the newMemtable entry is committed via Raft.
+    /// The new_id is assigned by the leader and included in the proposal
+    /// so all nodes use the same ID.
+    pub fn newMemtable(self: *Forest, new_id: u64) !void {
         try self.memtables.swapCurrentOut(new_id);
+    }
+
+    /// Ensure next_file_id is past the given id, so a follower that
+    /// becomes leader won't reuse IDs assigned by the old leader.
+    pub fn advanceFileId(self: *Forest, id: u64) void {
+        while (true) {
+            const cur = self.next_file_id.load(.monotonic);
+            if (cur > id) return;
+            if (self.next_file_id.cmpxchgWeak(cur, id + 1, .monotonic, .monotonic) == null) return;
+        }
     }
 
     /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen
     /// memtable, routes each key to its tree, builds one L0 SST per tree,
     /// and returns the manifest changes. The caller proposes these through Raft.
-    pub fn buildFlush(self: *Forest) !std.ArrayList(manifest.TableChange) {
-        const mt = self.memtables.peekOldest() orelse return .{};
+    pub const FlushResult = struct {
+        changes: std.ArrayList(manifest.TableChange),
+        memtable_id: u64,
+    };
+
+    pub fn buildFlush(self: *Forest) !?FlushResult {
+        const mt = self.memtables.peekOldest() orelse return null;
         var iter = mt.iterator();
         defer iter.deinit();
 
@@ -369,6 +385,7 @@ pub const Forest = struct {
         // Flush all builders to SST files. writeAndSyncTable handles the full
         // write path (finish → create file → write → sync → close) and returns
         // the manifest TableChange directly.
+        var flush_err: utils.ThreadSafeError = .{};
         var handles: std.ArrayList(zio.JoinHandle(?manifest.TableChange)) = .{};
         defer {
             for (handles.items) |*h| _ = h.join();
@@ -387,14 +404,10 @@ pub const Forest = struct {
             }
 
             const file_id = self.next_file_id.fetchAdd(1, .monotonic);
-            const path = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}/{d:0>6}.sst",
-                .{ self.opts.dir, file_id },
-            );
+            const path = try options.sstPath(self.allocator, self.opts.dir,file_id);
 
             try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
-                self.allocator, tb, path, file_id, tree_id,
+                self.allocator, tb, path, file_id, tree_id, &flush_err,
             }));
         }
 
@@ -405,6 +418,7 @@ pub const Forest = struct {
             try changes.append(self.allocator, tc);
         }
         handles.clearAndFree(self.allocator);
+        if (flush_err.get()) |err| return err;
 
         // Best-effort directory sync.
         if (self.opts.dir.len > 0) {
@@ -412,7 +426,7 @@ pub const Forest = struct {
             defer dir_sync.join();
         }
 
-        return changes;
+        return .{ .changes = changes, .memtable_id = mt.id };
     }
 
     /// Writes table bytes to a new SST file, syncs, and closes.
@@ -423,14 +437,24 @@ pub const Forest = struct {
         path: []const u8,
         file_id: u64,
         tree_id: u64,
+        err_out: *utils.ThreadSafeError,
     ) ?manifest.TableChange {
         defer allocator.free(path);
         var mtb = tb;
         defer mtb.deinit();
 
-        const wh = vfs.g().createFile(path, .{ .mode = .direct }) catch return null;
-        wh.write(mtb.bytes, 0, .p0) catch return null;
-        wh.sync() catch return null;
+        const wh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
+            err_out.set(err);
+            return null;
+        };
+        wh.write(mtb.bytes, 0, .p0) catch |err| {
+            err_out.set(err);
+            return null;
+        };
+        wh.sync() catch |err| {
+            err_out.set(err);
+            return null;
+        };
         wh.close();
         return manifest.createTableChange(file_id, tree_id, 0);
     }
@@ -443,23 +467,23 @@ pub const Forest = struct {
             try self.ms.commit(changes, &.{});
         }
 
-        // Open new L0 tables and add to each tree's level 0.
+        // Load all new L0 tables concurrently via the cache. writeFile may
+        // have pre-opened these (follower path) → cache hit. On the leader,
+        // flush writes bytes directly, so these will typically be misses.
+        var needed: std.ArrayList(tree_mod.TableNeed) = .{};
+        defer needed.deinit(self.allocator);
         for (changes) |c| {
             std.debug.assert(c.op == 0); // flush only creates
+            try needed.append(self.allocator, .{ .id = c.table_id, .level = c.level });
+        }
+        try self.table_cache.loadTables(needed.items);
+
+        // Install each loaded table into its tree's level. We zip changes and
+        // needed in the same order they were built, so indices align.
+        for (changes, needed.items) |c, n| {
+            std.debug.assert(c.table_id == n.id);
             const tree = self.trees.get(c.tree_id) orelse continue;
-
-            const path = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}/{d:0>6}.sst",
-                .{ self.opts.dir, c.table_id },
-            );
-            defer self.allocator.free(path);
-
-            const t = try Table.open(self.allocator, path, .p0);
-            errdefer t.decrRef();
-            try self.table_cache.own(c.table_id, t);
-            try tree.levels[c.level].addEntry(c.table_id, t);
-            t.decrRef(); // drop open ref; level holds its own
+            try tree.levels[c.level].addEntry(n.id, n.table.?);
         }
 
         // Remove the oldest flushed memtable.
@@ -540,25 +564,107 @@ pub const Forest = struct {
     /// Compact finds the tree with the highest compaction score and runs one
     /// compaction on it. Returns true if a compaction was executed, false if
     /// no tree needs compaction.
-    pub fn compact(self: *Forest) !bool {
-        const Best = struct { tree: *Tree, tree_id: u64, candidate: tree_mod.CompactCandidate };
-        var best: ?Best = null;
+    pub const CompactionTarget = struct {
+        tree: *Tree,
+        tree_id: u64,
+        candidate: tree_mod.CompactCandidate,
+    };
 
-        {
-            self.mu.lockShared();
-            defer self.mu.unlockShared();
+    /// Find the best tree/level to compact without performing compaction.
+    pub fn bestCompactionCandidate(self: *Forest) ?CompactionTarget {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
 
-            var it = self.trees.iterator();
-            while (it.next()) |kv| {
-                const tree = kv.value_ptr.*;
-                const candidate = tree.compact_candidate orelse continue;
-                if (best == null or candidate.score > best.?.candidate.score) {
-                    best = .{ .tree = tree, .tree_id = kv.key_ptr.*, .candidate = candidate };
-                }
+        var best: ?CompactionTarget = null;
+        var it = self.trees.iterator();
+        while (it.next()) |kv| {
+            const tree = kv.value_ptr.*;
+            const candidate = tree.compact_candidate orelse continue;
+            if (best == null or candidate.score > best.?.candidate.score) {
+                best = .{ .tree = tree, .tree_id = kv.key_ptr.*, .candidate = candidate };
             }
         }
+        return best;
+    }
 
-        const b = best orelse return false;
+    /// Check if the current memtable should be frozen.
+    pub fn shouldFreeze(self: *Forest) bool {
+        return self.memtables.memoryUsage() >= self.opts.memtable_size;
+    }
+
+    /// Check if there are frozen memtables waiting to be flushed.
+    pub fn hasFrozenMemtables(self: *Forest) bool {
+        return self.memtables.peekOldest() != null;
+    }
+
+    /// Check if an SST file exists on disk.
+    pub fn hasFile(self: *Forest, file_id: u64) bool {
+        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return false;
+        defer self.allocator.free(path);
+        std.fs.cwd().access(path, .{}) catch return false;
+        return true;
+    }
+
+    /// Write an SST file to disk and pre-open it into the table cache.
+    /// Skips the write when the file is already cached, or already on disk with
+    /// a matching size — file_id → content is deterministic in this system, and
+    /// a size match is a strong signal the bytes are correct (no cross-ID
+    /// collisions possible). If a size mismatch is detected, we log and rewrite.
+    pub fn writeFile(self: *Forest, file_id: u64, data: []const u8) void {
+        if (self.table_cache.contains(file_id)) return;
+
+        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return;
+        defer self.allocator.free(path);
+
+        // Probe existence + size via vfs (no allocation, just open + getEndPos).
+        const existing_size: ?u64 = if (vfs.g().openFile(self.allocator, path, .{})) |fh| blk: {
+            defer fh.close();
+            break :blk fh.file_size;
+        } else |_| null;
+
+        const size_matches = existing_size != null and existing_size.? == data.len;
+        if (existing_size != null and !size_matches) {
+            log.warn("writeFile: size mismatch for {d} ({d} on disk vs {d}), rewriting", .{
+                file_id, existing_size.?, data.len,
+            });
+        }
+
+        if (!size_matches) {
+            const fh = vfs.g().createFile(path, .{ .mode = .direct, .flags = .{ .truncate = true } }) catch |err| {
+                log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
+                return;
+            };
+            fh.write(data, 0, .p1) catch |err| {
+                log.err("writeFile: write failed for {d}: {s}", .{ file_id, @errorName(err) });
+                fh.close();
+                return;
+            };
+            fh.sync() catch {};
+            fh.close();
+        }
+
+        // Pre-open the table into the cache so it's ready when compaction needs it.
+        const t = Table.open(self.allocator, path, .p1) catch |err| {
+            log.err("writeFile: Table.open failed for {d}: {s}", .{ file_id, @errorName(err) });
+            return;
+        };
+        self.table_cache.own(file_id, t) catch |err| {
+            log.err("writeFile: table_cache.own failed for {d}: {s}", .{ file_id, @errorName(err) });
+        };
+    }
+
+    /// Read an SST file from disk. Caller owns the returned slice.
+    pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
+        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return null;
+        defer self.allocator.free(path);
+        const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
+        defer handle.close();
+        const result = handle.readAligned(allocator, 0, @intCast(handle.file_size), .p1) catch return null;
+        return result.data;
+    }
+
+    pub fn compact(self: *Forest) !bool {
+        const b = self.bestCompactionCandidate() orelse return false;
         try b.tree.doCompact(b.candidate.level, &self.next_file_id);
         self.table_cache.clearStale();
 
@@ -641,7 +747,7 @@ pub const Forest = struct {
         return .{
             .table_changes = try table_changes.toOwnedSlice(alloc),
             .tree_changes = tree_changes,
-            .cmd = 3, // tree_split
+            .cmd = 4, // tree_split
         };
     }
 
@@ -684,7 +790,7 @@ pub const Forest = struct {
         // Remove migrated tables from old tree.
         for (mc.table_changes) |c| {
             if (c.op == 1 and c.tree_id == old_tree_id) { // DELETE from old tree
-                left_tree.levels[c.level].deleteEntries(&.{.{ .id = c.table_id, .table = undefined }});
+                left_tree.levels[c.level].deleteEntry(c.table_id);
             }
         }
 

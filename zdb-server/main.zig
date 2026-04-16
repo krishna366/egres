@@ -161,13 +161,13 @@ pub fn main() !void {
     }
     log.info("forest opened", .{});
 
-    // Storage applier bridges raft commits to forest.
-    var applier = zdb.applier.StorageApplier.init(allocator, forest);
-    defer deinitWithLog("applier", &applier);
-
-    // Register state machine apply callback so both leader and followers apply committed entries.
-    node.on_apply = &zdb_server.applyEntryToStorage;
-    node.on_apply_ctx = @ptrCast(&applier);
+    // Storage interface bridges raft commits to forest.
+    var storage_impl = zdb_server.StorageImpl{
+        .forest = forest,
+        .allocator = allocator,
+    };
+    var sm = storage_impl.asStateMachine();
+    node.state_machine = &sm;
 
     // zio runtime must be created before raft_rt so its defer (deinit) runs last,
     // after all coroutines are cleaned up.
@@ -184,7 +184,6 @@ pub fn main() !void {
     var zdb_srv = try zdb_server.ZdbServer.init(
         allocator,
         forest,
-        &applier,
         node,
         args.client_addr,
     );

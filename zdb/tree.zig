@@ -45,7 +45,7 @@ const LevelPriority = struct {
 // TableCache
 // ---------------------------------------------------------------------------
 
-pub const TableNeed = struct { id: u64, level: usize };
+pub const TableNeed = struct { id: u64, level: usize, table: ?*Table = null };
 
 /// TableCache is a Forest-owned registry of open *Table objects keyed by table_id.
 /// Tree.open() calls loadTables() instead of opening SST files itself, so a table
@@ -75,15 +75,28 @@ pub const TableCache = struct {
         self.tables.deinit();
     }
 
-    /// own hands ownership of a *Table to the cache. The cache will destroy the
-    /// struct in deinit/clearStale. Caller must not destroy t after this call.
+    /// contains reports whether a table with this id is currently cached.
+    pub fn contains(self: *TableCache, id: u64) bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.tables.contains(id);
+    }
+
+    /// own hands ownership of a *Table to the cache. The cache incrRef's so
+    /// the table stays alive until explicitly released (e.g. after a snapshot
+    /// confirms no follower needs the backing SST file). Caller must not
+    /// destroy t after this call.
     pub fn own(self: *TableCache, id: u64, t: *Table) !void {
         self.mu.lock();
         defer self.mu.unlock();
         std.debug.assert(!self.tables.contains(id));
+        t.incrRef();
         try self.tables.put(id, t);
     }
 
+    /// Evict tables whose ref has reached zero. Since own() holds a cache ref,
+    /// a table only becomes evictable after its cache ref is explicitly released
+    /// (e.g. after a snapshot confirms no follower needs the SST file).
     pub fn clearStale(self: *TableCache) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -107,20 +120,22 @@ pub const TableCache = struct {
     }
 
     /// loadTables serves each TableNeed from cache (read lock) or opens it
-    /// concurrently via zio fibers (write lock per miss). Each served table
-    /// is added to levels[need.level] via Level.addEntry (which incrRef's).
-    pub fn loadTables(self: *TableCache, needed: []const TableNeed, levels: []Level) !void {
-        // Phase 1: serve cache hits under read lock.
-        var misses: std.ArrayList(TableNeed) = .{};
+    /// concurrently via zio fibers (write lock per miss). On return, each
+    /// need's .table field points to an open *Table owned by the cache.
+    /// The caller is responsible for installing these tables into levels
+    /// (e.g. via Level.addEntry) — this keeps loadTables free of any
+    /// level-layout assumptions.
+    pub fn loadTables(self: *TableCache, needed: []TableNeed) !void {
+        // Phase 1: serve cache hits under read lock; collect pointers for misses.
+        var misses: std.ArrayList(*TableNeed) = .{};
         defer misses.deinit(self.allocator);
         {
             self.mu.lockShared();
             defer self.mu.unlockShared();
-            for (needed) |n| {
+            for (needed) |*n| {
                 if (self.tables.get(n.id)) |t| {
                     std.debug.assert(t.ref.load(.acquire) > 0);
-                    // addEntry acquires Level.mu; lock order TableCache.mu(R) → Level.mu is safe.
-                    try levels[n.level].addEntry(n.id, t);
+                    n.table = t;
                 } else {
                     try misses.append(self.allocator, n);
                 }
@@ -128,12 +143,12 @@ pub const TableCache = struct {
         }
         if (misses.items.len == 0) return;
 
-        // Phase 2: open misses concurrently.
+        // Phase 2: open misses concurrently. Each fiber writes to need.table.
         var tse: utils.ThreadSafeError = .{};
         var group = zio.group();
         defer group.cancel();
         for (misses.items) |n| {
-            try group.spawn(openFiber, .{ self, n, levels, &tse });
+            try group.spawn(openFiber, .{ self, n, &tse });
         }
         group.wait() catch {};
         if (tse.get()) |err| return err;
@@ -141,15 +156,14 @@ pub const TableCache = struct {
 
     fn openFiber(
         self: *TableCache,
-        need: TableNeed,
-        levels: []Level,
+        need: *TableNeed,
         tse: *utils.ThreadSafeError,
     ) void {
         // Phase A: check under write lock (brief — no I/O).
         self.mu.lock();
         if (self.tables.get(need.id)) |t| {
             self.mu.unlock();
-            levels[need.level].addEntry(need.id, t) catch |err| tse.set(err);
+            need.table = t;
             return;
         }
         self.mu.unlock();
@@ -157,11 +171,7 @@ pub const TableCache = struct {
         // Phase B: open the SST file WITHOUT holding the lock.
         // Table.open may yield the fiber (async I/O); holding the lock here
         // would deadlock cooperative fibers on the same OS thread (EDEADLK).
-        const path = std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{d:0>6}.sst",
-            .{ self.dir, need.id },
-        ) catch |err| {
+        const path = options.sstPath(self.allocator, self.dir, need.id) catch |err| {
             tse.set(err);
             return;
         };
@@ -170,26 +180,25 @@ pub const TableCache = struct {
             tse.set(err);
             return;
         };
-        defer t.decrRef(); // We shouldn't own a ref.
-        errdefer self.allocator.free(t);
+        defer t.decrRef(); // Drop the open-time ref; own() takes its own.
 
         // Phase C: re-acquire write lock to insert; handle race with another fiber.
         self.mu.lock();
         if (self.tables.get(need.id)) |existing| {
             // Another fiber opened the same table while we were in phase B.
             self.mu.unlock();
-            levels[need.level].addEntry(need.id, existing) catch |err| tse.set(err);
+            need.table = existing;
             return;
         }
-        // Cache holds its own ref (Table.open starts at refcount 1).
+        // Cache takes its own ref; defer above drops the open-time ref.
+        t.incrRef();
         self.tables.put(need.id, t) catch |err| {
             self.mu.unlock();
             tse.set(err);
             return;
         };
         self.mu.unlock();
-        // Level takes its own ref via addEntry.
-        levels[need.level].addEntry(need.id, t) catch |err| tse.set(err);
+        need.table = t;
     }
 };
 
@@ -251,7 +260,10 @@ pub const Tree = struct {
                     try needed.append(allocator, .{ .id = tid.*, .level = level_idx });
                 }
             }
-            try cache.loadTables(needed.items, levels);
+            try cache.loadTables(needed.items);
+            for (needed.items) |n| {
+                try levels[n.level].addEntry(n.id, n.table.?);
+            }
         }
 
         var tree: Tree = .{
@@ -589,16 +601,18 @@ pub const Tree = struct {
         // Flush any remaining data.
         try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
 
+        // Start dir sync while we're waiting for file syncs to be done. We can do dir sync here
+        // because files have already been created and written. So, dir should have everything it
+        // needs.
+        var dir_sync = try zio.spawn(vfs.VFS.syncDir, .{self.opts.dir});
+        defer dir_sync.join();
+
         // Join all sync fibers and collect output file IDs.
         for (flush_handles.items) |*h| {
             const result = h.join() orelse return error.FlushFailed;
             try output_file_ids.append(self.allocator, result.file_id);
         }
         flush_handles.clearAndFree(self.allocator);
-
-        // Best-effort directory sync in a zio fiber, overlapping with manifest build.
-        var dir_sync = try zio.spawn(vfs.VFS.syncDir, .{self.opts.dir});
-        defer dir_sync.join();
 
         // --- build manifest changes ---
         var changes = try std.ArrayList(manifest.TableChange).initCapacity(
@@ -630,24 +644,28 @@ pub const Tree = struct {
         // Commit to manifest (durable) before touching the levels.
         try self.ms.commit(changes, &.{});
 
-        // Apply level changes: delete old entries, add new ones.
+        // Batch-load all CREATE tables via the cache in a single concurrent
+        // pass. writeFile may have pre-opened them (follower path) → hit;
+        // otherwise loadTables opens them.
+        var needed: std.ArrayList(TableNeed) = .{};
+        defer needed.deinit(self.allocator);
+        for (changes) |c| {
+            if (c.op == 0) {
+                try needed.append(self.allocator, .{ .id = c.table_id, .level = c.level });
+            }
+        }
+        try self.cache.loadTables(needed.items);
+
+        // Apply level changes in original order: delete old entries, add new.
+        var need_idx: usize = 0;
         for (changes) |c| {
             if (c.op == 1) { // DELETE
-                self.levels[c.level].deleteEntries(&.{.{ .id = c.table_id, .table = undefined }});
+                self.levels[c.level].deleteEntry(c.table_id);
             } else if (c.op == 0) { // CREATE
-                const path = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}/{d:0>6}.sst",
-                    .{ self.opts.dir, c.table_id },
-                );
-                defer self.allocator.free(path);
-                const t = try Table.open(self.allocator, path, .p0);
-                errdefer t.decrRef();
-                try self.cache.own(c.table_id, t);
-                try self.levels[c.level].addEntry(c.table_id, t);
-                // cache.own takes struct ownership; addEntry incrRef'd.
-                // Drop the open ref so only the level holds a live ref.
-                t.decrRef();
+                const n = needed.items[need_idx];
+                need_idx += 1;
+                std.debug.assert(c.table_id == n.id);
+                try self.levels[c.level].addEntry(n.id, n.table.?);
             }
         }
 
@@ -669,11 +687,7 @@ pub const Tree = struct {
         if (tb.bytes.len == 0) return;
 
         const id = next_file_id.fetchAdd(1, .monotonic);
-        const path = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{d:0>6}.sst",
-            .{ self.opts.dir, id },
-        );
+        const path = try options.sstPath(self.allocator, self.opts.dir, id);
         errdefer self.allocator.free(path);
 
         const wh = try vfs.g().createFile(path, .{ .mode = .direct });
