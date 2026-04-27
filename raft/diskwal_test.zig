@@ -438,48 +438,6 @@ test "BIGTEST diskwal large payload rotation" {
     try handle.join();
 }
 
-test "diskwal meta file adapted from dgraph" {
-    const alloc = std.testing.allocator;
-    const wal_dir = try makeTempWalDir(alloc);
-    defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
-        alloc.free(wal_dir);
-    }
-
-    var mf = try raft.diskwal.metaFile.openPath(wal_dir, alloc);
-    defer mf.deinit();
-
-    const hs0 = try mf.hardState();
-    defer hs0.destroy(alloc);
-    try std.testing.expectEqual(@as(u64, 0), hs0.current_term);
-    try std.testing.expectEqual(@as(u64, 0), hs0.voted_for);
-    try mf.storeHardState(&.{
-        .current_term = 10,
-        .voted_for = 20,
-    });
-    const hs1 = try mf.hardState();
-    defer hs1.destroy(alloc);
-    try std.testing.expectEqual(@as(u64, 10), hs1.current_term);
-    try std.testing.expectEqual(@as(u64, 20), hs1.voted_for);
-
-    const snap0 = try mf.snapshot();
-    defer snap0.destroy(alloc);
-    try std.testing.expectEqual(@as(u64, 0), snap0.index);
-    try std.testing.expectEqual(@as(u64, 0), snap0.term);
-    try std.testing.expectEqual(@as(usize, 0), snap0.data.len);
-
-    try mf.storeSnapshot(&.{
-        .index = 12,
-        .term = 200,
-        .data = "foo",
-    });
-    const snap1 = try mf.snapshot();
-    defer snap1.destroy(alloc);
-    try std.testing.expectEqual(@as(u64, 12), snap1.index);
-    try std.testing.expectEqual(@as(u64, 200), snap1.term);
-    try std.testing.expectEqualSlices(u8, "foo", snap1.data);
-}
-
 fn bigTestTruncateStorageImpl() !void {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);

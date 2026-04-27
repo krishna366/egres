@@ -594,6 +594,15 @@ fn addRaftTests(
     raft_tests.root_module.addImport("zio", zio_dep.module("zio"));
     raft_tests.step.dependOn(regen_buffers_step);
 
+    // MetaStore unit tests — self-contained, runs alongside the raft suite.
+    const meta_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "raft/meta_test.zig"),
+    });
+    addVendoredCompressionSources(b, meta_tests);
+    meta_tests.root_module.addImport("raft", raft_mod);
+    meta_tests.step.dependOn(regen_buffers_step);
+    const run_meta_tests = b.addRunArtifact(meta_tests);
+
     const run_raft_tests = b.addRunArtifact(raft_tests);
     const run_raft_tests_trace = b.addRunArtifact(raft_tests);
     run_raft_tests_trace.stdio = .inherit;
@@ -618,6 +627,7 @@ fn addRaftTests(
     const raft_test_step = b.step("test-raft", "Run raft tests");
     raft_test_step.dependOn(regen_buffers_step);
     raft_test_step.dependOn(&run_raft_tests.step);
+    raft_test_step.dependOn(&run_meta_tests.step);
     raft_test_step.dependOn(run_diskwal_tests);
 
     const raft_test_all_step = b.step("test-raft-all", "Run raft tests including BIGTEST cases");

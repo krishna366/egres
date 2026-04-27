@@ -3735,11 +3735,15 @@ pub const ConfStateWriter = struct {
 pub const HardStateStruct = struct {
     current_term: u64 = 0,
     voted_for: u64 = 0,
+    raft_id: u64 = 0,
+    checkpoint_index: u64 = 0,
 
     fn fromReaderValue(alloc: std.mem.Allocator, r: HardStateReader) Error!HardStateStruct {
         var s = HardStateStruct{
             .current_term = r.currentTerm(),
             .voted_for = r.votedFor(),
+            .raft_id = r.raftId(),
+            .checkpoint_index = r.checkpointIndex(),
         };
         errdefer s.deinit(alloc);
         return s;
@@ -3766,6 +3770,8 @@ pub const HardStateStruct = struct {
         var s = HardStateStruct{
             .current_term = self.current_term,
             .voted_for = self.voted_for,
+            .raft_id = self.raft_id,
+            .checkpoint_index = self.checkpoint_index,
         };
         errdefer s.deinit(alloc);
         return s;
@@ -3782,6 +3788,8 @@ pub const HardStateStruct = struct {
         var writer = try HardStateWriter.initWithBuf(alloc, out);
         try writer.setCurrentTerm(self.current_term);
         try writer.setVotedFor(self.voted_for);
+        try writer.setRaftId(self.raft_id);
+        try writer.setCheckpointIndex(self.checkpoint_index);
         const result = try writer.finish();
         return result.offset;
     }
@@ -3795,7 +3803,7 @@ pub const HardStateReader = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42252;
-    pub const SIZE_BYTES: u16 = 20;
+    pub const SIZE_BYTES: u16 = 36;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -3823,6 +3831,20 @@ pub const HardStateReader = struct {
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 12)) catch 0;
+    }
+
+    pub fn raftId(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 28;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 20)) catch 0;
+    }
+
+    pub fn checkpointIndex(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 36;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 28)) catch 0;
     }
 
     pub fn verify(self: Self) Error!void {
@@ -3854,6 +3876,8 @@ pub const HardStateBuffer = struct {
         var writer = try HardStateWriter.initWithBuf(alloc, out);
         try writer.setCurrentTerm(reader.currentTerm());
         try writer.setVotedFor(reader.votedFor());
+        try writer.setRaftId(reader.raftId());
+        try writer.setCheckpointIndex(reader.checkpointIndex());
         const result = try writer.finish();
         return result.offset;
     }
@@ -3875,7 +3899,7 @@ pub const HardStateWriter = struct {
 
     pub const VERSION: u16 = 1;
     pub const TABLE_ID: u16 = 42252;
-    pub const SIZE_BYTES: u16 = 20;
+    pub const SIZE_BYTES: u16 = 36;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -3908,6 +3932,16 @@ pub const HardStateWriter = struct {
         try zbuf.patchU64(out.items, self.base + 12, v);
     }
 
+    pub fn setRaftId(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 20, v);
+    }
+
+    pub fn setCheckpointIndex(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 28, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -3915,6 +3949,8 @@ pub const HardStateWriter = struct {
         }
         if (@hasField(Values, "current_term")) try self.setCurrentTerm(@field(values, "current_term"));
         if (@hasField(Values, "voted_for")) try self.setVotedFor(@field(values, "voted_for"));
+        if (@hasField(Values, "raft_id")) try self.setRaftId(@field(values, "raft_id"));
+        if (@hasField(Values, "checkpoint_index")) try self.setCheckpointIndex(@field(values, "checkpoint_index"));
     }
 
     pub fn finish(self: *Self) Error!HardStateBuffer {

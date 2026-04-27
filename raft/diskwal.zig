@@ -4,6 +4,7 @@ const raftlog = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const vfs_mod = @import("vfs");
 const zio = @import("zio");
+const meta = @import("meta.zig");
 
 fn readInt(comptime T: type, buf: []const u8, endian: std.builtin.Endian) T {
     const n = @divExact(@typeInfo(T).int.bits, 8);
@@ -65,11 +66,6 @@ fn writeInt(comptime T: type, buf: []u8, value: T, endian: std.builtin.Endian) v
 // mmap generally handles process crash safety well enough for default mode.
 // If hard sync is enabled, call msync/fdatasync after writes.
 
-pub const meta_name = "wal.meta";
-pub const meta_file_size: usize = 1 << 20;
-pub const hard_state_offset: usize = 512;
-pub const snapshot_offset: usize = 1024;
-
 pub const max_num_entries: usize = 60_000;
 pub const log_file_offset: usize = 1 << 20;
 pub const log_file_size: usize = 256 << 20;
@@ -80,17 +76,7 @@ pub const log_header_version: u32 = 1;
 pub const log_header_size: usize = 24;
 pub const first_data_slot: usize = 1;
 
-pub const MetaInfo = enum {
-    raft_id,
-    group_id,
-    checkpoint_index,
-    snapshot,
-    hard_state,
-};
-
 pub const Error = error{
-    CorruptMeta,
-    InvalidMetaInfo,
     CorruptLogFile,
     InvalidLogOffset,
     InvalidLogHeader,
@@ -104,29 +90,6 @@ pub const Error = error{
 
 pub const err_not_found = error{NotFound};
 
-fn metaOffset(comptime info: MetaInfo) usize {
-    return switch (info) {
-        .raft_id => 0,
-        .group_id => 8,
-        .checkpoint_index => 16,
-        .snapshot => snapshot_offset,
-        .hard_state => hard_state_offset,
-    };
-}
-
-fn writeSlice(dst: []u8, src: []const u8) Error!void {
-    if (dst.len < 4 + src.len) return error.CorruptMeta;
-    writeInt(u32, dst[0..4], @as(u32, @intCast(src.len)), .little);
-    @memcpy(dst[4 .. 4 + src.len], src);
-}
-
-fn readSlice(src: []const u8) Error![]const u8 {
-    if (src.len < 4) return error.CorruptMeta;
-    const size = readInt(u32, src[0..4], .little);
-    if (src.len < 4 + size) return error.CorruptMeta;
-    return src[4 .. 4 + size];
-}
-
 pub const EntryType = raftlog.EntryType;
 
 pub const entry = struct {
@@ -135,122 +98,6 @@ pub const entry = struct {
     data_offset: u32 = 0,
     data_len: u32 = 0,
     ty: EntryType = .any,
-};
-
-pub const metaFile = struct {
-    alloc: std.mem.Allocator,
-    file: std.fs.File,
-    data: []align(std.heap.page_size_min) u8,
-
-    pub fn openPath(path: []const u8, alloc: std.mem.Allocator) Error!metaFile {
-        const cwd = std.fs.cwd();
-        var dir = cwd.openDir(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                try cwd.makePath(path);
-                break :blk try cwd.openDir(path, .{});
-            },
-            else => return err,
-        };
-        defer dir.close();
-        return openInDir(dir, alloc);
-    }
-
-    pub fn openInDir(dir: std.fs.Dir, alloc: std.mem.Allocator) Error!metaFile {
-        var created = false;
-        var file = dir.openFile(meta_name, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                created = true;
-                break :blk try dir.createFile(meta_name, .{ .read = true, .truncate = false });
-            },
-            else => return err,
-        };
-        errdefer file.close();
-
-        const st = try file.stat();
-        if (st.size < meta_file_size) {
-            try file.setEndPos(meta_file_size);
-        }
-
-        const map = try std.posix.mmap(
-            null,
-            meta_file_size,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
-            .{ .TYPE = .SHARED },
-            file.handle,
-            0,
-        );
-        errdefer std.posix.munmap(map);
-
-        if (created) {
-            @memset(map, 0);
-        }
-        return .{
-            .alloc = alloc,
-            .file = file,
-            .data = map,
-        };
-    }
-
-    pub fn deinit(self: *metaFile) void {
-        std.posix.munmap(self.data);
-        self.file.close();
-    }
-
-    pub fn sync(self: *metaFile, hard: bool) Error!void {
-        try std.posix.msync(self.data, if (hard) std.posix.MSF.SYNC else std.posix.MSF.ASYNC);
-        if (hard) {
-            try std.posix.fdatasync(self.file.handle);
-        }
-    }
-
-    inline fn checkOffset(comptime offset: usize) void {
-        if (offset % 8 != 0) {
-            @compileError("offset must be a multiple of 8");
-        }
-    }
-    inline fn u64Buf(self: *metaFile, info: MetaInfo, comptime offset: usize) []u8 {
-        checkOffset(offset);
-        const idx = metaOffset(info) + offset;
-        return self.data[idx .. idx + 8];
-    }
-
-    pub fn hardState(self: *metaFile) Error!*raftlog.HardState {
-        const blob = try readSlice(self.data[hard_state_offset..]);
-        if (blob.len == 0) {
-            const hs = try self.alloc.create(raftlog.HardState);
-            hs.* = .{};
-            return hs;
-        }
-        const reader = try zen.HardStateReader.parseRoot(blob);
-        return raftlog.HardState.fromReader(self.alloc, reader);
-    }
-
-    pub fn storeHardState(self: *metaFile, hs: *const raftlog.HardState) Error!void {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.alloc);
-        const offset = try hs.marshalTo(self.alloc, &buf);
-        try zen.addTail(self.alloc, &buf, zen.HardStateReader, offset);
-        try writeSlice(self.data[hard_state_offset..], buf.items);
-    }
-
-    pub fn snapshot(self: *metaFile) Error!*raftlog.Snapshot {
-        const blob = try readSlice(self.data[snapshot_offset..]);
-        if (blob.len == 0) {
-            const snap = try self.alloc.create(raftlog.Snapshot);
-            snap.* = .{};
-            return snap;
-        }
-        const reader = try zen.SnapshotReader.parseRoot(blob);
-        return raftlog.Snapshot.fromReader(self.alloc, reader);
-    }
-
-    pub fn storeSnapshot(self: *metaFile, snap: *const raftlog.Snapshot) Error!void {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.alloc);
-        const offset = try snap.marshalTo(self.alloc, &buf);
-        try zen.addTail(self.alloc, &buf, zen.SnapshotReader, offset);
-        try writeSlice(self.data[snapshot_offset..], buf.items);
-    }
 };
 
 pub const logFile = struct {
@@ -1224,42 +1071,35 @@ pub const wal = struct {
 
 pub const DiskWAL = struct {
     allocator: std.mem.Allocator,
-    meta: metaFile,
+    /// MetaStore owns the in-memory authoritative HardState + Snapshot, so
+    /// the old `hard_state_cache` + `snapshot_cache` pointers go away.
+    meta: meta.MetaStore,
     wal_store: wal,
-    hard_state_cache: *raftlog.HardState,
-    snapshot_cache: *raftlog.Snapshot,
 
     pub fn openPath(
         path: []const u8,
         allocator: std.mem.Allocator,
         cache_capacity: usize,
     ) !DiskWAL {
-        var mf = try metaFile.openPath(path, allocator);
-        errdefer mf.deinit();
+        var ms = try meta.MetaStore.openPath(path, allocator);
+        errdefer ms.deinit();
 
         var wf = try wal.openPath(path, allocator, cache_capacity);
         errdefer wf.deinit();
 
-        const hs = try mf.hardState();
-        errdefer hs.destroy(allocator);
-        const snap = try mf.snapshot();
-        errdefer snap.destroy(allocator);
+        const snap = ms.snapshotState();
         if (snap.index > 0 and wf.firstIndex() != snap.index + 1) {
             return error.CorruptLogFile;
         }
 
         return .{
             .allocator = allocator,
-            .meta = mf,
+            .meta = ms,
             .wal_store = wf,
-            .hard_state_cache = hs,
-            .snapshot_cache = snap,
         };
     }
 
     pub fn deinit(self: *DiskWAL) void {
-        self.snapshot_cache.destroy(self.allocator);
-        self.hard_state_cache.destroy(self.allocator);
         self.wal_store.deinit();
         self.meta.deinit();
     }
@@ -1288,25 +1128,19 @@ pub const DiskWAL = struct {
     // --- Implementation methods (no locking, caller must hold appropriate lock) ---
 
     fn hardState(self: *DiskWAL) *const raftlog.HardState {
-        return self.hard_state_cache;
+        return self.meta.hardState();
     }
 
     fn setHardState(self: *DiskWAL, hs: raftlog.HardState) raftlog.RaftLogError!void {
-        self.meta.storeHardState(&hs) catch |err| return mapToRaftLogError(err);
-        const copy = hs.clone(self.allocator) catch return error.OutOfMemory;
-        self.hard_state_cache.destroy(self.allocator);
-        self.hard_state_cache = copy;
+        self.meta.setHardState(hs) catch |err| return mapToRaftLogError(err);
     }
 
     fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
-        return self.snapshot_cache;
+        return self.meta.snapshotState();
     }
 
     fn setSnapshot(self: *DiskWAL, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
-        self.meta.storeSnapshot(&snap) catch |err| return mapToRaftLogError(err);
-        const copy = snap.clone(self.allocator) catch return error.OutOfMemory;
-        self.snapshot_cache.destroy(self.allocator);
-        self.snapshot_cache = copy;
+        self.meta.setSnapshot(snap) catch |err| return mapToRaftLogError(err);
     }
 
     fn firstIndex(self: *DiskWAL) u64 {
@@ -1319,8 +1153,9 @@ pub const DiskWAL = struct {
 
     fn lastTerm(self: *DiskWAL) u64 {
         const last_idx = self.wal_store.lastIndex();
-        if (last_idx == 0) return self.snapshot_cache.term;
-        return self.wal_store.term(last_idx) catch self.snapshot_cache.term;
+        const snap_term = self.meta.snapshotState().term;
+        if (last_idx == 0) return snap_term;
+        return self.wal_store.term(last_idx) catch snap_term;
     }
 
     fn term(self: *DiskWAL, idx: u64) raftlog.RaftLogError!?u64 {
@@ -1362,7 +1197,9 @@ pub const DiskWAL = struct {
     }
 
     fn sync(self: *DiskWAL) raftlog.RaftLogError!void {
-        self.meta.sync(true) catch |err| return mapToRaftLogError(err);
+        // MetaStore writes are durable inline (state.bin opens with O_DSYNC,
+        // snapshot.bin uses tmp+rename+dir-sync), so only the WAL needs an
+        // explicit sync here.
         self.wal_store.sync(true) catch |err| return mapToRaftLogError(err);
     }
 

@@ -9,6 +9,13 @@ pub const Flags = struct {
     writable: bool = false,
     /// Truncate an existing file instead of failing with O_EXCL.
     truncate: bool = false,
+    /// Open with O_DSYNC so every `write()` returns only after the data
+    /// (and any metadata required to read it back) is durable. Removes the
+    /// need for an explicit `fdatasync` after each write — useful for small
+    /// metadata files where the cost of a separate fsync syscall dominates
+    /// the actual I/O. POSIX-portable; on macOS the kernel treats DSYNC
+    /// like full SYNC, which is still correct (data is durable).
+    dsync: bool = false,
 };
 
 pub const FileOptions = struct {
@@ -297,7 +304,9 @@ pub const VFS = struct {
         const fid = fileIdFromPath(path);
         switch (opts.mode) {
             .mmap => {
-                const fd = try openDirect(path, false, false);
+                // mmap mode opens RO+default for the underlying fd; mapped
+                // semantics live above the fd, not in its open flags.
+                const fd = try openDirect(path, .{});
                 errdefer posix.close(fd);
 
                 const file_size = try (std.fs.File{ .handle = fd }).getEndPos();
@@ -305,14 +314,15 @@ pub const VFS = struct {
                 return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .file_id = fid, .mapped = mapped, .vfs = self };
             },
             .default, .direct => {
-                const fd = try openDirect(path, opts.mode == .direct, opts.flags.writable);
+                const fd = try openDirect(path, opts);
                 errdefer posix.close(fd);
 
                 const file_size = try (std.fs.File{ .handle = fd }).getEndPos();
                 return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .file_id = fid, .vfs = self };
             },
             .memory => {
-                const fd = try openDirect(path, false, false);
+                // memory mode reads the file once into a buffer; underlying fd is RO+default.
+                const fd = try openDirect(path, .{});
                 defer posix.close(fd); // closed after reading; FileHandle won't own it
 
                 const file = std.fs.File{ .handle = fd };
@@ -342,6 +352,7 @@ pub const VFS = struct {
             open_flags.EXCL = true;
         }
         if (builtin.os.tag == .linux and opts.mode == .direct) open_flags.DIRECT = true;
+        if (opts.flags.dsync) open_flags.DSYNC = true;
 
         const fd = posix.open(path, open_flags, 0o644) catch |err| switch (err) {
             // tmpfs doesn't support O_DIRECT — fall back to plain open.
@@ -374,16 +385,27 @@ pub const VFS = struct {
     }
 };
 
-/// When direct_io is set, open read-only with O_DIRECT on Linux. Falls back to plain open if the
-/// filesystem doesn't support it (e.g. tmpfs returns EINVAL → BadPathName).
-fn openDirect(path: []const u8, direct_io: bool, writable: bool) !posix.fd_t {
-    const accmode: posix.ACCMODE = if (writable) .RDWR else .RDONLY;
+/// Open a file according to `opts`. Honors `mode = .direct` (O_DIRECT,
+/// Linux only) and `flags.{ writable, dsync }`. Falls back to a plain
+/// open without O_DIRECT if the filesystem rejects it (e.g. tmpfs returns
+/// EINVAL → BadPathName); the fallback keeps O_DSYNC because every fs we
+/// care about supports it.
+///
+/// Takes `FileOptions` rather than expanding into one parameter per flag
+/// so this function's signature stays stable as new flags are added.
+fn openDirect(path: []const u8, opts: FileOptions) !posix.fd_t {
+    const direct_io = opts.mode == .direct;
+    const accmode: posix.ACCMODE = if (opts.flags.writable) .RDWR else .RDONLY;
     var flags: posix.O = .{ .ACCMODE = accmode };
     if (builtin.os.tag == .linux and direct_io) flags.DIRECT = true;
+    if (opts.flags.dsync) flags.DSYNC = true;
 
     const fd = posix.open(path, flags, 0) catch |err| switch (err) {
-        // EINVAL is mapped to error.BadPathName
-        error.BadPathName => return posix.open(path, .{ .ACCMODE = accmode }, 0),
+        error.BadPathName => {
+            var fb: posix.O = .{ .ACCMODE = accmode };
+            if (opts.flags.dsync) fb.DSYNC = true;
+            return posix.open(path, fb, 0);
+        },
         else => return err,
     };
 

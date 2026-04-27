@@ -1550,6 +1550,12 @@ pub const Node = struct {
         try self.log.setHardState(.{
             .current_term = self.current_term,
             .voted_for = self.voted_for orelse 0,
+            // raft_id pins the metadata to this node so a misplaced data
+            // dir can't be silently picked up by a different node id.
+            .raft_id = self.id,
+            // checkpoint_index gets wired when snapshot/compaction starts
+            // bumping it; for now MetaStore writes it as 0.
+            .checkpoint_index = 0,
         });
         try self.log.sync();
     }
