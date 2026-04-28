@@ -130,7 +130,7 @@ pub const logFile = struct {
 
         var handle = try vfs_inst.openFile(alloc, path, .{
             .mode = .default,
-            .flags = .{ .writable = true },
+            .flags = .{ .writable = true, .dsync = true },
         });
         errdefer handle.close();
 
@@ -208,7 +208,7 @@ pub const logFile = struct {
 
         var handle = try vfs_inst.openFile(alloc, path, .{
             .mode = .default,
-            .flags = .{ .writable = true },
+            .flags = .{ .writable = true, .dsync = true },
         });
         errdefer handle.close();
 
@@ -289,7 +289,7 @@ pub const logFile = struct {
 
         var handle = try vfs_inst.createFile(path, .{
             .mode = .default,
-            .flags = .{ .writable = true, .truncate = true },
+            .flags = .{ .writable = true, .truncate = true, .dsync = true },
         });
         errdefer handle.close();
 
@@ -321,7 +321,10 @@ pub const logFile = struct {
     }
 
     pub fn syncFile(self: *logFile) !void {
-        try self.handle.sync();
+        // NOTE:We are opening files with dsync =  true, we can just turn this off.
+        // try self.handle.sync();
+        _ = self;
+        return;
     }
 
     pub fn truncateFile(self: *logFile, size: u64) !void {
@@ -472,6 +475,10 @@ pub const logFile = struct {
     }
 };
 
+/// Inner WAL implementation. NOT internally synchronized — assumes the
+/// caller (`DiskWAL`) holds `DiskWAL.mu` in the appropriate mode (shared
+/// for reads, exclusive for mutations). Exposing `wal` directly without
+/// going through `DiskWAL` is unsafe under concurrency.
 pub const wal = struct {
     allocator: std.mem.Allocator,
     vfs_inst: *const vfs_mod.VFS,
@@ -480,7 +487,17 @@ pub const wal = struct {
     current: *logFile, // points to files.items[files.items.len - 1]
     cache: EntryCache,
     next_fid: u64,
-    mu: zio.RwLock,
+    /// Buffered framed records for the current file. `addEntries` appends
+    /// here without touching disk; `sync` flushes via one pwrite (durable
+    /// because the file was opened with O_DSYNC, so the syscall return
+    /// implies on-disk persistence). On rotation, this is flushed to the
+    /// outgoing file before creating the next one.
+    write_buf: std.ArrayList(u8) = .empty,
+    /// Highest log index whose framed bytes are on disk. `addEntries`
+    /// consults this before letting the cache evict: if the entry about
+    /// to be evicted has index > last_synced_index, we flush write_buf
+    /// first. Preserves the invariant "every entry is in cache OR on disk."
+    last_synced_index: u64 = 0,
 
     const Pos = struct {
         file_idx: usize,
@@ -567,7 +584,6 @@ pub const wal = struct {
                 .current = &files.items[files.items.len - 1],
                 .cache = entry_cache,
                 .next_fid = 2,
-                .mu = .init,
             };
         }
 
@@ -639,8 +655,7 @@ pub const wal = struct {
                     .current = &opened.items[opened.items.len - 1],
                     .cache = entry_cache,
                     .next_fid = current.fid + 1,
-                    .mu = .init,
-                };
+                    };
             }
 
             // All files were malformed — start fresh.
@@ -661,7 +676,6 @@ pub const wal = struct {
                 .current = &files.items[files.items.len - 1],
                 .cache = entry_cache,
                 .next_fid = 2,
-                .mu = .init,
             };
         }
 
@@ -685,7 +699,6 @@ pub const wal = struct {
             .current = &opened.items[opened.items.len - 1],
             .cache = entry_cache,
             .next_fid = cur_fid + 1,
-            .mu = .init,
         };
     }
 
@@ -693,6 +706,7 @@ pub const wal = struct {
         self.cache.deinit();
         for (self.files.items) |*lf| lf.deinit();
         self.files.deinit(self.allocator);
+        self.write_buf.deinit(self.allocator);
         self.allocator.free(self.dir_path);
     }
 
@@ -951,17 +965,19 @@ pub const wal = struct {
     }
 
     /// Flush pending writes, write header to current file, then create a new file.
-    fn rotate(self: *wal, write_buf: *std.ArrayList(u8)) !void {
-        // Flush any pending writes before rotation.
-        try self.current.flushWriteBuffer(write_buf.items);
-        write_buf.shrinkRetainingCapacity(0);
+    fn rotate(self: *wal) !void {
+        // Mid-batch rotation: flush whatever's accumulated for the outgoing
+        // file before we move to a new one. With O_DSYNC the pwrite is the
+        // durable point, so no separate fdatasync is needed.
+        try self.current.flushWriteBuffer(self.write_buf.items);
+        self.write_buf.clearRetainingCapacity();
+        self.last_synced_index = self.current.lastEntry().index;
 
         const prev = self.current.lastEntry();
 
-        // Write header with slot metadata, truncate to actual data, sync.
+        // Write header with slot metadata, truncate to actual data.
         try self.current.writeHeader();
         try self.current.truncateFile(self.current.write_offset);
-        try self.current.syncFile();
 
         // Mark current as rotated.
         self.current.is_current = false;
@@ -980,17 +996,15 @@ pub const wal = struct {
         const first_reader = try entries[0].initReader();
         const first_index = first_reader.index();
         if (first_index <= self.lastIndex()) {
-            self.truncateFrom(first_index);
+            try self.truncateFrom(first_index);
         }
 
         // Raft invariant: written indices must be strictly contiguous.
         if (first_index != self.current.lastEntry().index + 1) return raftlog.RaftLogError.Invalid;
 
-        // Batch writes into a single buffer, flush once (or per rotation boundary).
-        var write_buf = std.ArrayList(u8).empty;
-        defer write_buf.deinit(self.allocator);
-
-        // This loop validates batch-internal continuity while buffering writes.
+        // Append into self.write_buf — the actual pwrite is deferred to
+        // sync(). Cache + slot table get updated immediately so reads see
+        // the new entries before they hit disk.
         var expected_index = first_index;
         for (entries) |entry_buf| {
             const reader = try entry_buf.initReader();
@@ -1001,20 +1015,27 @@ pub const wal = struct {
             if (self.current.firstEmptySlot() >= max_num_entries or
                 self.current.write_offset + record_header_size + bytes.len > log_file_size)
             {
-                // Segment full: flush buffer, rotate, continue in new file.
-                // rotate() flushes write_buf and resets it.
-                try self.rotate(&write_buf);
+                // Segment full: rotate (which flushes self.write_buf to the
+                // outgoing file before creating the new one).
+                try self.rotate();
             }
 
             // Buffer the CRC-framed record (no I/O), update in-memory slots.
-            try self.current.appendRecordToBuffer(&write_buf, bytes, reader);
+            try self.current.appendRecordToBuffer(&self.write_buf, bytes, reader);
 
-            // Populate cache.
+            // If the cache is about to evict an entry that hasn't been
+            // pwritten yet, flush write_buf first. Otherwise reads of the
+            // evicted index would miss in cache AND on disk.
+            if (self.cache.isFull()) {
+                if (self.cache.oldestIndex()) |oldest| {
+                    if (oldest > self.last_synced_index) {
+                        try self.sync(true);
+                    }
+                }
+            }
+            // Populate cache so reads see the entry pre-sync.
             self.cache.append(reader.index(), reader.term(), bytes) catch {};
         }
-
-        // Flush remaining writes in one call.
-        try self.current.flushWriteBuffer(write_buf.items);
     }
 
     pub fn deleteBefore(self: *wal, raft_index: u64) void {
@@ -1040,11 +1061,20 @@ pub const wal = struct {
         self.current.slots.shrinkRetainingCapacity(1);
         self.current.write_offset = log_file_offset;
         self.cache.clear();
+        self.write_buf.clearRetainingCapacity();
+        self.last_synced_index = 0;
     }
 
     // Drops entries from `from_index` onward, keeping prefix entries intact.
     // This is used by Raft conflict resolution when a leader overwrites suffix.
-    pub fn truncateFrom(self: *wal, from_index: u64) void {
+    pub fn truncateFrom(self: *wal, from_index: u64) !void {
+        // Flush any pending unsynced records first. write_buf may contain
+        // records BELOW from_index that we want to preserve, plus records
+        // AT/ABOVE from_index we want to discard. Splitting it in-place is
+        // O(n) and fiddly; sync gets the prefix on disk, then we truncate
+        // disk + slots in one shot.
+        if (self.write_buf.items.len > 0) try self.sync(true);
+
         const pos = self.slotGe(from_index);
         if (pos.slot_idx == 0) return;
 
@@ -1060,12 +1090,20 @@ pub const wal = struct {
         self.current.truncateFromSlot(pos.slot_idx);
         self.current.is_current = true;
         self.cache.truncateFrom(from_index);
+        // last_synced_index can't exceed what's still in the log.
+        if (from_index > 0 and self.last_synced_index >= from_index) {
+            self.last_synced_index = from_index - 1;
+        }
     }
 
     pub fn sync(self: *wal, _: bool) !void {
-
-        // The other files should have already been synced. No need to resync them.
-        try self.current.syncFile();
+        // Flush the buffered framed records via one pwrite. With O_DSYNC the
+        // syscall returns only after the data is on disk, so no separate
+        // fdatasync is needed. (Older segments were flushed at rotation.)
+        if (self.write_buf.items.len == 0) return;
+        try self.current.flushWriteBuffer(self.write_buf.items);
+        self.write_buf.clearRetainingCapacity();
+        self.last_synced_index = self.lastIndex();
     }
 };
 
@@ -1075,6 +1113,10 @@ pub const DiskWAL = struct {
     /// the old `hard_state_cache` + `snapshot_cache` pointers go away.
     meta: meta.MetaStore,
     wal_store: wal,
+    /// Single rwlock guarding all DiskWAL state — covers both `meta` and
+    /// `wal_store` since the public API (hardState/snapshot/append/...)
+    /// can read/mutate either. Shared for reads, exclusive for writes.
+    mu: zio.RwLock = .init,
 
     pub fn openPath(
         path: []const u8,
@@ -1092,6 +1134,9 @@ pub const DiskWAL = struct {
             return error.CorruptLogFile;
         }
 
+        // Recovery: every entry the wal just discovered is on disk and durable.
+        wf.last_synced_index = wf.lastIndex();
+
         return .{
             .allocator = allocator,
             .meta = ms,
@@ -1102,14 +1147,6 @@ pub const DiskWAL = struct {
     pub fn deinit(self: *DiskWAL) void {
         self.wal_store.deinit();
         self.meta.deinit();
-    }
-
-    pub fn asRaftWAL(self: *DiskWAL) raftlog.RaftWAL {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
-
-    fn fromCtx(ctx: *anyopaque) *DiskWAL {
-        return @ptrCast(@alignCast(ctx));
     }
 
     fn mapToRaftLogError(err: anyerror) raftlog.RaftLogError {
@@ -1125,40 +1162,59 @@ pub const DiskWAL = struct {
         };
     }
 
-    // --- Implementation methods (no locking, caller must hold appropriate lock) ---
+    // --- Public API: each method takes the appropriate lock inline. Mode
+    // matches the prior vtable wrapping (shared for reads, exclusive for
+    // writes, _uncancelable for cheap struct-field reads where blocking
+    // on cancellation isn't useful).
 
-    fn hardState(self: *DiskWAL) *const raftlog.HardState {
+    pub fn hardState(self: *DiskWAL) *const raftlog.HardState {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         return self.meta.hardState();
     }
 
-    fn setHardState(self: *DiskWAL, hs: raftlog.HardState) raftlog.RaftLogError!void {
+    pub fn setHardState(self: *DiskWAL, hs: raftlog.HardState) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.meta.setHardState(hs) catch |err| return mapToRaftLogError(err);
     }
 
-    fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
+    pub fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         return self.meta.snapshotState();
     }
 
-    fn setSnapshot(self: *DiskWAL, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
+    pub fn setSnapshot(self: *DiskWAL, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.meta.setSnapshot(snap) catch |err| return mapToRaftLogError(err);
     }
 
-    fn firstIndex(self: *DiskWAL) u64 {
+    pub fn firstIndex(self: *DiskWAL) u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         return self.wal_store.firstIndex();
     }
 
-    fn lastIndex(self: *DiskWAL) u64 {
+    pub fn lastIndex(self: *DiskWAL) u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         return self.wal_store.lastIndex();
     }
 
-    fn lastTerm(self: *DiskWAL) u64 {
+    pub fn lastTerm(self: *DiskWAL) u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         const last_idx = self.wal_store.lastIndex();
         const snap_term = self.meta.snapshotState().term;
         if (last_idx == 0) return snap_term;
         return self.wal_store.term(last_idx) catch snap_term;
     }
 
-    fn term(self: *DiskWAL, idx: u64) raftlog.RaftLogError!?u64 {
+    pub fn term(self: *DiskWAL, idx: u64) raftlog.RaftLogError!?u64 {
+        try self.mu.lockShared();
+        defer self.mu.unlockShared();
         if (idx == 0) return 0;
         return self.wal_store.term(idx) catch |err| switch (err) {
             raftlog.RaftLogError.Compacted => null,
@@ -1168,13 +1224,17 @@ pub const DiskWAL = struct {
         };
     }
 
-    fn entriesRange(self: *DiskWAL, opts: raftlog.EntriesRangeOpts) raftlog.RaftLogError!raftlog.EntriesResult {
+    pub fn entriesRange(self: *DiskWAL, opts: raftlog.EntriesRangeOpts) raftlog.RaftLogError!raftlog.EntriesResult {
+        try self.mu.lockShared();
+        defer self.mu.unlockShared();
         return self.wal_store.allEntries(self.allocator, opts) catch |err| {
             return mapToRaftLogError(err);
         };
     }
 
-    fn firstIndexOfTerm(self: *DiskWAL, term_value: u64) u64 {
+    pub fn firstIndexOfTerm(self: *DiskWAL, term_value: u64) u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
         var idx = self.wal_store.firstIndex();
         const last = self.wal_store.lastIndex();
         while (idx <= last) : (idx += 1) {
@@ -1184,108 +1244,31 @@ pub const DiskWAL = struct {
         return 0;
     }
 
-    fn append(self: *DiskWAL, entries: []const raftlog.LogEntryBuffer) raftlog.RaftLogError!void {
+    pub fn append(self: *DiskWAL, entries: []const raftlog.LogEntryBuffer) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.wal_store.addEntries(entries) catch |err| return mapToRaftLogError(err);
     }
 
-    fn truncateFrom(self: *DiskWAL, from_index: u64) raftlog.RaftLogError!void {
-        self.wal_store.truncateFrom(from_index);
+    pub fn truncateFrom(self: *DiskWAL, from_index: u64) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
+        self.wal_store.truncateFrom(from_index) catch |err| return mapToRaftLogError(err);
     }
 
-    fn compactUntil(self: *DiskWAL, index: u64) raftlog.RaftLogError!void {
+    pub fn compactUntil(self: *DiskWAL, index: u64) raftlog.RaftLogError!void {
+        try self.mu.lock();
+        defer self.mu.unlock();
         self.wal_store.deleteBefore(index);
     }
 
-    fn sync(self: *DiskWAL) raftlog.RaftLogError!void {
+    pub fn sync(self: *DiskWAL) raftlog.RaftLogError!void {
         // MetaStore writes are durable inline (state.bin opens with O_DSYNC,
         // snapshot.bin uses tmp+rename+dir-sync), so only the WAL needs an
         // explicit sync here.
+        try self.mu.lockShared();
+        defer self.mu.unlockShared();
         self.wal_store.sync(true) catch |err| return mapToRaftLogError(err);
-    }
-
-    const vtable = raftlog.RaftWAL.VTable{
-        .hardState = withLock(.shared_uncancelable, hardState),
-        .setHardState = withLock(.exclusive, setHardState),
-        .snapshot = withLock(.shared_uncancelable, snapshot),
-        .setSnapshot = withLock(.exclusive, setSnapshot),
-        .firstIndex = withLock(.shared_uncancelable, firstIndex),
-        .lastIndex = withLock(.shared_uncancelable, lastIndex),
-        .lastTerm = withLock(.shared_uncancelable, lastTerm),
-        .term = withLock(.shared, term),
-        .entriesRange = withLock(.shared, entriesRange),
-        .firstIndexOfTerm = withLock(.shared_uncancelable, firstIndexOfTerm),
-        .append = withLock(.exclusive, append),
-        .truncateFrom = withLock(.exclusive, truncateFrom),
-        .compactUntil = withLock(.exclusive, compactUntil),
-        .sync = withLock(.shared, sync),
-    };
-
-    /// Generate a vtable-compatible function pointer that acquires a lock,
-    /// casts ctx to *DiskWAL, calls the implementation fn, then releases.
-    /// The impl fn takes (*DiskWAL, ...extra args) and returns RaftLogError!T.
-    /// The generated fn takes (*anyopaque, ...extra args) and returns RaftLogError!T.
-    fn VtableFn(comptime Impl: type) type {
-        const info = @typeInfo(Impl).@"fn";
-        const RetType = info.return_type.?;
-        // Build vtable param types: replace first param (*DiskWAL) with *anyopaque.
-        var vtable_params: [info.params.len]std.builtin.Type.Fn.Param = undefined;
-        for (info.params, 0..) |p, i| {
-            vtable_params[i] = if (i == 0) .{ .is_generic = false, .is_noalias = false, .type = *anyopaque } else p;
-        }
-        return *const @Type(.{ .@"fn" = .{
-            .calling_convention = .auto,
-            .is_generic = false,
-            .is_var_args = false,
-            .return_type = RetType,
-            .params = &vtable_params,
-        } });
-    }
-
-    const LockMode = enum { shared, shared_uncancelable, exclusive };
-
-    fn withLock(comptime mode: LockMode, comptime impl: anytype) VtableFn(@TypeOf(impl)) {
-        const Impl = @TypeOf(impl);
-        const param_count = @typeInfo(Impl).@"fn".params.len;
-
-        const Wrapper = struct {
-            fn acquire(self: *DiskWAL) switch (mode) {
-                .shared => zio.Cancelable!void,
-                .shared_uncancelable => void,
-                .exclusive => zio.Cancelable!void,
-            } {
-                switch (mode) {
-                    .shared => try self.wal_store.mu.lockShared(),
-                    .shared_uncancelable => self.wal_store.mu.lockSharedUncancelable(),
-                    .exclusive => try self.wal_store.mu.lock(),
-                }
-            }
-            fn release(self: *DiskWAL) void {
-                switch (mode) {
-                    .shared, .shared_uncancelable => self.wal_store.mu.unlockShared(),
-                    .exclusive => self.wal_store.mu.unlock(),
-                }
-            }
-        };
-
-        return switch (param_count) {
-            1 => &struct {
-                fn f(ctx: *anyopaque) @typeInfo(Impl).@"fn".return_type.? {
-                    const self = fromCtx(ctx);
-                    if (mode == .shared_uncancelable) Wrapper.acquire(self) else try Wrapper.acquire(self);
-                    defer Wrapper.release(self);
-                    return @call(.auto, impl, .{self});
-                }
-            }.f,
-            2 => &struct {
-                fn f(ctx: *anyopaque, a1: @typeInfo(Impl).@"fn".params[1].type.?) @typeInfo(Impl).@"fn".return_type.? {
-                    const self = fromCtx(ctx);
-                    if (mode == .shared_uncancelable) Wrapper.acquire(self) else try Wrapper.acquire(self);
-                    defer Wrapper.release(self);
-                    return @call(.auto, impl, .{ self, a1 });
-                }
-            }.f,
-            else => @compileError("withLockImpl: unsupported arity"),
-        };
     }
 };
 
@@ -1338,6 +1321,18 @@ pub const EntryCache = struct {
         }
         self.head = 0;
         self.len = 0;
+    }
+
+    /// Raft index of the oldest entry — the one a full-cache `append`
+    /// would overwrite. `null` if cache is empty or disabled.
+    pub fn oldestIndex(self: *const EntryCache) ?u64 {
+        if (self.buf.len == 0 or self.len == 0) return null;
+        return self.buf[self.head].index;
+    }
+
+    /// True if the next `append` would have to evict an existing entry.
+    pub fn isFull(self: *const EntryCache) bool {
+        return self.buf.len > 0 and self.len == self.buf.len;
     }
 
     pub fn append(self: *EntryCache, index: u64, term_val: u64, bytes: []const u8) !void {
