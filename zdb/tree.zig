@@ -6,6 +6,7 @@ const manifest = @import("manifest.zig");
 const level_handler = @import("level.zig");
 const table_mod = @import("table.zig");
 const vfs = @import("vfs");
+const metrics = @import("metrics.zig");
 
 const Table = table_mod.Table;
 const TableIterator = table_mod.TableIterator;
@@ -215,7 +216,22 @@ pub const TableCache = struct {
 // If it helps, we can think of L1..n as basement levels, where i is the ith floor
 // below ground. DB Infrastructure works way under the API surface, so this is apt.
 
-pub const CompactCandidate = struct { level: u8, score: f64 };
+/// A tree's pending work item, picked by `Forest.bestCompactionCandidate`.
+/// `needs_split=true` means the tree has outgrown `tree_split_size` and
+/// should be split instead of compacted; the `level` field then describes
+/// the lowest non-empty level (informational, since split operates across
+/// all levels at the median key, not on a single level). `score` is bumped
+/// above the natural compaction range so a split preempts any pending
+/// compaction in the forest.
+pub const CompactCandidate = struct {
+    level: u8,
+    score: f64,
+    needs_split: bool = false,
+};
+
+/// Score assigned to a tree that needs a split. Comfortably above any
+/// natural compaction adjusted-score so splits always rank first.
+pub const split_priority_score: f64 = 100.0;
 
 pub const Tree = struct {
     allocator: std.mem.Allocator,
@@ -412,6 +428,23 @@ pub const Tree = struct {
     /// stores the result in self.compact_candidate. Called after open and after
     /// every doCompact so the candidate is always fresh.
     pub fn updateCompactCandidate(self: *Tree) !void {
+        // Split check overrides compaction. If Lmax has outgrown the split
+        // threshold, schedule a split ahead of any compaction work — the
+        // split is manifest-only (cheap) and shrinks the tree before the
+        // next compaction merges into an even larger Lmax. The score is
+        // bumped to `split_priority_score` so this tree wins over normal
+        // compaction candidates in the forest. Set `level` to the lowest
+        // non-empty level for diagnostic legibility (`stats forest`).
+        const linfo = self.lowestLevelSize();
+        if (linfo.size > self.opts.tree_split_size) {
+            self.compact_candidate = .{
+                .level = @intCast(linfo.level),
+                .score = split_priority_score,
+                .needs_split = true,
+            };
+            return;
+        }
+
         var t = try self.levelTargets();
         defer t.deinit();
 
@@ -657,7 +690,10 @@ pub const Tree = struct {
         try self.cache.loadTables(needed.items);
 
         // Apply level changes in original order: delete old entries, add new.
+        // Track total bytes created and the destination level for metrics.
         var need_idx: usize = 0;
+        var bytes_out: u64 = 0;
+        var dest_level: ?u8 = null;
         for (changes) |c| {
             if (c.op == 1) { // DELETE
                 self.levels[c.level].deleteEntry(c.table_id);
@@ -666,7 +702,25 @@ pub const Tree = struct {
                 need_idx += 1;
                 std.debug.assert(c.table_id == n.id);
                 try self.levels[c.level].addEntry(n.id, n.table.?);
+                bytes_out += n.table.?.fileSize();
+                dest_level = @intCast(c.level);
             }
+        }
+
+        // Metrics: one compaction run, plus bytes written to the dest level.
+        const ns_id: u32 = if (self.ms.trees.get(self.tree_id)) |ts| ts.namespace_id else 0;
+        if (dest_level) |lvl| {
+            try metrics.g().compactions.incr(.{
+                .namespace_id = ns_id,
+                .tree_id = self.tree_id,
+                .level = lvl,
+            });
+            try metrics.g().bytes_written.incrBy(.{
+                .source = "compact",
+                .namespace_id = ns_id,
+                .tree_id = self.tree_id,
+                .level = lvl,
+            }, bytes_out);
         }
 
         try self.updateCompactCandidate();

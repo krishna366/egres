@@ -7,6 +7,7 @@ const transport_mod = @import("transport");
 const Transport = transport_mod.Transport;
 const serial_mod = @import("serial");
 const Serial = serial_mod.Serial;
+const metrics = @import("metrics.zig");
 const raft_log = std.log.scoped(.raft);
 
 pub const NodeId = raftwal_mod.NodeId;
@@ -34,6 +35,12 @@ pub const Config = struct {
     election_timeout_max_ticks: u32 = 20,
     max_entries_per_msg: u32 = 64,
     max_msg_size: u32 = 1_048_576,
+    /// Peers within `lockstep_cutoff` of the slowest in-window peer share a
+    /// single AppendEntries (built once, fan-out via RefValue). Followers
+    /// already at the higher index walk past the duplicate prefix entries
+    /// (term-match check) and only WAL-append the new tail. Outliers beyond
+    /// this cutoff get their own AE to avoid shipping huge duplicate prefixes.
+    lockstep_cutoff: u32 = 32,
     enable_prevote: bool = true,
 
     pub fn validate(self: Config) !void {
@@ -57,13 +64,17 @@ pub const RaftError = error{
     LastVoter,
     InvalidBytes,
     QueueClosed,
+    QueueFull,
+    CommitFailed,
+    NotCommitted,
 } || RaftLogError || zen.Error;
 
 pub const Peer = struct {
     id: NodeId,
     next_index: u64,
     // Highest log index known to be replicated on this peer (leader view).
-    match_index: u64,
+    // Raft's `matchIndex[i]` — kept here under the more readable name.
+    last_index: u64,
     role: PeerRole,
     addr: []const u8 = "",
 };
@@ -77,9 +88,10 @@ pub const InboundMsg = struct {
 };
 
 pub const Inbound = []const u8;
-pub const ProposalEntry = struct {
+pub const Entry = struct {
     term: u64,
     index: u64,
+    timestamp: u64 = 0,
 };
 
 pub const CommitStatus = enum {
@@ -97,7 +109,7 @@ pub const CommitStatus = enum {
 
 pub const ApplyCallback = *const fn (
     ctx: *anyopaque,
-    entry: ProposalEntry,
+    entry: Entry,
     status: CommitStatus,
 ) void;
 
@@ -119,14 +131,14 @@ pub const Node = struct {
     /// this (e.g. with forest/applier) and sets node.state_machine.
     pub const StateMachine = struct {
         ctx: *anyopaque,
-        applyFn: *const fn (*anyopaque, u64, u64, []const u8) void,
+        applyFn: *const fn (*anyopaque, Entry, []const u8) void,
         writeFileFn: ?*const fn (*anyopaque, u64, []const u8) void = null,
         readFileFn: ?*const fn (*anyopaque, std.mem.Allocator, u64) ?[]const u8 = null,
         hasFileFn: ?*const fn (*anyopaque, u64) bool = null,
         preAppendFn: ?*const fn (*anyopaque, *Node, []const zen.LogEntryBuffer) void = null,
 
-        pub fn apply(self: *StateMachine, index: u64, term: u64, data: []const u8) void {
-            self.applyFn(self.ctx, index, term, data);
+        pub fn apply(self: *StateMachine, entry: Entry, data: []const u8) void {
+            self.applyFn(self.ctx, entry, data);
         }
         pub fn writeFile(self: *StateMachine, file_id: u64, data: []const u8) void {
             (self.writeFileFn orelse @panic("StateMachine.writeFile not implemented"))(self.ctx, file_id, data);
@@ -152,6 +164,13 @@ pub const Node = struct {
     state: State,
     commit_index: std.atomic.Value(u64),
     apply_index: std.atomic.Value(u64),
+    /// HLC timestamp of the most-recently applied entry. Progress marker
+    /// parallel to `apply_index`. Readers bounded by `read_ts` block until
+    /// `apply_ts >= read_ts` via `waitUntilApplied`.
+    apply_ts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Broadcast signal fired after every `apply_ts` advance. Waiters in
+    /// `waitUntilApplied` are woken and re-check their target.
+    apply_ts_notify: zio.Notify = .init,
     conf_applied_index: u64,
     leader_id: ?NodeId,
     pending_conf_change: bool,
@@ -169,10 +188,15 @@ pub const Node = struct {
     allocator: std.mem.Allocator,
 
     prng: std.Random.DefaultPrng,
-    proposal_requests: ProposalQueue,
+    proposal_ch: zio.Channel(ProposalRequest) = undefined,
     apply_callbacks: zio.Channel(PendingApply) = undefined,
     event_ch: zio.Channel(u8) = undefined,
-    commit_ch: zio.Channel(u8) = undefined,
+    // Broadcast notify fired by `advance()` whenever commit_index moves
+    // forward. Both applyLoop (state-machine apply) and callbackLoop
+    // (proposal-callback firing) wait on it. Notify is the right primitive
+    // here — a Channel is rendezvous (one signal = one receiver), which
+    // would let the two loops race for each commit signal.
+    commit_notify: zio.Notify = .init,
     inbound_ch: zio.Channel(InboundMsg) = undefined,
     shutting_down: std.atomic.Value(bool),
 
@@ -195,7 +219,7 @@ pub const Node = struct {
     };
 
     pub const ProposalType = enum { data, conf };
-    const ProposalQueue = utils.Queue(ProposalRequest, 4096);
+    const proposal_queue_capacity: usize = 4096;
     const ProposalRequest = struct {
         data: []u8,
         apply_cb: ApplyCallback,
@@ -203,7 +227,7 @@ pub const Node = struct {
         proposal_type: ProposalType = .data,
     };
     const PendingApply = struct {
-        entry: ProposalEntry,
+        entry: Entry,
         cb: ApplyCallback,
         ctx: *anyopaque,
     };
@@ -239,14 +263,13 @@ pub const Node = struct {
             .config = config,
             .allocator = allocator,
             .prng = prng,
-            .proposal_requests = .{},
             .shutting_down = std.atomic.Value(bool).init(false),
             .file_acks = utils.SafeHashMap(u64, *PendingFileAck).init(allocator),
             .file_requests = utils.SafeHashMap(u64, *utils.WaitGroup).init(allocator),
         };
+        node.proposal_ch = try zio.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
         node.apply_callbacks = try zio.Channel(PendingApply).initAlloc(allocator, 1024);
         node.event_ch = try zio.Channel(u8).initAlloc(allocator, 1);
-        node.commit_ch = try zio.Channel(u8).initAlloc(allocator, 1);
         node.inbound_ch = try zio.Channel(InboundMsg).initAlloc(allocator, 1024);
         errdefer allocator.destroy(node);
         for (peers) |peer| {
@@ -254,6 +277,10 @@ pub const Node = struct {
         }
         node.recomputeQuorum();
         node.resetElectionTimeout(.init);
+
+        // Seed the HLC clock with the current wall-clock second so peek()
+        // returns a sensible value even before the first `next()` call.
+        utils.hlc.g().seed(.{ .seconds = @intCast(std.time.timestamp()), .logical = 0 });
 
         // Restore persisted state from WAL if present.
         if (node.log.lastIndex() > 0) {
@@ -263,6 +290,13 @@ pub const Node = struct {
             raft_log.info("node {d}: state restored, term={d} peers={d} quorum={d}", .{
                 node.id, node.current_term, node.peers.count(), node.quorum_size,
             });
+            // Raise the HLC clock past the most recent log entry's timestamp,
+            // so a newly-elected leader's future `next()` values are strictly
+            // past every previously-committed one.
+            const seed_ts = node.lastLogTimestamp();
+            if (seed_ts != 0) {
+                utils.hlc.g().seed(utils.hlc.HLC.fromU64(seed_ts));
+            }
         }
 
         dbg(
@@ -280,18 +314,17 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
-        self.proposal_requests.close();
-        while (self.proposal_requests.tryPop()) |req| {
+        self.proposal_ch.close(.graceful);
+        while (self.proposal_ch.tryReceive()) |req| {
             self.allocator.free(req.data);
             req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
-        }
+        } else |_| {}
+        self.proposal_ch.deinit();
         self.failAllPendingCallbacks(.shutdown);
         self.apply_callbacks.close(.immediate);
         self.apply_callbacks.deinit();
         self.event_ch.close(.immediate);
         self.event_ch.deinit();
-        self.commit_ch.close(.immediate);
-        self.commit_ch.deinit();
 
         self.inbound_ch.close(.graceful);
         while (self.inbound_ch.tryReceive()) |msg| {
@@ -394,7 +427,7 @@ pub const Node = struct {
         }
     };
 
-    fn onJoinCommit(ctx_raw: *anyopaque, _: ProposalEntry, status: CommitStatus) void {
+    fn onJoinCommit(ctx_raw: *anyopaque, _: Entry, status: CommitStatus) void {
         const ctx: *JoinCtx = @ptrCast(@alignCast(ctx_raw));
         ctx.status = status;
         ctx.done.send(1) catch {};
@@ -485,6 +518,10 @@ pub const Node = struct {
                     raft_log.err("file_push crc mismatch for file {d}", .{file_id});
                     return;
                 }
+                std.log.scoped(.file_event).info(
+                    "node={d} event=p1_recv file_id={d} bytes={d}",
+                    .{ self.id, file_id, data.len },
+                );
                 if (self.state_machine) |s| {
                     if (!s.hasFile(file_id)) s.writeFile(file_id, data);
                 }
@@ -562,14 +599,20 @@ pub const Node = struct {
 
             // Build payload: [8B file_id][4B crc32][data]
             const payload = try self.allocator.alloc(u8, 12 + data.len);
-            defer self.allocator.free(payload);
             std.mem.writeInt(u64, payload[0..8], file_id, .little);
             std.mem.writeInt(u32, payload[8..12], std.hash.crc.Crc32Iscsi.hash(data), .little);
             @memcpy(payload[12..], data);
 
+            // Wrap once; sendMsg incrRefs per peer enqueued, no per-peer copy.
+            const value = utils.RefValue.init(self.allocator, payload) catch {
+                self.allocator.free(payload);
+                continue;
+            };
+            defer value.decrRef();
+
             var peer_it = self.peers.iterator();
             while (peer_it.next()) |kv| {
-                tr.sendMsg(kv.key_ptr.*, .p1, serial_mod.msg_type_file_push, payload) catch {};
+                tr.sendMsg(kv.key_ptr.*, .p1, serial_mod.msg_type_file_push, value) catch {};
             }
         }
 
@@ -590,6 +633,11 @@ pub const Node = struct {
         if (file_ids.len == 0) return;
         const leader = self.leader_id orelse return error.NotLeader;
         const tr = self.transport orelse return error.NoTransport;
+
+        const fe = std.log.scoped(.file_event);
+        for (file_ids) |fid| {
+            fe.info("node={d} event=fetch_request file_id={d} from_leader={d}", .{ self.id, fid, leader });
+        }
 
         // Register pending wait entries.
         for (file_ids) |fid| {
@@ -618,11 +666,15 @@ pub const Node = struct {
 
         // Send all requested IDs in one message: [N * 8B file_ids]
         const payload = try self.allocator.alloc(u8, file_ids.len * 8);
-        defer self.allocator.free(payload);
         for (file_ids, 0..) |fid, i| {
             std.mem.writeInt(u64, payload[i * 8 ..][0..8], fid, .little);
         }
-        tr.sendMsg(leader, .p1, serial_mod.msg_type_file_request, payload) catch |err| {
+        const value = utils.RefValue.init(self.allocator, payload) catch {
+            self.allocator.free(payload);
+            return;
+        };
+        defer value.decrRef();
+        tr.sendMsg(leader, .p1, serial_mod.msg_type_file_request, value) catch |err| {
             raft_log.err("requestFiles: send failed: {s}", .{@errorName(err)});
         };
 
@@ -704,7 +756,7 @@ pub const Node = struct {
         while (peer_it.next()) |kv| {
             const p = kv.value_ptr.*;
             dbg("  peer id={d} role={s} addr={s} match={d} next={d}", .{
-                p.id, @tagName(p.role), p.addr, p.match_index, p.next_index,
+                p.id, @tagName(p.role), p.addr, p.last_index, p.next_index,
             });
         }
     }
@@ -740,14 +792,15 @@ pub const Node = struct {
     }
 
     pub fn startShutdown(self: *Node) void {
-        self.shutting_down.store(true, .seq_cst);
-        self.proposal_requests.close();
+        self.shutting_down.store(true, .release);
+        self.proposal_ch.close(.graceful);
         self.event_ch.close(.graceful);
-        self.commit_ch.close(.graceful);
+        // Wake applyLoop + callbackLoop so they observe isShuttingDown() and exit.
+        self.commit_notify.broadcast();
     }
 
     pub fn isShuttingDown(self: *const Node) bool {
-        return self.shutting_down.load(.seq_cst);
+        return self.shutting_down.load(.acquire);
     }
 
     /// Returns true if a heartbeat is due (leader only).
@@ -845,7 +898,7 @@ pub const Node = struct {
         }
     }
 
-    fn noopCommitCb(_: *anyopaque, _: ProposalEntry, _: CommitStatus) void {}
+    fn noopCommitCb(_: *anyopaque, _: Entry, _: CommitStatus) void {}
 
     pub fn becomeLeader(self: *Node) RaftError!void {
         if (self.state == .learner) return;
@@ -857,7 +910,7 @@ pub const Node = struct {
         var it = self.peers.iterator();
         while (it.next()) |kv| {
             kv.value_ptr.next_index = 1;
-            kv.value_ptr.match_index = 0;
+            kv.value_ptr.last_index = 0;
         }
 
         // On bootstrap (first leader election, no conf changes yet), register
@@ -878,32 +931,72 @@ pub const Node = struct {
 
     /// Send AppendEntries only to peers that are behind (need entries or commit update).
     pub fn maybeBroadcast(self: *Node, do_send: bool) void {
+        if (!do_send) return;
         if (self.state != .leader) return;
-        const last = self.log.lastIndex();
+        const tr = self.transport orelse return;
+        const cutoff = self.config.lockstep_cutoff;
+
+        // Pass 1: highest next_index across peers — the "leading" position.
+        var top: u64 = 0;
+        {
+            var it = self.peers.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.*.next_index > top) top = kv.value_ptr.*.next_index;
+            }
+        }
+        if (top == 0) return; // no peers at all
+        const window_lo = if (top > cutoff) top - cutoff else 0;
+
+        // Pass 2: min next_index of peers in [window_lo, top]. That cluster
+        // shares one AE built at cluster_min — followers ahead walk past
+        // duplicate prefix entries (term-match check) and only WAL-append
+        // the new tail. Stragglers (below window_lo) get their own AE.
+        var cluster_min: u64 = top;
+        {
+            var it = self.peers.iterator();
+            while (it.next()) |kv| {
+                const p = kv.value_ptr.*;
+                if (p.next_index >= window_lo and p.next_index < cluster_min) {
+                    cluster_min = p.next_index;
+                }
+            }
+        }
+
+        // Build the cluster AE once. Even single-peer clusters take this
+        // path — building once + RefValue overhead is sub-µs, and the
+        // common steady-state has all peers in the same cluster.
+        const cluster_value = self.buildAppendEntries(cluster_min) catch return;
+        defer cluster_value.decrRef();
+
+        // Pass 3: send. In-window peers share the cluster AE; stragglers
+        // build & send their own.
         var it = self.peers.iterator();
         while (it.next()) |kv| {
-            const peer = kv.value_ptr.*;
-            // Send if peer needs entries or doesn't know about our commit.
-            if (do_send or peer.match_index < last or peer.next_index <= last) {
+            const p = kv.value_ptr.*;
+            if (p.next_index >= window_lo) {
+                tr.sendMsg(kv.key_ptr.*, .p0, serial_mod.msg_type_raft, cluster_value) catch {};
+            } else {
                 self.sendAppendEntries(kv.key_ptr.*) catch {};
             }
         }
     }
 
-    pub fn sendAppendEntries(self: *Node, peer: NodeId) RaftError!void {
-        if (self.state != .leader) return;
-        const state = self.peers.getPtr(peer) orelse return;
-        const prev_index = if (state.next_index == 0) 0 else state.next_index - 1;
+    /// Build an AppendEntries starting from `from_index`, wrapped in a
+    /// refcounted `RefValue` (caller owns one ref). Used both by the per-peer
+    /// send path and the grouped fan-out path in `maybeBroadcast` — the
+    /// latter shares the same RefValue across multiple peers.
+    fn buildAppendEntries(self: *Node, from_index: u64) RaftError!*utils.RefValue {
+        const prev_index = if (from_index == 0) 0 else from_index - 1;
         const prev_term: u64 = if (prev_index == 0) 0 else (try self.log.term(prev_index)) orelse 0;
         var result = try self.log.entriesRange(.{
-            .lo = state.next_index,
-            .hi = state.next_index + self.config.max_entries_per_msg,
+            .lo = from_index,
+            .hi = from_index + self.config.max_entries_per_msg,
             .max_bytes = 32 * 1024 * 1024, // 32 MiB
         });
         defer result.deinit();
 
         var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(self.allocator);
+        errdefer buf.deinit(self.allocator);
 
         var ae_writer = try zen.AppendEntriesWriter.initWithBuf(self.allocator, &buf);
         defer ae_writer.deinit();
@@ -930,11 +1023,25 @@ pub const Node = struct {
             .prev_log_index = prev_index,
             .prev_log_term = prev_term,
             .entries = entry_offsets.items,
-            .leader_commit = self.commit_index.load(.seq_cst),
+            .leader_commit = self.commit_index.load(.acquire),
         });
         _ = try ae_writer.finishWithTail();
         const bytes = try buf.toOwnedSlice(self.allocator);
-        self.sendEncoded(peer, bytes);
+        return utils.RefValue.init(self.allocator, bytes) catch |err| {
+            self.allocator.free(bytes);
+            return err;
+        };
+    }
+
+    pub fn sendAppendEntries(self: *Node, peer: NodeId) RaftError!void {
+        if (self.state != .leader) return;
+        const state = self.peers.getPtr(peer) orelse return;
+        const tr = self.transport orelse return;
+        const value = try self.buildAppendEntries(state.next_index);
+        defer value.decrRef();
+        tr.sendMsg(peer, .p0, serial_mod.msg_type_raft, value) catch |err| {
+            utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ peer, @errorName(err) });
+        };
     }
 
     fn handleRequestVote(self: *Node, rv: zen.RequestVoteReader) RaftError!void {
@@ -1094,7 +1201,7 @@ pub const Node = struct {
         if (ae_term < self.current_term) {
             try self.sendAppendEntriesReply(leader_id, .{
                 .success = false,
-                .match_index = 0,
+                .last_index = 0,
                 .conflict_term = 0,
                 .conflict_index = self.log.lastIndex() + 1,
             });
@@ -1113,7 +1220,7 @@ pub const Node = struct {
             if (prev_term_opt == null or prev_term_opt.? != ae.prevLogTerm()) {
                 try self.sendAppendEntriesReply(leader_id, .{
                     .success = false,
-                    .match_index = 0,
+                    .last_index = 0,
                     .conflict_term = prev_term_opt orelse 0,
                     .conflict_index = if (prev_term_opt) |t| self.log.firstIndexOfTerm(t) else self.log.lastIndex() + 1,
                 });
@@ -1157,18 +1264,18 @@ pub const Node = struct {
         }
 
         // utils.logEvery(10, "node {d}: handleAE entries={d} leaderCommit={d} ci={d} lastIndex={d}", .{
-        //     self.id, ae_entries_len, ae.leaderCommit(), self.commit_index.load(.seq_cst), self.log.lastIndex(),
+        //     self.id, ae_entries_len, ae.leaderCommit(), self.commit_index.load(.acquire), self.log.lastIndex(),
         // });
 
-        if (ae.leaderCommit() > self.commit_index.load(.seq_cst)) {
+        if (ae.leaderCommit() > self.commit_index.load(.acquire)) {
             const last_index = self.log.lastIndex();
             const new_ci = if (ae.leaderCommit() < last_index) ae.leaderCommit() else last_index;
-            dbg("node {d}: advancing commit_index {d} -> {d}", .{ self.id, self.commit_index.load(.seq_cst), new_ci });
-            self.commit_index.store(new_ci, .seq_cst);
+            dbg("node {d}: advancing commit_index {d} -> {d}", .{ self.id, self.commit_index.load(.acquire), new_ci });
+            self.commit_index.store(new_ci, .release);
         }
         try self.sendAppendEntriesReply(leader_id, .{
             .success = true,
-            .match_index = self.log.lastIndex(),
+            .last_index = self.log.lastIndex(),
             .conflict_term = 0,
             .conflict_index = 0,
         });
@@ -1198,9 +1305,9 @@ pub const Node = struct {
         }
 
         if (self.peers.getPtr(from)) |state| {
-            const match_index = aer.matchIndex();
-            state.match_index = match_index;
-            state.next_index = match_index + 1;
+            const last_idx = aer.lastIndex();
+            state.last_index = last_idx;
+            state.next_index = last_idx + 1;
         }
     }
 
@@ -1245,6 +1352,32 @@ pub const Node = struct {
         return self.proposeWithCallback(data, cb, ctx, .data);
     }
 
+    /// Synchronous wrapper around `proposeDataChange` — propose a data
+    /// entry and block until it commits (or fails). Used by callers that
+    /// don't need to track the commit asynchronously (clock ticks,
+    /// manifest changes from compaction loops, etc). The wait doubles as
+    /// a rate-limit: the caller fiber stays parked until commit, so it
+    /// can't pile up more than one in-flight proposal.
+    pub fn proposeAndWait(self: *Node, data: []const u8) RaftError!void {
+        var ctx = WaitCtx{ .status = .committed };
+        ctx.wg.init();
+        ctx.wg.add(1);
+        try self.proposeDataChange(data, &onWaitCommit, @ptrCast(&ctx));
+        ctx.wg.wait() catch return error.CommitFailed;
+        if (ctx.status != .committed) return error.NotCommitted;
+    }
+
+    const WaitCtx = struct {
+        wg: utils.WaitGroup = .{},
+        status: CommitStatus,
+    };
+
+    fn onWaitCommit(ctx_raw: *anyopaque, _: Entry, status: CommitStatus) void {
+        const ctx: *WaitCtx = @ptrCast(@alignCast(ctx_raw));
+        ctx.status = status;
+        ctx.wg.done();
+    }
+
     fn proposeWithCallback(
         self: *Node,
         data: []const u8,
@@ -1255,18 +1388,36 @@ pub const Node = struct {
         if (self.isShuttingDown()) return error.QueueClosed;
         const owned = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(owned);
-        try self.proposal_requests.pushOrClosed(.{
+        self.proposal_ch.trySend(.{
             .data = owned,
             .apply_cb = cb,
             .ctx = ctx,
             .proposal_type = proposal_type,
-        });
+        }) catch |err| switch (err) {
+            error.ChannelClosed => return error.QueueClosed,
+            error.ChannelFull => return error.QueueFull,
+        };
         self.event_ch.trySend(1) catch {};
     }
 
-    fn appendProposalsToLeaderLog(self: *Node, requests: []const ProposalRequest) RaftError!u64 {
+    /// Append the successful subset of `requests` to the leader's log,
+    /// assigning each a fresh HLC timestamp under the propose lock so log
+    /// order equals timestamp order. Each successfully-appended request's
+    /// apply callback is enqueued into `apply_callbacks`; rejected conf
+    /// changes fire their apply_cb inline and are NOT enqueued. If the
+    /// enqueue fails (channel closed during shutdown), the callback fires
+    /// inline with `.shutdown`.
+    fn appendProposalsToLeaderLog(
+        self: *Node,
+        requests: []const ProposalRequest,
+    ) RaftError!void {
         if (self.state != .leader) return RaftError.NotLeader;
-        if (requests.len == 0) return self.log.lastIndex() + 1;
+        if (requests.len == 0) return;
+
+        // Sub-phase: propose_build — walk requests, validate + serialize each
+        // into a LogEntryBuffer, register the apply callback. Pure CPU work
+        // (no I/O), so anything > 100µs/batch points at zbuf encoding cost.
+        const t_build = std.time.microTimestamp();
 
         var entries = std.ArrayList(zen.LogEntryBuffer).empty;
         defer {
@@ -1275,8 +1426,7 @@ pub const Node = struct {
         }
         try entries.ensureTotalCapacity(self.allocator, requests.len);
 
-        const first_index = self.log.lastIndex() + 1;
-        var index = first_index;
+        var index = self.log.lastIndex() + 1;
         var has_conf = false;
         for (requests) |req| {
             const is_conf = req.proposal_type == .conf;
@@ -1355,9 +1505,14 @@ pub const Node = struct {
                 cc_offset = try cc_buf.cloneInto(self.allocator, &buf);
             }
 
+            // Assign the HLC inside this critical section so log order matches
+            // timestamp order — the invariant that makes applied_timestamp a
+            // safe bound for consistent follower reads.
+            const ts = utils.hlc.g().next().asU64();
             try writer.set(.{
                 .index = index,
                 .term = self.current_term,
+                .timestamp = ts,
                 .data = if (is_conf) &[_]u8{} else req.data,
                 .is_normal = !is_conf,
                 .is_conf_change = is_conf,
@@ -1370,39 +1525,68 @@ pub const Node = struct {
             errdefer entry.deinit();
 
             try entries.append(self.allocator, entry);
+
+            // Enqueue the pending apply callback. send() blocks on full channel
+            // (backpressure if state-machine apply is lagging) and fails only
+            // on channel closed (shutdown) or fiber cancellation — in either
+            // case we fire the callback inline with .shutdown so the client
+            // isn't left hanging.
+            const pending: PendingApply = .{
+                .entry = .{ .index = index, .term = self.current_term, .timestamp = ts },
+                .cb = req.apply_cb,
+                .ctx = req.ctx,
+            };
+            self.apply_callbacks.send(pending) catch {
+                req.apply_cb(req.ctx, pending.entry, .shutdown);
+            };
+
             index += 1;
         }
 
+        metrics.g().observePhase("propose_build", t_build);
+
+        // Sub-phase: propose_persist — DiskWAL.append batches the framed
+        // records into one pwrite. The fdatasync is no longer issued here;
+        // mainLoop spawns it in a fiber so it can overlap with broadcast.
+        const t_persist = std.time.microTimestamp();
         try self.log.append(entries.items);
-        try self.log.sync();
+        metrics.g().observePhase("log_append", t_persist);
+
         if (has_conf) self.pending_conf_change = true;
-        return first_index;
     }
 
     // processProposalRequests is just checking for proposals in proposal_requests queue, and
     // proposing them. This is only relevant to the leader node. Followers won't have this.
-    pub fn processProposalRequests(self: *Node, max_batch: usize) RaftError!usize {
-        _ = max_batch;
+    pub fn processProposalRequests(self: *Node) RaftError!usize {
         if (self.isShuttingDown()) {
-            while (self.proposal_requests.tryPop()) |req| {
+            while (self.proposal_ch.tryReceive()) |req| {
                 self.allocator.free(req.data);
                 req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
-            }
+            } else |_| {}
             return 0;
         }
+
         var batch = std.ArrayList(ProposalRequest).empty;
         defer batch.deinit(self.allocator);
 
         while (true) {
-            const req = self.proposal_requests.tryPop() orelse break;
+            const req = self.proposal_ch.tryReceive() catch break;
             try batch.append(self.allocator, req);
         }
+        // Drain depth — emitted before the early-out so a separate "queue was
+        // empty" sample isn't accidentally generated (observeBatchSize skips
+        // on count==0 anyway, but the early return below would skip it too).
+        metrics.g().observeBatchSize(batch.items.len);
         if (batch.items.len == 0) return 0;
 
         defer for (batch.items) |req| self.allocator.free(req.data);
 
         const term = self.current_term;
-        const first_index = self.appendProposalsToLeaderLog(batch.items) catch |err| switch (err) {
+        // appendProposalsToLeaderLog enqueues each successful entry's
+        // PendingApply directly into apply_callbacks with the assigned HLC
+        // timestamp. Rejected conf changes already fired their apply_cb inline
+        // from within the function, so there's no per-request loop here.
+        self.appendProposalsToLeaderLog(batch.items) catch |err| switch (err) {
             error.NotLeader => {
                 for (batch.items) |req| {
                     req.apply_cb(req.ctx, .{ .term = term, .index = 0 }, .not_leader);
@@ -1412,43 +1596,68 @@ pub const Node = struct {
             else => return err,
         };
 
-        for (batch.items, 0..) |req, i| {
-            const entry = ProposalEntry{
-                .term = term,
-                .index = first_index + @as(u64, @intCast(i)),
-            };
-            self.apply_callbacks.trySend(.{
-                .entry = entry,
-                .cb = req.apply_cb,
-                .ctx = req.ctx,
-            }) catch {
-                req.apply_cb(req.ctx, entry, .shutdown);
-            };
-        }
-
         return batch.items.len;
     }
 
-    fn notifyApplyCallbacks(self: *Node) void {
-        // DO NOT BLOCK
-        self.commit_ch.trySend(1) catch {};
+    pub fn blockingRunAllLoops(self: *Node) !void {
+        var group = zio.group();
+
+        try group.spawn(tickLoop, .{ self, self.config.tick_interval_ms });
+        try group.spawn(mainLoop, .{ self, self.config.tick_interval_ms });
+        try group.spawn(applyLoop, .{self});
+        try group.spawn(callbackLoop, .{self});
+        try group.spawn(clockTickLoop, .{self});
+
+        group.wait() catch {};
     }
 
+    fn notifyCommitAdvanced(self: *Node) void {
+        self.commit_notify.broadcast();
+    }
+
+    /// Drains `apply_callbacks` for entries whose index is ≤ commit_index,
+    /// firing each callback with `.committed`. The callback channel is in
+    /// log-index order (populated by `appendProposalsToLeaderLog`), so a
+    /// peek/receive loop is sufficient — no map/scan needed.
+    ///
+    /// Re-check before wait: commit_notify is edge-triggered, so a broadcast
+    /// that fires while we're inside the drain loop is lost. Snapshot
+    /// commit_index at the start, drain against it, then load again before
+    /// waiting — if it advanced, loop without waiting so we never miss
+    /// callbacks.
+    pub fn callbackLoop(self: *Node) void {
+        while (!self.isShuttingDown()) {
+            const ci_seen = self.commit_index.load(.acquire);
+            while (true) {
+                const head = self.apply_callbacks.peek() catch break;
+                if (head.entry.index > ci_seen) break;
+                const ready = self.apply_callbacks.tryReceive() catch break;
+                ready.cb(ready.ctx, ready.entry, .committed);
+            }
+            if (self.commit_index.load(.acquire) > ci_seen) continue;
+            self.commit_notify.wait() catch return;
+        }
+    }
+
+    /// Re-check before wait for the same lost-wakeup reason as callbackLoop:
+    /// applyCommits captures commit_index at entry and stops there, so any
+    /// commits that landed during the apply loop need a fresh re-check.
     pub fn applyLoop(self: *Node) void {
         // TODO: Use this loop to replay all the logs from last snapshot.
         // Actually, if we just set the apply index to the last snapshot index, then this would
         // automatically apply all the pending entries anyway. We just need to trigger it.
         while (!self.isShuttingDown()) {
             self.applyCommits();
-            _ = self.commit_ch.receive() catch return;
+            if (self.apply_index.load(.acquire) < self.commit_index.load(.acquire)) continue;
+            self.commit_notify.wait() catch return;
         }
     }
 
     const max_apply_bytes: u64 = 16 * 1024 * 1024; // 16 MiB per batch
 
     pub fn applyCommits(self: *Node) void {
-        var ai = self.apply_index.load(.seq_cst);
-        const ci = self.commit_index.load(.seq_cst);
+        var ai = self.apply_index.load(.acquire);
+        const ci = self.commit_index.load(.acquire);
         if (ai >= ci) {
             return;
         }
@@ -1465,22 +1674,34 @@ pub const Node = struct {
             for (result.entries) |entry| {
                 const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
 
-                if (reader.isNormal()) {
+                if (reader.isNormal() and reader.data().len > 0) {
                     if (self.state_machine) |s| {
-                        if (reader.data().len > 0) {
-                            s.apply(entry.index, entry.term, reader.data());
-                        }
+                        // One observation per state-machine apply call —
+                        // each carries one Raft entry's worth of work
+                        // (e.g. a batched forest.put). Lets us see whether
+                        // the apply path is the bottleneck when commit
+                        // outpaces apply.
+                        const t_apply = std.time.microTimestamp();
+                        s.apply(.{
+                            .index = entry.index,
+                            .term = entry.term,
+                            .timestamp = reader.timestamp(),
+                        }, reader.data());
+                        metrics.g().observePhase("apply", t_apply);
                     }
                 }
                 ai = entry.index;
-                self.apply_index.store(ai, .seq_cst);
-
-                // Fire proposal callback if one exists for this index (leader only).
-                const head = self.apply_callbacks.peek() catch continue;
-                if (head.entry.index == entry.index) {
-                    const ready = self.apply_callbacks.tryReceive() catch continue;
-                    ready.cb(ready.ctx, ready.entry, .committed);
-                }
+                self.apply_index.store(ai, .release);
+                // Advance apply_ts AFTER the state machine has applied the
+                // entry (or is a no-op for empty-data ticks). Matches the
+                // read contract: "apply_ts >= T implies every entry with
+                // timestamp <= T is visible."
+                _ = self.apply_ts.fetchMax(reader.timestamp(), .acq_rel);
+                // Wake any reader blocked in waitUntilApplied.
+                self.apply_ts_notify.broadcast();
+                // Proposal callbacks now fire from `callbackLoop` as soon
+                // as commit advances — they no longer wait for the state
+                // machine to apply. See advance() → notifyCommitAdvanced.
             }
         }
         dbg(
@@ -1498,6 +1719,40 @@ pub const Node = struct {
         }
     }
 
+    /// Adaptive HLC tick loop. On the leader only: wakes every 400 ms and
+    /// checks whether wall-clock seconds have advanced past the last log
+    /// entry's HLC second. If yes, proposes an empty-data LogEntry so
+    /// `apply_ts` advances on followers even during write-quiet periods.
+    /// During active writes, each user mutation naturally advances the
+    /// last log entry's second, so no tick fires. Followers are passive —
+    /// they receive the leader's empty entries via normal AppendEntries
+    /// replication and advance their own `apply_ts` on apply.
+    ///
+    /// The wait-for-commit doubles as a rate-limit: only one tick can be
+    /// in flight at a time, so burst-piling under apply lag is impossible.
+    pub fn clockTickLoop(self: *Node) void {
+        const poll = zio.Duration.fromMilliseconds(400);
+        while (!self.isShuttingDown()) {
+            zio.sleep(poll) catch return;
+            if (!self.isLeader()) continue;
+            const last_ts = utils.hlc.HLC.fromU64(self.lastLogTimestamp());
+            const wall_sec: u32 = @intCast(std.time.timestamp());
+            if (wall_sec <= last_ts.seconds) continue;
+
+            self.proposeAndWait(&.{}) catch |err| {
+                raft_log.warn("clock tick propose failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    /// Helper used by mainLoop to spawn the WAL fsync into a sub-fiber so
+    /// the leader can broadcast AppendEntries while the local sync is in
+    /// flight (Raft paper §7 pipelining). Passes `log_grew` so the fiber
+    /// is a fast no-op on iterations that didn't append anything new.
+    fn syncLogTask(self: *Node) RaftLogError!void {
+        return self.log.sync();
+    }
+
     /// Main processing loop. Blocks on event_ch, drains inbound messages,
     /// processes proposals, advances state, and broadcasts to peers.
     pub fn mainLoop(self: *Node, tick_interval_ms: u32) void {
@@ -1507,7 +1762,11 @@ pub const Node = struct {
         while (!self.isShuttingDown()) {
             _ = self.event_ch.receive() catch return;
 
-            // Drain all queued inbound messages.
+            // Phase: inbound — drain inbound_ch (handle AE, AER, RV replies).
+            // We observe even when the queue was empty: the histogram includes
+            // a 0-bucket sample, which is information about how often the loop
+            // ran without inbound work to do.
+            var t = std.time.microTimestamp();
             while (self.inbound_ch.tryReceive()) |msg| {
                 defer self.allocator.free(msg.payload);
                 switch (msg.message_type) {
@@ -1517,12 +1776,48 @@ pub const Node = struct {
                     else => {},
                 }
             } else |_| {}
+            metrics.g().observePhase("inbound", t);
 
-            const ci_before = self.commit_index.load(.seq_cst);
-            // TODO: What happens to the rest of the requests?
-            _ = self.processProposalRequests(64) catch {};
+            const ci_before = self.commit_index.load(.acquire);
+            const last_before = self.log.lastIndex();
+
+            // Phase: propose — drain proposal queue, build entries, persist,
+            // register apply callbacks. Sub-phases ("propose_build" and
+            // "propose_persist") are observed inside appendProposalsToLeaderLog.
+            t = std.time.microTimestamp();
+            _ = self.processProposalRequests() catch {};
+            metrics.g().observePhase("propose", t);
+            const log_grew = self.log.lastIndex() > last_before;
+
+            // Spawn WAL fsync into a sub-fiber so it can overlap with
+            // broadcast (Raft paper §7 pipelining). `addEntries` already
+            // populated cache + write_buf; the spawned `sync()` does the
+            // pwrite (durable due to O_DSYNC) on a separate fiber.
+            var sync_handle = zio.spawn(syncLogTask, .{self}) catch @panic("zio.spawn syncLogTask");
+            // Tracks whether we still need to join the sync handle. Set to
+            // false in the q==1 branch (where we wait early). We capture
+            // this decision *before* advance(), since advance can apply
+            // conf changes that mutate quorum_size mid-iteration.
+            var sync_pending: bool = true;
+
+            // When quorum_size == 1, advance() would commit through the
+            // just-appended (unsynced) entries since the leader is sole
+            // voter. Wait for sync before advance in that case.
+            if (self.quorum_size == 1) {
+                t = std.time.microTimestamp();
+                sync_handle.join() catch |err| {
+                    raft_log.err("node {d}: sync_handle.join (pre-advance) failed: {s}", .{ self.id, @errorName(err) });
+                };
+                metrics.g().observePhase("log_sync_q_one", t);
+                sync_pending = false;
+            }
+
+            // Phase: advance — advanceCommitIndex + applyConfChanges + notify.
+            t = std.time.microTimestamp();
             self.advance();
-            const ci_advanced = self.commit_index.load(.seq_cst) > ci_before;
+            metrics.g().observePhase("advance", t);
+
+            const ci_advanced = self.commit_index.load(.acquire) > ci_before;
 
             var heartbeat_due = false;
             const now = std.time.microTimestamp();
@@ -1530,7 +1825,24 @@ pub const Node = struct {
                 heartbeat_due = self.tick() catch false;
                 last_tick = now;
             }
-            self.maybeBroadcast(heartbeat_due or ci_advanced);
+
+            // Phase: broadcast — for multi-voter clusters, the WAL fsync
+            // runs concurrently with these network sends.
+            t = std.time.microTimestamp();
+            self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
+            metrics.g().observePhase("broadcast", t);
+
+            // Phase: sync_wait — time waiting for the sync fiber to finish
+            // AFTER broadcast already completed. Near-zero when sync fully
+            // overlapped broadcast; positive when broadcast finished first
+            // and we're still waiting on disk.
+            if (sync_pending) {
+                t = std.time.microTimestamp();
+                sync_handle.join() catch |err| {
+                    raft_log.err("node {d}: sync_handle.join (post-broadcast) failed: {s}", .{ self.id, @errorName(err) });
+                };
+                metrics.g().observePhase("log_sync_q_many", t);
+            }
         }
     }
 
@@ -1573,12 +1885,18 @@ pub const Node = struct {
     }
 
     fn sendEncoded(self: *Node, to: NodeId, payload: []u8) void {
-        if (self.transport) |tr| {
-            tr.sendMsg(to, .p0, serial_mod.msg_type_raft, payload) catch |err| {
-                utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ to, @errorName(err) });
-            };
-        }
-        self.allocator.free(payload);
+        const tr = self.transport orelse {
+            self.allocator.free(payload);
+            return;
+        };
+        const value = utils.RefValue.init(self.allocator, payload) catch {
+            self.allocator.free(payload);
+            return;
+        };
+        defer value.decrRef();
+        tr.sendMsg(to, .p0, serial_mod.msg_type_raft, value) catch |err| {
+            utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ to, @errorName(err) });
+        };
     }
 
     fn decodeConfChange(self: *Node, reader: zen.ConfChangeReader) RaftError!ConfChange {
@@ -1637,7 +1955,7 @@ pub const Node = struct {
 
     fn sendAppendEntriesReply(self: *Node, to: NodeId, opts: struct {
         success: bool,
-        match_index: u64,
+        last_index: u64,
         conflict_term: u64,
         conflict_index: u64,
     }) !void {
@@ -1648,7 +1966,7 @@ pub const Node = struct {
             .term = self.current_term,
             .success = opts.success,
             .from = self.id,
-            .match_index = opts.match_index,
+            .last_index = opts.last_index,
             .conflict_term = opts.conflict_term,
             .conflict_index = opts.conflict_index,
         });
@@ -1673,7 +1991,7 @@ pub const Node = struct {
         var it = self.peers.valueIterator();
         while (it.next()) |peer| {
             if (peer.role != .voter) continue;
-            matches.append(self.allocator, peer.match_index) catch return;
+            matches.append(self.allocator, peer.last_index) catch return;
         }
 
         if (matches.items.len == 0) return;
@@ -1682,24 +2000,27 @@ pub const Node = struct {
 
         const quorum_pos = matches.items.len - self.quorum_size;
         const candidate = matches.items[quorum_pos];
-        if (candidate <= self.commit_index.load(.seq_cst)) return;
+        if (candidate <= self.commit_index.load(.acquire)) return;
 
         const term = self.log.term(candidate) catch return orelse return;
         if (term != self.current_term) return;
-        self.commit_index.store(candidate, .seq_cst);
+        self.commit_index.store(candidate, .release);
     }
 
-    // commit_index udvances when leader sees a quorum match.
+    // commit_index advances when leader sees a quorum match.
     // apply_index advances when entries are applied to the state machine (via callbacks).
     // conf_applied_index advances when conf changes are applied to raft membership.
     pub fn advance(self: *Node) void {
         self.advanceCommitIndex();
         self.applyConfChanges();
-        self.notifyApplyCallbacks();
+        // Wakes both applyLoop (state-machine apply) and callbackLoop
+        // (proposal-callback firing). Callbacks fire as soon as commit
+        // advances — they do not wait for the state-machine apply.
+        self.notifyCommitAdvanced();
     }
 
     fn applyConfChanges(self: *Node) void {
-        const ci = self.commit_index.load(.seq_cst);
+        const ci = self.commit_index.load(.acquire);
         if (self.conf_applied_index >= ci) return;
         dbg("applyConfChanges node={d} conf_applied={d} ci={d}", .{ self.id, self.conf_applied_index, ci });
 
@@ -1790,7 +2111,7 @@ pub const Node = struct {
         _ = self.peers.put(id, .{
             .id = id,
             .next_index = self.log.lastIndex() + 1,
-            .match_index = 0,
+            .last_index = 0,
             .role = role,
             .addr = owned_addr,
         }) catch {
@@ -1895,6 +2216,37 @@ pub const Node = struct {
         try self.persistHardState();
     }
 
+    /// HLC timestamp of the most-recently applied entry on this node.
+    /// Reads bounded by `read_ts` must wait until `appliedTs() >= read_ts`.
+    pub fn appliedTs(self: *const Node) u64 {
+        return self.apply_ts.load(.acquire);
+    }
+
+    /// Block the caller until this node's `apply_ts >= target_ts` or the
+    /// timeout expires. Returns `error.Timeout` if the deadline passes
+    /// before catch-up. Wake-up is event-driven — each `apply_ts` advance
+    /// in `applyCommits` broadcasts to all waiters, who then recheck.
+    pub fn waitUntilApplied(self: *Node, target_ts: u64, timeout: zio.Duration) !void {
+        const deadline = (zio.Timeout{ .duration = timeout }).toDeadline();
+        while (self.apply_ts.load(.acquire) < target_ts) {
+            try self.apply_ts_notify.timedWait(deadline);
+        }
+    }
+
+    /// Timestamp of the last entry in the WAL (0 if empty). The clock-tick
+    /// fiber reads this to decide whether to propose a tick: if the wall
+    /// clock has ticked past this entry's second, a new tick is needed.
+    /// Source of truth is the WAL — no separate atomic to maintain.
+    pub fn lastLogTimestamp(self: *Node) u64 {
+        const last = self.log.lastIndex();
+        if (last == 0) return 0;
+        var result = self.log.entriesRange(.{ .lo = last, .hi = last + 1, .max_bytes = 4096 }) catch return 0;
+        defer result.deinit();
+        if (result.entries.len == 0) return 0;
+        const reader = zen.LogEntryReader.parseRoot(result.entries[0].bytes) catch return 0;
+        return reader.timestamp();
+    }
+
     fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {
         while (true) {
             const head = self.apply_callbacks.tryReceive() catch break;
@@ -1913,6 +2265,7 @@ pub const Node = struct {
         try writer.set(.{
             .index = new_index,
             .term = self.current_term,
+            .timestamp = utils.hlc.g().next().asU64(),
             .data = data,
             .is_normal = true,
             .is_conf_change = false,

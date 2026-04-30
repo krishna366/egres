@@ -9,6 +9,7 @@ const table_mod = @import("table.zig");
 const vfs = @import("vfs");
 const tree_mod = @import("tree.zig");
 const skl = @import("skl/skiplist.zig");
+const metrics = @import("metrics.zig");
 
 const Key = @import("key.zig").Key;
 const KeyRange = level.KeyRange;
@@ -143,6 +144,27 @@ pub const Memtables = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.current.memoryUsage();
+    }
+
+    /// Aggregate sizes for the active + immutable memtables, taken under
+    /// one lock. Used by the stats dump so we don't have to chain three
+    /// separate lookups (each of which would re-acquire the lock).
+    pub const Stats = struct {
+        active_bytes: usize,
+        immutable_bytes: usize,
+        immutable_count: usize,
+    };
+
+    pub fn stats(self: *Memtables) Stats {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        var imm_bytes: usize = 0;
+        for (self.immutables.items) |imm| imm_bytes += imm.memoryUsage();
+        return .{
+            .active_bytes = self.current.memoryUsage(),
+            .immutable_bytes = imm_bytes,
+            .immutable_count = self.immutables.items.len,
+        };
     }
 
     /// Look up a key across current and immutable memtables.
@@ -332,6 +354,16 @@ pub const Forest = struct {
         }
     }
 
+    /// Same as advanceFileId but for tree IDs. A follower that becomes leader
+    /// must not reuse tree IDs assigned by the previous leader.
+    pub fn advanceTreeId(self: *Forest, id: u64) void {
+        while (true) {
+            const cur = self.next_tree_id.load(.monotonic);
+            if (cur > id) return;
+            if (self.next_tree_id.cmpxchgWeak(cur, id + 1, .monotonic, .monotonic) == null) return;
+        }
+    }
+
     /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen
     /// memtable, routes each key to its tree, builds one L0 SST per tree,
     /// and returns the manifest changes. The caller proposes these through Raft.
@@ -404,7 +436,7 @@ pub const Forest = struct {
             }
 
             const file_id = self.next_file_id.fetchAdd(1, .monotonic);
-            const path = try options.sstPath(self.allocator, self.opts.dir,file_id);
+            const path = try options.sstPath(self.allocator, self.opts.dir, file_id);
 
             try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tree_id, &flush_err,
@@ -484,6 +516,16 @@ pub const Forest = struct {
             std.debug.assert(c.table_id == n.id);
             const tree = self.trees.get(c.tree_id) orelse continue;
             try tree.levels[c.level].addEntry(n.id, n.table.?);
+
+            // Metrics: one per-tree flush output + bytes written to L0.
+            const ns_id: u32 = if (self.ms.trees.get(c.tree_id)) |ts| ts.namespace_id else 0;
+            try metrics.g().flushes.incr(.{ .namespace_id = ns_id, .tree_id = c.tree_id });
+            try metrics.g().bytes_written.incrBy(.{
+                .source = "flush",
+                .namespace_id = ns_id,
+                .tree_id = c.tree_id,
+                .level = @intCast(c.level),
+            }, n.table.?.fileSize());
         }
 
         // Remove the oldest flushed memtable.
@@ -522,36 +564,74 @@ pub const Forest = struct {
         return tree.get(search_key, priority);
     }
 
+    /// installTree opens an empty in-memory Tree for the given id and registers
+    /// the namespace route. Caller must have already committed the TreeChange to
+    /// manifest and must hold the forest write lock.
+    fn installTree(self: *Forest, tree_id: u64, namespace_id: u32, range: KeyRange) !void {
+        var tree = try Tree.open(self.allocator, self.opts, tree_id, &self.ms, &self.table_cache);
+        errdefer tree.close();
+
+        const tree_ptr = try self.allocator.create(Tree);
+        errdefer self.allocator.destroy(tree_ptr);
+        tree_ptr.* = tree;
+        try self.trees.put(tree_id, tree_ptr);
+
+        const rt = try self.getOrCreateRouteTable(namespace_id);
+        try rt.addRoute(tree_id, range);
+    }
+
     /// Create a new tree for the given namespace and key range.
-    /// Returns the new tree_id.
+    /// Single-node path (no Raft) — used by tests. Returns the new tree_id.
     pub fn createTree(self: *Forest, namespace_id: u32, range: KeyRange) !u64 {
         self.mu.lock();
         defer self.mu.unlock();
 
         const tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
 
-        // Commit tree creation to manifest.
         const left_raw = try range.left.marshal(self.allocator);
         defer self.allocator.free(left_raw);
-
         const right_raw = try range.right.marshal(self.allocator);
         defer self.allocator.free(right_raw);
 
         try self.ms.commit(&.{}, &.{manifest.createTreeChange(tree_id, namespace_id, left_raw, right_raw)});
-
-        // Create in-memory tree (empty — no tables yet).
-        var tree = try Tree.open(self.allocator, self.opts, tree_id, &self.ms, &self.table_cache);
-        errdefer tree.close();
-
-        const tree_ptr = try self.allocator.create(Tree);
-        tree_ptr.* = tree;
-        try self.trees.put(tree_id, tree_ptr);
-
-        // Set up namespace routing.
-        const rt = try self.getOrCreateRouteTable(namespace_id);
-        try rt.addRoute(tree_id, range);
-
+        try self.installTree(tree_id, namespace_id, range);
         return tree_id;
+    }
+
+    /// buildNamespaceCreate is Phase A of the Raft-replicated namespace create:
+    /// allocates a new tree_id and returns a ManifestChange with one TreeChange
+    /// carrying an infinite range (empty left+right). No state mutates beyond
+    /// next_tree_id, so a failed propose only burns one id. Caller owns the
+    /// returned slice.
+    pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u32) !manifest.ManifestChange {
+        std.debug.assert(namespace_id > 0);
+        const tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
+
+        const tree_changes = try alloc.alloc(manifest.TreeChange, 1);
+        tree_changes[0] = manifest.createTreeChange(tree_id, namespace_id, "", "");
+
+        return .{
+            .tree_changes = tree_changes,
+            .table_changes = &.{},
+            .cmd = 5, // ns_create
+            .memtable_id = 0,
+        };
+    }
+
+    /// applyNamespaceCreate is Phase B: commits each TreeChange to the manifest
+    /// and installs the in-memory Tree + namespace route. Called on all nodes
+    /// after Raft commit (cmd=5).
+    pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        for (mc.tree_changes) |tc| {
+            if (tc.op != 0) continue; // only CREATE for ns_create
+            self.advanceTreeId(tc.tree_id);
+            try self.ms.commit(&.{}, &.{tc});
+            // Empty left/right encodes the infinite range.
+            try self.installTree(tc.tree_id, tc.namespace_id, .{ .inf = true });
+        }
     }
 
     /// Get a tree by its id.
@@ -597,9 +677,230 @@ pub const Forest = struct {
         return self.memtables.peekOldest() != null;
     }
 
+    // -----------------------------------------------------------------------
+    // Stats dump
+    // -----------------------------------------------------------------------
+
+    /// What slice of the forest the caller wants to see. Default is a
+    /// top-level summary that aggregates across all trees.
+    pub const StatsScope = union(enum) {
+        forest,
+        tree: u64,
+        namespace: u32,
+    };
+
+    pub const StatsOpts = struct {
+        scope: StatsScope = .forest,
+    };
+
+    /// writeStats produces a hierarchical, human-readable text dump of
+    /// current LSM state to `w`. Unlike the Prometheus metrics endpoint,
+    /// this is for ops drill-down: per-tree shape, per-level sizes,
+    /// pending compactions. Snapshot is best-effort — locks are taken
+    /// briefly per section, so a concurrent flush/compaction may show
+    /// itself half-applied. Acceptable for a debug endpoint.
+    pub fn writeStats(self: *Forest, w: *std.Io.Writer, opts: StatsOpts) !void {
+        switch (opts.scope) {
+            .forest => try self.writeForestStats(w),
+            .tree => |id| try self.writeTreeStats(w, id),
+            .namespace => |ns| try self.writeNamespaceStats(w, ns),
+        }
+    }
+
+    fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
+        const mt = self.memtables.stats();
+        try w.print("forest:\n", .{});
+        try w.print("  memtables: active=", .{});
+        try writeBytes(w, mt.active_bytes);
+        try w.print(" immutable={d} (", .{mt.immutable_count});
+        try writeBytes(w, mt.immutable_bytes);
+        try w.print(" pending flush)\n", .{});
+        try w.print("  flush_pending: {d}\n", .{mt.immutable_count});
+
+        // Per-level aggregate (sum + max-with-tree).
+        const max_levels = self.opts.max_levels;
+        const Agg = struct {
+            tables_total: u64 = 0,
+            tables_max: u64 = 0,
+            tables_max_tree: u64 = 0,
+            bytes_total: u64 = 0,
+            bytes_max: u64 = 0,
+            bytes_max_tree: u64 = 0,
+        };
+        const aggs = try self.allocator.alloc(Agg, max_levels);
+        defer self.allocator.free(aggs);
+        for (aggs) |*a| a.* = .{};
+
+        // Per-level "compactions wanted" rollup.
+        const Wanted = struct {
+            count: u64 = 0,
+            score_max: f64 = 0,
+            score_max_tree: u64 = 0,
+        };
+        const wanted = try self.allocator.alloc(Wanted, max_levels);
+        defer self.allocator.free(wanted);
+        for (wanted) |*x| x.* = .{};
+
+        // Largest tree (sum across levels).
+        var largest_tree_id: u64 = 0;
+        var largest_tree_size: i64 = 0;
+        var tree_count: usize = 0;
+
+        // Walk trees under the forest read lock, but only briefly: collect
+        // the numbers we need, release. Each level access takes its own
+        // lock inside numTables/getTotalSize.
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            tree_count = self.trees.count();
+            var it = self.trees.iterator();
+            while (it.next()) |kv| {
+                const tree_id = kv.key_ptr.*;
+                const tree = kv.value_ptr.*;
+
+                var tree_total: i64 = 0;
+                for (tree.levels, 0..) |*lv, idx| {
+                    if (idx >= max_levels) break;
+                    const tcount: u64 = @intCast(lv.numTables());
+                    const tbytes: u64 = @intCast(lv.getTotalSize());
+                    tree_total += @intCast(tbytes);
+
+                    aggs[idx].tables_total += tcount;
+                    if (tcount > aggs[idx].tables_max) {
+                        aggs[idx].tables_max = tcount;
+                        aggs[idx].tables_max_tree = tree_id;
+                    }
+                    aggs[idx].bytes_total += tbytes;
+                    if (tbytes > aggs[idx].bytes_max) {
+                        aggs[idx].bytes_max = tbytes;
+                        aggs[idx].bytes_max_tree = tree_id;
+                    }
+                }
+                if (tree_total > largest_tree_size) {
+                    largest_tree_size = tree_total;
+                    largest_tree_id = tree_id;
+                }
+
+                if (tree.compact_candidate) |c| {
+                    if (c.level < max_levels) {
+                        wanted[c.level].count += 1;
+                        if (c.score > wanted[c.level].score_max) {
+                            wanted[c.level].score_max = c.score;
+                            wanted[c.level].score_max_tree = tree_id;
+                        }
+                    }
+                }
+            }
+        }
+
+        try w.print("  trees: {d}\n", .{tree_count});
+        try w.print("  largest_tree: id={d} size=", .{largest_tree_id});
+        try writeBytes(w, @intCast(largest_tree_size));
+        try w.print("\n\n", .{});
+
+        try w.print("  level summary (across all trees):\n", .{});
+        for (aggs, 0..) |a, idx| {
+            // Skip levels that have nothing — shows max_levels=7 dumps cleanly.
+            if (a.tables_total == 0 and a.bytes_total == 0) continue;
+            try w.print("    L{d}: tables={d} (max={d} in tree {d})  bytes=", .{
+                idx, a.tables_total, a.tables_max, a.tables_max_tree,
+            });
+            try writeBytes(w, a.bytes_total);
+            try w.print(" (max=", .{});
+            try writeBytes(w, a.bytes_max);
+            try w.print(" in tree {d})\n", .{a.bytes_max_tree});
+        }
+
+        var any_wanted = false;
+        for (wanted) |x| if (x.count > 0) {
+            any_wanted = true;
+            break;
+        };
+        if (any_wanted) {
+            try w.print("\n  compactions wanted:\n", .{});
+            for (wanted, 0..) |x, idx| {
+                if (x.count == 0) continue;
+                try w.print("    L{d}: trees={d} score_max={d:.2} (tree {d})\n", .{
+                    idx, x.count, x.score_max, x.score_max_tree,
+                });
+            }
+        }
+    }
+
+    fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tree_id: u64) !void {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const tree = self.trees.get(tree_id) orelse {
+            try w.print("tree id={d}: not found\n", .{tree_id});
+            return;
+        };
+        const ns_id: u32 = if (self.ms.trees.get(tree_id)) |ts| ts.namespace_id else 0;
+        const total = tree.totalSize();
+
+        try w.print("tree id={d} namespace={d} size=", .{ tree_id, ns_id });
+        try writeBytes(w, @intCast(total));
+        try w.print("\n", .{});
+
+        for (tree.levels, 0..) |*lv, idx| {
+            const tcount = lv.numTables();
+            const tbytes: u64 = @intCast(lv.getTotalSize());
+            if (tcount == 0 and tbytes == 0) continue;
+            try w.print("  L{d}: {d} tables, ", .{ idx, tcount });
+            try writeBytes(w, tbytes);
+            try w.print("\n", .{});
+        }
+        if (tree.compact_candidate) |c| {
+            try w.print("  compact_candidate: L{d} score={d:.2}\n", .{ c.level, c.score });
+        }
+    }
+
+    fn writeNamespaceStats(self: *Forest, w: *std.Io.Writer, ns_id: u32) !void {
+        try w.print("namespace={d}:\n", .{ns_id});
+        var any = false;
+        // Collect tree ids in this namespace under the lock, then drop and
+        // call writeTreeStats for each (which re-acquires its own lock).
+        var ids: std.ArrayList(u64) = .{};
+        defer ids.deinit(self.allocator);
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            var it = self.ms.trees.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.namespace_id != ns_id) continue;
+                try ids.append(self.allocator, kv.key_ptr.*);
+            }
+        }
+        for (ids.items) |id| {
+            any = true;
+            try writeTreeStats(self, w, id);
+        }
+        if (!any) try w.print("  (no trees)\n", .{});
+    }
+
+    /// Pretty-print a byte count: KiB / MiB / GiB / TiB. Two decimal places
+    /// of precision past the smallest meaningful unit.
+    fn writeBytes(w: *std.Io.Writer, b: u64) !void {
+        const kib: u64 = 1024;
+        const mib: u64 = 1024 * kib;
+        const gib: u64 = 1024 * mib;
+        const tib: u64 = 1024 * gib;
+        if (b >= tib) {
+            try w.print("{d:.2}TiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(tib))});
+        } else if (b >= gib) {
+            try w.print("{d:.2}GiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(gib))});
+        } else if (b >= mib) {
+            try w.print("{d:.2}MiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(mib))});
+        } else if (b >= kib) {
+            try w.print("{d:.2}KiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(kib))});
+        } else {
+            try w.print("{d}B", .{b});
+        }
+    }
+
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return false;
+        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
         defer self.allocator.free(path);
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
@@ -611,7 +912,11 @@ pub const Forest = struct {
     /// a size match is a strong signal the bytes are correct (no cross-ID
     /// collisions possible). If a size mismatch is detected, we log and rewrite.
     pub fn writeFile(self: *Forest, file_id: u64, data: []const u8) void {
-        if (self.table_cache.contains(file_id)) return;
+        const fe = std.log.scoped(.file_event);
+        if (self.table_cache.contains(file_id)) {
+            fe.info("event=write_file file_id={d} path=cache_hit", .{file_id});
+            return;
+        }
 
         const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return;
         defer self.allocator.free(path);
@@ -641,6 +946,9 @@ pub const Forest = struct {
             };
             fh.sync() catch {};
             fh.close();
+            fe.info("event=write_file file_id={d} path=wrote bytes={d}", .{ file_id, data.len });
+        } else {
+            fe.info("event=write_file file_id={d} path=disk_hit bytes={d}", .{ file_id, data.len });
         }
 
         // Pre-open the table into the cache so it's ready when compaction needs it.
@@ -655,7 +963,7 @@ pub const Forest = struct {
 
     /// Read an SST file from disk. Caller owns the returned slice.
     pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-        const path = options.sstPath(self.allocator, self.opts.dir,file_id) catch return null;
+        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
         defer self.allocator.free(path);
         const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
         defer handle.close();
@@ -663,24 +971,12 @@ pub const Forest = struct {
         return result.data;
     }
 
-    pub fn compact(self: *Forest) !bool {
-        const b = self.bestCompactionCandidate() orelse return false;
-        try b.tree.doCompact(b.candidate.level, &self.next_file_id);
-        self.table_cache.clearStale();
-
-        const linfo = b.tree.lowestLevelSize();
-        if (linfo.size > self.opts.tree_split_size) {
-            self.mu.lock();
-            defer self.mu.unlock();
-            try self.splitTree(b.tree_id);
-        }
-
-        return true;
-    }
-
-    /// splitTree splits the given tree at the median key of its bottommost level.
-    /// Caller must hold the write lock.
-    pub fn splitTree(self: *Forest, tree_id: u64) !void {
+    /// splitTreeForTests splits the given tree at the median key of its
+    /// bottommost level, locally, without going through Raft. **Test-only**
+    /// — production must propose splits through the manifest pipeline so
+    /// all nodes apply the same split deterministically; see
+    /// `proposeSplit` in zdb-server. Caller must hold the write lock.
+    pub fn splitTreeForTests(self: *Forest, tree_id: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const mc = try self.buildSplit(arena.allocator(), tree_id) orelse return;

@@ -70,9 +70,18 @@ fn discoverBigTestNames(b: *std.Build) []const []const u8 {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // `-Drelease` is a shortcut for `-Doptimize=ReleaseFast`. Tests + the
+    // default build still go through `standardOptimizeOption` (i.e. Debug
+    // unless explicitly overridden), so attaching a debugger or running
+    // safety-checked tests stays the path of least resistance. The bench-*
+    // steps that hardcode `.ReleaseFast` in their own `addExecutable` are
+    // unaffected.
+    const release_mode = b.option(bool, "release", "Shortcut for -Doptimize=ReleaseFast") orelse false;
+    const optimize: std.builtin.OptimizeMode = if (release_mode)
+        .ReleaseFast
+    else
+        b.standardOptimizeOption(.{});
 
-    addServer(b, target, optimize);
 
     const schema_mod = makeSchemaModule(b, target, optimize);
     const regen_buffers_step = addRegenAllBuffers(b, target, optimize, schema_mod);
@@ -82,6 +91,7 @@ pub fn build(b: *std.Build) void {
 
     addZdbServer(b, target, optimize, raft_mod, regen_buffers_step);
     addZdbBench(b, target, optimize);
+    addLoadtestDriver(b, target, optimize);
     const zdb_test_step = addZdbTests(b, target, optimize, regen_buffers_step);
     const utils_test_step = addUCompressTests(b, target, optimize);
     const zbuf_test_step = addZbufTests(b, target, optimize, regen_buffers_step);
@@ -90,6 +100,7 @@ pub fn build(b: *std.Build) void {
     _ = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
     addBenchZio(b, target, optimize);
     addBenchDiskwal(b, target, optimize, raft_mod, regen_buffers_step);
+    addBenchQueue(b, target, optimize, raft_mod);
     const net_test_step = addNetTests(b, target, optimize);
 
     const all_test_step = b.step("test", "Run all tests");
@@ -214,23 +225,6 @@ fn isSkippedPath(path: []const u8) bool {
         std.mem.startsWith(u8, path, "node_modules/");
 }
 
-fn addServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const exe = b.addExecutable(.{
-        .name = "server",
-        .root_module = makeModule(b, target, optimize, "server.zig"),
-    });
-    addVendoredCompressionSources(b, exe);
-
-    b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-
-    const run_step = b.step("run", "Run the server");
-    run_step.dependOn(&run_cmd.step);
-}
-
 fn addZbufCli(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -303,6 +297,12 @@ fn addZdbTests(
     });
     const zio_mod = zio_dep.module("zio");
 
+    const metrics_dep = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const metrics_mod = metrics_dep.module("metrics");
+
     const utils_mod = makeModule(b, target, optimize, "u/utils.zig");
     utils_mod.addIncludePath(b.path("."));
     utils_mod.addIncludePath(b.path("third_party/lz4/lib"));
@@ -317,6 +317,7 @@ fn addZdbTests(
     zdb_mod.addImport("utils", utils_mod);
     zdb_mod.addImport("zio", zio_mod);
     zdb_mod.addImport("vfs", vfs_mod);
+    zdb_mod.addImport("metrics", metrics_mod);
 
     const zdb_core_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/core_test.zig"),
@@ -364,6 +365,7 @@ fn addZdbTests(
     const zdb_cache_tests = b.addTest(.{
         .root_module = makeModule(b, target, optimize, "zdb/cache.zig"),
     });
+    zdb_cache_tests.root_module.addImport("utils", utils_mod);
 
     zdb_levels_tests.root_module.addImport("zio", zio_mod);
     zdb_levels_tests.root_module.addImport("utils", utils_mod);
@@ -382,6 +384,11 @@ fn addZdbTests(
     zdb_bw_tests.root_module.addImport("zio", zio_mod);
     zdb_bw_tests.linkLibC();
 
+    const proto_tests = b.addTest(.{
+        .root_module = makeModule(b, target, optimize, "zdb-server/protocol_test.zig"),
+    });
+    proto_tests.root_module.addImport("zio", zio_mod);
+
     const zdb_test_step = b.step("test-zdb", "Run zdb core tests");
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_core_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_skl_tests).step);
@@ -392,6 +399,7 @@ fn addZdbTests(
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_cache_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_vfs_tests).step);
     zdb_test_step.dependOn(&b.addRunArtifact(zdb_bw_tests).step);
+    zdb_test_step.dependOn(&b.addRunArtifact(proto_tests).step);
     return zdb_test_step;
 }
 
@@ -453,13 +461,23 @@ fn makeRaftModule(
 
     const serial_mod = makeModule(b, target, optimize, "net/serial.zig");
     serial_mod.addImport("zio", zio_mod);
+    serial_mod.addImport("utils", utils_mod);
 
     const transport_mod = makeModule(b, target, optimize, "net/transport.zig");
     transport_mod.addImport("zio", zio_mod);
     transport_mod.addImport("serial", serial_mod);
+    transport_mod.addImport("utils", utils_mod);
 
     const vfs_mod = makeModule(b, target, optimize, "vfs/vfs.zig");
     vfs_mod.addImport("zio", zio_mod);
+
+    // karlseguin/metrics — shared with zdb_mod via the same b.dependency call;
+    // the build system de-duplicates so we don't get two compiled copies.
+    const metrics_dep = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const metrics_mod = metrics_dep.module("metrics");
 
     const raft_mod = makeModule(b, target, optimize, "raft/raft.zig");
     raft_mod.addImport("buffers_gen", raft_buffers_gen_mod);
@@ -469,6 +487,7 @@ fn makeRaftModule(
     raft_mod.addImport("serial", serial_mod);
     raft_mod.addImport("transport", transport_mod);
     raft_mod.addImport("vfs", vfs_mod);
+    raft_mod.addImport("metrics", metrics_mod);
     return raft_mod;
 }
 
@@ -494,17 +513,29 @@ fn addZdbServer(
 
     const vfs_mod = raft_mod.import_table.get("vfs").?;
 
+    const metrics_dep = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const metrics_mod = metrics_dep.module("metrics");
+
     const zdb_mod = makeModule(b, target, optimize, "zdb.zig");
     zdb_mod.addImport("zbuf", zbuf_mod);
     zdb_mod.addImport("utils", utils_mod);
     zdb_mod.addImport("zio", zio_mod);
     zdb_mod.addImport("vfs", vfs_mod);
+    zdb_mod.addImport("metrics", metrics_mod);
 
     const zdb_server_mod = makeModule(b, target, optimize, "zdb-server/server.zig");
     zdb_server_mod.addImport("zio", zio_mod);
     zdb_server_mod.addImport("raft", raft_mod);
     zdb_server_mod.addImport("zdb", zdb_mod);
     zdb_server_mod.addImport("runtime", runtime_mod);
+    zdb_server_mod.addImport("metrics", metrics_mod);
+
+    // `flags` is its own module with no transitive deps; needed by main.zig
+    // for CLI parsing (single quoted `--node="k=v; k=v"` payload form).
+    const flags_mod = makeModule(b, target, optimize, "u/flags.zig");
 
     const exe = b.addExecutable(.{
         .name = "zdb-server",
@@ -516,6 +547,8 @@ fn addZdbServer(
     exe.root_module.addImport("zdb", zdb_mod);
     exe.root_module.addImport("runtime", runtime_mod);
     exe.root_module.addImport("zdb_server", zdb_server_mod);
+    exe.root_module.addImport("metrics", metrics_mod);
+    exe.root_module.addImport("flags", flags_mod);
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);
 
@@ -535,15 +568,46 @@ fn addZdbBench(
     });
     const zio_mod = zio_dep.module("zio");
 
+    const flags_mod = makeModule(b, target, optimize, "u/flags.zig");
+
     const exe = b.addExecutable(.{
         .name = "zdb-bench",
         .root_module = makeModule(b, target, optimize, "benchmark.zig"),
     });
     exe.root_module.addImport("zio", zio_mod);
+    exe.root_module.addImport("flags", flags_mod);
     b.installArtifact(exe);
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("zdb-bench", "Build zdb YCSB benchmark client");
+    step.dependOn(&install.step);
+}
+
+fn addLoadtestDriver(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
+    // `flags` is its own module — it only depends on std, so no need to
+    // rope it through utils_mod (which would pull in lz4/zstd headers).
+    const flags_mod = makeModule(b, target, optimize, "u/flags.zig");
+
+    const exe = b.addExecutable(.{
+        .name = "loadtest",
+        .root_module = makeModule(b, target, optimize, "scripts/loadtest.zig"),
+    });
+    exe.root_module.addImport("zio", zio_mod);
+    exe.root_module.addImport("flags", flags_mod);
+    b.installArtifact(exe);
+
+    const install = b.addInstallArtifact(exe, .{});
+    const step = b.step("loadtest", "Build the zdb load-test driver");
     step.dependOn(&install.step);
 }
 
@@ -595,15 +659,6 @@ fn addRaftTests(
     raft_tests.root_module.addImport("zio", zio_dep.module("zio"));
     raft_tests.step.dependOn(regen_buffers_step);
 
-    // MetaStore unit tests — self-contained, runs alongside the raft suite.
-    const meta_tests = b.addTest(.{
-        .root_module = makeModule(b, target, optimize, "raft/meta_test.zig"),
-    });
-    addVendoredCompressionSources(b, meta_tests);
-    meta_tests.root_module.addImport("raft", raft_mod);
-    meta_tests.step.dependOn(regen_buffers_step);
-    const run_meta_tests = b.addRunArtifact(meta_tests);
-
     const run_raft_tests = b.addRunArtifact(raft_tests);
     const run_raft_tests_trace = b.addRunArtifact(raft_tests);
     run_raft_tests_trace.stdio = .inherit;
@@ -628,7 +683,6 @@ fn addRaftTests(
     const raft_test_step = b.step("test-raft", "Run raft tests");
     raft_test_step.dependOn(regen_buffers_step);
     raft_test_step.dependOn(&run_raft_tests.step);
-    raft_test_step.dependOn(&run_meta_tests.step);
     raft_test_step.dependOn(run_diskwal_tests);
 
     const raft_test_all_step = b.step("test-raft-all", "Run raft tests including BIGTEST cases");
@@ -686,6 +740,32 @@ fn addBenchZio(
     bench_step.dependOn(&run_bench.step);
 }
 
+fn addBenchQueue(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    raft_mod: *std.Build.Module,
+) void {
+    // Reuse zio + utils modules already wired through raft_mod so we don't
+    // recompile them — same trick as bench-diskwal.
+    const zio_mod = raft_mod.import_table.get("zio").?;
+    const utils_mod = raft_mod.import_table.get("utils").?;
+
+    const bench_exe = b.addExecutable(.{
+        .name = "queue-bench",
+        // Always ReleaseFast — Debug Mutex/Condvar overhead swamps the
+        // measurement, and we're comparing fast paths.
+        .root_module = makeModule(b, target, .ReleaseFast, "benchmarks/queue_bench.zig"),
+    });
+    bench_exe.root_module.addImport("zio", zio_mod);
+    bench_exe.root_module.addImport("utils", utils_mod);
+    _ = optimize;
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench-queue", "Run utils.Queue vs zio.Channel benchmark");
+    bench_step.dependOn(&run_bench.step);
+}
+
 fn addBenchDiskwal(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -728,12 +808,17 @@ fn addNetTests(
     });
     const zio_mod = zio_dep.module("zio");
 
+    const utils_mod_test = makeModule(b, target, optimize, "u/utils.zig");
+    utils_mod_test.addImport("zio", zio_mod);
+
     const serial_mod_test = makeModule(b, target, optimize, "net/serial.zig");
     serial_mod_test.addImport("zio", zio_mod);
+    serial_mod_test.addImport("utils", utils_mod_test);
 
     const transport_mod = makeModule(b, target, optimize, "net/transport.zig");
     transport_mod.addImport("zio", zio_mod);
     transport_mod.addImport("serial", serial_mod_test);
+    transport_mod.addImport("utils", utils_mod_test);
 
     // TODO: Rewrite transport_test.zig to use Serial instead of Mux.
     const net_test_step = b.step("test-net", "Run net tests");

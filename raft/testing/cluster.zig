@@ -115,6 +115,7 @@ pub const TestCluster = struct {
             entry.group.spawn(Node.tickLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
             entry.group.spawn(Node.mainLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
             entry.group.spawn(Node.applyLoop, .{entry.node}) catch {};
+            entry.group.spawn(Node.callbackLoop, .{entry.node}) catch {};
         }
         std.debug.print("TestCluster.init: done\n", .{});
         return cluster;
@@ -209,7 +210,7 @@ pub const TestCluster = struct {
             try peers.append(allocator, .{
                 .id = id,
                 .next_index = 1,
-                .match_index = 0,
+                .last_index = 0,
                 .role = role,
             });
         }
