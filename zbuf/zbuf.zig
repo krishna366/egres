@@ -46,6 +46,84 @@ pub fn readMessageTail(buf: []const u8) !MessageTail {
     const table_id = try readU16(buf, start + 0);
     return .{ .table_id = table_id };
 }
+
+// The single hash function used for ALL framing and integrity checks in
+// this project. Centralizing here means one decision, one comment, one
+// place to swap implementations.
+//
+// Choice: std.hash.XxHash3 (Zig stdlib, AVX2-vectorized via @Vector(8, u64)).
+// ~67 GiB/s on Zen 3 — ~5× faster than scalar SSE4.2 CRC32C, ~115× faster
+// than software CRC. Full u64 output gives a 2⁻⁶⁴ false-negative rate on
+// random/torn-write corruption (vs. 2⁻³² for a 32-bit CRC). CRC32C retains
+// a theoretical edge on single-bit and small-burst errors (provably 100%
+// vs. xxhash3's 1 − 2⁻⁶⁴) but the gap is ~10⁻¹⁰ — irrelevant at NVMe
+// error rates.
+pub fn hash(payload: []const u8) u64 {
+    return std.hash.XxHash3.hash(0, payload);
+}
+
+/// 12-byte self-describing prefix for an arbitrary serialized payload:
+/// `[u64 hash][u32 length][payload bytes]`. Lets the reader bound the
+/// payload inside a larger fixed-size region (e.g. a zero-padded WAL
+/// header) and verify it with one hash pass — no magic number / separate
+/// length file needed.
+///
+/// All four items below (hdr_size, write, append, read) operate on the
+/// same wire format; they're co-located so a future format tweak only
+/// needs to touch one block.
+pub const Frame = struct {
+    pub const hdr_size: u16 = 12;
+
+    /// In-place writer: place the [hash | len | payload] frame at the
+    /// start of `dest`. `dest` must be at least `hdr_size + payload.len`
+    /// bytes long. Bytes after the payload are left untouched, so callers
+    /// using a fixed-size region should @memset the region first.
+    ///
+    /// Zero-copy fast path: if `payload` already aliases the destination
+    /// slot (e.g. the caller wrapped `dest[hdr_size..]` as an ArrayList
+    /// build buffer and wrote the payload into it directly), the copy is
+    /// skipped. One API serves both "build elsewhere, copy in" and "build
+    /// in place, just stamp the prefix" callers.
+    pub fn write(dest: []u8, payload: []const u8) !void {
+        if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
+        if (dest.len < @as(usize, hdr_size) + payload.len) return Error.OutOfBounds;
+        try writeU64At(dest, 0, hash(payload));
+        try writeU32At(dest, 8, @intCast(payload.len));
+        const slot = dest[hdr_size .. hdr_size + payload.len];
+        if (payload.ptr != slot.ptr) @memcpy(slot, payload);
+    }
+
+    /// Streaming writer: append a framed payload onto an ArrayList.
+    /// Mirrors `write` for callers that build their output incrementally.
+    /// Returns the total number of bytes appended (prefix + payload).
+    pub fn append(
+        list: *std.ArrayList(u8),
+        alloc: std.mem.Allocator,
+        payload: []const u8,
+    ) !usize {
+        if (payload.len > std.math.maxInt(u32)) return Error.OutOfBounds;
+        try list.ensureUnusedCapacity(alloc, hdr_size + payload.len);
+        const start = list.items.len;
+        const sz = hdr_size + payload.len;
+        list.items.len += sz;
+        try write(list.items[start..], payload);
+        return sz;
+    }
+
+    /// Reads the frame prefix from `buf`, validates the encoded length fits
+    /// within `buf`, and verifies the hash against the payload bytes.
+    /// Returns a slice into `buf` covering just the payload (no copy).
+    pub fn read(buf: []const u8) ![]const u8 {
+        if (buf.len < hdr_size) return Error.OutOfBounds;
+        const stored_hash = try readU64(buf, 0);
+        const len = try readU32(buf, 8);
+        const end = @as(usize, hdr_size) + @as(usize, len);
+        if (end > buf.len) return Error.OutOfBounds;
+        const payload = buf[hdr_size..end];
+        if (hash(payload) != stored_hash) return Error.Invalid;
+        return payload;
+    }
+};
 pub fn readU8(buf: []const u8, off: usize) !u8 {
     if (off + 1 > buf.len) return Error.OutOfBounds;
     return buf[off];

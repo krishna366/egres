@@ -37,15 +37,21 @@ pub const ConfState = schema.Table(.{
 // a single 4 KiB metadata page (see raft/meta.zig::MetaStore). zbuf forward-
 // compat means new fields can be added without breaking older on-disk data.
 pub const HardState = schema.Table(.{
-    .{ .id = 1, .name = "current_term", .ty = schema.U64 },
-    .{ .id = 2, .name = "voted_for", .ty = schema.U64 },
+    // Storage-internal monotonic counter. MetaStore writes alternating
+    // slots; on recovery the slot with the higher `seq` wins (tie-break:
+    // slot B). Callers outside MetaStore should treat this as opaque —
+    // it's not part of raft's protocol-level semantics.
+    .{ .id = 1, .name = "seq", .ty = schema.U64 },
+
+    .{ .id = 2, .name = "current_term", .ty = schema.U64 },
+    .{ .id = 3, .name = "voted_for", .ty = schema.U64 },
     // raft_id of the node that owns this metadata file. Persisted so a
     // misplaced data directory can't be silently picked up by a different
     // node id and confused for that node's state.
-    .{ .id = 3, .name = "raft_id", .ty = schema.U64 },
+    .{ .id = 4, .name = "raft_id", .ty = schema.U64 },
     // Highest log index covered by the most recent durable snapshot. Lets
     // recovery short-circuit replay below this index. 0 = no snapshot yet.
-    .{ .id = 4, .name = "checkpoint_index", .ty = schema.U64 },
+    .{ .id = 5, .name = "checkpoint_index", .ty = schema.U64 },
 });
 
 pub const Snapshot = schema.Table(.{
@@ -62,6 +68,27 @@ pub const EntryType = schema.EnumDef(.{
     .{ .name = "any", .tag = 0 },
     .{ .name = "data", .tag = 1 },
     .{ .name = "conf", .tag = 2 },
+});
+
+// One row of the WAL's slot index. Slots live in the file header region;
+// each slot points at a CRC-framed record in the data region. `timestamp`
+// is the HLC timestamp from the LogEntry — copying it into the slot lets
+// snapshot policy ("retain at least N minutes of activity") read the slot
+// region without parsing payload bytes. Wire format is fixed-size; the
+// reader treats an all-zero slot as the empty sentinel via index() == 0.
+pub const WalSlot = schema.Table(.{
+    .{ .id = 1, .name = "term", .ty = schema.U64 },
+    .{ .id = 2, .name = "index", .ty = schema.U64 },
+    .{ .id = 3, .name = "timestamp", .ty = schema.U64 },
+    .{ .id = 4, .name = "data_offset", .ty = schema.U32 },
+    .{ .id = 5, .name = "data_len", .ty = schema.U32 },
+    .{ .id = 6, .name = "flags", .ty = schema.U16 },
+    .{ .id = 7, .name = "entry_type", .ty = schema.Enum(EntryType) },
+});
+
+pub const WalHeader = schema.Table(.{
+    .{ .id = 1, .name = "base_slot", .ty = WalSlot },
+    .{ .id = 2, .name = "slots", .ty = schema.Array(WalSlot) },
 });
 
 pub const LogEntry = schema.Table(.{
@@ -154,4 +181,6 @@ pub const tables = .{
     .{ .name = "ConfState", .ty = ConfState, .id = tableId(11) },
     .{ .name = "HardState", .ty = HardState, .id = tableId(12) },
     .{ .name = "Snapshot", .ty = Snapshot, .id = tableId(13) },
+    .{ .name = "WalSlot", .ty = WalSlot, .id = tableId(14) },
+    .{ .name = "WalHeader", .ty = WalHeader, .id = tableId(15) },
 };

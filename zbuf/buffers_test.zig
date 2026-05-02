@@ -558,3 +558,48 @@ test "clone roundtrip matches marshal" {
     try std.testing.expectEqual(off_orig, off_clone);
     try std.testing.expectEqualSlices(u8, out_orig.items, out_clone.items);
 }
+
+test "frame round-trip preserves payload across Frame.write/Frame.read" {
+    // Verifies the [u64 hash | u32 len | payload] frame layout:
+    // Frame.write must produce bytes that Frame.read can recover unchanged.
+    // Sweeps lengths 0..=64 to cover every alignment relative to the
+    // 12-byte prefix, plus a few larger and odd-modulo sizes.
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xCAFEBABE);
+    var src: [4096]u8 = undefined;
+    prng.random().bytes(&src);
+
+    const dest = try alloc.alloc(u8, 4096 + zbuf.Frame.hdr_size);
+    defer alloc.free(dest);
+
+    const sizes = blk: {
+        var s: [75]usize = undefined;
+        for (0..65) |i| s[i] = i;
+        const tail = [_]usize{ 99, 100, 511, 512, 513, 1023, 1024, 1025, 4095, 4096 };
+        for (tail, 0..) |v, i| s[65 + i] = v;
+        break :blk s;
+    };
+
+    for (sizes) |size| {
+        const payload = src[0..size];
+        try zbuf.Frame.write(dest, payload);
+        const got = try zbuf.Frame.read(dest[0 .. zbuf.Frame.hdr_size + size]);
+        try std.testing.expectEqualSlices(u8, payload, got);
+    }
+}
+
+test "frame Frame.read rejects corrupt payload" {
+    // Flip a single byte in a written frame and confirm Frame.read catches
+    // it. xxhash3 with full u64 output gives ~2⁻⁶⁴ false-negative odds;
+    // a single-byte flip is overwhelmingly likely to be detected.
+    const alloc = std.testing.allocator;
+    const payload = "hello, framed world";
+    const dest = try alloc.alloc(u8, zbuf.Frame.hdr_size + payload.len);
+    defer alloc.free(dest);
+
+    try zbuf.Frame.write(dest, payload);
+
+    // Corrupt one payload byte.
+    dest[zbuf.Frame.hdr_size + 5] ^= 0x01;
+    try std.testing.expectError(zbuf.Error.Invalid, zbuf.Frame.read(dest));
+}

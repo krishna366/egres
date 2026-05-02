@@ -57,6 +57,8 @@ pub fn parseMessageWithTail(buf: []const u8) Error!MessageReader {
         ConfStateReader.TABLE_ID => .{ .ConfState = try ConfStateReader.init(payload_buf, 0) },
         HardStateReader.TABLE_ID => .{ .HardState = try HardStateReader.init(payload_buf, 0) },
         SnapshotReader.TABLE_ID => .{ .Snapshot = try SnapshotReader.init(payload_buf, 0) },
+        WalSlotReader.TABLE_ID => .{ .WalSlot = try WalSlotReader.init(payload_buf, 0) },
+        WalHeaderReader.TABLE_ID => .{ .WalHeader = try WalHeaderReader.init(payload_buf, 0) },
         else => zbuf.Error.Invalid,
     };
 }
@@ -75,6 +77,8 @@ pub const MessageReader = union(enum) {
     ConfState: ConfStateReader,
     HardState: HardStateReader,
     Snapshot: SnapshotReader,
+    WalSlot: WalSlotReader,
+    WalHeader: WalHeaderReader,
 };
 
 pub const ConfChangeStruct = struct {
@@ -82,7 +86,7 @@ pub const ConfChangeStruct = struct {
     node_id: u64 = 0,
     addr: []const u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: ConfChangeReader) Error!ConfChangeStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfChangeReader) Error!ConfChangeStruct {
         var s = ConfChangeStruct{
             .change_type = r.changeType(),
             .node_id = r.nodeId(),
@@ -338,7 +342,7 @@ pub const LogEntryStruct = struct {
     entry_type: EntryTypeEnum = @enumFromInt(0),
     conf_change: ?ConfChangeStruct = null,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: LogEntryReader) Error!LogEntryStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: LogEntryReader) Error!LogEntryStruct {
         var s = LogEntryStruct{
             .index = r.index(),
             .term = r.term(),
@@ -664,7 +668,7 @@ pub const RequestVoteStruct = struct {
     last_log_term: u64 = 0,
     status: u16 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReader) Error!RequestVoteStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReader) Error!RequestVoteStruct {
         var s = RequestVoteStruct{
             .is_prevote = r.isPrevote(),
             .term = r.term(),
@@ -992,7 +996,7 @@ pub const RequestVoteReplyStruct = struct {
     from: u64 = 0,
     status: u16 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReplyReader) Error!RequestVoteReplyStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReplyReader) Error!RequestVoteReplyStruct {
         var s = RequestVoteReplyStruct{
             .is_prevote = r.isPrevote(),
             .vote_granted = r.voteGranted(),
@@ -1312,7 +1316,7 @@ pub const AppendEntriesStruct = struct {
     prev_log_term: u64 = 0,
     entries: []LogEntryStruct = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReader) Error!AppendEntriesStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReader) Error!AppendEntriesStruct {
         var s = AppendEntriesStruct{
             .term = r.term(),
             .leader_id = r.leaderId(),
@@ -1672,7 +1676,7 @@ pub const AppendEntriesReplyStruct = struct {
     conflict_term: u64 = 0,
     conflict_index: u64 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReplyReader) Error!AppendEntriesReplyStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReplyReader) Error!AppendEntriesReplyStruct {
         var s = AppendEntriesReplyStruct{
             .success = r.success(),
             .term = r.term(),
@@ -2014,7 +2018,7 @@ pub const TransportHandshakeStruct = struct {
     cluster_id: u64 = 0,
     node_id: u64 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: TransportHandshakeReader) Error!TransportHandshakeStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TransportHandshakeReader) Error!TransportHandshakeStruct {
         var s = TransportHandshakeStruct{
             .cluster_id = r.clusterId(),
             .node_id = r.nodeId(),
@@ -2229,7 +2233,7 @@ pub const JoinRequestStruct = struct {
     node_id: u64 = 0,
     addr: []const u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: JoinRequestReader) Error!JoinRequestStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: JoinRequestReader) Error!JoinRequestStruct {
         var s = JoinRequestStruct{
             .cluster_id = r.clusterId(),
             .node_id = r.nodeId(),
@@ -2483,7 +2487,7 @@ pub const JoinResponseStruct = struct {
     reason_code: u32 = 0,
     leader_addr: []const u8 = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: JoinResponseReader) Error!JoinResponseStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: JoinResponseReader) Error!JoinResponseStruct {
         var s = JoinResponseStruct{
             .accepted = r.accepted(),
             .status = r.status(),
@@ -2812,7 +2816,7 @@ pub const ConfStatePeerStruct = struct {
     addr: []const u8 = &.{},
     role: RoleEnum = @enumFromInt(0),
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStatePeerReader) Error!ConfStatePeerStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStatePeerReader) Error!ConfStatePeerStruct {
         var s = ConfStatePeerStruct{
             .id = r.id(),
             .role = r.role(),
@@ -3063,7 +3067,7 @@ pub const ConfStatePeerWriter = struct {
 pub const ConfStateStruct = struct {
     peers: []ConfStatePeerStruct = &.{},
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStateReader) Error!ConfStateStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStateReader) Error!ConfStateStruct {
         var s = ConfStateStruct{};
         errdefer s.deinit(alloc);
         {
@@ -3328,13 +3332,15 @@ pub const ConfStateWriter = struct {
 };
 
 pub const HardStateStruct = struct {
+    seq: u64 = 0,
     current_term: u64 = 0,
     voted_for: u64 = 0,
     raft_id: u64 = 0,
     checkpoint_index: u64 = 0,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: HardStateReader) Error!HardStateStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: HardStateReader) Error!HardStateStruct {
         var s = HardStateStruct{
+            .seq = r.seq(),
             .current_term = r.currentTerm(),
             .voted_for = r.votedFor(),
             .raft_id = r.raftId(),
@@ -3363,6 +3369,7 @@ pub const HardStateStruct = struct {
 
     fn cloneValue(self: HardStateStruct, alloc: std.mem.Allocator) Error!HardStateStruct {
         var s = HardStateStruct{
+            .seq = self.seq,
             .current_term = self.current_term,
             .voted_for = self.voted_for,
             .raft_id = self.raft_id,
@@ -3381,6 +3388,7 @@ pub const HardStateStruct = struct {
 
     pub fn marshalTo(self: HardStateStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try HardStateWriter.initWithBuf(alloc, out);
+        try writer.setSeq(self.seq);
         try writer.setCurrentTerm(self.current_term);
         try writer.setVotedFor(self.voted_for);
         try writer.setRaftId(self.raft_id);
@@ -3397,7 +3405,7 @@ pub const HardStateReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 42252;
-    pub const SIZE_BYTES: u16 = 34;
+    pub const SIZE_BYTES: u16 = 42;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -3413,36 +3421,44 @@ pub const HardStateReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn currentTerm(self: Self) u64 {
+    pub fn seq(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 10;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
     }
 
-    pub fn votedFor(self: Self) u64 {
+    pub fn currentTerm(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 18;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 10)) catch 0;
     }
 
-    pub fn raftId(self: Self) u64 {
+    pub fn votedFor(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 26;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 18)) catch 0;
     }
 
-    pub fn checkpointIndex(self: Self) u64 {
+    pub fn raftId(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 34;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU64(self.buf, @as(usize, self.base + 26)) catch 0;
     }
 
+    pub fn checkpointIndex(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 42;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 34)) catch 0;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try HardStateWriter.initWithBuf(alloc, out);
+        try writer.setSeq(self.seq());
         try writer.setCurrentTerm(self.currentTerm());
         try writer.setVotedFor(self.votedFor());
         try writer.setRaftId(self.raftId());
@@ -3491,7 +3507,7 @@ pub const HardStateWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 42252;
-    pub const SIZE_BYTES: u16 = 34;
+    pub const SIZE_BYTES: u16 = 42;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -3512,24 +3528,29 @@ pub const HardStateWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setCurrentTerm(self: *Self, v: u64) Error!void {
+    pub fn setSeq(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 2, v);
     }
 
-    pub fn setVotedFor(self: *Self, v: u64) Error!void {
+    pub fn setCurrentTerm(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 10, v);
     }
 
-    pub fn setRaftId(self: *Self, v: u64) Error!void {
+    pub fn setVotedFor(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 18, v);
     }
 
-    pub fn setCheckpointIndex(self: *Self, v: u64) Error!void {
+    pub fn setRaftId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 26, v);
+    }
+
+    pub fn setCheckpointIndex(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 34, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -3537,6 +3558,7 @@ pub const HardStateWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
+        if (@hasField(Values, "seq")) try self.setSeq(@field(values, "seq"));
         if (@hasField(Values, "current_term")) try self.setCurrentTerm(@field(values, "current_term"));
         if (@hasField(Values, "voted_for")) try self.setVotedFor(@field(values, "voted_for"));
         if (@hasField(Values, "raft_id")) try self.setRaftId(@field(values, "raft_id"));
@@ -3583,7 +3605,7 @@ pub const SnapshotStruct = struct {
     data: []const u8 = &.{},
     conf_state: ?ConfStateStruct = null,
 
-    fn fromReaderValue(alloc: std.mem.Allocator, r: SnapshotReader) Error!SnapshotStruct {
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: SnapshotReader) Error!SnapshotStruct {
         var s = SnapshotStruct{
             .index = r.index(),
             .term = r.term(),
@@ -3846,6 +3868,615 @@ pub const SnapshotWriter = struct {
     /// Root must be at payload offset 0. Initialize the root writer first
     /// on an empty buffer; children built later land at higher offsets.
     pub fn finishWithTail(self: *Self) Error!SnapshotBuffer {
+        if (self.base != 0) return zbuf.Error.Invalid;
+        const out = self.bufMut();
+        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
+        var result = try self.finish();
+        result.has_tail = true;
+        return result;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return;
+            owned.deinit(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            self.base = 0;
+            self.owns_buf = false;
+        }
+    }
+};
+
+pub const WalSlotStruct = struct {
+    term: u64 = 0,
+    index: u64 = 0,
+    timestamp: u64 = 0,
+    data_offset: u32 = 0,
+    data_len: u32 = 0,
+    flags: u16 = 0,
+    entry_type: EntryTypeEnum = @enumFromInt(0),
+
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: WalSlotReader) Error!WalSlotStruct {
+        var s = WalSlotStruct{
+            .term = r.term(),
+            .index = r.index(),
+            .timestamp = r.timestamp(),
+            .data_offset = r.dataOffset(),
+            .data_len = r.dataLen(),
+            .flags = r.flags(),
+            .entry_type = r.entryType(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: WalSlotReader) Error!*WalSlotStruct {
+        const ptr = try alloc.create(WalSlotStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
+    pub fn deinit(self: *WalSlotStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+
+    pub fn destroy(self: *WalSlotStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: WalSlotStruct, alloc: std.mem.Allocator) Error!WalSlotStruct {
+        var s = WalSlotStruct{
+            .term = self.term,
+            .index = self.index,
+            .timestamp = self.timestamp,
+            .data_offset = self.data_offset,
+            .data_len = self.data_len,
+            .flags = self.flags,
+            .entry_type = self.entry_type,
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn clone(self: WalSlotStruct, alloc: std.mem.Allocator) Error!*WalSlotStruct {
+        const ptr = try alloc.create(WalSlotStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: WalSlotStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try WalSlotWriter.initWithBuf(alloc, out);
+        try writer.setTerm(self.term);
+        try writer.setIndex(self.index);
+        try writer.setTimestamp(self.timestamp);
+        try writer.setDataOffset(self.data_offset);
+        try writer.setDataLen(self.data_len);
+        try writer.setFlags(self.flags);
+        try writer.setEntryType(self.entry_type);
+        const result = try writer.finish();
+        return result.offset;
+    }
+};
+
+pub const WalSlotReader = struct {
+    const Self = @This();
+    buf: []const u8,
+    base: u32,
+    size_bytes: u16,
+
+    pub const TABLE_ID: u16 = 42254;
+    pub const SIZE_BYTES: u16 = 37;
+
+    pub fn parseRoot(buf: []const u8) Error!Self {
+        const tail = try zbuf.readMessageTail(buf);
+        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
+        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
+        return init(payload_buf, 0);
+    }
+
+    pub fn init(buf: []const u8, base: u32) Error!Self {
+        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
+        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
+        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
+        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+    }
+
+    pub fn term(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 10;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
+    }
+
+    pub fn index(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 18;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 10)) catch 0;
+    }
+
+    pub fn timestamp(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 26;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 18)) catch 0;
+    }
+
+    pub fn dataOffset(self: Self) u32 {
+        const slot_end = @as(u32, self.base) + 30;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 26)) catch 0;
+    }
+
+    pub fn dataLen(self: Self) u32 {
+        const slot_end = @as(u32, self.base) + 34;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 30)) catch 0;
+    }
+
+    pub fn flags(self: Self) u16 {
+        const slot_end = @as(u32, self.base) + 36;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU16(self.buf, @as(usize, self.base + 34)) catch 0;
+    }
+
+    pub fn entryType(self: Self) EntryTypeEnum {
+        const slot_end = @as(u32, self.base) + 37;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 36)) catch 0;
+        return @enumFromInt(v);
+    }
+
+    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try WalSlotWriter.initWithBuf(alloc, out);
+        try writer.setTerm(self.term());
+        try writer.setIndex(self.index());
+        try writer.setTimestamp(self.timestamp());
+        try writer.setDataOffset(self.dataOffset());
+        try writer.setDataLen(self.dataLen());
+        try writer.setFlags(self.flags());
+        try writer.setEntryType(self.entryType());
+        const result = try writer.finish();
+        return result.offset;
+    }
+
+    pub fn verify(self: Self) Error!void {
+        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+};
+
+pub const WalSlotBuffer = struct {
+    alloc: std.mem.Allocator,
+    offset: u32,
+    bytes: ?[]u8,
+    ownership: Ownership,
+    has_tail: bool,
+    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
+        const tail = try zbuf.readMessageTail(bytes);
+        if (tail.table_id != WalSlotReader.TABLE_ID) return zbuf.Error.Invalid;
+        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
+    }
+    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
+        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
+    }
+    pub fn initReader(self: @This()) Error!WalSlotReader {
+        const payload = self.bytes orelse return zbuf.Error.Invalid;
+        return WalSlotReader.init(payload, self.offset);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| {
+            if (self.ownership == .owned) self.alloc.free(bytes);
+            self.bytes = null;
+            self.ownership = .borrowed;
+        }
+    }
+};
+
+pub const WalSlotWriter = struct {
+    const Self = @This();
+    buf: ?*std.ArrayList(u8),
+    owns_buf: bool,
+    alloc: std.mem.Allocator,
+    base: u32,
+
+    pub const TABLE_ID: u16 = 42254;
+    pub const SIZE_BYTES: u16 = 37;
+
+    fn bufMut(self: *Self) *std.ArrayList(u8) {
+        return self.buf orelse @panic("zbuf writer missing buffer");
+    }
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
+        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
+        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
+        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+    }
+
+    pub fn init(alloc: std.mem.Allocator) Error!Self {
+        const owned = try alloc.create(std.ArrayList(u8));
+        owned.* = .empty;
+        errdefer alloc.destroy(owned);
+        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
+        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
+        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+    }
+
+    pub fn setTerm(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 2, v);
+    }
+
+    pub fn setIndex(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 10, v);
+    }
+
+    pub fn setTimestamp(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 18, v);
+    }
+
+    pub fn setDataOffset(self: *Self, v: u32) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU32(out.items, self.base + 26, v);
+    }
+
+    pub fn setDataLen(self: *Self, v: u32) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU32(out.items, self.base + 30, v);
+    }
+
+    pub fn setFlags(self: *Self, v: u16) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU16(out.items, self.base + 34, v);
+    }
+
+    pub fn setEntryType(self: *Self, v: EntryTypeEnum) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU8(out.items, self.base + 36, @intFromEnum(v));
+    }
+
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "term")) try self.setTerm(@field(values, "term"));
+        if (@hasField(Values, "index")) try self.setIndex(@field(values, "index"));
+        if (@hasField(Values, "timestamp")) try self.setTimestamp(@field(values, "timestamp"));
+        if (@hasField(Values, "data_offset")) try self.setDataOffset(@field(values, "data_offset"));
+        if (@hasField(Values, "data_len")) try self.setDataLen(@field(values, "data_len"));
+        if (@hasField(Values, "flags")) try self.setFlags(@field(values, "flags"));
+        if (@hasField(Values, "entry_type")) try self.setEntryType(@field(values, "entry_type"));
+    }
+
+    pub fn finish(self: *Self) Error!WalSlotBuffer {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return zbuf.Error.Invalid;
+            const bytes = try owned.toOwnedSlice(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
+        }
+        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+    }
+
+    /// Root must be at payload offset 0. Initialize the root writer first
+    /// on an empty buffer; children built later land at higher offsets.
+    pub fn finishWithTail(self: *Self) Error!WalSlotBuffer {
+        if (self.base != 0) return zbuf.Error.Invalid;
+        const out = self.bufMut();
+        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
+        var result = try self.finish();
+        result.has_tail = true;
+        return result;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return;
+            owned.deinit(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            self.base = 0;
+            self.owns_buf = false;
+        }
+    }
+};
+
+pub const WalHeaderStruct = struct {
+    base_slot: ?WalSlotStruct = null,
+    slots: []WalSlotStruct = &.{},
+
+    pub fn fromReaderValue(alloc: std.mem.Allocator, r: WalHeaderReader) Error!WalHeaderStruct {
+        var s = WalHeaderStruct{};
+        errdefer s.deinit(alloc);
+        {
+            const _cnt = r.slotsLen();
+            s.slots = try alloc.alloc(WalSlotStruct, @intCast(_cnt));
+            @memset(s.slots, .{});
+            for (0.._cnt) |_i| {
+                const _child = try r.slotsAt(@intCast(_i));
+                s.slots[_i] = try WalSlotStruct.fromReaderValue(alloc, _child);
+            }
+        }
+        if (r.baseSlot()) |_child| {
+            s.base_slot = try WalSlotStruct.fromReaderValue(alloc, _child);
+        }
+        return s;
+    }
+
+    pub fn fromReader(alloc: std.mem.Allocator, r: WalHeaderReader) Error!*WalHeaderStruct {
+        const ptr = try alloc.create(WalHeaderStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try fromReaderValue(alloc, r);
+        return ptr;
+    }
+
+    pub fn deinit(self: *WalHeaderStruct, alloc: std.mem.Allocator) void {
+        if (self.base_slot) |*_bf| _bf.deinit(alloc);
+        self.base_slot = null;
+        for (self.slots) |*_b| _b.deinit(alloc);
+        alloc.free(self.slots);
+        self.slots = &.{};
+    }
+
+    pub fn destroy(self: *WalHeaderStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: WalHeaderStruct, alloc: std.mem.Allocator) Error!WalHeaderStruct {
+        var s = WalHeaderStruct{};
+        errdefer s.deinit(alloc);
+        {
+            s.slots = try alloc.alloc(WalSlotStruct, self.slots.len);
+            @memset(s.slots, .{});
+            for (self.slots, 0..) |_child, _i| {
+                s.slots[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        if (self.base_slot) |_child| {
+            s.base_slot = try _child.cloneValue(alloc);
+        }
+        return s;
+    }
+
+    pub fn clone(self: WalHeaderStruct, alloc: std.mem.Allocator) Error!*WalHeaderStruct {
+        const ptr = try alloc.create(WalHeaderStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: WalHeaderStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try WalHeaderWriter.initWithBuf(alloc, out);
+        if (self.base_slot) |child| {
+            const child_off = try child.marshalTo(alloc, out);
+            try writer.setBaseSlot(child_off);
+        }
+        if (self.slots.len > 0) {
+            const offsets = try alloc.alloc(u32, self.slots.len);
+            defer alloc.free(offsets);
+            for (self.slots, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setSlots(offsets);
+        }
+        const result = try writer.finish();
+        return result.offset;
+    }
+};
+
+pub const WalHeaderReader = struct {
+    const Self = @This();
+    buf: []const u8,
+    base: u32,
+    size_bytes: u16,
+
+    pub const TABLE_ID: u16 = 42255;
+    pub const SIZE_BYTES: u16 = 14;
+
+    pub fn parseRoot(buf: []const u8) Error!Self {
+        const tail = try zbuf.readMessageTail(buf);
+        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
+        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
+        return init(payload_buf, 0);
+    }
+
+    pub fn init(buf: []const u8, base: u32) Error!Self {
+        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
+        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
+        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
+        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+    }
+
+    pub fn baseSlot(self: Self) ?WalSlotReader {
+        const slot_end = @as(u32, self.base) + 6;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return null;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
+        if (off == zbuf.NullOffset) return null;
+        return WalSlotReader.init(self.buf, off) catch null;
+    }
+
+    fn slotsSlice(self: Self) []const u8 {
+        const slot_end = @as(u32, self.base) + 14;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch return &.{};
+        if (elem_count == 0) return &.{};
+        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn slotsLen(self: Self) u32 {
+        return @intCast(self.slotsSlice().len / 4);
+    }
+
+    pub fn slotsAt(self: Self, i: u32) Error!WalSlotReader {
+        const s = self.slotsSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        const child_off = zbuf.readU32(s, off) catch unreachable;
+        return WalSlotReader.init(self.buf, child_off);
+    }
+
+    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try WalHeaderWriter.initWithBuf(alloc, out);
+        if (self.baseSlot()) |child| {
+            const child_off = try child.cloneInto(alloc, out);
+            try writer.setBaseSlot(child_off);
+        }
+        const count_slots: u32 = self.slotsLen();
+        if (count_slots != 0) {
+            var child_offsets_slots = try alloc.alloc(u32, @intCast(count_slots));
+            defer alloc.free(child_offsets_slots);
+            var i_slots: u32 = 0;
+            while (i_slots < count_slots) : (i_slots += 1) {
+                const child = try self.slotsAt(i_slots);
+                child_offsets_slots[@intCast(i_slots)] = try child.cloneInto(alloc, out);
+            }
+            try writer.setSlots(child_offsets_slots);
+        }
+        const result = try writer.finish();
+        return result.offset;
+    }
+
+    pub fn verify(self: Self) Error!void {
+        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (self.baseSlot()) |child_view| {
+            try child_view.verify();
+        }
+        const slot_end_arr_6 = @as(u32, self.base) + 14;
+        if (slot_end_arr_6 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
+            if (elem_count > 0) {
+                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
+                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
+            }
+        }
+        const count_slots: u32 = self.slotsLen();
+        var i_slots: u32 = 0;
+        while (i_slots < count_slots) : (i_slots += 1) {
+            const child_view = try self.slotsAt(i_slots);
+            try child_view.verify();
+        }
+    }
+};
+
+pub const WalHeaderBuffer = struct {
+    alloc: std.mem.Allocator,
+    offset: u32,
+    bytes: ?[]u8,
+    ownership: Ownership,
+    has_tail: bool,
+    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
+        const tail = try zbuf.readMessageTail(bytes);
+        if (tail.table_id != WalHeaderReader.TABLE_ID) return zbuf.Error.Invalid;
+        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
+    }
+    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
+        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
+    }
+    pub fn initReader(self: @This()) Error!WalHeaderReader {
+        const payload = self.bytes orelse return zbuf.Error.Invalid;
+        return WalHeaderReader.init(payload, self.offset);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| {
+            if (self.ownership == .owned) self.alloc.free(bytes);
+            self.bytes = null;
+            self.ownership = .borrowed;
+        }
+    }
+};
+
+pub const WalHeaderWriter = struct {
+    const Self = @This();
+    buf: ?*std.ArrayList(u8),
+    owns_buf: bool,
+    alloc: std.mem.Allocator,
+    base: u32,
+
+    pub const TABLE_ID: u16 = 42255;
+    pub const SIZE_BYTES: u16 = 14;
+
+    fn bufMut(self: *Self) *std.ArrayList(u8) {
+        return self.buf orelse @panic("zbuf writer missing buffer");
+    }
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
+        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
+        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
+        try zbuf.patchU32(buf.items, base + 2, zbuf.NullOffset);
+        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+    }
+
+    pub fn init(alloc: std.mem.Allocator) Error!Self {
+        const owned = try alloc.create(std.ArrayList(u8));
+        owned.* = .empty;
+        errdefer alloc.destroy(owned);
+        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
+        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
+        try zbuf.patchU32(owned.items, base + 2, zbuf.NullOffset);
+        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+    }
+
+    pub fn setBaseSlot(self: *Self, child_off: u32) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU32(out.items, self.base + 2, child_off);
+    }
+
+    pub fn setSlots(self: *Self, values: []const u32) Error!void {
+        const out = self.bufMut();
+        if (values.len == 0) {
+            try zbuf.patchU32(out.items, self.base + 6, 0);
+            try zbuf.patchU32(out.items, self.base + 10, 0);
+            return;
+        }
+        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
+        const index_off = abs_index_off;
+        try zbuf.patchU32(out.items, self.base + 6, index_off);
+        try zbuf.patchU32(out.items, self.base + 10, @as(u32, @intCast(values.len)));
+    }
+
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "base_slot")) try self.setBaseSlot(@field(values, "base_slot"));
+        if (@hasField(Values, "slots")) try self.setSlots(@field(values, "slots"));
+    }
+
+    pub fn finish(self: *Self) Error!WalHeaderBuffer {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return zbuf.Error.Invalid;
+            const bytes = try owned.toOwnedSlice(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
+        }
+        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+    }
+
+    /// Root must be at payload offset 0. Initialize the root writer first
+    /// on an empty buffer; children built later land at higher offsets.
+    pub fn finishWithTail(self: *Self) Error!WalHeaderBuffer {
         if (self.base != 0) return zbuf.Error.Invalid;
         const out = self.bufMut();
         try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);

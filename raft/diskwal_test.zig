@@ -2,9 +2,9 @@ const std = @import("std");
 const build_options = @import("build_options");
 const raft = @import("raft");
 const zio = @import("zio");
+const zbuf = @import("zbuf").zbuf;
 const zen = raft.buffers;
 const u = raft.utils;
-
 
 fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
@@ -781,9 +781,8 @@ test "diskwal CRC corruption truncates at corrupt entry" {
     }
 
     // Corrupt the 3rd entry's payload by flipping a byte.
-    // Entries start at log_file_offset (1 MiB). Each entry is:
-    //   [4 bytes CRC][4 bytes len][payload]
-    // We need to find the offset of the 3rd entry and corrupt its payload.
+    // Entries start at log_file_offset (1 MiB). Each entry is framed as
+    // `[u64 hash | u32 len | payload]` — see zbuf.Frame.hdr_size.
     {
         // The current file is 00001.wal (no rotation happened).
         const current_path = try std.fmt.allocPrint(alloc, "{s}/00001.wal", .{wal_dir});
@@ -792,18 +791,17 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         defer file.close();
 
         // Read past the first two entries to find the 3rd entry's payload.
-        // Each entry has: 8 byte header + variable payload.
-        // Scan to find offsets.
+        const hdr_size: usize = zbuf.Frame.hdr_size;
         var offset: u64 = diskwal.log_file_offset;
-        var hdr_buf: [8]u8 = undefined;
+        var hdr_buf: [zbuf.Frame.hdr_size]u8 = undefined;
         for (0..2) |_| {
             _ = try file.preadAll(&hdr_buf, offset);
-            const payload_len = std.mem.readInt(u32, hdr_buf[4..8], .little);
-            offset += 8 + payload_len;
+            // u32 length lives at byte 8 of the prefix (after the u64 hash).
+            const payload_len = std.mem.readInt(u32, hdr_buf[8..12], .little);
+            offset += hdr_size + payload_len;
         }
         // Now offset points at the 3rd entry. Corrupt a byte in its payload.
-        // Skip the 8-byte record header to hit the payload.
-        const corrupt_offset = offset + 8 + 1; // +1 to hit inside the payload
+        const corrupt_offset = offset + hdr_size + 1; // +1 to hit inside the payload
         var byte: [1]u8 = undefined;
         _ = try file.preadAll(&byte, corrupt_offset);
         byte[0] ^= 0xFF; // flip all bits
@@ -820,6 +818,86 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         try checkRange(log, 1, 3);
         // Entry 3 and beyond should be gone.
         try std.testing.expectEqual(@as(?u64, null), try log.term(3));
+    }
+}
+
+test "diskwal writeHeader/readHeader round-trip" {
+    // Drive writeHeader and readHeader directly (no DiskWAL wrapper, no
+    // data-region records). Verifies that a logFile's in-memory slots
+    // survive a serialize/deserialize cycle through the on-disk WalHeader,
+    // covering both the empty-slots case (just base) and the populated
+    // case (base + multiple data slots).
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        std.fs.cwd().deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    const vfs = @import("vfs");
+    const vfs_inst = vfs.g();
+
+    const base = raft.diskwal.entry{
+        .term = 5,
+        .index = 100,
+        .timestamp = 0xDEAD_BEEF,
+    };
+    var lf = try raft.diskwal.logFile.createCurrent(vfs_inst, alloc, wal_dir, 1, base);
+    defer lf.deinit();
+
+    // Empty case: createCurrent writes a WalHeader with just the base slot.
+    {
+        var slots = try raft.diskwal.logFile.readHeader(alloc, lf.handle);
+        defer slots.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), slots.items.len);
+        try std.testing.expectEqual(@as(u64, 5), slots.items[0].term);
+        try std.testing.expectEqual(@as(u64, 100), slots.items[0].index);
+        try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF), slots.items[0].timestamp);
+    }
+
+    // Populated case: append slot metadata and re-persist via writeHeader.
+    // Test slots can carry arbitrary data_offset/data_len/entry_type
+    // values — the data region is never touched by either function.
+    try lf.slots.append(alloc, .{
+        .term = 5,
+        .index = 101,
+        .timestamp = 0xDEAD_BEF0,
+        .data_offset = 1 << 20,
+        .data_len = 42,
+        .entry_type = zen.EntryTypeEnum.data,
+    });
+    try lf.slots.append(alloc, .{
+        .term = 6,
+        .index = 102,
+        .timestamp = 0xDEAD_BEF1,
+        .data_offset = (1 << 20) + 50,
+        .data_len = 100,
+        .entry_type = zen.EntryTypeEnum.conf,
+    });
+    try lf.writeHeader();
+
+    {
+        var slots = try raft.diskwal.logFile.readHeader(alloc, lf.handle);
+        defer slots.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 3), slots.items.len);
+
+        try std.testing.expectEqual(@as(u64, 5), slots.items[0].term);
+        try std.testing.expectEqual(@as(u64, 100), slots.items[0].index);
+        try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF), slots.items[0].timestamp);
+
+        try std.testing.expectEqual(@as(u64, 5), slots.items[1].term);
+        try std.testing.expectEqual(@as(u64, 101), slots.items[1].index);
+        try std.testing.expectEqual(@as(u64, 0xDEAD_BEF0), slots.items[1].timestamp);
+        try std.testing.expectEqual(@as(u32, 1 << 20), slots.items[1].data_offset);
+        try std.testing.expectEqual(@as(u32, 42), slots.items[1].data_len);
+        try std.testing.expectEqual(zen.EntryTypeEnum.data, slots.items[1].entry_type);
+
+        try std.testing.expectEqual(@as(u64, 6), slots.items[2].term);
+        try std.testing.expectEqual(@as(u64, 102), slots.items[2].index);
+        try std.testing.expectEqual(@as(u64, 0xDEAD_BEF1), slots.items[2].timestamp);
+        try std.testing.expectEqual(@as(u32, (1 << 20) + 50), slots.items[2].data_offset);
+        try std.testing.expectEqual(@as(u32, 100), slots.items[2].data_len);
+        try std.testing.expectEqual(zen.EntryTypeEnum.conf, slots.items[2].entry_type);
     }
 }
 
