@@ -14,37 +14,37 @@ pub const NullOffset: u32 = 0xFFFF_FFFF;
 
 pub const MessageTail = struct {
     table_id: u16,
-    table_version: u16,
-    offset: u32, // offset from payload base
 };
 
-pub const message_magic: u32 = 0x4655425A; // "ZBUF" little-endian
-pub const message_tail_size: u16 = 16;
+// 2-byte magic ("ZB" little-endian) — enough to discriminate zbuf bytes from
+// arbitrary noise without paying for a 4-byte signature on every message.
+pub const message_magic: u16 = 0x425A;
+// 4-byte tail: u16 table_id + u16 magic. The root table is required to live
+// at payload offset 0. appendMessageTail accepts the caller's offset only to
+// validate that invariant; the offset is not stored.
+pub const message_tail_size: u16 = 4;
 const payload_alignment: usize = 4;
 
-pub fn appendMessageTail(list: *std.ArrayList(u8), alloc: std.mem.Allocator, table_id: u16, table_version: u16, offset: u32) !void {
+pub fn appendMessageTail(
+    list: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    table_id: u16,
+    offset: u32,
+) !void {
+    if (offset != 0) return Error.Invalid;
     const start = list.items.len;
     try appendZeros(list, alloc, message_tail_size);
-    try writeU32At(list.items, start + 0, offset);
-    try writeU16At(list.items, start + 4, table_id);
-    try writeU16At(list.items, start + 6, table_version);
-    try writeU32At(list.items, start + 8, 0);
-    try writeU32At(list.items, start + 12, message_magic);
+    try writeU16At(list.items, start + 0, table_id);
+    try writeU16At(list.items, start + 2, message_magic);
 }
 
 pub fn readMessageTail(buf: []const u8) !MessageTail {
     if (buf.len < message_tail_size) return Error.OutOfBounds;
     const start = buf.len - message_tail_size;
-    const magic = try readU32(buf, start + 12);
+    const magic = try readU16(buf, start + 2);
     if (magic != message_magic) return Error.Invalid;
-    const offset = try readU32(buf, start + 0);
-    const table_id = try readU16(buf, start + 4);
-    const table_version = try readU16(buf, start + 6);
-    return .{
-        .table_id = table_id,
-        .table_version = table_version,
-        .offset = offset,
-    };
+    const table_id = try readU16(buf, start + 0);
+    return .{ .table_id = table_id };
 }
 pub fn readU8(buf: []const u8, off: usize) !u8 {
     if (off + 1 > buf.len) return Error.OutOfBounds;
@@ -125,6 +125,16 @@ pub fn appendU32Slice(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values
         list.items.len += 4;
         writeIntLittle(u32, list.items, start, v);
     }
+    return off;
+}
+
+pub fn appendU8Slice(list: *std.ArrayList(u8), alloc: std.mem.Allocator, values: []const u8) !u32 {
+    const aligned = alignForward(list.items.len, payload_alignment);
+    if (aligned > list.items.len) {
+        try appendZeros(list, alloc, aligned - list.items.len);
+    }
+    const off = @as(u32, @intCast(list.items.len));
+    try list.appendSlice(alloc, values);
     return off;
 }
 

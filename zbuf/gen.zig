@@ -146,16 +146,20 @@ fn emitEnumTypes(w: anytype) !void {
 
 fn boolBitWidthForKind(comptime k: schema.Kind) u16 {
     return switch (k) {
-        .b64 => 64,
-        else => @compileError("bool backing field must be B64"),
+        .u8 => 8,
+        .u16 => 16,
+        .u32 => 32,
+        .u64 => 64,
+        else => @compileError("bool backing field must be U8/U16/U32/U64"),
     };
 }
 
 fn arrayElemSizeForKind(comptime k: schema.Kind) u16 {
     return switch (k) {
+        .u8 => 1,
         .u16 => 2,
         .u32 => 4,
-        .u64, .b64 => 8,
+        .u64 => 8,
         .table => 4, // table arrays store u32 offsets
         else => @compileError("unsupported array child kind"),
     };
@@ -163,20 +167,40 @@ fn arrayElemSizeForKind(comptime k: schema.Kind) u16 {
 
 fn scalarTypeNameForKind(comptime k: schema.Kind) []const u8 {
     return switch (k) {
+        .u8 => "u8",
         .u16 => "u16",
         .u32 => "u32",
-        .u64, .b64 => "u64",
-        else => @compileError("not a scalar array child kind"),
+        .u64 => "u64",
+        else => @compileError("not a scalar kind"),
     };
 }
 
 fn scalarReadFnForKind(comptime k: schema.Kind) []const u8 {
     return switch (k) {
+        .u8 => "readU8",
         .u16 => "readU16",
         .u32 => "readU32",
-        .u64, .b64 => "readU64",
-        else => @compileError("not a scalar array child kind"),
+        .u64 => "readU64",
+        else => @compileError("not a scalar kind"),
     };
+}
+
+fn scalarPatchFnForKind(comptime k: schema.Kind) []const u8 {
+    return switch (k) {
+        .u8 => "patchU8",
+        .u16 => "patchU16",
+        .u32 => "patchU32",
+        .u64 => "patchU64",
+        else => @compileError("not a scalar kind"),
+    };
+}
+
+fn hasBoolOverlay(comptime infos: anytype, comptime field_id: u32) bool {
+    inline for (infos) |other| {
+        if (schema.kindOf(other.ty) != .bool) continue;
+        if (schema.boolFieldId(other.ty) == field_id) return true;
+    }
+    return false;
 }
 
 fn findFieldInfoById(comptime infos: anytype, comptime field_id: u32) ?FieldInfo {
@@ -218,9 +242,10 @@ fn requireBoolLayoutValid(comptime infos: anytype) void {
 
 fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime T: type, comptime table_id: u16, w: anytype) !void {
     // Compile-time layout calculation: field order, slot offsets, and header size.
+    // Header is just `size_bytes` (u16) at offset 0; field slots start at offset 2.
     const layout = comptime blk: {
         const fields = schema.sortFieldsById(T.fields);
-        var offset: u16 = 4; // version + size_bytes
+        var offset: u16 = 2; // size_bytes
         var infos: [fields.len]FieldInfo = undefined;
         for (fields, 0..) |f, i| {
             infos[i] = .{ .id = f.id, .name = f.name, .ty = f.ty, .offset = offset };
@@ -246,21 +271,24 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("    base: u32,\n");
     try w.writeAll("    size_bytes: u16,\n\n");
 
-    try w.print("    pub const VERSION: u16 = {d};\n", .{1});
     try w.print("    pub const TABLE_ID: u16 = {d};\n", .{table_id});
     try w.print("    pub const SIZE_BYTES: u16 = {d};\n\n", .{size_bytes});
 
+    // The root table is required to live at payload offset 0 (writers enforce
+    // this in finishWithTail); the tail just carries the table_id for type
+    // dispatch. So parseRoot strips the tail and inits at base=0.
     try w.writeAll("    pub fn parseRoot(buf: []const u8) Error!Self {\n");
     try w.writeAll("        const tail = try zbuf.readMessageTail(buf);\n");
     try w.writeAll("        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;\n");
     try w.writeAll("        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];\n");
-    try w.writeAll("        return init(payload_buf, tail.offset);\n");
+    try w.writeAll("        return init(payload_buf, 0);\n");
     try w.writeAll("    }\n\n");
 
     // init() validates that header fits in the buffer; field accessors are bounds-checked.
+    // Header is 2 bytes (just size_bytes at offset 0).
     try w.writeAll("    pub fn init(buf: []const u8, base: u32) Error!Self {\n");
-    try w.writeAll("        if (@as(usize, base) + 4 > buf.len) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const size_bytes = try zbuf.readU16(buf, @as(usize, base + 2));\n");
+    try w.writeAll("        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;\n");
+    try w.writeAll("        const size_bytes = try zbuf.readU16(buf, @as(usize, base));\n");
     try w.writeAll("        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;\n");
     try w.writeAll("        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };\n");
     try w.writeAll("    }\n\n");
@@ -270,31 +298,27 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         const name_camel = try schema.camelName(alloc, info.name);
         defer alloc.free(name_camel);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16 => {
-                // Scalars are stored inline in the fixed header.
-                try w.print("    pub fn {s}(self: Self) u16 {{\n", .{name_camel});
-                try emitScalarGetter(w, info.offset, 2, "readU16");
+            .u8, .u16, .u32, .u64 => {
+                // Scalars are stored inline in the fixed header. If the field
+                // is referenced by Bool sub-fields, emit a HasBit accessor too.
+                const kind = comptime schema.kindOf(info.ty);
+                const ty_name = comptime scalarTypeNameForKind(kind);
+                const read_fn = comptime scalarReadFnForKind(kind);
+                const slot_bytes: u16 = comptime switch (kind) {
+                    .u8 => 1,
+                    .u16 => 2,
+                    .u32 => 4,
+                    .u64 => 8,
+                    else => unreachable,
+                };
+                try w.print("    pub fn {s}(self: Self) {s} {{\n", .{ name_camel, ty_name });
+                try emitScalarGetter(w, info.offset, slot_bytes, read_fn);
                 try w.writeAll("    }\n\n");
-            },
-            .u32 => {
-                // Scalars are stored inline in the fixed header.
-                try w.print("    pub fn {s}(self: Self) u32 {{\n", .{name_camel});
-                try emitScalarGetter(w, info.offset, 4, "readU32");
-                try w.writeAll("    }\n\n");
-            },
-            .u64 => {
-                // Scalars are stored inline in the fixed header.
-                try w.print("    pub fn {s}(self: Self) u64 {{\n", .{name_camel});
-                try emitScalarGetter(w, info.offset, 8, "readU64");
-                try w.writeAll("    }\n\n");
-            },
-            .b64 => {
-                try w.print("    pub fn {s}(self: Self) u64 {{\n", .{name_camel});
-                try emitBitsetGetter(w, info.offset);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}HasBit(self: Self, bit_index: u32) bool {{\n", .{name_camel});
-                try emitBitsetHasBit(w, info.offset);
-                try w.writeAll("    }\n\n");
+                if (comptime hasBoolOverlay(infos, info.id)) {
+                    try w.print("    pub fn {s}HasBit(self: Self, bit_index: u32) bool {{\n", .{name_camel});
+                    try emitBitsetHasBit(w, info.offset, kind);
+                    try w.writeAll("    }\n\n");
+                }
             },
             .bytes => {
                 // Bytes are stored as (off,len) in the header, pointing into the buffer.
@@ -327,18 +351,8 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.writeAll("        const child_off = zbuf.readU32(s, off) catch unreachable;\n");
                         try w.print("        return {s}Reader.init(self.buf, child_off);\n", .{child_name});
                         try w.writeAll("    }\n\n");
-                        try w.print("    pub fn {s}AtClone(self: Self, alloc: std.mem.Allocator, i: u32) Error!{s}Buffer {{\n", .{ name_camel_arr, child_name });
-                        try w.print("        const child = try self.{s}At(i);\n", .{name_camel_arr});
-                        try w.writeAll("        var out = std.ArrayList(u8).empty;\n");
-                        try w.writeAll("        errdefer out.deinit(alloc);\n");
-                        try w.print("        const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(self.buf), child.base, .borrowed);\n", .{child_name});
-                        try w.writeAll("        const child_off = try child_buf.cloneInto(alloc, &out);\n");
-                        try w.print("        try addTail(alloc, &out, {s}Reader, child_off);\n", .{child_name});
-                        try w.writeAll("        const bytes = try out.toOwnedSlice(alloc);\n");
-                        try w.print("        return {s}Buffer.initWithTail(alloc, bytes, .owned);\n", .{child_name});
-                        try w.writeAll("    }\n\n");
                     },
-                    .u16, .u32, .u64 => {
+                    .u8, .u16, .u32, .u64 => {
                         // Scalar arrays: validate backing region once via *Slice(), then delegate.
                         const scalar_ty = scalarTypeNameForKind(child_kind);
                         const scalar_read_fn = scalarReadFnForKind(child_kind);
@@ -365,17 +379,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.writeAll("        return out;\n");
                         try w.writeAll("    }\n\n");
                     },
-                    .b64 => {
-                        // b64 arrays keep the old per-element approach (no *Slice / ToSliceAlloc).
-                        const scalar_ty = scalarTypeNameForKind(child_kind);
-                        const scalar_read_fn = scalarReadFnForKind(child_kind);
-                        try w.print("    pub fn {s}Len(self: Self) u32 {{\n", .{name_camel_arr});
-                        try emitArrayLenGetter(w, info.offset, elem_size);
-                        try w.writeAll("    }\n\n");
-                        try w.print("    pub fn {s}At(self: Self, i: u32) Error!{s} {{\n", .{ name_camel_arr, scalar_ty });
-                        try emitArrayAtGetterScalar(w, info.offset, elem_size, scalar_read_fn);
-                        try w.writeAll("    }\n\n");
-                    },
                     else => @compileError("unsupported array child kind"),
                 }
             },
@@ -388,9 +391,10 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
             .bool => {
                 const bits_field = findFieldInfoById(infos, schema.boolFieldId(info.ty)) orelse
                     @compileError("Bool field references unknown backing field id");
+                const bits_kind = comptime schema.kindOf(bits_field.ty);
                 const bit_index: u16 = schema.boolBitIndex(info.ty);
                 try w.print("    pub fn {s}(self: Self) bool {{\n", .{name_camel});
-                try emitBoolGetter(w, bits_field.offset, bit_index);
+                try emitBoolGetter(w, bits_field.offset, bit_index, bits_kind);
                 try w.writeAll("    }\n\n");
             },
             .enum_ => {
@@ -402,6 +406,57 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
             },
         }
     }
+
+    try w.writeAll("    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {\n");
+    try w.print("        var writer = try {s}Writer.initWithBuf(alloc, out);\n", .{table_name});
+    inline for (infos) |info| {
+        const name_camel = try schema.camelNameCapitalized(alloc, info.name);
+        defer alloc.free(name_camel);
+        const name_lower = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_lower);
+        switch (comptime schema.kindOf(info.ty)) {
+            .u8, .u16, .u32, .u64, .bytes, .bool, .enum_ => {
+                try w.print("        try writer.set{s}(self.{s}());\n", .{ name_camel, name_lower });
+            },
+            .table => {
+                try w.print("        if (self.{s}()) |child| {{\n", .{name_lower});
+                try w.writeAll("            const child_off = try child.cloneInto(alloc, out);\n");
+                try w.print("            try writer.set{s}(child_off);\n", .{name_camel});
+                try w.writeAll("        }\n");
+            },
+            .array => {
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                const name_camel_arr = try schema.camelName(alloc, info.name);
+                defer alloc.free(name_camel_arr);
+                switch (child_kind) {
+                    .table => {
+                        try w.print("        const count_{s}: u32 = self.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
+                        try w.print("            var child_offsets_{s} = try alloc.alloc(u32, @intCast(count_{s}));\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("            defer alloc.free(child_offsets_{s});\n", .{name_camel_arr});
+                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
+                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
+                        try w.print("                const child = try self.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("                child_offsets_{s}[@intCast(i_{s})] = try child.cloneInto(alloc, out);\n", .{ name_camel_arr, name_camel_arr });
+                        try w.writeAll("            }\n");
+                        try w.print("            try writer.set{s}(child_offsets_{s});\n", .{ name_camel, name_camel_arr });
+                        try w.writeAll("        }\n");
+                    },
+                    .u8, .u16, .u32, .u64 => {
+                        // Use ToSliceAlloc: validates once, single allocation, single copy.
+                        try w.print("        const values_{s} = try self.{s}ToSliceAlloc(alloc);\n", .{ name_camel_arr, name_camel_arr });
+                        try w.print("        defer alloc.free(values_{s});\n", .{name_camel_arr});
+                        try w.print("        if (values_{s}.len > 0) try writer.set{s}(values_{s});\n", .{ name_camel_arr, name_camel, name_camel_arr });
+                    },
+                    else => @compileError("unsupported array child kind"),
+                }
+            },
+        }
+    }
+    try w.writeAll("        const result = try writer.finish();\n");
+    try w.writeAll("        return result.offset;\n");
+    try w.writeAll("    }\n\n");
 
     // verify() provides optional bounds checking of nested data.
     const verify_needs_header_end = comptime blk: {
@@ -468,8 +523,8 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {\n");
     try w.writeAll("        const tail = try zbuf.readMessageTail(bytes);\n");
     try w.print("        if (tail.table_id != {s}Reader.TABLE_ID) return zbuf.Error.Invalid;\n", .{table_name});
-    try w.print("        if (tail.table_version != {s}Reader.VERSION) return zbuf.Error.Invalid;\n", .{table_name});
-    try w.writeAll("        return .{ .alloc = alloc, .offset = tail.offset, .bytes = bytes, .ownership = ownership, .has_tail = true };\n");
+    // Root table is always at payload offset 0 (writers enforce in finishWithTail).
+    try w.writeAll("        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };\n");
     try w.writeAll("    }\n");
     try w.writeAll("    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {\n");
     try w.writeAll("        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };\n");
@@ -477,78 +532,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.print("    pub fn initReader(self: @This()) Error!{s}Reader {{\n", .{table_name});
     try w.writeAll("        const payload = self.bytes orelse return zbuf.Error.Invalid;\n");
     try w.print("        return {s}Reader.init(payload, self.offset);\n", .{table_name});
-    try w.writeAll("    }\n");
-    try w.writeAll("    pub fn cloneInto(self: @This(), alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {\n");
-    try w.writeAll("        const reader = try self.initReader();\n");
-    try w.print("        var writer = try {s}Writer.initWithBuf(alloc, out);\n", .{table_name});
-    inline for (infos) |info| {
-        const name_camel = try schema.camelNameCapitalized(alloc, info.name);
-        defer alloc.free(name_camel);
-        const name_lower = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_lower);
-        switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .bytes, .bool, .enum_ => {
-                try w.print("        try writer.set{s}(reader.{s}());\n", .{ name_camel, name_lower });
-            },
-            .b64 => {
-                try w.print("        try writer.{s}Set(reader.{s}());\n", .{ name_lower, name_lower });
-            },
-            .table => {
-                const child_name = tableNameForType(info.ty);
-                try w.print("        if (reader.{s}()) |child| {{\n", .{name_lower});
-                try w.print("            const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(reader.buf), child.base, .borrowed);\n", .{child_name});
-                try w.writeAll("            const child_off = try child_buf.cloneInto(alloc, out);\n");
-                try w.print("            try writer.set{s}(child_off);\n", .{name_camel});
-                try w.writeAll("        }\n");
-            },
-            .array => {
-                const child = comptime schema.childOfArray(info.ty);
-                const child_kind = comptime schema.kindOf(child);
-                const name_camel_arr = try schema.camelName(alloc, info.name);
-                defer alloc.free(name_camel_arr);
-                switch (child_kind) {
-                    .table => {
-                        const child_name = tableNameForType(child);
-                        try w.print("        const count_{s}: u32 = reader.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
-                        try w.print("            var child_offsets_{s} = try alloc.alloc(u32, @intCast(count_{s}));\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("            defer alloc.free(child_offsets_{s});\n", .{name_camel_arr});
-                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
-                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
-                        try w.print("                const child = try reader.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("                const child_buf = try {s}Buffer.initWithOffset(alloc, @constCast(reader.buf), child.base, .borrowed);\n", .{child_name});
-                        try w.print("                child_offsets_{s}[@intCast(i_{s})] = try child_buf.cloneInto(alloc, out);\n", .{ name_camel_arr, name_camel_arr });
-                        try w.writeAll("            }\n");
-                        try w.print("            try writer.set{s}(child_offsets_{s});\n", .{ name_camel, name_camel_arr });
-                        try w.writeAll("        }\n");
-                    },
-                    .u16, .u32, .u64 => {
-                        // Use ToSliceAlloc: validates once, single allocation, single copy.
-                        try w.print("        const values_{s} = try reader.{s}ToSliceAlloc(alloc);\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("        defer alloc.free(values_{s});\n", .{name_camel_arr});
-                        try w.print("        if (values_{s}.len > 0) try writer.set{s}(values_{s});\n", .{ name_camel_arr, name_camel, name_camel_arr });
-                    },
-                    .b64 => {
-                        // b64 arrays: no ToSliceAlloc, use element-by-element loop.
-                        const scalar_ty = scalarTypeNameForKind(child_kind);
-                        try w.print("        const count_{s}: u32 = reader.{s}Len();\n", .{ name_camel_arr, name_camel_arr });
-                        try w.print("        if (count_{s} != 0) {{\n", .{name_camel_arr});
-                        try w.print("            var values_{s} = try alloc.alloc({s}, @intCast(count_{s}));\n", .{ name_camel_arr, scalar_ty, name_camel_arr });
-                        try w.print("            defer alloc.free(values_{s});\n", .{name_camel_arr});
-                        try w.print("            var i_{s}: u32 = 0;\n", .{name_camel_arr});
-                        try w.print("            while (i_{s} < count_{s}) : (i_{s} += 1) {{\n", .{ name_camel_arr, name_camel_arr, name_camel_arr });
-                        try w.print("                values_{s}[@intCast(i_{s})] = try reader.{s}At(i_{s});\n", .{ name_camel_arr, name_camel_arr, name_camel_arr, name_camel_arr });
-                        try w.writeAll("            }\n");
-                        try w.print("            try writer.set{s}(values_{s});\n", .{ name_camel, name_camel_arr });
-                        try w.writeAll("        }\n");
-                    },
-                    else => @compileError("unsupported array child kind"),
-                }
-            },
-        }
-    }
-    try w.writeAll("        const result = try writer.finish();\n");
-    try w.writeAll("        return result.offset;\n");
     try w.writeAll("    }\n");
     try w.writeAll("    pub fn deinit(self: *@This()) void {\n");
     try w.writeAll("        if (self.bytes) |bytes| {\n");
@@ -565,7 +548,6 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("    owns_buf: bool,\n");
     try w.writeAll("    alloc: std.mem.Allocator,\n");
     try w.writeAll("    base: u32,\n\n");
-    try w.print("    pub const VERSION: u16 = {d};\n", .{1});
     try w.print("    pub const TABLE_ID: u16 = {d};\n", .{table_id});
     try w.print("    pub const SIZE_BYTES: u16 = {d};\n\n", .{size_bytes});
 
@@ -573,11 +555,10 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("        return self.buf orelse @panic(\"zbuf writer missing buffer\");\n");
     try w.writeAll("    }\n\n");
 
-    // initWithBuf() reserves the fixed header and writes version + size_bytes.
+    // initWithBuf() reserves the fixed header and writes size_bytes at base+0.
     try w.writeAll("    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {\n");
     try w.writeAll("        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);\n");
-    try w.writeAll("        try zbuf.writeU16At(buf.items, @as(usize, base), VERSION);\n");
-    try w.writeAll("        try zbuf.writeU16At(buf.items, @as(usize, base + 2), SIZE_BYTES);\n");
+    try w.writeAll("        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);\n");
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
             .table => {
@@ -595,8 +576,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("        owned.* = .empty;\n");
     try w.writeAll("        errdefer alloc.destroy(owned);\n");
     try w.writeAll("        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);\n");
-    try w.writeAll("        try zbuf.writeU16At(owned.items, @as(usize, base), VERSION);\n");
-    try w.writeAll("        try zbuf.writeU16At(owned.items, @as(usize, base + 2), SIZE_BYTES);\n");
+    try w.writeAll("        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);\n");
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
             .table => {
@@ -614,40 +594,28 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         const name_lower = try schema.camelName(alloc, info.name);
         defer alloc.free(name_lower);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16 => {
-                // Patch inline scalar slot.
-                try w.print("    pub fn set{s}(self: *Self, v: u16) Error!void {{\n", .{name_camel});
+            .u8, .u16, .u32, .u64 => {
+                // Patch inline scalar slot. If the field is referenced by Bool
+                // sub-fields, also emit SetBit / ClearBit / HasBit helpers that
+                // operate on the same backing word.
+                const kind = comptime schema.kindOf(info.ty);
+                const ty_name = comptime scalarTypeNameForKind(kind);
+                const patch_fn = comptime scalarPatchFnForKind(kind);
+                try w.print("    pub fn set{s}(self: *Self, v: {s}) Error!void {{\n", .{ name_camel, ty_name });
                 try w.writeAll("        const out = self.bufMut();\n");
-                try w.print("        try zbuf.patchU16(out.items, self.base + {d}, v);\n", .{info.offset});
+                try w.print("        try zbuf.{s}(out.items, self.base + {d}, v);\n", .{ patch_fn, info.offset });
                 try w.writeAll("    }\n\n");
-            },
-            .u32 => {
-                // Patch inline scalar slot.
-                try w.print("    pub fn set{s}(self: *Self, v: u32) Error!void {{\n", .{name_camel});
-                try w.writeAll("        const out = self.bufMut();\n");
-                try w.print("        try zbuf.patchU32(out.items, self.base + {d}, v);\n", .{info.offset});
-                try w.writeAll("    }\n\n");
-            },
-            .u64 => {
-                // Patch inline scalar slot.
-                try w.print("    pub fn set{s}(self: *Self, v: u64) Error!void {{\n", .{name_camel});
-                try w.writeAll("        const out = self.bufMut();\n");
-                try w.print("        try zbuf.patchU64(out.items, self.base + {d}, v);\n", .{info.offset});
-                try w.writeAll("    }\n\n");
-            },
-            .b64 => {
-                try w.print("    pub fn {s}Set(self: *Self, v: u64) Error!void {{\n", .{name_lower});
-                try emitBitsetSetter(w, info.offset);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}SetBit(self: *Self, bit_index: u32) Error!void {{\n", .{name_lower});
-                try emitBitsetSetBit(w, info.offset);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}ClearBit(self: *Self, bit_index: u32) Error!void {{\n", .{name_lower});
-                try emitBitsetClearBit(w, info.offset);
-                try w.writeAll("    }\n\n");
-                try w.print("    pub fn {s}HasBit(self: *Self, bit_index: u32) Error!bool {{\n", .{name_lower});
-                try emitBitsetHasBitBuilder(w, info.offset);
-                try w.writeAll("    }\n\n");
+                if (comptime hasBoolOverlay(infos, info.id)) {
+                    try w.print("    pub fn {s}SetBit(self: *Self, bit_index: u32) Error!void {{\n", .{name_lower});
+                    try emitBitsetSetBit(w, info.offset, kind);
+                    try w.writeAll("    }\n\n");
+                    try w.print("    pub fn {s}ClearBit(self: *Self, bit_index: u32) Error!void {{\n", .{name_lower});
+                    try emitBitsetClearBit(w, info.offset, kind);
+                    try w.writeAll("    }\n\n");
+                    try w.print("    pub fn {s}HasBit(self: *Self, bit_index: u32) Error!bool {{\n", .{name_lower});
+                    try emitBitsetHasBitBuilder(w, info.offset, kind);
+                    try w.writeAll("    }\n\n");
+                }
             },
             .bytes => {
                 // Append payload and patch (off,len) in the header (offsets are payload-relative).
@@ -683,6 +651,21 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.print("        try zbuf.patchU32(out.items, self.base + {d}, @as(u32, @intCast(values.len)));\n", .{info.offset + 4});
                         try w.writeAll("    }\n\n");
                     },
+                    .u8 => {
+                        // Append u8 data and patch (index_off,count) in the header.
+                        try w.print("    pub fn set{s}(self: *Self, values: []const u8) Error!void {{\n", .{name_camel});
+                        try w.writeAll("        const out = self.bufMut();\n");
+                        try w.writeAll("        if (values.len == 0) {\n");
+                        try w.print("            try zbuf.patchU32(out.items, self.base + {d}, 0);\n", .{info.offset});
+                        try w.print("            try zbuf.patchU32(out.items, self.base + {d}, 0);\n", .{info.offset + 4});
+                        try w.writeAll("            return;\n");
+                        try w.writeAll("        }\n");
+                        try w.writeAll("        const abs_index_off = try zbuf.appendU8Slice(out, self.alloc, values);\n");
+                        try w.writeAll("        const index_off = abs_index_off;\n");
+                        try w.print("        try zbuf.patchU32(out.items, self.base + {d}, index_off);\n", .{info.offset});
+                        try w.print("        try zbuf.patchU32(out.items, self.base + {d}, @as(u32, @intCast(values.len)));\n", .{info.offset + 4});
+                        try w.writeAll("    }\n\n");
+                    },
                     .u16 => {
                         // Append u16 data and patch (index_off,count) in the header.
                         try w.print("    pub fn set{s}(self: *Self, values: []const u16) Error!void {{\n", .{name_camel});
@@ -698,7 +681,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
                         try w.print("        try zbuf.patchU32(out.items, self.base + {d}, @as(u32, @intCast(values.len)));\n", .{info.offset + 4});
                         try w.writeAll("    }\n\n");
                     },
-                    .u64, .b64 => {
+                    .u64 => {
                         // Append u64 data and patch (index_off,count) in the header.
                         try w.print("    pub fn set{s}(self: *Self, values: []const u64) Error!void {{\n", .{name_camel});
                         try w.writeAll("        const out = self.bufMut();\n");
@@ -726,9 +709,10 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
             .bool => {
                 const bits_field = findFieldInfoById(infos, schema.boolFieldId(info.ty)) orelse
                     @compileError("Bool field references unknown backing field id");
+                const bits_kind = comptime schema.kindOf(bits_field.ty);
                 const bit_index: u16 = schema.boolBitIndex(info.ty);
                 try w.print("    pub fn set{s}(self: *Self, v: bool) Error!void {{\n", .{name_camel});
-                try emitBoolSetter(w, bits_field.offset, bit_index);
+                try emitBoolSetter(w, bits_field.offset, bit_index, bits_kind);
                 try w.writeAll("    }\n\n");
             },
             .enum_ => {
@@ -751,16 +735,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     inline for (infos) |info| {
         const name_camel = try schema.camelNameCapitalized(alloc, info.name);
         defer alloc.free(name_camel);
-        const name_lower = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_lower);
-        switch (comptime schema.kindOf(info.ty)) {
-            .b64 => {
-                try w.print("        if (@hasField(Values, \"{s}\")) try self.{s}Set(@field(values, \"{s}\"));\n", .{ info.name, name_lower, info.name });
-            },
-            else => {
-                try w.print("        if (@hasField(Values, \"{s}\")) try self.set{s}(@field(values, \"{s}\"));\n", .{ info.name, name_camel, info.name });
-            },
-        }
+        try w.print("        if (@hasField(Values, \"{s}\")) try self.set{s}(@field(values, \"{s}\"));\n", .{ info.name, name_camel, info.name });
     }
     try w.writeAll("    }\n\n");
 
@@ -775,9 +750,12 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };\n");
     try w.writeAll("    }\n");
     try w.writeAll("\n");
+    try w.writeAll("    /// Root must be at payload offset 0. Initialize the root writer first\n");
+    try w.writeAll("    /// on an empty buffer; children built later land at higher offsets.\n");
     try w.print("    pub fn finishWithTail(self: *Self) Error!{s}Buffer {{\n", .{table_name});
+    try w.writeAll("        if (self.base != 0) return zbuf.Error.Invalid;\n");
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, VERSION, self.base);\n");
+    try w.writeAll("        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);\n");
     try w.writeAll("        var result = try self.finish();\n");
     try w.writeAll("        result.has_tail = true;\n");
     try w.writeAll("        return result;\n");
@@ -804,10 +782,10 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
     // Field declarations with defaults.
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
+            .u8 => try w.print("    {s}: u8 = 0,\n", .{info.name}),
             .u16 => try w.print("    {s}: u16 = 0,\n", .{info.name}),
             .u32 => try w.print("    {s}: u32 = 0,\n", .{info.name}),
             .u64 => try w.print("    {s}: u64 = 0,\n", .{info.name}),
-            .b64 => try w.print("    {s}: u64 = 0,\n", .{info.name}),
             .bool => try w.print("    {s}: bool = false,\n", .{info.name}),
             .enum_ => {
                 const enum_def = comptime schema.enumDefOf(info.ty);
@@ -819,9 +797,10 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                 const child = comptime schema.childOfArray(info.ty);
                 const child_kind = comptime schema.kindOf(child);
                 switch (child_kind) {
+                    .u8 => try w.print("    {s}: []u8 = &.{{}},\n", .{info.name}),
                     .u16 => try w.print("    {s}: []u16 = &.{{}},\n", .{info.name}),
                     .u32 => try w.print("    {s}: []u32 = &.{{}},\n", .{info.name}),
-                    .u64, .b64 => try w.print("    {s}: []u64 = &.{{}},\n", .{info.name}),
+                    .u64 => try w.print("    {s}: []u64 = &.{{}},\n", .{info.name}),
                     .table => {
                         const child_name = tableNameForType(child);
                         try w.print("    {s}: []{s}Struct = &.{{}},\n", .{ info.name, child_name });
@@ -845,7 +824,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         const name_camel = try schema.camelName(alloc, info.name);
         defer alloc.free(name_camel);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .b64, .bool, .enum_ => {
+            .u8, .u16, .u32, .u64, .bool, .enum_ => {
                 try w.print("            .{s} = r.{s}(),\n", .{ info.name, name_camel });
             },
             else => {},
@@ -868,7 +847,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         }
     }
 
-    // Step 4: scalar array fields (u16/u32/u64 use ToSliceAlloc; b64 uses manual loop).
+    // Step 4: scalar array fields use ToSliceAlloc.
     inline for (infos) |info| {
         const name_camel = try schema.camelName(alloc, info.name);
         defer alloc.free(name_camel);
@@ -877,19 +856,8 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                 const child = comptime schema.childOfArray(info.ty);
                 const child_kind = comptime schema.kindOf(child);
                 switch (child_kind) {
-                    .u16, .u32, .u64 => {
+                    .u8, .u16, .u32, .u64 => {
                         try w.print("        s.{s} = try r.{s}ToSliceAlloc(alloc);\n", .{ info.name, name_camel });
-                    },
-                    .b64 => {
-                        // No ToSliceAlloc for b64 arrays: use element-by-element loop.
-                        try w.writeAll("        {\n");
-                        try w.print("            const _cnt = r.{s}Len();\n", .{name_camel});
-                        try w.print("            s.{s} = try alloc.alloc(u64, @intCast(_cnt));\n", .{info.name});
-                        try w.writeAll("            var _i: u32 = 0;\n");
-                        try w.writeAll("            while (_i < _cnt) : (_i += 1) {\n");
-                        try w.print("                s.{s}[@intCast(_i)] = try r.{s}At(_i);\n", .{ info.name, name_camel });
-                        try w.writeAll("            }\n");
-                        try w.writeAll("        }\n");
                     },
                     .table => {}, // handled in step 5
                     else => @compileError("unsupported array child kind in struct fromReader"),
@@ -975,7 +943,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                 const child = comptime schema.childOfArray(info.ty);
                 const child_kind = comptime schema.kindOf(child);
                 switch (child_kind) {
-                    .u16, .u32, .u64, .b64 => {
+                    .u8, .u16, .u32, .u64 => {
                         try w.print("        alloc.free(self.{s});\n", .{info.name});
                         try w.print("        self.{s} = &.{{}};\n", .{info.name});
                     },
@@ -1009,7 +977,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
     try w.print("        var s = {s}Struct{{\n", .{table_name});
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .b64, .bool, .enum_ => {
+            .u8, .u16, .u32, .u64, .bool, .enum_ => {
                 try w.print("            .{s} = self.{s},\n", .{ info.name, info.name });
             },
             else => {},
@@ -1030,20 +998,23 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
         }
     }
 
-    // Step 4: scalar/b64 array fields — dupe the slice.
+    // Step 4: scalar array fields — dupe the slice.
     inline for (infos) |info| {
         switch (comptime schema.kindOf(info.ty)) {
             .array => {
                 const child = comptime schema.childOfArray(info.ty);
                 const child_kind = comptime schema.kindOf(child);
                 switch (child_kind) {
+                    .u8 => {
+                        try w.print("        s.{s} = try alloc.dupe(u8, self.{s});\n", .{ info.name, info.name });
+                    },
                     .u16 => {
                         try w.print("        s.{s} = try alloc.dupe(u16, self.{s});\n", .{ info.name, info.name });
                     },
                     .u32 => {
                         try w.print("        s.{s} = try alloc.dupe(u32, self.{s});\n", .{ info.name, info.name });
                     },
-                    .u64, .b64 => {
+                    .u64 => {
                         try w.print("        s.{s} = try alloc.dupe(u64, self.{s});\n", .{ info.name, info.name });
                     },
                     .table => {}, // handled in step 5
@@ -1104,14 +1075,9 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
     inline for (infos) |info| {
         const name_camel = try schema.camelNameCapitalized(alloc, info.name);
         defer alloc.free(name_camel);
-        const name_lower = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_lower);
         switch (comptime schema.kindOf(info.ty)) {
-            .u16, .u32, .u64, .bytes, .bool, .enum_ => {
+            .u8, .u16, .u32, .u64, .bytes, .bool, .enum_ => {
                 try w.print("        try writer.set{s}(self.{s});\n", .{ name_camel, info.name });
-            },
-            .b64 => {
-                try w.print("        try writer.{s}Set(self.{s});\n", .{ name_lower, info.name });
             },
             .table => {
                 try w.print("        if (self.{s}) |child| {{\n", .{info.name});
@@ -1133,7 +1099,7 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                         try w.print("            try writer.set{s}(offsets);\n", .{name_camel});
                         try w.writeAll("        }\n");
                     },
-                    .u16, .u32, .u64, .b64 => {
+                    .u8, .u16, .u32, .u64 => {
                         try w.print("        if (self.{s}.len > 0) try writer.set{s}(self.{s});\n", .{ info.name, name_camel, info.name });
                     },
                     else => @compileError("unsupported array child kind in struct marshalTo"),
@@ -1155,18 +1121,16 @@ fn emitScalarGetter(w: anytype, offset: u16, size: u16, comptime read_fn: []cons
     try w.print("        return zbuf.{s}(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{ read_fn, offset });
 }
 
-fn emitBitsetGetter(w: anytype, offset: u16) !void {
-    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
+fn emitBitsetHasBit(w: anytype, offset: u16, comptime kind: schema.Kind) !void {
+    const slot_bytes: u16 = switch (kind) { .u8 => 1, .u16 => 2, .u32 => 4, .u64 => 8, else => unreachable };
+    const width = boolBitWidthForKind(kind);
+    const read_fn = scalarReadFnForKind(kind);
+    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + slot_bytes});
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
-    try w.writeAll("        if (slot_end > header_end) return 0;\n");
-    try w.print("        return zbuf.readU64(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
-}
-
-fn emitBitsetHasBit(w: anytype, offset: u16) !void {
-    try w.writeAll("        if (bit_index >= 64) return false;\n");
-    try w.writeAll("        const bit = @as(u6, @intCast(bit_index % 64));\n");
-    try w.print("        const word = zbuf.readU64(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
-    try w.writeAll("        return ((word >> bit) & 1) == 1;\n");
+    try w.writeAll("        if (slot_end > header_end) return false;\n");
+    try w.print("        if (bit_index >= {d}) return false;\n", .{width});
+    try w.print("        const word = zbuf.{s}(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{ read_fn, offset });
+    try w.writeAll("        return ((word >> @intCast(bit_index)) & 1) == 1;\n");
 }
 
 fn emitBytesGetter(w: anytype, offset: u16) !void {
@@ -1179,64 +1143,65 @@ fn emitBytesGetter(w: anytype, offset: u16) !void {
     try w.writeAll("        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};\n");
 }
 
-fn emitBoolGetter(w: anytype, bits_offset: u16, bit_index: u16) !void {
-    const word_index: u16 = bit_index / 64;
-    const bit_in_word: u16 = bit_index % 64;
-    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{bits_offset + (word_index + 1) * 8});
+fn emitBoolGetter(w: anytype, bits_offset: u16, bit_index: u16, comptime kind: schema.Kind) !void {
+    const slot_bytes: u16 = switch (kind) { .u8 => 1, .u16 => 2, .u32 => 4, .u64 => 8, else => unreachable };
+    const read_fn = scalarReadFnForKind(kind);
+    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{bits_offset + slot_bytes});
     try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
     try w.writeAll("        if (slot_end > header_end) return false;\n");
-    try w.print("        const word = zbuf.readU64(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{bits_offset + word_index * 8});
-    try w.print("        const bit = @as(u6, @intCast({d}));\n", .{bit_in_word});
-    try w.writeAll("        return ((word >> bit) & 1) == 1;\n");
+    try w.print("        const word = zbuf.{s}(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{ read_fn, bits_offset });
+    try w.print("        return ((word >> {d}) & 1) == 1;\n", .{bit_index});
 }
 
-fn emitBitsetSetter(w: anytype, offset: u16) !void {
+fn emitBitsetSetBit(w: anytype, offset: u16, comptime kind: schema.Kind) !void {
+    const width = boolBitWidthForKind(kind);
+    const read_fn = scalarReadFnForKind(kind);
+    const patch_fn = scalarPatchFnForKind(kind);
+    const ty_name = scalarTypeNameForKind(kind);
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.print("        try zbuf.patchU64(out.items, self.base + {d}, v);\n", .{offset});
-}
-
-fn emitBitsetSetBit(w: anytype, offset: u16) !void {
-    try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        if (bit_index >= 64) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const bit = @as(u6, @intCast(bit_index % 64));\n");
+    try w.print("        if (bit_index >= {d}) return zbuf.Error.OutOfBounds;\n", .{width});
     try w.print("        const word_off = self.base + {d};\n", .{offset});
-    try w.writeAll("        var word = try zbuf.readU64(out.items, @as(usize, word_off));\n");
-    try w.writeAll("        word |= (@as(u64, 1) << bit);\n");
-    try w.writeAll("        try zbuf.patchU64(out.items, word_off, word);\n");
+    try w.print("        var word = try zbuf.{s}(out.items, @as(usize, word_off));\n", .{read_fn});
+    try w.print("        word |= (@as({s}, 1) << @intCast(bit_index));\n", .{ty_name});
+    try w.print("        try zbuf.{s}(out.items, word_off, word);\n", .{patch_fn});
 }
 
-fn emitBitsetClearBit(w: anytype, offset: u16) !void {
+fn emitBitsetClearBit(w: anytype, offset: u16, comptime kind: schema.Kind) !void {
+    const width = boolBitWidthForKind(kind);
+    const read_fn = scalarReadFnForKind(kind);
+    const patch_fn = scalarPatchFnForKind(kind);
+    const ty_name = scalarTypeNameForKind(kind);
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        if (bit_index >= 64) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const bit = @as(u6, @intCast(bit_index % 64));\n");
+    try w.print("        if (bit_index >= {d}) return zbuf.Error.OutOfBounds;\n", .{width});
     try w.print("        const word_off = self.base + {d};\n", .{offset});
-    try w.writeAll("        var word = try zbuf.readU64(out.items, @as(usize, word_off));\n");
-    try w.writeAll("        word &= ~(@as(u64, 1) << bit);\n");
-    try w.writeAll("        try zbuf.patchU64(out.items, word_off, word);\n");
+    try w.print("        var word = try zbuf.{s}(out.items, @as(usize, word_off));\n", .{read_fn});
+    try w.print("        word &= ~(@as({s}, 1) << @intCast(bit_index));\n", .{ty_name});
+    try w.print("        try zbuf.{s}(out.items, word_off, word);\n", .{patch_fn});
 }
 
-fn emitBitsetHasBitBuilder(w: anytype, offset: u16) !void {
+fn emitBitsetHasBitBuilder(w: anytype, offset: u16, comptime kind: schema.Kind) !void {
+    const width = boolBitWidthForKind(kind);
+    const read_fn = scalarReadFnForKind(kind);
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.writeAll("        if (bit_index >= 64) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        const bit = @as(u6, @intCast(bit_index % 64));\n");
+    try w.print("        if (bit_index >= {d}) return zbuf.Error.OutOfBounds;\n", .{width});
     try w.print("        const word_off = self.base + {d};\n", .{offset});
-    try w.writeAll("        const word = try zbuf.readU64(out.items, @as(usize, word_off));\n");
-    try w.writeAll("        return ((word >> bit) & 1) == 1;\n");
+    try w.print("        const word = try zbuf.{s}(out.items, @as(usize, word_off));\n", .{read_fn});
+    try w.writeAll("        return ((word >> @intCast(bit_index)) & 1) == 1;\n");
 }
 
-fn emitBoolSetter(w: anytype, bits_offset: u16, bit_index: u16) !void {
-    const word_index: u16 = bit_index / 64;
-    const bit_in_word: u16 = bit_index % 64;
+fn emitBoolSetter(w: anytype, bits_offset: u16, bit_index: u16, comptime kind: schema.Kind) !void {
+    const read_fn = scalarReadFnForKind(kind);
+    const patch_fn = scalarPatchFnForKind(kind);
+    const ty_name = scalarTypeNameForKind(kind);
     try w.writeAll("        const out = self.bufMut();\n");
-    try w.print("        const word_off = self.base + {d};\n", .{bits_offset + word_index * 8});
-    try w.writeAll("        var word = try zbuf.readU64(out.items, @as(usize, word_off));\n");
-    try w.print("        const bit = @as(u6, @intCast({d}));\n", .{bit_in_word});
+    try w.print("        const word_off = self.base + {d};\n", .{bits_offset});
+    try w.print("        var word = try zbuf.{s}(out.items, @as(usize, word_off));\n", .{read_fn});
     try w.writeAll("        if (v) {\n");
-    try w.writeAll("            word |= (@as(u64, 1) << bit);\n");
+    try w.print("            word |= (@as({s}, 1) << {d});\n", .{ ty_name, bit_index });
     try w.writeAll("        } else {\n");
-    try w.writeAll("            word &= ~(@as(u64, 1) << bit);\n");
+    try w.print("            word &= ~(@as({s}, 1) << {d});\n", .{ ty_name, bit_index });
     try w.writeAll("        }\n");
-    try w.writeAll("        try zbuf.patchU64(out.items, word_off, word);\n");
+    try w.print("        try zbuf.{s}(out.items, word_off, word);\n", .{patch_fn});
 }
 
 fn emitEnumGetter(w: anytype, offset: u16) !void {
@@ -1250,38 +1215,6 @@ fn emitEnumGetter(w: anytype, offset: u16) !void {
 fn emitEnumSetter(w: anytype, offset: u16) !void {
     try w.writeAll("        const out = self.bufMut();\n");
     try w.print("        try zbuf.patchU8(out.items, self.base + {d}, @intFromEnum(v));\n", .{offset});
-}
-
-fn emitArrayLenGetter(w: anytype, offset: u16, elem_size: u16) !void {
-    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
-    try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
-    try w.writeAll("        if (slot_end > header_end) return 0;\n");
-    try w.print("        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset});
-    try w.print("        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + {d})) catch 0;\n", .{offset + 4});
-    try w.writeAll("        if (elem_count == 0) return 0;\n");
-    try w.print("        const end = @as(usize, index_off) + @as(usize, elem_count) * {d};\n", .{elem_size});
-    try w.writeAll("        if (end > self.buf.len) return 0;\n");
-    try w.writeAll("        return elem_count;\n");
-}
-
-
-fn emitArrayAtGetterScalar(
-    w: anytype,
-    offset: u16,
-    elem_size: u16,
-    read_fn: []const u8,
-) !void {
-    try w.print("        const slot_end = @as(u32, self.base) + {d};\n", .{offset + 8});
-    try w.writeAll("        const header_end = @as(u32, self.base) + self.size_bytes;\n");
-    try w.writeAll("        if (slot_end > header_end) return zbuf.Error.OutOfBounds;\n");
-    try w.print("        const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset});
-    try w.print("        const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + {d}));\n", .{offset + 4});
-    try w.writeAll("        if (i >= elem_count) return zbuf.Error.OutOfBounds;\n");
-    try w.writeAll("        if (elem_count == 0) return zbuf.Error.OutOfBounds;\n");
-    try w.print("        const index_end = @as(usize, index_off) + @as(usize, elem_count) * {d};\n", .{elem_size});
-    try w.writeAll("        if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;\n");
-    try w.print("        const entry_off = @as(usize, index_off) + @as(usize, i) * {d};\n", .{elem_size});
-    try w.print("        return try zbuf.{s}(self.buf, entry_off);\n", .{read_fn});
 }
 
 // emitScalarArraySliceGetter emits *Slice() []const u8 — validates the backing byte region
@@ -1331,8 +1264,10 @@ fn emitBytesVerify(w: anytype, offset: u16) !void {
 }
 
 fn emitTailHelpers(w: anytype) !void {
+    // addTail tags an existing buffer with the type-id tail. The caller must
+    // ensure the root table sits at payload offset 0.
     try w.writeAll("pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {\n");
-    try w.writeAll("    try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, T.VERSION, offset);\n");
+    try w.writeAll("    try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, offset);\n");
     try w.writeAll("}\n\n");
     try w.writeAll("pub fn parseTail(buf: []const u8) Error!zbuf.MessageTail {\n");
     try w.writeAll("    return zbuf.readMessageTail(buf);\n");
@@ -1342,7 +1277,7 @@ fn emitTailHelpers(w: anytype) !void {
     try w.writeAll("    const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];\n");
     try w.writeAll("    return switch (tail.table_id) {\n");
     inline for (defs.tables) |entry| {
-        try w.print("        {s}Reader.TABLE_ID => .{{ .{s} = try {s}Reader.init(payload_buf, tail.offset) }},\n", .{ entry.name, entry.name, entry.name });
+        try w.print("        {s}Reader.TABLE_ID => .{{ .{s} = try {s}Reader.init(payload_buf, 0) }},\n", .{ entry.name, entry.name, entry.name });
     }
     try w.writeAll("        else => zbuf.Error.Invalid,\n");
     try w.writeAll("    };\n");
