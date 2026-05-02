@@ -139,7 +139,7 @@ pub const logFile = struct {
         var i: u32 = 0;
         while (i < slot_count) : (i += 1) {
             const sr = try hdr_reader.slotsAt(i);
-            const srv = try zen.WalSlotStruct.fromReaderValue(alloc, sr);
+            const srv = try sr.toStructValue(alloc);
             try slots_list.append(alloc, srv);
         }
 

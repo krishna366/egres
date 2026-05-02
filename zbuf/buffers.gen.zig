@@ -53,25 +53,6 @@ pub const CellStruct = struct {
     tag: u32 = 0,
     data: []const u8 = &.{},
     cell_flags: u8 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: CellReader) Error!CellStruct {
-        var s = CellStruct{
-            .cell_hot = r.cellHot(),
-            .tag = r.tag(),
-            .cell_flags = r.cellFlags(),
-        };
-        errdefer s.deinit(alloc);
-        s.data = try alloc.dupe(u8, r.data());
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: CellReader) Error!*CellStruct {
-        const ptr = try alloc.create(CellStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *CellStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.data = &.{};
@@ -196,6 +177,22 @@ pub const CellReader = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!CellStruct {
+        var s = CellStruct{
+            .cell_hot = self.cellHot(),
+            .tag = self.tag(),
+            .cell_flags = self.cellFlags(),
+        };
+        errdefer s.deinit(alloc);
+        s.data = try alloc.dupe(u8, self.data());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*CellStruct {
+        const ptr = try alloc.create(CellStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -372,41 +369,6 @@ pub const RowStruct = struct {
     lifecycle: LifecycleEnum = @enumFromInt(0),
     u32_values: []u32 = &.{},
     u64_values: []u64 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: RowReader) Error!RowStruct {
-        var s = RowStruct{
-            .is_pinned = r.isPinned(),
-            .is_deleted = r.isDeleted(),
-            .value = r.value(),
-            .flags = r.flags(),
-            .lifecycle = r.lifecycle(),
-        };
-        errdefer s.deinit(alloc);
-        s.name = try alloc.dupe(u8, r.name());
-        s.u32_values = try r.u32ValuesToSliceAlloc(alloc);
-        s.u64_values = try r.u64ValuesToSliceAlloc(alloc);
-        {
-            const _cnt = r.cellsLen();
-            s.cells = try alloc.alloc(CellStruct, @intCast(_cnt));
-            @memset(s.cells, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.cellsAt(@intCast(_i));
-                s.cells[_i] = try CellStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        if (r.rowCell()) |_child| {
-            s.row_cell = try CellStruct.fromReaderValue(alloc, _child);
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: RowReader) Error!*RowStruct {
-        const ptr = try alloc.create(RowStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *RowStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         self.name = &.{};
@@ -747,6 +709,38 @@ pub const RowReader = struct {
             }
         }
     }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!RowStruct {
+        var s = RowStruct{
+            .is_pinned = self.isPinned(),
+            .is_deleted = self.isDeleted(),
+            .value = self.value(),
+            .flags = self.flags(),
+            .lifecycle = self.lifecycle(),
+        };
+        errdefer s.deinit(alloc);
+        s.name = try alloc.dupe(u8, self.name());
+        s.u32_values = try self.u32ValuesToSliceAlloc(alloc);
+        s.u64_values = try self.u64ValuesToSliceAlloc(alloc);
+        {
+            const _cnt = self.cellsLen();
+            s.cells = try alloc.alloc(CellStruct, @intCast(_cnt));
+            @memset(s.cells, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.cellsAt(@intCast(_i));
+                s.cells[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        if (self.rowCell()) |_child| {
+            s.row_cell = try _child.toStructValue(alloc);
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*RowStruct {
+        const ptr = try alloc.create(RowStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
 };
 
 pub const RowBuffer = struct {
@@ -985,35 +979,6 @@ pub const TableStruct = struct {
     payload: []const u8 = &.{},
     count: u32 = 0,
     table_row: ?RowStruct = null,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TableReader) Error!TableStruct {
-        var s = TableStruct{
-            .count = r.count(),
-        };
-        errdefer s.deinit(alloc);
-        s.payload = try alloc.dupe(u8, r.payload());
-        {
-            const _cnt = r.rowsLen();
-            s.rows = try alloc.alloc(RowStruct, @intCast(_cnt));
-            @memset(s.rows, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.rowsAt(@intCast(_i));
-                s.rows[_i] = try RowStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        if (r.tableRow()) |_child| {
-            s.table_row = try RowStruct.fromReaderValue(alloc, _child);
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: TableReader) Error!*TableStruct {
-        const ptr = try alloc.create(TableStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *TableStruct, alloc: std.mem.Allocator) void {
         for (self.rows) |*_b| _b.deinit(alloc);
         alloc.free(self.rows);
@@ -1202,6 +1167,32 @@ pub const TableReader = struct {
             try child_view.verify();
         }
     }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableStruct {
+        var s = TableStruct{
+            .count = self.count(),
+        };
+        errdefer s.deinit(alloc);
+        s.payload = try alloc.dupe(u8, self.payload());
+        {
+            const _cnt = self.rowsLen();
+            s.rows = try alloc.alloc(RowStruct, @intCast(_cnt));
+            @memset(s.rows, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.rowsAt(@intCast(_i));
+                s.rows[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        if (self.tableRow()) |_child| {
+            s.table_row = try _child.toStructValue(alloc);
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TableStruct {
+        const ptr = try alloc.create(TableStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
 };
 
 pub const TableBuffer = struct {
@@ -1345,21 +1336,6 @@ pub const TableWriter = struct {
 
 pub const U32ArrayOnlyStruct = struct {
     values: []u32 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!U32ArrayOnlyStruct {
-        var s = U32ArrayOnlyStruct{};
-        errdefer s.deinit(alloc);
-        s.values = try r.valuesToSliceAlloc(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: U32ArrayOnlyReader) Error!*U32ArrayOnlyStruct {
-        const ptr = try alloc.create(U32ArrayOnlyStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *U32ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
         self.values = &.{};
@@ -1470,6 +1446,18 @@ pub const U32ArrayOnlyReader = struct {
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!U32ArrayOnlyStruct {
+        var s = U32ArrayOnlyStruct{};
+        errdefer s.deinit(alloc);
+        s.values = try self.valuesToSliceAlloc(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*U32ArrayOnlyStruct {
+        const ptr = try alloc.create(U32ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -1586,21 +1574,6 @@ pub const U32ArrayOnlyWriter = struct {
 
 pub const U64ArrayOnlyStruct = struct {
     values: []u64 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!U64ArrayOnlyStruct {
-        var s = U64ArrayOnlyStruct{};
-        errdefer s.deinit(alloc);
-        s.values = try r.valuesToSliceAlloc(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: U64ArrayOnlyReader) Error!*U64ArrayOnlyStruct {
-        const ptr = try alloc.create(U64ArrayOnlyStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *U64ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
         self.values = &.{};
@@ -1711,6 +1684,18 @@ pub const U64ArrayOnlyReader = struct {
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!U64ArrayOnlyStruct {
+        var s = U64ArrayOnlyStruct{};
+        errdefer s.deinit(alloc);
+        s.values = try self.valuesToSliceAlloc(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*U64ArrayOnlyStruct {
+        const ptr = try alloc.create(U64ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -1827,21 +1812,6 @@ pub const U64ArrayOnlyWriter = struct {
 
 pub const U16ArrayOnlyStruct = struct {
     values: []u16 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!U16ArrayOnlyStruct {
-        var s = U16ArrayOnlyStruct{};
-        errdefer s.deinit(alloc);
-        s.values = try r.valuesToSliceAlloc(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: U16ArrayOnlyReader) Error!*U16ArrayOnlyStruct {
-        const ptr = try alloc.create(U16ArrayOnlyStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *U16ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
         self.values = &.{};
@@ -1952,6 +1922,18 @@ pub const U16ArrayOnlyReader = struct {
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!U16ArrayOnlyStruct {
+        var s = U16ArrayOnlyStruct{};
+        errdefer s.deinit(alloc);
+        s.values = try self.valuesToSliceAlloc(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*U16ArrayOnlyStruct {
+        const ptr = try alloc.create(U16ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -2068,21 +2050,6 @@ pub const U16ArrayOnlyWriter = struct {
 
 pub const U8ArrayOnlyStruct = struct {
     values: []u8 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: U8ArrayOnlyReader) Error!U8ArrayOnlyStruct {
-        var s = U8ArrayOnlyStruct{};
-        errdefer s.deinit(alloc);
-        s.values = try r.valuesToSliceAlloc(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: U8ArrayOnlyReader) Error!*U8ArrayOnlyStruct {
-        const ptr = try alloc.create(U8ArrayOnlyStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *U8ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
         self.values = &.{};
@@ -2193,6 +2160,18 @@ pub const U8ArrayOnlyReader = struct {
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!U8ArrayOnlyStruct {
+        var s = U8ArrayOnlyStruct{};
+        errdefer s.deinit(alloc);
+        s.values = try self.valuesToSliceAlloc(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*U8ArrayOnlyStruct {
+        const ptr = try alloc.create(U8ArrayOnlyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 

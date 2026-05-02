@@ -509,6 +509,111 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
         }
     }
     try w.writeAll("    }\n");
+
+    // toStructValue: decode reader into an owned struct by value. Used by
+    // toStruct and parent readers internally; also exposed publicly so
+    // callers that want a value-form copy (no heap alloc) can avoid the
+    // pointer hop of toStruct. For scalar-only tables, deinit is a no-op.
+    try w.print("    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!{s}Struct {{\n", .{table_name});
+
+    // Step 1: inline-init scalars and bools (no allocation).
+    try w.print("        var s = {s}Struct{{\n", .{table_name});
+    inline for (infos) |info| {
+        const name_camel = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_camel);
+        switch (comptime schema.kindOf(info.ty)) {
+            .u8, .u16, .u32, .u64, .bool, .enum_ => {
+                try w.print("            .{s} = self.{s}(),\n", .{ info.name, name_camel });
+            },
+            else => {},
+        }
+    }
+    try w.writeAll("        };\n");
+
+    // Step 2: errdefer before any allocation so partial failures are safe.
+    try w.writeAll("        errdefer s.deinit(alloc);\n");
+
+    // Step 3: bytes fields — dupe the slice.
+    inline for (infos) |info| {
+        const name_camel = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_camel);
+        switch (comptime schema.kindOf(info.ty)) {
+            .bytes => {
+                try w.print("        s.{s} = try alloc.dupe(u8, self.{s}());\n", .{ info.name, name_camel });
+            },
+            else => {},
+        }
+    }
+
+    // Step 4: scalar array fields use ToSliceAlloc.
+    inline for (infos) |info| {
+        const name_camel = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_camel);
+        switch (comptime schema.kindOf(info.ty)) {
+            .array => {
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                switch (child_kind) {
+                    .u8, .u16, .u32, .u64 => {
+                        try w.print("        s.{s} = try self.{s}ToSliceAlloc(alloc);\n", .{ info.name, name_camel });
+                    },
+                    .table => {}, // handled in step 5
+                    else => @compileError("unsupported array child kind in struct toStructValue"),
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Step 5: table array fields — alloc slice, zero-init, then toStructValue each child.
+    inline for (infos) |info| {
+        const name_camel = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_camel);
+        switch (comptime schema.kindOf(info.ty)) {
+            .array => {
+                const child = comptime schema.childOfArray(info.ty);
+                const child_kind = comptime schema.kindOf(child);
+                if (child_kind == .table) {
+                    const child_name = tableNameForType(child);
+                    try w.writeAll("        {\n");
+                    try w.print("            const _cnt = self.{s}Len();\n", .{name_camel});
+                    try w.print("            s.{s} = try alloc.alloc({s}Struct, @intCast(_cnt));\n", .{ info.name, child_name });
+                    try w.print("            @memset(s.{s}, .{{}});\n", .{info.name});
+                    try w.writeAll("            for (0.._cnt) |_i| {\n");
+                    try w.print("                const _child = try self.{s}At(@intCast(_i));\n", .{name_camel});
+                    try w.print("                s.{s}[_i] = try _child.toStructValue(alloc);\n", .{info.name});
+                    try w.writeAll("            }\n");
+                    try w.writeAll("        }\n");
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Step 6: optional nested table fields.
+    inline for (infos) |info| {
+        const name_camel = try schema.camelName(alloc, info.name);
+        defer alloc.free(name_camel);
+        switch (comptime schema.kindOf(info.ty)) {
+            .table => {
+                try w.print("        if (self.{s}()) |_child| {{\n", .{name_camel});
+                try w.print("            s.{s} = try _child.toStructValue(alloc);\n", .{info.name});
+                try w.writeAll("        }\n");
+            },
+            else => {},
+        }
+    }
+
+    try w.writeAll("        return s;\n");
+    try w.writeAll("    }\n");
+
+    // toStruct: heap-allocate and decode reader into owned struct, returning a pointer.
+    try w.print("    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*{s}Struct {{\n", .{table_name});
+    try w.print("        const ptr = try alloc.create({s}Struct);\n", .{table_name});
+    try w.writeAll("        errdefer alloc.destroy(ptr);\n");
+    try w.writeAll("        ptr.* = try self.toStructValue(alloc);\n");
+    try w.writeAll("        return ptr;\n");
+    try w.writeAll("    }\n");
     try w.writeAll("};\n\n");
 
     // -------------------------
@@ -774,7 +879,8 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     try w.writeAll("};\n\n");
 }
 
-// emitStructType emits {Name}Struct with fromReader(alloc, r) and deinit(self*, alloc).
+// emitStructType emits {Name}Struct with deinit(self*, alloc), cloneValue, and clone.
+// Decoding from a Reader lives on the Reader itself (toStruct/toStructValue).
 // Fields are decoded into owned Zig values — no Reader needed after construction.
 fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime infos: anytype, w: anytype) !void {
     try w.print("pub const {s}Struct = struct {{\n", .{table_name});
@@ -814,112 +920,6 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
             },
         }
     }
-
-    // fromReaderValue: decode reader into owned struct by value. Used by
-    // fromReader and parent structs internally; also exposed publicly so
-    // callers that want a value-form copy (no heap alloc) can avoid the
-    // pointer hop of fromReader. For scalar-only tables, deinit is a no-op.
-    try w.print("\n    pub fn fromReaderValue(alloc: std.mem.Allocator, r: {s}Reader) Error!{s}Struct {{\n", .{ table_name, table_name });
-
-    // Step 1: inline-init scalars and bools (no allocation).
-    try w.print("        var s = {s}Struct{{\n", .{table_name});
-    inline for (infos) |info| {
-        const name_camel = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_camel);
-        switch (comptime schema.kindOf(info.ty)) {
-            .u8, .u16, .u32, .u64, .bool, .enum_ => {
-                try w.print("            .{s} = r.{s}(),\n", .{ info.name, name_camel });
-            },
-            else => {},
-        }
-    }
-    try w.writeAll("        };\n");
-
-    // Step 2: errdefer before any allocation so partial failures are safe.
-    try w.writeAll("        errdefer s.deinit(alloc);\n");
-
-    // Step 3: bytes fields — dupe the slice.
-    inline for (infos) |info| {
-        const name_camel = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_camel);
-        switch (comptime schema.kindOf(info.ty)) {
-            .bytes => {
-                try w.print("        s.{s} = try alloc.dupe(u8, r.{s}());\n", .{ info.name, name_camel });
-            },
-            else => {},
-        }
-    }
-
-    // Step 4: scalar array fields use ToSliceAlloc.
-    inline for (infos) |info| {
-        const name_camel = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_camel);
-        switch (comptime schema.kindOf(info.ty)) {
-            .array => {
-                const child = comptime schema.childOfArray(info.ty);
-                const child_kind = comptime schema.kindOf(child);
-                switch (child_kind) {
-                    .u8, .u16, .u32, .u64 => {
-                        try w.print("        s.{s} = try r.{s}ToSliceAlloc(alloc);\n", .{ info.name, name_camel });
-                    },
-                    .table => {}, // handled in step 5
-                    else => @compileError("unsupported array child kind in struct fromReader"),
-                }
-            },
-            else => {},
-        }
-    }
-
-    // Step 5: table array fields — alloc slice, zero-init, then fromReaderValue each child.
-    inline for (infos) |info| {
-        const name_camel = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_camel);
-        switch (comptime schema.kindOf(info.ty)) {
-            .array => {
-                const child = comptime schema.childOfArray(info.ty);
-                const child_kind = comptime schema.kindOf(child);
-                if (child_kind == .table) {
-                    const child_name = tableNameForType(child);
-                    try w.writeAll("        {\n");
-                    try w.print("            const _cnt = r.{s}Len();\n", .{name_camel});
-                    try w.print("            s.{s} = try alloc.alloc({s}Struct, @intCast(_cnt));\n", .{ info.name, child_name });
-                    try w.print("            @memset(s.{s}, .{{}});\n", .{info.name});
-                    try w.writeAll("            for (0.._cnt) |_i| {\n");
-                    try w.print("                const _child = try r.{s}At(@intCast(_i));\n", .{name_camel});
-                    try w.print("                s.{s}[_i] = try {s}Struct.fromReaderValue(alloc, _child);\n", .{ info.name, child_name });
-                    try w.writeAll("            }\n");
-                    try w.writeAll("        }\n");
-                }
-            },
-            else => {},
-        }
-    }
-
-    // Step 6: optional nested table fields.
-    inline for (infos) |info| {
-        const name_camel = try schema.camelName(alloc, info.name);
-        defer alloc.free(name_camel);
-        switch (comptime schema.kindOf(info.ty)) {
-            .table => {
-                const child_name = tableNameForType(info.ty);
-                try w.print("        if (r.{s}()) |_child| {{\n", .{name_camel});
-                try w.print("            s.{s} = try {s}Struct.fromReaderValue(alloc, _child);\n", .{ info.name, child_name });
-                try w.writeAll("        }\n");
-            },
-            else => {},
-        }
-    }
-
-    try w.writeAll("        return s;\n");
-    try w.writeAll("    }\n");
-
-    // fromReader: heap-allocate and decode reader into owned struct, returning a pointer.
-    try w.print("\n    pub fn fromReader(alloc: std.mem.Allocator, r: {s}Reader) Error!*{s}Struct {{\n", .{ table_name, table_name });
-    try w.print("        const ptr = try alloc.create({s}Struct);\n", .{table_name});
-    try w.writeAll("        errdefer alloc.destroy(ptr);\n");
-    try w.writeAll("        ptr.* = try fromReaderValue(alloc, r);\n");
-    try w.writeAll("        return ptr;\n");
-    try w.writeAll("    }\n\n");
 
     // deinit: free all allocated fields.
     const has_owned_fields = comptime blk: {

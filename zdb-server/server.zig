@@ -96,7 +96,7 @@ pub const StorageImpl = struct {
 
     fn applyManifestChange(self: *StorageImpl, index: u64, mc: zdb_bufs.ManifestChangeReader) !void {
         _ = index;
-        const mcs = try zdb_bufs.ManifestChangeStruct.fromReader(self.allocator, mc);
+        const mcs = try mc.toStruct(self.allocator);
         defer {
             mcs.deinit(self.allocator);
             self.allocator.destroy(mcs);

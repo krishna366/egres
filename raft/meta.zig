@@ -289,7 +289,7 @@ pub const MetaStore = struct {
         };
         const w = winner orelse return Error.MetaCorrupt;
 
-        self.hard_state = try zen.HardStateStruct.fromReaderValue(self.allocator, w.hs);
+        self.hard_state = try w.hs.toStructValue(self.allocator);
         self.active_slot = w.idx;
     }
 
@@ -322,9 +322,9 @@ pub const MetaStore = struct {
         const payload = zbuf.Frame.read(buf) catch return Error.SnapshotCorrupt;
 
         const reader = try zen.SnapshotReader.parseRoot(payload);
-        // fromReader returns a *SnapshotStruct that owns its data + conf_state.
+        // toStruct returns a *SnapshotStruct that owns its data + conf_state.
         // Same destroy/install pattern as setSnapshot.
-        const new_snap = try zen.SnapshotStruct.fromReader(self.allocator, reader);
+        const new_snap = try reader.toStruct(self.allocator);
         self.snapshot.destroy(self.allocator);
         self.snapshot = new_snap;
     }

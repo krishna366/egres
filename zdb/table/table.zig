@@ -100,7 +100,7 @@ pub const Table = struct {
         if (got_checksum != stored_checksum) return error.ChecksumMismatch;
 
         const index_reader = try buffers.TableIndexReader.init(index_bytes, 0);
-        var table_index = try buffers.TableIndexStruct.fromReader(allocator, index_reader);
+        var table_index = try index_reader.toStruct(allocator);
         errdefer table_index.deinit(allocator);
 
         const codec: compress.Codec = @enumFromInt(@intFromEnum(table_index.compression));

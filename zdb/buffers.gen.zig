@@ -53,24 +53,6 @@ pub const BlockIndexStruct = struct {
     key: []const u8 = &.{},
     offset: u32 = 0,
     len: u32 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: BlockIndexReader) Error!BlockIndexStruct {
-        var s = BlockIndexStruct{
-            .offset = r.offset(),
-            .len = r.len(),
-        };
-        errdefer s.deinit(alloc);
-        s.key = try alloc.dupe(u8, r.key());
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: BlockIndexReader) Error!*BlockIndexStruct {
-        const ptr = try alloc.create(BlockIndexStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *BlockIndexStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         self.key = &.{};
@@ -175,6 +157,21 @@ pub const BlockIndexReader = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!BlockIndexStruct {
+        var s = BlockIndexStruct{
+            .offset = self.offset(),
+            .len = self.len(),
+        };
+        errdefer s.deinit(alloc);
+        s.key = try alloc.dupe(u8, self.key());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*BlockIndexStruct {
+        const ptr = try alloc.create(BlockIndexStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -311,40 +308,6 @@ pub const TableIndexStruct = struct {
     last_key: []const u8 = &.{},
     blocks: []BlockIndexStruct = &.{},
     binary_fuse: ?BinaryFuseFilterStruct = null,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TableIndexReader) Error!TableIndexStruct {
-        var s = TableIndexStruct{
-            .max_version = r.maxVersion(),
-            .key_count = r.keyCount(),
-            .uncompressed_size = r.uncompressedSize(),
-            .compressed_size = r.compressedSize(),
-            .stale_data_size = r.staleDataSize(),
-            .compression = r.compression(),
-        };
-        errdefer s.deinit(alloc);
-        s.last_key = try alloc.dupe(u8, r.lastKey());
-        {
-            const _cnt = r.blocksLen();
-            s.blocks = try alloc.alloc(BlockIndexStruct, @intCast(_cnt));
-            @memset(s.blocks, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.blocksAt(@intCast(_i));
-                s.blocks[_i] = try BlockIndexStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        if (r.binaryFuse()) |_child| {
-            s.binary_fuse = try BinaryFuseFilterStruct.fromReaderValue(alloc, _child);
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: TableIndexReader) Error!*TableIndexStruct {
-        const ptr = try alloc.create(TableIndexStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.last_key);
         self.last_key = &.{};
@@ -584,6 +547,37 @@ pub const TableIndexReader = struct {
             try child_view.verify();
         }
     }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableIndexStruct {
+        var s = TableIndexStruct{
+            .max_version = self.maxVersion(),
+            .key_count = self.keyCount(),
+            .uncompressed_size = self.uncompressedSize(),
+            .compressed_size = self.compressedSize(),
+            .stale_data_size = self.staleDataSize(),
+            .compression = self.compression(),
+        };
+        errdefer s.deinit(alloc);
+        s.last_key = try alloc.dupe(u8, self.lastKey());
+        {
+            const _cnt = self.blocksLen();
+            s.blocks = try alloc.alloc(BlockIndexStruct, @intCast(_cnt));
+            @memset(s.blocks, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.blocksAt(@intCast(_i));
+                s.blocks[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        if (self.binaryFuse()) |_child| {
+            s.binary_fuse = try _child.toStructValue(alloc);
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TableIndexStruct {
+        const ptr = try alloc.create(TableIndexStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
 };
 
 pub const TableIndexBuffer = struct {
@@ -762,27 +756,6 @@ pub const BinaryFuseFilterStruct = struct {
     segment_count: u32 = 0,
     segment_count_length: u32 = 0,
     fingerprints: []u16 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: BinaryFuseFilterReader) Error!BinaryFuseFilterStruct {
-        var s = BinaryFuseFilterStruct{
-            .seed = r.seed(),
-            .segment_length = r.segmentLength(),
-            .segment_length_mask = r.segmentLengthMask(),
-            .segment_count = r.segmentCount(),
-            .segment_count_length = r.segmentCountLength(),
-        };
-        errdefer s.deinit(alloc);
-        s.fingerprints = try r.fingerprintsToSliceAlloc(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: BinaryFuseFilterReader) Error!*BinaryFuseFilterStruct {
-        const ptr = try alloc.create(BinaryFuseFilterStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *BinaryFuseFilterStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.fingerprints);
         self.fingerprints = &.{};
@@ -945,6 +918,24 @@ pub const BinaryFuseFilterReader = struct {
             }
         }
     }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!BinaryFuseFilterStruct {
+        var s = BinaryFuseFilterStruct{
+            .seed = self.seed(),
+            .segment_length = self.segmentLength(),
+            .segment_length_mask = self.segmentLengthMask(),
+            .segment_count = self.segmentCount(),
+            .segment_count_length = self.segmentCountLength(),
+        };
+        errdefer s.deinit(alloc);
+        s.fingerprints = try self.fingerprintsToSliceAlloc(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*BinaryFuseFilterStruct {
+        const ptr = try alloc.create(BinaryFuseFilterStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
 };
 
 pub const BinaryFuseFilterBuffer = struct {
@@ -1094,26 +1085,6 @@ pub const TreeChangeStruct = struct {
     tree_id: u64 = 0,
     left_key: []const u8 = &.{},
     right_key: []const u8 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TreeChangeReader) Error!TreeChangeStruct {
-        var s = TreeChangeStruct{
-            .op = r.op(),
-            .namespace_id = r.namespaceId(),
-            .tree_id = r.treeId(),
-        };
-        errdefer s.deinit(alloc);
-        s.left_key = try alloc.dupe(u8, r.leftKey());
-        s.right_key = try alloc.dupe(u8, r.rightKey());
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: TreeChangeReader) Error!*TreeChangeStruct {
-        const ptr = try alloc.create(TreeChangeStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.left_key);
         self.left_key = &.{};
@@ -1251,6 +1222,23 @@ pub const TreeChangeReader = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TreeChangeStruct {
+        var s = TreeChangeStruct{
+            .op = self.op(),
+            .namespace_id = self.namespaceId(),
+            .tree_id = self.treeId(),
+        };
+        errdefer s.deinit(alloc);
+        s.left_key = try alloc.dupe(u8, self.leftKey());
+        s.right_key = try alloc.dupe(u8, self.rightKey());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TreeChangeStruct {
+        const ptr = try alloc.create(TreeChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -1404,27 +1392,6 @@ pub const TableChangeStruct = struct {
     tree_id: u64 = 0,
     checksum: u32 = 0,
     size: u64 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TableChangeReader) Error!TableChangeStruct {
-        var s = TableChangeStruct{
-            .op = r.op(),
-            .level = r.level(),
-            .table_id = r.tableId(),
-            .tree_id = r.treeId(),
-            .checksum = r.checksum(),
-            .size = r.size(),
-        };
-        errdefer s.deinit(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: TableChangeReader) Error!*TableChangeStruct {
-        const ptr = try alloc.create(TableChangeStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *TableChangeStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -1547,6 +1514,24 @@ pub const TableChangeReader = struct {
 
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableChangeStruct {
+        var s = TableChangeStruct{
+            .op = self.op(),
+            .level = self.level(),
+            .table_id = self.tableId(),
+            .tree_id = self.treeId(),
+            .checksum = self.checksum(),
+            .size = self.size(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TableChangeStruct {
+        const ptr = try alloc.create(TableChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -1688,41 +1673,6 @@ pub const ManifestChangeStruct = struct {
     table_changes: []TableChangeStruct = &.{},
     cmd: u32 = 0,
     memtable_id: u64 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ManifestChangeReader) Error!ManifestChangeStruct {
-        var s = ManifestChangeStruct{
-            .cmd = r.cmd(),
-            .memtable_id = r.memtableId(),
-        };
-        errdefer s.deinit(alloc);
-        {
-            const _cnt = r.treeChangesLen();
-            s.tree_changes = try alloc.alloc(TreeChangeStruct, @intCast(_cnt));
-            @memset(s.tree_changes, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.treeChangesAt(@intCast(_i));
-                s.tree_changes[_i] = try TreeChangeStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        {
-            const _cnt = r.tableChangesLen();
-            s.table_changes = try alloc.alloc(TableChangeStruct, @intCast(_cnt));
-            @memset(s.table_changes, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.tableChangesAt(@intCast(_i));
-                s.table_changes[_i] = try TableChangeStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: ManifestChangeReader) Error!*ManifestChangeStruct {
-        const ptr = try alloc.create(ManifestChangeStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
         for (self.tree_changes) |*_b| _b.deinit(alloc);
         alloc.free(self.tree_changes);
@@ -1941,6 +1891,38 @@ pub const ManifestChangeReader = struct {
             try child_view.verify();
         }
     }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!ManifestChangeStruct {
+        var s = ManifestChangeStruct{
+            .cmd = self.cmd(),
+            .memtable_id = self.memtableId(),
+        };
+        errdefer s.deinit(alloc);
+        {
+            const _cnt = self.treeChangesLen();
+            s.tree_changes = try alloc.alloc(TreeChangeStruct, @intCast(_cnt));
+            @memset(s.tree_changes, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.treeChangesAt(@intCast(_i));
+                s.tree_changes[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        {
+            const _cnt = self.tableChangesLen();
+            s.table_changes = try alloc.alloc(TableChangeStruct, @intCast(_cnt));
+            @memset(s.table_changes, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.tableChangesAt(@intCast(_i));
+                s.table_changes[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*ManifestChangeStruct {
+        const ptr = try alloc.create(ManifestChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
 };
 
 pub const ManifestChangeBuffer = struct {
@@ -2083,22 +2065,6 @@ pub const ManifestChangeWriter = struct {
 pub const KeyValueStruct = struct {
     key: []const u8 = &.{},
     value: []const u8 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: KeyValueReader) Error!KeyValueStruct {
-        var s = KeyValueStruct{};
-        errdefer s.deinit(alloc);
-        s.key = try alloc.dupe(u8, r.key());
-        s.value = try alloc.dupe(u8, r.value());
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: KeyValueReader) Error!*KeyValueStruct {
-        const ptr = try alloc.create(KeyValueStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *KeyValueStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         self.key = &.{};
@@ -2205,6 +2171,19 @@ pub const KeyValueReader = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!KeyValueStruct {
+        var s = KeyValueStruct{};
+        errdefer s.deinit(alloc);
+        s.key = try alloc.dupe(u8, self.key());
+        s.value = try alloc.dupe(u8, self.value());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*KeyValueStruct {
+        const ptr = try alloc.create(KeyValueStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -2336,31 +2315,6 @@ pub const KeyValueWriter = struct {
 pub const MutationsStruct = struct {
     namespace: u32 = 0,
     kvs: []KeyValueStruct = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: MutationsReader) Error!MutationsStruct {
-        var s = MutationsStruct{
-            .namespace = r.namespace(),
-        };
-        errdefer s.deinit(alloc);
-        {
-            const _cnt = r.kvsLen();
-            s.kvs = try alloc.alloc(KeyValueStruct, @intCast(_cnt));
-            @memset(s.kvs, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.kvsAt(@intCast(_i));
-                s.kvs[_i] = try KeyValueStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: MutationsReader) Error!*MutationsStruct {
-        const ptr = try alloc.create(MutationsStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *MutationsStruct, alloc: std.mem.Allocator) void {
         for (self.kvs) |*_b| _b.deinit(alloc);
         alloc.free(self.kvs);
@@ -2500,6 +2454,28 @@ pub const MutationsReader = struct {
             const child_view = try self.kvsAt(i_kvs);
             try child_view.verify();
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!MutationsStruct {
+        var s = MutationsStruct{
+            .namespace = self.namespace(),
+        };
+        errdefer s.deinit(alloc);
+        {
+            const _cnt = self.kvsLen();
+            s.kvs = try alloc.alloc(KeyValueStruct, @intCast(_cnt));
+            @memset(s.kvs, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.kvsAt(@intCast(_i));
+                s.kvs[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*MutationsStruct {
+        const ptr = try alloc.create(MutationsStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 

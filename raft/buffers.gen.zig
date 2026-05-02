@@ -85,24 +85,6 @@ pub const ConfChangeStruct = struct {
     change_type: ChangeTypeEnum = @enumFromInt(0),
     node_id: u64 = 0,
     addr: []const u8 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfChangeReader) Error!ConfChangeStruct {
-        var s = ConfChangeStruct{
-            .change_type = r.changeType(),
-            .node_id = r.nodeId(),
-        };
-        errdefer s.deinit(alloc);
-        s.addr = try alloc.dupe(u8, r.addr());
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: ConfChangeReader) Error!*ConfChangeStruct {
-        const ptr = try alloc.create(ConfChangeStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *ConfChangeStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.addr);
         self.addr = &.{};
@@ -208,6 +190,21 @@ pub const ConfChangeReader = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!ConfChangeStruct {
+        var s = ConfChangeStruct{
+            .change_type = self.changeType(),
+            .node_id = self.nodeId(),
+        };
+        errdefer s.deinit(alloc);
+        s.addr = try alloc.dupe(u8, self.addr());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*ConfChangeStruct {
+        const ptr = try alloc.create(ConfChangeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -341,29 +338,6 @@ pub const LogEntryStruct = struct {
     data: []const u8 = &.{},
     entry_type: EntryTypeEnum = @enumFromInt(0),
     conf_change: ?ConfChangeStruct = null,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: LogEntryReader) Error!LogEntryStruct {
-        var s = LogEntryStruct{
-            .index = r.index(),
-            .term = r.term(),
-            .timestamp = r.timestamp(),
-            .entry_type = r.entryType(),
-        };
-        errdefer s.deinit(alloc);
-        s.data = try alloc.dupe(u8, r.data());
-        if (r.confChange()) |_child| {
-            s.conf_change = try ConfChangeStruct.fromReaderValue(alloc, _child);
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: LogEntryReader) Error!*LogEntryStruct {
-        const ptr = try alloc.create(LogEntryStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *LogEntryStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.data = &.{};
@@ -514,6 +488,26 @@ pub const LogEntryReader = struct {
         if (self.confChange()) |child_view| {
             try child_view.verify();
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!LogEntryStruct {
+        var s = LogEntryStruct{
+            .index = self.index(),
+            .term = self.term(),
+            .timestamp = self.timestamp(),
+            .entry_type = self.entryType(),
+        };
+        errdefer s.deinit(alloc);
+        s.data = try alloc.dupe(u8, self.data());
+        if (self.confChange()) |_child| {
+            s.conf_change = try _child.toStructValue(alloc);
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*LogEntryStruct {
+        const ptr = try alloc.create(LogEntryStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -667,27 +661,6 @@ pub const RequestVoteStruct = struct {
     last_log_index: u64 = 0,
     last_log_term: u64 = 0,
     status: u16 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReader) Error!RequestVoteStruct {
-        var s = RequestVoteStruct{
-            .is_prevote = r.isPrevote(),
-            .term = r.term(),
-            .candidate_id = r.candidateId(),
-            .last_log_index = r.lastLogIndex(),
-            .last_log_term = r.lastLogTerm(),
-            .status = r.status(),
-        };
-        errdefer s.deinit(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: RequestVoteReader) Error!*RequestVoteStruct {
-        const ptr = try alloc.create(RequestVoteStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *RequestVoteStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -820,6 +793,24 @@ pub const RequestVoteReader = struct {
 
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!RequestVoteStruct {
+        var s = RequestVoteStruct{
+            .is_prevote = self.isPrevote(),
+            .term = self.term(),
+            .candidate_id = self.candidateId(),
+            .last_log_index = self.lastLogIndex(),
+            .last_log_term = self.lastLogTerm(),
+            .status = self.status(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*RequestVoteStruct {
+        const ptr = try alloc.create(RequestVoteStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -995,26 +986,6 @@ pub const RequestVoteReplyStruct = struct {
     term: u64 = 0,
     from: u64 = 0,
     status: u16 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: RequestVoteReplyReader) Error!RequestVoteReplyStruct {
-        var s = RequestVoteReplyStruct{
-            .is_prevote = r.isPrevote(),
-            .vote_granted = r.voteGranted(),
-            .term = r.term(),
-            .from = r.from(),
-            .status = r.status(),
-        };
-        errdefer s.deinit(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: RequestVoteReplyReader) Error!*RequestVoteReplyStruct {
-        const ptr = try alloc.create(RequestVoteReplyStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *RequestVoteReplyStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -1138,6 +1109,23 @@ pub const RequestVoteReplyReader = struct {
 
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!RequestVoteReplyStruct {
+        var s = RequestVoteReplyStruct{
+            .is_prevote = self.isPrevote(),
+            .vote_granted = self.voteGranted(),
+            .term = self.term(),
+            .from = self.from(),
+            .status = self.status(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*RequestVoteReplyStruct {
+        const ptr = try alloc.create(RequestVoteReplyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -1315,35 +1303,6 @@ pub const AppendEntriesStruct = struct {
     prev_log_index: u64 = 0,
     prev_log_term: u64 = 0,
     entries: []LogEntryStruct = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReader) Error!AppendEntriesStruct {
-        var s = AppendEntriesStruct{
-            .term = r.term(),
-            .leader_id = r.leaderId(),
-            .leader_commit = r.leaderCommit(),
-            .prev_log_index = r.prevLogIndex(),
-            .prev_log_term = r.prevLogTerm(),
-        };
-        errdefer s.deinit(alloc);
-        {
-            const _cnt = r.entriesLen();
-            s.entries = try alloc.alloc(LogEntryStruct, @intCast(_cnt));
-            @memset(s.entries, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.entriesAt(@intCast(_i));
-                s.entries[_i] = try LogEntryStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: AppendEntriesReader) Error!*AppendEntriesStruct {
-        const ptr = try alloc.create(AppendEntriesStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *AppendEntriesStruct, alloc: std.mem.Allocator) void {
         for (self.entries) |*_b| _b.deinit(alloc);
         alloc.free(self.entries);
@@ -1524,6 +1483,32 @@ pub const AppendEntriesReader = struct {
             try child_view.verify();
         }
     }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!AppendEntriesStruct {
+        var s = AppendEntriesStruct{
+            .term = self.term(),
+            .leader_id = self.leaderId(),
+            .leader_commit = self.leaderCommit(),
+            .prev_log_index = self.prevLogIndex(),
+            .prev_log_term = self.prevLogTerm(),
+        };
+        errdefer s.deinit(alloc);
+        {
+            const _cnt = self.entriesLen();
+            s.entries = try alloc.alloc(LogEntryStruct, @intCast(_cnt));
+            @memset(s.entries, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.entriesAt(@intCast(_i));
+                s.entries[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*AppendEntriesStruct {
+        const ptr = try alloc.create(AppendEntriesStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
 };
 
 pub const AppendEntriesBuffer = struct {
@@ -1675,28 +1660,6 @@ pub const AppendEntriesReplyStruct = struct {
     last_index: u64 = 0,
     conflict_term: u64 = 0,
     conflict_index: u64 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: AppendEntriesReplyReader) Error!AppendEntriesReplyStruct {
-        var s = AppendEntriesReplyStruct{
-            .success = r.success(),
-            .term = r.term(),
-            .status = r.status(),
-            .from = r.from(),
-            .last_index = r.lastIndex(),
-            .conflict_term = r.conflictTerm(),
-            .conflict_index = r.conflictIndex(),
-        };
-        errdefer s.deinit(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: AppendEntriesReplyReader) Error!*AppendEntriesReplyStruct {
-        const ptr = try alloc.create(AppendEntriesReplyStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *AppendEntriesReplyStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -1839,6 +1802,25 @@ pub const AppendEntriesReplyReader = struct {
 
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!AppendEntriesReplyStruct {
+        var s = AppendEntriesReplyStruct{
+            .success = self.success(),
+            .term = self.term(),
+            .status = self.status(),
+            .from = self.from(),
+            .last_index = self.lastIndex(),
+            .conflict_term = self.conflictTerm(),
+            .conflict_index = self.conflictIndex(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*AppendEntriesReplyStruct {
+        const ptr = try alloc.create(AppendEntriesReplyStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -2017,23 +1999,6 @@ pub const AppendEntriesReplyWriter = struct {
 pub const TransportHandshakeStruct = struct {
     cluster_id: u64 = 0,
     node_id: u64 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: TransportHandshakeReader) Error!TransportHandshakeStruct {
-        var s = TransportHandshakeStruct{
-            .cluster_id = r.clusterId(),
-            .node_id = r.nodeId(),
-        };
-        errdefer s.deinit(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: TransportHandshakeReader) Error!*TransportHandshakeStruct {
-        const ptr = try alloc.create(TransportHandshakeStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *TransportHandshakeStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -2116,6 +2081,20 @@ pub const TransportHandshakeReader = struct {
 
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TransportHandshakeStruct {
+        var s = TransportHandshakeStruct{
+            .cluster_id = self.clusterId(),
+            .node_id = self.nodeId(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TransportHandshakeStruct {
+        const ptr = try alloc.create(TransportHandshakeStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -2232,24 +2211,6 @@ pub const JoinRequestStruct = struct {
     cluster_id: u64 = 0,
     node_id: u64 = 0,
     addr: []const u8 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: JoinRequestReader) Error!JoinRequestStruct {
-        var s = JoinRequestStruct{
-            .cluster_id = r.clusterId(),
-            .node_id = r.nodeId(),
-        };
-        errdefer s.deinit(alloc);
-        s.addr = try alloc.dupe(u8, r.addr());
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: JoinRequestReader) Error!*JoinRequestStruct {
-        const ptr = try alloc.create(JoinRequestStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *JoinRequestStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.addr);
         self.addr = &.{};
@@ -2354,6 +2315,21 @@ pub const JoinRequestReader = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!JoinRequestStruct {
+        var s = JoinRequestStruct{
+            .cluster_id = self.clusterId(),
+            .node_id = self.nodeId(),
+        };
+        errdefer s.deinit(alloc);
+        s.addr = try alloc.dupe(u8, self.addr());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*JoinRequestStruct {
+        const ptr = try alloc.create(JoinRequestStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -2486,26 +2462,6 @@ pub const JoinResponseStruct = struct {
     leader_id: u64 = 0,
     reason_code: u32 = 0,
     leader_addr: []const u8 = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: JoinResponseReader) Error!JoinResponseStruct {
-        var s = JoinResponseStruct{
-            .accepted = r.accepted(),
-            .status = r.status(),
-            .leader_id = r.leaderId(),
-            .reason_code = r.reasonCode(),
-        };
-        errdefer s.deinit(alloc);
-        s.leader_addr = try alloc.dupe(u8, r.leaderAddr());
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: JoinResponseReader) Error!*JoinResponseStruct {
-        const ptr = try alloc.create(JoinResponseStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *JoinResponseStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.leader_addr);
         self.leader_addr = &.{};
@@ -2640,6 +2596,23 @@ pub const JoinResponseReader = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!JoinResponseStruct {
+        var s = JoinResponseStruct{
+            .accepted = self.accepted(),
+            .status = self.status(),
+            .leader_id = self.leaderId(),
+            .reason_code = self.reasonCode(),
+        };
+        errdefer s.deinit(alloc);
+        s.leader_addr = try alloc.dupe(u8, self.leaderAddr());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*JoinResponseStruct {
+        const ptr = try alloc.create(JoinResponseStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -2815,24 +2788,6 @@ pub const ConfStatePeerStruct = struct {
     id: u64 = 0,
     addr: []const u8 = &.{},
     role: RoleEnum = @enumFromInt(0),
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStatePeerReader) Error!ConfStatePeerStruct {
-        var s = ConfStatePeerStruct{
-            .id = r.id(),
-            .role = r.role(),
-        };
-        errdefer s.deinit(alloc);
-        s.addr = try alloc.dupe(u8, r.addr());
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: ConfStatePeerReader) Error!*ConfStatePeerStruct {
-        const ptr = try alloc.create(ConfStatePeerStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *ConfStatePeerStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.addr);
         self.addr = &.{};
@@ -2938,6 +2893,21 @@ pub const ConfStatePeerReader = struct {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!ConfStatePeerStruct {
+        var s = ConfStatePeerStruct{
+            .id = self.id(),
+            .role = self.role(),
+        };
+        errdefer s.deinit(alloc);
+        s.addr = try alloc.dupe(u8, self.addr());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*ConfStatePeerStruct {
+        const ptr = try alloc.create(ConfStatePeerStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -3066,29 +3036,6 @@ pub const ConfStatePeerWriter = struct {
 
 pub const ConfStateStruct = struct {
     peers: []ConfStatePeerStruct = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: ConfStateReader) Error!ConfStateStruct {
-        var s = ConfStateStruct{};
-        errdefer s.deinit(alloc);
-        {
-            const _cnt = r.peersLen();
-            s.peers = try alloc.alloc(ConfStatePeerStruct, @intCast(_cnt));
-            @memset(s.peers, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.peersAt(@intCast(_i));
-                s.peers[_i] = try ConfStatePeerStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: ConfStateReader) Error!*ConfStateStruct {
-        const ptr = try alloc.create(ConfStateStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *ConfStateStruct, alloc: std.mem.Allocator) void {
         for (self.peers) |*_b| _b.deinit(alloc);
         alloc.free(self.peers);
@@ -3218,6 +3165,26 @@ pub const ConfStateReader = struct {
             try child_view.verify();
         }
     }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!ConfStateStruct {
+        var s = ConfStateStruct{};
+        errdefer s.deinit(alloc);
+        {
+            const _cnt = self.peersLen();
+            s.peers = try alloc.alloc(ConfStatePeerStruct, @intCast(_cnt));
+            @memset(s.peers, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.peersAt(@intCast(_i));
+                s.peers[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*ConfStateStruct {
+        const ptr = try alloc.create(ConfStateStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
 };
 
 pub const ConfStateBuffer = struct {
@@ -3337,26 +3304,6 @@ pub const HardStateStruct = struct {
     voted_for: u64 = 0,
     raft_id: u64 = 0,
     checkpoint_index: u64 = 0,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: HardStateReader) Error!HardStateStruct {
-        var s = HardStateStruct{
-            .seq = r.seq(),
-            .current_term = r.currentTerm(),
-            .voted_for = r.votedFor(),
-            .raft_id = r.raftId(),
-            .checkpoint_index = r.checkpointIndex(),
-        };
-        errdefer s.deinit(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: HardStateReader) Error!*HardStateStruct {
-        const ptr = try alloc.create(HardStateStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *HardStateStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -3469,6 +3416,23 @@ pub const HardStateReader = struct {
 
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!HardStateStruct {
+        var s = HardStateStruct{
+            .seq = self.seq(),
+            .current_term = self.currentTerm(),
+            .voted_for = self.votedFor(),
+            .raft_id = self.raftId(),
+            .checkpoint_index = self.checkpointIndex(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*HardStateStruct {
+        const ptr = try alloc.create(HardStateStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -3604,27 +3568,6 @@ pub const SnapshotStruct = struct {
     term: u64 = 0,
     data: []const u8 = &.{},
     conf_state: ?ConfStateStruct = null,
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: SnapshotReader) Error!SnapshotStruct {
-        var s = SnapshotStruct{
-            .index = r.index(),
-            .term = r.term(),
-        };
-        errdefer s.deinit(alloc);
-        s.data = try alloc.dupe(u8, r.data());
-        if (r.confState()) |_child| {
-            s.conf_state = try ConfStateStruct.fromReaderValue(alloc, _child);
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: SnapshotReader) Error!*SnapshotStruct {
-        const ptr = try alloc.create(SnapshotStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *SnapshotStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.data = &.{};
@@ -3754,6 +3697,24 @@ pub const SnapshotReader = struct {
         if (self.confState()) |child_view| {
             try child_view.verify();
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!SnapshotStruct {
+        var s = SnapshotStruct{
+            .index = self.index(),
+            .term = self.term(),
+        };
+        errdefer s.deinit(alloc);
+        s.data = try alloc.dupe(u8, self.data());
+        if (self.confState()) |_child| {
+            s.conf_state = try _child.toStructValue(alloc);
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*SnapshotStruct {
+        const ptr = try alloc.create(SnapshotStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -3896,28 +3857,6 @@ pub const WalSlotStruct = struct {
     data_len: u32 = 0,
     flags: u16 = 0,
     entry_type: EntryTypeEnum = @enumFromInt(0),
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: WalSlotReader) Error!WalSlotStruct {
-        var s = WalSlotStruct{
-            .term = r.term(),
-            .index = r.index(),
-            .timestamp = r.timestamp(),
-            .data_offset = r.dataOffset(),
-            .data_len = r.dataLen(),
-            .flags = r.flags(),
-            .entry_type = r.entryType(),
-        };
-        errdefer s.deinit(alloc);
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: WalSlotReader) Error!*WalSlotStruct {
-        const ptr = try alloc.create(WalSlotStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *WalSlotStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -4051,6 +3990,25 @@ pub const WalSlotReader = struct {
 
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!WalSlotStruct {
+        var s = WalSlotStruct{
+            .term = self.term(),
+            .index = self.index(),
+            .timestamp = self.timestamp(),
+            .data_offset = self.dataOffset(),
+            .data_len = self.dataLen(),
+            .flags = self.flags(),
+            .entry_type = self.entryType(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*WalSlotStruct {
+        const ptr = try alloc.create(WalSlotStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 
@@ -4196,32 +4154,6 @@ pub const WalSlotWriter = struct {
 pub const WalHeaderStruct = struct {
     base_slot: ?WalSlotStruct = null,
     slots: []WalSlotStruct = &.{},
-
-    pub fn fromReaderValue(alloc: std.mem.Allocator, r: WalHeaderReader) Error!WalHeaderStruct {
-        var s = WalHeaderStruct{};
-        errdefer s.deinit(alloc);
-        {
-            const _cnt = r.slotsLen();
-            s.slots = try alloc.alloc(WalSlotStruct, @intCast(_cnt));
-            @memset(s.slots, .{});
-            for (0.._cnt) |_i| {
-                const _child = try r.slotsAt(@intCast(_i));
-                s.slots[_i] = try WalSlotStruct.fromReaderValue(alloc, _child);
-            }
-        }
-        if (r.baseSlot()) |_child| {
-            s.base_slot = try WalSlotStruct.fromReaderValue(alloc, _child);
-        }
-        return s;
-    }
-
-    pub fn fromReader(alloc: std.mem.Allocator, r: WalHeaderReader) Error!*WalHeaderStruct {
-        const ptr = try alloc.create(WalHeaderStruct);
-        errdefer alloc.destroy(ptr);
-        ptr.* = try fromReaderValue(alloc, r);
-        return ptr;
-    }
-
     pub fn deinit(self: *WalHeaderStruct, alloc: std.mem.Allocator) void {
         if (self.base_slot) |*_bf| _bf.deinit(alloc);
         self.base_slot = null;
@@ -4375,6 +4307,29 @@ pub const WalHeaderReader = struct {
             const child_view = try self.slotsAt(i_slots);
             try child_view.verify();
         }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!WalHeaderStruct {
+        var s = WalHeaderStruct{};
+        errdefer s.deinit(alloc);
+        {
+            const _cnt = self.slotsLen();
+            s.slots = try alloc.alloc(WalSlotStruct, @intCast(_cnt));
+            @memset(s.slots, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.slotsAt(@intCast(_i));
+                s.slots[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        if (self.baseSlot()) |_child| {
+            s.base_slot = try _child.toStructValue(alloc);
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*WalHeaderStruct {
+        const ptr = try alloc.create(WalHeaderStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
     }
 };
 

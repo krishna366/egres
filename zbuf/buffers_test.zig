@@ -419,7 +419,7 @@ test "clone deep copies nested struct" {
         .Table => |v| v,
         else => return error.Invalid,
     };
-    const original = try gen.TableStruct.fromReader(alloc, root);
+    const original = try root.toStruct(alloc);
     defer original.destroy(alloc);
 
     // Clone — returns heap-allocated pointer, cleaned up via destroy.
@@ -495,7 +495,7 @@ test "clone of struct with null optional table" {
         .Table => |v| v,
         else => return error.Invalid,
     };
-    const original = try gen.TableStruct.fromReader(alloc, root);
+    const original = try root.toStruct(alloc);
     defer original.destroy(alloc);
 
     try std.testing.expect(original.table_row == null);
@@ -539,7 +539,7 @@ test "clone roundtrip matches marshal" {
         .Table => |v| v,
         else => return error.Invalid,
     };
-    const original = try gen.TableStruct.fromReader(alloc, root);
+    const original = try root.toStruct(alloc);
     defer original.destroy(alloc);
 
     // Clone, then marshal both and compare.
