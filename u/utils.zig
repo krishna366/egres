@@ -304,13 +304,18 @@ pub fn runTestsInZioRuntime(comptime Module: type) !void {
         fn run() !void {
             const decls = @typeInfo(Module).@"struct".decls;
             inline for (decls) |d| {
-                if (comptime std.mem.startsWith(u8, d.name, "test")) {
-                    const func = @field(Module, d.name);
-                    const F = @TypeOf(func);
-                    if (F == fn () anyerror!void) {
-                        std.debug.print("  running {s}...\n", .{d.name});
-                        try func();
-                    }
+                if (comptime !std.mem.startsWith(u8, d.name, "test")) continue;
+                const func = @field(Module, d.name);
+                const fn_info = comptime @typeInfo(@TypeOf(func));
+                if (comptime fn_info != .@"fn") continue;
+                if (comptime fn_info.@"fn".params.len != 0) continue;
+
+                std.debug.print("  running {s}...\n", .{d.name});
+                const ret_ty = comptime fn_info.@"fn".return_type orelse void;
+                if (comptime @typeInfo(ret_ty) == .error_union) {
+                    try func();
+                } else {
+                    func();
                 }
             }
         }

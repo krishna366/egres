@@ -5,7 +5,24 @@ const zdb = @import("zdb");
 const runtime = @import("runtime");
 const proto = @import("protocol.zig");
 const m = @import("metrics");
+const flags = @import("flags");
 const WaitGroup = @import("raft").utils.WaitGroup;
+
+/// `--snapshot` — Raft snapshot triggers and polling cadence. The leader's
+/// snapshot loop reads these every iteration so operators can tune at
+/// runtime via the live flags channel.
+pub const SnapshotCfg = struct {
+    min_bytes: u64 = 1 << 30, // 1 GiB
+    min_age_seconds: u64 = 10 * 60, // 10 minutes
+    poll_interval_seconds: u64 = 30,
+
+    pub const docs = .{
+        .self = "Raft snapshot triggers. Leader proposes a snapshot when WAL tail bytes from head reach min_bytes OR an entry crosses min_age_seconds.",
+        .min_bytes = "Snapshot triggers once WAL tail-bytes-from-head reach this. Default 1 GiB.",
+        .min_age_seconds = "Snapshot triggers when an entry is at least this many seconds older than wall clock. Default 600 (10 min).",
+        .poll_interval_seconds = "How often the snapshot loop checks the criteria. Default 30s.",
+    };
+};
 
 const zdb_bufs = zdb.buffers;
 const manifest = zdb.manifest;
@@ -19,6 +36,20 @@ const log = std.log.scoped(.zdb_server);
 pub const StorageImpl = struct {
     forest: *Forest,
     allocator: std.mem.Allocator,
+    node: *raft.Node,
+    snapshot_cfg: *flags.Live(SnapshotCfg),
+    /// Gate the apply path until `recoverFromSnapshot` finishes. Until then
+    /// trees, route tables, and SST files referenced by the snapshot may not
+    /// be in place, and apply would error-retry-spin. Set to true via defer
+    /// at the top of `recoverFromSnapshot`, so the no-snapshot fast path
+    /// also flips it (no permanent block).
+    recovery_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Skip Mutations whose log index is strictly less than this during
+    /// recovery replay — the corresponding data is in SSTs that the replay
+    /// will install. Set from the recovery snapshot's
+    /// `oldest_memtable_index` field (0 if no snapshot, equivalent to "no
+    /// skipping"). Read-only after `recovery_done` flips, so no atomic.
+    oldest_memtable_index: u64 = 0,
 
     pub fn asStateMachine(self: *StorageImpl) raft.Node.StateMachine {
         return .{
@@ -37,6 +68,15 @@ pub const StorageImpl = struct {
         // timestamp becomes visible to blocked readers.
         if (data.len == 0) return;
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+
+        // Recovery barrier: if `runRecovery` is still fetching SSTs and
+        // installing the snapshot manifest, applies would fail (missing
+        // trees/files). Park until the barrier flips.
+        while (!self.recovery_done.load(.acquire)) {
+            if (self.node.isShuttingDown()) return;
+            zio.sleep(zio.Duration.fromMilliseconds(50)) catch return;
+        }
+
         while (true) {
             self.applyEntryInner(entry, data) catch |err| {
                 log.err("on_apply: failed at index={d}: {s}, retrying", .{ entry.index, @errorName(err) });
@@ -54,6 +94,14 @@ pub const StorageImpl = struct {
         };
         switch (parsed) {
             .Mutations => |ms| {
+                // Recovery shortcut: mutations below `oldest_memtable_index`
+                // are durable in SSTs that the replay will install via
+                // upcoming flush proposals. Putting them into the
+                // placeholder memtable here would just waste CPU — the
+                // placeholder is discarded by the first replayed
+                // `newMemtable` anyway.
+                if (entry.index < self.oldest_memtable_index) return;
+
                 const ns = ms.namespace();
                 const count = ms.kvsLen();
 
@@ -95,7 +143,6 @@ pub const StorageImpl = struct {
     }
 
     fn applyManifestChange(self: *StorageImpl, index: u64, mc: zdb_bufs.ManifestChangeReader) !void {
-        _ = index;
         const mcs = try mc.toStruct(self.allocator);
         defer {
             mcs.deinit(self.allocator);
@@ -110,7 +157,7 @@ pub const StorageImpl = struct {
         }
 
         switch (mcs.cmd) {
-            1 => try self.forest.newMemtable(mcs.memtable_id),
+            1 => try self.forest.newMemtable(mcs.memtable_id, index),
             2 => try self.forest.applyFlush(mcs.table_changes, mcs.memtable_id),
             3 => {
                 if (mcs.table_changes.len > 0) {
@@ -141,6 +188,224 @@ pub const StorageImpl = struct {
         return self.forest.hasFile(file_id);
     }
 
+    /// Restore the manifest from `wal.snapshot().data` and bring the in-memory
+    /// trees online. If any SST files referenced by the manifest are missing
+    /// from disk, fetch them from the leader (retry until success or shutdown).
+    /// No-op when there is no snapshot on disk.
+    ///
+    /// Must run AFTER `node.initTransport()` so file fetches can use the
+    /// transport, and AFTER raft has started so a leader is reachable
+    /// (followers learn `leader_id` via AppendEntries; nodes that joined via
+    /// seeds learn it via the join response). The apply loop tolerates a brief
+    /// window where this hasn't completed: `applyEntryInner` errors retry
+    /// until the manifest is in place.
+    pub fn recoverFromSnapshot(self: *StorageImpl) !void {
+        // Flip the apply-loop barrier no matter what — the no-snapshot fast
+        // path must also unblock applies. Errors mid-recovery still flip the
+        // flag (they would otherwise wedge the apply loop forever); the
+        // caller logs the error.
+        defer self.recovery_done.store(true, .release);
+
+        const snap = self.node.log.snapshot();
+        if (snap.index == 0 or snap.data.len == 0) return;
+
+        log.info("recovery: restoring manifest from snapshot index={d} bytes={d}", .{ snap.index, snap.data.len });
+        try self.forest.ms.restoreFrom(snap.data);
+        // Set BEFORE recovery_done flips: the apply gate's release pairs
+        // with applyEntry's acquire-load, so the floor is visible by the
+        // time apply dispatches its first mutation.
+        self.oldest_memtable_index = snap.oldest_memtable_index;
+
+        // Fetch any missing SSTs from the leader. Retry until empty or
+        // shutdown — fetchFiles errors when leader_id is unknown, which
+        // resolves once raft elects/learns one.
+        while (!self.node.isShuttingDown()) {
+            const missing = try self.forest.collectMissingFileIds(self.allocator);
+            defer self.allocator.free(missing);
+            if (missing.len == 0) break;
+            log.info("recovery: fetching {d} missing SST files from leader", .{missing.len});
+            self.node.fetchFiles(missing) catch |err| {
+                log.warn("recovery: fetchFiles failed ({s}); retrying in 200 ms", .{@errorName(err)});
+                zio.sleep(zio.Duration.fromMilliseconds(200)) catch return;
+                continue;
+            };
+            // Loop body re-checks; further iterations should find none missing.
+        }
+
+        try self.forest.openTablesFromManifest();
+        log.info("recovery: snapshot manifest installed", .{});
+    }
+
+    /// Periodic background loop. Polls per `snapshot_cfg.poll_interval_seconds`
+    /// and invokes `maybeProposeSnapshot`, which is a no-op until the WAL
+    /// crosses the size or age threshold. Runs concurrently with `applyLoop` —
+    /// DiskWAL/Forest are designed for concurrent reads.
+    pub fn runSnapshotLoop(self: *StorageImpl) void {
+        while (!self.node.isShuttingDown()) {
+            const cfg = self.snapshot_cfg.snapshot();
+            zio.sleep(zio.Duration.fromSeconds(cfg.poll_interval_seconds)) catch return;
+            if (!self.node.isLeader()) continue;
+            self.maybeProposeSnapshot() catch |err| {
+                log.warn("maybeProposeSnapshot: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    /// Leader-only. Pick a target snapshot index from WAL size/age (capped by
+    /// the oldest in-memory memtable so replay can reconstruct memtable state),
+    /// build snapshot bytes by replaying manifest entries onto a draft seeded
+    /// from the previous snapshot, then propose the marshalled SnapshotStruct
+    /// through Raft. Every node (including the leader) installs via
+    /// `Node.applySnapshotEntry` when the proposal is committed and applied.
+    ///
+    /// === Replay-safety invariant ===
+    ///
+    /// After `setSnapshot(I) + compactUntil(I)`, log entries < I are gone.
+    /// For recovery to reconstruct correct state, every committed mutation
+    /// must have AT LEAST ONE surviving representation:
+    ///    (a) a log entry at index >= I (preserved by `compactUntil`), OR
+    ///    (b) an SST referenced either by `snap.data`'s manifest, or by a
+    ///        `flush` proposal whose log index >= I (so replay installs it).
+    ///
+    /// The cap below — `min(oldest_in_memory - 1, apply_index)` — is the
+    /// precise bound that makes (a) || (b) hold for every mutation:
+    ///
+    ///   - Mutations in still-in-memory memtables (no SST yet):
+    ///       Mutations into memtable `Mt` are at log indices > Mt.created_at.
+    ///       So if `Mt` is in-memory, `oldest_in_memory <= Mt.created_at`,
+    ///       and capping `I <= oldest_in_memory - 1` keeps every mutation
+    ///       index strictly above I → (a) holds.
+    ///
+    ///   - Mutations in already-flushed memtables (SST on disk):
+    ///       The flush proposal at log index F either survives compaction
+    ///       (F >= I) — replay reaches F and installs the SST → (b) — or
+    ///       was already folded into `snap.data` by the build-replay pass
+    ///       (F < I) → (b) via the manifest itself.
+    ///
+    /// === Worked example ===
+    ///
+    ///   100  newMemtable(M_0)        placeholder discarded; current=M_0
+    ///   120  newMemtable(M_1)        M_0->immutable; current=M_1
+    ///   125  flush(M_0)->SST_a       pops M_0
+    ///   131,132   mutations into M_1 (in-memory only, no SST yet)
+    ///   140  newMemtable(M_2)        M_1->immutable; current=M_2
+    ///   160  flush(M_1)->SST_b       pops M_1; SST_b captures 121..139
+    ///
+    /// At leader head ~170: oldest = M_2.created_at = 140 → cap = 139.
+    /// We propose snap.index = I = 135 (between the two flushes, valid).
+    ///
+    /// On follower recovery from this snapshot:
+    ///   - `snap.data` lists SST_a (flush at 125 <= I) but not SST_b (160 > I).
+    ///   - `compactUntil(135)` drops entries 121..134, including 131, 132.
+    ///   - Log preserves entries 136..head (including flush at 160).
+    ///   - Replay from 136..139 puts mutations into the id=0 placeholder.
+    ///     (At this point, queries would not see them yet.)
+    ///   - At 140, `swapCurrentOut` discards the placeholder. The id=0
+    ///     branch frees its in-memory contents — fine, because:
+    ///   - At 160, `applyFlush` installs SST_b. SST_b on the leader was
+    ///     built from M_1's full history (121..139), so it captures the
+    ///     "lost" mutations 131, 132 AND 136..139. Queries against those
+    ///     keys hit SST_b. No data loss.
+    ///
+    /// Brief inconsistency window: between replay of 140 (placeholder
+    /// dropped) and 160 (SST_b installed), keys mutated at 136..139 are
+    /// momentarily unreachable on the follower. After 160, all good.
+    /// This is normal Raft follower-catchup eventual consistency, not
+    /// data loss.
+    fn maybeProposeSnapshot(self: *StorageImpl) !void {
+        const oldest = self.forest.memtables.oldestInMemoryLogIndex();
+        if (oldest == 0) return; // no real memtable yet — nothing pinned
+
+        // See the replay-safety invariant above. Two caps, both required:
+        //   1. `oldest - 1`: every in-memory memtable's mutation history
+        //      stays in the log for replay reconstruction.
+        //   2. `apply_index`: never snapshot past entries we haven't applied
+        //      to the manifest yet — the draft replay would skip them, and
+        //      after restart `apply_index = snap.index` would silently drop
+        //      their effects from the state machine.
+        const memtable_cap = oldest - 1;
+        const apply_cap = self.node.apply_index.load(.acquire);
+
+        const wal = self.node.log;
+        const cfg = self.snapshot_cfg.snapshot();
+        const found = wal.findIndexOlderThan(cfg.min_bytes, cfg.min_age_seconds) orelse return;
+        const target = @min(@min(found, memtable_cap), apply_cap);
+
+        const prev_snap = wal.snapshot();
+        if (target <= prev_snap.index) return;
+
+        const target_term = (try wal.term(target)) orelse {
+            log.warn("maybeProposeSnapshot: no term for index={d}", .{target});
+            return;
+        };
+
+        // Seed draft from previous snapshot's manifest, then replay every
+        // manifest-bearing log entry in (prev_snap.index, target].
+        var draft = manifest.ForestState.init(self.allocator);
+        defer draft.deinit();
+        if (prev_snap.data.len > 0) {
+            try draft.restoreFrom(prev_snap.data);
+        }
+
+        var result = try wal.entriesRange(.{
+            .lo = prev_snap.index + 1,
+            .hi = target + 1,
+            .ty = .manifest,
+            .max_bytes = std.math.maxInt(u64),
+        });
+        defer result.deinit();
+        if (!result.eof) {
+            log.warn("maybeProposeSnapshot: manifest entries truncated by max_bytes — aborting", .{});
+            return;
+        }
+
+        for (result.entries) |stored| {
+            const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch |err| {
+                log.warn("maybeProposeSnapshot: parseRoot at index={d}: {s}", .{ stored.index, @errorName(err) });
+                continue;
+            };
+            const payload = reader.data();
+            if (payload.len == 0) continue;
+            const parsed = zdb_bufs.parseMessageWithTail(payload) catch |err| {
+                log.warn("maybeProposeSnapshot: parseMessageWithTail at index={d}: {s}", .{ stored.index, @errorName(err) });
+                continue;
+            };
+            switch (parsed) {
+                .ManifestChange => |mc| {
+                    const mcs = try mc.toStruct(self.allocator);
+                    defer {
+                        mcs.deinit(self.allocator);
+                        self.allocator.destroy(mcs);
+                    }
+                    try draft.commit(mcs.table_changes, mcs.tree_changes);
+                },
+                else => continue,
+            }
+        }
+
+        const data = try draft.serialize(self.allocator);
+        defer self.allocator.free(data);
+
+        // Pick the latest conf state. It doesn't need to be as of the snapshot index.
+        var conf_state = try self.node.confState();
+        defer conf_state.deinit(self.allocator);
+
+        try self.node.proposeSnapshot(.{
+            .index = target,
+            .term = target_term,
+            .data = data,
+            .conf_state = conf_state,
+            // Tells recovering nodes to skip mutation replay below this
+            // index — those mutations are captured in SSTs the replay
+            // will install. See `applyEntryInner` and the worked example
+            // above. (= `oldest` from above; recompute in case it changed
+            // between the cap calc and now is unnecessary — `oldest` is
+            // already pinned by the cap.)
+            .oldest_memtable_index = oldest,
+        });
+        log.info("snapshot proposed: index={d} term={d} bytes={d}", .{ target, target_term, data.len });
+    }
+
     /// Ensure all SST files referenced by ManifestChange entries are on disk
     /// before the WAL append. Fetches missing files from the leader.
     fn preAppend(ctx: *anyopaque, node: *raft.Node, entries: []const raft.buffers.LogEntryBuffer) void {
@@ -152,23 +417,17 @@ pub const StorageImpl = struct {
 
         for (entries) |entry| {
             const reader = entry.initReader() catch continue;
-            if (reader.entryType() != .data) continue;
+            if (reader.entryType() != .manifest) continue;
             const data = reader.data();
             if (data.len == 0) continue;
 
-            // Try parsing as ManifestChange.
-            const parsed = zdb_bufs.parseMessageWithTail(data) catch continue;
-            switch (parsed) {
-                .ManifestChange => |mc| {
-                    const tc_len = mc.tableChangesLen();
-                    for (0..tc_len) |i| {
-                        const tc = mc.tableChangesAt(@intCast(i)) catch continue;
-                        if (tc.op() == 0 and !self.forest.hasFile(tc.tableId())) {
-                            missing.append(self.allocator, tc.tableId()) catch continue;
-                        }
-                    }
-                },
-                else => {},
+            const mc = zdb_bufs.ManifestChangeReader.parseRoot(data) catch continue;
+            const tc_len = mc.tableChangesLen();
+            for (0..tc_len) |i| {
+                const tc = mc.tableChangesAt(@intCast(i)) catch continue;
+                if (tc.op() == .create and !self.forest.hasFile(tc.tableId())) {
+                    missing.append(self.allocator, tc.tableId()) catch continue;
+                }
             }
         }
 
@@ -317,7 +576,7 @@ pub const ZdbServer = struct {
         const new_id = self.forest.next_file_id.fetchAdd(1, .monotonic);
         const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
         defer self.allocator.free(payload);
-        try self.node.proposeAndWait(payload);
+        try self.node.proposeAndWait(payload, .manifest);
     }
 
     fn proposeFlush(self: *ZdbServer) !void {
@@ -330,7 +589,7 @@ pub const ZdbServer = struct {
 
         const payload = try encodeManifestChange(self.allocator, 2, changes.items, &.{}, result.memtable_id);
         defer self.allocator.free(payload);
-        try self.node.proposeAndWait(payload);
+        try self.node.proposeAndWait(payload, .manifest);
     }
 
     fn proposeCompaction(self: *ZdbServer, target: Forest.CompactionTarget) !void {
@@ -342,7 +601,7 @@ pub const ZdbServer = struct {
 
         const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
-        try self.node.proposeAndWait(payload);
+        try self.node.proposeAndWait(payload, .manifest);
     }
 
     fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
@@ -364,7 +623,7 @@ pub const ZdbServer = struct {
             0,
         );
         defer self.allocator.free(payload);
-        try self.node.proposeAndWait(payload);
+        try self.node.proposeAndWait(payload, .manifest);
     }
 
     /// Send new SST files to peers and wait for quorum acks.
@@ -372,7 +631,7 @@ pub const ZdbServer = struct {
         var file_ids = std.ArrayList(u64).empty;
         defer file_ids.deinit(self.allocator);
         for (changes) |c| {
-            if (c.op == 0) try file_ids.append(self.allocator, c.table_id);
+            if (c.op == .create) try file_ids.append(self.allocator, c.table_id);
         }
         if (file_ids.items.len == 0) return;
         try self.node.sendAndWaitForFileQuorum(file_ids.items);
@@ -727,7 +986,7 @@ pub const ZdbServer = struct {
         };
         defer self.allocator.free(payload);
 
-        self.node.proposeAndWait(payload) catch |err| {
+        self.node.proposeAndWait(payload, .manifest) catch |err| {
             log.err("ns create propose failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;

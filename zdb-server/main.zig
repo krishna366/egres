@@ -118,6 +118,7 @@ pub fn main() !void {
     const live_listen = try flags.g().register("listen", ListenCfg);
     const live_raft = try flags.g().register("raft", RaftCfg);
     const live_data = try flags.g().register("data", DataCfg);
+    const live_snapshot = try flags.g().register("snapshot", zdb_server.SnapshotCfg);
 
     // --help is terminal; handle after registration so writeHelpAll has
     // every module's fields populated.
@@ -228,6 +229,8 @@ pub fn main() !void {
     var storage_impl = zdb_server.StorageImpl{
         .forest = forest,
         .allocator = allocator,
+        .node = node,
+        .snapshot_cfg = live_snapshot,
     };
     var sm = storage_impl.asStateMachine();
     node.state_machine = &sm;
@@ -256,7 +259,7 @@ pub fn main() !void {
 
     // appMain(&raft_rt, &zdb_srv, node, &args);
     // // Entry point: spawn appMain on the raft pool. It orchestrates everything.
-    var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node, &args });
+    var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, &storage_impl, node, &args });
     handle.join();
 
     log.info("shutting down...", .{});
@@ -265,7 +268,7 @@ pub fn main() !void {
 /// Runs on the raft pool. Spawns raft runtime, client server (on query pool
 /// via runtime.pool() singleton), compaction loop (on background pool),
 /// and waits for SIGINT or SIGTERM to shut down.
-fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const Args) void {
+fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, storage: *zdb_server.StorageImpl, node: *raft.Node, args: *const Args) void {
     log.info("inside appMain", .{});
     var group = zio.group();
     defer group.cancel();
@@ -287,11 +290,20 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
     log.info("appMain: spawning raft runtime on raft pool", .{});
     group.spawn(runRaft, .{raft_rt}) catch return;
 
+    // Recovery runs alongside the raft loop: it depends on `leader_id`
+    // becoming known (via AppendEntries from leader, or via the join
+    // response) so `fetchFiles` can locate the source for missing SSTs.
+    log.info("appMain: spawning recovery on background pool", .{});
+    group.spawn(runRecovery, .{storage}) catch return;
+
     log.info("appMain: spawning client server on query pool", .{});
     group.spawn(runServer, .{zdb_srv}) catch return;
 
     log.info("appMain: spawning compaction loop on background pool", .{});
     group.spawn(runCompaction, .{zdb_srv}) catch return;
+
+    log.info("appMain: spawning snapshot loop on background pool", .{});
+    group.spawn(runSnapshot, .{storage}) catch return;
 
     log.info("appMain: waiting for SIGINT/SIGTERM to shutdown", .{});
     var sigint = zio.Signal.init(.interrupt) catch return;
@@ -329,6 +341,36 @@ fn runServer(s: *zdb_server.ZdbServer) void {
         .{s},
     ) catch |err| {
         log.err("runServer err: {}", .{err});
+        return;
+    };
+    handle.join();
+}
+
+/// One-shot recovery: install the manifest from the latest snapshot, fetching
+/// any missing SST files from the leader along the way. Returns once the
+/// manifest is online (or on shutdown). Apply loop retries during this window.
+fn runRecovery(s: *zdb_server.StorageImpl) void {
+    var handle = runtime.pool().get(.background).spawn(
+        zdb_server.StorageImpl.recoverFromSnapshot,
+        .{s},
+    ) catch |err| {
+        log.err("runRecovery err: {}", .{err});
+        return;
+    };
+    handle.join() catch |err| {
+        log.err("runRecovery join: {}", .{err});
+    };
+}
+
+/// Spawn the snapshot loop on the background runtime pool. Leader-only loop
+/// that polls WAL size/age and proposes snapshots through Raft.
+/// Must be called from a zio coroutine. Blocks until cancelled.
+fn runSnapshot(s: *zdb_server.StorageImpl) void {
+    var handle = runtime.pool().get(.background).spawn(
+        zdb_server.StorageImpl.runSnapshotLoop,
+        .{s},
+    ) catch |err| {
+        log.err("runSnapshot err: {}", .{err});
         return;
     };
     handle.join();

@@ -14,6 +14,13 @@ pub const CompressionEnum = enum(u8) {
     _,
 };
 
+pub const OpEnum = enum(u8) {
+    create = 0,
+    delete = 1,
+    update = 2,
+    _,
+};
+
 pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, offset);
 }
@@ -1080,7 +1087,7 @@ pub const BinaryFuseFilterWriter = struct {
 };
 
 pub const TreeChangeStruct = struct {
-    op: u32 = 0,
+    op: OpEnum = @enumFromInt(0),
     namespace_id: u32 = 0,
     tree_id: u64 = 0,
     left_key: []const u8 = &.{},
@@ -1135,7 +1142,7 @@ pub const TreeChangeReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 34;
+    pub const SIZE_BYTES: u16 = 31;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -1151,43 +1158,44 @@ pub const TreeChangeReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn op(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 6;
+    pub fn op(self: Self) OpEnum {
+        const slot_end = @as(u32, self.base) + 3;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 2)) catch 0;
+        return @enumFromInt(v);
     }
 
     pub fn namespaceId(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 10;
+        const slot_end = @as(u32, self.base) + 7;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 3)) catch 0;
     }
 
     pub fn treeId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 18;
+        const slot_end = @as(u32, self.base) + 15;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 10)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 7)) catch 0;
     }
 
     pub fn leftKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 26;
+        const slot_end = @as(u32, self.base) + 23;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 18)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 22)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 15)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 19)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
     pub fn rightKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 34;
+        const slot_end = @as(u32, self.base) + 31;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 26)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 30)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 23)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 27)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
@@ -1206,18 +1214,18 @@ pub const TreeChangeReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_18 = @as(u32, self.base) + 26;
-        if (slot_end_18 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 18));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 22));
+        const slot_end_15 = @as(u32, self.base) + 23;
+        if (slot_end_15 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 15));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 19));
             if (data_len > 0) {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
-        const slot_end_26 = @as(u32, self.base) + 34;
-        if (slot_end_26 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 26));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 30));
+        const slot_end_23 = @as(u32, self.base) + 31;
+        if (slot_end_23 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 23));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 27));
             if (data_len > 0) {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
@@ -1277,7 +1285,7 @@ pub const TreeChangeWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 34;
+    pub const SIZE_BYTES: u16 = 31;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -1298,45 +1306,45 @@ pub const TreeChangeWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setOp(self: *Self, v: u32) Error!void {
+    pub fn setOp(self: *Self, v: OpEnum) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 2, v);
+        try zbuf.patchU8(out.items, self.base + 2, @intFromEnum(v));
     }
 
     pub fn setNamespaceId(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 6, v);
+        try zbuf.patchU32(out.items, self.base + 3, v);
     }
 
     pub fn setTreeId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 10, v);
+        try zbuf.patchU64(out.items, self.base + 7, v);
     }
 
     pub fn setLeftKey(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
         if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 18, 0);
-            try zbuf.patchU32(out.items, self.base + 22, 0);
+            try zbuf.patchU32(out.items, self.base + 15, 0);
+            try zbuf.patchU32(out.items, self.base + 19, 0);
             return;
         }
         const abs_off = try zbuf.appendBytes(out, self.alloc, data);
         const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 18, off);
-        try zbuf.patchU32(out.items, self.base + 22, @as(u32, @intCast(data.len)));
+        try zbuf.patchU32(out.items, self.base + 15, off);
+        try zbuf.patchU32(out.items, self.base + 19, @as(u32, @intCast(data.len)));
     }
 
     pub fn setRightKey(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
         if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 26, 0);
-            try zbuf.patchU32(out.items, self.base + 30, 0);
+            try zbuf.patchU32(out.items, self.base + 23, 0);
+            try zbuf.patchU32(out.items, self.base + 27, 0);
             return;
         }
         const abs_off = try zbuf.appendBytes(out, self.alloc, data);
         const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 26, off);
-        try zbuf.patchU32(out.items, self.base + 30, @as(u32, @intCast(data.len)));
+        try zbuf.patchU32(out.items, self.base + 23, off);
+        try zbuf.patchU32(out.items, self.base + 27, @as(u32, @intCast(data.len)));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -1386,7 +1394,7 @@ pub const TreeChangeWriter = struct {
 };
 
 pub const TableChangeStruct = struct {
-    op: u32 = 0,
+    op: OpEnum = @enumFromInt(0),
     level: u32 = 0,
     table_id: u64 = 0,
     tree_id: u64 = 0,
@@ -1442,7 +1450,7 @@ pub const TableChangeReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46597;
-    pub const SIZE_BYTES: u16 = 38;
+    pub const SIZE_BYTES: u16 = 35;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -1458,46 +1466,47 @@ pub const TableChangeReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn op(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 6;
+    pub fn op(self: Self) OpEnum {
+        const slot_end = @as(u32, self.base) + 3;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 2)) catch 0;
+        return @enumFromInt(v);
     }
 
     pub fn level(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 10;
+        const slot_end = @as(u32, self.base) + 7;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 3)) catch 0;
     }
 
     pub fn tableId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 18;
+        const slot_end = @as(u32, self.base) + 15;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 10)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 7)) catch 0;
     }
 
     pub fn treeId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 26;
+        const slot_end = @as(u32, self.base) + 23;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 18)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 15)) catch 0;
     }
 
     pub fn checksum(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 30;
+        const slot_end = @as(u32, self.base) + 27;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 26)) catch 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 23)) catch 0;
     }
 
     pub fn size(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 38;
+        const slot_end = @as(u32, self.base) + 35;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 30)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 27)) catch 0;
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -1570,7 +1579,7 @@ pub const TableChangeWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46597;
-    pub const SIZE_BYTES: u16 = 38;
+    pub const SIZE_BYTES: u16 = 35;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -1591,34 +1600,34 @@ pub const TableChangeWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setOp(self: *Self, v: u32) Error!void {
+    pub fn setOp(self: *Self, v: OpEnum) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 2, v);
+        try zbuf.patchU8(out.items, self.base + 2, @intFromEnum(v));
     }
 
     pub fn setLevel(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 6, v);
+        try zbuf.patchU32(out.items, self.base + 3, v);
     }
 
     pub fn setTableId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 10, v);
+        try zbuf.patchU64(out.items, self.base + 7, v);
     }
 
     pub fn setTreeId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 18, v);
+        try zbuf.patchU64(out.items, self.base + 15, v);
     }
 
     pub fn setChecksum(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 26, v);
+        try zbuf.patchU32(out.items, self.base + 23, v);
     }
 
     pub fn setSize(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 30, v);
+        try zbuf.patchU64(out.items, self.base + 27, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {

@@ -38,9 +38,15 @@ pub const TableIndex = schema.Table(.{
     .{ .id = 9, .name = "binary_fuse", .ty = BinaryFuseFilter },
 });
 
+pub const Op = schema.EnumDef(.{
+    .{ .name = "create", .tag = 0 },
+    .{ .name = "delete", .tag = 1 },
+    .{ .name = "update", .tag = 2 },
+});
+
 // TreeChange is used to create a new tree, delete a tree or update a tree's range.
 pub const TreeChange = schema.Table(.{
-    .{ .id = 1, .name = "op", .ty = schema.U32 }, // 0=CREATE, 1=DELETE, 2=UPDATE
+    .{ .id = 1, .name = "op", .ty = schema.Enum(Op) }, // 0=CREATE, 1=DELETE, 2=UPDATE
     .{ .id = 2, .name = "namespace_id", .ty = schema.U32 },
     .{ .id = 3, .name = "tree_id", .ty = schema.U64 },
     .{ .id = 4, .name = "left_key", .ty = schema.Bytes },
@@ -51,7 +57,7 @@ pub const TreeChange = schema.Table(.{
 // Note that a table can belong to multiple trees. Table deletion should
 // only happen when a table's ref count reaches 0.
 pub const TableChange = schema.Table(.{
-    .{ .id = 1, .name = "op", .ty = schema.U32 }, // 0=CREATE, 1=DELETE
+    .{ .id = 1, .name = "op", .ty = schema.Enum(Op) }, // 0=CREATE, 1=DELETE
     .{ .id = 2, .name = "level", .ty = schema.U32 }, // 0 for DELETE
     .{ .id = 3, .name = "table_id", .ty = schema.U64 },
     .{ .id = 4, .name = "tree_id", .ty = schema.U64 },

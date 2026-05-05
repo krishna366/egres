@@ -192,7 +192,10 @@ pub const MetaStore = struct {
         // invariant even though the tail only stores the table id.
         var zbuf_bytes: std.ArrayList(u8) = .empty;
         defer zbuf_bytes.deinit(self.allocator);
+        // marshalTo on an empty buffer puts the root at offset 0, which is
+        // what the tail-only-table_id format requires.
         const off = try snap.marshalTo(self.allocator, &zbuf_bytes);
+        // TODO: Use zen.addTail
         try zbuf.appendMessageTail(&zbuf_bytes, self.allocator, zen.SnapshotReader.TABLE_ID, off);
 
         // Wrap with a zbuf frame so we detect a torn pwrite (e.g. a power

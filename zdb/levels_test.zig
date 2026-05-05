@@ -354,8 +354,8 @@ pub fn testLevelsOpen() !void {
 
     // Create manifest with table 1 at L0, table 2 at L1.
     const test_tree_id: u64 = 1;
-    var ms = try manifest.openOrCreate(alloc, dir_path);
-    defer ms.close();
+    var ms = manifest.ForestState.init(alloc);
+    defer ms.deinit();
     try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
     try ms.commit(&.{
         createTableChange(1, test_tree_id, 0),
@@ -390,8 +390,8 @@ pub fn testPickCompactLevel() !void {
 
     // Create an empty manifest (no SST files needed for this test).
     const test_tree_id: u64 = 1;
-    var ms = try manifest.openOrCreate(alloc, dir_path);
-    defer ms.close();
+    var ms = manifest.ForestState.init(alloc);
+    defer ms.deinit();
 
     // Use a very small base_level_size so one table in L1 exceeds the target.
     const opts = options_mod.Options{
@@ -441,8 +441,8 @@ pub fn testDoCompactL0L1() !void {
     };
 
     const test_tree_id: u64 = 1;
-    var ms = try manifest.openOrCreate(alloc, dir_path);
-    defer ms.close();
+    var ms = manifest.ForestState.init(alloc);
+    defer ms.deinit();
 
     for (l0_data) |d| {
         var tb = try buildTable(alloc, &.{.{ .key = d.key, .ts = 0, .val = d.val }});
@@ -503,8 +503,8 @@ pub fn testDoCompactL0L1WithDestOverlap() !void {
     defer alloc.free(dir_path);
 
     const test_tree_id: u64 = 1;
-    var ms = try manifest.openOrCreate(alloc, dir_path);
-    defer ms.close();
+    var ms = manifest.ForestState.init(alloc);
+    defer ms.deinit();
 
     // L0 table 1: {aa→vaa}
     {
@@ -596,8 +596,8 @@ pub fn testDoCompactL1L2() !void {
     // L1: {aa, bb}; L2: {cc} — non-overlapping, so compacting L1 doesn't
     // touch the L2 table; both survive in L2 after compaction.
     const test_tree_id: u64 = 1;
-    var ms = try manifest.openOrCreate(alloc, dir_path);
-    defer ms.close();
+    var ms = manifest.ForestState.init(alloc);
+    defer ms.deinit();
 
     {
         var tb1 = try buildTable(alloc, &.{
@@ -671,8 +671,8 @@ pub fn testLevelsGetL0ShadowsL1() !void {
     defer alloc.free(dir_path);
 
     const test_tree_id: u64 = 1;
-    var ms = try manifest.openOrCreate(alloc, dir_path);
-    defer ms.close();
+    var ms = manifest.ForestState.init(alloc);
+    defer ms.deinit();
 
     const opts = options_mod.Options{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);

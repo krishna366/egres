@@ -901,6 +901,136 @@ test "diskwal writeHeader/readHeader round-trip" {
     }
 }
 
+fn makeLogEntryWithTimestamp(
+    alloc: std.mem.Allocator,
+    index: u64,
+    term: u64,
+    timestamp: u64,
+    data: []const u8,
+) !zen.LogEntryBuffer {
+    var writer = try zen.LogEntryWriter.init(alloc);
+    defer writer.deinit();
+    try writer.set(.{
+        .index = index,
+        .term = term,
+        .timestamp = timestamp,
+        .data = data,
+        .entry_type = zen.EntryTypeEnum.data,
+        .conf_change = zen.NullOffset,
+    });
+    return writer.finishWithTail();
+}
+
+test "diskwal findIndexOlderThan bytes-only branch" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        std.fs.cwd().deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    defer ds.deinit();
+
+    // 10 entries with 1 KiB payload each = 10 KiB total tail.
+    // Timestamps left at 0 so age check is bypassed (HLC sentinel).
+    const payload = try alloc.alloc(u8, 1024);
+    defer alloc.free(payload);
+    @memset(payload, 0xab);
+    for (1..11) |i| {
+        var entry = try makeLogEntryWithTimestamp(alloc, @intCast(i), 1, 0, payload);
+        defer entry.deinit();
+        try ds.append(&[_]zen.LogEntryBuffer{entry});
+    }
+
+    // Threshold larger than the whole tail → null.
+    try std.testing.expectEqual(@as(?u64, null), ds.findIndexOlderThan(1 << 20, std.math.maxInt(u64)));
+
+    // Need ≥ 3 KiB from head — slot 10 (1 KiB), 9 (2 KiB), 8 (3 KiB) → returns 8.
+    try std.testing.expectEqual(@as(?u64, 8), ds.findIndexOlderThan(3 * 1024, std.math.maxInt(u64)));
+
+    // Need ≥ 1 byte → first slot walked (slot 10) wins.
+    try std.testing.expectEqual(@as(?u64, 10), ds.findIndexOlderThan(1, std.math.maxInt(u64)));
+}
+
+test "diskwal findIndexOlderThan age-only branch" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        std.fs.cwd().deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    defer ds.deinit();
+
+    const now_secs: u32 = @intCast(std.time.timestamp());
+    // Slot 1: 100 s ago. Slot 2: 50 s ago. Slot 3: 10 s ago.
+    const ages = [_]u32{ 100, 50, 10 };
+    for (ages, 1..) |age, i| {
+        const ts: u64 = (raft.utils.hlc.HLC{ .seconds = now_secs - age, .logical = 1 }).asU64();
+        var entry = try makeLogEntryWithTimestamp(alloc, @intCast(i), 1, ts, "x");
+        defer entry.deinit();
+        try ds.append(&[_]zen.LogEntryBuffer{entry});
+    }
+
+    // Need entries ≥ 60 s old. Walking newest-first: slot 3 (10s) no, slot 2
+    // (50s) no, slot 1 (100s) yes → returns 1.
+    try std.testing.expectEqual(@as(?u64, 1), ds.findIndexOlderThan(std.math.maxInt(u64), 60));
+
+    // Need ≥ 30 s old. Slot 3 (10s) no, slot 2 (50s) yes → returns 2.
+    try std.testing.expectEqual(@as(?u64, 2), ds.findIndexOlderThan(std.math.maxInt(u64), 30));
+
+    // Need ≥ 5 s old. Slot 3 (10s) yes → returns 3.
+    try std.testing.expectEqual(@as(?u64, 3), ds.findIndexOlderThan(std.math.maxInt(u64), 5));
+
+    // Need ≥ 1000 s old. Nothing qualifies → null.
+    try std.testing.expectEqual(@as(?u64, null), ds.findIndexOlderThan(std.math.maxInt(u64), 1000));
+}
+
+test "diskwal findIndexOlderThan returns larger of bytes and age" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        std.fs.cwd().deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    defer ds.deinit();
+
+    const now_secs: u32 = @intCast(std.time.timestamp());
+    // 5 entries, 1 KiB each. Slot 1 is the oldest (100 s). Slots 2–5 are fresh.
+    const payload = try alloc.alloc(u8, 1024);
+    defer alloc.free(payload);
+    @memset(payload, 0xcd);
+    for (1..6) |i| {
+        const age: u32 = if (i == 1) 100 else 0;
+        const ts: u64 = (raft.utils.hlc.HLC{ .seconds = now_secs - age, .logical = 1 }).asU64();
+        var entry = try makeLogEntryWithTimestamp(alloc, @intCast(i), 1, ts, payload);
+        defer entry.deinit();
+        try ds.append(&[_]zen.LogEntryBuffer{entry});
+    }
+
+    // Bytes: need ≥ 3 KiB. Walking back: slot 5 (1KiB), 4 (2KiB), 3 (3KiB) — fires at slot 3.
+    // Age: 60 s, only slot 1 fires.
+    // Either condition triggers — slot 3 fires first while walking back, so returns 3.
+    try std.testing.expectEqual(@as(?u64, 3), ds.findIndexOlderThan(3 * 1024, 60));
+}
+
+test "diskwal findIndexOlderThan returns null on empty WAL" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        std.fs.cwd().deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    defer ds.deinit();
+    try std.testing.expectEqual(@as(?u64, null), ds.findIndexOlderThan(1, 1));
+}
+
 test "diskwal rotation creates numbered file and new CURRENT.wal" {
     // Fill entries until rotation is triggered, then verify:
     // - A numbered .wal file exists (rotated segment)

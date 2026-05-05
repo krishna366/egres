@@ -29,6 +29,8 @@ pub const EntryTypeEnum = enum(u8) {
     any = 0,
     data = 1,
     conf = 2,
+    manifest = 3,
+    snapshot = 4,
     _,
 };
 
@@ -3568,6 +3570,7 @@ pub const SnapshotStruct = struct {
     term: u64 = 0,
     data: []const u8 = &.{},
     conf_state: ?ConfStateStruct = null,
+    oldest_memtable_index: u64 = 0,
     pub fn deinit(self: *SnapshotStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.data = &.{};
@@ -3584,6 +3587,7 @@ pub const SnapshotStruct = struct {
         var s = SnapshotStruct{
             .index = self.index,
             .term = self.term,
+            .oldest_memtable_index = self.oldest_memtable_index,
         };
         errdefer s.deinit(alloc);
         s.data = try alloc.dupe(u8, self.data);
@@ -3609,6 +3613,7 @@ pub const SnapshotStruct = struct {
             const child_off = try child.marshalTo(alloc, out);
             try writer.setConfState(child_off);
         }
+        try writer.setOldestMemtableIndex(self.oldest_memtable_index);
         const result = try writer.finish();
         return result.offset;
     }
@@ -3621,7 +3626,7 @@ pub const SnapshotReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 42253;
-    pub const SIZE_BYTES: u16 = 30;
+    pub const SIZE_BYTES: u16 = 38;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -3670,6 +3675,13 @@ pub const SnapshotReader = struct {
         return ConfStateReader.init(self.buf, off) catch null;
     }
 
+    pub fn oldestMemtableIndex(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 38;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 30)) catch 0;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try SnapshotWriter.initWithBuf(alloc, out);
         try writer.setIndex(self.index());
@@ -3679,6 +3691,7 @@ pub const SnapshotReader = struct {
             const child_off = try child.cloneInto(alloc, out);
             try writer.setConfState(child_off);
         }
+        try writer.setOldestMemtableIndex(self.oldestMemtableIndex());
         const result = try writer.finish();
         return result.offset;
     }
@@ -3702,6 +3715,7 @@ pub const SnapshotReader = struct {
         var s = SnapshotStruct{
             .index = self.index(),
             .term = self.term(),
+            .oldest_memtable_index = self.oldestMemtableIndex(),
         };
         errdefer s.deinit(alloc);
         s.data = try alloc.dupe(u8, self.data());
@@ -3753,7 +3767,7 @@ pub const SnapshotWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 42253;
-    pub const SIZE_BYTES: u16 = 30;
+    pub const SIZE_BYTES: u16 = 38;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -3804,6 +3818,11 @@ pub const SnapshotWriter = struct {
         try zbuf.patchU32(out.items, self.base + 26, child_off);
     }
 
+    pub fn setOldestMemtableIndex(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 30, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -3813,6 +3832,7 @@ pub const SnapshotWriter = struct {
         if (@hasField(Values, "term")) try self.setTerm(@field(values, "term"));
         if (@hasField(Values, "data")) try self.setData(@field(values, "data"));
         if (@hasField(Values, "conf_state")) try self.setConfState(@field(values, "conf_state"));
+        if (@hasField(Values, "oldest_memtable_index")) try self.setOldestMemtableIndex(@field(values, "oldest_memtable_index"));
     }
 
     pub fn finish(self: *Self) Error!SnapshotBuffer {

@@ -71,6 +71,13 @@ pub const TableCache = struct {
         var it = self.tables.iterator();
         while (it.next()) |kv| {
             const table = kv.value_ptr.*;
+            // detach + decrRef mirrors Level.deinit: the path is cleared so
+            // the file isn't deleted, and decrRef at zero frees the index /
+            // binary_fuse / file handle (via Table.deinit). Without this,
+            // those allocations leak — `destroy(table)` only frees the
+            // *Table struct memory, not its owned fields.
+            table.detach();
+            table.decrRef();
             self.allocator.destroy(table);
         }
         self.tables.deinit();
@@ -683,7 +690,7 @@ pub const Tree = struct {
         var needed: std.ArrayList(TableNeed) = .{};
         defer needed.deinit(self.allocator);
         for (changes) |c| {
-            if (c.op == 0) {
+            if (c.op == .create) {
                 try needed.append(self.allocator, .{ .id = c.table_id, .level = c.level });
             }
         }
@@ -695,9 +702,9 @@ pub const Tree = struct {
         var bytes_out: u64 = 0;
         var dest_level: ?u8 = null;
         for (changes) |c| {
-            if (c.op == 1) { // DELETE
+            if (c.op == .delete) { // DELETE
                 self.levels[c.level].deleteEntry(c.table_id);
-            } else if (c.op == 0) { // CREATE
+            } else if (c.op == .create) { // CREATE
                 const n = needed.items[need_idx];
                 need_idx += 1;
                 std.debug.assert(c.table_id == n.id);

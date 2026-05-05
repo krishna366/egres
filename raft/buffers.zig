@@ -59,15 +59,32 @@ pub const Snapshot = schema.Table(.{
     .{ .id = 2, .name = "term", .ty = schema.U64 },
     .{ .id = 3, .name = "data", .ty = schema.Bytes },
     .{ .id = 4, .name = "conf_state", .ty = ConfState },
+    // Recovery hint for the state machine: log index of the oldest in-memory
+    // memtable on the leader at snapshot-creation time. Mutations at indices
+    // strictly less than this are durable in SSTs that the post-snapshot
+    // replay will install via flush proposals, so the state machine can skip
+    // putting them into the placeholder memtable (where they'd be discarded
+    // anyway). 0 means "skip nothing" — backward-compat default.
+    .{ .id = 5, .name = "oldest_memtable_index", .ty = schema.U64 },
 });
 
 // tag 0 = .any: serves both as the safe default for an uninitialized byte and
 // as the wildcard filter in `EntriesRangeOpts.ty` (no real entry on the wire
 // is ever .any, so it never matches an actual entry).
+//
+// `manifest` is a peer of `data` (not a flag on top of it): its payload is an
+// LSM ManifestChange zbuf rather than a Mutations zbuf. Splitting it out lets
+// the snapshot builder filter manifest-only entries via `entriesRange(.ty = .manifest)`
+// without parsing each frame's payload.
 pub const EntryType = schema.EnumDef(.{
     .{ .name = "any", .tag = 0 },
     .{ .name = "data", .tag = 1 },
     .{ .name = "conf", .tag = 2 },
+    .{ .name = "manifest", .tag = 3 },
+    // Carries a marshalled SnapshotStruct as its payload. Leader-only at
+    // propose time; the apply path inside Node parses + installs (bypasses
+    // the state machine, like .conf).
+    .{ .name = "snapshot", .tag = 4 },
 });
 
 // One row of the WAL's slot index. Slots live in the file header region;

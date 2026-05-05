@@ -216,7 +216,10 @@ pub const Node = struct {
         acks: std.AutoHashMap(u64, void),
     };
 
-    pub const ProposalType = enum { data, conf };
+    /// Proposal type is the same enum used in the WAL frame's entry_type.
+    /// At propose time, callers pass `.data`, `.conf`, `.manifest`, etc. `.any`
+    /// is the wildcard filter and never appears as a real proposal.
+    pub const ProposalType = zen.EntryTypeEnum;
     const proposal_queue_capacity: usize = 4096;
     const ProposalRequest = struct {
         data: []u8,
@@ -295,6 +298,18 @@ pub const Node = struct {
             if (seed_ts != 0) {
                 utils.hlc.g().seed(utils.hlc.HLC.fromU64(seed_ts));
             }
+        }
+
+        // If a snapshot is on disk, resume apply from snapshot.index+1.
+        // The storage layer's `recoverFromSnapshot` (in zdb-server) handles
+        // installing the snapshot's manifest + fetching missing SSTs before
+        // the apply gate opens. commit_index is safe to seed here too: the
+        // snapshot was built strictly from committed entries.
+        const snap_idx = node.log.snapshot().index;
+        if (snap_idx > 0) {
+            node.apply_index.store(snap_idx, .release);
+            node.commit_index.store(snap_idx, .release);
+            raft_log.info("node {d}: post-snapshot startup, apply_index={d}", .{ node.id, snap_idx });
         }
 
         dbg(
@@ -775,6 +790,30 @@ pub const Node = struct {
 
     /// Build the current conf state from the peers map (including self).
     /// Caller must deinit the returned ConfState.
+    /// Apply a `.snapshot` log entry: parse the marshalled SnapshotStruct,
+    /// install via `setSnapshot`, then trim segments below it. Idempotent —
+    /// skips if the snapshot index is at or below the current snapshot.
+    /// Bypasses the state machine (Forest is updated by normal `.manifest`
+    /// apply; this only affects WAL state).
+    fn applySnapshotEntry(self: *Node, payload: []const u8) !void {
+        const new_snap = try zen.SnapshotReader.parseRoot(payload);
+        const cur = self.log.snapshot();
+        if (new_snap.index() <= cur.index) return;
+
+        const snap_ptr = try new_snap.toStruct(self.allocator);
+        defer {
+            snap_ptr.deinit(self.allocator);
+            self.allocator.destroy(snap_ptr);
+        }
+        try self.log.setSnapshot(snap_ptr.*);
+        self.log.compactUntil(snap_ptr.index) catch |err| {
+            raft_log.warn("compactUntil({d}): {s}", .{ snap_ptr.index, @errorName(err) });
+        };
+        raft_log.info("snapshot installed: index={d} term={d} bytes={d}", .{
+            snap_ptr.index, snap_ptr.term, snap_ptr.data.len,
+        });
+    }
+
     pub fn confState(self: *Node) !raftwal_mod.ConfState {
         const total = self.peers.count() + 1; // +1 for self
         var cs_peers = try self.allocator.alloc(raftwal_mod.ConfStatePeer, total);
@@ -1349,6 +1388,18 @@ pub const Node = struct {
         try self.proposeWithCallback(buf.items, cb, ctx, .conf);
     }
 
+    /// Marshal a SnapshotStruct as the proposal payload and propose it
+    /// through the raft queue with `entry_type=.snapshot`. Followers receive
+    /// the byte-identical proposal via AppendEntries; on apply, every node
+    /// (leader included) installs via `Node.applySnapshotEntry`.
+    pub fn proposeSnapshot(self: *Node, snap: raftwal_mod.Snapshot) RaftError!void {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.allocator);
+        const off = try snap.marshalTo(self.allocator, &buf);
+        try zbuf.appendMessageTail(&buf, self.allocator, zen.SnapshotReader.TABLE_ID, off);
+        try self.proposeAndWait(buf.items, .snapshot);
+    }
+
     /// Propose a data change (normal mutation) through the raft proposal queue.
     pub fn proposeDataChange(
         self: *Node,
@@ -1359,17 +1410,17 @@ pub const Node = struct {
         return self.proposeWithCallback(data, cb, ctx, .data);
     }
 
-    /// Synchronous wrapper around `proposeDataChange` — propose a data
-    /// entry and block until it commits (or fails). Used by callers that
-    /// don't need to track the commit asynchronously (clock ticks,
-    /// manifest changes from compaction loops, etc). The wait doubles as
-    /// a rate-limit: the caller fiber stays parked until commit, so it
-    /// can't pile up more than one in-flight proposal.
-    pub fn proposeAndWait(self: *Node, data: []const u8) RaftError!void {
+    /// Synchronous propose-and-block-until-commit wrapper. The wait doubles
+    /// as a rate-limit: the caller fiber stays parked until commit, so it
+    /// can't pile up more than one in-flight proposal. `proposal_type`
+    /// becomes the wire-level `entry_type`, which lets the snapshot builder
+    /// filter manifest entries via `entriesRange(.ty = .manifest)`.
+    pub fn proposeAndWait(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
+        std.debug.assert(proposal_type != .any);
         var ctx = WaitCtx{ .status = .committed };
         ctx.wg.init();
         ctx.wg.add(1);
-        try self.proposeDataChange(data, &onWaitCommit, @ptrCast(&ctx));
+        try self.proposeWithCallback(data, &onWaitCommit, @ptrCast(&ctx), proposal_type);
         ctx.wg.wait() catch return error.CommitFailed;
         if (ctx.status != .committed) return error.NotCommitted;
     }
@@ -1516,13 +1567,12 @@ pub const Node = struct {
             // timestamp order — the invariant that makes applied_timestamp a
             // safe bound for consistent follower reads.
             const ts = utils.hlc.g().next().asU64();
-            const et: zen.EntryTypeEnum = if (is_conf) .conf else .data;
             try writer.set(.{
                 .index = index,
                 .term = self.current_term,
                 .timestamp = ts,
                 .data = if (is_conf) &[_]u8{} else req.data,
-                .entry_type = et,
+                .entry_type = req.proposal_type,
                 .conf_change = cc_offset,
             });
             _ = try writer.finishWithTail();
@@ -1681,7 +1731,8 @@ pub const Node = struct {
             for (result.entries) |entry| {
                 const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
 
-                if (reader.entryType() == .data and reader.data().len > 0) {
+                const ety = reader.entryType();
+                if ((ety == .data or ety == .manifest) and reader.data().len > 0) {
                     if (self.state_machine) |s| {
                         // One observation per state-machine apply call —
                         // each carries one Raft entry's worth of work
@@ -1696,6 +1747,10 @@ pub const Node = struct {
                         }, reader.data());
                         metrics.g().observePhase("apply", t_apply);
                     }
+                } else if (ety == .snapshot and reader.data().len > 0) {
+                    self.applySnapshotEntry(reader.data()) catch |err| {
+                        raft_log.err("applySnapshotEntry at index={d}: {s}", .{ entry.index, @errorName(err) });
+                    };
                 }
                 ai = entry.index;
                 self.apply_index.store(ai, .release);
@@ -1746,7 +1801,7 @@ pub const Node = struct {
             const wall_sec: u32 = @intCast(std.time.timestamp());
             if (wall_sec <= last_ts.seconds) continue;
 
-            self.proposeAndWait(&.{}) catch |err| {
+            self.proposeAndWait(&.{}, .data) catch |err| {
                 raft_log.warn("clock tick propose failed: {s}", .{@errorName(err)});
             };
         }

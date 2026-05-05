@@ -27,6 +27,12 @@ pub const SkipList = struct {
     // - many readers may call `get`/iterate
     // - ownership is refcounted via `acquire`/`release`
     id: u64,
+    /// Log index of the Raft entry that created this memtable (0 for the
+    /// initial placeholder created at Forest.open before any replay).
+    /// Used to compute the safe snapshot index — replay must be able to
+    /// rebuild the oldest in-memory memtable from log entries above this
+    /// index, so `snapshot.index <= oldest.created_at_log_index - 1`.
+    created_at_log_index: u64,
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     head: *Node,
@@ -50,6 +56,7 @@ pub const SkipList = struct {
         const self = try allocator.create(Self);
         self.* = .{
             .id = 0,
+            .created_at_log_index = 0,
             .allocator = allocator,
             .arena = arena,
             .head = head,

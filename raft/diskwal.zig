@@ -5,6 +5,7 @@ const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
 const vfs_mod = @import("vfs");
 const zio = @import("zio");
+const utils = @import("utils");
 const meta = @import("meta.zig");
 
 // DiskWAL handles disk access and writes for the Raft write-ahead log.
@@ -399,6 +400,7 @@ pub const logFile = struct {
         try self.slots.append(self.allocator, .{
             .term = reader.term(),
             .index = reader.index(),
+            .timestamp = reader.timestamp(),
             .data_offset = @intCast(self.write_offset),
             .data_len = @intCast(entry_bytes.len),
             .entry_type = reader.entryType(),
@@ -1195,6 +1197,45 @@ pub const DiskWAL = struct {
         try self.mu.lock();
         defer self.mu.unlock();
         self.meta.setSnapshot(snap) catch |err| return mapToRaftLogError(err);
+    }
+
+    /// Find the highest raft index whose tail (slots from there to the head)
+    /// reaches `min_bytes`, OR whose HLC second is `min_age_seconds` older
+    /// than wall-clock now. Returns null if neither threshold is met.
+    /// No payload reads — uses slot.data_len and slot.timestamp directly.
+    /// The replay-safe horizon (oldest in-memory memtable) is applied by the
+    /// caller via @min on the returned value.
+    pub fn findIndexOlderThan(
+        self: *DiskWAL,
+        min_bytes: u64,
+        min_age_seconds: u64,
+    ) ?u64 {
+        self.mu.lockSharedUncancelable();
+        defer self.mu.unlockShared();
+
+        const head = self.wal_store.lastIndex();
+        if (head == 0) return null;
+
+        const now_secs: u32 = @intCast(std.time.timestamp());
+        var bytes_acc: u64 = 0;
+
+        var fi: usize = self.wal_store.files.items.len;
+        while (fi > 0) {
+            fi -= 1;
+            const f = &self.wal_store.files.items[fi];
+            var si: usize = f.slots.items.len;
+            while (si > first_data_slot) {
+                si -= 1;
+                const slot = f.slots.items[si];
+                if (slot.index == 0) continue;
+                bytes_acc += slot.data_len;
+                const ts = utils.hlc.HLC.fromU64(slot.timestamp);
+                const age_ok = ts.seconds != 0 and now_secs >= ts.seconds and
+                    @as(u64, now_secs - ts.seconds) >= min_age_seconds;
+                if (age_ok or bytes_acc >= min_bytes) return slot.index;
+            }
+        }
+        return null;
     }
 
     pub fn firstIndex(self: *DiskWAL) u64 {

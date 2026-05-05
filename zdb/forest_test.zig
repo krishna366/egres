@@ -107,35 +107,11 @@ pub fn testForestCreateTreeAndGet() !void {
     try std.testing.expectEqual(tree_id, tree.?.tree_id);
 }
 
-// ---------------------------------------------------------------------------
-// 4. Forest create tree survives reopen
-// ---------------------------------------------------------------------------
-
-pub fn testForestTreePersistsAcrossReopen() !void {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try tmpPath(alloc, &tmp);
-    defer alloc.free(dir_path);
-
-    // Create forest and add a tree.
-    var tree_id: u64 = undefined;
-    {
-        const f = try Forest.open(alloc, .{ .dir = dir_path });
-        tree_id = try f.createTree(42, .{ .inf = true });
-        f.close();
-    }
-
-    // Reopen and verify tree is still there.
-    {
-        const f = try Forest.open(alloc, .{ .dir = dir_path });
-        defer f.close();
-
-        const tree = f.getTree(tree_id);
-        try std.testing.expect(tree != null);
-        try std.testing.expectEqual(tree_id, tree.?.tree_id);
-    }
-}
+// Note: There used to be a `testForestTreePersistsAcrossReopen` test here.
+// With the snapshot-resident manifest design, the on-disk manifest is gone:
+// persistence flows through the Raft log + periodic snapshots. The
+// equivalent end-to-end recovery test will live in raft/snapshot_test.zig
+// once the snapshot apply path is wired up.
 
 // ---------------------------------------------------------------------------
 // 5. Forest route table lookup
@@ -164,59 +140,208 @@ pub fn testForestSplitTree() !void {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    // Phase 1: set up manifest + 3 SST files at L1 of tree 1 (namespace 42).
-    // Keys: "aaa", "mmm", "zzz" — sorted, non-overlapping, one key per table.
-    {
-        var ms = try manifest.openOrCreate(alloc, dir_path);
-        defer ms.close();
+    // Set up: forest with one tree (namespace 42, infinite range) + 3 SST
+    // files at L1 (keys "aaa", "mmm", "zzz" — sorted, non-overlapping, one
+    // key per table). Tables are written to disk and then installed into
+    // the tree's L1 via Tree.applyCompaction (which uses the table cache).
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
 
-        try ms.commit(&.{}, &.{manifest.createTreeChange(1, 42, &.{}, &.{})});
+    const tree_id = try f.createTree(42, .{ .inf = true });
+    try std.testing.expectEqual(@as(u64, 1), tree_id);
 
-        const table_keys = [_][]const u8{ "aaa", "mmm", "zzz" };
-        for (table_keys, 1..) |key, tbl_id| {
-            const path = try options_mod.sstPath(alloc, dir_path, tbl_id);
-            defer alloc.free(path);
-            try buildAndWriteTable(alloc, path, key);
-            try ms.commit(&.{manifest.createTableChange(tbl_id, 1, 1)}, &.{});
-        }
+    const table_keys = [_][]const u8{ "aaa", "mmm", "zzz" };
+    for (table_keys, 1..) |key, tbl_id| {
+        const path = try options_mod.sstPath(alloc, dir_path, tbl_id);
+        defer alloc.free(path);
+        try buildAndWriteTable(alloc, path, key);
     }
 
-    // Phase 2: open forest, verify 3 tables loaded, then split.
     {
-        const f = try Forest.open(alloc, .{ .dir = dir_path });
-        defer f.close();
+        const tree_ptr = f.getTree(tree_id).?;
+        const changes = [_]manifest.TableChange{
+            manifest.createTableChange(1, tree_id, 1),
+            manifest.createTableChange(2, tree_id, 1),
+            manifest.createTableChange(3, tree_id, 1),
+        };
+        try tree_ptr.applyCompaction(&changes);
+        try std.testing.expectEqual(@as(usize, 3), tree_ptr.levels[1].numTables());
+    }
 
-        const tree = f.getTree(1).?;
-        try std.testing.expectEqual(@as(usize, 3), tree.levels[1].numTables());
-
-        // splitTreeForTests requires the write lock.
+    // splitTreeForTests requires the write lock.
+    {
         f.mu.lock();
         defer f.mu.unlock();
         try f.splitTreeForTests(1);
-
-        // Now 2 trees should exist.
-        try std.testing.expectEqual(@as(usize, 2), f.trees.count());
-
-        // The split key is "mmm" (middle table, index 1 of 3).
-        // Old tree (id=1): tables ["aaa"] — left side.
-        // New tree (id=2): tables ["mmm","zzz"] — right side.
-        const old_tree = f.trees.get(1).?;
-        const new_tree = f.trees.get(2).?;
-        try std.testing.expectEqual(@as(usize, 1), old_tree.levels[1].numTables());
-        try std.testing.expectEqual(@as(usize, 2), new_tree.levels[1].numTables());
-
-        // Key ranges: old right = "mmm", new left = "mmm".
-        try std.testing.expectEqualStrings("mmm", old_tree.key_range.right.primary);
-        try std.testing.expectEqualStrings("mmm", new_tree.key_range.left.primary);
-
-        // Route table for namespace 42 should have 2 entries.
-        const rt = f.ns_routes.get(42).?;
-        try std.testing.expectEqual(@as(usize, 2), rt.entries.items.len);
-
-        // Routing: "aaa" → old tree (1), "zzz" → new tree (2).
-        try std.testing.expectEqual(@as(u64, 1), rt.lookup(.{ .primary = "aaa" }).?);
-        try std.testing.expectEqual(@as(u64, 2), rt.lookup(.{ .primary = "zzz" }).?);
     }
+
+    // Now 2 trees should exist.
+    try std.testing.expectEqual(@as(usize, 2), f.trees.count());
+
+    // The split key is "mmm" (middle table, index 1 of 3).
+    // Old tree (id=1): tables ["aaa"] — left side.
+    // New tree (id=2): tables ["mmm","zzz"] — right side.
+    const old_tree = f.trees.get(1).?;
+    const new_tree = f.trees.get(2).?;
+    try std.testing.expectEqual(@as(usize, 1), old_tree.levels[1].numTables());
+    try std.testing.expectEqual(@as(usize, 2), new_tree.levels[1].numTables());
+
+    // Key ranges: old right = "mmm", new left = "mmm".
+    try std.testing.expectEqualStrings("mmm", old_tree.key_range.right.primary);
+    try std.testing.expectEqualStrings("mmm", new_tree.key_range.left.primary);
+
+    // Route table for namespace 42 should have 2 entries.
+    const rt = f.ns_routes.get(42).?;
+    try std.testing.expectEqual(@as(usize, 2), rt.entries.items.len);
+
+    // Routing: "aaa" → old tree (1), "zzz" → new tree (2).
+    try std.testing.expectEqual(@as(u64, 1), rt.lookup(.{ .primary = "aaa" }).?);
+    try std.testing.expectEqual(@as(u64, 2), rt.lookup(.{ .primary = "zzz" }).?);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Snapshot manifest round-trip — recovery path
+// ---------------------------------------------------------------------------
+//
+// Build a forest with two trees (ns=42 with key range, ns=43 covering all)
+// plus an SST file at L1 of the first tree. Serialize the manifest, install
+// it into a fresh forest pointing at the same on-disk dir, and assert: tree
+// set, namespace routes, level membership, and ID counters are all restored.
+
+pub fn testForestSnapshotManifestRoundTrip() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Phase 1: build source forest with content + serialize manifest.
+    const ak = try (Key{ .namespace = 42, .primary = "a" }).marshal(alloc);
+    defer alloc.free(ak);
+    const mk = try (Key{ .namespace = 42, .primary = "m" }).marshal(alloc);
+    defer alloc.free(mk);
+
+    const bytes = blk: {
+        const src = try Forest.open(alloc, .{ .dir = dir_path });
+        defer src.close();
+
+        // Tree 1: ns=42, range [a, m). Tree 2: ns=43, infinite.
+        _ = try src.createTree(42, .{ .left = Key.init(ak), .right = Key.init(mk) });
+        _ = try src.createTree(43, .{ .inf = true });
+
+        // Drop one SST into tree 1's L1, both on disk and in the manifest.
+        const sst_path = try options_mod.sstPath(alloc, dir_path, 1);
+        defer alloc.free(sst_path);
+        try buildAndWriteTable(alloc, sst_path, "ccc");
+
+        const tree1 = src.getTree(1).?;
+        const changes = [_]manifest.TableChange{manifest.createTableChange(1, 1, 1)};
+        try tree1.applyCompaction(&changes);
+
+        break :blk try src.ms.serialize(alloc);
+    };
+    defer alloc.free(bytes);
+
+    // Phase 2: fresh forest, install snapshot, verify.
+    const dst = try Forest.open(alloc, .{ .dir = dir_path });
+    defer dst.close();
+
+    try dst.ms.restoreFrom(bytes);
+    try dst.openTablesFromManifest();
+
+    // Both trees present.
+    try std.testing.expectEqual(@as(u32, 2), dst.trees.count());
+    try std.testing.expect(dst.trees.contains(1));
+    try std.testing.expect(dst.trees.contains(2));
+
+    // Namespace routes wired.
+    try std.testing.expect(dst.ns_routes.contains(42));
+    try std.testing.expect(dst.ns_routes.contains(43));
+    try std.testing.expectEqual(@as(u64, 1), dst.ns_routes.get(42).?.lookup(.{ .namespace = 42, .primary = "ccc" }).?);
+    try std.testing.expectEqual(@as(u64, 2), dst.ns_routes.get(43).?.lookup(.{ .namespace = 43, .primary = "any" }).?);
+
+    // Tree 1's L1 contains the SST.
+    try std.testing.expectEqual(@as(usize, 1), dst.trees.get(1).?.levels[1].numTables());
+
+    // Counters advanced past the existing IDs (trees 1,2 → next 3; tables 1 → next 2).
+    try std.testing.expect(dst.next_tree_id.load(.monotonic) > 2);
+    try std.testing.expect(dst.next_file_id.load(.monotonic) > 1);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Memtables.popOldestIfMatches — recovery-time pop semantics
+// ---------------------------------------------------------------------------
+//
+// Helper that builds a Memtables with a chain of immutables of the given ids.
+// The current memtable is the placeholder (id=0); each `swapCurrentOut(id_i)`
+// freezes the prior current and makes a new current with id_i. After N swaps,
+// immutables = [id_1, id_2, ..., id_{N-1}], current = id_N.
+
+fn buildMemtables(alloc: std.mem.Allocator, ids: []const u64) !forest_mod.Memtables {
+    const initial = try zdb.skl.SkipList.init(alloc);
+    var mts = forest_mod.Memtables.init(alloc, initial);
+    errdefer mts.deinit();
+    for (ids) |id| try mts.swapCurrentOut(id, 0);
+    return mts;
+}
+
+pub fn testPopOldestIfMatchesEmpty() !void {
+    const alloc = std.testing.allocator;
+    var mts = try buildMemtables(alloc, &.{}); // current=placeholder, immutables=[]
+    defer mts.deinit();
+    mts.popOldestIfMatches(7); // no-op
+    try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
+}
+
+pub fn testPopOldestIfMatchesExact() !void {
+    const alloc = std.testing.allocator;
+    // immutables=[5], current=8.
+    var mts = try buildMemtables(alloc, &.{ 5, 8 });
+    defer mts.deinit();
+    mts.popOldestIfMatches(5);
+    try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
+    try std.testing.expectEqual(@as(u64, 8), mts.current.id);
+}
+
+pub fn testPopOldestIfMatchesGreater() !void {
+    const alloc = std.testing.allocator;
+    // immutables=[7], current=10. Flush proposal expects 5 — older than oldest.
+    var mts = try buildMemtables(alloc, &.{ 7, 10 });
+    defer mts.deinit();
+    mts.popOldestIfMatches(5); // skip — oldest > expected
+    try std.testing.expectEqual(@as(usize, 1), mts.immutables.items.len);
+    try std.testing.expectEqual(@as(u64, 7), mts.immutables.items[0].id);
+}
+
+pub fn testPopOldestIfMatchesPhantom() !void {
+    const alloc = std.testing.allocator;
+    // immutables=[3], current=10. Flush proposal expects 7. M_3 is a phantom.
+    var mts = try buildMemtables(alloc, &.{ 3, 10 });
+    defer mts.deinit();
+    mts.popOldestIfMatches(7); // drops phantom M_3, no match for 7 → done
+    try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
+}
+
+pub fn testPopOldestIfMatchesMultiplePhantomsThenMatch() !void {
+    const alloc = std.testing.allocator;
+    // immutables=[2, 4, 7], current=10. Flush proposal expects 7.
+    // Loop drops M_2 and M_4 as phantoms, then pops M_7.
+    var mts = try buildMemtables(alloc, &.{ 2, 4, 7, 10 });
+    defer mts.deinit();
+    mts.popOldestIfMatches(7);
+    try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
+    try std.testing.expectEqual(@as(u64, 10), mts.current.id);
+}
+
+pub fn testPopOldestIfMatchesMultiplePhantomsNoMatch() !void {
+    const alloc = std.testing.allocator;
+    // immutables=[2, 4], current=10. Flush proposal expects 7. Both phantoms;
+    // no match — immutables drained, current untouched.
+    var mts = try buildMemtables(alloc, &.{ 2, 4, 10 });
+    defer mts.deinit();
+    mts.popOldestIfMatches(7);
+    try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
+    try std.testing.expectEqual(@as(u64, 10), mts.current.id);
 }
 
 pub fn testForestRoutesToCorrectTree() !void {

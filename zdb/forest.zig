@@ -188,24 +188,82 @@ pub const Memtables = struct {
     }
 
     /// Freeze the current memtable: move it to immutables, create a new current.
-    pub fn swapCurrentOut(self: *Memtables, new_id: u64) !void {
+    /// `log_index` is the apply index of the Raft `newMemtable` entry; it pins
+    /// the snapshot horizon (`snapshot.index <= oldest.created_at_log_index - 1`).
+    ///
+    /// Special case: the id=0 placeholder (created by `Forest.open` before any
+    /// real `newMemtable` has been applied) is *discarded*, not frozen — it
+    /// would otherwise sit in immutables forever, since no flush ever targets
+    /// id=0.
+    pub fn swapCurrentOut(self: *Memtables, new_id: u64, log_index: u64) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
-        try self.immutables.append(self.allocator, self.current);
+        if (self.current.id == 0) {
+            self.current.release();
+        } else {
+            try self.immutables.append(self.allocator, self.current);
+        }
         const new_mt = try SkipList.init(self.allocator);
         new_mt.id = new_id;
+        new_mt.created_at_log_index = log_index;
         self.current = new_mt;
     }
 
-    /// Remove and return the oldest immutable memtable (for flushing).
-    /// Returns null if there are no immutables.
-    pub fn popOldest(self: *Memtables) ?*SkipList {
+    /// Log index of the oldest in-memory memtable. Returns 0 when the only
+    /// thing around is the initial placeholder (no real `newMemtable` entry
+    /// has been applied yet), which the caller treats as "no snapshot yet."
+    pub fn oldestInMemoryLogIndex(self: *Memtables) u64 {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        if (self.immutables.items.len > 0) return self.immutables.items[0].created_at_log_index;
+        return self.current.created_at_log_index;
+    }
+
+    /// Drop any phantom immutables whose id is strictly less than `expected_id`,
+    /// then pop+release the oldest IFF its id equals `expected_id`. No-op when
+    /// the matched memtable isn't found.
+    ///
+    /// Used by `applyFlush`. Three cases reflect leader/follower divergence
+    /// during recovery replay:
+    ///   - oldest.id < expected_id  → phantom: flush already happened
+    ///     pre-snap on leader, SST is in snap.data, but we still have the
+    ///     local memtable (e.g., its `newMemtable` was post-snap and
+    ///     replayed, but its `flush` was pre-snap and compacted). Release
+    ///     and continue checking the next oldest.
+    ///   - oldest.id == expected_id → normal: pop and release.
+    ///   - oldest.id > expected_id  → flush's target memtable was popped on
+    ///     the leader pre-snap and never re-created here (its `newMemtable`
+    ///     proposal was below snap.index). Nothing local to remove; the SST
+    ///     install above handles the data side.
+    /// Steady-state: FIFO ordering means oldest always equals expected.
+    pub fn popOldestIfMatches(self: *Memtables, expected_id: u64) void {
         self.mu.lock();
         defer self.mu.unlock();
 
-        if (self.immutables.items.len == 0) return null;
-        return self.immutables.orderedRemove(0);
+        while (self.immutables.items.len > 0 and self.immutables.items[0].id < expected_id) {
+            const phantom = self.immutables.orderedRemove(0);
+            log.info(
+                "popOldestIfMatches: releasing phantom immutable id={d} (expected_id={d})",
+                .{ phantom.id, expected_id },
+            );
+            phantom.release();
+        }
+
+        if (self.immutables.items.len == 0) {
+            log.info("popOldestIfMatches: skipping pop, immutables empty (expected_id={d})", .{expected_id});
+            return;
+        }
+        const oldest_id = self.immutables.items[0].id;
+        if (oldest_id != expected_id) {
+            log.info(
+                "popOldestIfMatches: skipping pop, oldest.id={d} > expected_id={d} (recovery: pre-snap flush, memtable not re-created locally)",
+                .{ oldest_id, expected_id },
+            );
+            return;
+        }
+        const imm = self.immutables.orderedRemove(0);
+        imm.release();
     }
 
     /// Return the oldest immutable memtable without removing it.
@@ -234,18 +292,19 @@ pub const Forest = struct {
     mu: std.Thread.RwLock,
     memtables: Memtables,
 
-    /// Open or create a forest from a directory.
-    /// Rebuilds trees from the manifest state.
-    /// Note: namespace routing is not persisted yet — routes must be
-    /// re-established after open via createTree or addRoute.
+    /// Open a forest with empty in-memory state. Persistent state is restored
+    /// later via `installManifest` (called by recovery if a Raft snapshot is
+    /// present); fresh starts go straight to `createTree` / Raft replay.
     pub fn open(allocator: std.mem.Allocator, opts: options.Options) !*Forest {
-        var ms = try manifest.openOrCreate(allocator, opts.dir);
-        errdefer ms.close();
+        var ms = manifest.ForestState.init(allocator);
+        errdefer ms.deinit();
 
         const self = try allocator.create(Forest);
         errdefer allocator.destroy(self);
 
-        // Allocate memtable; id will be updated after scanning max IDs.
+        // Initial placeholder memtable. id and created_at_log_index both 0
+        // are the sentinel values that mark "no real memtable yet" — the
+        // first replayed `newMemtable` swaps it out (Phase 5).
         const mt = try SkipList.init(allocator);
         errdefer mt.release();
 
@@ -261,47 +320,6 @@ pub const Forest = struct {
             .mu = .{},
             .memtables = Memtables.init(allocator, mt),
         };
-        errdefer self.trees.deinit();
-        errdefer self.ns_routes.deinit();
-        errdefer self.table_cache.deinit();
-
-        var max_tid: u64 = 0;
-        var max_fid: u64 = 0;
-        {
-            var it = self.ms.trees.iterator();
-            while (it.next()) |kv| {
-                const tree_id = kv.key_ptr.*;
-                const tree_state = kv.value_ptr.*;
-                if (tree_id > max_tid) max_tid = tree_id;
-
-                // Track the highest table ID to seed next_file_id.
-                for (tree_state.levels.items) |lm| {
-                    var fit = lm.tables.keyIterator();
-                    while (fit.next()) |fid| {
-                        if (fid.* > max_fid) max_fid = fid.*;
-                    }
-                }
-
-                var tree = try Tree.open(allocator, opts, tree_id, &self.ms, &self.table_cache);
-                errdefer tree.close();
-
-                const tree_ptr = try allocator.create(Tree);
-                tree_ptr.* = tree;
-                try self.trees.put(tree_id, tree_ptr);
-
-                // Rebuild namespace routing from persisted tree state.
-                if (tree_state.namespace_id != 0) {
-                    const rt = try self.getOrCreateRouteTable(tree_state.namespace_id);
-                    try rt.addRoute(tree_id, .{ .left = tree_state.left, .right = tree_state.right });
-                }
-            }
-        }
-
-        self.next_tree_id = std.atomic.Value(u64).init(max_tid + 1);
-        self.next_file_id = std.atomic.Value(u64).init(max_fid + 1);
-
-        // Assign the first memtable a proper file ID.
-        self.memtables.current.id = self.next_file_id.fetchAdd(1, .monotonic);
         return self;
     }
 
@@ -322,7 +340,7 @@ pub const Forest = struct {
         }
         self.ns_routes.deinit();
 
-        self.ms.close();
+        self.ms.deinit();
         self.table_cache.deinit();
         self.allocator.destroy(self);
     }
@@ -338,10 +356,11 @@ pub const Forest = struct {
 
     /// Create a new memtable, freezing the current one.
     /// Called when the newMemtable entry is committed via Raft.
-    /// The new_id is assigned by the leader and included in the proposal
-    /// so all nodes use the same ID.
-    pub fn newMemtable(self: *Forest, new_id: u64) !void {
-        try self.memtables.swapCurrentOut(new_id);
+    /// The new_id is assigned by the leader and included in the proposal so
+    /// all nodes use the same ID. `log_index` is the apply index of that
+    /// Raft entry — pins the snapshot horizon for the new memtable.
+    pub fn newMemtable(self: *Forest, new_id: u64, log_index: u64) !void {
+        try self.memtables.swapCurrentOut(new_id, log_index);
     }
 
     /// Ensure next_file_id is past the given id, so a follower that
@@ -505,7 +524,7 @@ pub const Forest = struct {
         var needed: std.ArrayList(tree_mod.TableNeed) = .{};
         defer needed.deinit(self.allocator);
         for (changes) |c| {
-            std.debug.assert(c.op == 0); // flush only creates
+            std.debug.assert(c.op == .create); // flush only creates
             try needed.append(self.allocator, .{ .id = c.table_id, .level = c.level });
         }
         try self.table_cache.loadTables(needed.items);
@@ -528,11 +547,12 @@ pub const Forest = struct {
             }, n.table.?.fileSize());
         }
 
-        // Remove the oldest flushed memtable.
-        if (self.memtables.popOldest()) |imm| {
-            std.debug.assert(imm.id == memtable_id);
-            imm.release();
-        }
+        // Remove the flushed memtable from local immutables IF it's there.
+        // During recovery replay, the memtable's `newMemtable` proposal may
+        // have been below snap.index and compacted; in that case immutables
+        // either is empty or contains a *later* memtable. The SST install
+        // above handles the data side; nothing local to remove.
+        self.memtables.popOldestIfMatches(memtable_id);
 
         // Update compaction candidates for affected trees.
         var seen_trees = std.AutoHashMap(u64, void).init(self.allocator);
@@ -578,6 +598,67 @@ pub const Forest = struct {
 
         const rt = try self.getOrCreateRouteTable(namespace_id);
         try rt.addRoute(tree_id, range);
+    }
+
+    /// Walk every tree's level table list and append the file_ids of any SST
+    /// not currently on disk. The returned slice is owned by the caller.
+    pub fn collectMissingFileIds(self: *Forest, allocator: std.mem.Allocator) ![]u64 {
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(allocator);
+
+        var it = self.ms.trees.iterator();
+        while (it.next()) |kv| {
+            for (kv.value_ptr.*.levels.items) |lm| {
+                var tit = lm.tables.keyIterator();
+                while (tit.next()) |fid| {
+                    if (!self.hasFile(fid.*)) try out.append(allocator, fid.*);
+                }
+            }
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Walk `self.ms.trees` and install each tree (Tree + RouteTable entries),
+    /// then advance `next_tree_id` / `next_file_id` past every id seen. Used
+    /// after `ForestState.restoreFrom(snapshot.data)` at recovery — the manifest
+    /// already names every tree and table, but the in-memory Tree objects and
+    /// route table need to be rebuilt from it.
+    pub fn openTablesFromManifest(self: *Forest) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        var max_tree_id: u64 = 0;
+        var max_file_id: u64 = 0;
+
+        var it = self.ms.trees.iterator();
+        while (it.next()) |kv| {
+            const tree_id = kv.key_ptr.*;
+            const tree = kv.value_ptr.*;
+
+            // Route table holds non-owning refs into `self.ms.trees[tid]`.
+            // Tree-key changes (split / update) flow through `applySplit`
+            // under the forest write lock, which atomically rewrites both
+            // `ms.trees[tid]` and the corresponding route entry — so the
+            // ref never outlives the underlying allocation. Same lifetime
+            // discipline as `createTree` / `applyNamespaceCreate`.
+            const range: KeyRange = if (tree.left.len() == 0 and tree.right.len() == 0)
+                .{ .inf = true }
+            else
+                .{ .left = tree.left, .right = tree.right };
+
+            try self.installTree(tree_id, tree.namespace_id, range);
+
+            if (tree_id > max_tree_id) max_tree_id = tree_id;
+            for (tree.levels.items) |lm| {
+                var tit = lm.tables.keyIterator();
+                while (tit.next()) |fid| {
+                    if (fid.* > max_file_id) max_file_id = fid.*;
+                }
+            }
+        }
+
+        self.advanceTreeId(max_tree_id);
+        self.advanceFileId(max_file_id);
     }
 
     /// Create a new tree for the given namespace and key range.
@@ -626,7 +707,7 @@ pub const Forest = struct {
         defer self.mu.unlock();
 
         for (mc.tree_changes) |tc| {
-            if (tc.op != 0) continue; // only CREATE for ns_create
+            if (tc.op != .create) continue; // only CREATE for ns_create
             self.advanceTreeId(tc.tree_id);
             try self.ms.commit(&.{}, &.{tc});
             // Empty left/right encodes the infinite range.
@@ -1050,6 +1131,10 @@ pub const Forest = struct {
     /// applySplit is Phase B: commits the manifest changes, opens the new tree,
     /// updates the old tree's key range, removes migrated tables, and updates
     /// namespace routing. Called on all nodes after Raft commit.
+    /// TODO(advance-tree-id): this path doesn't `advanceTreeId(new_tree_id)`,
+    /// so a follower that becomes leader right after applying a split can
+    /// re-issue the split's new id. Add the bump after the manifest commit
+    /// (mirrors `applyNamespaceCreate`).
     pub fn applySplit(self: *Forest, mc: manifest.ManifestChange) !void {
         // Commit MANIFEST so we can recover from a crash.
         try self.ms.commit(mc.table_changes, mc.tree_changes);
@@ -1059,9 +1144,9 @@ pub const Forest = struct {
         var new_tree_id: u64 = 0;
         var namespace_id: u32 = 0;
         for (mc.tree_changes) |tc| {
-            if (tc.op == 2) { // UPDATE
+            if (tc.op == .update) { // UPDATE
                 old_tree_id = tc.tree_id;
-            } else if (tc.op == 0) { // CREATE
+            } else if (tc.op == .create) { // CREATE
                 new_tree_id = tc.tree_id;
                 namespace_id = tc.namespace_id;
             }
@@ -1085,7 +1170,7 @@ pub const Forest = struct {
 
         // Remove migrated tables from old tree.
         for (mc.table_changes) |c| {
-            if (c.op == 1 and c.tree_id == old_tree_id) { // DELETE from old tree
+            if (c.op == .delete and c.tree_id == old_tree_id) { // DELETE from old tree
                 left_tree.levels[c.level].deleteEntry(c.table_id);
             }
         }

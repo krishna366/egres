@@ -531,16 +531,18 @@ fn addZdbServer(
     zdb_mod.addImport("vfs", vfs_mod);
     zdb_mod.addImport("metrics", metrics_mod);
 
+    // `flags` is its own module with no transitive deps; needed by main.zig
+    // for CLI parsing (single quoted `--node="k=v; k=v"` payload form), and
+    // by zdb_server for the live `SnapshotCfg` consumer.
+    const flags_mod = makeModule(b, target, optimize, "u/flags.zig");
+
     const zdb_server_mod = makeModule(b, target, optimize, "zdb-server/server.zig");
     zdb_server_mod.addImport("zio", zio_mod);
     zdb_server_mod.addImport("raft", raft_mod);
     zdb_server_mod.addImport("zdb", zdb_mod);
     zdb_server_mod.addImport("runtime", runtime_mod);
     zdb_server_mod.addImport("metrics", metrics_mod);
-
-    // `flags` is its own module with no transitive deps; needed by main.zig
-    // for CLI parsing (single quoted `--node="k=v; k=v"` payload form).
-    const flags_mod = makeModule(b, target, optimize, "u/flags.zig");
+    zdb_server_mod.addImport("flags", flags_mod);
 
     const exe = b.addExecutable(.{
         .name = "zdb-server",
