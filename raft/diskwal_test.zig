@@ -1,5 +1,4 @@
 const std = @import("std");
-const build_options = @import("build_options");
 const raft = @import("raft");
 const zio = @import("zio");
 const zbuf = @import("zbuf").zbuf;
@@ -356,7 +355,7 @@ test "diskwal rejects snapshot-log firstIndex mismatch on reopen" {
     );
 }
 
-fn bigTestStorageImpl() !void {
+test "BIG: diskwal storage" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
@@ -413,31 +412,7 @@ fn bigTestStorageImpl() !void {
     }
 }
 
-test "BIGTEST diskwal storage" {
-    if (!build_options.enable_bigtests) return error.SkipZigTest;
-    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
-    defer rt.deinit();
-    var handle = try rt.spawn(bigTestStorageImpl, .{});
-    try handle.join();
-}
-
-test "BIGTEST diskwal truncate storage" {
-    if (!build_options.enable_bigtests) return error.SkipZigTest;
-    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
-    defer rt.deinit();
-    var handle = try rt.spawn(bigTestTruncateStorageImpl, .{});
-    try handle.join();
-}
-
-test "BIGTEST diskwal large payload rotation" {
-    if (!build_options.enable_bigtests) return error.SkipZigTest;
-    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
-    defer rt.deinit();
-    var handle = try rt.spawn(bigTestLargePayloadRotationImpl, .{});
-    try handle.join();
-}
-
-fn bigTestTruncateStorageImpl() !void {
+test "BIG: diskwal truncate storage" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
@@ -473,7 +448,7 @@ fn bigTestTruncateStorageImpl() !void {
     try checkRange(log, new_last - 100, new_last + 1);
 }
 
-fn bigTestLargePayloadRotationImpl() !void {
+test "BIG: diskwal large payload rotation" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {

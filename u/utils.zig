@@ -3,6 +3,7 @@ const zio = @import("zio");
 const builtin = @import("builtin");
 pub const compression = @import("compress.zig");
 pub const hlc = @import("hlc.zig");
+pub const bench = @import("bench.zig");
 
 /// WaitGroup provides Go-style Add/Done/Wait synchronization for zio coroutines.
 ///
@@ -291,36 +292,3 @@ pub fn SafeHashMap(comptime K: type, comptime V: type) type {
     };
 }
 
-/// Run all pub test functions (fn names starting with "test") in a module
-/// inside a zio runtime. Test functions must be `pub fn testXxx() !void`.
-///
-/// Usage in a test file:
-///   test { try utils.runTestsInZioRuntime(@This()); }
-pub fn runTestsInZioRuntime(comptime Module: type) !void {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-
-    const Runner = struct {
-        fn run() !void {
-            const decls = @typeInfo(Module).@"struct".decls;
-            inline for (decls) |d| {
-                if (comptime !std.mem.startsWith(u8, d.name, "test")) continue;
-                const func = @field(Module, d.name);
-                const fn_info = comptime @typeInfo(@TypeOf(func));
-                if (comptime fn_info != .@"fn") continue;
-                if (comptime fn_info.@"fn".params.len != 0) continue;
-
-                std.debug.print("  running {s}...\n", .{d.name});
-                const ret_ty = comptime fn_info.@"fn".return_type orelse void;
-                if (comptime @typeInfo(ret_ty) == .error_union) {
-                    try func();
-                } else {
-                    func();
-                }
-            }
-        }
-    };
-
-    var handle = try rt.spawn(Runner.run, .{});
-    try handle.join();
-}

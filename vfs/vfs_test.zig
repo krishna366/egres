@@ -1,8 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
 const zio = @import("zio");
-const vfs = @import("vfs.zig");
-const bandwidth = @import("bandwidth.zig");
+const vfs = @import("vfs");
+const bandwidth = vfs.bandwidth;
 const VFS = vfs.VFS;
 const Priority = vfs.Priority;
 const page_size = vfs.page_size;
@@ -277,7 +277,7 @@ test "read bandwidth enforcement" {
     try testing.expectEqual(file_size, r.data.len);
     // At 4 MB/s, 4 MB should take ~1000ms. Allow wide range for CI variance.
     try testing.expect(elapsed_ms >= 500);
-    try testing.expect(elapsed_ms <= 5000);
+    try testing.expect(elapsed_ms <= 10000);
 }
 
 // ── 12. Write bandwidth enforcement ─────────────────────────────────
@@ -383,13 +383,13 @@ test "P1 prioritized over P2" {
     var p2_ctx = PriorityTestCtx{ .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
 
     // Launch P2 first, then P1 — P1 should still finish first.
-    const p2_thread = try std.Thread.spawn(.{}, PriorityTestCtx.readerFn, .{ &p2_ctx, .p2 });
+    var p2_handle = try zio.spawn(PriorityTestCtx.readerFn, .{ &p2_ctx, .p2 });
     // Small delay so P2 enters the wait loop first.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
-    const p1_thread = try std.Thread.spawn(.{}, PriorityTestCtx.readerFn, .{ &p1_ctx, .p1 });
+    try zio.sleep(zio.Duration.fromMilliseconds(5));
+    var p1_handle = try zio.spawn(PriorityTestCtx.readerFn, .{ &p1_ctx, .p1 });
 
-    p1_thread.join();
-    p2_thread.join();
+    p1_handle.join();
+    p2_handle.join();
 
     // Both should have read the full file.
     try testing.expectEqual(@as(u64, file_size), p1_ctx.bytes_read.load(.monotonic));

@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 const flags = @import("flags.zig");
 
 const RaftCfg = struct {
@@ -192,8 +193,8 @@ test "concurrent readers do not see torn state" {
     var err_flag = std.atomic.Value(u16).init(0);
     const ctx = ConcurrentCtx{ .live = &live, .stop = &stop, .err = &err_flag };
 
-    var threads: [4]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, readerLoop, .{ctx});
+    var handles: [4]zio.JoinHandle(void) = undefined;
+    for (&handles) |*h| h.* = try zio.spawn(readerLoop, .{ctx});
 
     // Hammer with updates.
     var i: usize = 0;
@@ -206,7 +207,7 @@ test "concurrent readers do not see torn state" {
     }
 
     stop.store(true, .release);
-    for (threads) |t| t.join();
+    for (&handles) |*h| h.join();
     try std.testing.expectEqual(@as(u16, 0), err_flag.load(.acquire));
 }
 
@@ -325,7 +326,6 @@ test "registry: writeHelpAll renders both modules with their docs" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
     try reg.writeHelpAll(&out);
-    std.debug.print("{s}\n", .{out.items});
 
     // raft has a self-doc; rendered next to the module name.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Raft consensus tunables. Hot-reloadable.\n") != null);
@@ -378,9 +378,9 @@ test "registry: concurrent updates same module are serialised" {
     var err_flag = std.atomic.Value(u16).init(0);
     const ctx = MultiUpdaterCtx{ .live = raft, .iters = 100, .err = &err_flag };
 
-    var threads: [4]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, updaterLoop, .{ctx});
-    for (threads) |t| t.join();
+    var handles: [4]zio.JoinHandle(void) = undefined;
+    for (&handles) |*h| h.* = try zio.spawn(updaterLoop, .{ctx});
+    for (&handles) |*h| h.join();
 
     try std.testing.expectEqual(@as(u16, 0), err_flag.load(.acquire));
     try std.testing.expectEqual(@as(u64, 4 * 100), raft.version());

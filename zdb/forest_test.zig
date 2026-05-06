@@ -17,10 +17,6 @@ const RouteTable = forest_mod.RouteTable;
 
 const options_mod = zdb.options;
 
-const utils = @import("utils");
-test "all" {
-    try utils.runTestsInZioRuntime(@This());
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,7 +30,7 @@ fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
 // 1. RouteTable lookup
 // ---------------------------------------------------------------------------
 
-pub fn testRouteTableSingleEntry() !void {
+test "forest: route table single entry" {
     const alloc = std.testing.allocator;
     var rt = RouteTable.init(alloc, 1);
     defer rt.deinit();
@@ -44,7 +40,7 @@ pub fn testRouteTableSingleEntry() !void {
     try std.testing.expectEqual(@as(u64, 10), rt.lookup(.{ .namespace = 1, .primary = "anything" }).?);
 }
 
-pub fn testRouteTableMultiEntry() !void {
+test "forest: route table multi-entry" {
     const alloc = std.testing.allocator;
     var rt = RouteTable.init(alloc, 1);
     defer rt.deinit();
@@ -72,7 +68,7 @@ pub fn testRouteTableMultiEntry() !void {
 // 2. Forest open/close
 // ---------------------------------------------------------------------------
 
-pub fn testForestOpenCloseEmpty() !void {
+test "forest: open close empty" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -87,7 +83,7 @@ pub fn testForestOpenCloseEmpty() !void {
 // 3. Forest create tree + get
 // ---------------------------------------------------------------------------
 
-pub fn testForestCreateTreeAndGet() !void {
+test "forest: create tree and get" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -133,7 +129,7 @@ fn buildAndWriteTable(alloc: std.mem.Allocator, path: []const u8, primary: []con
     try f.writeAll(tb.bytes);
 }
 
-pub fn testForestSplitTree() !void {
+test "forest: split tree" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -208,7 +204,7 @@ pub fn testForestSplitTree() !void {
 // it into a fresh forest pointing at the same on-disk dir, and assert: tree
 // set, namespace routes, level membership, and ID counters are all restored.
 
-pub fn testForestSnapshotManifestRoundTrip() !void {
+test "forest: snapshot manifest round-trip" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -285,7 +281,7 @@ fn buildMemtables(alloc: std.mem.Allocator, ids: []const u64) !forest_mod.Memtab
     return mts;
 }
 
-pub fn testPopOldestIfMatchesEmpty() !void {
+test "forest: popOldestIfMatches empty" {
     const alloc = std.testing.allocator;
     var mts = try buildMemtables(alloc, &.{}); // current=placeholder, immutables=[]
     defer mts.deinit();
@@ -293,7 +289,7 @@ pub fn testPopOldestIfMatchesEmpty() !void {
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
 }
 
-pub fn testPopOldestIfMatchesExact() !void {
+test "forest: popOldestIfMatches exact" {
     const alloc = std.testing.allocator;
     // immutables=[5], current=8.
     var mts = try buildMemtables(alloc, &.{ 5, 8 });
@@ -303,7 +299,7 @@ pub fn testPopOldestIfMatchesExact() !void {
     try std.testing.expectEqual(@as(u64, 8), mts.current.id);
 }
 
-pub fn testPopOldestIfMatchesGreater() !void {
+test "forest: popOldestIfMatches greater" {
     const alloc = std.testing.allocator;
     // immutables=[7], current=10. Flush proposal expects 5 — older than oldest.
     var mts = try buildMemtables(alloc, &.{ 7, 10 });
@@ -313,7 +309,7 @@ pub fn testPopOldestIfMatchesGreater() !void {
     try std.testing.expectEqual(@as(u64, 7), mts.immutables.items[0].id);
 }
 
-pub fn testPopOldestIfMatchesPhantom() !void {
+test "forest: popOldestIfMatches phantom" {
     const alloc = std.testing.allocator;
     // immutables=[3], current=10. Flush proposal expects 7. M_3 is a phantom.
     var mts = try buildMemtables(alloc, &.{ 3, 10 });
@@ -322,7 +318,7 @@ pub fn testPopOldestIfMatchesPhantom() !void {
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
 }
 
-pub fn testPopOldestIfMatchesMultiplePhantomsThenMatch() !void {
+test "forest: popOldestIfMatches multi phantom then match" {
     const alloc = std.testing.allocator;
     // immutables=[2, 4, 7], current=10. Flush proposal expects 7.
     // Loop drops M_2 and M_4 as phantoms, then pops M_7.
@@ -333,7 +329,7 @@ pub fn testPopOldestIfMatchesMultiplePhantomsThenMatch() !void {
     try std.testing.expectEqual(@as(u64, 10), mts.current.id);
 }
 
-pub fn testPopOldestIfMatchesMultiplePhantomsNoMatch() !void {
+test "forest: popOldestIfMatches multi phantom no match" {
     const alloc = std.testing.allocator;
     // immutables=[2, 4], current=10. Flush proposal expects 7. Both phantoms;
     // no match — immutables drained, current untouched.
@@ -344,7 +340,7 @@ pub fn testPopOldestIfMatchesMultiplePhantomsNoMatch() !void {
     try std.testing.expectEqual(@as(u64, 10), mts.current.id);
 }
 
-pub fn testForestRoutesToCorrectTree() !void {
+test "forest: routes to correct tree" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

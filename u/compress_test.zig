@@ -1,6 +1,6 @@
 const std = @import("std");
-const compress = @import("compress.zig");
-const utils = @import("utils.zig");
+const utils = @import("utils");
+const compress = utils.compression;
 
 fn makePayload(alloc: std.mem.Allocator, len: usize) ![]u8 {
     var out = try alloc.alloc(u8, len);

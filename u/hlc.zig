@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 
 // Hybrid Logical Clock.
 //
@@ -182,8 +183,8 @@ test "concurrent next yields distinct monotonic HLCs" {
     };
     var a = Ctx{ .clock = &clock };
     var b = Ctx{ .clock = &clock };
-    const ta = try std.Thread.spawn(.{}, Ctx.run, .{&a});
-    const tb = try std.Thread.spawn(.{}, Ctx.run, .{&b});
+    var ta = try zio.spawn(Ctx.run, .{&a});
+    var tb = try zio.spawn(Ctx.run, .{&b});
     ta.join();
     tb.join();
 

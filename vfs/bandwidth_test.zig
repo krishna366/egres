@@ -1,7 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
-const bandwidth = @import("bandwidth.zig");
-const vfs = @import("vfs.zig");
+const zio = @import("zio");
+const vfs = @import("vfs");
+const bandwidth = vfs.bandwidth;
 const Limiter = bandwidth.Limiter;
 const Spinner = bandwidth.Spinner;
 const page_size = vfs.page_size;
@@ -51,7 +52,7 @@ test "token refill" {
     _ = acquireAll(&limiter, .p0, 200_000_000, .read);
     try testing.expectEqual(@as(u64, 0), limiter.pages.load(.monotonic));
 
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try zio.sleep(zio.Duration.fromMilliseconds(50));
 
     // After 50ms at 100 MB/s, ~5 MB refilled.
     var s = limiter.spinner(.p1, 100_000_000, .read);
@@ -202,7 +203,7 @@ test "page-aligned requests yield page-aligned chunks" {
     _ = acquireAll(&limiter, .p0, 4 * page_size, .read);
 
     // Wait for some refill so P1 gets partial grants.
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try zio.sleep(zio.Duration.fromMilliseconds(50));
 
     const requested: usize = 16 * page_size;
     var s = limiter.spinner(.p1, requested, .read);
