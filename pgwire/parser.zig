@@ -115,12 +115,14 @@ pub fn parse(
     return .{ .json = owned, .parsed = parsed };
 }
 
-/// Free libpg_query's per-thread top memory context. The library
-/// auto-cleans on thread exit, but tests benefit from an explicit
-/// hook to drain leaks before testing-allocator checks.
-pub fn shutdown() void {
-    c.pg_query_exit();
-}
+// Note on cleanup: libpg_query installs a pthread TSD destructor that
+// frees each thread's TopMemoryContext when the OS thread exits. We do
+// NOT expose pg_query_exit() — calling it manually trips a latent
+// upstream bug where the TSD slot keeps a dangling pointer and the
+// destructor double-frees on thread exit. Per-query memory is released
+// in `parse` via pg_query_free_parse_result, and per-thread state is
+// released by the OS at thread/process exit. That's enough for both the
+// long-running server and the unified test runner.
 
 test {
     std.testing.refAllDecls(@This());

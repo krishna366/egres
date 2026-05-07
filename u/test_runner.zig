@@ -109,6 +109,7 @@ const bench = utils.bench;
 //
 // CLI flags (forwarded via `zig build test -- ...`):
 //   --filter <substr>   Run only tests whose name contains <substr>.
+//   --exclude <substr>  Skip tests whose name contains <substr> (composes with --filter).
 //   --bigtest           Include `BIG: ...` prefixed tests.
 //   --only-bench        Run only `BENCH: ...` tests (used by `zig build bench`).
 //   --parallel <N>      Concurrent test fibers. 0 (default) = max(2, cpu_count/2).
@@ -134,6 +135,7 @@ fn resolveParallel(p: u6) u6 {
 
 const Args = struct {
     filter: ?[]const u8 = null,
+    exclude: ?[]const u8 = null,
     run_big: bool = false,
     only_bench: bool = false,
     parallel: u6 = default_parallel,
@@ -227,6 +229,7 @@ const help_text =
     \\
     \\Flags (forward via `zig build test -- ...`):
     \\  --filter <substr>   Run only tests whose name contains <substr>.
+    \\  --exclude <substr>  Skip tests whose name contains <substr> (composes with --filter).
     \\  --bigtest           Include `BIG: …` prefixed tests (slow, opt-in).
     \\  --only-bench        Run only `BENCH: …` tests (used by `zig build bench`).
     \\  --parallel <N>      Concurrent test fibers. 0 (default) = max(2, cpu_count/2).
@@ -236,6 +239,7 @@ const help_text =
     \\  zig build test                          # default suite (skips BIG:/BENCH:)
     \\  zig build test -- --bigtest             # include the slow tests
     \\  zig build test -- --filter "forest:"    # only forest tests
+    \\  zig build test -- --exclude pgwire      # skip every pgwire test
     \\  zig build bench                         # run benchmarks (always ReleaseFast)
     \\
 ;
@@ -251,6 +255,9 @@ fn parseArgs(alloc: std.mem.Allocator) !Args {
             std.process.exit(0);
         } else if (std.mem.eql(u8, a, "--filter") and i + 1 < argv.len) {
             args.filter = argv[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--exclude") and i + 1 < argv.len) {
+            args.exclude = argv[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, a, "--bigtest")) {
             args.run_big = true;
@@ -626,6 +633,7 @@ fn driver(
         const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
         const is_bench = std.mem.startsWith(u8, user_name, "BENCH: ");
         if (args.filter) |f| if (std.mem.indexOf(u8, t.name, f) == null) continue;
+        if (args.exclude) |x| if (std.mem.indexOf(u8, t.name, x) != null) continue;
         if (is_bench) {
             if (!args.only_bench) continue;
             try bench_tests.append(alloc, t);

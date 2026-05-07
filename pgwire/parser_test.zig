@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const zio = @import("zio");
 const pgwire = @import("pgwire");
 
 const parser = pgwire.parser_mod;
@@ -96,16 +97,78 @@ test "parse: syntax error returns SyntaxError + cursor info" {
     try testing.expect(info_unwrap.message.len > 0);
 }
 
-test "parse: 1000 iterations under testing allocator (no leaks)" {
+test "parse: 1000 concurrent fibers parse distinct queries (no leaks, no races)" {
+    // Each fiber N parses `SELECT a, b, c FROM t_N WHERE id = N`, then
+    // walks the parse tree to confirm relname == `t_N` and the WHERE
+    // clause's integer constant == N. With parallel=16 workers running
+    // 1000 fibers, this exercises libpg_query under genuine cross-thread
+    // concurrency. If any per-thread libpg state ever leaked across
+    // threads, fibers would see each other's parses and either the
+    // relname or the int wouldn't match — the failure counter catches it.
+    //
+    // testing.allocator is GPA with thread_safe = !single_threaded, so
+    // the leak check stays valid under concurrent fibers. libpg_query's
+    // plain-malloc per-thread state is released on thread exit by its
+    // own pthread destructor — no manual shutdown needed.
     const a = std.testing.allocator;
-    var i: usize = 0;
+    var failures: std.atomic.Value(u32) = .{ .raw = 0 };
+
+    const Worker = struct {
+        fn run(alloc: std.mem.Allocator, n: u32, fail_count: *std.atomic.Value(u32)) void {
+            const sql = std.fmt.allocPrint(
+                alloc,
+                "SELECT a, b, c FROM t_{d} WHERE id = {d}",
+                .{ n, n },
+            ) catch {
+                _ = fail_count.fetchAdd(1, .seq_cst);
+                return;
+            };
+            defer alloc.free(sql);
+
+            var tree = parser.parse(alloc, sql, null) catch {
+                _ = fail_count.fetchAdd(1, .seq_cst);
+                return;
+            };
+            defer tree.deinit(alloc);
+
+            if (!verifyParse(&tree, n)) {
+                _ = fail_count.fetchAdd(1, .seq_cst);
+            }
+        }
+
+        fn verifyParse(tree: *const parser.ParseTree, n: u32) bool {
+            const stmts = tree.statements() orelse return false;
+            if (stmts.len != 1) return false;
+            const select = stmts[0].object.get("stmt").?.object.get("SelectStmt").?.object;
+
+            // FROM: relname must be `t_<n>` for THIS fiber's n.
+            const from = select.get("fromClause").?.array;
+            if (from.items.len != 1) return false;
+            const relname = from.items[0].object.get("RangeVar").?.object.get("relname").?.string;
+            if (!std.mem.startsWith(u8, relname, "t_")) return false;
+            const got_n = std.fmt.parseInt(u32, relname[2..], 10) catch return false;
+            if (got_n != n) return false;
+
+            // WHERE: integer constant must equal n. Independent witness
+            // from the relname — both being right rules out a cross-fiber
+            // bleed that happens to align on one of them.
+            //
+            // libpg_query's JSON serializer treats 0 as a default and emits
+            // "ival":{} (no inner key) instead of "ival":{"ival":0}. So a
+            // missing inner key means the value was 0.
+            const where = select.get("whereClause").?.object.get("A_Expr").?.object;
+            const aconst = where.get("rexpr").?.object.get("A_Const").?.object;
+            const outer_ival = aconst.get("ival").?.object;
+            const value: i64 = if (outer_ival.get("ival")) |v| v.integer else 0;
+            return value == @as(i64, @intCast(n));
+        }
+    };
+
+    var group = zio.group();
+    var i: u32 = 0;
     while (i < 1000) : (i += 1) {
-        var tree = try parser.parse(a, "SELECT 1", null);
-        tree.deinit(a);
+        try group.spawn(Worker.run, .{ a, i, &failures });
     }
-    // libpg_query lazily creates a per-thread top memory context; we
-    // tear it down explicitly so testing.allocator can detect any
-    // leak in our wrapper code (libpg's own state is tracked by the
-    // C lib and isn't allocated through Zig's allocator).
-    parser.shutdown();
+    try group.wait();
+    try testing.expectEqual(@as(u32, 0), failures.load(.seq_cst));
 }
