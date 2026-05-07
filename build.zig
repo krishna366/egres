@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) void {
     _ = addAllTests(b, target, optimize, raft_mod, regen_buffers_step);
     // TODO: rewrite multiproc harness to use zdb-server
     _ = addRaftMultiprocHarness(b, target, optimize, raft_mod, regen_buffers_step);
+    addPgwireShakeout(b, target, optimize);
 }
 
 fn makeModule(
@@ -253,6 +254,14 @@ fn addAllTests(
     zdb_mod.addImport("vfs", vfs_mod);
     zdb_mod.addImport("metrics", metrics_mod);
 
+    // pgwire.parser does `@cImport("pg_query.h")`, so the libpg_query
+    // include path must be on the *module* (resolved at module-build
+    // time). Linking the C archive itself happens once on the unified
+    // test/bench artifacts via `addLibpgQuerySources` below.
+    const pgwire_mod = makeModule(b, target, optimize, "pgwire.zig");
+    pgwire_mod.addImport("zio", zio_mod);
+    pgwire_mod.addIncludePath(b.path("third_party/libpg_query"));
+
     const buffers_gen_mod = makeModule(b, target, optimize, "zbuf/buffers.gen.zig");
     buffers_gen_mod.addImport("zbuf", zbuf_mod);
 
@@ -274,6 +283,7 @@ fn addAllTests(
         .{ .name = "buffers_gen", .module = buffers_gen_mod },
         .{ .name = "transport", .module = transport_mod },
         .{ .name = "serial", .module = serial_mod },
+        .{ .name = "pgwire", .module = pgwire_mod },
     };
 
     const test_files = collectTestFiles(b);
@@ -322,6 +332,7 @@ fn addAllTests(
         },
     });
     addVendoredCompressionSources(b, all_tests);
+    addLibpgQuerySources(b, all_tests);
 
     const run = b.addRunArtifact(all_tests);
     run.step.dependOn(regen_buffers_step);
@@ -353,6 +364,7 @@ fn addAllTests(
         },
     });
     addVendoredCompressionSources(b, all_bench);
+    addLibpgQuerySources(b, all_bench);
 
     const run_bench = b.addRunArtifact(all_bench);
     run_bench.step.dependOn(regen_buffers_step);
@@ -589,6 +601,109 @@ fn addRaftMultiprocHarness(
     );
     step.dependOn(&run.step);
     return step;
+}
+
+/// libpg_query is the upstream Postgres parser carved out as a static
+/// C library (see third_party/libpg_query/). The vendored copy keeps
+/// only the JSON output path: protobuf encode/decode, the deparser,
+/// and the standalone `pg_query_scan` are dropped — see
+/// pgwire/README.md for what was excised and why.
+fn addLibpgQuerySources(b: *std.Build, compile: *std.Build.Step.Compile) void {
+    compile.linkLibC();
+    compile.root_module.addIncludePath(b.path("third_party/libpg_query"));
+    compile.root_module.addIncludePath(b.path("third_party/libpg_query/vendor"));
+    compile.root_module.addIncludePath(b.path("third_party/libpg_query/src/include"));
+    compile.root_module.addIncludePath(b.path("third_party/libpg_query/src/postgres/include"));
+
+    compile.root_module.addCSourceFiles(.{
+        .root = b.path("."),
+        .files = collectLibpgQuerySources(b),
+        .flags = &.{
+            "-Wno-unused-function",
+            "-Wno-unused-value",
+            "-Wno-unused-variable",
+            "-Wno-format",
+            "-fno-strict-aliasing",
+            "-fwrapv",
+        },
+    });
+}
+
+/// Walk the vendored libpg_query tree and collect every `.c` file we
+/// want to compile. The vendored copy is already pruned (protobuf
+/// encoder/decoder + deparser + standalone scanner are absent); this
+/// just enumerates whatever is on disk under `src/`, `src/postgres/`,
+/// and the xxhash vendor lib. `src/include/` is intentionally skipped
+/// — those files are *.c by name but get `#include`-d into other
+/// translation units, not compiled standalone.
+fn collectLibpgQuerySources(b: *std.Build) [][]const u8 {
+    var paths = std.ArrayList([]const u8).empty;
+    const roots = [_][]const u8{
+        "third_party/libpg_query/src",
+        "third_party/libpg_query/src/postgres",
+        "third_party/libpg_query/vendor/xxhash",
+    };
+    for (roots) |root_path| {
+        var dir = std.fs.cwd().openDir(root_path, .{ .iterate = true }) catch
+            @panic("failed to open libpg_query dir");
+        defer dir.close();
+
+        var it = dir.iterate();
+        while (it.next() catch @panic("failed to read libpg_query dir")) |entry| {
+            // Only this directory level — we walk each root separately
+            // so the `src/include/` C-fragment files (which are
+            // `#include`-d, not compiled) are skipped automatically.
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".c")) continue;
+            const full = std.fs.path.join(
+                b.allocator,
+                &.{ root_path, entry.name },
+            ) catch @panic("OOM joining libpg_query path");
+            paths.append(b.allocator, full) catch
+                @panic("OOM collecting libpg_query sources");
+        }
+    }
+    if (paths.items.len == 0) {
+        @panic("no libpg_query sources found — is the vendored tree present?");
+    }
+    // Sorted output keeps the build cache key stable across runs;
+    // dir.iterate() order is filesystem-defined.
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lt(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lt);
+    return paths.toOwnedSlice(b.allocator) catch
+        @panic("OOM finalizing libpg_query source list");
+}
+
+fn addPgwireShakeout(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
+    const pgwire_mod = makeModule(b, target, optimize, "pgwire.zig");
+    pgwire_mod.addImport("zio", zio_mod);
+    pgwire_mod.addIncludePath(b.path("third_party/libpg_query"));
+
+    const exe = b.addExecutable(.{
+        .name = "pgwire-shakeout",
+        .root_module = makeModule(b, target, optimize, "pgwire-shakeout/main.zig"),
+    });
+    exe.root_module.addImport("zio", zio_mod);
+    exe.root_module.addImport("pgwire", pgwire_mod);
+    addLibpgQuerySources(b, exe);
+    b.installArtifact(exe);
+
+    const install = b.addInstallArtifact(exe, .{});
+    const step = b.step("pgwire-shakeout", "Build the pgwire psql shakeout server");
+    step.dependOn(&install.step);
 }
 
 fn addVendoredCompressionSources(b: *std.Build, compile: *std.Build.Step.Compile) void {
