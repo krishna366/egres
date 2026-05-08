@@ -722,6 +722,17 @@ pub const Forest = struct {
         return self.trees.get(tree_id);
     }
 
+    /// True iff the namespace has been created (its route table exists).
+    /// Used by the leader to reject mutations destined for unknown
+    /// namespaces — those would otherwise pile up in immutable memtables
+    /// since `buildFlush` silently drops items whose namespace has no
+    /// route.
+    pub fn hasNamespace(self: *Forest, namespace_id: u32) bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        return self.ns_routes.contains(namespace_id);
+    }
+
     /// Compact finds the tree with the highest compaction score and runs one
     /// compaction on it. Returns true if a compaction was executed, false if
     /// no tree needs compaction.

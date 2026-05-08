@@ -52,6 +52,82 @@ pub const Config = struct {
 pub const ConfigError = error{
     InvalidConfig,
 };
+
+/// Monotonically-advancing u64 with wait/signal. Used for raft progress
+/// markers (applied HLC, commit index, etc.) where many tasks block until
+/// the value crosses a target.
+///
+/// Fast-path readers call `load()` without taking a lock — the value is
+/// stored atomically. Writers call `advance()`, which takes `mu` so that
+/// the (store, broadcast) pair is serialized against waiters' (check,
+/// suspend) pair. A waiter inside `cv.wait` has atomically released `mu`
+/// and joined the queue, so an advance can't slip between a waiter's
+/// check and suspend: either the waiter sees the new value before
+/// entering `cv.wait`, or it's already in the queue when broadcast runs.
+///
+/// `close()` lets shutdown unblock all current and future waiters with
+/// `error.Closed`. `advance()` still works after close — `closed` only
+/// controls the wait paths.
+const Watermark = struct {
+    value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    mu: zio.Mutex = .init,
+    cv: zio.Condition = .init,
+    closed: bool = false, // protected by mu
+
+    /// Lockless load. Cheap — safe to call on hot paths.
+    pub fn load(self: *Watermark) u64 {
+        return self.value.load(.acquire);
+    }
+
+    /// Monotonic advance. No-op if `new_value <= current`. Broadcasts
+    /// only when the value actually moves.
+    pub fn advance(self: *Watermark, new_value: u64) void {
+        self.mu.lockUncancelable();
+        defer self.mu.unlock();
+        // We hold mu and are the only writer, so a monotonic load is
+        // enough for the local compare.
+        if (new_value > self.value.load(.monotonic)) {
+            self.value.store(new_value, .release);
+            self.cv.broadcast();
+        }
+    }
+
+    /// Mark the watermark closed and wake every current/future waiter
+    /// with `error.Closed`. Idempotent.
+    pub fn close(self: *Watermark) void {
+        self.mu.lockUncancelable();
+        defer self.mu.unlock();
+        if (!self.closed) {
+            self.closed = true;
+            self.cv.broadcast();
+        }
+    }
+
+    /// Block until `value >= target` or `timeout` elapses. Returns
+    /// `error.Closed` if `close()` is called, `error.Timeout` on expiry,
+    /// `error.Canceled` if the task is canceled.
+    pub fn waitFor(self: *Watermark, target: u64, timeout: zio.Duration) !void {
+        const deadline: zio.Timeout = (zio.Timeout{ .duration = timeout }).toDeadline();
+        try self.mu.lock();
+        defer self.mu.unlock();
+        while (self.value.load(.acquire) < target) {
+            if (self.closed) return error.Closed;
+            try self.cv.timedWait(&self.mu, deadline);
+        }
+    }
+
+    /// Block until `value >= target`. Returns `error.Closed` on close,
+    /// `error.Canceled` on cancel.
+    pub fn waitForUntimed(self: *Watermark, target: u64) !void {
+        try self.mu.lock();
+        defer self.mu.unlock();
+        while (self.value.load(.acquire) < target) {
+            if (self.closed) return error.Closed;
+            try self.cv.wait(&self.mu);
+        }
+    }
+};
+
 pub const DiskWAL = @import("diskwal.zig").DiskWAL;
 pub const RaftLogError = raftwal_mod.RaftLogError;
 
@@ -129,14 +205,19 @@ pub const Node = struct {
     /// this (e.g. with forest/applier) and sets node.state_machine.
     pub const StateMachine = struct {
         ctx: *anyopaque,
-        applyFn: *const fn (*anyopaque, Entry, []const u8) void,
+        /// Apply an entry to the state machine. Returning an error parks the
+        /// raft apply loop on this entry: `applyCommits` will sleep briefly
+        /// (still polling shutdown) and retry until apply succeeds. The
+        /// state machine must NOT loop on transient errors itself — it would
+        /// block the raft fiber from observing shutdown.
+        applyFn: *const fn (*anyopaque, Entry, []const u8) anyerror!void,
         writeFileFn: ?*const fn (*anyopaque, u64, []const u8) void = null,
         readFileFn: ?*const fn (*anyopaque, std.mem.Allocator, u64) ?[]const u8 = null,
         hasFileFn: ?*const fn (*anyopaque, u64) bool = null,
         preAppendFn: ?*const fn (*anyopaque, *Node, []const zen.LogEntryBuffer) void = null,
 
-        pub fn apply(self: *StateMachine, entry: Entry, data: []const u8) void {
-            self.applyFn(self.ctx, entry, data);
+        pub fn apply(self: *StateMachine, entry: Entry, data: []const u8) anyerror!void {
+            try self.applyFn(self.ctx, entry, data);
         }
         pub fn writeFile(self: *StateMachine, file_id: u64, data: []const u8) void {
             (self.writeFileFn orelse @panic("StateMachine.writeFile not implemented"))(self.ctx, file_id, data);
@@ -160,15 +241,14 @@ pub const Node = struct {
     log: *DiskWAL,
 
     state: State,
-    commit_index: std.atomic.Value(u64),
+    /// Commit index. Lockless reads on hot replication paths via `commit_index.load()`;
+    /// applyLoop and callbackLoop block on `commit_index.waitForUntimed(target)`.
+    commit_index: Watermark = .{},
     apply_index: std.atomic.Value(u64),
     /// HLC timestamp of the most-recently applied entry. Progress marker
     /// parallel to `apply_index`. Readers bounded by `read_ts` block until
-    /// `apply_ts >= read_ts` via `waitUntilApplied`.
-    apply_ts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Broadcast signal fired after every `apply_ts` advance. Waiters in
-    /// `waitUntilApplied` are woken and re-check their target.
-    apply_ts_notify: zio.Notify = .init,
+    /// `applied_ts.load() >= read_ts` via `waitForApplied`.
+    applied_ts: Watermark = .{},
     conf_applied_index: u64,
     leader_id: ?NodeId,
     pending_conf_change: bool,
@@ -189,12 +269,6 @@ pub const Node = struct {
     proposal_ch: zio.Channel(ProposalRequest) = undefined,
     apply_callbacks: zio.Channel(PendingApply) = undefined,
     event_ch: zio.Channel(u8) = undefined,
-    // Broadcast notify fired by `advance()` whenever commit_index moves
-    // forward. Both applyLoop (state-machine apply) and callbackLoop
-    // (proposal-callback firing) wait on it. Notify is the right primitive
-    // here — a Channel is rendezvous (one signal = one receiver), which
-    // would let the two loops race for each commit signal.
-    commit_notify: zio.Notify = .init,
     inbound_ch: zio.Channel(InboundMsg) = undefined,
     shutting_down: std.atomic.Value(bool),
 
@@ -250,7 +324,6 @@ pub const Node = struct {
             .voted_for = null,
             .log = log,
             .state = .follower,
-            .commit_index = std.atomic.Value(u64).init(0),
             .apply_index = std.atomic.Value(u64).init(0),
             .conf_applied_index = 0,
             .leader_id = null,
@@ -308,7 +381,7 @@ pub const Node = struct {
         const snap_idx = node.log.snapshot().index;
         if (snap_idx > 0) {
             node.apply_index.store(snap_idx, .release);
-            node.commit_index.store(snap_idx, .release);
+            node.commit_index.advance(snap_idx);
             raft_log.info("node {d}: post-snapshot startup, apply_index={d}", .{ node.id, snap_idx });
         }
 
@@ -843,8 +916,10 @@ pub const Node = struct {
         self.shutting_down.store(true, .release);
         self.proposal_ch.close(.graceful);
         self.event_ch.close(.graceful);
-        // Wake applyLoop + callbackLoop so they observe isShuttingDown() and exit.
-        self.commit_notify.broadcast();
+        // Wake applyLoop + callbackLoop with error.Closed; wake any pending
+        // proposeAndWaitForApply / waitForApplied callers the same way.
+        self.commit_index.close();
+        self.applied_ts.close();
     }
 
     pub fn isShuttingDown(self: *const Node) bool {
@@ -1065,7 +1140,7 @@ pub const Node = struct {
             .prev_log_index = prev_index,
             .prev_log_term = prev_term,
             .entries = entry_offsets.items,
-            .leader_commit = self.commit_index.load(.acquire),
+            .leader_commit = self.commit_index.load(),
         });
         _ = try ae_writer.finishWithTail();
         const bytes = try buf.toOwnedSlice(self.allocator);
@@ -1315,14 +1390,14 @@ pub const Node = struct {
         }
 
         // utils.logEvery(10, "node {d}: handleAE entries={d} leaderCommit={d} ci={d} lastIndex={d}", .{
-        //     self.id, ae_entries_len, ae.leaderCommit(), self.commit_index.load(.acquire), self.log.lastIndex(),
+        //     self.id, ae_entries_len, ae.leaderCommit(), self.commit_index.load(), self.log.lastIndex(),
         // });
 
-        if (ae.leaderCommit() > self.commit_index.load(.acquire)) {
+        if (ae.leaderCommit() > self.commit_index.load()) {
             const last_index = self.log.lastIndex();
             const new_ci = if (ae.leaderCommit() < last_index) ae.leaderCommit() else last_index;
-            dbg("node {d}: advancing commit_index {d} -> {d}", .{ self.id, self.commit_index.load(.acquire), new_ci });
-            self.commit_index.store(new_ci, .release);
+            dbg("node {d}: advancing commit_index {d} -> {d}", .{ self.id, self.commit_index.load(), new_ci });
+            self.commit_index.advance(new_ci);
         }
         try self.sendAppendEntriesReply(leader_id, .{
             .success = true,
@@ -1397,7 +1472,7 @@ pub const Node = struct {
         defer buf.deinit(self.allocator);
         const off = try snap.marshalTo(self.allocator, &buf);
         try zbuf.appendMessageTail(&buf, self.allocator, zen.SnapshotReader.TABLE_ID, off);
-        try self.proposeAndWait(buf.items, .snapshot);
+        try self.proposeAndWaitForApply(buf.items, .snapshot);
     }
 
     /// Propose a data change (normal mutation) through the raft proposal queue.
@@ -1410,29 +1485,50 @@ pub const Node = struct {
         return self.proposeWithCallback(data, cb, ctx, .data);
     }
 
-    /// Synchronous propose-and-block-until-commit wrapper. The wait doubles
-    /// as a rate-limit: the caller fiber stays parked until commit, so it
-    /// can't pile up more than one in-flight proposal. `proposal_type`
+    /// Synchronous propose-and-block-until-applied wrapper. The wait doubles
+    /// as a rate-limit: the caller fiber stays parked until commit + apply,
+    /// so it can't pile up more than one in-flight proposal. `proposal_type`
     /// becomes the wire-level `entry_type`, which lets the snapshot builder
     /// filter manifest entries via `entriesRange(.ty = .manifest)`.
-    pub fn proposeAndWait(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
+    ///
+    /// Apply-not-just-commit matters for control-plane proposals: e.g. a
+    /// memtable flush proposal's apply pops the immutable from the queue,
+    /// and the next iteration of the flush loop must observe that. Returning
+    /// at commit instead let the loop see the same memtable still queued and
+    /// re-flush it, producing two L0 SSTs with identical (primary, ts) data
+    /// → MergeIterator yields duplicates → builder rejects → KeyOrderViolation.
+    /// User-facing writes go through `proposeDataChange` (callback fires on
+    /// commit) and are unaffected.
+    pub fn proposeAndWaitForApply(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
         var ctx = WaitCtx{ .status = .committed };
         ctx.wg.init();
         ctx.wg.add(1);
         try self.proposeWithCallback(data, &onWaitCommit, @ptrCast(&ctx), proposal_type);
-        ctx.wg.wait() catch return error.CommitFailed;
+        ctx.wg.wait() catch |err| {
+            raft_log.err("proposeAndWaitForApply: wait for commit failed: {s}", .{@errorName(err)});
+            return error.CommitFailed;
+        };
         if (ctx.status != .committed) return error.NotCommitted;
+        // Wait for applied to catch up to this entry's timestamp. The
+        // tracker's check-and-suspend is atomic under its mutex, so no
+        // advance can slip past us between the check and the wait.
+        self.applied_ts.waitForUntimed(ctx.entry_ts) catch |err| {
+            raft_log.err("proposeAndWaitForApply: wait for apply (ts={d}): {s}", .{ ctx.entry_ts, @errorName(err) });
+            return error.CommitFailed;
+        };
     }
 
     const WaitCtx = struct {
         wg: utils.WaitGroup = .{},
         status: CommitStatus,
+        entry_ts: u64 = 0,
     };
 
-    fn onWaitCommit(ctx_raw: *anyopaque, _: Entry, status: CommitStatus) void {
+    fn onWaitCommit(ctx_raw: *anyopaque, entry: Entry, status: CommitStatus) void {
         const ctx: *WaitCtx = @ptrCast(@alignCast(ctx_raw));
         ctx.status = status;
+        ctx.entry_ts = entry.timestamp;
         ctx.wg.done();
     }
 
@@ -1668,45 +1764,42 @@ pub const Node = struct {
         group.wait() catch {};
     }
 
-    fn notifyCommitAdvanced(self: *Node) void {
-        self.commit_notify.broadcast();
-    }
-
-    /// Drains `apply_callbacks` for entries whose index is ≤ commit_index,
-    /// firing each callback with `.committed`. The callback channel is in
-    /// log-index order (populated by `appendProposalsToLeaderLog`), so a
-    /// peek/receive loop is sufficient — no map/scan needed.
-    ///
-    /// Re-check before wait: commit_notify is edge-triggered, so a broadcast
-    /// that fires while we're inside the drain loop is lost. Snapshot
-    /// commit_index at the start, drain against it, then load again before
-    /// waiting — if it advanced, loop without waiting so we never miss
-    /// callbacks.
+    /// Fires `apply_callbacks` with `.committed` once each entry commits.
+    /// The channel is in log-index order (populated by
+    /// `appendProposalsToLeaderLog`), so the loop is: pull the next pending
+    /// callback, wait until commit_index catches up to its index, fire.
     pub fn callbackLoop(self: *Node) void {
         while (!self.isShuttingDown()) {
-            const ci_seen = self.commit_index.load(.acquire);
-            while (true) {
-                const head = self.apply_callbacks.peek() catch break;
-                if (head.entry.index > ci_seen) break;
-                const ready = self.apply_callbacks.tryReceive() catch break;
-                ready.cb(ready.ctx, ready.entry, .committed);
-            }
-            if (self.commit_index.load(.acquire) > ci_seen) continue;
-            self.commit_notify.wait() catch return;
+            const ready = self.apply_callbacks.receive() catch |err| {
+                if (err != error.ChannelClosed) {
+                    raft_log.err("callbackLoop: receive: {s}", .{@errorName(err)});
+                }
+                return;
+            };
+            self.commit_index.waitForUntimed(ready.entry.index) catch |err| {
+                if (err != error.Closed) {
+                    raft_log.err("callbackLoop: waitFor commit >= {d}: {s}", .{ ready.entry.index, @errorName(err) });
+                }
+                ready.cb(ready.ctx, ready.entry, .shutdown);
+                return;
+            };
+            ready.cb(ready.ctx, ready.entry, .committed);
         }
     }
 
-    /// Re-check before wait for the same lost-wakeup reason as callbackLoop:
-    /// applyCommits captures commit_index at entry and stops there, so any
-    /// commits that landed during the apply loop need a fresh re-check.
     pub fn applyLoop(self: *Node) void {
         // TODO: Use this loop to replay all the logs from last snapshot.
         // Actually, if we just set the apply index to the last snapshot index, then this would
         // automatically apply all the pending entries anyway. We just need to trigger it.
         while (!self.isShuttingDown()) {
             self.applyCommits();
-            if (self.apply_index.load(.acquire) < self.commit_index.load(.acquire)) continue;
-            self.commit_notify.wait() catch return;
+            const target = self.apply_index.load(.acquire) + 1;
+            self.commit_index.waitForUntimed(target) catch |err| {
+                if (err != error.Closed) {
+                    raft_log.err("applyLoop: waitFor commit >= {d}: {s}", .{ target, @errorName(err) });
+                }
+                return;
+            };
         }
     }
 
@@ -1714,7 +1807,7 @@ pub const Node = struct {
 
     pub fn applyCommits(self: *Node) void {
         var ai = self.apply_index.load(.acquire);
-        const ci = self.commit_index.load(.acquire);
+        const ci = self.commit_index.load();
         if (ai >= ci) {
             return;
         }
@@ -1740,11 +1833,34 @@ pub const Node = struct {
                         // the apply path is the bottleneck when commit
                         // outpaces apply.
                         const t_apply = std.time.microTimestamp();
-                        s.apply(.{
+                        const sm_entry = Entry{
                             .index = entry.index,
                             .term = entry.term,
                             .timestamp = reader.timestamp(),
-                        }, reader.data());
+                        };
+                        // Retry on apply failure with a 1 ms backoff so the
+                        // raft fiber stays responsive to shutdown. The state
+                        // machine must NOT do its own retry loop — it would
+                        // wedge shutdown.
+                        //
+                        // Logging policy: hard errors fire on every retry
+                        // (loud signal that something's wrong). The expected
+                        // transient `error.RecoveryInProgress` would spam
+                        // ~1000 lines/sec during normal startup, so it goes
+                        // through `utils.logEvery` (5 s).
+                        while (true) {
+                            s.apply(sm_entry, reader.data()) catch |err| {
+                                if (err == error.RecoveryInProgress) {
+                                    utils.logEvery(5, "apply idx={d}: recovery in progress, retrying", .{entry.index});
+                                } else {
+                                    raft_log.err("apply idx={d}: {s}, retrying in 1ms", .{ entry.index, @errorName(err) });
+                                }
+                                if (self.isShuttingDown()) return;
+                                zio.sleep(zio.Duration.fromMilliseconds(1)) catch return;
+                                continue;
+                            };
+                            break;
+                        }
                         metrics.g().observePhase("apply", t_apply);
                     }
                 } else if (ety == .snapshot and reader.data().len > 0) {
@@ -1754,16 +1870,15 @@ pub const Node = struct {
                 }
                 ai = entry.index;
                 self.apply_index.store(ai, .release);
-                // Advance apply_ts AFTER the state machine has applied the
+                // Advance applied AFTER the state machine has applied the
                 // entry (or is a no-op for empty-data ticks). Matches the
-                // read contract: "apply_ts >= T implies every entry with
-                // timestamp <= T is visible."
-                _ = self.apply_ts.fetchMax(reader.timestamp(), .acq_rel);
-                // Wake any reader blocked in waitUntilApplied.
-                self.apply_ts_notify.broadcast();
-                // Proposal callbacks now fire from `callbackLoop` as soon
-                // as commit advances — they no longer wait for the state
-                // machine to apply. See advance() → notifyCommitAdvanced.
+                // read contract: "applied.ts >= T implies every entry with
+                // timestamp <= T is visible." advance() broadcasts under
+                // its own lock, so no reader can be mid-(check, suspend).
+                self.applied_ts.advance(reader.timestamp());
+                // Proposal callbacks fire from `callbackLoop` as soon as
+                // commit advances — they do not wait for the state-machine
+                // apply.
             }
         }
         dbg(
@@ -1801,7 +1916,7 @@ pub const Node = struct {
             const wall_sec: u32 = @intCast(std.time.timestamp());
             if (wall_sec <= last_ts.seconds) continue;
 
-            self.proposeAndWait(&.{}, .data) catch |err| {
+            self.proposeAndWaitForApply(&.{}, .data) catch |err| {
                 raft_log.warn("clock tick propose failed: {s}", .{@errorName(err)});
             };
         }
@@ -1840,7 +1955,7 @@ pub const Node = struct {
             } else |_| {}
             metrics.g().observePhase("inbound", t);
 
-            const ci_before = self.commit_index.load(.acquire);
+            const ci_before = self.commit_index.load();
             const last_before = self.log.lastIndex();
 
             // Phase: propose — drain proposal queue, build entries, persist,
@@ -1879,7 +1994,7 @@ pub const Node = struct {
             self.advance();
             metrics.g().observePhase("advance", t);
 
-            const ci_advanced = self.commit_index.load(.acquire) > ci_before;
+            const ci_advanced = self.commit_index.load() > ci_before;
 
             var heartbeat_due = false;
             const now = std.time.microTimestamp();
@@ -2050,27 +2165,27 @@ pub const Node = struct {
 
         const quorum_pos = matches.items.len - self.quorum_size;
         const candidate = matches.items[quorum_pos];
-        if (candidate <= self.commit_index.load(.acquire)) return;
+        if (candidate <= self.commit_index.load()) return;
 
         const term = self.log.term(candidate) catch return orelse return;
         if (term != self.current_term) return;
-        self.commit_index.store(candidate, .release);
+        self.commit_index.advance(candidate);
     }
 
     // commit_index advances when leader sees a quorum match.
     // apply_index advances when entries are applied to the state machine (via callbacks).
     // conf_applied_index advances when conf changes are applied to raft membership.
+    //
+    // `commit_index.advance()` broadcasts internally on a real advance, so both
+    // applyLoop (state-machine apply) and callbackLoop (proposal-callback firing)
+    // are woken without a separate notify call.
     pub fn advance(self: *Node) void {
         self.advanceCommitIndex();
         self.applyConfChanges();
-        // Wakes both applyLoop (state-machine apply) and callbackLoop
-        // (proposal-callback firing). Callbacks fire as soon as commit
-        // advances — they do not wait for the state-machine apply.
-        self.notifyCommitAdvanced();
     }
 
     fn applyConfChanges(self: *Node) void {
-        const ci = self.commit_index.load(.acquire);
+        const ci = self.commit_index.load();
         if (self.conf_applied_index >= ci) return;
         dbg("applyConfChanges node={d} conf_applied={d} ci={d}", .{ self.id, self.conf_applied_index, ci });
 
@@ -2270,19 +2385,15 @@ pub const Node = struct {
 
     /// HLC timestamp of the most-recently applied entry on this node.
     /// Reads bounded by `read_ts` must wait until `appliedTs() >= read_ts`.
-    pub fn appliedTs(self: *const Node) u64 {
-        return self.apply_ts.load(.acquire);
+    pub fn appliedTs(self: *Node) u64 {
+        return self.applied_ts.load();
     }
 
-    /// Block the caller until this node's `apply_ts >= target_ts` or the
-    /// timeout expires. Returns `error.Timeout` if the deadline passes
-    /// before catch-up. Wake-up is event-driven — each `apply_ts` advance
-    /// in `applyCommits` broadcasts to all waiters, who then recheck.
-    pub fn waitUntilApplied(self: *Node, target_ts: u64, timeout: zio.Duration) !void {
-        const deadline = (zio.Timeout{ .duration = timeout }).toDeadline();
-        while (self.apply_ts.load(.acquire) < target_ts) {
-            try self.apply_ts_notify.timedWait(deadline);
-        }
+    /// Block the caller until this node's applied timestamp >= `target_ts`
+    /// or the timeout expires. Returns `error.Timeout` if the deadline
+    /// passes before catch-up.
+    pub fn waitForApplied(self: *Node, target_ts: u64, timeout: zio.Duration) !void {
+        return self.applied_ts.waitFor(target_ts, timeout);
     }
 
     /// Timestamp of the last entry in the WAL (0 if empty). The clock-tick
