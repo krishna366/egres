@@ -377,7 +377,7 @@ pub const Node = struct {
             // Raise the HLC clock past the most recent log entry's timestamp,
             // so a newly-elected leader's future `next()` values are strictly
             // past every previously-committed one.
-            const seed_ts = node.lastLogTimestamp();
+            const seed_ts = node.log.lastTimestamp();
             if (seed_ts != 0) {
                 utils.hlc.g().seed(utils.hlc.HLC.fromU64(seed_ts));
             }
@@ -1511,6 +1511,7 @@ pub const Node = struct {
     /// commit) and are unaffected.
     pub fn proposeAndWaitForApply(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
+        const start_ms = std.time.milliTimestamp();
         var ctx = WaitCtx{ .status = .committed };
         ctx.wg.init();
         ctx.wg.add(1);
@@ -1519,6 +1520,12 @@ pub const Node = struct {
             raft_log.err("proposeAndWaitForApply: wait for commit failed: {s}", .{@errorName(err)});
             return error.CommitFailed;
         };
+        const commit_ms = std.time.milliTimestamp();
+        if (commit_ms - start_ms > 5_000) {
+            raft_log.warn("proposeAndWaitForApply: commit phase slow type={s} ms={d}", .{
+                @tagName(proposal_type), commit_ms - start_ms,
+            });
+        }
         if (ctx.status != .committed) return error.NotCommitted;
         // Wait for applied to catch up to this entry's timestamp. The
         // tracker's check-and-suspend is atomic under its mutex, so no
@@ -1937,7 +1944,7 @@ pub const Node = struct {
         while (!self.isShuttingDown()) {
             zio.sleep(poll) catch return;
             if (!self.isLeader()) continue;
-            const last_ts = utils.hlc.HLC.fromU64(self.lastLogTimestamp());
+            const last_ts = utils.hlc.HLC.fromU64(self.log.lastTimestamp());
             const wall_sec: u32 = @intCast(std.time.timestamp());
             if (wall_sec <= last_ts.seconds) continue;
 
@@ -2419,20 +2426,6 @@ pub const Node = struct {
     /// passes before catch-up.
     pub fn waitForApplied(self: *Node, target_ts: u64, timeout: zio.Duration) !void {
         return self.applied_ts.waitFor(target_ts, timeout);
-    }
-
-    /// Timestamp of the last entry in the WAL (0 if empty). The clock-tick
-    /// fiber reads this to decide whether to propose a tick: if the wall
-    /// clock has ticked past this entry's second, a new tick is needed.
-    /// Source of truth is the WAL — no separate atomic to maintain.
-    pub fn lastLogTimestamp(self: *Node) u64 {
-        const last = self.log.lastIndex();
-        if (last == 0) return 0;
-        var result = self.log.entriesRange(.{ .lo = last, .hi = last + 1, .max_bytes = 4096 }) catch return 0;
-        defer result.deinit();
-        if (result.entries.len == 0) return 0;
-        const reader = zen.LogEntryReader.parseRoot(result.entries[0].bytes) catch return 0;
-        return reader.timestamp();
     }
 
     fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {
