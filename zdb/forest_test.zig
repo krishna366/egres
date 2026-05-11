@@ -15,7 +15,7 @@ const forest_mod = zdb.forest;
 const Forest = forest_mod.Forest;
 const RouteTable = forest_mod.RouteTable;
 
-const options_mod = zdb.options;
+const config = zdb.config;
 
 
 // ---------------------------------------------------------------------------
@@ -136,32 +136,29 @@ test "forest: split tree" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    // Set up: forest with one tree (namespace 42, infinite range) + 3 SST
-    // files at L1 (keys "aaa", "mmm", "zzz" — sorted, non-overlapping, one
-    // key per table). Tables are written to disk and then installed into
-    // the tree's L1 via Tree.applyCompaction (which uses the table cache).
+    // findSplitKey now requires Lmax to have ≥ 10 tables and pulls
+    // candidates from there. Install 10 single-key SSTs ("k01"…"k10")
+    // directly into L3 (default max_levels=4 → lmax_idx=3) so the
+    // splitter has a clean, evenly-sized Lmax to work with.
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
     const tree_id = try f.createTree(42, .{ .inf = true });
     try std.testing.expectEqual(@as(u64, 1), tree_id);
 
-    const table_keys = [_][]const u8{ "aaa", "mmm", "zzz" };
+    const table_keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (table_keys, 1..) |key, tbl_id| {
-        const path = try options_mod.sstPath(alloc, dir_path, tbl_id);
+        const path = try config.sstPath(alloc, dir_path, tbl_id);
         defer alloc.free(path);
         try buildAndWriteTable(alloc, path, key);
     }
 
     {
         const tree_ptr = f.getTree(tree_id).?;
-        const changes = [_]manifest.TableChange{
-            manifest.createTableChange(1, tree_id, 1),
-            manifest.createTableChange(2, tree_id, 1),
-            manifest.createTableChange(3, tree_id, 1),
-        };
+        var changes: [10]manifest.TableChange = undefined;
+        for (&changes, 1..) |*c, tbl_id| c.* = manifest.createTableChange(@intCast(tbl_id), tree_id, 3); // L3
         try tree_ptr.applyCompaction(&changes);
-        try std.testing.expectEqual(@as(usize, 3), tree_ptr.levels[1].numTables());
+        try std.testing.expectEqual(@as(usize, 10), tree_ptr.levels[3].numTables());
     }
 
     // splitTreeForTests requires the write lock.
@@ -174,25 +171,25 @@ test "forest: split tree" {
     // Now 2 trees should exist.
     try std.testing.expectEqual(@as(usize, 2), f.trees.count());
 
-    // The split key is "mmm" (middle table, index 1 of 3).
-    // Old tree (id=1): tables ["aaa"] — left side.
-    // New tree (id=2): tables ["mmm","zzz"] — right side.
+    // Best balance with 10 equal-size L3 tables: split at items[5].smallest
+    // = "k06" (left=5 tables, right=5 tables, |L−R| = 0). Old tree keeps
+    // [k01..k05]; new tree gets [k06..k10].
     const old_tree = f.trees.get(1).?;
     const new_tree = f.trees.get(2).?;
-    try std.testing.expectEqual(@as(usize, 1), old_tree.levels[1].numTables());
-    try std.testing.expectEqual(@as(usize, 2), new_tree.levels[1].numTables());
+    try std.testing.expectEqual(@as(usize, 5), old_tree.levels[3].numTables());
+    try std.testing.expectEqual(@as(usize, 5), new_tree.levels[3].numTables());
 
-    // Key ranges: old right = "mmm", new left = "mmm".
-    try std.testing.expectEqualStrings("mmm", old_tree.key_range.right.primary);
-    try std.testing.expectEqualStrings("mmm", new_tree.key_range.left.primary);
+    // Key ranges: old right = "k06", new left = "k06".
+    try std.testing.expectEqualStrings("k06", old_tree.key_range.right.primary);
+    try std.testing.expectEqualStrings("k06", new_tree.key_range.left.primary);
 
     // Route table for namespace 42 should have 2 entries.
     const rt = f.ns_routes.get(42).?;
     try std.testing.expectEqual(@as(usize, 2), rt.entries.items.len);
 
-    // Routing: "aaa" → old tree (1), "zzz" → new tree (2).
-    try std.testing.expectEqual(@as(u64, 1), rt.lookup(.{ .primary = "aaa" }).?);
-    try std.testing.expectEqual(@as(u64, 2), rt.lookup(.{ .primary = "zzz" }).?);
+    // Routing: "k01" → old tree (1), "k10" → new tree (2).
+    try std.testing.expectEqual(@as(u64, 1), rt.lookup(.{ .primary = "k01" }).?);
+    try std.testing.expectEqual(@as(u64, 2), rt.lookup(.{ .primary = "k10" }).?);
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +223,7 @@ test "forest: snapshot manifest round-trip" {
         _ = try src.createTree(43, .{ .inf = true });
 
         // Drop one SST into tree 1's L1, both on disk and in the manifest.
-        const sst_path = try options_mod.sstPath(alloc, dir_path, 1);
+        const sst_path = try config.sstPath(alloc, dir_path, 1);
         defer alloc.free(sst_path);
         try buildAndWriteTable(alloc, sst_path, "ccc");
 
@@ -338,6 +335,61 @@ test "forest: popOldestIfMatches multi phantom no match" {
     mts.popOldestIfMatches(7);
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
     try std.testing.expectEqual(@as(u64, 10), mts.current.id);
+}
+
+test "forest: getIterators outlives a concurrent flush+pop" {
+    // The race we're guarding against: a scan calls
+    // `Memtables.getIterators` and then drops the lock; before the
+    // scan is done iterating, a flush completes and `popOldestIfMatches`
+    // calls `release()` on the immutable memtable. If the iterator
+    // hadn't already bumped the refcount, the SkipList's arena would
+    // be freed mid-iteration and the next .next() would UAF.
+    const alloc = std.testing.allocator;
+
+    // Build immutables=[5], current=10, then put a key into M_5 so we
+    // can read it after the pop.
+    var mts = try buildMemtables(alloc, &.{ 5, 10 });
+    defer mts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mts.immutables.items.len);
+    const m5 = mts.immutables.items[0];
+    try m5.put(.{ .namespace = 1, .primary = "alpha", .timestamp = 100 }, "v1");
+
+    // Snapshot under the lock — each skl.Iterator.init bumps
+    // refcount before getIterators returns.
+    const iters = try mts.getIterators(alloc);
+
+    // Simulate flush completion: drop M_5 from immutables (release fires
+    // inside popOldestIfMatches). M_5's refcount goes from 2 → 1
+    // because the snapshot iterator still holds a ref.
+    mts.popOldestIfMatches(5);
+    try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
+
+    // Iterate AFTER the pop; the snapshotted iterator for M_5 should
+    // still see the key. Use ts=maxInt because same-primary keys sort
+    // newest-first (timestamp is reverse-ordered) — seeking with ts=0
+    // would land on the *next* primary, missing alpha.
+    var found: ?[]const u8 = null;
+    for (iters) |*it| {
+        var copy = it.*;
+        try copy.seekRange(.{
+            .namespace = 1,
+            .primary = "alpha",
+            .timestamp = std.math.maxInt(u64),
+        }, .{});
+        if (copy.itemRef()) |item| {
+            if (std.mem.eql(u8, item.key.primary, "alpha")) {
+                found = item.value;
+            }
+        }
+    }
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("v1", found.?);
+
+    // Final release: deinit each iterator (mirroring what
+    // MergeIterator.deinit would do), then free the slice. Without
+    // this, M_5's last ref leaks and the arena is never freed.
+    for (iters) |*it| it.deinit();
+    alloc.free(iters);
 }
 
 test "forest: routes to correct tree" {

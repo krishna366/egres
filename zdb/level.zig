@@ -23,6 +23,19 @@ pub const KeyRange = struct {
         return self.left.primary.len == 0 and self.right.primary.len == 0 and !self.inf;
     }
 
+    /// Deep copy: dupes the underlying primary bytes for both bounds
+    /// using `allocator`. The original Keys may borrow from
+    /// short-lived storage (e.g. manifest entries protected by a
+    /// lock); duping into an allocator the caller controls keeps the
+    /// range usable after that storage is released.
+    pub fn dupe(self: KeyRange, allocator: std.mem.Allocator) !KeyRange {
+        return .{
+            .left = try self.left.dupe(allocator),
+            .right = try self.right.dupe(allocator),
+            .inf = self.inf,
+        };
+    }
+
     pub fn overlapsWith(self: KeyRange, other: KeyRange) bool {
         if (self.isEmpty()) return true;
         if (other.isEmpty()) return false;
@@ -47,6 +60,37 @@ pub const KeyRange = struct {
             self.right = other.right;
         }
         if (other.inf) self.inf = true;
+    }
+
+    /// Tighten `self` against `other` and return the overlap. Empty
+    /// primary on either bound is treated as "open" (no constraint
+    /// from that side), so this composes naturally with caller-supplied
+    /// open scan bounds and tree-stored ranges. `inf` survives only
+    /// when BOTH sides are unbounded after tightening.
+    pub fn intersect(self: KeyRange, other: KeyRange) KeyRange {
+        const lhs = tighter_left(self.left, other.left);
+        const rhs = tighter_right(self.right, other.right);
+        return .{
+            .left = lhs,
+            .right = rhs,
+            .inf = lhs.primary.len == 0 and rhs.primary.len == 0,
+        };
+    }
+
+    /// Pick the "rightmost" lower bound (= max). An empty primary
+    /// means "unbounded on the left" — the OTHER bound wins.
+    fn tighter_left(a: Key, b: Key) Key {
+        if (a.primary.len == 0) return b;
+        if (b.primary.len == 0) return a;
+        return if (a.order(b) == .gt) a else b;
+    }
+
+    /// Pick the "leftmost" upper bound (= min). An empty primary means
+    /// "unbounded on the right" — the OTHER bound wins.
+    fn tighter_right(a: Key, b: Key) Key {
+        if (a.primary.len == 0) return b;
+        if (b.primary.len == 0) return a;
+        return if (a.order(b) == .lt) a else b;
     }
 };
 
@@ -203,11 +247,18 @@ pub const Level = struct {
                 }
             }.f);
             // First table where kr.right < smallest (no longer overlapping).
-            const right = utils.search(TableEntry, items, kr.right, struct {
-                fn f(right_key: Key, e: TableEntry) bool {
-                    return right_key.order(e.table.smallest) == .lt;
-                }
-            }.f);
+            // An empty kr.right means "no upper bound" — sweep to end.
+            // Without this, the binary search would treat the empty primary
+            // as smaller than every table's smallest key and return 0,
+            // making the slice empty even when the left bound is well-formed.
+            const right = if (kr.right.primary.len == 0)
+                items.len
+            else
+                utils.search(TableEntry, items, kr.right, struct {
+                    fn f(right_key: Key, e: TableEntry) bool {
+                        return right_key.order(e.table.smallest) == .lt;
+                    }
+                }.f);
             break :blk items[left..right];
         };
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const log = std.log.scoped(.forest);
 const zio = @import("zio");
 const utils = @import("utils");
-const options = @import("options.zig");
+const config = @import("config.zig");
 const manifest = @import("manifest.zig");
 const level = @import("level.zig");
 const table_mod = @import("table.zig");
@@ -19,6 +19,7 @@ const Table = table_mod.Table;
 const Item = table_mod.table.Item;
 const SkipList = skl.SkipList;
 const Builder = table_mod.builder.Builder;
+const merge_iterator = table_mod.merge_iterator;
 
 // ---------------------------------------------------------------------------
 // RouteTable
@@ -86,7 +87,10 @@ pub const RouteTable = struct {
         }.lt);
     }
 
-    /// Find the tree_id that owns this key, or null if none.
+    /// Find the tree_id that owns this key, or null if none. Callers
+    /// that also need the tree's key range can read it directly from
+    /// `Tree.key_range` after looking up the tree (kept in sync by
+    /// `applySplit`); the route table is just for routing.
     pub fn lookup(self: *const RouteTable, search_key: Key) ?u64 {
         if (self.entries.items.len == 1) return self.entries.items[0].tree_id;
         if (self.entries.items.len == 0) return null;
@@ -144,6 +148,26 @@ pub const Memtables = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.current.memoryUsage();
+    }
+
+    /// Get iterators across the active memtable + every immutable
+    /// for use in a scan merge. Each `skl.Iterator.init` acquires the
+    /// underlying skiplist — release happens via `deinit` on the
+    /// returned iterator (transitively from `MergeIterator.deinit`).
+    /// Doing the acquires under our shared lock guarantees that even if
+    /// a concurrent flush + `popOldestIfMatches` releases the original
+    /// ref a moment later, the skiplist stays alive until the iterator
+    /// drops its ref. Caller frees the slice itself.
+    pub fn getIterators(self: *Memtables, allocator: std.mem.Allocator) ![]merge_iterator.Iterator {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        const total = self.immutables.items.len + 1;
+        const out = try allocator.alloc(merge_iterator.Iterator, total);
+        out[0] = .{ .skiplist = skl.Iterator.init(self.current) };
+        for (self.immutables.items, 0..) |imm, i| {
+            out[i + 1] = .{ .skiplist = skl.Iterator.init(imm) };
+        }
+        return out;
     }
 
     /// id of the current memtable. 0 means the initial placeholder is still
@@ -291,7 +315,7 @@ pub const Memtables = struct {
 
 pub const Forest = struct {
     allocator: std.mem.Allocator,
-    opts: options.Options,
+    opts: config.Config,
     ms: manifest.ForestState,
     next_tree_id: std.atomic.Value(u64),
     next_file_id: std.atomic.Value(u64),
@@ -304,7 +328,7 @@ pub const Forest = struct {
     /// Open a forest with empty in-memory state. Persistent state is restored
     /// later via `installManifest` (called by recovery if a Raft snapshot is
     /// present); fresh starts go straight to `createTree` / Raft replay.
-    pub fn open(allocator: std.mem.Allocator, opts: options.Options) !*Forest {
+    pub fn open(allocator: std.mem.Allocator, opts: config.Config) !*Forest {
         var ms = manifest.ForestState.init(allocator);
         errdefer ms.deinit();
 
@@ -425,12 +449,18 @@ pub const Forest = struct {
         };
 
         // Route each key to a tree and add to the appropriate builder.
-        while (iter.next()) |item| {
+        while (iter.itemRef()) |item| {
             const tree_id = blk: {
                 self.mu.lockShared();
                 defer self.mu.unlockShared();
-                const rt = self.ns_routes.get(item.key.namespace) orelse continue;
-                break :blk rt.lookup(item.key) orelse continue;
+                const rt = self.ns_routes.get(item.key.namespace) orelse {
+                    try iter.next();
+                    continue;
+                };
+                break :blk rt.lookup(item.key) orelse {
+                    try iter.next();
+                    continue;
+                };
             };
 
             const bld = if (builders.get(tree_id)) |b| b else blk: {
@@ -440,6 +470,7 @@ pub const Forest = struct {
                 break :blk b;
             };
             try bld.add(item.key, item.value);
+            try iter.next();
         }
 
         // Flush all builders to SST files. writeAndSyncTable handles the full
@@ -464,7 +495,7 @@ pub const Forest = struct {
             }
 
             const file_id = self.next_file_id.fetchAdd(1, .monotonic);
-            const path = try options.sstPath(self.allocator, self.opts.dir, file_id);
+            const path = try config.sstPath(self.allocator, self.opts.dir, file_id);
 
             try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tree_id, &flush_err,
@@ -593,6 +624,102 @@ pub const Forest = struct {
         return tree.get(search_key, priority);
     }
 
+    pub const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
+
+    /// Forward scan over `[scan_range.left, scan_range.right)` within
+    /// namespace `ns`, spanning every tree that overlaps the request.
+    ///
+    /// One tree at a time: look up the tree owning `current_left`,
+    /// snapshot its range, open a cursor (with a fresh memtable iter
+    /// snapshot), drain to the cursor's end (or max_count), then
+    /// advance `current_left` past the snapshotted right boundary and
+    /// re-look-up. Re-looking-up after each tree means the scan is
+    /// safe against splits firing mid-scan: we always pick whichever
+    /// tree currently covers the next key. Per-cursor memtable
+    /// snapshots also pick up any newly-flushed data.
+    pub fn scan(
+        self: *Forest,
+        allocator: std.mem.Allocator,
+        ns: u32,
+        scan_range: KeyRange,
+        max_count: u64,
+        priority: vfs.Priority,
+        ctx: *anyopaque,
+        cb: ScanCallback,
+    ) !u64 {
+        if (max_count == 0) return 0;
+
+        // Per-call arena — used to dupe each visited tree's
+        // right-boundary key so it stays alive across iterations
+        // (we drop the forest read lock between cursor hops).
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var emitted: u64 = 0;
+        var current_left = scan_range.left;
+
+        while (emitted < max_count) {
+            // Find the tree owning current_left + snapshot its range
+            // (tree.key_range stays in sync with the manifest via
+            // applySplit). Re-doing the lookup per hop keeps the scan
+            // safe against splits firing between hops — we always
+            // pick whichever tree currently covers the next key.
+            var tree: *Tree = undefined;
+            var tree_range = KeyRange{};
+            {
+                self.mu.lockShared();
+                defer self.mu.unlockShared();
+                const rt = self.ns_routes.get(ns) orelse return emitted;
+                const tid = blk: {
+                    if (current_left.primary.len == 0) {
+                        if (rt.entries.items.len == 0) break :blk null;
+                        break :blk rt.entries.items[0].tree_id;
+                    }
+                    break :blk rt.lookup(current_left) orelse null;
+                };
+                if (tid == null) return emitted;
+                tree = self.trees.get(tid.?) orelse return emitted;
+                tree_range = try tree.key_range.dupe(a);
+            }
+
+            // Restrict to the requested scan window. If the intersection
+            // is empty the scan has run off the end → done.
+            const remaining = KeyRange{ .left = current_left, .right = scan_range.right };
+            const visit_range = remaining.intersect(tree_range);
+
+            // Allocate memtable iters from the per-call arena so they
+            // live exactly as long as the merge. (Memtables.getIterators
+            // returns a fresh slice; freeing it through the arena at
+            // end-of-scope is fine.)
+            const mem_iters = try self.memtables.getIterators(a);
+            var merge = try tree.openMerge(a, visit_range, priority, mem_iters);
+
+            // Drain (or hit max_count). Use a labeled block so merge.deinit
+            // fires on every exit path before we either return or hop to
+            // the next tree.
+            const stop_early = drain: {
+                while (emitted < max_count) {
+                    const item = merge.itemRef() orelse break :drain false;
+                    const cont = try cb(ctx, item);
+                    emitted += 1;
+                    if (!cont) break :drain true;
+                    try merge.next();
+                }
+                break :drain false;
+            };
+            merge.deinit();
+            if (stop_early) return emitted;
+
+            // Advance to next tree by jumping past the snapshotted
+            // right edge. Empty primary = unbounded right (rightmost
+            // tree) → done.
+            if (tree_range.right.primary.len == 0) break;
+            current_left = tree_range.right;
+        }
+        return emitted;
+    }
+
     /// installTree opens an empty in-memory Tree for the given id and registers
     /// the namespace route. Caller must have already committed the TreeChange to
     /// manifest and must hold the forest write lock.
@@ -693,8 +820,16 @@ pub const Forest = struct {
     /// carrying an infinite range (empty left+right). No state mutates beyond
     /// next_tree_id, so a failed propose only burns one id. Caller owns the
     /// returned slice.
+    ///
+    /// Errors with `NamespaceAlreadyExists` if a route table already exists
+    /// for `namespace_id`.
     pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u32) !manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            if (self.ns_routes.contains(namespace_id)) return error.NamespaceAlreadyExists;
+        }
         const tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
 
         const tree_changes = try alloc.alloc(manifest.TreeChange, 1);
@@ -711,12 +846,18 @@ pub const Forest = struct {
     /// applyNamespaceCreate is Phase B: commits each TreeChange to the manifest
     /// and installs the in-memory Tree + namespace route. Called on all nodes
     /// after Raft commit (cmd=5).
+    ///
+    /// Skips any TreeChange whose namespace already has a route table.
     pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
         for (mc.tree_changes) |tc| {
             if (tc.op != .create) continue; // only CREATE for ns_create
+            if (self.ns_routes.contains(tc.namespace_id)) {
+                std.log.warn("applyNamespaceCreate: ns={d} already exists, skipping tree_id={d}", .{ tc.namespace_id, tc.tree_id });
+                continue;
+            }
             self.advanceTreeId(tc.tree_id);
             try self.ms.commit(&.{}, &.{tc});
             // Empty left/right encodes the infinite range.
@@ -753,16 +894,28 @@ pub const Forest = struct {
 
     /// Find the best tree/level to compact without performing compaction.
     pub fn bestCompactionCandidate(self: *Forest) ?CompactionTarget {
+        return self.bestCompactionCandidateExcluding(null);
+    }
+
+    /// Same as `bestCompactionCandidate` but skips any tree whose id is
+    /// in `skip` (used by parallel compactors so two fibers don't pick
+    /// the same tree). `skip == null` means "no exclusions".
+    pub fn bestCompactionCandidateExcluding(
+        self: *Forest,
+        skip: ?*const std.AutoHashMap(u64, void),
+    ) ?CompactionTarget {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
         var best: ?CompactionTarget = null;
         var it = self.trees.iterator();
         while (it.next()) |kv| {
+            const tree_id = kv.key_ptr.*;
+            if (skip) |s| if (s.contains(tree_id)) continue;
             const tree = kv.value_ptr.*;
             const candidate = tree.compact_candidate orelse continue;
             if (best == null or candidate.score > best.?.candidate.score) {
-                best = .{ .tree = tree, .tree_id = kv.key_ptr.*, .candidate = candidate };
+                best = .{ .tree = tree, .tree_id = tree_id, .candidate = candidate };
             }
         }
         return best;
@@ -1022,7 +1175,7 @@ pub const Forest = struct {
 
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
+        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
         defer self.allocator.free(path);
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
@@ -1040,7 +1193,7 @@ pub const Forest = struct {
             return;
         }
 
-        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return;
+        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return;
         defer self.allocator.free(path);
 
         // Probe existence + size via vfs (no allocation, just open + getEndPos).
@@ -1085,7 +1238,7 @@ pub const Forest = struct {
 
     /// Read an SST file from disk. Caller owns the returned slice.
     pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-        const path = options.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
+        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
         defer self.allocator.free(path);
         const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
         defer handle.close();
