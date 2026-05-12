@@ -288,14 +288,28 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
         runJoin(args, raft_rt);
     }
 
+    // Sequenced startup, before any raft / compaction / snapshot loop runs:
+    //   1. Install the snapshot manifest. Forest is now in a valid state.
+    //   2. Synchronously apply every committed WAL entry on disk
+    //      (apply_index → commit_index).
+    // This eliminates the race where the compaction loop would propose
+    // new SST ids that collide with ids replay is about to install
+    // (PathAlreadyExists).
+    log.info("appMain: synchronous recovery", .{});
+    zdb_srv.recoverFromSnapshot() catch |err| {
+        log.err("recoverFromSnapshot err: {}", .{err});
+        return;
+    };
+
+    // It's safe to apply all the commits before joining Raft group, because if
+    // a log entry was acknowledged by this node, it would already have
+    // downloaded the SSTable files, because we consider them to be part of the
+    // WAL log. We have everything we need to replay the committed log.
+    log.info("appMain: synchronous applyCommits", .{});
+    node.applyCommits();
+
     log.info("appMain: spawning raft runtime on raft pool", .{});
     group.spawn(runRaft, .{raft_rt}) catch return;
-
-    // Recovery runs alongside the raft loop: it depends on `leader_id`
-    // becoming known (via AppendEntries from leader, or via the join
-    // response) so `fetchFiles` can locate the source for missing SSTs.
-    log.info("appMain: spawning recovery on background pool", .{});
-    group.spawn(runRecovery, .{zdb_srv}) catch return;
 
     log.info("appMain: spawning client server on query pool", .{});
     group.spawn(runServer, .{zdb_srv}) catch return;
@@ -345,22 +359,6 @@ fn runServer(s: *zdb_server.ZdbServer) void {
         return;
     };
     handle.join();
-}
-
-/// One-shot recovery: install the manifest from the latest snapshot, fetching
-/// any missing SST files from the leader along the way. Returns once the
-/// manifest is online (or on shutdown). Apply loop retries during this window.
-fn runRecovery(s: *zdb_server.ZdbServer) void {
-    var handle = runtime.pool().get(.background).spawn(
-        zdb_server.ZdbServer.recoverFromSnapshot,
-        .{s},
-    ) catch |err| {
-        log.err("runRecovery err: {}", .{err});
-        return;
-    };
-    handle.join() catch |err| {
-        log.err("runRecovery join: {}", .{err});
-    };
 }
 
 /// Spawn the snapshot loop on the background runtime pool. Leader-only loop
