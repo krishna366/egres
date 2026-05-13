@@ -9,6 +9,7 @@ pub const level = @import("zdb/level.zig");
 pub const tree = @import("zdb/tree.zig");
 pub const forest = @import("zdb/forest.zig");
 pub const cache = @import("zdb/cache.zig");
+pub const file_ids = @import("zdb/file_ids.zig");
 pub const metrics = @import("zdb/metrics.zig");
 pub const vfs = @import("vfs");
 pub const bandwidth = vfs.bandwidth;

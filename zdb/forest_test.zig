@@ -148,7 +148,7 @@ test "forest: split tree" {
 
     const table_keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (table_keys, 1..) |key, tbl_id| {
-        const path = try config.sstPath(alloc, dir_path, tbl_id);
+        const path = try zdb.file_ids.sstPath(alloc, dir_path, tbl_id);
         defer alloc.free(path);
         try buildAndWriteTable(alloc, path, key);
     }
@@ -223,7 +223,7 @@ test "forest: snapshot manifest round-trip" {
         _ = try src.createTree(43, .{ .inf = true });
 
         // Drop one SST into tree 1's L1, both on disk and in the manifest.
-        const sst_path = try config.sstPath(alloc, dir_path, 1);
+        const sst_path = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(sst_path);
         try buildAndWriteTable(alloc, sst_path, "ccc");
 
@@ -256,9 +256,11 @@ test "forest: snapshot manifest round-trip" {
     // Tree 1's L1 contains the SST.
     try std.testing.expectEqual(@as(usize, 1), dst.trees.get(1).?.levels[1].numTables());
 
-    // Counters advanced past the existing IDs (trees 1,2 → next 3; tables 1 → next 2).
+    // tree-id counter advanced past the existing IDs (trees 1,2 → next 3).
+    // file_id counter is NOT touched by openTablesFromManifest — that lives
+    // in the per-node HardState lease (`Forest.file_ids`), restored from
+    // disk independently of the manifest.
     try std.testing.expect(dst.next_tree_id.load(.monotonic) > 2);
-    try std.testing.expect(dst.next_file_id.load(.monotonic) > 1);
 }
 
 // ---------------------------------------------------------------------------

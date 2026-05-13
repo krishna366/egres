@@ -1,6 +1,8 @@
 const std = @import("std");
 const zio = @import("zio");
 const zdb = @import("zdb");
+
+fn noopPersist(_: *anyopaque, _: u64) anyerror!void {}
 const vfs = zdb.vfs;
 
 const Key = zdb.key.Key;
@@ -336,9 +338,9 @@ test "levels: open" {
         var tb2 = try buildTable(alloc, &.{.{ .key = "b", .ts = 0, .val = "vb" }});
         defer tb2.deinit();
 
-        const p1 = try std.fmt.allocPrint(alloc, "{s}/000001.sst", .{dir_path});
+        const p1 = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(p1);
-        const p2 = try std.fmt.allocPrint(alloc, "{s}/000002.sst", .{dir_path});
+        const p2 = try zdb.file_ids.sstPath(alloc, dir_path, 2);
         defer alloc.free(p2);
 
         const f1 = try std.fs.createFileAbsolute(p1, .{});
@@ -446,7 +448,7 @@ test "levels: doCompact L0 L1" {
     for (l0_data) |d| {
         var tb = try buildTable(alloc, &.{.{ .key = d.key, .ts = 0, .val = d.val }});
         defer tb.deinit();
-        const path = try config.sstPath(alloc, dir_path, d.id);
+        const path = try zdb.file_ids.sstPath(alloc, dir_path, d.id);
         defer alloc.free(path);
         const f = try std.fs.createFileAbsolute(path, .{});
         defer f.close();
@@ -470,8 +472,9 @@ test "levels: doCompact L0 L1" {
     try std.testing.expectEqual(@as(usize, 3), tree.levels[0].numTables());
     try std.testing.expectEqual(@as(usize, 0), tree.levels[1].numTables());
 
-    var next_file_id = std.atomic.Value(u64).init(100);
-    try tree.doCompact(0, &next_file_id);
+    var file_ids: zdb.file_ids.FileIds = .{};
+    file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
+    try tree.doCompact(0, &file_ids);
 
     // After compaction L0 must be empty and keys must live in L1.
     try std.testing.expectEqual(@as(usize, 0), tree.levels[0].numTables());
@@ -509,7 +512,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
     {
         var tb = try buildTable(alloc, &.{.{ .key = "aa", .ts = 0, .val = "vaa" }});
         defer tb.deinit();
-        const p = try std.fmt.allocPrint(alloc, "{s}/000001.sst", .{dir_path});
+        const p = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(p);
         const f = try std.fs.createFileAbsolute(p, .{});
         defer f.close();
@@ -519,7 +522,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
     {
         var tb = try buildTable(alloc, &.{.{ .key = "cc", .ts = 0, .val = "vcc" }});
         defer tb.deinit();
-        const p = try std.fmt.allocPrint(alloc, "{s}/000002.sst", .{dir_path});
+        const p = try zdb.file_ids.sstPath(alloc, dir_path, 2);
         defer alloc.free(p);
         const f = try std.fs.createFileAbsolute(p, .{});
         defer f.close();
@@ -532,7 +535,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
             .{ .key = "dd", .ts = 0, .val = "vdd" },
         });
         defer tb.deinit();
-        const p = try std.fmt.allocPrint(alloc, "{s}/000003.sst", .{dir_path});
+        const p = try zdb.file_ids.sstPath(alloc, dir_path, 3);
         defer alloc.free(p);
         const f = try std.fs.createFileAbsolute(p, .{});
         defer f.close();
@@ -555,8 +558,9 @@ test "levels: doCompact L0 L1 with dest overlap" {
     try std.testing.expectEqual(@as(usize, 2), tree.levels[0].numTables());
     try std.testing.expectEqual(@as(usize, 1), tree.levels[1].numTables());
 
-    var next_file_id = std.atomic.Value(u64).init(100);
-    try tree.doCompact(0, &next_file_id);
+    var file_ids: zdb.file_ids.FileIds = .{};
+    file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
+    try tree.doCompact(0, &file_ids);
 
     // L0 must be empty; L1 holds the merged result in a single table.
     try std.testing.expectEqual(@as(usize, 0), tree.levels[0].numTables());
@@ -604,7 +608,7 @@ test "levels: doCompact L1 L2" {
             .{ .key = "bb", .ts = 0, .val = "vbb" },
         });
         defer tb1.deinit();
-        const p1 = try std.fmt.allocPrint(alloc, "{s}/000001.sst", .{dir_path});
+        const p1 = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(p1);
         const f1 = try std.fs.createFileAbsolute(p1, .{});
         defer f1.close();
@@ -612,7 +616,7 @@ test "levels: doCompact L1 L2" {
 
         var tb2 = try buildTable(alloc, &.{.{ .key = "cc", .ts = 0, .val = "vcc" }});
         defer tb2.deinit();
-        const p2 = try std.fmt.allocPrint(alloc, "{s}/000002.sst", .{dir_path});
+        const p2 = try zdb.file_ids.sstPath(alloc, dir_path, 2);
         defer alloc.free(p2);
         const f2 = try std.fs.createFileAbsolute(p2, .{});
         defer f2.close();
@@ -634,8 +638,9 @@ test "levels: doCompact L1 L2" {
     try std.testing.expectEqual(@as(usize, 1), tree.levels[1].numTables());
     try std.testing.expectEqual(@as(usize, 1), tree.levels[2].numTables());
 
-    var next_file_id = std.atomic.Value(u64).init(100);
-    try tree.doCompact(1, &next_file_id);
+    var file_ids: zdb.file_ids.FileIds = .{};
+    file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
+    try tree.doCompact(1, &file_ids);
 
     // L1 must be empty; L2 holds the original {cc} table plus new {aa, bb}.
     try std.testing.expectEqual(@as(usize, 0), tree.levels[1].numTables());

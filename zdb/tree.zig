@@ -7,6 +7,7 @@ const level_handler = @import("level.zig");
 const table_mod = @import("table.zig");
 const vfs = @import("vfs");
 const metrics = @import("metrics.zig");
+const fi = @import("file_ids.zig");
 
 const Table = table_mod.Table;
 const TableIterator = table_mod.TableIterator;
@@ -206,7 +207,7 @@ pub const TableCache = struct {
         // Phase B: open the SST file WITHOUT holding the lock.
         // Table.open may yield the fiber (async I/O); holding the lock here
         // would deadlock cooperative fibers on the same OS thread (EDEADLK).
-        const path = config.sstPath(self.allocator, self.dir, need.id) catch |err| {
+        const path = fi.sstPath(self.allocator, self.dir, need.id) catch |err| {
             tse.set(err);
             return;
         };
@@ -728,8 +729,8 @@ pub const Tree = struct {
     /// doCompact runs the full compaction pipeline: buildCompaction (Phase A)
     /// then applyCompaction (Phase B). For Raft integration, callers can use
     /// buildCompaction and applyCompaction separately.
-    pub fn doCompact(self: *Tree, src_level: u8, next_file_id: *std.atomic.Value(u64)) !void {
-        var changes = try self.buildCompaction(src_level, next_file_id);
+    pub fn doCompact(self: *Tree, src_level: u8, file_ids: *fi.FileIds) !void {
+        var changes = try self.buildCompaction(src_level, file_ids);
         defer changes.deinit(self.allocator);
         try self.applyCompaction(changes.items);
     }
@@ -738,7 +739,7 @@ pub const Tree = struct {
     /// writes new SST files, and returns the manifest TableChange list describing
     /// the result. The caller is responsible for proposing these changes (e.g.
     /// through Raft) and then calling applyCompaction.
-    pub fn buildCompaction(self: *Tree, src_level: u8, next_file_id: *std.atomic.Value(u64)) !std.ArrayList(manifest.TableChange) {
+    pub fn buildCompaction(self: *Tree, src_level: u8, file_ids: *fi.FileIds) !std.ArrayList(manifest.TableChange) {
         const src: usize = src_level;
         const prio: vfs.Priority = if (src_level == 0) .p1 else .p2;
 
@@ -874,7 +875,7 @@ pub const Tree = struct {
                 // find higher version keys at higher levels. This expectation is used by get fn to
                 // stop searching for key as soon as we're able to find a version >= search key.
                 if (!item.key.equalPrimary(bld.lastKey())) {
-                    try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
+                    try self.flushBuilderOutput(&bld, &flush_handles, file_ids);
                     bld.reset();
                 }
             }
@@ -885,7 +886,7 @@ pub const Tree = struct {
         }
 
         // Flush any remaining data.
-        try self.flushBuilderOutput(&bld, &flush_handles, next_file_id);
+        try self.flushBuilderOutput(&bld, &flush_handles, file_ids);
 
         // Sum up input key counts + on-disk byte sizes from every src + bot
         // SST's index for the "expected" baseline. If keys_in != expected,
@@ -1022,14 +1023,14 @@ pub const Tree = struct {
         self: *Tree,
         bld: *Builder,
         handles: *std.ArrayList(zio.JoinHandle(?FlushResult)),
-        next_file_id: *std.atomic.Value(u64),
+        file_ids: *fi.FileIds,
     ) !void {
         var tb = try bld.finish();
         defer tb.deinit();
         if (tb.bytes.len == 0) return;
 
-        const id = next_file_id.fetchAdd(1, .monotonic);
-        const path = try config.sstPath(self.allocator, self.opts.dir, id);
+        const id = try file_ids.allocate();
+        const path = try fi.sstPath(self.allocator, self.opts.dir, id);
         errdefer self.allocator.free(path);
 
         const wh = try vfs.g().createFile(path, .{ .mode = .direct });

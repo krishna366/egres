@@ -10,6 +10,7 @@ const vfs = @import("vfs");
 const tree_mod = @import("tree.zig");
 const skl = @import("skl/skiplist.zig");
 const metrics = @import("metrics.zig");
+const fi = @import("file_ids.zig");
 
 const Key = @import("key.zig").Key;
 const KeyRange = level.KeyRange;
@@ -318,7 +319,10 @@ pub const Forest = struct {
     opts: config.Config,
     ms: manifest.ForestState,
     next_tree_id: std.atomic.Value(u64),
-    next_file_id: std.atomic.Value(u64),
+    /// Per-node file_id allocator. Wired at startup via `bindWorker`.
+    /// All callers go through `file_ids.allocate()`; raw `fetchAdd` is
+    /// never correct because it skips the HardState lease.
+    file_ids: fi.FileIds,
     trees: std.AutoHashMap(u64, *Tree),
     ns_routes: std.AutoHashMap(u32, *RouteTable),
     table_cache: TableCache,
@@ -346,7 +350,7 @@ pub const Forest = struct {
             .opts = opts,
             .ms = ms,
             .next_tree_id = std.atomic.Value(u64).init(1),
-            .next_file_id = std.atomic.Value(u64).init(1),
+            .file_ids = .{},
             .trees = std.AutoHashMap(u64, *Tree).init(allocator),
             .ns_routes = std.AutoHashMap(u32, *RouteTable).init(allocator),
             .table_cache = TableCache.init(allocator, opts.dir),
@@ -396,17 +400,7 @@ pub const Forest = struct {
         try self.memtables.swapCurrentOut(new_id, log_index);
     }
 
-    /// Ensure next_file_id is past the given id, so a follower that
-    /// becomes leader won't reuse IDs assigned by the old leader.
-    pub fn advanceFileId(self: *Forest, id: u64) void {
-        while (true) {
-            const cur = self.next_file_id.load(.monotonic);
-            if (cur > id) return;
-            if (self.next_file_id.cmpxchgWeak(cur, id + 1, .monotonic, .monotonic) == null) return;
-        }
-    }
-
-    /// Same as advanceFileId but for tree IDs. A follower that becomes leader
+    /// Ensure next_tree_id is past the given id. A follower that becomes leader
     /// must not reuse tree IDs assigned by the previous leader.
     pub fn advanceTreeId(self: *Forest, id: u64) void {
         while (true) {
@@ -494,8 +488,8 @@ pub const Forest = struct {
                 continue;
             }
 
-            const file_id = self.next_file_id.fetchAdd(1, .monotonic);
-            const path = try config.sstPath(self.allocator, self.opts.dir, file_id);
+            const file_id = try self.file_ids.allocate();
+            const path = try fi.sstPath(self.allocator, self.opts.dir, file_id);
 
             try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tree_id, &flush_err,
@@ -755,16 +749,20 @@ pub const Forest = struct {
     }
 
     /// Walk `self.ms.trees` and install each tree (Tree + RouteTable entries),
-    /// then advance `next_tree_id` / `next_file_id` past every id seen. Used
-    /// after `ForestState.restoreFrom(snapshot.data)` at recovery — the manifest
-    /// already names every tree and table, but the in-memory Tree objects and
-    /// route table need to be rebuilt from it.
+    /// then advance `next_tree_id` past every id seen. Used after
+    /// `ForestState.restoreFrom(snapshot.data)` at recovery — the manifest
+    /// already names every tree and table, but the in-memory Tree objects
+    /// and route table need to be rebuilt from it.
+    ///
+    /// File ids are NOT scanned here: each node's local counter is
+    /// restored from HardState's `max_file_id` via `forest.file_ids.bind`,
+    /// which is independent of (and immune to) ids in other nodes'
+    /// namespaces that show up in the manifest.
     pub fn openTablesFromManifest(self: *Forest) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
         var max_tree_id: u64 = 0;
-        var max_file_id: u64 = 0;
 
         var it = self.ms.trees.iterator();
         while (it.next()) |kv| {
@@ -785,16 +783,9 @@ pub const Forest = struct {
             try self.installTree(tree_id, tree.namespace_id, range);
 
             if (tree_id > max_tree_id) max_tree_id = tree_id;
-            for (tree.levels.items) |lm| {
-                var tit = lm.tables.keyIterator();
-                while (tit.next()) |fid| {
-                    if (fid.* > max_file_id) max_file_id = fid.*;
-                }
-            }
         }
 
         self.advanceTreeId(max_tree_id);
-        self.advanceFileId(max_file_id);
     }
 
     /// Create a new tree for the given namespace and key range.
@@ -1175,7 +1166,7 @@ pub const Forest = struct {
 
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
+        const path = fi.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
         defer self.allocator.free(path);
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
@@ -1193,7 +1184,7 @@ pub const Forest = struct {
             return;
         }
 
-        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return;
+        const path = fi.sstPath(self.allocator, self.opts.dir, file_id) catch return;
         defer self.allocator.free(path);
 
         // Probe existence + size via vfs (no allocation, just open + getEndPos).
@@ -1238,7 +1229,7 @@ pub const Forest = struct {
 
     /// Read an SST file from disk. Caller owns the returned slice.
     pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-        const path = config.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
+        const path = fi.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
         defer self.allocator.free(path);
         const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
         defer handle.close();

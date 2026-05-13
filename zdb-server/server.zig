@@ -153,13 +153,6 @@ pub const StorageImpl = struct {
             self.allocator.destroy(mcs);
         }
 
-        // Advance file ID counter so a follower that becomes leader
-        // won't reuse IDs assigned by the old leader.
-        self.forest.advanceFileId(mcs.memtable_id);
-        for (mcs.table_changes) |tc| {
-            self.forest.advanceFileId(tc.table_id);
-        }
-
         switch (mcs.cmd) {
             1 => try self.forest.newMemtable(mcs.memtable_id, index),
             2 => try self.forest.applyFlush(mcs.table_changes, mcs.memtable_id),
@@ -747,7 +740,7 @@ pub const ZdbServer = struct {
     fn proposeNewMemtable(self: *ZdbServer) !void {
         self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_us = std.time.microTimestamp() });
         defer self.removeInFlight(.new_memtable, 0, 0);
-        const new_id = self.forest.next_file_id.fetchAdd(1, .monotonic);
+        const new_id = try self.forest.file_ids.allocate();
         const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
@@ -794,7 +787,7 @@ pub const ZdbServer = struct {
         const t0 = std.time.milliTimestamp();
         log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.tree_id, src, dst });
 
-        var changes = try target.tree.buildCompaction(src, &self.forest.next_file_id);
+        var changes = try target.tree.buildCompaction(src, &self.forest.file_ids);
         defer changes.deinit(self.allocator);
         if (changes.items.len == 0) {
             log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});

@@ -54,19 +54,10 @@ pub const ReadResult = struct {
     }
 };
 
-pub fn fileIdFromPath(path: []const u8) u44 {
-    const basename = std.fs.path.basename(path);
-    if (std.mem.endsWith(u8, basename, ".sst")) {
-        const stem = basename[0 .. basename.len - 4];
-        return std.fmt.parseInt(u44, stem, 10) catch 0;
-    }
-    return 0; // non-SST: no caching
-}
 
 pub const FileHandle = struct {
     file: ?zio.File = null,
     file_size: u64,
-    file_id: u64 = 0,
     mapped: ?[]align(page_size) const u8 = null,
     owned_buf: ?[]u8 = null, // memory mode: entire file read into this buffer
     buf_allocator: ?std.mem.Allocator = null, // for freeing owned_buf on close
@@ -308,7 +299,6 @@ pub const VFS = struct {
     }
 
     pub fn openFile(self: *const VFS, allocator: std.mem.Allocator, path: []const u8, opts: FileOptions) !FileHandle {
-        const fid = fileIdFromPath(path);
         switch (opts.mode) {
             .mmap => {
                 // mmap mode opens RO+default for the underlying fd; mapped
@@ -318,14 +308,14 @@ pub const VFS = struct {
 
                 const file_size = try (std.fs.File{ .handle = fd }).getEndPos();
                 const mapped = try posix.mmap(null, file_size, posix.PROT.READ, .{ .TYPE = .PRIVATE }, fd, 0);
-                return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .file_id = fid, .mapped = mapped, .vfs = self };
+                return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .mapped = mapped, .vfs = self };
             },
             .default, .direct => {
                 const fd = try openDirect(path, opts);
                 errdefer posix.close(fd);
 
                 const file_size = try (std.fs.File{ .handle = fd }).getEndPos();
-                return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .file_id = fid, .vfs = self };
+                return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .vfs = self };
             },
             .memory => {
                 // memory mode reads the file once into a buffer; underlying fd is RO+default.
@@ -340,7 +330,6 @@ pub const VFS = struct {
                 _ = try file.readAll(buf);
                 return .{
                     .file_size = file_size,
-                    .file_id = fid,
                     .owned_buf = buf,
                     .buf_allocator = allocator,
                     .vfs = self,

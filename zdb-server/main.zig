@@ -225,6 +225,17 @@ pub fn main() !void {
     }
     log.info("forest opened", .{});
 
+    // Wire the file_id allocator: node_id = raft node id; initial local
+    // counter restored from HardState's persisted max_file_id (any id we
+    // could have written to disk before the crash is < that value, so we
+    // resume past every possibly-orphaned SST without a disk scan).
+    forest.file_ids.bind(
+        @intCast(raft_cfg.id),
+        node.log.hardState().max_file_id,
+        @ptrCast(&wal),
+        raft.DiskWAL.persistMaxFileId,
+    );
+
     // Storage interface bridges raft commits to forest.
     var storage_impl = zdb_server.StorageImpl{
         .forest = forest,

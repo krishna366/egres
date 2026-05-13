@@ -10,10 +10,15 @@ const compress = utils.compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("vfs");
 const cache_mod = @import("../cache.zig");
+const fi = @import("../file_ids.zig");
 
-/// Module-level block cache singleton. Set before opening tables to enable caching.
-/// When null (default), readBlock always reads from disk.
-pub var block_cache: ?*cache_mod.ShardedCache(u64) = null;
+/// Module-level block cache singleton. Set before opening tables to enable
+/// caching. When null (default), readBlock always reads from disk.
+///
+/// Key layout: high 64 bits = file_id, low 64 bits = block_idx. Storing
+/// both fields in their own halves of a u128 means no hash combine and
+/// zero collision risk across the node_id-namespaced file_id space.
+pub var block_cache: ?*cache_mod.ShardedCache(u128) = null;
 
 pub const Error = idx.Error || buffers.Error || compress.Error ||
     std.mem.Allocator.Error || error{
@@ -36,7 +41,10 @@ pub const Table = struct {
     ref: std.atomic.Value(i32),
     smallest: Key,
     biggest: Key,
-    file_id: u44, // parsed from SST filename; 0 for in-memory tables
+    /// Parsed from the SST filename (see `zdb.file_ids.sstPath`). 0 for
+    /// in-memory tables — also the sentinel "skip block-cache" value
+    /// since 0 isn't a valid encoded id (node 0 is reserved).
+    file_id: u64,
     // Owned path split into atomic pointer + length for thread-safe detach.
     // Use getPath() to read, claimPath() to atomically take ownership.
     path_ptr: std.atomic.Value(?[*]const u8),
@@ -53,7 +61,7 @@ pub const Table = struct {
         const handle = try vfs.g().openFile(allocator, path, .{});
         const t = try initFromHandle(allocator, handle, priority);
         errdefer t.decrRef();
-        t.file_id = vfs.fileIdFromPath(path);
+        t.file_id = fi.fromPath(path);
         const duped = try allocator.dupe(u8, path);
         t.path_ptr = std.atomic.Value(?[*]const u8).init(duped.ptr);
         t.path_len = duped.len;
@@ -214,11 +222,14 @@ pub const Table = struct {
     pub fn readBlock(self: *const Table, block_idx: usize, priority: vfs.Priority) Error!*cache_mod.Value {
         if (block_idx >= self.index.blocks.len) return error.CorruptTable;
 
-        // Cache key: 44 bits file_id (MSB) | 20 bits block_idx (LSB).
-        // null on overflow → cache_key = 0 → skip caching.
+        // file_id in high 64 bits, block_idx in low 64 bits — no hashing,
+        // no collision possible. 0 = "skip cache" sentinel (file_id 0 is
+        // the in-memory / non-SST marker).
         const fid: u64 = self.file_id;
-        const bidx: u64 = std.math.cast(u20, block_idx) orelse 0;
-        const cache_key: u64 = if (fid != 0 and bidx != 0) (fid << 20) | bidx else 0;
+        const cache_key: u128 = if (fid != 0)
+            (@as(u128, fid) << 64) | @as(u128, block_idx)
+        else
+            0;
 
         if (block_cache != null and cache_key != 0) {
             if (block_cache.?.get(cache_key)) |val| return val; // incrRef'd by get.
