@@ -153,6 +153,13 @@ pub const StorageImpl = struct {
             self.allocator.destroy(mcs);
         }
 
+        // TRACE: pinpoints which entry / cmd hangs the apply path. Last
+        // "enter" without a matching "exit" is the wedge.
+        log.info("applyManifestChange enter idx={d} cmd={d} mt={d} tcs={d}", .{
+            index, mcs.cmd, mcs.memtable_id, mcs.table_changes.len,
+        });
+        defer log.info("applyManifestChange exit  idx={d} cmd={d}", .{ index, mcs.cmd });
+
         switch (mcs.cmd) {
             1 => try self.forest.newMemtable(mcs.memtable_id, index),
             2 => try self.forest.applyFlush(mcs.table_changes, mcs.memtable_id),
@@ -249,6 +256,10 @@ pub const InFlight = struct {
     src_level: u8 = 0,
     dest_level: u8 = 0,
     src_tables: u32 = 0,
+    /// Compaction id (`cid`) for `kind == .compaction`; 0 otherwise. Lets
+    /// the watchdog log line cross-reference the per-compaction phase
+    /// logs (`compact cid=N start/build_done/...`).
+    cid: u64 = 0,
     started_at_us: i64,
 };
 
@@ -428,8 +439,8 @@ pub const ZdbServer = struct {
             for (self.in_flight.items) |it| {
                 const age_ms = @divTrunc(now_us - it.started_at_us, 1000);
                 if (age_ms < stuck_threshold_ms) continue;
-                log.warn("in-flight stuck: kind={s} tree={d} src_level={d} dest_level={d} age_ms={d}", .{
-                    @tagName(it.kind), it.tree_id, it.src_level, it.dest_level, age_ms,
+                log.warn("in-flight stuck: kind={s} cid={d} tree={d} src_level={d} dest_level={d} age_ms={d}", .{
+                    @tagName(it.kind), it.cid, it.tree_id, it.src_level, it.dest_level, age_ms,
                 });
             }
         }
@@ -766,6 +777,12 @@ pub const ZdbServer = struct {
     }
 
     fn proposeCompaction(self: *ZdbServer, target: Forest.CompactionTarget) !void {
+        // Per-call ID so we can grep all phase-lines for one compaction
+        // out of a noisy multi-loop log: every line below carries
+        // `cid=<id>`. The `cid_` prefix is unique enough to tail+grep.
+        // Assigned BEFORE addInFlight so the watchdog warning carries it.
+        const cid = self.next_compaction_id.fetchAdd(1, .monotonic);
+
         // Track the compaction so `zdb forest` can show whether a
         // "compactions wanted" entry is genuinely starved or just waiting
         // on a build/sync that hasn't proposed yet.
@@ -774,14 +791,11 @@ pub const ZdbServer = struct {
             .tree_id = target.tree_id,
             .src_level = @intCast(target.candidate.level),
             .dest_level = @intCast(@as(usize, target.candidate.level) + 1),
+            .cid = cid,
             .started_at_us = std.time.microTimestamp(),
         });
         defer self.removeInFlight(.compaction, target.tree_id, @intCast(target.candidate.level));
 
-        // Per-call ID so we can grep all phase-lines for one compaction
-        // out of a noisy multi-loop log: every line below carries
-        // `cid=<id>`. The `cid_` prefix is unique enough to tail+grep.
-        const cid = self.next_compaction_id.fetchAdd(1, .monotonic);
         const src = target.candidate.level;
         const dst: usize = @as(usize, src) + 1;
         const t0 = std.time.milliTimestamp();
