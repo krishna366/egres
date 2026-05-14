@@ -390,6 +390,21 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
     var trace_addrs: []usize = &.{};
     defer std.heap.page_allocator.free(trace_addrs);
 
+    // 30 s deadline for normal tests; BIG: tests advertise long runtimes
+    // and opt out. AutoCancel.set arms a timer on this fiber; when it
+    // fires, the next I/O yield (sleep, lock, recv, …) returns
+    // error.Canceled and `timeout.triggered` is set. A test stuck in a
+    // tight CPU loop without yielding cannot be canceled cooperatively.
+    const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
+        t.name[p + ".test.".len ..]
+    else
+        t.name;
+    const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
+
+    var timeout = zio.AutoCancel.init;
+    defer timeout.clear();
+    if (!is_big) timeout.set(zio.Timeout.fromSeconds(30));
+
     const t0 = std.time.nanoTimestamp();
     const result: ?anyerror = if (t.func()) |_| null else |e| blk: {
         if (e != error.SkipZigTest) {
@@ -401,6 +416,7 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
         break :blk e;
     };
     const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - t0, std.time.ns_per_ms);
+    const timed_out = if (result) |e| e == error.Canceled and timeout.triggered else false;
 
     const seq = ctx.seq.fetchAdd(1, .seq_cst) + 1;
 
@@ -425,11 +441,20 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
         },
         else => {
             _ = ctx.counters.failed.fetchAdd(1, .seq_cst);
-            writeColored(ctx.out, ctx.tty, .bright_red, "FAIL: {s}", .{@errorName(err)});
+            if (timed_out) {
+                writeColored(ctx.out, ctx.tty, .bright_red, "FAIL: TIMEOUT", .{});
+            } else {
+                writeColored(ctx.out, ctx.tty, .bright_red, "FAIL: {s}", .{@errorName(err)});
+            }
             writeColored(ctx.out, ctx.tty, .dim, " ({d}ms)\n", .{elapsed_ms});
             // Capture for serial retry. We're inside print_mu, so the append
             // is implicitly serialized.
             if (ctx.failures) |list| list.append(std.heap.page_allocator, t) catch {};
+            // On timeout, log the test name once up front so the diag
+            // block self-identifies even if scrolled past the status line.
+            if (timed_out) {
+                writeColored(ctx.out, ctx.tty, .bright_red, "  | TIMEOUT in '{s}' — diagnostics follow\n", .{user_name});
+            }
             // Dump the captured stack trace (writes to stderr directly via
             // its own lock; flush our buffered writer first so order is
             // preserved on the terminal).
@@ -439,6 +464,14 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
                     .index = trace_addrs.len,
                     .instruction_addresses = trace_addrs,
                 });
+            }
+            // On timeout, also dump TrackedMutex state — currently-held
+            // locks are the most likely smoking gun for a deadlock.
+            if (timed_out) {
+                ctx.out.flush() catch {};
+                writeColored(ctx.out, ctx.tty, .dim, "  | TrackedMutex state for '{s}':\n", .{user_name});
+                utils.tracked_mutex.dump(ctx.out) catch {};
+                ctx.out.flush() catch {};
             }
         },
     } else {
@@ -758,6 +791,9 @@ pub fn main() !void {
 
     var handle = try rt.spawn(driver, .{ args, &counters, &retry_counters, &bench_counters, alloc, out, tty });
     try handle.join();
+    // Drain the coarse.Clock tick fiber, if any test started it.
+    // Without this, `rt.deinit()` asserts task_count == 0 fails.
+    utils.coarse.Clock.stop();
 
     const total_ms = @divTrunc(std.time.nanoTimestamp() - t0_all, std.time.ns_per_ms);
     const main_passed = counters.passed.load(.seq_cst);

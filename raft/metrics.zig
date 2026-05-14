@@ -1,5 +1,6 @@
 const std = @import("std");
 const m = @import("metrics");
+const utils = @import("utils");
 
 // Raft-layer metrics. Same lifecycle pattern as zdb/metrics.zig: an
 // application creates a `Metrics` once, library code reaches it via the
@@ -10,10 +11,10 @@ pub const PhaseLabels = struct {
     phase: []const u8,
 };
 
-// Microsecond bucket boundaries — leader phases on a non-contended node
-// should live in the 1-500µs band, so a tail above 1ms instantly screams
-// "fsync stall" or "scheduling hazard". Last bucket = 50ms.
-const phase_buckets: []const u64 = &.{ 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 50000 };
+// Millisecond bucket boundaries. coarse.Clock ticks every 1 ms, so any
+// sub-ms phase lands in the lowest bucket — a tail above ~10 ms points
+// at fsync stalls or scheduling hazards. Last bucket = 1 s.
+const phase_buckets: []const u64 = &.{ 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000 };
 
 // Powers-of-two bucket boundaries for proposal-batch sizes. The propose
 // pipeline drains the entire pending queue per call, so this histogram
@@ -32,7 +33,7 @@ pub const Metrics = struct {
     ///   propose_persist  sub-phase: log.append + log.sync
     ///   advance          advanceCommitIndex + applyConfChanges + notify
     ///   broadcast        sendAppendEntries to all peers
-    propose_phase_us: PhaseHist,
+    propose_phase_ms: PhaseHist,
     /// How many proposals were drained out of the queue per
     /// `processProposalRequests` call. Higher = more group-commit
     /// amortization across the WAL fsync. Recorded only when the call had
@@ -42,9 +43,9 @@ pub const Metrics = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Metrics {
         return .{
-            .propose_phase_us = try PhaseHist.init(
+            .propose_phase_ms = try PhaseHist.init(
                 allocator,
-                "raft_propose_phase_us",
+                "raft_propose_phase_ms",
                 .{},
                 .{},
             ),
@@ -59,7 +60,7 @@ pub const Metrics = struct {
     }
 
     pub fn deinit(self: *Metrics) void {
-        self.propose_phase_us.deinit();
+        self.propose_phase_ms.deinit();
         // propose_batch_size has no dynamic state, no deinit needed.
     }
 
@@ -69,12 +70,13 @@ pub const Metrics = struct {
         return m.initializeNoop(Metrics);
     }
 
-    /// Observe `microTimestamp() - start_us` on the named phase. Errors from
-    /// the underlying allocator (only possible the first time a new label is
-    /// seen) are swallowed — losing one sample beats taking down the leader.
-    pub fn observePhase(self: *Metrics, phase: []const u8, start_us: i64) void {
-        const elapsed_us: u64 = @intCast(std.time.microTimestamp() - start_us);
-        self.propose_phase_us.observe(.{ .phase = phase }, elapsed_us) catch {};
+    /// Observe `coarse.Clock.ms() - start_ms` on the named phase. Errors
+    /// from the underlying allocator (only possible the first time a new
+    /// label is seen) are swallowed — losing one sample beats taking down
+    /// the leader.
+    pub fn observePhase(self: *Metrics, phase: []const u8, start_ms: i64) void {
+        const elapsed_ms: u64 = @intCast(utils.coarse.Clock.ms() - start_ms);
+        self.propose_phase_ms.observe(.{ .phase = phase }, elapsed_ms) catch {};
     }
 
     /// Record the drain depth — number of proposal requests pulled out of

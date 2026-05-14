@@ -5,6 +5,7 @@ const zdb = @import("zdb");
 const runtime = @import("runtime");
 const zdb_server = @import("zdb_server");
 const flags = @import("flags");
+const utils = @import("utils");
 
 pub const std_options = std.Options{
     .log_level = .debug,
@@ -112,6 +113,23 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
+
+    // Single-executor bootstrap runtime. Everything from flag init
+    // onward runs in a fiber on it so flag locks and other zio-aware
+    // locks never block an executor thread across a yield.
+    const bootstrap_rt = try zio.Runtime.init(allocator, .{ .executors = .exact(1) });
+    defer bootstrap_rt.deinit();
+
+    var handle = try bootstrap_rt.spawn(bootstrap, .{ allocator, argv });
+    try handle.join();
+}
+
+fn bootstrap(allocator: std.mem.Allocator, argv: [][:0]u8) !void {
+    // Spawn the cached-time ticker. Lives for the rest of the process.
+    utils.coarse.Clock.start() catch |err| {
+        log.err("coarse.Clock.start failed: {s}", .{@errorName(err)});
+        return err;
+    };
 
     flags.initGlobal(allocator);
     defer flags.deinitGlobal();

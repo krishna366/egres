@@ -99,8 +99,6 @@ fn makeModules(
     buffers_gen.addImport("zbuf", zbuf);
 
     // Infra
-    const flags = makeModule(b, target, optimize, "u/flags.zig");
-
     const utils = makeModule(b, target, optimize, "u/utils.zig");
     utils.addImport("zio", zio);
     // utils/compress.zig does @cImport for lz4/zstd. Bake the include paths
@@ -110,8 +108,12 @@ fn makeModules(
     utils.addIncludePath(b.path("third_party/lz4/lib"));
     utils.addIncludePath(b.path("third_party/zstd/lib"));
 
+    const flags = makeModule(b, target, optimize, "u/flags.zig");
+    flags.addImport("zio", zio);
+
     const vfs = makeModule(b, target, optimize, "vfs/vfs.zig");
     vfs.addImport("zio", zio);
+    vfs.addImport("utils", utils);
 
     const runtime = makeModule(b, target, optimize, "runtime.zig");
     runtime.addImport("zio", zio);
@@ -502,7 +504,7 @@ fn addZdbServer(
         .root_module = makeModule(b, target, optimize, "zdb-server/main.zig"),
     });
     addVendoredCompressionSources(b, exe);
-    addImports(exe.root_module, mods, .{ "zio", "raft", "zdb", "runtime", "metrics", "flags" });
+    addImports(exe.root_module, mods, .{ "zio", "raft", "zdb", "runtime", "metrics", "flags", "utils" });
     exe.root_module.addImport("zdb_server", zdb_server_mod);
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);

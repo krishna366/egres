@@ -28,7 +28,7 @@ pub const Serial = struct {
 
     allocator: Allocator,
     tcp_stream: zio.net.Stream,
-    writer_mu: zio.Mutex,
+    writer_mu: utils.TrackedMutex,
     write_buf: []u8,
     read_buf: []u8,
     buf_reader: zio.net.Stream.Reader,
@@ -46,12 +46,12 @@ pub const Serial = struct {
         self.* = .{
             .allocator = allocator,
             .tcp_stream = tcp_stream,
-            .writer_mu = .init,
+            .writer_mu = .{},
             .write_buf = write_buf,
             .read_buf = read_buf,
             .buf_reader = tcp_stream.reader(read_buf),
             .outbound = try zio.Channel(OutboundMsg).initAlloc(allocator, 256),
-            .last_recv_ms = std.atomic.Value(i64).init(std.time.milliTimestamp()),
+            .last_recv_ms = std.atomic.Value(i64).init(utils.coarse.Clock.ms()),
             .closed = false,
             .drop_messages = std.atomic.Value(bool).init(false),
         };
@@ -63,6 +63,7 @@ pub const Serial = struct {
         self.outbound.deinit();
         self.allocator.free(self.write_buf);
         self.allocator.free(self.read_buf);
+        self.writer_mu.deinit();
         self.allocator.destroy(self);
     }
 
@@ -93,7 +94,7 @@ pub const Serial = struct {
 
     /// Send a framed message. Thread-safe via writer_mu.
     pub fn send(self: *Serial, message_type: u16, payload: []const u8) !void {
-        try self.writer_mu.lock();
+        try self.writer_mu.lock(@src());
         defer self.writer_mu.unlock();
 
         var buf_writer = self.tcp_stream.writer(self.write_buf);
@@ -167,7 +168,7 @@ pub const Serial = struct {
             defer if (msg.payload.len > 0) self.allocator.free(msg.payload);
 
             // Update the liveness of this connection.
-            self.last_recv_ms.store(std.time.milliTimestamp(), .release);
+            self.last_recv_ms.store(utils.coarse.Clock.ms(), .release);
             if (msg.message_type == msg_type_pong) continue; // liveness ack, nothing to do
             if (msg.message_type == msg_type_ping) {
                 self.send(msg_type_pong, &.{}) catch |err| {

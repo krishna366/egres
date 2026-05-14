@@ -260,7 +260,7 @@ pub const InFlight = struct {
     /// the watchdog log line cross-reference the per-compaction phase
     /// logs (`compact cid=N start/build_done/...`).
     cid: u64 = 0,
-    started_at_us: i64,
+    started_at_ms: i64,
 };
 
 pub const ZdbServer = struct {
@@ -274,7 +274,7 @@ pub const ZdbServer = struct {
     storage: *StorageImpl,
     snapshot_cfg: *flags.Live(SnapshotCfg),
     listen_addr: zio.net.IpAddress,
-    in_flight_mu: std.Thread.Mutex = .{},
+    in_flight_mu: utils.TrackedMutex = .{},
     in_flight: std.ArrayList(InFlight) = .empty,
     /// Monotonic per-call ID for proposeCompaction so we can grep its
     /// per-phase log lines (start/build_done/distribute_done/done) out
@@ -286,7 +286,7 @@ pub const ZdbServer = struct {
     /// fiber. Each fiber reserves its tree before starting work so
     /// two fibers never pick the same tree. Allocated lazily on init;
     /// the deinit code below frees it.
-    compacting_mu: std.Thread.Mutex = .{},
+    compacting_mu: utils.TrackedMutex = .{},
     compacting_trees: std.AutoHashMap(u64, void) = undefined,
 
     pub fn init(
@@ -310,12 +310,14 @@ pub const ZdbServer = struct {
     }
 
     pub fn deinit(self: *ZdbServer) void {
-        self.in_flight_mu.lock();
+        self.in_flight_mu.lockUncancelable(@src());
         self.in_flight.deinit(self.allocator);
         self.in_flight_mu.unlock();
-        self.compacting_mu.lock();
+        self.compacting_mu.lockUncancelable(@src());
         self.compacting_trees.deinit();
         self.compacting_mu.unlock();
+        self.in_flight_mu.deinit();
+        self.compacting_mu.deinit();
     }
 
     /// Try to claim a compaction target; returns null if every eligible
@@ -324,7 +326,7 @@ pub const ZdbServer = struct {
     /// `defer` in the caller). Race-safe because the candidate selection
     /// and the reservation insert happen under the same mutex.
     fn pickAndReserveCompactionTarget(self: *ZdbServer) ?Forest.CompactionTarget {
-        self.compacting_mu.lock();
+        self.compacting_mu.lockUncancelable(@src());
         defer self.compacting_mu.unlock();
         const target = self.forest.bestCompactionCandidateExcluding(&self.compacting_trees) orelse return null;
         self.compacting_trees.put(target.tree_id, {}) catch return null;
@@ -332,7 +334,7 @@ pub const ZdbServer = struct {
     }
 
     fn releaseCompactingTree(self: *ZdbServer, tree_id: u64) void {
-        self.compacting_mu.lock();
+        self.compacting_mu.lockUncancelable(@src());
         defer self.compacting_mu.unlock();
         _ = self.compacting_trees.remove(tree_id);
     }
@@ -341,13 +343,13 @@ pub const ZdbServer = struct {
     /// Caller is responsible for pairing exactly one `remove` per `add`,
     /// typically via `defer`.
     fn addInFlight(self: *ZdbServer, entry: InFlight) void {
-        self.in_flight_mu.lock();
+        self.in_flight_mu.lockUncancelable(@src());
         defer self.in_flight_mu.unlock();
         self.in_flight.append(self.allocator, entry) catch {};
     }
 
     fn removeInFlight(self: *ZdbServer, kind: InFlight.Kind, tree_id: u64, src_level: u8) void {
-        self.in_flight_mu.lock();
+        self.in_flight_mu.lockUncancelable(@src());
         defer self.in_flight_mu.unlock();
         // Match on (kind, tree_id, src_level) — multiple in-flight entries
         // with the same key would mean two concurrent compactions on the
@@ -433,11 +435,11 @@ pub const ZdbServer = struct {
         const stuck_threshold_ms: i64 = 30_000;
         while (!self.node.isShuttingDown()) {
             zio.sleep(poll) catch return;
-            const now_us = std.time.microTimestamp();
-            self.in_flight_mu.lock();
+            const now_ms = utils.coarse.Clock.ms();
+            self.in_flight_mu.lockUncancelable(@src());
             defer self.in_flight_mu.unlock();
             for (self.in_flight.items) |it| {
-                const age_ms = @divTrunc(now_us - it.started_at_us, 1000);
+                const age_ms = now_ms - it.started_at_ms;
                 if (age_ms < stuck_threshold_ms) continue;
                 log.warn("in-flight stuck: kind={s} cid={d} tree={d} src_level={d} dest_level={d} age_ms={d}", .{
                     @tagName(it.kind), it.cid, it.tree_id, it.src_level, it.dest_level, age_ms,
@@ -749,7 +751,7 @@ pub const ZdbServer = struct {
     }
 
     fn proposeNewMemtable(self: *ZdbServer) !void {
-        self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_us = std.time.microTimestamp() });
+        self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_ms = utils.coarse.Clock.ms() });
         defer self.removeInFlight(.new_memtable, 0, 0);
         const new_id = try self.forest.file_ids.allocate();
         const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
@@ -762,7 +764,7 @@ pub const ZdbServer = struct {
         // part). buildFlush iterates the oldest immutable memtable; we
         // don't know the target tree(s) until changes return, so use
         // tree_id=0 as a "global" marker.
-        self.addInFlight(.{ .kind = .flush, .tree_id = 0, .started_at_us = std.time.microTimestamp() });
+        self.addInFlight(.{ .kind = .flush, .tree_id = 0, .started_at_ms = utils.coarse.Clock.ms() });
         defer self.removeInFlight(.flush, 0, 0);
         const result = try self.forest.buildFlush() orelse return;
         var changes = result.changes;
@@ -792,13 +794,13 @@ pub const ZdbServer = struct {
             .src_level = @intCast(target.candidate.level),
             .dest_level = @intCast(@as(usize, target.candidate.level) + 1),
             .cid = cid,
-            .started_at_us = std.time.microTimestamp(),
+            .started_at_ms = utils.coarse.Clock.ms(),
         });
         defer self.removeInFlight(.compaction, target.tree_id, @intCast(target.candidate.level));
 
         const src = target.candidate.level;
         const dst: usize = @as(usize, src) + 1;
-        const t0 = std.time.milliTimestamp();
+        const t0 = utils.coarse.Clock.ms();
         log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.tree_id, src, dst });
 
         var changes = try target.tree.buildCompaction(src, &self.forest.file_ids);
@@ -807,22 +809,22 @@ pub const ZdbServer = struct {
             log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});
             return;
         }
-        const t1 = std.time.milliTimestamp();
+        const t1 = utils.coarse.Clock.ms();
         log.info("compact cid={d} build_done changes={d} build_ms={d}", .{ cid, changes.items.len, t1 - t0 });
 
         try self.distributeNewFiles(changes.items);
-        const t2 = std.time.milliTimestamp();
+        const t2 = utils.coarse.Clock.ms();
         log.info("compact cid={d} distribute_done distribute_ms={d}", .{ cid, t2 - t1 });
 
         const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
-        const t3 = std.time.milliTimestamp();
+        const t3 = utils.coarse.Clock.ms();
         log.info("compact cid={d} done propose_ms={d} total_ms={d}", .{ cid, t3 - t2, t3 - t0 });
     }
 
     fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
-        self.addInFlight(.{ .kind = .split, .tree_id = tree_id, .started_at_us = std.time.microTimestamp() });
+        self.addInFlight(.{ .kind = .split, .tree_id = tree_id, .started_at_ms = utils.coarse.Clock.ms() });
         defer self.removeInFlight(.split, tree_id, 0);
         // buildSplit allocates table_changes / tree_changes on the arena;
         // encodeManifestChange copies the bytes into a self-owned payload,
@@ -960,6 +962,9 @@ pub const ZdbServer = struct {
                 },
                 .vfs => |_| {
                     self.handleVfs(stream) catch return;
+                },
+                .locks => |_| {
+                    self.handleLocks(stream) catch return;
                 },
                 .help => |_| {
                     proto.writeHelp(stream) catch return;
@@ -1181,6 +1186,17 @@ pub const ZdbServer = struct {
         try w.flush();
     }
 
+    fn handleLocks(self: *ZdbServer, stream: zio.net.Stream) !void {
+        // Walks the intrusive registry in u/tracked_mutex.zig and emits one
+        // line per registered mutex. Read while wedged to find the lock /
+        // call site that's blocking everyone.
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+        try utils.tracked_mutex.dump(&body.writer);
+        try body.writer.writeByte('\n');
+        try stream.writeAll(body.writer.buffered(), .none);
+    }
+
     fn handleVfs(self: *ZdbServer, stream: zio.net.Stream) !void {
         _ = self;
         // Pretty-printed snapshot of the global VFS bandwidth limiter,
@@ -1387,16 +1403,16 @@ pub const ZdbServer = struct {
     /// compaction loop is starved (not picking up the candidate); a row
     /// that's been "in flight" for many seconds means a build is slow.
     fn writeInFlight(self: *ZdbServer, w: *std.Io.Writer) !void {
-        self.in_flight_mu.lock();
+        self.in_flight_mu.lockUncancelable(@src());
         defer self.in_flight_mu.unlock();
         if (self.in_flight.items.len == 0) {
             try w.print("\n  in-flight: (none)\n", .{});
             return;
         }
-        const now = std.time.microTimestamp();
+        const now = utils.coarse.Clock.ms();
         try w.print("\n  in-flight:\n", .{});
         for (self.in_flight.items) |it| {
-            const age_ms = @divTrunc(now - it.started_at_us, 1000);
+            const age_ms = now - it.started_at_ms;
             switch (it.kind) {
                 .compaction => try w.print(
                     "    compaction tree={d} L{d}->L{d} age_ms={d}\n",

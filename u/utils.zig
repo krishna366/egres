@@ -4,6 +4,10 @@ const builtin = @import("builtin");
 pub const compression = @import("compress.zig");
 pub const hlc = @import("hlc.zig");
 pub const bench = @import("bench.zig");
+pub const tracked_mutex = @import("tracked_mutex.zig");
+pub const TrackedMutex = tracked_mutex.TrackedMutex;
+pub const TrackedRwLock = tracked_mutex.TrackedRwLock;
+pub const coarse = @import("coarse.zig");
 
 /// WaitGroup provides Go-style Add/Done/Wait synchronization for zio coroutines.
 ///
@@ -62,8 +66,8 @@ pub fn logEvery(comptime interval_secs: i64, comptime fmt: []const u8, args: any
     const S = struct {
         var last: i64 = 0;
     };
-    const now = std.time.microTimestamp();
-    if (now - S.last > interval_secs * 1_000_000) {
+    const now = coarse.Clock.ms();
+    if (now - S.last > interval_secs * 1_000) {
         std.log.debug(fmt, args);
         S.last = now;
     }
@@ -244,44 +248,44 @@ pub fn SafeHashMap(comptime K: type, comptime V: type) type {
         const HashMap = std.AutoHashMap(K, V);
 
         map: HashMap,
-        mu: std.Thread.Mutex = .{},
+        mu: zio.Mutex = .init,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{ .map = HashMap.init(allocator) };
         }
 
         pub fn get(self: *Self, key: K) ?V {
-            self.mu.lock();
+            self.mu.lockUncancelable();
             defer self.mu.unlock();
             return self.map.get(key);
         }
 
         pub fn put(self: *Self, key: K, value: V) !void {
-            self.mu.lock();
+            self.mu.lockUncancelable();
             defer self.mu.unlock();
             try self.map.put(key, value);
         }
 
         pub fn remove(self: *Self, key: K) bool {
-            self.mu.lock();
+            self.mu.lockUncancelable();
             defer self.mu.unlock();
             return self.map.remove(key);
         }
 
         pub fn fetchRemove(self: *Self, key: K) ?HashMap.KV {
-            self.mu.lock();
+            self.mu.lockUncancelable();
             defer self.mu.unlock();
             return self.map.fetchRemove(key);
         }
 
         pub fn contains(self: *Self, key: K) bool {
-            self.mu.lock();
+            self.mu.lockUncancelable();
             defer self.mu.unlock();
             return self.map.contains(key);
         }
 
         pub fn count(self: *Self) u32 {
-            self.mu.lock();
+            self.mu.lockUncancelable();
             defer self.mu.unlock();
             return self.map.count();
         }

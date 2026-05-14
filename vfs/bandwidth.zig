@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const utils = @import("utils");
 const vfs = @import("vfs.zig");
 
 pub const Config = struct {
@@ -80,7 +81,7 @@ pub const Spinner = struct {
         std.debug.assert(pages % factor == 0); // caller's responsibility
 
         const limiter = self.limiter;
-        const start = std.time.milliTimestamp();
+        const start = utils.coarse.Clock.ms();
 
         while (true) {
             limiter.tryRefill();
@@ -101,7 +102,7 @@ pub const Spinner = struct {
             const want = (raw_want / factor) * factor;
 
             if (want == 0 and self.priority != .p0) {
-                if (std.time.milliTimestamp() - start >= @as(i64, @intCast(limiter.conf.timeout_ms))) {
+                if (utils.coarse.Clock.ms() - start >= @as(i64, @intCast(limiter.conf.timeout_ms))) {
                     // Timeout fallback: round min_alloc_pages up to the
                     // factor so the result is still a usable multiple.
                     const fallback = limiter.min_alloc_pages;
@@ -180,7 +181,7 @@ pub const Limiter = struct {
         const pps = config.bytes_per_sec / vfs.page_size;
         return .{
             .pages = std.atomic.Value(u64).init(pps),
-            .last_refill = std.atomic.Value(i64).init(std.time.milliTimestamp()),
+            .last_refill = std.atomic.Value(i64).init(utils.coarse.Clock.ms()),
             .demand_p1 = std.atomic.Value(u64).init(0),
             .pages_per_sec = pps,
             .min_alloc_pages = @max(config.min_alloc_bytes / vfs.page_size, 1),
@@ -207,7 +208,7 @@ pub const Limiter = struct {
     /// wins per time window — losers skip and proceed to page deduction.
     fn tryRefill(self: *Limiter) void {
         const old_refill = self.last_refill.load(.monotonic);
-        const now = std.time.milliTimestamp();
+        const now = utils.coarse.Clock.ms();
         const elapsed_ms = now - old_refill;
         if (elapsed_ms <= 0) return;
 

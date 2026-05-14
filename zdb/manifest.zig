@@ -3,6 +3,7 @@ const zen = @import("buffers.gen.zig");
 const Key = @import("key.zig").Key;
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
+const zio = @import("zio");
 
 // -------------------------------------------------------------------------
 // Error set
@@ -35,13 +36,12 @@ pub const TreeState = struct {
 pub const ForestState = struct {
     allocator: std.mem.Allocator,
     trees: std.AutoHashMap(u64, TreeState),
-    mu: std.Thread.Mutex,
+    mu: zio.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator) ForestState {
         return .{
             .allocator = allocator,
             .trees = std.AutoHashMap(u64, TreeState).init(allocator),
-            .mu = .{},
         };
     }
 
@@ -114,7 +114,7 @@ pub const ForestState = struct {
     ) !void {
         if (table_changes.len == 0 and tree_changes.len == 0) return;
 
-        self.mu.lock();
+        self.mu.lockUncancelable();
         defer self.mu.unlock();
 
         for (tree_changes) |tc| try self.applyTreeChange(tc);

@@ -1535,7 +1535,7 @@ pub const Node = struct {
     /// commit) and are unaffected.
     pub fn proposeAndWaitForApply(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
-        const start_ms = std.time.milliTimestamp();
+        const start_ms = utils.coarse.Clock.ms();
         var ctx = WaitCtx{ .status = .committed };
         ctx.wg.init();
         ctx.wg.add(1);
@@ -1544,7 +1544,7 @@ pub const Node = struct {
             raft_log.err("proposeAndWaitForApply: wait for commit failed: {s}", .{@errorName(err)});
             return error.CommitFailed;
         };
-        const commit_ms = std.time.milliTimestamp();
+        const commit_ms = utils.coarse.Clock.ms();
         if (commit_ms - start_ms > 5_000) {
             raft_log.warn("proposeAndWaitForApply: commit phase slow type={s} ms={d}", .{
                 @tagName(proposal_type), commit_ms - start_ms,
@@ -1588,9 +1588,9 @@ pub const Node = struct {
         // client doesn't sit forever if the SM is genuinely stuck.
         if (self.state_machine) |sm| {
             if (proposal_type == .data and !sm.isReady()) {
-                const deadline = std.time.milliTimestamp() + 1000; // 1s
+                const deadline = utils.coarse.Clock.ms() + 1000; // 1s
                 while (!sm.isReady()) {
-                    if (std.time.milliTimestamp() >= deadline) return error.NotReady;
+                    if (utils.coarse.Clock.ms() >= deadline) return error.NotReady;
                     zio.sleep(zio.Duration.fromMilliseconds(10)) catch return error.QueueClosed;
                 }
             }
@@ -1626,8 +1626,8 @@ pub const Node = struct {
 
         // Sub-phase: propose_build — walk requests, validate + serialize each
         // into a LogEntryBuffer, register the apply callback. Pure CPU work
-        // (no I/O), so anything > 100µs/batch points at zbuf encoding cost.
-        const t_build = std.time.microTimestamp();
+        // (no I/O); anything > 1 ms/batch points at zbuf encoding cost.
+        const t_build = utils.coarse.Clock.ms();
 
         var entries = std.ArrayList(zen.LogEntryBuffer).empty;
         defer {
@@ -1757,7 +1757,7 @@ pub const Node = struct {
         // Sub-phase: propose_persist — DiskWAL.append batches the framed
         // records into one pwrite. The fdatasync is no longer issued here;
         // mainLoop spawns it in a fiber so it can overlap with broadcast.
-        const t_persist = std.time.microTimestamp();
+        const t_persist = utils.coarse.Clock.ms();
         try self.log.append(entries.items);
         metrics.g().observePhase("log_append", t_persist);
 
@@ -1890,7 +1890,7 @@ pub const Node = struct {
                         // (e.g. a batched forest.put). Lets us see whether
                         // the apply path is the bottleneck when commit
                         // outpaces apply.
-                        const t_apply = std.time.microTimestamp();
+                        const t_apply = utils.coarse.Clock.ms();
                         const sm_entry = Entry{
                             .index = entry.index,
                             .term = entry.term,
@@ -1991,8 +1991,8 @@ pub const Node = struct {
     /// Main processing loop. Blocks on event_ch, drains inbound messages,
     /// processes proposals, advances state, and broadcasts to peers.
     pub fn mainLoop(self: *Node, tick_interval_ms: u32) void {
-        const tick_us: i64 = @as(i64, tick_interval_ms) * 1_000;
-        var last_tick: i64 = std.time.microTimestamp();
+        const tick_ms: i64 = @as(i64, tick_interval_ms);
+        var last_tick: i64 = utils.coarse.Clock.ms();
 
         while (!self.isShuttingDown()) {
             _ = self.event_ch.receive() catch return;
@@ -2001,7 +2001,7 @@ pub const Node = struct {
             // We observe even when the queue was empty: the histogram includes
             // a 0-bucket sample, which is information about how often the loop
             // ran without inbound work to do.
-            var t = std.time.microTimestamp();
+            var t = utils.coarse.Clock.ms();
             while (self.inbound_ch.tryReceive()) |msg| {
                 defer self.allocator.free(msg.payload);
                 switch (msg.message_type) {
@@ -2019,7 +2019,7 @@ pub const Node = struct {
             // Phase: propose — drain proposal queue, build entries, persist,
             // register apply callbacks. Sub-phases ("propose_build" and
             // "propose_persist") are observed inside appendProposalsToLeaderLog.
-            t = std.time.microTimestamp();
+            t = utils.coarse.Clock.ms();
             _ = self.processProposalRequests() catch {};
             metrics.g().observePhase("propose", t);
             const log_grew = self.log.lastIndex() > last_before;
@@ -2039,7 +2039,7 @@ pub const Node = struct {
             // just-appended (unsynced) entries since the leader is sole
             // voter. Wait for sync before advance in that case.
             if (self.quorum_size == 1) {
-                t = std.time.microTimestamp();
+                t = utils.coarse.Clock.ms();
                 sync_handle.join() catch |err| {
                     raft_log.err("node {d}: sync_handle.join (pre-advance) failed: {s}", .{ self.id, @errorName(err) });
                 };
@@ -2048,22 +2048,22 @@ pub const Node = struct {
             }
 
             // Phase: advance — advanceCommitIndex + applyConfChanges + notify.
-            t = std.time.microTimestamp();
+            t = utils.coarse.Clock.ms();
             self.advance();
             metrics.g().observePhase("advance", t);
 
             const ci_advanced = self.commit_index.load() > ci_before;
 
             var heartbeat_due = false;
-            const now = std.time.microTimestamp();
-            if (now - last_tick >= tick_us) {
+            const now = utils.coarse.Clock.ms();
+            if (now - last_tick >= tick_ms) {
                 heartbeat_due = self.tick() catch false;
                 last_tick = now;
             }
 
             // Phase: broadcast — for multi-voter clusters, the WAL fsync
             // runs concurrently with these network sends.
-            t = std.time.microTimestamp();
+            t = utils.coarse.Clock.ms();
             self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
             metrics.g().observePhase("broadcast", t);
 
@@ -2072,7 +2072,7 @@ pub const Node = struct {
             // overlapped broadcast; positive when broadcast finished first
             // and we're still waiting on disk.
             if (sync_pending) {
-                t = std.time.microTimestamp();
+                t = utils.coarse.Clock.ms();
                 sync_handle.join() catch |err| {
                     raft_log.err("node {d}: sync_handle.join (post-broadcast) failed: {s}", .{ self.id, @errorName(err) });
                 };
