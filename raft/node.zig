@@ -68,7 +68,7 @@ pub const ConfigError = error{
 /// `close()` lets shutdown unblock all current and future waiters with
 /// `error.Closed`. `advance()` still works after close — `closed` only
 /// controls the wait paths.
-const Watermark = struct {
+pub const Watermark = struct {
     value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     mu: zio.Mutex = .init,
     cv: zio.Condition = .init,

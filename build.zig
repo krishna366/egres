@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
     addZdbServer(b, target, optimize, raft_mod, regen_buffers_step);
     addZdbBench(b, target, optimize);
     addLoadtestDriver(b, target, optimize);
+    addSstVerify(b, target, optimize, raft_mod);
     // `zig build test` — one binary, auto-discovered from `*_test.zig` /
     // `test.zig` files. Replaces the previous test-zdb / test-zbuf /
     // test-utils / test-raft / test-net per-file plumbing.
@@ -573,6 +574,45 @@ fn addLoadtestDriver(
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("loadtest", "Build the zdb load-test driver");
+    step.dependOn(&install.step);
+}
+
+fn addSstVerify(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    raft_mod: *std.Build.Module,
+) void {
+    // Reuse modules already created inside raft_mod to avoid duplicate-file
+    // errors — same trick as addZdbServer.
+    const zio_mod = raft_mod.import_table.get("zio").?;
+    const zbuf_mod = raft_mod.import_table.get("zbuf").?;
+    const utils_mod = raft_mod.import_table.get("utils").?;
+    const vfs_mod = raft_mod.import_table.get("vfs").?;
+
+    const metrics_dep = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const metrics_mod = metrics_dep.module("metrics");
+
+    const zdb_mod = makeModule(b, target, optimize, "zdb.zig");
+    zdb_mod.addImport("zbuf", zbuf_mod);
+    zdb_mod.addImport("utils", utils_mod);
+    zdb_mod.addImport("zio", zio_mod);
+    zdb_mod.addImport("vfs", vfs_mod);
+    zdb_mod.addImport("metrics", metrics_mod);
+
+    const exe = b.addExecutable(.{
+        .name = "sst-verify",
+        .root_module = makeModule(b, target, optimize, "scripts/sst_verify.zig"),
+    });
+    addVendoredCompressionSources(b, exe);
+    exe.root_module.addImport("zdb", zdb_mod);
+    b.installArtifact(exe);
+
+    const install = b.addInstallArtifact(exe, .{});
+    const step = b.step("sst-verify", "Build the SST verifier");
     step.dependOn(&install.step);
 }
 

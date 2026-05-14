@@ -13,6 +13,7 @@ pub const ConfChangeType = @import("node.zig").ConfChangeType;
 pub const RaftError = @import("node.zig").RaftError;
 pub const Entry = @import("node.zig").Entry;
 pub const CommitStatus = @import("node.zig").CommitStatus;
+pub const Watermark = @import("node.zig").Watermark;
 pub const diskwal = @import("diskwal.zig");
 pub const DiskWAL = @import("diskwal.zig").DiskWAL;
 pub const HardState = @import("raftwal.zig").HardState;
