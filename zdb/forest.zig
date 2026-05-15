@@ -1373,6 +1373,14 @@ pub const Forest = struct {
         const ms_tree_right = self.ms.trees.getPtr(new_tree_id).?;
         rt.updateRange(old_tree_id, .{ .left = ms_left.left, .right = ms_left.right });
         try rt.addRoute(new_tree_id, .{ .left = ms_tree_right.left, .right = ms_tree_right.right });
+
+        // Refresh both trees' compact candidates against the post-split
+        // state. Without this, the old tree keeps its pre-split
+        // `{needs_split=true, score=100}` candidate even though half its
+        // tables just moved out, and the next levels-loop iteration
+        // re-picks it and fires another split.
+        try left_tree.updateCompactCandidate();
+        try new_ptr.updateCompactCandidate();
     }
 
     fn getOrCreateRouteTable(self: *Forest, namespace_id: u32) !*RouteTable {

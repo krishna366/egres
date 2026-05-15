@@ -390,11 +390,12 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
     var trace_addrs: []usize = &.{};
     defer std.heap.page_allocator.free(trace_addrs);
 
-    // 30 s deadline for normal tests; BIG: tests advertise long runtimes
-    // and opt out. AutoCancel.set arms a timer on this fiber; when it
-    // fires, the next I/O yield (sleep, lock, recv, …) returns
-    // error.Canceled and `timeout.triggered` is set. A test stuck in a
-    // tight CPU loop without yielding cannot be canceled cooperatively.
+    // Per-test deadline: 30 s normally, 60 s for BIG:-prefixed tests
+    // that advertise longer runtimes. AutoCancel.set arms a timer on
+    // this fiber; when it fires, the next I/O yield (sleep, lock,
+    // recv, …) returns error.Canceled and `timeout.triggered` is set.
+    // A test stuck in a tight CPU loop without yielding cannot be
+    // canceled cooperatively.
     const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
         t.name[p + ".test.".len ..]
     else
@@ -403,7 +404,7 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
 
     var timeout = zio.AutoCancel.init;
     defer timeout.clear();
-    if (!is_big) timeout.set(zio.Timeout.fromSeconds(30));
+    timeout.set(zio.Timeout.fromSeconds(if (is_big) 60 else 30));
 
     const t0 = std.time.nanoTimestamp();
     const result: ?anyerror = if (t.func()) |_| null else |e| blk: {

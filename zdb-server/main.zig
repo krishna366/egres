@@ -114,6 +114,11 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
+    // Runtime pool singleton — created first so all runtimes are available.
+    const pool = try runtime.Pool.init(allocator, .{});
+    defer deinitWithLog("pool", pool);
+    log.info("runtime pool initialized", .{});
+
     // Single-executor bootstrap runtime. Everything from flag init
     // onward runs in a fiber on it so flag locks and other zio-aware
     // locks never block an executor thread across a yield.
@@ -206,11 +211,6 @@ fn bootstrap(allocator: std.mem.Allocator, argv: [][:0]u8) !void {
     defer zdb.metrics.deinitGlobal();
     try raft.metrics.initGlobal(allocator);
     defer raft.metrics.deinitGlobal();
-
-    // Runtime pool singleton — created first so all runtimes are available.
-    const pool = try runtime.Pool.init(allocator, .{});
-    defer deinitWithLog("pool", pool);
-    log.info("runtime pool initialized", .{});
 
     // Open raft WAL.
     log.info("opening raft WAL at {s}", .{wal_dir});

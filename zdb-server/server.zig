@@ -289,6 +289,18 @@ pub const ZdbServer = struct {
     compacting_mu: utils.TrackedMutex = .{},
     compacting_trees: std.AutoHashMap(u64, void) = undefined,
 
+    /// Serializes `proposeFlush` and `proposeSplit` end-to-end (build → propose
+    /// → wait-for-apply). Without this, a flush whose `buildFlush` ran before a
+    /// split's `applySplit` routes every key to the pre-split tree (`ns_routes`
+    /// only updates at apply time); when applyFlush later installs the L0 SST,
+    /// keys ≥ split_key sit in the wrong tree's L0 and reads (which route to
+    /// the new tree) miss them. Holding the lock guarantees the next acquirer
+    /// reads post-apply state — fresh routes for a flush after a split, fresh
+    /// L0 contents for a split after a flush. Compactions don't take this lock:
+    /// they don't touch routes, and same-tree split↔compaction is already
+    /// mutex'd via `compacting_trees`.
+    flush_split_mu: utils.TrackedMutex = .{},
+
     pub fn init(
         allocator: std.mem.Allocator,
         forest: *Forest,
@@ -318,6 +330,7 @@ pub const ZdbServer = struct {
         self.compacting_mu.unlock();
         self.in_flight_mu.deinit();
         self.compacting_mu.deinit();
+        self.flush_split_mu.deinit();
     }
 
     /// Try to claim a compaction target; returns null if every eligible
@@ -760,12 +773,17 @@ pub const ZdbServer = struct {
     }
 
     fn proposeFlush(self: *ZdbServer) !void {
+        // Block while a split is in-flight.
+        self.flush_split_mu.lockUncancelable(@src());
+        defer self.flush_split_mu.unlock();
+
         // Track the flush BUILD as in-flight (writing SSTs is the slow
         // part). buildFlush iterates the oldest immutable memtable; we
         // don't know the target tree(s) until changes return, so use
         // tree_id=0 as a "global" marker.
         self.addInFlight(.{ .kind = .flush, .tree_id = 0, .started_at_ms = utils.coarse.Clock.ms() });
         defer self.removeInFlight(.flush, 0, 0);
+
         const result = try self.forest.buildFlush() orelse return;
         var changes = result.changes;
         defer changes.deinit(self.allocator);
@@ -824,6 +842,10 @@ pub const ZdbServer = struct {
     }
 
     fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
+        // Block while a flush is in-flight.
+        self.flush_split_mu.lockUncancelable(@src());
+        defer self.flush_split_mu.unlock();
+
         self.addInFlight(.{ .kind = .split, .tree_id = tree_id, .started_at_ms = utils.coarse.Clock.ms() });
         defer self.removeInFlight(.split, tree_id, 0);
         // buildSplit allocates table_changes / tree_changes on the arena;
