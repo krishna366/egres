@@ -167,20 +167,39 @@ const ConcurrentCtx = struct {
     live: *flags.Live(RaftCfg),
     stop: *std.atomic.Value(bool),
     err: *std.atomic.Value(u16),
+    observed: *std.atomic.Value(u64),
 };
 
+/// The writer encodes one logical version `i` into all three mutated fields
+/// atomically (under the write lock):
+///   name           = "v{i}"
+///   retries        = i % 10
+///   tracing        = (i % 2 == 0)
+/// The reader parses `i` back out of `name`, then asserts the other two
+/// fields agree. A torn snapshot — e.g. name from version i but retries
+/// from i-1 — fails the invariant on the very first read. Also tracks the
+/// number of snapshots that satisfied the invariant so the test can
+/// assert that readers actually ran (caught the case where the writer
+/// finished so fast the readers never observed anything).
 fn readerLoop(ctx: ConcurrentCtx) void {
     while (!ctx.stop.load(.acquire)) {
         const c = ctx.live.snapshot();
-        // Touch every field so any torn state would surface.
-        std.mem.doNotOptimizeAway(c.retries);
-        std.mem.doNotOptimizeAway(c.tracing);
-        std.mem.doNotOptimizeAway(c.tick_interval_ms);
-        std.mem.doNotOptimizeAway(c.ratio);
-        if (c.name.len == 0) {
-            _ = ctx.err.cmpxchgStrong(0, 1, .acq_rel, .monotonic);
-            return;
+        // Skip the initial "initial" value the test sets at init time —
+        // we only validate the writer's "v{N}" encoding.
+        if (c.name.len >= 2 and c.name[0] == 'v') {
+            const i = std.fmt.parseInt(usize, c.name[1..], 10) catch {
+                _ = ctx.err.cmpxchgStrong(0, 1, .acq_rel, .monotonic);
+                return;
+            };
+            const want_retries: u32 = @intCast(i % 10);
+            const want_tracing: bool = (i % 2 == 0);
+            if (c.retries != want_retries or c.tracing != want_tracing) {
+                _ = ctx.err.cmpxchgStrong(0, 2, .acq_rel, .monotonic);
+                return;
+            }
+            _ = ctx.observed.fetchAdd(1, .monotonic);
         }
+        zio.yield() catch {};
     }
 }
 
@@ -191,14 +210,21 @@ test "concurrent readers do not see torn state" {
 
     var stop = std.atomic.Value(bool).init(false);
     var err_flag = std.atomic.Value(u16).init(0);
-    const ctx = ConcurrentCtx{ .live = &live, .stop = &stop, .err = &err_flag };
+    var observed = std.atomic.Value(u64).init(0);
+    const ctx = ConcurrentCtx{
+        .live = &live,
+        .stop = &stop,
+        .err = &err_flag,
+        .observed = &observed,
+    };
 
     var handles: [4]zio.JoinHandle(void) = undefined;
     for (&handles) |*h| h.* = try zio.spawn(readerLoop, .{ctx});
 
-    // Hammer with updates.
+    // Hammer with updates. Each `i` writes a self-consistent triple
+    // (name=v{i}, retries=i%10, tracing=i%2==0) that readers verify.
     var i: usize = 0;
-    while (i < 200) : (i += 1) {
+    while (i < 2000) : (i += 1) {
         const buf = try std.fmt.allocPrint(alloc, "name=v{d}; retries={d}; tracing={s};", .{
             i, @as(u32, @intCast(i % 10)), if (i % 2 == 0) "true" else "false",
         });
@@ -209,6 +235,9 @@ test "concurrent readers do not see torn state" {
     stop.store(true, .release);
     for (&handles) |*h| h.join();
     try std.testing.expectEqual(@as(u16, 0), err_flag.load(.acquire));
+    // Sanity: readers must have actually observed at least one v{N}
+    // snapshot, otherwise the invariant check above was never exercised.
+    try std.testing.expect(observed.load(.monotonic) > 0);
 }
 
 // ---------- Registry tests ----------

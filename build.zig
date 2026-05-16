@@ -110,6 +110,7 @@ fn makeModules(
 
     const flags = makeModule(b, target, optimize, "u/flags.zig");
     flags.addImport("zio", zio);
+    flags.addImport("utils", utils);
 
     const vfs = makeModule(b, target, optimize, "vfs/vfs.zig");
     vfs.addImport("zio", zio);

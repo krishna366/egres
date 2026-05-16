@@ -289,7 +289,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: [][:0]u8) !void {
 
     // appMain(&raft_rt, &zdb_srv, node, &args);
     // // Entry point: spawn appMain on the raft pool. It orchestrates everything.
-    var handle = try pool.get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node, &args });
+    var handle = try runtime.pool().get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node, &args });
     handle.join();
 
     log.info("shutting down...", .{});

@@ -171,6 +171,13 @@ const FiberLog = struct {
 var log_map_mu: std.Thread.Mutex = .{};
 var log_map: ?std.AutoHashMap(usize, *FiberLog) = null;
 
+/// Set in `main()` before the runtime starts; read from `runOne`/`runBench`
+/// after each test completion to bump the no-progress timer. A global is
+/// simpler than threading a pointer through `driver` and the three
+/// `SharedCtx` instances; null until set so a unit-test runner without a
+/// watchdog (none today, but easy to imagine) is a no-op call.
+var thread_watchdog: ?*ThreadWatchdog = null;
+
 fn registerFiberLog(log: *FiberLog) void {
     const task = zio.getCurrentTaskOrNull() orelse return;
     log_map_mu.lock();
@@ -300,7 +307,169 @@ const SharedCtx = struct {
     // Set during the parallel round to collect failures for serial retry.
     // Null during the retry round itself (one bite at the apple).
     failures: ?*std.ArrayList(std.builtin.TestFn),
+    // Watchdog state: every running test pushes its entry on entry and pops
+    // on exit. The watchdog fiber periodically scans this list and dumps
+    // diagnostics if any test has been running longer than `stuck_after_s`.
+    running: *RunningSet,
 };
+
+/// Currently-running tests, used by the watchdog to identify wedges.
+/// Guarded by a `std.Thread.Mutex` rather than `zio.Mutex` so the
+/// std.Thread watchdog can safely snapshot it without depending on the
+/// zio runtime being alive — critical sections here are pure CPU work
+/// (no yields), so grabbing a thread mutex from a fiber is safe.
+const RunningSet = struct {
+    mu: std.Thread.Mutex = .{},
+    list: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct {
+        name: []const u8,
+        start_ns: i128,
+    };
+
+    fn add(self: *RunningSet, name: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.list.append(std.heap.page_allocator, .{
+            .name = name,
+            .start_ns = std.time.nanoTimestamp(),
+        }) catch {};
+    }
+
+    fn remove(self: *RunningSet, name: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.list.items, 0..) |t, i| {
+            if (t.name.ptr == name.ptr and t.name.len == name.len) {
+                _ = self.list.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn deinit(self: *RunningSet) void {
+        self.list.deinit(std.heap.page_allocator);
+    }
+};
+
+/// std.Thread-based watchdog. Runs OUTSIDE the zio runtime, so it stays
+/// alive — and capable of dumping diagnostics — even when the runtime is
+/// mid-deinit (which is where a 64-hour wedge was observed). Operation:
+///
+///   • `touch()` is called from each test completion. It just stores a
+///     monotonic-clock timestamp atomically; safe to call from any
+///     thread/fiber/anywhere.
+///   • The thread wakes every `tick_s` seconds via `wake.timedWait`.
+///   • Fires a dump when EITHER:
+///       (a) no test has completed in `stuck_after_s` seconds, OR
+///       (b) some specific running test has been live > `stuck_after_s`.
+///     The dump names the stuck tests (with elapsed-ms) and includes
+///     a TrackedMutex snapshot. Keeps watching so a growing wedge gets
+///     fresh dumps each tick.
+///
+/// Owns its own RunningSet so the watchdog and test runner share one
+/// source of truth on what's currently executing.
+///
+/// Lifecycle: `init` → `start` → `touch` ... `touch` → `stop`. `stop`
+/// flips the wake event and joins; without that the join would block
+/// for up to `tick_s` waiting for the next tick.
+const ThreadWatchdog = struct {
+    last_progress_ns: std.atomic.Value(i64),
+    /// Set by `stop()`. The loop uses `wake.timedWait(tick_s)` instead of
+    /// raw `std.Thread.sleep` so `stop()` can interrupt the sleep
+    /// immediately — without this, shutdown would pay up to `tick_s`
+    /// seconds of latency waiting for the next tick.
+    wake: std.Thread.ResetEvent = .{},
+    thread: ?std.Thread = null,
+    stuck_after_s: u64,
+    tick_s: u64,
+    running: RunningSet = .{},
+
+    fn init(stuck_after_s: u64, tick_s: u64) ThreadWatchdog {
+        return .{
+            .last_progress_ns = .init(@intCast(std.time.nanoTimestamp())),
+            .stuck_after_s = stuck_after_s,
+            .tick_s = tick_s,
+        };
+    }
+
+    fn deinit(self: *ThreadWatchdog) void {
+        self.running.deinit();
+    }
+
+    fn start(self: *ThreadWatchdog) !void {
+        self.thread = try std.Thread.spawn(.{}, threadWatchdogLoop, .{self});
+    }
+
+    fn touch(self: *ThreadWatchdog) void {
+        self.last_progress_ns.store(@intCast(std.time.nanoTimestamp()), .release);
+    }
+
+    fn stop(self: *ThreadWatchdog) void {
+        self.wake.set();
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+};
+
+/// Top-level (non-method) entry point so `std.Thread.spawn` doesn't trip
+/// the Zig backend bug "genSetReg called with a value larger than dst_reg"
+/// when it monomorphizes a method through `spawn(.{}, fn_ptr, ...)`.
+fn threadWatchdogLoop(self: *ThreadWatchdog) void {
+    // Write diagnostics straight to stderr (bypassing the zio-aware
+    // print_mu and io_writer). The runtime may be wedged; the print
+    // mutex itself may be the deadlocked lock. Using stderr directly
+    // keeps the watchdog independent of any zio state.
+    const tick_ns: u64 = self.tick_s * std.time.ns_per_s;
+    const threshold_ns: i128 = @as(i128, self.stuck_after_s) * std.time.ns_per_s;
+    while (true) {
+        // timedWait returns error.Timeout on normal tick, void on stop()
+        // having called .set(). Either way fall through to the wake check;
+        // we exit only when .set() was called.
+        self.wake.timedWait(tick_ns) catch {};
+        if (self.wake.isSet()) return;
+
+        const now_i128 = std.time.nanoTimestamp();
+        const now_i64: i64 = @intCast(now_i128);
+        const last = self.last_progress_ns.load(.acquire);
+        const elapsed_s: i64 = @divTrunc(now_i64 - last, std.time.ns_per_s);
+        const stuck_global = elapsed_s >= @as(i64, @intCast(self.stuck_after_s));
+
+        // Snapshot stuck tests under the lock; release before printing so
+        // we never hold it across I/O.
+        var stuck: std.ArrayList(RunningSet.Entry) = .empty;
+        defer stuck.deinit(std.heap.page_allocator);
+        {
+            self.running.mu.lock();
+            defer self.running.mu.unlock();
+            for (self.running.list.items) |t| {
+                if (now_i128 - t.start_ns >= threshold_ns) {
+                    stuck.append(std.heap.page_allocator, t) catch {};
+                }
+            }
+        }
+
+        if (!stuck_global and stuck.items.len == 0) continue;
+
+        var stderr_buf: [4096]u8 = undefined;
+        var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+        const w = &stderr_w.interface;
+        w.print(
+            "\n=== ThreadWatchdog: no progress for {d}s (threshold={d}s) ===\n",
+            .{ elapsed_s, self.stuck_after_s },
+        ) catch {};
+        for (stuck.items) |t| {
+            const ms = @divTrunc(now_i128 - t.start_ns, std.time.ns_per_ms);
+            w.print("  RUNNING {d}ms: {s}\n", .{ ms, t.name }) catch {};
+        }
+        w.print("TrackedMutex state:\n", .{}) catch {};
+        utils.tracked_mutex.dump(w) catch {};
+        w.print("\n", .{}) catch {};
+        w.flush() catch {};
+    }
+}
 
 fn writeColored(
     out: *std.io.Writer,
@@ -377,6 +546,12 @@ fn writeDisplayName(out: *std.io.Writer, tty: std.io.tty.Config, name: []const u
 fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
     ctx.sem.waitUncancelable();
     defer ctx.sem.post();
+
+    ctx.running.add(t.name);
+    defer {
+        ctx.running.remove(t.name);
+        if (thread_watchdog) |w| w.touch();
+    }
 
     var fiber_log: FiberLog = .{};
     defer fiber_log.bytes.deinit(std.heap.page_allocator);
@@ -498,6 +673,12 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
 fn runBench(t: std.builtin.TestFn, ctx: *SharedCtx) void {
     ctx.sem.waitUncancelable();
     defer ctx.sem.post();
+
+    ctx.running.add(t.name);
+    defer {
+        ctx.running.remove(t.name);
+        if (thread_watchdog) |w| w.touch();
+    }
 
     var fiber_log: FiberLog = .{};
     defer fiber_log.bytes.deinit(std.heap.page_allocator);
@@ -644,6 +825,22 @@ fn driver(
     out: *std.io.Writer,
     tty: std.io.tty.Config,
 ) !void {
+    // Spawn the coarse.Clock tick fiber on the runner's long-lived runtime
+    // so it survives across every test fiber. `Clock.start()` is idempotent
+    // and uses a process-global `started` flag — re-spawning it inside an
+    // individual test would attach the tick fiber to that test's runtime
+    // (or be a no-op if any earlier test had already set the flag), and
+    // when that runtime is deinit'd the fiber dies. Result: subsequent
+    // tests calling `Clock.ms()` would read a frozen cache. `Clock.stop()`
+    // in `main()` runs after all tests finish, draining this fiber.
+    try utils.coarse.Clock.start();
+
+    // Currently-running tests, owned by the std.Thread ThreadWatchdog so
+    // its diagnostics can name which tests are stuck. The watchdog itself
+    // is set up in main() before the zio runtime starts; here we just
+    // grab a pointer to its RunningSet for the test ctx.
+    const running: *RunningSet = if (thread_watchdog) |w| &w.running else unreachable;
+
     var sem = zio.Semaphore{ .permits = args.parallel };
     var print_mu: zio.Mutex = .init;
     var seq: std.atomic.Value(u32) = .{ .raw = 0 };
@@ -678,19 +875,20 @@ fn driver(
         try kept.append(alloc, t);
     }
 
+    var ctx = SharedCtx{
+        .sem = &sem,
+        .print_mu = &print_mu,
+        .counters = counters,
+        .seq = &seq,
+        .total = @intCast(kept.items.len),
+        .out = out,
+        .tty = tty,
+        .failures = &failures,
+        .running = running,
+    };
+
     // Parallel round: run all tests, collecting failures.
     {
-        var ctx = SharedCtx{
-            .sem = &sem,
-            .print_mu = &print_mu,
-            .counters = counters,
-            .seq = &seq,
-            .total = @intCast(kept.items.len),
-            .out = out,
-            .tty = tty,
-            .failures = &failures,
-        };
-
         var group = zio.group();
         for (kept.items) |t| try group.spawn(runOne, .{ t, &ctx });
         group.wait() catch {};
@@ -717,6 +915,7 @@ fn driver(
             .out = out,
             .tty = tty,
             .failures = null, // one round of retry only
+            .running = running,
         };
 
         var retry_group = zio.group();
@@ -754,6 +953,7 @@ fn driver(
         .out = out,
         .tty = tty,
         .failures = null,
+        .running = running,
     };
 
     var bench_group = zio.group();
@@ -779,6 +979,20 @@ pub fn main() !void {
 
     bench.initRegistry(std.heap.page_allocator);
     defer bench.deinitRegistry();
+
+    // std.Thread watchdog: runs outside the zio runtime so it stays alive
+    // (and dumping) even when the runtime itself is mid-deinit. Threshold:
+    // 120s of no test completion (covers normal idle gaps between runs,
+    // any slow BIG: test, and Clock.stop + rt.deinit hiccups). Tick: 10s
+    // so shutdown stop() waits at most 10s.
+    var twatch = ThreadWatchdog.init(120, 10);
+    defer twatch.deinit();
+    thread_watchdog = &twatch;
+    try twatch.start();
+    defer {
+        twatch.stop();
+        thread_watchdog = null;
+    }
 
     const rt = try zio.Runtime.init(std.heap.page_allocator, .{
         .executors = .exact(args.parallel),
