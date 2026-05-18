@@ -143,7 +143,7 @@ pub const Serial = struct {
     /// Reader calls on_message for each inbound frame.
     /// Writer drains the outbound channel and sends frames.
     pub fn run(self: *Serial, ctx: *anyopaque, on_message: OnMessageFn) void {
-        var group = zio.group();
+        var group = zio.Group{};
         group.spawn(writerLoop, .{self}) catch |err| {
             log.err("failed to spawn writer loop: {s}", .{@errorName(err)});
             return;

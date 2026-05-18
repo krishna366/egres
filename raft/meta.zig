@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const vfs = @import("vfs");
+const utils = @import("utils");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
 
@@ -68,10 +69,13 @@ pub const MetaStore = struct {
     active_slot: u8,
 
     pub fn openPath(path: []const u8, alloc: std.mem.Allocator) !MetaStore {
-        // Directory creation is path metadata, not data I/O. std.fs is fine.
-        const cwd = std.fs.cwd();
-        cwd.access(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => try cwd.makePath(path),
+        // Directory creation is path metadata, not data I/O — go through
+        // std.Io.Dir (cheap) rather than vfs (which is bandwidth-limited
+        // for data ops).
+        const io = utils.context.g().io;
+        const cwd = std.Io.Dir.cwd();
+        cwd.access(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => try cwd.createDirPath(io, path),
             else => return err,
         };
 

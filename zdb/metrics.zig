@@ -1,5 +1,6 @@
 const std = @import("std");
 const m = @import("metrics");
+const utils = @import("utils");
 
 // Storage-layer metrics. The `Metrics` struct is owned by the application
 // (e.g. zdb-server), not by Forest — so multiple Forest instances (tests,
@@ -44,21 +45,25 @@ pub const Metrics = struct {
     bytes_written: m.CounterVec(u64, BytesWrittenLabels),
 
     pub fn init(allocator: std.mem.Allocator) !Metrics {
+        const io = utils.context.g().io;
         return .{
             .flushes = try m.CounterVec(u64, FlushLabels).init(
                 allocator,
+                io,
                 "zdb_flushes_total",
                 .{},
                 .{},
             ),
             .compactions = try m.CounterVec(u64, CompactionLabels).init(
                 allocator,
+                io,
                 "zdb_compactions_total",
                 .{},
                 .{},
             ),
             .bytes_written = try m.CounterVec(u64, BytesWrittenLabels).init(
                 allocator,
+                io,
                 "zdb_bytes_written_total",
                 .{},
                 .{},

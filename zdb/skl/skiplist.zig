@@ -1,6 +1,7 @@
 const std = @import("std");
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
+const utils = @import("utils");
 const key_mod = @import("../key.zig");
 const Key = key_mod.Key;
 const Item = key_mod.Item;
@@ -61,7 +62,7 @@ pub const SkipList = struct {
             .arena = arena,
             .head = head,
             .max_height_seen = Atomic(u8).init(1),
-            .rng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp())),
+            .rng = std.Random.DefaultPrng.init(@intCast(std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds)),
             .ref_count = Atomic(u32).init(1),
             .node_count = Atomic(usize).init(0),
         };
@@ -195,7 +196,13 @@ pub const SkipList = struct {
     }
 
     pub fn memoryUsage(self: *Self) usize {
-        return self.arena.state.end_index;
+        // Zig 0.16: ArenaAllocator.State no longer exposes a single
+        // `end_index`; nodes form a linked list with per-node end_index.
+        // queryCapacity sums all node capacities — for a memtable that
+        // only grows (no reset), capacity == used.
+        // TODO: We should just track the size of key-values we're added,
+        // instead of relying on the arena to tell us that.
+        return self.arena.queryCapacity();
     }
 
     pub fn memoryCapacity(self: *Self) usize {

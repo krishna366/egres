@@ -98,7 +98,7 @@ fn muxExchangeTest() !void {
 
     const bound_addr = server.socket.address;
 
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.cancel();
 
     // Server side: accept one connection, run mux reader.
@@ -130,7 +130,7 @@ fn muxExchangeTest() !void {
 }
 
 fn serverSide(server: zio.net.Server, alloc: std.mem.Allocator) !void {
-    const conn = try server.accept();
+    const conn = try server.accept(.{});
     try conn.socket.setNoDelay(true);
 
     // Server uses odd stream IDs (1, 3, 5, ...).
@@ -169,7 +169,7 @@ fn concatStreamHandler(stream: *Mux.Stream) void {
 }
 
 fn concatServerSide(server: zio.net.Server, alloc: std.mem.Allocator) !void {
-    const conn = try server.accept();
+    const conn = try server.accept(.{});
     try conn.socket.setNoDelay(true);
 
     const server_mux = try Mux.init(alloc, conn, 1, &concatStreamHandler);
@@ -195,7 +195,7 @@ fn muxMultiFrameTest() !void {
 
     const bound_addr = server.socket.address;
 
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.cancel();
 
     try group.spawn(concatServerSide, .{ server, alloc });
@@ -234,7 +234,7 @@ fn muxMultiStreamTest() !void {
 
     const bound_addr = server.socket.address;
 
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.cancel();
 
     try group.spawn(serverSide, .{ server, alloc });

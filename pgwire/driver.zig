@@ -109,7 +109,7 @@ fn handleEvent(state: *conn_state.ConnState, handler: anytype) !void {
     const H = @TypeOf(handler.*);
     const ev = try state.nextEvent();
     switch (ev) {
-        .startup_complete => |_| {
+        .startup_complete => {
             // State machine has already enqueued the AuthOk +
             // ParameterStatus + ReadyForQuery batch. Nothing more
             // for us to do — outer loop flushes.

@@ -112,7 +112,7 @@ pub const TableCache = struct {
         self.mu.lockUncancelable(@src());
         defer self.mu.unlock();
 
-        var to_evict: std.ArrayList(u64) = .{};
+        var to_evict: std.ArrayList(u64) = .empty;
         defer to_evict.deinit(self.allocator);
 
         var it = self.tables.iterator();
@@ -138,7 +138,7 @@ pub const TableCache = struct {
     /// level-layout assumptions.
     pub fn loadTables(self: *TableCache, needed: []TableNeed) !void {
         // Phase 1: serve cache hits under read lock; collect pointers for misses.
-        var misses: std.ArrayList(*TableNeed) = .{};
+        var misses: std.ArrayList(*TableNeed) = .empty;
         defer misses.deinit(self.allocator);
         {
             self.mu.lockSharedUncancelable(@src());
@@ -160,7 +160,7 @@ pub const TableCache = struct {
         var tse: utils.ThreadSafeError = .{};
         var completed = std.atomic.Value(usize).init(0);
         const total = misses.items.len;
-        var group = zio.group();
+        var group = zio.Group{};
         defer group.cancel();
         group.spawn(loadTablesWatchdog, .{ total, &completed }) catch {};
         for (misses.items) |n| {
@@ -303,7 +303,7 @@ pub const Tree = struct {
                 kr.inf = true;
             }
 
-            var needed: std.ArrayList(TableNeed) = .{};
+            var needed: std.ArrayList(TableNeed) = .empty;
             defer needed.deinit(allocator);
             for (tree.levels.items, 0..) |lm, level_idx| {
                 if (level_idx >= opts.max_levels) continue;
@@ -754,7 +754,7 @@ pub const Tree = struct {
         // each compaction's input set bounded by the destination level's
         // overlapping range.
         const dest: usize = @as(usize, src_level) + 1;
-        if (dest >= self.opts.max_levels) return .{};
+        if (dest >= self.opts.max_levels) return .empty;
 
         // --- collect src entries ---
         // L≥1: pick a RANDOM single table. Always picking items[0] (the
@@ -772,14 +772,16 @@ pub const Tree = struct {
                 self.levels[src].mu.lockSharedUncancelable(@src());
                 defer self.levels[src].mu.unlockShared();
                 const items = self.levels[src].tables.items;
-                if (items.len == 0) return .{};
+                if (items.len == 0) return .empty;
                 break :ss try self.allocator.dupe(TableEntry, items);
             };
             defer self.allocator.free(src_snapshot);
 
             if (src_level != 0) {
                 // Pick any table at random.
-                const idx = std.crypto.random.uintLessThan(usize, src_snapshot.len);
+                const rng_impl: std.Random.IoSource = .{ .io = utils.context.g().io };
+                const rng = rng_impl.interface();
+                const idx = rng.uintLessThan(usize, src_snapshot.len);
                 break :blk try self.allocator.dupe(TableEntry, src_snapshot[idx .. idx + 1]);
             }
 
@@ -832,7 +834,7 @@ pub const Tree = struct {
         try merge.seekRange(self.key_range.left, self.key_range.right);
 
         // --- output file IDs produced by this compaction ---
-        var output_file_ids: std.ArrayList(u64) = .{};
+        var output_file_ids: std.ArrayList(u64) = .empty;
         defer output_file_ids.deinit(self.allocator);
 
         // --- merge loop ---
@@ -970,7 +972,7 @@ pub const Tree = struct {
         // Batch-load all CREATE tables via the cache in a single concurrent
         // pass. writeFile may have pre-opened them (follower path) → hit;
         // otherwise loadTables opens them.
-        var needed: std.ArrayList(TableNeed) = .{};
+        var needed: std.ArrayList(TableNeed) = .empty;
         defer needed.deinit(self.allocator);
         for (changes) |c| {
             if (c.op == .create) {

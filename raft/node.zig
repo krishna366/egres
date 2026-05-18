@@ -324,7 +324,7 @@ pub const Node = struct {
         config: Config,
     ) !*Node {
         try config.validate();
-        const seed = @as(u64, @intCast(std.time.nanoTimestamp())) ^ config.id;
+        const seed = @as(u64, @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds)) ^ config.id;
         const prng = std.Random.DefaultPrng.init(seed);
         const node = try allocator.create(Node);
         node.* = .{
@@ -364,7 +364,7 @@ pub const Node = struct {
 
         // Seed the HLC clock with the current wall-clock second so peek()
         // returns a sensible value even before the first `next()` call.
-        utils.hlc.g().seed(.{ .seconds = @intCast(std.time.timestamp()), .logical = 0 });
+        utils.hlc.g().seed(.{ .seconds = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds()), .logical = 0 });
 
         // Restore persisted state from WAL if present.
         if (node.log.lastIndex() > 0) {
@@ -1809,7 +1809,7 @@ pub const Node = struct {
     }
 
     pub fn blockingRunAllLoops(self: *Node) !void {
-        var group = zio.group();
+        var group = zio.Group{};
 
         try group.spawn(tickLoop, .{ self, self.config.tick_interval_ms });
         try group.spawn(mainLoop, .{ self, self.config.tick_interval_ms });
@@ -1971,7 +1971,7 @@ pub const Node = struct {
             zio.sleep(poll) catch return;
             if (!self.isLeader()) continue;
             const last_ts = utils.hlc.HLC.fromU64(self.log.lastTimestamp());
-            const wall_sec: u32 = @intCast(std.time.timestamp());
+            const wall_sec: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
             if (wall_sec <= last_ts.seconds) continue;
 
             self.proposeAndWaitForApply(&.{}, .data) catch |err| {

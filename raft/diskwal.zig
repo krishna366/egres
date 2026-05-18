@@ -71,9 +71,9 @@ pub const Error = error{
     WriteFailed,
     CrcMismatch,
 } || std.posix.MMapError || std.posix.MSyncError || std.posix.SyncError ||
-    std.fs.Dir.OpenError || std.fs.Dir.MakeError || std.fs.File.OpenError ||
-    std.fs.Dir.DeleteFileError ||
-    std.fs.File.StatError || std.fs.File.SetEndPosError ||
+    std.Io.Dir.OpenError || std.Io.Dir.CreateDirPathError || std.Io.File.OpenError ||
+    std.Io.Dir.DeleteFileError ||
+    std.Io.File.StatError || std.Io.File.SetLengthError ||
     std.mem.Allocator.Error || std.fmt.BufPrintError || zen.Error;
 
 pub const err_not_found = error{NotFound};
@@ -532,23 +532,24 @@ pub const wal = struct {
         cache_capacity: usize,
     ) !wal {
         const vfs_inst = vfs_mod.g();
-        const cwd = std.fs.cwd();
-        cwd.access(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => try cwd.makePath(path),
+        const io = utils.context.g().io;
+        const cwd = std.Io.Dir.cwd();
+        cwd.access(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => try cwd.createDirPath(io, path),
             else => return err,
         };
         const dir_copy = try alloc.dupe(u8, path);
         errdefer alloc.free(dir_copy);
 
-        var dir = try cwd.openDir(path, .{ .iterate = true });
-        defer dir.close();
+        var dir = try cwd.openDir(io, path, .{ .iterate = true });
+        defer dir.close(io);
 
         // Discover all segment file ids, sorted ascending.
         var found_fids = std.ArrayList(u64).empty;
         defer found_fids.deinit(alloc);
 
         var it = dir.iterate();
-        while (try it.next()) |entry_dir| {
+        while (try it.next(io)) |entry_dir| {
             if (entry_dir.kind != .file) continue;
             const fid = parseWalFid(entry_dir.name) orelse continue;
             try found_fids.append(alloc, fid);
@@ -1243,7 +1244,7 @@ pub const DiskWAL = struct {
         const head = self.wal_store.lastIndex();
         if (head == 0) return null;
 
-        const now_secs: u32 = @intCast(std.time.timestamp());
+        const now_secs: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
         var bytes_acc: u64 = 0;
 
         var fi: usize = self.wal_store.files.items.len;

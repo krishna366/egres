@@ -78,7 +78,7 @@ pub const Transport = struct {
             .listen_addr = listen_addr,
             .mu = .{},
             .peers = peers,
-            .group = zio.group(),
+            .group = zio.Group{},
             .listener = null,
         };
     }
@@ -248,7 +248,7 @@ pub const Transport = struct {
         log.debug("acceptLoop started", .{});
         defer log.debug("node {d}: accept loop exiting", .{self.cfg.self_id});
         while (true) {
-            const conn = self.listener.?.accept() catch return;
+            const conn = self.listener.?.accept(.{}) catch return;
             configureSocket(conn);
             self.group.spawn(handleInbound, .{ self, conn }) catch {
                 conn.close();
@@ -559,7 +559,12 @@ pub const Transport = struct {
 
     pub fn recvHandshake(conn: zio.net.Stream) !Handshake {
         var buf: [handshake_size]u8 = undefined;
-        conn.readAll(&buf, .none) catch return error.HandshakeFailed;
+        var off: usize = 0;
+        while (off < buf.len) {
+            const n = conn.read(buf[off..], .none) catch return error.HandshakeFailed;
+            if (n == 0) return error.HandshakeFailed;
+            off += n;
+        }
         const priority: Priority = switch (buf[16]) {
             0 => .p0,
             1 => .p1,

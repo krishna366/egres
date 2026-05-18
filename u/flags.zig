@@ -400,8 +400,8 @@ fn writeDefault(comptime FT: type, value: FT, out: *std.ArrayList(u8), allocator
     const info = @typeInfo(FT);
     switch (info) {
         .bool => try out.appendSlice(allocator, if (value) "true" else "false"),
-        .int => try std.fmt.format(out.writer(allocator), "{d}", .{value}),
-        .float => try std.fmt.format(out.writer(allocator), "{d}", .{value}),
+        .int => try out.print(allocator, "{d}", .{value}),
+        .float => try out.print(allocator, "{d}", .{value}),
         .pointer => try out.appendSlice(allocator, value),
         else => unreachable,
     }

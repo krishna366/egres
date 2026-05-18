@@ -13,8 +13,13 @@
 
 const std = @import("std");
 const zio = @import("zio");
+const context = @import("context.zig");
 
 const tick_interval = zio.Duration.fromMilliseconds(1);
+
+inline fn nowMs() i64 {
+    return std.Io.Timestamp.now(context.g().io, .real).toMilliseconds();
+}
 
 pub const Clock = struct {
     // Own cache line: `cached` is read by every TrackedMutex acquire
@@ -35,7 +40,7 @@ pub const Clock = struct {
     /// next `ms()` returns a real value even before the first tick.
     pub fn start() !void {
         if (started.swap(true, .monotonic)) return;
-        cached.store(std.time.milliTimestamp(), .monotonic);
+        cached.store(nowMs(), .monotonic);
         stopping.store(false, .monotonic);
         tick_handle = try zio.spawn(tickLoop, .{});
     }
@@ -56,7 +61,7 @@ pub const Clock = struct {
         while (!stopping.load(.acquire)) {
             // Monotonicity guard: only advance, never regress. Single
             // writer, so load+conditional-store suffices (no CAS).
-            const fresh = std.time.milliTimestamp();
+            const fresh = nowMs();
             if (fresh > cached.load(.monotonic)) {
                 cached.store(fresh, .monotonic);
             }

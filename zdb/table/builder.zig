@@ -1,7 +1,8 @@
 const std = @import("std");
 const Key = @import("../key.zig").Key;
 const buffers = @import("../buffers.gen.zig");
-const compress = @import("utils").compression;
+const utils = @import("utils");
+const compress = utils.compression;
 const binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
@@ -290,10 +291,11 @@ pub const Builder = struct {
                     _ = std.fmt.bufPrint(b[off..][0..line_len], "{x:0>16}\n", .{h}) catch break;
                     off += line_len;
                 }
-                const file = std.fs.createFileAbsolute(path, .{}) catch |e| std.debug.panic("dump open: {s}", .{@errorName(e)});
-                file.writeAll(b[0..off]) catch |e| std.debug.panic("dump write: {s}", .{@errorName(e)});
-                file.sync() catch |e| std.debug.panic("dump sync: {s}", .{@errorName(e)});
-                file.close();
+                const io = utils.context.g().io;
+                const file = std.Io.Dir.createFileAbsolute(io, path, .{}) catch |e| std.debug.panic("dump open: {s}", .{@errorName(e)});
+                file.writeStreamingAll(io, b[0..off]) catch |e| std.debug.panic("dump write: {s}", .{@errorName(e)});
+                file.sync(io) catch |e| std.debug.panic("dump sync: {s}", .{@errorName(e)});
+                file.close(io);
                 log.err("dumped {d} hashes (hex, one per line) to {s} — aborting", .{ self.bf_hashes.items.len, path });
                 std.debug.panic("binary fuse populate failed with {d} unique hashes; see {s}", .{ self.bf_hashes.items.len, path });
             };

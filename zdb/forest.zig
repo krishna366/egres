@@ -43,7 +43,7 @@ pub const RouteTable = struct {
         return .{
             .allocator = allocator,
             .namespace_id = namespace_id,
-            .entries = .{},
+            .entries = .empty,
         };
     }
 
@@ -129,7 +129,7 @@ pub const Memtables = struct {
             .allocator = allocator,
             .mu = .init,
             .current = current,
-            .immutables = .{},
+            .immutables = .empty,
         };
     }
 
@@ -473,7 +473,7 @@ pub const Forest = struct {
         // write path (finish → create file → write → sync → close) and returns
         // the manifest TableChange directly.
         var flush_err: utils.ThreadSafeError = .{};
-        var handles: std.ArrayList(zio.JoinHandle(?manifest.TableChange)) = .{};
+        var handles: std.ArrayList(zio.JoinHandle(?manifest.TableChange)) = .empty;
         defer {
             for (handles.items) |*h| _ = h.join();
             handles.deinit(self.allocator);
@@ -499,7 +499,7 @@ pub const Forest = struct {
         }
 
         // Join fibers and collect manifest changes.
-        var changes: std.ArrayList(manifest.TableChange) = .{};
+        var changes: std.ArrayList(manifest.TableChange) = .empty;
         for (handles.items) |*h| {
             const tc = h.join() orelse continue;
             try changes.append(self.allocator, tc);
@@ -557,7 +557,7 @@ pub const Forest = struct {
         // Load all new L0 tables concurrently via the cache. writeFile may
         // have pre-opened these (follower path) → cache hit. On the leader,
         // flush writes bytes directly, so these will typically be misses.
-        var needed: std.ArrayList(tree_mod.TableNeed) = .{};
+        var needed: std.ArrayList(tree_mod.TableNeed) = .empty;
         defer needed.deinit(self.allocator);
         for (changes) |c| {
             std.debug.assert(c.op == .create); // flush only creates
@@ -1128,7 +1128,7 @@ pub const Forest = struct {
         var any = false;
         // Collect tree ids in this namespace under the lock, then drop and
         // call writeTreeStats for each (which re-acquires its own lock).
-        var ids: std.ArrayList(u64) = .{};
+        var ids: std.ArrayList(u64) = .empty;
         defer ids.deinit(self.allocator);
         {
             self.mu.lockSharedUncancelable(@src());
@@ -1170,7 +1170,7 @@ pub const Forest = struct {
     pub fn hasFile(self: *Forest, file_id: u64) bool {
         const path = fi.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
         defer self.allocator.free(path);
-        std.fs.cwd().access(path, .{}) catch return false;
+        std.Io.Dir.cwd().access(utils.context.g().io, path, .{}) catch return false;
         return true;
     }
 
@@ -1269,7 +1269,7 @@ pub const Forest = struct {
         const new_tree_id = self.next_tree_id.fetchAdd(1, .monotonic);
 
         // Classify tables per level and build manifest changes.
-        var table_changes: std.ArrayList(manifest.TableChange) = .{};
+        var table_changes: std.ArrayList(manifest.TableChange) = .empty;
 
         for (left_tree.levels, 0..) |*llv, llv_idx| {
             llv.mu.lockSharedUncancelable(@src());

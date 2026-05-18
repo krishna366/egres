@@ -56,14 +56,18 @@ pub fn build(b: *std.Build) void {
     addZbufCli(b, target, optimize, mods);
     addZdbServer(b, target, optimize, mods, regen_buffers_step);
     addZdbBench(b, target, optimize, mods);
-    addLoadtestDriver(b, target, optimize, mods);
+    // Deferred for Zig 0.16 migration: loadtest has heavy std.process.Child
+    // and std.fs.cwd surface area; re-enable once those are migrated.
+    // addLoadtestDriver(b, target, optimize, mods);
     addSstVerify(b, target, optimize, mods);
     // `zig build test` — one binary, auto-discovered from `*_test.zig` /
     // `test.zig` files. Replaces the previous test-zdb / test-zbuf /
     // test-utils / test-raft / test-net per-file plumbing.
     _ = addAllTests(b, target, optimize, mods, regen_buffers_step);
     // TODO: rewrite multiproc harness to use zdb-server
-    _ = addRaftMultiprocHarness(b, target, optimize, mods, regen_buffers_step);
+    // Deferred for Zig 0.16 migration: builds an executable that pulls in
+    // std.process.Child paths in raft/testing.
+    // _ = addRaftMultiprocHarness(b, target, optimize, mods, regen_buffers_step);
     addPgwireShakeout(b, target, optimize, mods);
 }
 
@@ -251,15 +255,16 @@ fn addRegenAllBuffers(
 
 fn collectBufferSchemas(b: *std.Build) [][]const u8 {
     var paths = std.ArrayList([]const u8).empty;
-    var root_dir = std.fs.cwd().openDir(".", .{ .iterate = true }) catch {
+    const io = b.graph.io;
+    var root_dir = std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true }) catch {
         @panic("failed to open workspace dir");
     };
-    defer root_dir.close();
+    defer root_dir.close(io);
 
     var walker = root_dir.walk(b.allocator) catch @panic("failed to walk workspace");
     defer walker.deinit();
 
-    while (walker.next() catch @panic("failed to read workspace entry")) |entry| {
+    while (walker.next(io) catch @panic("failed to read workspace entry")) |entry| {
         if (entry.kind != .file) continue;
         const base = std.fs.path.basename(entry.path);
         if (!std.mem.eql(u8, base, "buffers.zig") and !std.mem.eql(u8, base, "buffers")) continue;
@@ -325,15 +330,16 @@ fn isSkippedTestFile(path: []const u8) bool {
 
 fn collectTestFiles(b: *std.Build) [][]const u8 {
     var paths = std.ArrayList([]const u8).empty;
-    var root_dir = std.fs.cwd().openDir(".", .{ .iterate = true }) catch {
+    const io = b.graph.io;
+    var root_dir = std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true }) catch {
         @panic("failed to open workspace dir");
     };
-    defer root_dir.close();
+    defer root_dir.close(io);
 
     var walker = root_dir.walk(b.allocator) catch @panic("failed to walk workspace");
     defer walker.deinit();
 
-    while (walker.next() catch @panic("failed to read workspace entry")) |entry| {
+    while (walker.next(io) catch @panic("failed to read workspace entry")) |entry| {
         if (entry.kind != .file) continue;
         const is_test = std.mem.endsWith(u8, entry.basename, "_test.zig");
         const is_bench = std.mem.endsWith(u8, entry.basename, "_bench.zig");
@@ -391,9 +397,10 @@ fn addAllTests(
 
     const root_path = ".test_root.zig";
     {
-        const f = std.fs.cwd().createFile(root_path, .{ .truncate = true }) catch @panic("create .test_root.zig");
-        defer f.close();
-        f.writeAll(root_owned) catch @panic("write .test_root.zig");
+        const io = b.graph.io;
+        const f = std.Io.Dir.cwd().createFile(io, root_path, .{ .truncate = true }) catch @panic("create .test_root.zig");
+        defer f.close(io);
+        f.writeStreamingAll(io, root_owned) catch @panic("write .test_root.zig");
     }
 
     // BIG/BENCH gating happens at runtime via the test_runner CLI flags
@@ -525,7 +532,7 @@ fn addZdbBench(
         .name = "zdb-bench",
         .root_module = makeModule(b, target, optimize, "benchmark.zig"),
     });
-    addImports(exe.root_module, mods, .{ "zio", "flags" });
+    addImports(exe.root_module, mods, .{ "zio", "flags", "utils" });
     b.installArtifact(exe);
 
     const install = b.addInstallArtifact(exe, .{});
@@ -543,7 +550,7 @@ fn addLoadtestDriver(
         .name = "loadtest",
         .root_module = makeModule(b, target, optimize, "scripts/loadtest.zig"),
     });
-    addImports(exe.root_module, mods, .{ "zio", "flags" });
+    addImports(exe.root_module, mods, .{ "zio", "flags", "utils" });
     b.installArtifact(exe);
 
     const install = b.addInstallArtifact(exe, .{});
@@ -561,7 +568,7 @@ fn addSstVerify(
         .name = "sst-verify",
         .root_module = makeModule(b, target, optimize, "scripts/sst_verify.zig"),
     });
-    addImports(exe.root_module, mods, .{"zdb"});
+    addImports(exe.root_module, mods, .{ "zdb", "utils" });
     addVendoredCompressionSources(b, exe);
     b.installArtifact(exe);
 
@@ -603,7 +610,7 @@ fn addRaftMultiprocHarness(
 /// and the standalone `pg_query_scan` are dropped — see
 /// pgwire/README.md for what was excised and why.
 fn addLibpgQuerySources(b: *std.Build, compile: *std.Build.Step.Compile) void {
-    compile.linkLibC();
+    compile.root_module.link_libc = true;
     compile.root_module.addIncludePath(b.path("third_party/libpg_query"));
     compile.root_module.addIncludePath(b.path("third_party/libpg_query/vendor"));
     compile.root_module.addIncludePath(b.path("third_party/libpg_query/src/include"));
@@ -632,18 +639,19 @@ fn addLibpgQuerySources(b: *std.Build, compile: *std.Build.Step.Compile) void {
 /// translation units, not compiled standalone.
 fn collectLibpgQuerySources(b: *std.Build) [][]const u8 {
     var paths = std.ArrayList([]const u8).empty;
+    const io = b.graph.io;
     const roots = [_][]const u8{
         "third_party/libpg_query/src",
         "third_party/libpg_query/src/postgres",
         "third_party/libpg_query/vendor/xxhash",
     };
     for (roots) |root_path| {
-        var dir = std.fs.cwd().openDir(root_path, .{ .iterate = true }) catch
+        var dir = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch
             @panic("failed to open libpg_query dir");
-        defer dir.close();
+        defer dir.close(io);
 
         var it = dir.iterate();
-        while (it.next() catch @panic("failed to read libpg_query dir")) |entry| {
+        while (it.next(io) catch @panic("failed to read libpg_query dir")) |entry| {
             // Only this directory level — we walk each root separately
             // so the `src/include/` C-fragment files (which are
             // `#include`-d, not compiled) are skipped automatically.
@@ -681,7 +689,7 @@ fn addPgwireShakeout(
         .name = "pgwire-shakeout",
         .root_module = makeModule(b, target, optimize, "pgwire-shakeout/main.zig"),
     });
-    addImports(exe.root_module, mods, .{ "zio", "pgwire" });
+    addImports(exe.root_module, mods, .{ "zio", "pgwire", "utils" });
     addLibpgQuerySources(b, exe);
     b.installArtifact(exe);
 
@@ -691,7 +699,7 @@ fn addPgwireShakeout(
 }
 
 fn addVendoredCompressionSources(b: *std.Build, compile: *std.Build.Step.Compile) void {
-    compile.linkLibC();
+    compile.root_module.link_libc = true;
     compile.root_module.addIncludePath(b.path("."));
     compile.root_module.addIncludePath(b.path("third_party/lz4/lib"));
     compile.root_module.addIncludePath(b.path("third_party/zstd/lib"));

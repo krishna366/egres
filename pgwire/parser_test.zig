@@ -164,7 +164,7 @@ test "parse: 1000 concurrent fibers parse distinct queries (no leaks, no races)"
         }
     };
 
-    var group = zio.group();
+    var group = zio.Group{};
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
         try group.spawn(Worker.run, .{ a, i, &failures });

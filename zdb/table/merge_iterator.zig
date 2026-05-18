@@ -55,20 +55,20 @@ pub const MergeIterator = struct {
         return .{
             .allocator = allocator,
             .iters = iters,
-            .heap = std.PriorityQueue(usize, []const Iterator, iterOrder).init(allocator, iters),
+            .heap = std.PriorityQueue(usize, []const Iterator, iterOrder).initContext(iters),
         };
     }
 
     pub fn deinit(self: *MergeIterator) void {
-        self.heap.deinit();
+        self.heap.deinit(self.allocator);
         for (self.iters) |*it| it.deinit();
     }
 
     pub fn seekRange(self: *MergeIterator, start: Key, end: Key) !void {
-        while (self.heap.removeOrNull() != null) {}
+        while (self.heap.pop() != null) {}
         for (self.iters) |*it| try it.seekRange(start, end);
         for (self.iters, 0..) |*it, i| {
-            if (it.itemRef() != null) try self.heap.add(i);
+            if (it.itemRef() != null) try self.heap.push(self.allocator, i);
         }
     }
 
@@ -78,9 +78,9 @@ pub const MergeIterator = struct {
     }
 
     pub fn next(self: *MergeIterator) Error!void {
-        const i = self.heap.removeOrNull() orelse return;
+        const i = self.heap.pop() orelse return;
         try self.iters[i].next();
-        if (self.iters[i].itemRef() != null) try self.heap.add(i);
+        if (self.iters[i].itemRef() != null) try self.heap.push(self.allocator, i);
     }
 };
 

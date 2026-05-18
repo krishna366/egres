@@ -42,9 +42,11 @@ pub const Metrics = struct {
     propose_batch_size: BatchHist,
 
     pub fn init(allocator: std.mem.Allocator) !Metrics {
+        const io = utils.context.g().io;
         return .{
             .propose_phase_ms = try PhaseHist.init(
                 allocator,
+                io,
                 "raft_propose_phase_ms",
                 .{},
                 .{},

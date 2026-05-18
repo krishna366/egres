@@ -296,7 +296,7 @@ pub fn testTransportStartsAndStopsCleanly() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.wait() catch {};
     try group.spawn(runRaftRuntime, .{&rt});
 
@@ -326,7 +326,7 @@ pub fn testTransportProcessesProposal() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.wait() catch {};
     try group.spawn(runRaftRuntime, .{&rt});
 
@@ -376,7 +376,7 @@ pub fn testTransportStopIsClean() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.wait() catch {};
     try group.spawn(runRaftRuntime, .{&rt});
 

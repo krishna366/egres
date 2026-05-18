@@ -13,6 +13,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const flags = @import("flags");
+const utils = @import("utils");
 
 // --- config -----------------------------------------------------------------
 
@@ -91,7 +92,9 @@ var cfg_stats: StatsCfg = .{};
 fn repoRoot(alloc: std.mem.Allocator) ![]u8 {
     // Driver sits at <repo>/zig-out/bin/loadtest; walk up two dirs.
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = try std.fs.selfExePath(&buf);
+    const io = utils.context.g().io;
+    const n = try std.process.executablePath(io, &buf);
+    const exe = buf[0..n];
     const bin_dir = std.fs.path.dirname(exe) orelse return error.BadExePath;
     const zig_out = std.fs.path.dirname(bin_dir) orelse return error.BadExePath;
     const root = std.fs.path.dirname(zig_out) orelse return error.BadExePath;
@@ -121,7 +124,8 @@ fn readLine(stream: zio.net.Stream, buf: []u8) ![]const u8 {
     var pos: usize = 0;
     while (pos < buf.len) {
         var byte: [1]u8 = undefined;
-        try stream.readAll(&byte, .none);
+        const n = try stream.read(&byte, .none);
+        if (n == 0) return error.EndOfStream;
         if (byte[0] == '\n') {
             const end = if (pos > 0 and buf[pos - 1] == '\r') pos - 1 else pos;
             return buf[0..end];
@@ -605,8 +609,9 @@ fn parseSubcommand(arg: []const u8) ?Mode {
 }
 
 fn usage(alloc: std.mem.Allocator) void {
-    const stderr = std.fs.File.stderr();
-    _ = stderr.write(
+    const io = utils.context.g().io;
+    const stderr = std.Io.File.stderr();
+    stderr.writeStreamingAll(io,
         \\usage: loadtest [subcommand] [--<module> k=v; k=v; ...]
         \\
         \\subcommands (positional, defaults to `run` if omitted):
@@ -623,8 +628,8 @@ fn usage(alloc: std.mem.Allocator) void {
     var help: std.ArrayList(u8) = .empty;
     defer help.deinit(alloc);
     flags.g().writeHelpAll(&help) catch {};
-    _ = stderr.write(help.items) catch {};
-    _ = stderr.write("\n") catch {};
+    stderr.writeStreamingAll(io, help.items) catch {};
+    stderr.writeStreamingAll(io, "\n") catch {};
 }
 
 // Root task — runs inside the zio runtime as a spawned task, so every
@@ -638,13 +643,10 @@ fn rootTask(alloc: std.mem.Allocator, mode: Mode) void {
     result catch |err| std.log.err("{s} failed: {s}", .{ @tagName(mode), @errorName(err) });
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, argv);
+pub fn main(init: std.process.Init) !void {
+    utils.context.initGlobal(init);
+    const alloc = utils.context.g().gpa;
+    const argv = try utils.context.g().argv();
 
     // Bootstrap fiber: flag init and the rest of setup runs in fiber
     // context so flag locks aren't blocking an executor thread.
@@ -654,7 +656,7 @@ pub fn main() !void {
     try handle.join();
 }
 
-fn bootstrap(alloc: std.mem.Allocator, argv: [][:0]u8) !void {
+fn bootstrap(alloc: std.mem.Allocator, argv: []const []const u8) !void {
     // --- step 1: extract the positional subcommand (argv[1] if present and
     // doesn't start with `--`). Anything else goes to the flag parser. This
     // keeps the verb natural (`loadtest run`) without needing flag gymnastics

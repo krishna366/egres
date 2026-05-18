@@ -66,7 +66,7 @@ pub const TestCluster = struct {
                 .node = undefined,
                 .wal = try TestLog.init(allocator, id),
                 .peers = peers,
-                .group = zio.group(),
+                .group = zio.Group{},
             };
             var ncfg = config;
             ncfg.id = id;

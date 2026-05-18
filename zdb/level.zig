@@ -117,7 +117,7 @@ pub const Level = struct {
     pub fn init(allocator: std.mem.Allocator, level: u8) Level {
         return .{
             .mu = .{},
-            .tables = .{},
+            .tables = .empty,
             .total_size = 0,
             .level = level,
             .allocator = allocator,

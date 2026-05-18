@@ -104,7 +104,7 @@ fn serverFn(ctx: *TestCtx) !void {
 
     try ctx.port_ch.send(server.socket.address.ip.getPort());
 
-    var stream = try server.accept();
+    var stream = try server.accept(.{});
     defer stream.close();
 
     try pgwire.serve(ctx.a, &stream, ctx.handler, .{});

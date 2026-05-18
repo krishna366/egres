@@ -1,6 +1,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const flags = @import("flags");
+const utils = @import("utils");
 const proto = @import("zdb-server/protocol.zig");
 
 const Timestamp = zio.Timestamp;
@@ -47,9 +48,10 @@ fn usage(alloc: std.mem.Allocator) void {
     var help: std.ArrayList(u8) = .empty;
     defer help.deinit(alloc);
     flags.g().writeHelpAll(&help) catch {};
-    const stderr = std.fs.File.stderr();
-    _ = stderr.write(help.items) catch {};
-    _ = stderr.write("\n") catch {};
+    const io = utils.context.g().io;
+    const stderr = std.Io.File.stderr();
+    stderr.writeStreamingAll(io, help.items) catch {};
+    stderr.writeStreamingAll(io, "\n") catch {};
 }
 
 // --- Text protocol (client side) ---
@@ -168,7 +170,8 @@ fn readResponseLine(stream: zio.net.Stream, buf: []u8) ![]const u8 {
     var pos: usize = 0;
     while (pos < buf.len) {
         var byte: [1]u8 = undefined;
-        try stream.readAll(&byte, .none);
+        const n = try stream.read(&byte, .none);
+        if (n == 0) return error.EndOfStream;
         if (byte[0] == '\n') {
             const end = if (pos > 0 and buf[pos - 1] == '\r') pos - 1 else pos;
             return buf[0..end];
@@ -669,13 +672,10 @@ fn printResults(args: *const Args, contexts: []WorkerCtx, shared: *const SharedS
 
 // --- Main ---
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    utils.context.initGlobal(init);
+    const allocator = utils.context.g().gpa;
+    const argv = try utils.context.g().argv();
 
     // Bootstrap fiber: runs flag init + benchmark setup in fiber context.
     const bootstrap_rt = try zio.Runtime.init(allocator, .{ .executors = .exact(1) });
@@ -684,7 +684,7 @@ pub fn main() !void {
     try handle.join();
 }
 
-fn bootstrap(allocator: std.mem.Allocator, argv: [][:0]u8) !void {
+fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     flags.initGlobal(allocator);
     defer flags.deinitGlobal();
     const live = try flags.g().register("bench", Args);
@@ -734,7 +734,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: [][:0]u8) !void {
     defer rt.deinit();
 
     log.info("runtime initialized with {d} threads, starting benchmark", .{n_threads});
-    // runBenchmark uses zio.group() / zio.net which require a current executor,
+    // runBenchmark uses zio.Group{} / zio.net which require a current executor,
     // so we spawn it as a root task on the runtime instead of calling from
     // the main thread (which is never an executor after Runtime.init).
     var root = try rt.spawn(runBenchmark, .{ allocator, &args });
@@ -783,7 +783,7 @@ fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) u64 {
 
     log.info("spawning {d} writer(s) + {d} verifier(s)", .{ args.clients, args.verify_clients });
 
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.cancel();
 
     // Writers = contexts[0..clients]; verifiers = contexts[clients..]

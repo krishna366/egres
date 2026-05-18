@@ -4,7 +4,7 @@
 //! `close()`-driven shutdown.
 //!
 //! The unified test runner already runs each test as a zio fiber, so
-//! these test bodies use `zio.yield` / `zio.sleep` / `zio.group()`
+//! these test bodies use `zio.yield` / `zio.sleep` / `zio.Group{}`
 //! directly — no per-test Runtime needed.
 
 const std = @import("std");
@@ -67,7 +67,7 @@ test "waitForUntimed: blocks until advance crosses target" {
     };
 
     var ctx = Ctx{};
-    var grp = zio.group();
+    var grp = zio.Group{};
     defer grp.cancel();
     try grp.spawn(Ctx.waiter, .{&ctx});
     try grp.spawn(Ctx.advancer, .{&ctx});
@@ -94,7 +94,7 @@ test "waitForUntimed: broadcast wakes every waiter on a single advance" {
     };
 
     var ctx = Ctx{};
-    var grp = zio.group();
+    var grp = zio.Group{};
     defer grp.cancel();
     try grp.spawn(Ctx.waiter, .{&ctx});
     try grp.spawn(Ctx.waiter, .{&ctx});
@@ -128,7 +128,7 @@ test "waitFor: returns successfully when advance crosses target before deadline"
     };
 
     var ctx = Ctx{};
-    var grp = zio.group();
+    var grp = zio.Group{};
     defer grp.cancel();
     try grp.spawn(Ctx.waiter, .{&ctx});
     try grp.spawn(Ctx.advancer, .{&ctx});
@@ -180,7 +180,7 @@ test "close: wakes pending waiters with error.Closed" {
     };
 
     var ctx = Ctx{};
-    var grp = zio.group();
+    var grp = zio.Group{};
     defer grp.cancel();
     try grp.spawn(Ctx.untimed, .{&ctx});
     try grp.spawn(Ctx.timed, .{&ctx});
@@ -226,7 +226,7 @@ test "close after advance: target-met waiters succeed, beyond-target see Closed"
     };
 
     var ctx = Ctx{};
-    var grp = zio.group();
+    var grp = zio.Group{};
     defer grp.cancel();
     try grp.spawn(Ctx.satisfied, .{&ctx});
     try grp.spawn(Ctx.beyond, .{&ctx});
@@ -260,7 +260,7 @@ test "waitForUntimed: stress — no waiter is lost under interleaved advances" {
     };
 
     var ctx = Ctx{};
-    var grp = zio.group();
+    var grp = zio.Group{};
     defer grp.cancel();
     // One waiter per integer target in [1, 20]. Some are spawned before,
     // some interleaved with, the advancer's loop.

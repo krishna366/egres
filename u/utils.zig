@@ -8,6 +8,7 @@ pub const tracked_mutex = @import("tracked_mutex.zig");
 pub const TrackedMutex = tracked_mutex.TrackedMutex;
 pub const TrackedRwLock = tracked_mutex.TrackedRwLock;
 pub const coarse = @import("coarse.zig");
+pub const context = @import("context.zig");
 
 /// WaitGroup provides Go-style Add/Done/Wait synchronization for zio coroutines.
 ///
@@ -73,20 +74,20 @@ pub fn logEvery(comptime interval_secs: i64, comptime fmt: []const u8, args: any
     }
 }
 
-/// search finds the first index in [0, items.len) for which pred(ctx, items[i]) is true,
+/// search finds the first index in [0, items.len) for which pred(c, items[i]) is true,
 /// assuming the range is partitioned as [false…false, true…true].
 /// Returns items.len when the predicate is never true (mirrors Go's sort.Search).
 pub fn search(
     comptime T: type,
     items: []const T,
-    ctx: anytype,
-    comptime pred: fn (@TypeOf(ctx), T) bool,
+    c: anytype,
+    comptime pred: fn (@TypeOf(c), T) bool,
 ) usize {
     var lo: usize = 0;
     var hi: usize = items.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (pred(ctx, items[mid])) {
+        if (pred(c, items[mid])) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -169,7 +170,7 @@ pub fn Queue(comptime T: type) type {
         pub const Error = error{ QueueClosed, QueueFull, OutOfMemory };
 
         allocator: std.mem.Allocator,
-        items: std.ArrayList(T) = .{},
+        items: std.ArrayList(T) = .empty,
         head: usize = 0,
         closed: bool = false,
         max: usize,

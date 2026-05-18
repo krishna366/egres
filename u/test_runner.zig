@@ -889,7 +889,7 @@ fn driver(
 
     // Parallel round: run all tests, collecting failures.
     {
-        var group = zio.group();
+        var group = zio.Group{};
         for (kept.items) |t| try group.spawn(runOne, .{ t, &ctx });
         group.wait() catch {};
     }
@@ -918,7 +918,7 @@ fn driver(
             .running = running,
         };
 
-        var retry_group = zio.group();
+        var retry_group = zio.Group{};
         for (failures.items) |t| try retry_group.spawn(runOne, .{ t, &retry_ctx });
         retry_group.wait() catch {};
     }
@@ -956,7 +956,7 @@ fn driver(
         .running = running,
     };
 
-    var bench_group = zio.group();
+    var bench_group = zio.Group{};
     for (bench_tests.items) |t| try bench_group.spawn(runBench, .{ t, &bench_ctx });
     bench_group.wait() catch {};
 }

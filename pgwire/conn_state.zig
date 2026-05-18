@@ -177,7 +177,7 @@ pub const ConnState = struct {
     /// at the top of every frame; grows to fit the largest body seen.
     /// Event slices that point here (`startup_complete.params`,
     /// `query.sql`) are invalidated on the next `nextEvent` call.
-    scratch_in: std.ArrayList(u8) = .{},
+    scratch_in: std.ArrayList(u8) = .empty,
     /// Reusable scratch for building length-prefixed *output* frame
     /// bodies before writeFrame ships them to `out`.
     scratch_out: std.Io.Writer.Allocating,
@@ -264,7 +264,7 @@ pub const ConnState = struct {
         }
         // Walk portals and drop any that reference this statement.
         // Two-pass to avoid mutating during iteration.
-        var to_remove: std.ArrayList([]const u8) = .{};
+        var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(self.alloc);
         var it = self.portals.iterator();
         while (it.next()) |e| {

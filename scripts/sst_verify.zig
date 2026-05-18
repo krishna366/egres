@@ -1,5 +1,6 @@
 const std = @import("std");
 const zdb = @import("zdb");
+const utils = @import("utils");
 const vfs = zdb.vfs;
 const Table = zdb.table.Table;
 const TableIterator = zdb.table.TableIterator;
@@ -58,13 +59,11 @@ fn verifyOne(allocator: std.mem.Allocator, path: []const u8) bool {
     return true;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    utils.context.initGlobal(init);
+    const allocator = utils.context.g().gpa;
+    const io = utils.context.g().io;
+    const argv = try utils.context.g().argv();
 
     const dir_path = if (argv.len >= 2) argv[1] else {
         std.debug.print("usage: sst-verify <dir>\n", .{});
@@ -75,8 +74,8 @@ pub fn main() !void {
     // VFS still needs a bandwidth controller.
     vfs.VFS.initGlobal(.{ .bytes_per_sec = 500 * 1024 * 1024 });
 
-    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
 
     var paths: std.ArrayList([]const u8) = .empty;
     defer {
@@ -84,7 +83,7 @@ pub fn main() !void {
         paths.deinit(allocator);
     }
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".sst")) continue;
         const full = try std.fs.path.join(allocator, &.{ dir_path, entry.name });

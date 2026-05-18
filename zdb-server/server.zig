@@ -387,12 +387,12 @@ pub const ZdbServer = struct {
 
         log.info("client TCP listener started, accepting connections", .{});
 
-        var group = zio.group();
+        var group = zio.Group{};
         defer group.cancel();
 
         var conn_id: u64 = 0;
         while (!self.node.isShuttingDown()) {
-            const stream = listener.accept() catch |err| {
+            const stream = listener.accept(.{}) catch |err| {
                 log.err("runClientLoop: accept failed: {}", .{err});
                 return;
             };
@@ -422,7 +422,7 @@ pub const ZdbServer = struct {
 
         const n_compactors = self.forest.opts.num_compactors;
         log.info("compaction loops started: num_compactors={d}", .{n_compactors});
-        var group = zio.group();
+        var group = zio.Group{};
         group.spawn(runMemtableLoop, .{self}) catch return;
         group.spawn(runFlushLoop, .{self}) catch return;
         // Each levels-loop fiber claims one tree at a time via
@@ -982,13 +982,13 @@ pub const ZdbServer = struct {
                 .raft => |req| {
                     self.handleRaft(stream, req) catch return;
                 },
-                .vfs => |_| {
+                .vfs => {
                     self.handleVfs(stream) catch return;
                 },
-                .locks => |_| {
+                .locks => {
                     self.handleLocks(stream) catch return;
                 },
-                .help => |_| {
+                .help => {
                     proto.writeHelp(stream) catch return;
                 },
             }

@@ -248,7 +248,7 @@ test "ShardedCache basic get/put" {
 }
 
 test "ShardedCache concurrent puts and gets" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
     defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 

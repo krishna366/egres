@@ -133,7 +133,7 @@ pub const Mux = struct {
             .streams = std.AutoHashMap(u32, *Stream).init(allocator),
             .next_stream_id = std.atomic.Value(u32).init(initial_stream_id),
             .on_stream = on_stream,
-            .group = zio.group(),
+            .group = zio.Group{},
             .closed = false,
             .mu = .{},
         };

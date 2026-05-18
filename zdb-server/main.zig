@@ -78,9 +78,10 @@ fn usage(alloc: std.mem.Allocator) void {
     var help: std.ArrayList(u8) = .empty;
     defer help.deinit(alloc);
     flags.g().writeHelpAll(&help) catch {};
-    const stderr = std.fs.File.stderr();
-    _ = stderr.write(help.items) catch {};
-    _ = stderr.write("\n") catch {};
+    const io = utils.context.g().io;
+    const stderr = std.Io.File.stderr();
+    stderr.writeStreamingAll(io, help.items) catch {};
+    stderr.writeStreamingAll(io, "\n") catch {};
 }
 
 const log = std.log.scoped(.zdb_main);
@@ -105,14 +106,11 @@ const Args = struct {
     wal_dir: []const u8,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     defer log.info("shutdown complete", .{});
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+    utils.context.initGlobal(init);
+    const allocator = utils.context.g().gpa;
+    const argv = try utils.context.g().argv();
 
     // Runtime pool singleton — created first so all runtimes are available.
     const pool = try runtime.Pool.init(allocator, .{});
@@ -129,7 +127,7 @@ pub fn main() !void {
     try handle.join();
 }
 
-fn bootstrap(allocator: std.mem.Allocator, argv: [][:0]u8) !void {
+fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     // Spawn the cached-time ticker. Lives for the rest of the process.
     utils.coarse.Clock.start() catch |err| {
         log.err("coarse.Clock.start failed: {s}", .{@errorName(err)});
@@ -300,7 +298,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: [][:0]u8) !void {
 /// and waits for SIGINT or SIGTERM to shut down.
 fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const Args) void {
     log.info("inside appMain", .{});
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.cancel();
 
     // Initialize transport (needed for both join and raft loops).
@@ -371,8 +369,15 @@ fn runRaft(r: *raft.RaftRuntime) void {
     r.run() catch |err| {
         if (err == error.Canceled) return;
         std.log.err("raft runtime error: {s}", .{@errorName(err)});
-        if (@errorReturnTrace()) |trace| {
-            std.debug.dumpStackTrace(trace.*);
+        if (@errorReturnTrace()) |bt| {
+            // Zig 0.16 split StackTrace: `@errorReturnTrace` returns
+            // `builtin.StackTrace`, but `dumpStackTrace` expects
+            // `debug.StackTrace`. Bridge by repacking the fields.
+            const dbg_trace: std.debug.StackTrace = .{
+                .return_addresses = bt.instruction_addresses[0..bt.index],
+                .skipped = .none,
+            };
+            std.debug.dumpStackTrace(&dbg_trace);
         }
     };
 }

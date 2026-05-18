@@ -2,7 +2,20 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const zio = @import("zio");
+const utils = @import("utils");
 pub const bandwidth = @import("bandwidth.zig");
+
+inline fn fdToFile(fd: posix.fd_t) std.Io.File {
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+inline fn fileSize(fd: posix.fd_t) !u64 {
+    return (try fdToFile(fd).stat(utils.context.g().io)).size;
+}
+
+inline fn closeFd(fd: posix.fd_t) void {
+    fdToFile(fd).close(utils.context.g().io);
+}
 
 pub const Flags = struct {
     /// Open for reading and writing instead of read-only.
@@ -304,30 +317,31 @@ pub const VFS = struct {
                 // mmap mode opens RO+default for the underlying fd; mapped
                 // semantics live above the fd, not in its open flags.
                 const fd = try openDirect(path, .{});
-                errdefer posix.close(fd);
+                errdefer closeFd(fd);
 
-                const file_size = try (std.fs.File{ .handle = fd }).getEndPos();
-                const mapped = try posix.mmap(null, file_size, posix.PROT.READ, .{ .TYPE = .PRIVATE }, fd, 0);
+                const file_size = try fileSize(fd);
+                const mapped = try posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
                 return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .mapped = mapped, .vfs = self };
             },
             .default, .direct => {
                 const fd = try openDirect(path, opts);
-                errdefer posix.close(fd);
+                errdefer closeFd(fd);
 
-                const file_size = try (std.fs.File{ .handle = fd }).getEndPos();
+                const file_size = try fileSize(fd);
                 return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .vfs = self };
             },
             .memory => {
                 // memory mode reads the file once into a buffer; underlying fd is RO+default.
                 const fd = try openDirect(path, .{});
-                defer posix.close(fd); // closed after reading; FileHandle won't own it
+                defer closeFd(fd); // closed after reading; FileHandle won't own it
 
-                const file = std.fs.File{ .handle = fd };
-                const file_size = try file.getEndPos();
+                const io = utils.context.g().io;
+                const file = fdToFile(fd);
+                const file_size = (try file.stat(io)).size;
                 const size: usize = @intCast(file_size);
                 const buf = try allocator.alloc(u8, size);
                 errdefer allocator.free(buf);
-                _ = try file.readAll(buf);
+                _ = try file.readPositionalAll(io, buf, 0);
                 return .{
                     .file_size = file_size,
                     .owned_buf = buf,
@@ -350,7 +364,7 @@ pub const VFS = struct {
         if (builtin.os.tag == .linux and opts.mode == .direct) open_flags.DIRECT = true;
         if (opts.flags.dsync) open_flags.DSYNC = true;
 
-        const fd = posix.open(path, open_flags, 0o644) catch |err| switch (err) {
+        const fd = posix.openat(posix.AT.FDCWD, path, open_flags, 0o644) catch |err| switch (err) {
             // tmpfs doesn't support O_DIRECT — fall back to plain open.
             error.BadPathName => return self.createFile(path, .{ .flags = opts.flags }),
             else => return err,
@@ -370,7 +384,7 @@ pub const VFS = struct {
     /// Best-effort directory fsync so newly created filenames are durable.
     /// Silently ignores errors (tmpfs, some network mounts don't support dir fsync).
     pub fn syncDir(path: []const u8) void {
-        const fd = posix.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
+        const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
         const f = zio.File.fromFd(fd);
         defer f.close();
         f.sync(.{}) catch {};
@@ -396,11 +410,11 @@ fn openDirect(path: []const u8, opts: FileOptions) !posix.fd_t {
     if (builtin.os.tag == .linux and direct_io) flags.DIRECT = true;
     if (opts.flags.dsync) flags.DSYNC = true;
 
-    const fd = posix.open(path, flags, 0) catch |err| switch (err) {
+    const fd = posix.openat(posix.AT.FDCWD, path, flags, 0) catch |err| switch (err) {
         error.BadPathName => {
             var fb: posix.O = .{ .ACCMODE = accmode };
             if (opts.flags.dsync) fb.DSYNC = true;
-            return posix.open(path, fb, 0);
+            return posix.openat(posix.AT.FDCWD, path, fb, 0);
         },
         else => return err,
     };

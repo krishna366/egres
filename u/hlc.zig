@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const context = @import("context.zig");
 
 // Hybrid Logical Clock.
 //
@@ -46,7 +47,7 @@ pub const Clock = struct {
     /// advances the physical seconds by 1 instead. In practice overflow never
     /// happens on real workloads, but the branch keeps monotonicity airtight.
     pub fn next(self: *Clock) HLC {
-        const wall_sec: u32 = @intCast(std.time.timestamp());
+        const wall_sec: u32 = @intCast(std.Io.Timestamp.now(context.g().io, .real).toSeconds());
         while (true) {
             const cur_u = self.last.load(.monotonic);
             const cur = HLC.fromU64(cur_u);

@@ -21,6 +21,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const coarse = @import("coarse.zig");
+const context = @import("context.zig");
 
 /// Cap on simultaneously-tracked locks. Sized to a ~512 KiB static
 /// storage budget so we don't have to revisit the constant when
@@ -264,11 +265,21 @@ var live_head: ?*RegEntry = null;
 // / dump's walk) are pure CPU work — no zio.sleep, no I/O, no
 // channel send/recv. Adding any yield point inside reg_mu would risk
 // the "all executor threads parked on this lock" deadlock pattern.
-var reg_mu: std.Thread.Mutex = .{};
+// std.Thread.Mutex → std.Io.Mutex in Zig 0.16. The Io-backed mutex behaves
+// like Thread.Mutex when used with std.Io.Threaded (which std.process.Init
+// gives us via context.g().io), so this is the closest drop-in.
+var reg_mu: std.Io.Mutex = .init;
+
+inline fn regLock() void {
+    reg_mu.lockUncancelable(context.g().io);
+}
+inline fn regUnlock() void {
+    reg_mu.unlock(context.g().io);
+}
 
 fn allocate() ?*RegEntry {
-    reg_mu.lock();
-    defer reg_mu.unlock();
+    regLock();
+    defer regUnlock();
     if (free_head) |e| {
         free_head = e.next;
         e.next = null;
@@ -281,22 +292,22 @@ fn allocate() ?*RegEntry {
 }
 
 fn release(e: *RegEntry) void {
-    reg_mu.lock();
-    defer reg_mu.unlock();
+    regLock();
+    defer regUnlock();
     e.next = free_head;
     free_head = e;
 }
 
 fn link(e: *RegEntry) void {
-    reg_mu.lock();
-    defer reg_mu.unlock();
+    regLock();
+    defer regUnlock();
     e.next = live_head;
     live_head = e;
 }
 
 fn unregister(e: *RegEntry) void {
-    reg_mu.lock();
-    defer reg_mu.unlock();
+    regLock();
+    defer regUnlock();
     if (live_head == e) {
         live_head = e.next;
     } else {
@@ -336,8 +347,8 @@ fn unregister(e: *RegEntry) void {
 /// (mutex / RwLock write) and 0..N for shared (RwLock read). Held locks
 /// always have `count >= 1`; the dump skips entries where it's 0.
 pub fn dump(w: *std.Io.Writer) !void {
-    reg_mu.lock();
-    defer reg_mu.unlock();
+    regLock();
+    defer regUnlock();
     var node = live_head;
     var total: usize = 0;
     var held: usize = 0;

@@ -8,6 +8,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const pgwire = @import("pgwire");
+const utils = @import("utils");
 
 const log = std.log.scoped(.pgwire_shakeout);
 
@@ -174,12 +175,12 @@ fn runListener(listen_addr: zio.net.IpAddress) !void {
         .{ listen_addr, listen_addr.getPort() },
     );
 
-    var group = zio.group();
+    var group = zio.Group{};
     defer group.cancel();
 
     var conn_id: u64 = 0;
     while (true) {
-        const stream = listener.accept() catch |err| {
+        const stream = listener.accept(.{}) catch |err| {
             log.err("accept failed: {s}", .{@errorName(err)});
             return err;
         };
@@ -192,15 +193,13 @@ fn runListener(listen_addr: zio.net.IpAddress) !void {
     }
 }
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    g_alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    utils.context.initGlobal(init);
+    g_alloc = utils.context.g().gpa;
 
     // Optional positional arg: host:port. Default to loopback:5433
     // (avoiding 5432 in case real Postgres is up).
-    const argv = try std.process.argsAlloc(g_alloc);
-    defer std.process.argsFree(g_alloc, argv);
+    const argv = try utils.context.g().argv();
     const addr_str = if (argv.len >= 2) argv[1] else default_addr;
 
     const listen_addr = try zio.net.IpAddress.parseIpAndPort(addr_str);
