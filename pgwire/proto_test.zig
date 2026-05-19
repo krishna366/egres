@@ -347,7 +347,7 @@ test "ConnState: startup → AuthOk + ParamStatus + ReadyForQuery" {
     // R(0) S+(several) K(1) Z(1).
     const out = aw.writer.buffered();
     var off: usize = 0;
-    var tags: std.ArrayList(u8) = .{};
+    var tags: std.ArrayList(u8) = .empty;
     defer tags.deinit(a);
     while (off < out.len) {
         const r = try proto.decodeMessage(out[off..]);
@@ -369,7 +369,7 @@ test "ConnState: Query event surfaces SQL text" {
     // Single fixed reader holding both startup and query frames —
     // the state machine processes them sequentially across nextEvent
     // calls.
-    var input: std.ArrayList(u8) = .{};
+    var input: std.ArrayList(u8) = .empty;
     defer input.deinit(a);
     try input.appendSlice(a, &hexToBytes(startup_golden_hex));
     try input.appendSlice(a, &hexToBytes(query_golden_hex));
@@ -392,7 +392,7 @@ test "ConnState: Terminate transitions to closed" {
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
 
-    var input: std.ArrayList(u8) = .{};
+    var input: std.ArrayList(u8) = .empty;
     defer input.deinit(a);
     try input.appendSlice(a, &hexToBytes(startup_golden_hex));
     try input.appendSlice(a, &hexToBytes(terminate_golden_hex));
@@ -417,7 +417,7 @@ test "ConnState: SSLRequest declined with 'N' + retried" {
     // SSL request followed by a real Startup3: the state machine
     // writes 'N' for the SSL probe and then processes the real
     // startup frame in one nextEvent call.
-    var input: std.ArrayList(u8) = .{};
+    var input: std.ArrayList(u8) = .empty;
     defer input.deinit(a);
     try input.appendSlice(a, &hexToBytes(ssl_request_golden_hex));
     try input.appendSlice(a, &hexToBytes(startup_golden_hex));
@@ -459,7 +459,7 @@ test "ConnState: clean EOF before next frame yields .terminate" {
 test "decodeMessage: golden Parse + roundtrip" {
     const a = std.testing.allocator;
     // Build a Parse: name="", sql="SELECT $1", n_params=1, oids=[23]
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
     try buf.append(a, 'P');
     const len_pos = buf.items.len;
@@ -486,7 +486,7 @@ test "decode Bind: text params, NULL handling" {
     const a = std.testing.allocator;
     // Bind: portal="", stmt="", n_pfmt=0, n_params=2 [text "42", NULL],
     //       n_rfmt=1 [0=text]
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
     try buf.append(a, 'B');
     const len_pos = buf.items.len;
@@ -522,7 +522,7 @@ test "decode Bind: text params, NULL handling" {
 
 test "decode Execute" {
     const a = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
     try buf.append(a, 'E');
     const len_pos = buf.items.len;
@@ -647,7 +647,7 @@ test "ext: Parse + Bind + Execute + Sync surfaces execute event" {
     defer aw.deinit();
 
     // Parse: name="" sql="SELECT $1" param_oids=[23]
-    var parse_body: std.ArrayList(u8) = .{};
+    var parse_body: std.ArrayList(u8) = .empty;
     defer parse_body.deinit(a);
     try parse_body.append(a, 0);
     try parse_body.appendSlice(a, "SELECT $1");
@@ -656,7 +656,7 @@ test "ext: Parse + Bind + Execute + Sync surfaces execute event" {
     try parse_body.appendSlice(a, &[_]u8{ 0, 0, 0, 23 });
 
     // Bind: portal="" stmt="" 0 pfmt; 1 param "42"; 0 rfmt
-    var bind_body: std.ArrayList(u8) = .{};
+    var bind_body: std.ArrayList(u8) = .empty;
     defer bind_body.deinit(a);
     try bind_body.append(a, 0); // portal
     try bind_body.append(a, 0); // stmt
@@ -667,7 +667,7 @@ test "ext: Parse + Bind + Execute + Sync surfaces execute event" {
     try bind_body.appendSlice(a, &[_]u8{ 0, 0 }); // n_rfmt=0
 
     // Execute: portal="" max_rows=0
-    var exec_body: std.ArrayList(u8) = .{};
+    var exec_body: std.ArrayList(u8) = .empty;
     defer exec_body.deinit(a);
     try exec_body.append(a, 0);
     try exec_body.appendSlice(a, &[_]u8{ 0, 0, 0, 0 });
@@ -675,7 +675,7 @@ test "ext: Parse + Bind + Execute + Sync surfaces execute event" {
     // Pre-build the entire input (startup + ext-query frames) for the
     // Reader to consume. Reader.fixed wraps a slice; we can't append
     // after construction.
-    var input: std.ArrayList(u8) = .{};
+    var input: std.ArrayList(u8) = .empty;
     defer input.deinit(a);
     try input.appendSlice(a, &hexToBytes(startup_golden_hex));
     try frame(a, &input, 'P', parse_body.items);
@@ -719,7 +719,7 @@ test "ext: Bind with binary param format is accepted, surfaces format" {
     defer aw.deinit();
 
     // Parse: name="" sql="SELECT $1" 0 oids
-    var parse_body: std.ArrayList(u8) = .{};
+    var parse_body: std.ArrayList(u8) = .empty;
     defer parse_body.deinit(a);
     try parse_body.append(a, 0);
     try parse_body.appendSlice(a, "SELECT $1");
@@ -727,7 +727,7 @@ test "ext: Bind with binary param format is accepted, surfaces format" {
     try parse_body.appendSlice(a, &[_]u8{ 0, 0 });
 
     // Bind with binary param format (1) — int4(7) on the wire.
-    var bind_body: std.ArrayList(u8) = .{};
+    var bind_body: std.ArrayList(u8) = .empty;
     defer bind_body.deinit(a);
     try bind_body.append(a, 0); // portal=""
     try bind_body.append(a, 0); // stmt=""
@@ -739,12 +739,12 @@ test "ext: Bind with binary param format is accepted, surfaces format" {
     try bind_body.appendSlice(a, &[_]u8{ 0, 0 }); // n_rfmt=0
 
     // Execute "" 0
-    var exec_body: std.ArrayList(u8) = .{};
+    var exec_body: std.ArrayList(u8) = .empty;
     defer exec_body.deinit(a);
     try exec_body.append(a, 0);
     try exec_body.appendSlice(a, &[_]u8{ 0, 0, 0, 0 });
 
-    var input: std.ArrayList(u8) = .{};
+    var input: std.ArrayList(u8) = .empty;
     defer input.deinit(a);
     try input.appendSlice(a, &hexToBytes(startup_golden_hex));
     try frame(a, &input, 'P', parse_body.items);
@@ -785,14 +785,14 @@ test "ext: Bind with format=2 (invalid) errors and skips until Sync" {
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
 
-    var parse_body: std.ArrayList(u8) = .{};
+    var parse_body: std.ArrayList(u8) = .empty;
     defer parse_body.deinit(a);
     try parse_body.append(a, 0);
     try parse_body.appendSlice(a, "SELECT $1");
     try parse_body.append(a, 0);
     try parse_body.appendSlice(a, &[_]u8{ 0, 0 });
 
-    var bind_body: std.ArrayList(u8) = .{};
+    var bind_body: std.ArrayList(u8) = .empty;
     defer bind_body.deinit(a);
     try bind_body.append(a, 0);
     try bind_body.append(a, 0);
@@ -803,7 +803,7 @@ test "ext: Bind with format=2 (invalid) errors and skips until Sync" {
     try bind_body.appendSlice(a, &[_]u8{ 0, 0, 0, 7 });
     try bind_body.appendSlice(a, &[_]u8{ 0, 0 });
 
-    var input: std.ArrayList(u8) = .{};
+    var input: std.ArrayList(u8) = .empty;
     defer input.deinit(a);
     try input.appendSlice(a, &hexToBytes(startup_golden_hex));
     try frame(a, &input, 'P', parse_body.items);
@@ -840,7 +840,7 @@ test "ext: Describe(statement) emits ParameterDescription" {
     defer aw.deinit();
 
     // Parse: name="ps1", sql="SELECT $1::int", oids=[23]
-    var parse_body: std.ArrayList(u8) = .{};
+    var parse_body: std.ArrayList(u8) = .empty;
     defer parse_body.deinit(a);
     try parse_body.appendSlice(a, "ps1");
     try parse_body.append(a, 0);
@@ -850,13 +850,13 @@ test "ext: Describe(statement) emits ParameterDescription" {
     try parse_body.appendSlice(a, &[_]u8{ 0, 0, 0, 23 });
 
     // Describe: kind='S' name="ps1"
-    var desc_body: std.ArrayList(u8) = .{};
+    var desc_body: std.ArrayList(u8) = .empty;
     defer desc_body.deinit(a);
     try desc_body.append(a, 'S');
     try desc_body.appendSlice(a, "ps1");
     try desc_body.append(a, 0);
 
-    var input: std.ArrayList(u8) = .{};
+    var input: std.ArrayList(u8) = .empty;
     defer input.deinit(a);
     try input.appendSlice(a, &hexToBytes(startup_golden_hex));
     try frame(a, &input, 'P', parse_body.items);
@@ -895,7 +895,7 @@ test "ext: Close(statement) drops dependent portals" {
     defer aw.deinit();
 
     // Parse "ps1" + Bind portal "p1" against it
-    var parse_body: std.ArrayList(u8) = .{};
+    var parse_body: std.ArrayList(u8) = .empty;
     defer parse_body.deinit(a);
     try parse_body.appendSlice(a, "ps1");
     try parse_body.append(a, 0);
@@ -903,7 +903,7 @@ test "ext: Close(statement) drops dependent portals" {
     try parse_body.append(a, 0);
     try parse_body.appendSlice(a, &[_]u8{ 0, 0 });
 
-    var bind_body: std.ArrayList(u8) = .{};
+    var bind_body: std.ArrayList(u8) = .empty;
     defer bind_body.deinit(a);
     try bind_body.appendSlice(a, "p1");
     try bind_body.append(a, 0);
@@ -914,13 +914,13 @@ test "ext: Close(statement) drops dependent portals" {
     try bind_body.appendSlice(a, &[_]u8{ 0, 0 });
 
     // Close: kind='S' name="ps1"
-    var close_body: std.ArrayList(u8) = .{};
+    var close_body: std.ArrayList(u8) = .empty;
     defer close_body.deinit(a);
     try close_body.append(a, 'S');
     try close_body.appendSlice(a, "ps1");
     try close_body.append(a, 0);
 
-    var input: std.ArrayList(u8) = .{};
+    var input: std.ArrayList(u8) = .empty;
     defer input.deinit(a);
     try input.appendSlice(a, &hexToBytes(startup_golden_hex));
     try frame(a, &input, 'P', parse_body.items);

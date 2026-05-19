@@ -373,5 +373,5 @@ pub fn dump(w: *std.Io.Writer) !void {
         }
         try w.writeByte('\n');
     }
-    try w.print("summary: {d} tracked locks, {d} currently held\n", .{ total, held });
+    try w.print("LOCKS: {d} tracked locks, {d} currently held\n", .{ total, held });
 }

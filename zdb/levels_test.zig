@@ -1,4 +1,5 @@
 const std = @import("std");
+const utils = @import("utils");
 const zio = @import("zio");
 const zdb = @import("zdb");
 
@@ -30,9 +31,11 @@ const config = zdb.config;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the absolute path of a TmpDir (caller frees).
-fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    return tmp.dir.realpathAlloc(alloc, ".");
+/// Returns the absolute path of a TmpDir (caller frees). Sentinel slice
+/// because realPathFileAlloc allocates len+1; declaring []u8 here would
+/// make the caller's free undercount by 1 (DebugAllocator catches it).
+fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
+    return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
 }
 
 /// Builds a TableBuffer containing the given key/value pairs.
@@ -343,13 +346,8 @@ test "levels: open" {
         const p2 = try zdb.file_ids.sstPath(alloc, dir_path, 2);
         defer alloc.free(p2);
 
-        const f1 = try std.fs.createFileAbsolute(p1, .{});
-        defer f1.close();
-        try f1.writeAll(tb1.bytes);
-
-        const f2 = try std.fs.createFileAbsolute(p2, .{});
-        defer f2.close();
-        try f2.writeAll(tb2.bytes);
+        try vfs.writeFile(p1, tb1.bytes);
+        try vfs.writeFile(p2, tb2.bytes);
     }
 
     // Create manifest with table 1 at L0, table 2 at L1.
@@ -450,9 +448,7 @@ test "levels: doCompact L0 L1" {
         defer tb.deinit();
         const path = try zdb.file_ids.sstPath(alloc, dir_path, d.id);
         defer alloc.free(path);
-        const f = try std.fs.createFileAbsolute(path, .{});
-        defer f.close();
-        try f.writeAll(tb.bytes);
+        try vfs.writeFile(path, tb.bytes);
     }
     try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
     try ms.commit(&.{
@@ -514,9 +510,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
         defer tb.deinit();
         const p = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(p);
-        const f = try std.fs.createFileAbsolute(p, .{});
-        defer f.close();
-        try f.writeAll(tb.bytes);
+        try vfs.writeFile(p, tb.bytes);
     }
     // L0 table 2: {cc→vcc}
     {
@@ -524,9 +518,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
         defer tb.deinit();
         const p = try zdb.file_ids.sstPath(alloc, dir_path, 2);
         defer alloc.free(p);
-        const f = try std.fs.createFileAbsolute(p, .{});
-        defer f.close();
-        try f.writeAll(tb.bytes);
+        try vfs.writeFile(p, tb.bytes);
     }
     // L1 table 3: {bb→vbb, dd→vdd} — key range [bb..dd] overlaps [aa..cc].
     {
@@ -537,9 +529,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
         defer tb.deinit();
         const p = try zdb.file_ids.sstPath(alloc, dir_path, 3);
         defer alloc.free(p);
-        const f = try std.fs.createFileAbsolute(p, .{});
-        defer f.close();
-        try f.writeAll(tb.bytes);
+        try vfs.writeFile(p, tb.bytes);
     }
     try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
     try ms.commit(&.{
@@ -610,17 +600,13 @@ test "levels: doCompact L1 L2" {
         defer tb1.deinit();
         const p1 = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(p1);
-        const f1 = try std.fs.createFileAbsolute(p1, .{});
-        defer f1.close();
-        try f1.writeAll(tb1.bytes);
+        try vfs.writeFile(p1, tb1.bytes);
 
         var tb2 = try buildTable(alloc, &.{.{ .key = "cc", .ts = 0, .val = "vcc" }});
         defer tb2.deinit();
         const p2 = try zdb.file_ids.sstPath(alloc, dir_path, 2);
         defer alloc.free(p2);
-        const f2 = try std.fs.createFileAbsolute(p2, .{});
-        defer f2.close();
-        try f2.writeAll(tb2.bytes);
+        try vfs.writeFile(p2, tb2.bytes);
     }
     try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
     try ms.commit(&.{

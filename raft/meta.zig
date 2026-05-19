@@ -138,7 +138,7 @@ pub const MetaStore = struct {
         // run yet — the half-written tmp is just discarded.
         const tmp_path = try std.fs.path.join(alloc, &.{ dir_path, snapshot_tmp_name });
         defer alloc.free(tmp_path);
-        vfs.VFS.deleteFile(tmp_path) catch |err| switch (err) {
+        vfs.deleteFile(tmp_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
@@ -225,11 +225,11 @@ pub const MetaStore = struct {
 
         // Atomic rename — POSIX guarantees the directory entry flips
         // either fully to the new inode or stays at the old one.
-        try vfs.VFS.renameFile(tmp_path, final_path);
+        try vfs.renameFile(tmp_path, final_path);
 
         // dir-fsync so the rename itself is durable across power loss.
         // VFS.syncDir is best-effort (some filesystems don't support it).
-        vfs.VFS.syncDir(self.dir_path);
+        vfs.syncDir(self.dir_path);
 
         // Replace the in-memory snapshot. clone returns a heap-allocated
         // *SnapshotStruct that deeply owns its data + conf_state, so after

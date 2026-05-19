@@ -931,7 +931,7 @@ pub const Tree = struct {
         // Start dir sync while we're waiting for file syncs to be done. We can do dir sync here
         // because files have already been created and written. So, dir should have everything it
         // needs.
-        var dir_sync = try runtime.spawnOn(.background, .shared, vfs.VFS.syncDir, .{self.opts.dir});
+        var dir_sync = try runtime.spawnOn(.background, .shared, vfs.syncDir, .{self.opts.dir});
         defer dir_sync.join();
 
         // Join all sync fibers and collect output file IDs.

@@ -24,6 +24,11 @@
 
 const std = @import("std");
 const zio = @import("zio");
+const context = @import("context.zig");
+
+inline fn nowNs() i128 {
+    return std.Io.Timestamp.now(context.g().io, .real).nanoseconds;
+}
 
 pub const Bench = struct {
     /// Iteration count for the current sample. Set by the runner before
@@ -53,21 +58,21 @@ pub const Bench = struct {
     /// Call after setup work so it isn't counted toward the measurement.
     pub fn resetTimer(self: *Bench) void {
         self.elapsed_ns = 0;
-        self.start_ns = std.time.nanoTimestamp();
+        self.start_ns = nowNs();
         self.timer_running = true;
     }
 
     /// Pause the timer. Subsequent work won't count until `startTimer()`.
     pub fn stopTimer(self: *Bench) void {
         if (!self.timer_running) return;
-        self.elapsed_ns += std.time.nanoTimestamp() - self.start_ns;
+        self.elapsed_ns += nowNs() - self.start_ns;
         self.timer_running = false;
     }
 
     /// Resume the timer. Pairs with a prior `stopTimer()`.
     pub fn startTimer(self: *Bench) void {
         if (self.timer_running) return;
-        self.start_ns = std.time.nanoTimestamp();
+        self.start_ns = nowNs();
         self.timer_running = true;
     }
 
@@ -88,7 +93,7 @@ pub const Bench = struct {
     /// runner after the bench function returns.
     pub fn elapsed(self: *const Bench) i128 {
         if (self.timer_running) {
-            return self.elapsed_ns + (std.time.nanoTimestamp() - self.start_ns);
+            return self.elapsed_ns + (nowNs() - self.start_ns);
         }
         return self.elapsed_ns;
     }
@@ -98,7 +103,14 @@ pub const Bench = struct {
 // Fiber-local registry — same pattern as the test runner's FiberLog.
 // ---------------------------------------------------------------------------
 
-var map_mu: std.Thread.Mutex = .{};
+var map_mu: std.Io.Mutex = .init;
+
+inline fn mapLock() void {
+    map_mu.lockUncancelable(context.g().io);
+}
+inline fn mapUnlock() void {
+    map_mu.unlock(context.g().io);
+}
 var map: ?std.AutoHashMap(usize, *Bench) = null;
 
 pub fn initRegistry(alloc: std.mem.Allocator) void {
@@ -106,23 +118,23 @@ pub fn initRegistry(alloc: std.mem.Allocator) void {
 }
 
 pub fn deinitRegistry() void {
-    map_mu.lock();
-    defer map_mu.unlock();
+    mapLock();
+    defer mapUnlock();
     if (map) |*m| m.deinit();
     map = null;
 }
 
 pub fn register(b: *Bench) void {
     const task = zio.getCurrentTaskOrNull() orelse return;
-    map_mu.lock();
-    defer map_mu.unlock();
+    mapLock();
+    defer mapUnlock();
     if (map) |*m| m.put(@intFromPtr(task), b) catch {};
 }
 
 pub fn unregister() void {
     const task = zio.getCurrentTaskOrNull() orelse return;
-    map_mu.lock();
-    defer map_mu.unlock();
+    mapLock();
+    defer mapUnlock();
     if (map) |*m| _ = m.remove(@intFromPtr(task));
 }
 
@@ -130,8 +142,8 @@ pub fn unregister() void {
 /// before calling each `BENCH: …` test. Panics if called outside one.
 pub fn current() *Bench {
     const task = zio.getCurrentTaskOrNull() orelse @panic("bench.current() requires a zio fiber context");
-    map_mu.lock();
-    defer map_mu.unlock();
+    mapLock();
+    defer mapUnlock();
     if (map) |*m| {
         return m.get(@intFromPtr(task)) orelse @panic("bench.current() called outside a BENCH: test");
     }

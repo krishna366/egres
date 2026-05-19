@@ -3,7 +3,7 @@ const gen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
 
 fn buildTable(alloc: std.mem.Allocator, set_root_node: bool) !gen.TableBuffer {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     var root = try gen.TableWriter.initWithBuf(alloc, &buf);
@@ -199,7 +199,7 @@ test "enum unknown tag falls into catch-all" {
     // simulate a "future" schema by writing an unknown tag through the same
     // public API — the enum's catch-all variant lets us round-trip arbitrary
     // u8 values without losing them.
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
 
     var node = try gen.RowWriter.initWithBuf(std.testing.allocator, &buf);
@@ -221,7 +221,7 @@ test "array toSliceAlloc for u8/u16/u32/u64" {
     const alloc = std.testing.allocator;
 
     {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
         var w = try gen.U8ArrayOnlyWriter.initWithBuf(alloc, &buf);
         const vals = [_]u8{ 0, 127, 255 };
@@ -234,7 +234,7 @@ test "array toSliceAlloc for u8/u16/u32/u64" {
     }
 
     {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
         var w = try gen.U16ArrayOnlyWriter.initWithBuf(alloc, &buf);
         const vals = [_]u16{ 1, 2, 65535 };
@@ -247,7 +247,7 @@ test "array toSliceAlloc for u8/u16/u32/u64" {
     }
 
     {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
         var w = try gen.U32ArrayOnlyWriter.initWithBuf(alloc, &buf);
         const vals = [_]u32{ 10, 20, 30 };
@@ -260,7 +260,7 @@ test "array toSliceAlloc for u8/u16/u32/u64" {
     }
 
     {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
         var w = try gen.U64ArrayOnlyWriter.initWithBuf(alloc, &buf);
         const vals = [_]u64{ 100, 200, 300 };
@@ -546,11 +546,11 @@ test "clone roundtrip matches marshal" {
     const cloned = try original.clone(alloc);
     defer cloned.destroy(alloc);
 
-    var out_orig: std.ArrayList(u8) = .{};
+    var out_orig: std.ArrayList(u8) = .empty;
     defer out_orig.deinit(alloc);
     const off_orig = try original.marshalTo(alloc, &out_orig);
 
-    var out_clone: std.ArrayList(u8) = .{};
+    var out_clone: std.ArrayList(u8) = .empty;
     defer out_clone.deinit(alloc);
     const off_clone = try cloned.marshalTo(alloc, &out_clone);
 

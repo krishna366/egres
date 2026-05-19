@@ -2,17 +2,41 @@ const std = @import("std");
 const testing = std.testing;
 const zio = @import("zio");
 const vfs = @import("vfs");
+const utils = @import("utils");
 const bandwidth = vfs.bandwidth;
 const VFS = vfs.VFS;
 const Priority = vfs.Priority;
 const page_size = vfs.page_size;
 
+// 0.16 helpers: thin wrappers around std.Io.Dir that inject the
+// process-wide `io` from `utils.context`. Keeps the per-test call sites
+// readable (no `io` parameter to thread).
+inline fn ioOf() std.Io {
+    return utils.context.g().io;
+}
+fn createFileAbs(path: []const u8) !std.Io.File {
+    return std.Io.Dir.createFileAbsolute(ioOf(), path, .{});
+}
+fn openFileAbs(path: []const u8) !std.Io.File {
+    return std.Io.Dir.openFileAbsolute(ioOf(), path, .{});
+}
+fn deleteFileAbs(path: []const u8) !void {
+    return std.Io.Dir.deleteFileAbsolute(ioOf(), path);
+}
+fn accessAbs(path: []const u8) !void {
+    return std.Io.Dir.accessAbsolute(ioOf(), path, .{});
+}
+inline fn nowMs() i64 {
+    return std.Io.Timestamp.now(ioOf(), .real).toMilliseconds();
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn writeTempFile(path: []const u8, data: []const u8) !void {
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(data);
+    const io = ioOf();
+    const file = try createFileAbs(path);
+    defer file.close(io);
+    try file.writeStreamingAll(io, data);
 }
 
 // ── 1. Open / close round-trip ───────────────────────────────────────
@@ -20,7 +44,7 @@ fn writeTempFile(path: []const u8, data: []const u8) !void {
 test "open and close" {
     const path = "/tmp/vfs_test_open_close";
     try writeTempFile(path, "hello world");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -38,7 +62,7 @@ test "readAligned at aligned offset" {
     var data: [8192]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i);
     try writeTempFile(path, &data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -60,7 +84,7 @@ test "readAligned at unaligned offset" {
     var data: [8192]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i);
     try writeTempFile(path, &data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -82,7 +106,7 @@ test "readAligned alignment math" {
     var data: [8192]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i);
     try writeTempFile(path, &data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -121,11 +145,11 @@ test "readAligned alignment math" {
 // Uses /data/egres/ which the project pins to ext4.
 test "O_DIRECT write honors unaligned address + length + offset (content verified)" {
     const dir = "/data/egres";
-    std.fs.accessAbsolute(dir, .{}) catch return error.SkipZigTest;
+    accessAbs(dir) catch return error.SkipZigTest;
 
     const path = dir ++ "/vfs_test_direct_unaligned";
-    defer std.fs.deleteFileAbsolute(path) catch {};
-    std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
+    deleteFileAbs(path) catch {};
 
     // 16 MB + 1 page + 3 bytes — matches the size class where corruption
     // was observed (~16 MB SST). Length is odd at every plausible device
@@ -152,13 +176,14 @@ test "O_DIRECT write honors unaligned address + length + offset (content verifie
 
     // Read the file back through a plain (non-O_DIRECT) handle so we
     // observe what's actually on disk, not whatever caches we skipped.
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    try testing.expectEqual(@as(u64, len), try file.getEndPos());
+    const io = ioOf();
+    const file = try openFileAbs(path);
+    defer file.close(io);
+    try testing.expectEqual(@as(u64, len), (try file.stat(io)).size);
 
     const back = try testing.allocator.alloc(u8, len);
     defer testing.allocator.free(back);
-    const n = try file.readAll(back);
+    const n = try file.readPositionalAll(io, back, 0);
     try testing.expectEqual(len, n);
 
     // Tail must survive: checksum bytes intact AND match the body.
@@ -175,7 +200,7 @@ test "O_DIRECT fallback on tmpfs" {
     // VFS.openFile must succeed via the fallback path.
     const path = "/tmp/vfs_test_direct_fallback";
     try writeTempFile(path, "fallback test");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     const v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
@@ -198,7 +223,7 @@ test "bandwidth limiter deducts on read" {
     var data: [8192]u8 = undefined;
     @memset(&data, 0xFF);
     try writeTempFile(path, &data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     // High rate so P0 grants everything, but we can observe token deduction.
     var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
@@ -221,7 +246,7 @@ test "bandwidth limiter deducts on read" {
 test "mmap open and close" {
     const path = "/tmp/vfs_test_mmap_open";
     try writeTempFile(path, "mmap test data");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     var v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
@@ -239,7 +264,7 @@ test "mmap readAligned" {
     var data: [8192]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i);
     try writeTempFile(path, &data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     var v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
@@ -261,7 +286,7 @@ test "mmap readAligned" {
 test "mmap readAligned no allocation" {
     const path = "/tmp/vfs_test_mmap_nobuf";
     try writeTempFile(path, "no alloc test!");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     var v = vfs.g().*;
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
@@ -282,7 +307,7 @@ test "mmap enforces bandwidth limiter" {
     var data: [8192]u8 = undefined;
     @memset(&data, 0xFF);
     try writeTempFile(path, &data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
     const pages_before = limiter.pages.load(.monotonic);
@@ -308,7 +333,7 @@ test "read bandwidth enforcement" {
     defer testing.allocator.free(data);
     @memset(data, 0xAB);
     try writeTempFile(path, data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     // Rate must be >= 1024*page_size so per-ms refill >= page_size
     // (avoids alignToPage inflation). At 4 MB/s, reading 4 MB takes ~1s.
@@ -335,10 +360,10 @@ test "read bandwidth enforcement" {
     try testing.expectEqual(@as(u64, 0), limiter.pages.load(.monotonic));
 
     // Time a P1 read of the full file — must wait for refill.
-    const start = std.time.milliTimestamp();
+    const start = nowMs();
     const r = try handle.readAligned(testing.allocator, 0, file_size, .p1);
     defer r.free();
-    const elapsed_ms = std.time.milliTimestamp() - start;
+    const elapsed_ms = nowMs() - start;
 
     try testing.expectEqual(file_size, r.data.len);
     // At 4 MB/s, 4 MB should take ~1000ms. Allow wide range for CI variance.
@@ -357,7 +382,7 @@ test "write bandwidth enforcement" {
     defer testing.allocator.free(data);
     @memset(data, 0xCD);
     try writeTempFile(path, data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     // Rate must be >= 8192*page_size so (per-ms refill)/write_cost >= page_size.
     // At 32 MB/s with write_cost=8, effective write rate ~4 MB/s.
@@ -371,8 +396,8 @@ test "write bandwidth enforcement" {
     });
 
     // Open for writing (need a real fd, not O_DIRECT for writes on tmpfs).
-    const fd = try std.posix.open(path, .{ .ACCMODE = .WRONLY }, 0);
-    defer std.posix.close(fd);
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0);
+    defer (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(ioOf());
 
     var v = VFS.new(&limiter);
     const fh = vfs.FileHandle{ .file = zio.File.fromFd(fd), .file_size = file_size, .vfs = &v };
@@ -387,9 +412,9 @@ test "write bandwidth enforcement" {
         break :blk;
     };
 
-    const start = std.time.milliTimestamp();
+    const start = nowMs();
     try fh.write(data, 0, .p1);
-    const elapsed_ms = std.time.milliTimestamp() - start;
+    const elapsed_ms = nowMs() - start;
 
     // Effective write rate ~4 MB/s. 2 MB should take ~500ms. Allow wide range.
     try testing.expect(elapsed_ms >= 250);
@@ -420,7 +445,7 @@ test "P1 prioritized over P2" {
     defer testing.allocator.free(data);
     @memset(data, 0xEF);
     try writeTempFile(path, data);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     // Rate >= 1024*page_size so per-ms refill >= page_size (no alignment inflation).
     const rate = 4096 * page_size; // 16 MB/s
@@ -472,17 +497,18 @@ test "P1 prioritized over P2" {
 fn batchReadTestImpl() !void {
     const alloc = testing.allocator;
     const path = "/tmp/vfs_test_batch_read";
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer deleteFileAbs(path) catch {};
 
     // Write a 2 MiB file. Each page filled with a byte derived from page index.
     const num_pages = 512;
     {
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
+        const io = ioOf();
+        const file = try createFileAbs(path);
+        defer file.close(io);
         var buf: [page_size]u8 = undefined;
         for (0..num_pages) |i| {
             @memset(&buf, @intCast(i % 251)); // distinct fill per page (mod 251 to stay in u8)
-            try file.writeAll(&buf);
+            try file.writeStreamingAll(io, &buf);
         }
     }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const utils = @import("utils");
 const zdb = @import("zdb");
 const Key = zdb.key.Key;
 const vfs = zdb.vfs;
@@ -186,7 +187,7 @@ test "table binary fuse large keyset contains sampled keys" {
     const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(t);
 
-    const seed: u64 = @intCast(std.time.nanoTimestamp());
+    const seed: u64 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds);
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
 

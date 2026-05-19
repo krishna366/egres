@@ -1,15 +1,17 @@
 const std = @import("std");
+const utils = @import("utils");
 const raft = @import("raft");
 const zio = @import("zio");
+const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
 const zen = raft.buffers;
 const u = raft.utils;
 
 fn makeTempWalDir(alloc: std.mem.Allocator) ![]u8 {
     var path_buf: [160]u8 = undefined;
-    const ts = std.time.nanoTimestamp();
+    const ts = std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds;
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/egres-diskwal-{d}", .{ts});
-    try std.fs.cwd().makePath(path);
+    try vfs.createDirPath(path);
     return alloc.dupe(u8, path);
 }
 
@@ -118,10 +120,8 @@ fn checkLargePayload(reader: zen.LogEntryReader, index: u64, expected_len: usize
 }
 
 fn countWalFiles(path: []const u8) !usize {
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-    defer dir.close();
-
-    var it = dir.iterate();
+    var it = try vfs.iterateDir(path);
+    defer it.deinit();
     var count: usize = 0;
     while (try it.next()) |entry_dir| {
         if (entry_dir.kind != .file) continue;
@@ -134,7 +134,7 @@ test "diskwal term and index basics" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -161,7 +161,7 @@ test "diskwal entriesRange max_bytes keeps at least one" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -190,7 +190,7 @@ test "diskwal append overwrites conflicting suffix" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -222,7 +222,7 @@ test "diskwal truncateFrom drops suffix" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -244,7 +244,7 @@ test "diskwal persists hardstate and entries across reopen" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -277,7 +277,7 @@ test "diskwal drops malformed trailing wal files on reopen" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -300,12 +300,11 @@ test "diskwal drops malformed trailing wal files on reopen" {
 
     // Corrupt the header of the last (current) file by flipping bytes in the magic.
     {
-        var dir = try std.fs.cwd().openDir(wal_dir, .{ .iterate = true });
-        defer dir.close();
+        var iter = try vfs.iterateDir(wal_dir);
+        defer iter.deinit();
 
         // Find the highest fid file.
         var max_fid: u64 = 0;
-        var iter = dir.iterate();
         while (try iter.next()) |e| {
             if (e.kind != .file) continue;
             const fid = raft.diskwal.wal.parseWalFid(e.name) orelse continue;
@@ -316,10 +315,11 @@ test "diskwal drops malformed trailing wal files on reopen" {
         // Corrupt the highest file's magic bytes.
         const bad_path = try std.fmt.allocPrint(alloc, "{s}/{d:0>5}.wal", .{ wal_dir, max_fid });
         defer alloc.free(bad_path);
-        var file = try std.fs.cwd().openFile(bad_path, .{ .mode = .read_write });
-        defer file.close();
+        const io = utils.context.g().io;
+        var file = try std.Io.Dir.cwd().openFile(io, bad_path, .{ .mode = .read_write });
+        defer file.close(io);
         var garbage = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
-        _ = try file.pwriteAll(&garbage, 0);
+        _ = try file.writePositionalAll(io, &garbage, 0);
     }
 
     // Reopen — the malformed current file should be dropped. The previous
@@ -343,7 +343,7 @@ test "diskwal tolerates WAL firstIndex below snapshot+1 on reopen" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -364,7 +364,7 @@ test "BIG: diskwal storage" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -421,7 +421,7 @@ test "BIG: diskwal truncate storage" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -457,7 +457,7 @@ test "BIG: diskwal large payload rotation" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -715,7 +715,7 @@ test "diskwal CURRENT.wal recovery after clean close" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -747,7 +747,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -767,15 +767,16 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         // The current file is 00001.wal (no rotation happened).
         const current_path = try std.fmt.allocPrint(alloc, "{s}/00001.wal", .{wal_dir});
         defer alloc.free(current_path);
-        var file = try std.fs.cwd().openFile(current_path, .{ .mode = .read_write });
-        defer file.close();
+        const io = utils.context.g().io;
+        var file = try std.Io.Dir.cwd().openFile(io, current_path, .{ .mode = .read_write });
+        defer file.close(io);
 
         // Read past the first two entries to find the 3rd entry's payload.
         const hdr_size: usize = zbuf.Frame.hdr_size;
         var offset: u64 = diskwal.log_file_offset;
         var hdr_buf: [zbuf.Frame.hdr_size]u8 = undefined;
         for (0..2) |_| {
-            _ = try file.preadAll(&hdr_buf, offset);
+            _ = try file.readPositionalAll(utils.context.g().io, &hdr_buf, offset);
             // u32 length lives at byte 8 of the prefix (after the u64 hash).
             const payload_len = std.mem.readInt(u32, hdr_buf[8..12], .little);
             offset += hdr_size + payload_len;
@@ -783,9 +784,9 @@ test "diskwal CRC corruption truncates at corrupt entry" {
         // Now offset points at the 3rd entry. Corrupt a byte in its payload.
         const corrupt_offset = offset + hdr_size + 1; // +1 to hit inside the payload
         var byte: [1]u8 = undefined;
-        _ = try file.preadAll(&byte, corrupt_offset);
+        _ = try file.readPositionalAll(utils.context.g().io, &byte, corrupt_offset);
         byte[0] ^= 0xFF; // flip all bits
-        _ = try file.pwriteAll(&byte, corrupt_offset);
+        _ = try file.writePositionalAll(utils.context.g().io, &byte, corrupt_offset);
     }
 
     // Reopen — should recover only entries 1 and 2.
@@ -810,11 +811,10 @@ test "diskwal writeHeader/readHeader round-trip" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
-    const vfs = @import("vfs");
     const vfs_inst = vfs.g();
 
     var lf = try raft.diskwal.logFile.createCurrent(vfs_inst, alloc, wal_dir, 1);
@@ -893,7 +893,7 @@ test "diskwal findIndexOlderThan bytes-only branch" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -925,14 +925,14 @@ test "diskwal findIndexOlderThan age-only branch" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
     defer ds.deinit();
 
-    const now_secs: u32 = @intCast(std.time.timestamp());
+    const now_secs: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
     // Slot 1: 100 s ago. Slot 2: 50 s ago. Slot 3: 10 s ago.
     const ages = [_]u32{ 100, 50, 10 };
     for (ages, 1..) |age, i| {
@@ -960,14 +960,14 @@ test "diskwal findIndexOlderThan returns larger of bytes and age" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
     defer ds.deinit();
 
-    const now_secs: u32 = @intCast(std.time.timestamp());
+    const now_secs: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
     // 5 entries, 1 KiB each. Slot 1 is the oldest (100 s). Slots 2–5 are fresh.
     const payload = try alloc.alloc(u8, 1024);
     defer alloc.free(payload);
@@ -990,7 +990,7 @@ test "diskwal findIndexOlderThan returns null on empty WAL" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 
@@ -1007,7 +1007,7 @@ test "diskwal rotation creates numbered file and new CURRENT.wal" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
-        std.fs.cwd().deleteTree(wal_dir) catch {};
+        vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
 

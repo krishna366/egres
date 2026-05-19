@@ -1,4 +1,5 @@
 const std = @import("std");
+const utils = @import("utils");
 
 fn runGenExpectFail(alloc: std.mem.Allocator, schema_path: []const u8, expect_substr: []const u8) !void {
     const argv = [_][]const u8{
@@ -9,15 +10,14 @@ fn runGenExpectFail(alloc: std.mem.Allocator, schema_path: []const u8, expect_su
         schema_path,
     };
 
-    const res = try std.process.Child.run(.{
-        .allocator = alloc,
+    const res = try std.process.run(alloc, utils.context.g().io, .{
         .argv = &argv,
     });
     defer alloc.free(res.stdout);
     defer alloc.free(res.stderr);
 
     const exit_code = switch (res.term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => return error.UnexpectedChildTermination,
     };
     try std.testing.expect(exit_code != 0);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const utils = @import("utils");
 const zio = @import("zio");
 const zdb = @import("zdb");
 const vfs = zdb.vfs;
@@ -22,8 +23,11 @@ const config = zdb.config;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    return tmp.dir.realpathAlloc(alloc, ".");
+fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
+    // realPathFileAlloc returns [:0]u8 (allocates len+1, sentinel at end).
+    // Returning []u8 would make callers free the wrong size and trip
+    // DebugAllocator's "alloc 49 != free 48" check.
+    return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +128,7 @@ fn buildAndWriteTable(alloc: std.mem.Allocator, path: []const u8, primary: []con
     try bld.add(.{ .primary = primary }, "v");
     var tb = try bld.finish();
     defer tb.deinit();
-    const f = try std.fs.createFileAbsolute(path, .{});
-    defer f.close();
-    try f.writeAll(tb.bytes);
+    try vfs.writeFile(path, tb.bytes);
 }
 
 test "forest: split tree" {

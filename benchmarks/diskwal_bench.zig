@@ -56,7 +56,8 @@ fn benchOne(
     // concurrent `zig build bench` invocations don't collide.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(b.alloc, ".");
+    const io = utils.context.g().io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", b.alloc);
     defer b.alloc.free(dir);
 
     var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, 0);

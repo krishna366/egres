@@ -509,7 +509,7 @@ pub const wal = struct {
     fn deleteFileByName(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8) void {
         const path = logFile.fullPath(alloc, dir_path, name) catch return;
         defer alloc.free(path);
-        vfs_mod.VFS.deleteFile(path) catch {};
+        vfs_mod.deleteFile(path) catch {};
     }
 
     fn deleteFileByFid(self: *wal, fid: u64) void {

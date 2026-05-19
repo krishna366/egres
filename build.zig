@@ -418,8 +418,8 @@ fn addAllTests(
     // BIG/BENCH gating happens at runtime via the test_runner CLI flags
     // (`--bigtest`, `--bench`); no compile-time `build_options` flag needed.
     const test_imports = .{
-        "zbuf",   "zdb",    "raft",   "utils",      "zio", "vfs",
-        "metrics", "buffers_gen", "transport", "serial", "pgwire",
+        "zbuf",    "zdb",         "raft",      "utils",  "zio", "vfs",
+        "metrics", "buffers_gen", "transport", "serial", "pgwire", "runtime",
     };
 
     const root_mod = b.createModule(.{

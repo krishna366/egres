@@ -19,7 +19,7 @@ const Stream = zio.net.Stream;
 /// Stub handler. Records the SQL it sees and emits a single hardcoded
 /// row each time. Used by the driver test below.
 const StubHandler = struct {
-    last_sql: std.ArrayList(u8) = .{},
+    last_sql: std.ArrayList(u8) = .empty,
     call_count: u32 = 0,
     alloc: std.mem.Allocator,
 
@@ -50,7 +50,7 @@ const StubHandler = struct {
 
 /// Build the bytes of a Startup3("user=u\0database=d\0\0") message.
 fn buildStartup(buf: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-    var body: std.ArrayList(u8) = .{};
+    var body: std.ArrayList(u8) = .empty;
     defer body.deinit(a);
     try body.appendSlice(a, "user");
     try body.append(a, 0);
@@ -118,7 +118,7 @@ fn clientFn(ctx: *TestCtx) !void {
     defer stream.close();
 
     // Send Startup3 + Query("SELECT 'hello'") + Terminate.
-    var to_send: std.ArrayList(u8) = .{};
+    var to_send: std.ArrayList(u8) = .empty;
     defer to_send.deinit(ctx.a);
     try buildStartup(&to_send, ctx.a);
     try buildQuery(&to_send, ctx.a, "SELECT 'hello'");
@@ -128,7 +128,7 @@ fn clientFn(ctx: *TestCtx) !void {
     // Drain the server's response. The driver loop terminates when
     // the peer sends 'X', then the server closes the stream — so
     // reading until EOF here is sufficient.
-    var inbox: std.ArrayList(u8) = .{};
+    var inbox: std.ArrayList(u8) = .empty;
     defer inbox.deinit(ctx.a);
     var buf: [4096]u8 = undefined;
     while (true) {
@@ -142,7 +142,7 @@ fn clientFn(ctx: *TestCtx) !void {
     // BackendKeyData + ReadyForQuery + RowDescription + DataRow +
     // CommandComplete + ReadyForQuery.
     var off: usize = 0;
-    var tags: std.ArrayList(u8) = .{};
+    var tags: std.ArrayList(u8) = .empty;
     defer tags.deinit(ctx.a);
     while (off < inbox.items.len) {
         const r = try pgwire.proto.decodeMessage(inbox.items[off..]);
@@ -215,7 +215,7 @@ test "driver: full startup + Query + Terminate round-trip" {
         .handler = &handler,
     };
 
-    var group = runtime.group();
+    var group = zio.Group{};
     defer group.cancel();
 
     try group.spawn(serverFn, .{&ctx});

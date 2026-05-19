@@ -9,7 +9,7 @@ inline fn fdToFile(fd: posix.fd_t) std.Io.File {
     return .{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
-inline fn fileSize(fd: posix.fd_t) !u64 {
+inline fn fdSize(fd: posix.fd_t) !u64 {
     return (try fdToFile(fd).stat(utils.context.g().io)).size;
 }
 
@@ -319,7 +319,7 @@ pub const VFS = struct {
                 const fd = try openDirect(path, .{});
                 errdefer closeFd(fd);
 
-                const file_size = try fileSize(fd);
+                const file_size = try fdSize(fd);
                 const mapped = try posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
                 return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .mapped = mapped, .vfs = self };
             },
@@ -327,7 +327,7 @@ pub const VFS = struct {
                 const fd = try openDirect(path, opts);
                 errdefer closeFd(fd);
 
-                const file_size = try fileSize(fd);
+                const file_size = try fdSize(fd);
                 return .{ .file = zio.File.fromFd(fd), .file_size = file_size, .vfs = self };
             },
             .memory => {
@@ -377,23 +377,121 @@ pub const VFS = struct {
         return .{ .file = zio.File.fromFd(fd), .file_size = 0, .vfs = self };
     }
 
-    pub fn renameFile(old_path: []const u8, new_path: []const u8) !void {
-        try zio.Dir.cwd().rename(old_path, zio.Dir.cwd(), new_path);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Module-level metadata ops
+// ═══════════════════════════════════════════════════════════════════════
+//
+// These are control-plane operations: they don't go through bandwidth
+// accounting or O_DIRECT semantics. Production code, tests, and tools all
+// route through these so the project's "always use vfs" rule applies to
+// the whole filesystem surface, not just data-plane I/O.
+//
+// Where zio.fs has the op (`zio.deleteFile`, `zio.rename`, `zio.access`,
+// `zio.openDir`, …), we wrap it for naming consistency.
+// Where zio.fs is missing higher-level conveniences (`createDirPath`,
+// `deleteTree`, file iteration), we wrap `std.Io.Dir` with the global
+// `io` from `utils.context`.
+
+pub fn access(path: []const u8) !void {
+    try zio.Dir.cwd().access(path, .{});
+}
+
+/// Recursive mkdir-p. Wraps std.Io.Dir.createDirPath (zio.fs doesn't have it).
+pub fn createDirPath(path: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(utils.context.g().io, path);
+}
+
+/// Recursive delete. Wraps std.Io.Dir.deleteTree (zio.fs doesn't have it).
+pub fn deleteTree(path: []const u8) !void {
+    try std.Io.Dir.cwd().deleteTree(utils.context.g().io, path);
+}
+
+pub fn renameFile(old_path: []const u8, new_path: []const u8) !void {
+    try zio.Dir.cwd().rename(old_path, zio.Dir.cwd(), new_path);
+}
+
+pub fn deleteFile(path: []const u8) !void {
+    try zio.Dir.cwd().deleteFile(path);
+}
+
+/// Best-effort directory fsync so newly created filenames are durable.
+/// Silently ignores errors (tmpfs, some network mounts don't support dir fsync).
+pub fn syncDir(path: []const u8) void {
+    const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
+    const f = zio.File.fromFd(fd);
+    defer f.close();
+    f.sync(.{}) catch {};
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// High-level file-content helpers (one-shot create/read)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// These are convenience wrappers for test setup / small-file scenarios.
+// For SST-style I/O, use `VFS.openFile` / `VFS.createFile` + `FileHandle`.
+
+/// Create (truncating if it exists) and write `data` in one shot.
+pub fn writeFile(path: []const u8, data: []const u8) !void {
+    const f = try zio.Dir.cwd().createFile(path, .{});
+    defer f.close();
+    var off: u64 = 0;
+    while (off < data.len) {
+        off += try f.write(data[off..], off);
+    }
+}
+
+/// Open and read the whole file. Caller owns the returned buffer.
+pub fn readFile(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    const f = try zio.Dir.cwd().openFile(path, .{});
+    defer f.close();
+    const info = try f.stat();
+    const buf = try allocator.alloc(u8, @intCast(info.size));
+    errdefer allocator.free(buf);
+    var off: u64 = 0;
+    while (off < buf.len) {
+        const n = try f.read(buf[off..], off);
+        if (n == 0) break;
+        off += n;
+    }
+    return buf;
+}
+
+/// Stat a path for its size in bytes.
+pub fn fileSize(path: []const u8) !u64 {
+    const f = try zio.Dir.cwd().openFile(path, .{});
+    defer f.close();
+    return (try f.stat()).size;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Directory iteration
+// ═══════════════════════════════════════════════════════════════════════
+//
+// zio.fs doesn't expose iteration today. We wrap std.Io.Dir's iterator
+// so callers don't have to thread `io` into every `next()` call.
+
+pub const DirIter = struct {
+    inner: std.Io.Dir,
+    iter: std.Io.Dir.Iterator,
+
+    pub const Entry = std.Io.Dir.Entry;
+
+    pub fn next(self: *DirIter) !?Entry {
+        return self.iter.next(utils.context.g().io);
     }
 
-    /// Best-effort directory fsync so newly created filenames are durable.
-    /// Silently ignores errors (tmpfs, some network mounts don't support dir fsync).
-    pub fn syncDir(path: []const u8) void {
-        const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
-        const f = zio.File.fromFd(fd);
-        defer f.close();
-        f.sync(.{}) catch {};
-    }
-
-    pub fn deleteFile(path: []const u8) !void {
-        try zio.Dir.cwd().deleteFile(path);
+    pub fn deinit(self: *DirIter) void {
+        self.inner.close(utils.context.g().io);
     }
 };
+
+pub fn iterateDir(path: []const u8) !DirIter {
+    const io = utils.context.g().io;
+    const d = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    return .{ .inner = d, .iter = d.iterate() };
+}
 
 /// Open a file according to `opts`. Honors `mode = .direct` (O_DIRECT,
 /// Linux only) and `flags.{ writable, dsync }`. Falls back to a plain

@@ -510,7 +510,7 @@ pub const Forest = struct {
 
         // Best-effort directory sync.
         if (self.opts.dir.len > 0) {
-            var dir_sync = try runtime.spawnOn(.background, .shared, vfs.VFS.syncDir, .{self.opts.dir});
+            var dir_sync = try runtime.spawnOn(.background, .shared, vfs.syncDir, .{self.opts.dir});
             defer dir_sync.join();
         }
 
@@ -1171,7 +1171,7 @@ pub const Forest = struct {
     pub fn hasFile(self: *Forest, file_id: u64) bool {
         const path = fi.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
         defer self.allocator.free(path);
-        std.Io.Dir.cwd().access(utils.context.g().io, path, .{}) catch return false;
+        vfs.access(path) catch return false;
         return true;
     }
 

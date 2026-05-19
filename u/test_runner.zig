@@ -1,6 +1,48 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
+const context = utils.context;
+
+// 0.16 helpers: std.Thread.Mutex / ResetEvent / time.nanoTimestamp are gone.
+// These wrap std.Io.Mutex / Event / Timestamp using the process-wide `io`.
+// Critical sections in this file are short / CPU-only, so the wrappers are
+// safe to call from both zio fibers and the watchdog std.Thread.
+inline fn ioOf() std.Io {
+    return context.g().io;
+}
+inline fn nowNs() i128 {
+    return std.Io.Timestamp.now(ioOf(), .real).nanoseconds;
+}
+fn mlock(m: *std.Io.Mutex) void {
+    m.lockUncancelable(ioOf());
+}
+fn munlock(m: *std.Io.Mutex) void {
+    m.unlock(ioOf());
+}
+fn timeoutNs(ns: u64) std.Io.Timeout {
+    return .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(@intCast(ns)), .clock = .awake } };
+}
+
+// Tty / Color were reorganized in 0.16 (→ std.Io.Terminal,
+// detect() now takes io + env-var bools). Tests don't need color output to
+// pass; stub the whole thing as no-op so the runner compiles. If we want
+// color back later, swap the stub for a real Terminal-backed type.
+const Tty = struct {
+    pub const Color = enum {
+        reset,
+        dim,
+        red,
+        green,
+        yellow,
+        bright_red,
+        bright_green,
+        bright_yellow,
+    };
+    pub fn setColor(_: Tty, _: *std.Io.Writer, _: Color) !void {}
+    pub fn detect() Tty {
+        return .{};
+    }
+};
 // Reach into utils module rather than @import("bench.zig") so the runner
 // and any test importing utils.bench end up sharing the same module tree
 // (avoids "file exists in two modules" errors).
@@ -138,7 +180,16 @@ const Args = struct {
     exclude: ?[]const u8 = null,
     run_big: bool = false,
     only_bench: bool = false,
+    /// `HANG:`-prefixed tests are watchdog smoke tests that intentionally
+    /// never finish. Excluded by default — pass `--run-hang` to include
+    /// them, e.g. to verify dump cadence and the `--wd-kill-s` exit.
+    run_hang: bool = false,
     parallel: u6 = default_parallel,
+    /// Watchdog tunables. `wd_stuck_tick_s` is one knob serving two
+    /// purposes — dump threshold AND tick interval — so cadence is
+    /// always one-dump-per-window. `wd_kill_s = 0` disables the kill.
+    wd_stuck_tick_s: u64 = 20,
+    wd_kill_s: u64 = 300,
 };
 
 const Counters = struct {
@@ -168,7 +219,7 @@ const FiberLog = struct {
 // Multi-threaded: zio executors live on separate OS threads and call into
 // logFn from any of them. std.Thread.Mutex (not zio.Mutex) because logFn
 // must work in any context, including when zio's scheduler is mid-handoff.
-var log_map_mu: std.Thread.Mutex = .{};
+var log_map_mu: std.Io.Mutex = .init;
 var log_map: ?std.AutoHashMap(usize, *FiberLog) = null;
 
 /// Set in `main()` before the runtime starts; read from `runOne`/`runBench`
@@ -178,31 +229,36 @@ var log_map: ?std.AutoHashMap(usize, *FiberLog) = null;
 /// watchdog (none today, but easy to imagine) is a no-op call.
 var thread_watchdog: ?*ThreadWatchdog = null;
 
+/// `--verbose` flag: print "STARTING <name>" before each test runs.
+/// Off by default; flip on to diagnose wedges so the log shows which
+/// fiber entered the test body but never finished.
+var verbose_start: bool = false;
+
 fn registerFiberLog(log: *FiberLog) void {
     const task = zio.getCurrentTaskOrNull() orelse return;
-    log_map_mu.lock();
-    defer log_map_mu.unlock();
+    mlock(&log_map_mu);
+    defer munlock(&log_map_mu);
     if (log_map) |*m| m.put(@intFromPtr(task), log) catch {};
 }
 
 fn unregisterFiberLog() void {
     const task = zio.getCurrentTaskOrNull() orelse return;
-    log_map_mu.lock();
-    defer log_map_mu.unlock();
+    mlock(&log_map_mu);
+    defer munlock(&log_map_mu);
     if (log_map) |*m| _ = m.remove(@intFromPtr(task));
 }
 
 fn lookupFiberLog() ?*FiberLog {
     const task = zio.getCurrentTaskOrNull() orelse return null;
-    log_map_mu.lock();
-    defer log_map_mu.unlock();
+    mlock(&log_map_mu);
+    defer munlock(&log_map_mu);
     if (log_map) |*m| return m.get(@intFromPtr(task));
     return null;
 }
 
 fn capturingLogFn(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -239,7 +295,13 @@ const help_text =
     \\  --exclude <substr>  Skip tests whose name contains <substr> (composes with --filter).
     \\  --bigtest           Include `BIG: …` prefixed tests (slow, opt-in).
     \\  --only-bench        Run only `BENCH: …` tests (used by `zig build bench`).
+    \\  --run-hang          Include `HANG: …` tests — never finish; exist to
+    \\                      exercise the process-level watchdog. Default run
+    \\                      gets killed at --wd-kill-s.
     \\  --parallel <N>      Concurrent test fibers. 0 (default) = max(2, cpu_count/2).
+    \\  --verbose           Print "STARTING <name>" before each test (debug wedges).
+    \\  --wd-stuck-tick-s <N> Watchdog: dump threshold AND tick interval, seconds (default 20).
+    \\  --wd-kill-s <N>     Abort process after N seconds of no progress (default 300; 0 disables).
     \\  --help, -h          Show this help and exit.
     \\
     \\Examples:
@@ -253,7 +315,8 @@ const help_text =
 
 fn parseArgs(alloc: std.mem.Allocator) !Args {
     var args: Args = .{};
-    const argv = try std.process.argsAlloc(alloc);
+    const argv = try context.g().argv();
+    _ = alloc;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -270,8 +333,18 @@ fn parseArgs(alloc: std.mem.Allocator) !Args {
             args.run_big = true;
         } else if (std.mem.eql(u8, a, "--only-bench")) {
             args.only_bench = true;
+        } else if (std.mem.eql(u8, a, "--run-hang")) {
+            args.run_hang = true;
         } else if (std.mem.eql(u8, a, "--parallel") and i + 1 < argv.len) {
             args.parallel = try std.fmt.parseInt(u6, argv[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--verbose")) {
+            verbose_start = true;
+        } else if (std.mem.eql(u8, a, "--wd-stuck-tick-s") and i + 1 < argv.len) {
+            args.wd_stuck_tick_s = try std.fmt.parseInt(u64, argv[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--wd-kill-s") and i + 1 < argv.len) {
+            args.wd_kill_s = try std.fmt.parseInt(u64, argv[i + 1], 10);
             i += 1;
         } else {
             std.debug.print("test_runner: unknown arg: {s}\n\n{s}", .{ a, help_text });
@@ -302,8 +375,8 @@ const SharedCtx = struct {
     counters: *Counters,
     seq: *std.atomic.Value(u32),
     total: u32,
-    out: *std.io.Writer,
-    tty: std.io.tty.Config,
+    out: *std.Io.Writer,
+    tty: Tty,
     // Set during the parallel round to collect failures for serial retry.
     // Null during the retry round itself (one bite at the apple).
     failures: ?*std.ArrayList(std.builtin.TestFn),
@@ -313,14 +386,29 @@ const SharedCtx = struct {
     running: *RunningSet,
 };
 
-/// Currently-running tests, used by the watchdog to identify wedges.
-/// Guarded by a `std.Thread.Mutex` rather than `zio.Mutex` so the
-/// std.Thread watchdog can safely snapshot it without depending on the
-/// zio runtime being alive — critical sections here are pure CPU work
-/// (no yields), so grabbing a thread mutex from a fiber is safe.
+/// Bookkeeping for the watchdog dump. `list` holds tests that have
+/// acquired the semaphore and entered the test body — i.e. POST-sem
+/// "actually running" fibers, never queued ones. `queued` and
+/// `total`/`completed` give the dump enough context to say "of N
+/// kept, K completed, R running, Q still queued on the sem".
+///
+/// Guarded by a `std.Io.Mutex` for cross-fiber writes; the std.Thread
+/// watchdog grabs it via `mlock` (an `lockUncancelable`-on-fiber-or-
+/// thread shim) — critical sections here are pure CPU (no yields), so
+/// it's safe to take the io-mutex from a thread.
 const RunningSet = struct {
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
     list: std.ArrayList(Entry) = .empty,
+    /// Spawned-but-not-yet-acquired-sem count. Incremented before
+    /// `sem.waitUncancelable()` and decremented immediately after, so
+    /// at any instant: `queued + list.len + completed ≈ total`.
+    queued: std.atomic.Value(u32) = .init(0),
+    /// Completed-test counter pointer (shared with SharedCtx.seq) and
+    /// the total test count for the current round. Null while no round
+    /// is active. Used only by the watchdog for the dump header — not
+    /// load-bearing for correctness.
+    completed: ?*std.atomic.Value(u32) = null,
+    total: u32 = 0,
 
     const Entry = struct {
         name: []const u8,
@@ -328,17 +416,17 @@ const RunningSet = struct {
     };
 
     fn add(self: *RunningSet, name: []const u8) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        mlock(&self.mu);
+        defer munlock(&self.mu);
         self.list.append(std.heap.page_allocator, .{
             .name = name,
-            .start_ns = std.time.nanoTimestamp(),
+            .start_ns = nowNs(),
         }) catch {};
     }
 
     fn remove(self: *RunningSet, name: []const u8) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        mlock(&self.mu);
+        defer munlock(&self.mu);
         for (self.list.items, 0..) |t, i| {
             if (t.name.ptr == name.ptr and t.name.len == name.len) {
                 _ = self.list.orderedRemove(i);
@@ -359,37 +447,49 @@ const RunningSet = struct {
 ///   • `touch()` is called from each test completion. It just stores a
 ///     monotonic-clock timestamp atomically; safe to call from any
 ///     thread/fiber/anywhere.
-///   • The thread wakes every `tick_s` seconds via `wake.timedWait`.
+///   • The thread wakes every `stuck_tick_s` seconds via `wake.timedWait`
+///     — the same value is also the "test has been stuck this long" dump
+///     threshold, so the dump cadence is exactly one-per-window.
 ///   • Fires a dump when EITHER:
-///       (a) no test has completed in `stuck_after_s` seconds, OR
-///       (b) some specific running test has been live > `stuck_after_s`.
+///       (a) no test has completed in `stuck_tick_s` seconds, OR
+///       (b) some specific running test has been live > `stuck_tick_s`.
 ///     The dump names the stuck tests (with elapsed-ms) and includes
 ///     a TrackedMutex snapshot. Keeps watching so a growing wedge gets
 ///     fresh dumps each tick.
+///   • If `kill_after_s > 0` and no progress for that long, the watchdog
+///     dumps a final diagnostic and aborts the process. 0 disables the
+///     kill (debug-without-time-bomb mode).
 ///
 /// Owns its own RunningSet so the watchdog and test runner share one
 /// source of truth on what's currently executing.
 ///
 /// Lifecycle: `init` → `start` → `touch` ... `touch` → `stop`. `stop`
 /// flips the wake event and joins; without that the join would block
-/// for up to `tick_s` waiting for the next tick.
+/// for up to `stuck_tick_s` waiting for the next tick.
 const ThreadWatchdog = struct {
     last_progress_ns: std.atomic.Value(i64),
-    /// Set by `stop()`. The loop uses `wake.timedWait(tick_s)` instead of
-    /// raw `std.Thread.sleep` so `stop()` can interrupt the sleep
-    /// immediately — without this, shutdown would pay up to `tick_s`
-    /// seconds of latency waiting for the next tick.
-    wake: std.Thread.ResetEvent = .{},
+    /// Set by `stop()`. The loop uses `wake.timedWait(stuck_tick_s)`
+    /// instead of raw `std.Thread.sleep` so `stop()` can interrupt the
+    /// sleep immediately — without this, shutdown would pay up to
+    /// `stuck_tick_s` seconds of latency waiting for the next tick.
+    wake: std.Io.Event = .unset,
     thread: ?std.Thread = null,
-    stuck_after_s: u64,
-    tick_s: u64,
+    /// One knob for two purposes: how long a test has to be stuck before
+    /// we dump, AND how often we re-check. Holding them equal keeps the
+    /// dump cadence clean and removes a footgun (tick > stuck would silently
+    /// delay the first dump).
+    stuck_tick_s: u64,
+    /// Hard timeout: after this many seconds of no progress, dump and
+    /// abort the process. 0 disables the kill — useful when attaching a
+    /// debugger to a wedged binary.
+    kill_after_s: u64,
     running: RunningSet = .{},
 
-    fn init(stuck_after_s: u64, tick_s: u64) ThreadWatchdog {
+    fn init(stuck_tick_s: u64, kill_after_s: u64) ThreadWatchdog {
         return .{
-            .last_progress_ns = .init(@intCast(std.time.nanoTimestamp())),
-            .stuck_after_s = stuck_after_s,
-            .tick_s = tick_s,
+            .last_progress_ns = .init(@intCast(nowNs())),
+            .stuck_tick_s = stuck_tick_s,
+            .kill_after_s = kill_after_s,
         };
     }
 
@@ -402,11 +502,11 @@ const ThreadWatchdog = struct {
     }
 
     fn touch(self: *ThreadWatchdog) void {
-        self.last_progress_ns.store(@intCast(std.time.nanoTimestamp()), .release);
+        self.last_progress_ns.store(@intCast(nowNs()), .release);
     }
 
     fn stop(self: *ThreadWatchdog) void {
-        self.wake.set();
+        self.wake.set(ioOf());
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -422,28 +522,28 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
     // print_mu and io_writer). The runtime may be wedged; the print
     // mutex itself may be the deadlocked lock. Using stderr directly
     // keeps the watchdog independent of any zio state.
-    const tick_ns: u64 = self.tick_s * std.time.ns_per_s;
-    const threshold_ns: i128 = @as(i128, self.stuck_after_s) * std.time.ns_per_s;
+    const tick_ns: u64 = self.stuck_tick_s * std.time.ns_per_s;
+    const threshold_ns: i128 = @as(i128, self.stuck_tick_s) * std.time.ns_per_s;
     while (true) {
         // timedWait returns error.Timeout on normal tick, void on stop()
         // having called .set(). Either way fall through to the wake check;
         // we exit only when .set() was called.
-        self.wake.timedWait(tick_ns) catch {};
+        self.wake.waitTimeout(ioOf(), timeoutNs(tick_ns)) catch {};
         if (self.wake.isSet()) return;
 
-        const now_i128 = std.time.nanoTimestamp();
+        const now_i128 = nowNs();
         const now_i64: i64 = @intCast(now_i128);
         const last = self.last_progress_ns.load(.acquire);
         const elapsed_s: i64 = @divTrunc(now_i64 - last, std.time.ns_per_s);
-        const stuck_global = elapsed_s >= @as(i64, @intCast(self.stuck_after_s));
+        const stuck_global = elapsed_s >= @as(i64, @intCast(self.stuck_tick_s));
 
         // Snapshot stuck tests under the lock; release before printing so
         // we never hold it across I/O.
         var stuck: std.ArrayList(RunningSet.Entry) = .empty;
         defer stuck.deinit(std.heap.page_allocator);
         {
-            self.running.mu.lock();
-            defer self.running.mu.unlock();
+            mlock(&self.running.mu);
+            defer munlock(&self.running.mu);
             for (self.running.list.items) |t| {
                 if (now_i128 - t.start_ns >= threshold_ns) {
                     stuck.append(std.heap.page_allocator, t) catch {};
@@ -453,28 +553,62 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
 
         if (!stuck_global and stuck.items.len == 0) continue;
 
+        // Snapshot counters AFTER releasing the list lock. "running" is
+        // the post-sem-acquire fiber count; "queued" is spawned-but-still-
+        // waiting-on-sem; "completed" is tests already reported. These
+        // three plus the always-zero "not yet spawned" should sum to total.
+        const queued = self.running.queued.load(.acquire);
+        const completed: u32 = if (self.running.completed) |c| c.load(.acquire) else 0;
+        const running_now: u32 = blk: {
+            mlock(&self.running.mu);
+            defer munlock(&self.running.mu);
+            break :blk @intCast(self.running.list.items.len);
+        };
+        const total = self.running.total;
+
         var stderr_buf: [4096]u8 = undefined;
-        var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+        var stderr_w = std.Io.File.stderr().writer(ioOf(), &stderr_buf);
         const w = &stderr_w.interface;
         w.print(
             "\n=== ThreadWatchdog: no progress for {d}s (threshold={d}s) ===\n",
-            .{ elapsed_s, self.stuck_after_s },
+            .{ elapsed_s, self.stuck_tick_s },
+        ) catch {};
+        w.print(
+            "  round: total={d} completed={d} running={d} queued-on-sem={d}\n",
+            .{ total, completed, running_now, queued },
         ) catch {};
         for (stuck.items) |t| {
+            // Divide-then-cast so fractional seconds survive: 21500ms → 21.5s.
             const ms = @divTrunc(now_i128 - t.start_ns, std.time.ns_per_ms);
-            w.print("  RUNNING {d}ms: {s}\n", .{ ms, t.name }) catch {};
+            const secs = @as(f64, @floatFromInt(ms)) / 1000.0;
+            w.print("  RUNNING {d:.1}s: {s}\n", .{ secs, t.name }) catch {};
         }
         w.print("TrackedMutex state:\n", .{}) catch {};
         utils.tracked_mutex.dump(w) catch {};
         w.print("\n", .{}) catch {};
         w.flush() catch {};
+
+        // Hard timeout: dump and abort the process. The dump above is
+        // already printed and flushed, so the user sees the final state
+        // before we kill. `kill_after_s == 0` disables (debug mode).
+        if (self.kill_after_s > 0 and elapsed_s >= @as(i64, @intCast(self.kill_after_s))) {
+            var kill_buf: [256]u8 = undefined;
+            var kill_w = std.Io.File.stderr().writer(ioOf(), &kill_buf);
+            const kw = &kill_w.interface;
+            kw.print(
+                "=== ThreadWatchdog: KILL after {d}s of no progress (limit={d}s) ===\n",
+                .{ elapsed_s, self.kill_after_s },
+            ) catch {};
+            kw.flush() catch {};
+            std.process.exit(124); // 124 mirrors `timeout(1)` exit code
+        }
     }
 }
 
 fn writeColored(
-    out: *std.io.Writer,
-    tty: std.io.tty.Config,
-    color: std.io.tty.Color,
+    out: *std.Io.Writer,
+    tty: Tty,
+    color: Tty.Color,
     comptime fmt: []const u8,
     args: anytype,
 ) void {
@@ -530,7 +664,7 @@ fn splitModuleName(name: []const u8) struct { module: []const u8, test_name: []c
     return .{ .module = "", .test_name = name };
 }
 
-fn writeDisplayName(out: *std.io.Writer, tty: std.io.tty.Config, name: []const u8) void {
+fn writeDisplayName(out: *std.Io.Writer, tty: Tty, name: []const u8) void {
     const split = splitModuleName(name);
     if (split.module.len == 0) {
         out.writeAll(split.test_name) catch {};
@@ -544,13 +678,27 @@ fn writeDisplayName(out: *std.io.Writer, tty: std.io.tty.Config, name: []const u
 }
 
 fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
+    // Track the semaphore wait: queued is "spawned but not yet started".
+    // Watchdog reads this to label its dump with how many fibers are
+    // still queued vs. actually running.
+    _ = ctx.running.queued.fetchAdd(1, .seq_cst);
     ctx.sem.waitUncancelable();
+    _ = ctx.running.queued.fetchSub(1, .seq_cst);
     defer ctx.sem.post();
 
     ctx.running.add(t.name);
     defer {
         ctx.running.remove(t.name);
         if (thread_watchdog) |w| w.touch();
+    }
+
+    // Optional STARTING log — useful for diagnosing wedges. Disabled by
+    // default; the watchdog dump names stuck tests on its own.
+    if (verbose_start) {
+        ctx.print_mu.lockUncancelable();
+        ctx.out.print("  >> STARTING {s}\n", .{t.name}) catch {};
+        ctx.out.flush() catch {};
+        ctx.print_mu.unlock();
     }
 
     var fiber_log: FiberLog = .{};
@@ -576,12 +724,18 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
     else
         t.name;
     const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
+    const is_hang = std.mem.startsWith(u8, user_name, "HANG: ");
 
     var timeout = zio.AutoCancel.init;
     defer timeout.clear();
-    timeout.set(zio.Timeout.fromSeconds(if (is_big) 60 else 30));
+    // HANG: tests intentionally never finish — they exist to exercise the
+    // process-level watchdog (--wd-stuck-tick-s dumps + --wd-kill-s abort).
+    // Setting a per-test cancel would defeat the point: the fiber would
+    // wake at 30/60s with error.Canceled and report a normal failure, and
+    // the watchdog would never see a sustained no-progress window.
+    if (!is_hang) timeout.set(zio.Timeout.fromSeconds(if (is_big) 60 else 30));
 
-    const t0 = std.time.nanoTimestamp();
+    const t0 = nowNs();
     const result: ?anyerror = if (t.func()) |_| null else |e| blk: {
         if (e != error.SkipZigTest) {
             if (@errorReturnTrace()) |trace| {
@@ -591,7 +745,7 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
         }
         break :blk e;
     };
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - t0, std.time.ns_per_ms);
+    const elapsed_ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
     const timed_out = if (result) |e| e == error.Canceled and timeout.triggered else false;
 
     const seq = ctx.seq.fetchAdd(1, .seq_cst) + 1;
@@ -636,10 +790,15 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
             // preserved on the terminal).
             if (trace_addrs.len > 0) {
                 ctx.out.flush() catch {};
-                std.debug.dumpStackTrace(.{
-                    .index = trace_addrs.len,
-                    .instruction_addresses = trace_addrs,
-                });
+                // Zig 0.16 split StackTrace into a builtin variant
+                // (index + instruction_addresses) and a debug variant
+                // (return_addresses + skipped). dumpStackTrace wants the
+                // debug variant.
+                const dbg_trace: std.debug.StackTrace = .{
+                    .return_addresses = trace_addrs,
+                    .skipped = .none,
+                };
+                std.debug.dumpStackTrace(&dbg_trace);
             }
             // On timeout, also dump TrackedMutex state — currently-held
             // locks are the most likely smoking gun for a deadlock.
@@ -671,7 +830,9 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
 }
 
 fn runBench(t: std.builtin.TestFn, ctx: *SharedCtx) void {
+    _ = ctx.running.queued.fetchAdd(1, .seq_cst);
     ctx.sem.waitUncancelable();
+    _ = ctx.running.queued.fetchSub(1, .seq_cst);
     defer ctx.sem.post();
 
     ctx.running.add(t.name);
@@ -704,7 +865,7 @@ fn runBench(t: std.builtin.TestFn, ctx: *SharedCtx) void {
         // resetTimer() in the bench function will move the start point
         // forward to discount setup; addBytes() accumulates into total_bytes.
         b.elapsed_ns = 0;
-        b.start_ns = std.time.nanoTimestamp();
+        b.start_ns = nowNs();
         b.timer_running = true;
         b.total_bytes = 0;
         if (t.func()) |_| {} else |e| {
@@ -822,8 +983,8 @@ fn driver(
     retry_counters: *Counters,
     bench_counters: *Counters,
     alloc: std.mem.Allocator,
-    out: *std.io.Writer,
-    tty: std.io.tty.Config,
+    out: *std.Io.Writer,
+    tty: Tty,
 ) !void {
     // Spawn the coarse.Clock tick fiber on the runner's long-lived runtime
     // so it survives across every test fiber. `Clock.start()` is idempotent
@@ -863,6 +1024,7 @@ fn driver(
             t.name;
         const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
         const is_bench = std.mem.startsWith(u8, user_name, "BENCH: ");
+        const is_hang = std.mem.startsWith(u8, user_name, "HANG: ");
         if (args.filter) |f| if (std.mem.indexOf(u8, t.name, f) == null) continue;
         if (args.exclude) |x| if (std.mem.indexOf(u8, t.name, x) != null) continue;
         if (is_bench) {
@@ -872,6 +1034,7 @@ fn driver(
         }
         if (args.only_bench) continue;
         if (is_big and !args.run_big) continue;
+        if (is_hang and !args.run_hang) continue;
         try kept.append(alloc, t);
     }
 
@@ -889,6 +1052,12 @@ fn driver(
 
     // Parallel round: run all tests, collecting failures.
     {
+        running.completed = &seq;
+        running.total = @intCast(kept.items.len);
+        defer {
+            running.completed = null;
+            running.total = 0;
+        }
         var group = zio.Group{};
         for (kept.items) |t| try group.spawn(runOne, .{ t, &ctx });
         group.wait() catch {};
@@ -918,6 +1087,12 @@ fn driver(
             .running = running,
         };
 
+        running.completed = &retry_seq;
+        running.total = @intCast(failures.items.len);
+        defer {
+            running.completed = null;
+            running.total = 0;
+        }
         var retry_group = zio.Group{};
         for (failures.items) |t| try retry_group.spawn(runOne, .{ t, &retry_ctx });
         retry_group.wait() catch {};
@@ -961,18 +1136,29 @@ fn driver(
     bench_group.wait() catch {};
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    context.initGlobal(init);
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+
+    // std.testing.io_instance is `undefined` by default — any test calling
+    // `std.testing.io` (via tmpDir, etc.) hangs/UBs until it's initialized.
+    // The stock Zig test_runner does this per-test; we use one shared
+    // instance for the whole run.
+    std.testing.io_instance = .init(std.heap.page_allocator, .{
+        .argv0 = .init(init.minimal.args),
+        .environ = init.minimal.environ,
+    });
+    defer std.testing.io_instance.deinit();
 
     var args = try parseArgs(alloc);
     args.parallel = resolveParallel(args.parallel);
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_w = std.Io.File.stderr().writer(ioOf(), &stderr_buf);
     const out = &stderr_w.interface;
-    const tty = std.io.tty.Config.detect(std.fs.File.stderr());
+    const tty = Tty.detect();
 
     log_map = std.AutoHashMap(usize, *FiberLog).init(std.heap.page_allocator);
     defer if (log_map) |*m| m.deinit();
@@ -981,11 +1167,11 @@ pub fn main() !void {
     defer bench.deinitRegistry();
 
     // std.Thread watchdog: runs outside the zio runtime so it stays alive
-    // (and dumping) even when the runtime itself is mid-deinit. Threshold:
-    // 120s of no test completion (covers normal idle gaps between runs,
-    // any slow BIG: test, and Clock.stop + rt.deinit hiccups). Tick: 10s
-    // so shutdown stop() waits at most 10s.
-    var twatch = ThreadWatchdog.init(120, 10);
+    // (and dumping) even when the runtime itself is mid-deinit. Defaults
+    // are aggressive (20s dump-and-tick, 300s kill) — most tests finish
+    // in <1s so a 20s gap already means something's stuck. Override per
+    // run with --wd-stuck-tick-s / --wd-kill-s.
+    var twatch = ThreadWatchdog.init(args.wd_stuck_tick_s, args.wd_kill_s);
     defer twatch.deinit();
     thread_watchdog = &twatch;
     try twatch.start();
@@ -994,23 +1180,25 @@ pub fn main() !void {
         thread_watchdog = null;
     }
 
-    const rt = try zio.Runtime.init(std.heap.page_allocator, .{
-        .executors = .exact(args.parallel),
-    });
-    defer rt.deinit();
+    // Use the egres single-runtime seam so deeper code paths
+    // (coarse.Clock, raft loops, etc.) that call `runtime.spawnOn`
+    // share the same runtime as the test runner.
+    const runtime = @import("runtime");
+    try runtime.init(std.heap.page_allocator, .{ .total_threads = args.parallel });
+    defer runtime.deinit();
 
     var counters: Counters = .{};
     var retry_counters: Counters = .{};
     var bench_counters: Counters = .{};
-    const t0_all = std.time.nanoTimestamp();
+    const t0_all = nowNs();
 
-    var handle = try rt.spawn(driver, .{ args, &counters, &retry_counters, &bench_counters, alloc, out, tty });
+    var handle = try runtime.spawnOn(.background, .shared, driver, .{ args, &counters, &retry_counters, &bench_counters, alloc, out, tty });
     try handle.join();
     // Drain the coarse.Clock tick fiber, if any test started it.
     // Without this, `rt.deinit()` asserts task_count == 0 fails.
     utils.coarse.Clock.stop();
 
-    const total_ms = @divTrunc(std.time.nanoTimestamp() - t0_all, std.time.ns_per_ms);
+    const total_ms = @divTrunc(nowNs() - t0_all, std.time.ns_per_ms);
     const main_passed = counters.passed.load(.seq_cst);
     const main_failed = counters.failed.load(.seq_cst);
     const main_skipped = counters.skipped.load(.seq_cst);

@@ -25,7 +25,7 @@ test "coarse.Clock: ms() is close to std.time.milliTimestamp" {
     try zio.sleep(zio.Duration.fromMilliseconds(2));
 
     const cached = Clock.ms();
-    const real = std.time.milliTimestamp();
+    const real = std.Io.Timestamp.now(utils.context.g().io, .real).toMilliseconds();
     // ±50 ms covers worst-case scheduling jitter on the test runner.
     try std.testing.expect(@abs(real - cached) < 50);
 }

@@ -69,7 +69,8 @@ fn benchMilliTimestamp(b: *bench.Bench) !void {
     b.resetTimer();
     var sink: i64 = 0;
     var i: u64 = 0;
-    while (i < b.n) : (i += 1) sink +%= std.time.milliTimestamp();
+    const io = utils.context.g().io;
+    while (i < b.n) : (i += 1) sink +%= std.Io.Timestamp.now(io, .real).toMilliseconds();
     std.mem.doNotOptimizeAway(sink);
 }
 
