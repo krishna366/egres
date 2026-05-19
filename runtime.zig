@@ -34,8 +34,7 @@ pub const Runtime = enum(u2) {
 /// Process-wide configuration for the single shared runtime.
 pub const Config = struct {
     /// Total executor threads in the singleton zio.Runtime.
-    /// 0 = auto-detect from CPU count. Cap is `zio.Executor.max_executors`
-    /// (255 with our patch — was 64 in stock zio).
+    /// 0 = auto-detect from CPU count.
     total_threads: u8 = 0,
 };
 
@@ -50,7 +49,7 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !void {
     // doesn't surface it). Cap by zio's `Executor.max_executors` (255
     // with our patch). Fall back to 2 on getCpuCount failure so
     // single-CPU-detection failures still leave us multi-threaded.
-    const max = 255; // mirrors zio.Executor.max_executors in our patches/v0.11
+    const max = 255; // mirrors zio.Executor.max_executors
     const n: u8 = if (cfg.total_threads != 0)
         cfg.total_threads
     else

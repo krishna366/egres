@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
+const rt = @import("runtime");
 const context = utils.context;
 
 // 0.16 helpers: std.Thread.Mutex / ResetEvent / time.nanoTimestamp are gone.
@@ -370,7 +371,15 @@ const bench_total_width: usize = 10; // right-aligned total-bytes column
 const bench_dur_width: usize = 9; // right-aligned sample-duration column
 
 const SharedCtx = struct {
-    sem: *zio.Semaphore,
+    // Pacing primitive. Each spawned fiber gets a queue position
+    // (0-indexed) and waits for the watermark to reach `my_index + 1`
+    // before running. The watermark is pre-credited to `permits` so the
+    // first `permits` fibers proceed immediately. Each completion
+    // advances by 1 (offset by permits), which broadcasts — waiters
+    // re-check their target and either proceed or re-park.
+    watermark: *utils.Watermark,
+    completed_count: *std.atomic.Value(u64),
+    permits: u32,
     print_mu: *zio.Mutex,
     counters: *Counters,
     seq: *std.atomic.Value(u32),
@@ -387,10 +396,10 @@ const SharedCtx = struct {
 };
 
 /// Bookkeeping for the watchdog dump. `list` holds tests that have
-/// acquired the semaphore and entered the test body — i.e. POST-sem
+/// passed the watermark wait and entered the test body — i.e.
 /// "actually running" fibers, never queued ones. `queued` and
 /// `total`/`completed` give the dump enough context to say "of N
-/// kept, K completed, R running, Q still queued on the sem".
+/// kept, K completed, R running, Q still queued".
 ///
 /// Guarded by a `std.Io.Mutex` for cross-fiber writes; the std.Thread
 /// watchdog grabs it via `mlock` (an `lockUncancelable`-on-fiber-or-
@@ -399,9 +408,9 @@ const SharedCtx = struct {
 const RunningSet = struct {
     mu: std.Io.Mutex = .init,
     list: std.ArrayList(Entry) = .empty,
-    /// Spawned-but-not-yet-acquired-sem count. Incremented before
-    /// `sem.waitUncancelable()` and decremented immediately after, so
-    /// at any instant: `queued + list.len + completed ≈ total`.
+    /// Spawned-but-not-yet-past-the-watermark-wait count. Incremented
+    /// before `watermark.waitForUntimed` and decremented immediately
+    /// after, so at any instant: `queued + list.len + completed ≈ total`.
     queued: std.atomic.Value(u32) = .init(0),
     /// Completed-test counter pointer (shared with SharedCtx.seq) and
     /// the total test count for the current round. Null while no round
@@ -439,6 +448,28 @@ const RunningSet = struct {
         self.list.deinit(std.heap.page_allocator);
     }
 };
+
+/// Format into `buf` and write to stderr (fd 2) via the raw Linux
+/// write syscall — bypasses std.Io entirely. Used by the watchdog
+/// so its dumps land even when zio itself is wedged (the previous
+/// File.stderr().writer path would have blocked on zio's io).
+/// Truncates silently if the formatted string exceeds the buffer
+/// or the syscall returns an error.
+fn rawStderrWriteAll(bytes: []const u8) void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.os.linux.write(2, bytes.ptr + written, bytes.len - written);
+        // Linux raw syscall: negative encodes errno, positive is byte count.
+        // Treat any non-positive return as "stop trying".
+        if (rc == 0 or rc > std.math.maxInt(isize)) return;
+        written += rc;
+    }
+}
+
+fn rawStderrPrint(buf: []u8, comptime fmt: []const u8, args: anytype) void {
+    const formatted = std.fmt.bufPrint(buf, fmt, args) catch buf[0..0];
+    rawStderrWriteAll(formatted);
+}
 
 /// std.Thread-based watchdog. Runs OUTSIDE the zio runtime, so it stays
 /// alive — and capable of dumping diagnostics — even when the runtime is
@@ -522,8 +553,17 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
     // print_mu and io_writer). The runtime may be wedged; the print
     // mutex itself may be the deadlocked lock. Using stderr directly
     // keeps the watchdog independent of any zio state.
-    const tick_ns: u64 = self.stuck_tick_s * std.time.ns_per_s;
+    // Wake every 1s regardless of the stuck threshold so the first dump
+    // lands within ~1s of the threshold (instead of up to 2× threshold).
+    // The threshold below still controls WHEN we declare "stuck"; tick
+    // only controls how often we check.
+    const tick_ns: u64 = std.time.ns_per_s;
     const threshold_ns: i128 = @as(i128, self.stuck_tick_s) * std.time.ns_per_s;
+    // Initialize to 0 (not minInt). `now_s` is wall-clock seconds since
+    // epoch (≈ 1.7e9 in 2026), and (now_s - minInt(i64)) would overflow.
+    // Starting from 0 means the first eligible dump fires immediately
+    // once `stuck_global` is true — which is exactly what we want.
+    var last_dumped_at_s: i64 = 0;
     while (true) {
         // timedWait returns error.Timeout on normal tick, void on stop()
         // having called .set(). Either way fall through to the wake check;
@@ -553,10 +593,17 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
 
         if (!stuck_global and stuck.items.len == 0) continue;
 
+        // Throttle dump cadence to once per stuck_tick_s window so
+        // tick-every-1s doesn't spam stderr every second once stuck.
+        const now_s: i64 = @divTrunc(now_i64, std.time.ns_per_s);
+        if (now_s - last_dumped_at_s < @as(i64, @intCast(self.stuck_tick_s))) continue;
+        last_dumped_at_s = now_s;
+
         // Snapshot counters AFTER releasing the list lock. "running" is
-        // the post-sem-acquire fiber count; "queued" is spawned-but-still-
-        // waiting-on-sem; "completed" is tests already reported. These
-        // three plus the always-zero "not yet spawned" should sum to total.
+        // the post-watermark fiber count; "queued" is spawned-but-still-
+        // waiting on its watermark target; "completed" is tests already
+        // reported. These three plus the always-zero "not yet spawned"
+        // should sum to total.
         const queued = self.running.queued.load(.acquire);
         const completed: u32 = if (self.running.completed) |c| c.load(.acquire) else 0;
         const running_now: u32 = blk: {
@@ -566,40 +613,45 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
         };
         const total = self.running.total;
 
-        var stderr_buf: [4096]u8 = undefined;
-        var stderr_w = std.Io.File.stderr().writer(ioOf(), &stderr_buf);
-        const w = &stderr_w.interface;
-        w.print(
-            "\n=== ThreadWatchdog: no progress for {d}s (threshold={d}s) ===\n",
-            .{ elapsed_s, self.stuck_tick_s },
-        ) catch {};
-        w.print(
-            "  round: total={d} completed={d} running={d} queued-on-sem={d}\n",
-            .{ total, completed, running_now, queued },
-        ) catch {};
+        // Raw stderr via std.posix.write(2, …). The previous version
+        // used `File.stderr().writer(ioOf(), &buf)` which goes through
+        // the zio-backed io; if zio itself is wedged (the very case we
+        // need to diagnose) that writer's flush blocks and the dump
+        // never reaches the user. POSIX write bypasses io entirely.
+        var line_buf: [1024]u8 = undefined;
+        rawStderrPrint(&line_buf, "\n=== ThreadWatchdog: no progress for {d}s (threshold={d}s) ===\n", .{ elapsed_s, self.stuck_tick_s });
+        rawStderrPrint(&line_buf, "  round: total={d} completed={d} running={d} queued={d}\n", .{ total, completed, running_now, queued });
         for (stuck.items) |t| {
             // Divide-then-cast so fractional seconds survive: 21500ms → 21.5s.
             const ms = @divTrunc(now_i128 - t.start_ns, std.time.ns_per_ms);
             const secs = @as(f64, @floatFromInt(ms)) / 1000.0;
-            w.print("  RUNNING {d:.1}s: {s}\n", .{ secs, t.name }) catch {};
+            rawStderrPrint(&line_buf, "  RUNNING {d:.1}s: {s}\n", .{ secs, t.name });
         }
-        w.print("TrackedMutex state:\n", .{}) catch {};
-        utils.tracked_mutex.dump(w) catch {};
-        w.print("\n", .{}) catch {};
-        w.flush() catch {};
+        // Zio fiber state: same memory-buffer-then-raw-write trick so
+        // the dump bypasses any zio-backed I/O even when the runtime is
+        // wedged. `rt.stats()` and `rt.dumpFibers()` both lock
+        // `fibers_mutex` (an `os.Mutex` = std.Thread-safe), so calling
+        // them from the watchdog thread is fine.
+        const zrt = rt.underlying();
+        const zs = zrt.stats();
+        rawStderrPrint(&line_buf, "zio fibers: total={d} ready={d} blocked={d}\n", .{ zs.total, zs.ready, zs.blocked });
+        var dump_writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer dump_writer.deinit();
+        zrt.dumpFibers(&dump_writer.writer) catch {};
+        rawStderrWriteAll(dump_writer.written());
+
+        // TrackedMutex dump (same buffered-then-raw-write pattern).
+        rawStderrPrint(&line_buf, "TrackedMutex state:\n", .{});
+        dump_writer.clearRetainingCapacity();
+        utils.tracked_mutex.dump(&dump_writer.writer) catch {};
+        rawStderrWriteAll(dump_writer.written());
+        rawStderrPrint(&line_buf, "\n", .{});
 
         // Hard timeout: dump and abort the process. The dump above is
-        // already printed and flushed, so the user sees the final state
-        // before we kill. `kill_after_s == 0` disables (debug mode).
+        // already printed, so the user sees the final state before we
+        // kill. `kill_after_s == 0` disables (debug mode).
         if (self.kill_after_s > 0 and elapsed_s >= @as(i64, @intCast(self.kill_after_s))) {
-            var kill_buf: [256]u8 = undefined;
-            var kill_w = std.Io.File.stderr().writer(ioOf(), &kill_buf);
-            const kw = &kill_w.interface;
-            kw.print(
-                "=== ThreadWatchdog: KILL after {d}s of no progress (limit={d}s) ===\n",
-                .{ elapsed_s, self.kill_after_s },
-            ) catch {};
-            kw.flush() catch {};
+            rawStderrPrint(&line_buf, "=== ThreadWatchdog: KILL after {d}s of no progress (limit={d}s) ===\n", .{ elapsed_s, self.kill_after_s });
             std.process.exit(124); // 124 mirrors `timeout(1)` exit code
         }
     }
@@ -677,14 +729,37 @@ fn writeDisplayName(out: *std.Io.Writer, tty: Tty, name: []const u8) void {
     out.writeAll(split.test_name) catch {};
 }
 
-fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
-    // Track the semaphore wait: queued is "spawned but not yet started".
+fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx, my_index: u64) void {
+    // Track the queue wait: `queued` is "spawned but not yet started".
     // Watchdog reads this to label its dump with how many fibers are
     // still queued vs. actually running.
     _ = ctx.running.queued.fetchAdd(1, .seq_cst);
-    ctx.sem.waitUncancelable();
+    // The watermark was pre-advanced to `permits` before spawn, so
+    // fibers 0..permits-1 satisfy `value >= my_index + 1` immediately
+    // without entering cv.wait. Fibers from index `permits` onward
+    // park until enough completions arrive. Shielded against cancel
+    // so we never bail mid-wait — same contract as the old
+    // waitUncancelable.
+    {
+        ctx.watermark.waitForUntimed(my_index + 1) catch |e| {
+            std.log.err("watermark wait failed for {s}: {s}", .{ t.name, @errorName(e) });
+            return;
+        };
+    }
     _ = ctx.running.queued.fetchSub(1, .seq_cst);
-    defer ctx.sem.post();
+    // Defer-last: advance the watermark by 1 past the permit floor for
+    // each completion. The pre-credit of `permits` means initial=
+    // permits, and after k completions value=permits+k. Every advance
+    // broadcasts, so all waiters re-check — no chain wake to lose.
+    //
+    // Diagnostic: stderr-print on every advance so we can confirm
+    // from outside the zio runtime that completions are firing.
+    // Bypasses the per-fiber log capture so this lands in the run log
+    // even when the runtime is mid-wedge.
+    defer {
+        const n = ctx.completed_count.fetchAdd(1, .monotonic) + 1;
+        ctx.watermark.advance(ctx.permits + n);
+    }
 
     ctx.running.add(t.name);
     defer {
@@ -829,11 +904,21 @@ fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx) void {
     ctx.out.flush() catch {};
 }
 
-fn runBench(t: std.builtin.TestFn, ctx: *SharedCtx) void {
+fn runBench(t: std.builtin.TestFn, ctx: *SharedCtx, my_index: u64) void {
     _ = ctx.running.queued.fetchAdd(1, .seq_cst);
-    ctx.sem.waitUncancelable();
+    {
+        zio.beginShield();
+        defer zio.endShield();
+        ctx.watermark.waitForUntimed(my_index + 1) catch |e| {
+            std.log.err("watermark wait failed for {s}: {s}", .{ t.name, @errorName(e) });
+            return;
+        };
+    }
     _ = ctx.running.queued.fetchSub(1, .seq_cst);
-    defer ctx.sem.post();
+    defer {
+        const n = ctx.completed_count.fetchAdd(1, .monotonic) + 1;
+        ctx.watermark.advance(ctx.permits + n);
+    }
 
     ctx.running.add(t.name);
     defer {
@@ -1002,7 +1087,12 @@ fn driver(
     // grab a pointer to its RunningSet for the test ctx.
     const running: *RunningSet = if (thread_watchdog) |w| &w.running else unreachable;
 
-    var sem = zio.Semaphore{ .permits = args.parallel };
+    var watermark: utils.Watermark = .{};
+    // Pre-credit `permits` slots so the first `permits` fibers
+    // satisfy their `value >= my_index + 1` check immediately
+    // without entering cv.wait.
+    watermark.advance(args.parallel);
+    var completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
     var print_mu: zio.Mutex = .init;
     var seq: std.atomic.Value(u32) = .{ .raw = 0 };
     var failures: std.ArrayList(std.builtin.TestFn) = .empty;
@@ -1039,7 +1129,9 @@ fn driver(
     }
 
     var ctx = SharedCtx{
-        .sem = &sem,
+        .watermark = &watermark,
+        .completed_count = &completed_count,
+        .permits = args.parallel,
         .print_mu = &print_mu,
         .counters = counters,
         .seq = &seq,
@@ -1050,7 +1142,10 @@ fn driver(
         .running = running,
     };
 
-    // Parallel round: run all tests, collecting failures.
+    // Parallel round: run all tests, collecting failures. Use
+    // `spawnWith` instead of `Group.spawn` so each test fiber carries a
+    // spawn-site `@src()` that `rt.dumpFibers()` can print in the
+    // watchdog dump.
     {
         running.completed = &seq;
         running.total = @intCast(kept.items.len);
@@ -1058,9 +1153,14 @@ fn driver(
             running.completed = null;
             running.total = 0;
         }
-        var group = zio.Group{};
-        for (kept.items) |t| try group.spawn(runOne, .{ t, &ctx });
-        group.wait() catch {};
+        const zrt = rt.underlying();
+        var handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
+        defer handles.deinit(alloc);
+        for (kept.items, 0..) |t, i| {
+            const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runOne, .{ t, &ctx, @as(u64, i) });
+            try handles.append(alloc, h);
+        }
+        for (handles.items) |*h| h.join();
     }
 
     // Serial retry round: re-run any failures one at a time. Skips when
@@ -1073,10 +1173,14 @@ fn driver(
         out.flush() catch {};
         print_mu.unlock();
 
-        var retry_sem = zio.Semaphore{ .permits = 1 };
+        var retry_watermark: utils.Watermark = .{};
+        retry_watermark.advance(1); // permits=1 for retry round
+        var retry_completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
         var retry_seq: std.atomic.Value(u32) = .{ .raw = 0 };
         var retry_ctx = SharedCtx{
-            .sem = &retry_sem,
+            .watermark = &retry_watermark,
+            .completed_count = &retry_completed_count,
+            .permits = 1,
             .print_mu = &print_mu,
             .counters = retry_counters,
             .seq = &retry_seq,
@@ -1093,9 +1197,14 @@ fn driver(
             running.completed = null;
             running.total = 0;
         }
-        var retry_group = zio.Group{};
-        for (failures.items) |t| try retry_group.spawn(runOne, .{ t, &retry_ctx });
-        retry_group.wait() catch {};
+        const zrt = rt.underlying();
+        var retry_handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
+        defer retry_handles.deinit(alloc);
+        for (failures.items, 0..) |t, i| {
+            const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runOne, .{ t, &retry_ctx, @as(u64, i) });
+            try retry_handles.append(alloc, h);
+        }
+        for (retry_handles.items) |*h| h.join();
     }
 
     // Bench round: serial, auto-tuned iteration count. Only runs when
@@ -1117,10 +1226,14 @@ fn driver(
         }
     }.lt);
 
-    var bench_sem = zio.Semaphore{ .permits = 1 };
+    var bench_watermark: utils.Watermark = .{};
+    bench_watermark.advance(1); // permits=1 for bench round
+    var bench_completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
     var bench_seq: std.atomic.Value(u32) = .{ .raw = 0 };
     var bench_ctx = SharedCtx{
-        .sem = &bench_sem,
+        .watermark = &bench_watermark,
+        .completed_count = &bench_completed_count,
+        .permits = 1,
         .print_mu = &print_mu,
         .counters = bench_counters,
         .seq = &bench_seq,
@@ -1131,9 +1244,14 @@ fn driver(
         .running = running,
     };
 
-    var bench_group = zio.Group{};
-    for (bench_tests.items) |t| try bench_group.spawn(runBench, .{ t, &bench_ctx });
-    bench_group.wait() catch {};
+    const zrt = rt.underlying();
+    var bench_handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
+    defer bench_handles.deinit(alloc);
+    for (bench_tests.items, 0..) |t, i| {
+        const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runBench, .{ t, &bench_ctx, @as(u64, i) });
+        try bench_handles.append(alloc, h);
+    }
+    for (bench_handles.items) |*h| h.join();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -1183,16 +1301,15 @@ pub fn main(init: std.process.Init) !void {
     // Use the egres single-runtime seam so deeper code paths
     // (coarse.Clock, raft loops, etc.) that call `runtime.spawnOn`
     // share the same runtime as the test runner.
-    const runtime = @import("runtime");
-    try runtime.init(std.heap.page_allocator, .{ .total_threads = args.parallel });
-    defer runtime.deinit();
+    try rt.init(std.heap.page_allocator, .{ .total_threads = args.parallel });
+    defer rt.deinit();
 
     var counters: Counters = .{};
     var retry_counters: Counters = .{};
     var bench_counters: Counters = .{};
     const t0_all = nowNs();
 
-    var handle = try runtime.spawnOn(.background, .shared, driver, .{ args, &counters, &retry_counters, &bench_counters, alloc, out, tty });
+    var handle = try rt.spawnOn(.background, .shared, driver, .{ args, &counters, &retry_counters, &bench_counters, alloc, out, tty });
     try handle.join();
     // Drain the coarse.Clock tick fiber, if any test started it.
     // Without this, `rt.deinit()` asserts task_count == 0 fails.

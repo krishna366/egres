@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const rt = @import("runtime");
 const flags = @import("flags.zig");
 
 const RaftCfg = struct {
@@ -218,8 +219,10 @@ test "concurrent readers do not see torn state" {
         .observed = &observed,
     };
 
+    // Use spawnWith so the fiber dump shows where each reader was
+    // spawned, distinguishing them from the test fiber itself.
     var handles: [4]zio.JoinHandle(void) = undefined;
-    for (&handles) |*h| h.* = try zio.spawn(readerLoop, .{ctx});
+    for (&handles) |*h| h.* = try rt.underlying().spawnWith(.{ .spawn_loc = @src() }, readerLoop, .{ctx});
 
     // Hammer with updates. Each `i` writes a self-consistent triple
     // (name=v{i}, retries=i%10, tracing=i%2==0) that readers verify.

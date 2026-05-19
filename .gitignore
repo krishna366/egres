@@ -7,3 +7,5 @@ zig-out/
 
 # Claude Code's per-project settings and session state.
 .claude/
+
+*.log

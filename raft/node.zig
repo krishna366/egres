@@ -56,78 +56,8 @@ pub const ConfigError = error{
 
 /// Monotonically-advancing u64 with wait/signal. Used for raft progress
 /// markers (applied HLC, commit index, etc.) where many tasks block until
-/// the value crosses a target.
-///
-/// Fast-path readers call `load()` without taking a lock — the value is
-/// stored atomically. Writers call `advance()`, which takes `mu` so that
-/// the (store, broadcast) pair is serialized against waiters' (check,
-/// suspend) pair. A waiter inside `cv.wait` has atomically released `mu`
-/// and joined the queue, so an advance can't slip between a waiter's
-/// check and suspend: either the waiter sees the new value before
-/// entering `cv.wait`, or it's already in the queue when broadcast runs.
-///
-/// `close()` lets shutdown unblock all current and future waiters with
-/// `error.Closed`. `advance()` still works after close — `closed` only
-/// controls the wait paths.
-pub const Watermark = struct {
-    value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    mu: zio.Mutex = .init,
-    cv: zio.Condition = .init,
-    closed: bool = false, // protected by mu
-
-    /// Lockless load. Cheap — safe to call on hot paths.
-    pub fn load(self: *Watermark) u64 {
-        return self.value.load(.acquire);
-    }
-
-    /// Monotonic advance. No-op if `new_value <= current`. Broadcasts
-    /// only when the value actually moves.
-    pub fn advance(self: *Watermark, new_value: u64) void {
-        self.mu.lockUncancelable();
-        defer self.mu.unlock();
-        // We hold mu and are the only writer, so a monotonic load is
-        // enough for the local compare.
-        if (new_value > self.value.load(.monotonic)) {
-            self.value.store(new_value, .release);
-            self.cv.broadcast();
-        }
-    }
-
-    /// Mark the watermark closed and wake every current/future waiter
-    /// with `error.Closed`. Idempotent.
-    pub fn close(self: *Watermark) void {
-        self.mu.lockUncancelable();
-        defer self.mu.unlock();
-        if (!self.closed) {
-            self.closed = true;
-            self.cv.broadcast();
-        }
-    }
-
-    /// Block until `value >= target` or `timeout` elapses. Returns
-    /// `error.Closed` if `close()` is called, `error.Timeout` on expiry,
-    /// `error.Canceled` if the task is canceled.
-    pub fn waitFor(self: *Watermark, target: u64, timeout: zio.Duration) !void {
-        const deadline: zio.Timeout = (zio.Timeout{ .duration = timeout }).toDeadline();
-        try self.mu.lock();
-        defer self.mu.unlock();
-        while (self.value.load(.acquire) < target) {
-            if (self.closed) return error.Closed;
-            try self.cv.timedWait(&self.mu, deadline);
-        }
-    }
-
-    /// Block until `value >= target`. Returns `error.Closed` on close,
-    /// `error.Canceled` on cancel.
-    pub fn waitForUntimed(self: *Watermark, target: u64) !void {
-        try self.mu.lock();
-        defer self.mu.unlock();
-        while (self.value.load(.acquire) < target) {
-            if (self.closed) return error.Closed;
-            try self.cv.wait(&self.mu);
-        }
-    }
-};
+/// the value crosses a target. Re-exported from `utils.Watermark`.
+pub const Watermark = utils.Watermark;
 
 pub const DiskWAL = @import("diskwal.zig").DiskWAL;
 pub const RaftLogError = raftwal_mod.RaftLogError;

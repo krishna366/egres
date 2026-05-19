@@ -1,0 +1,34 @@
+generated zdb/buffers.gen.zig
+generated raft/buffers.gen.zig
+generated zbuf/buffers.gen.zig
+info: runtime: starting with 16 executor threads
+[1/245]   pgwire.binary_test          bool round-trip ... OK (0ms)
+[2/245]   pgwire.binary_test          float4/float8 round-trip + bit-pattern check ... OK (0ms)
+[3/245]   pgwire.binary_test          int2/int4/int8 round-trip including extremes ... OK (0ms)
+[4/245]   pgwire.binary_test          isBinarySupported covers expected OIDs ... OK (0ms)
+[5/245]   pgwire.proto_test           decodeStartup: golden Startup3 ... OK (0ms)
+[6/245]   pgwire.proto_test           decodeStartup: SSLRequest sentinel ... OK (0ms)
+[7/245]   pgwire.proto_test           decodeMessage: NeedMore on partial body ... OK (0ms)
+[8/245]   pgwire.proto_test           decodeMessage: NeedMore on partial header ... OK (0ms)
+[9/245]   pgwire.proto_test           decodeMessage: BadLength rejects len<4 ... OK (0ms)
+[10/245]  pgwire.proto_test           decodeMessage: golden Terminate ... OK (0ms)
+[11/245]  pgwire.proto_test           encode/decode round-trip: BackendKeyData ... OK (0ms)
+[12/245]  pgwire.proto_test           encode/decode round-trip: ReadyForQuery ... OK (0ms)
+[13/245]  pgwire.proto_test           encode/decode round-trip: DataRow with NULL ... OK (0ms)
+[14/245]  pgwire.parser_test          parse: syntax error returns SyntaxError + cursor info ... OK (1ms)
+[15/245]  pgwire.proto_test           encode DataRow with mixed text/binary cells ... OK (1ms)
+[16/245]  pgwire.parser_test          parse: SELECT a, b FROM t WHERE c = 1 → 2 target entries ... OK (2ms)
+[17/245]  pgwire.parser_test          parse: SELECT 1 → SelectStmt ... OK (2ms)
+[18/245]  pgwire.parser_test          parse: INSERT INTO t VALUES (1) → InsertStmt ... OK (5ms)
+[19/245]  pgwire.parser_test          parse: CREATE TABLE → CreateStmt ... OK (6ms)
+[20/245]  pgwire.driver_test          driver: full startup + Query + Terminate round-trip ... OK (9ms)
+thread 1751183 panic: no current executor
+/home/mrjn/source/zio/src/runtime.zig:649:36: 0x145d39c in getCurrentExecutor (zio.zig)
+    return Executor.current orelse @panic("no current executor");
+                                   ^
+/home/mrjn/source/zio/src/task.zig:521:38: 0x1473851 in startFn (zio.zig)
+        executor = getCurrentExecutor();
+                                     ^
+/home/mrjn/source/zio/src/coro/coroutines.zig:1158:31: 0x1473d7a in entrypointFn (zio.zig)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
