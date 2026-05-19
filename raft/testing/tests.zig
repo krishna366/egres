@@ -1,6 +1,7 @@
 const std = @import("std");
 const raft = @import("raft");
 const zio = @import("zio");
+const runtime = @import("runtime");
 const cluster_mod = @import("cluster.zig");
 const zen = raft.buffers;
 
@@ -296,9 +297,12 @@ pub fn testTransportStartsAndStopsCleanly() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = zio.Group{};
-    defer group.wait() catch {};
-    try group.spawn(runRaftRuntime, .{&rt});
+    var group = runtime.Group(void).init(std.testing.allocator, .background);
+    defer {
+        group.wait();
+        group.deinit();
+    }
+    try group.spawn(.shared, runRaftRuntime, .{&rt});
 
     zio.sleep(zio.Duration.fromMilliseconds(50)) catch return;
     node.startShutdown();
@@ -326,9 +330,12 @@ pub fn testTransportProcessesProposal() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = zio.Group{};
-    defer group.wait() catch {};
-    try group.spawn(runRaftRuntime, .{&rt});
+    var group = runtime.Group(void).init(std.testing.allocator, .background);
+    defer {
+        group.wait();
+        group.deinit();
+    }
+    try group.spawn(.shared, runRaftRuntime, .{&rt});
 
     const Ctx = struct {
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -376,9 +383,12 @@ pub fn testTransportStopIsClean() !void {
     var rt = raft.RaftRuntime.init(std.testing.allocator, node);
     defer rt.deinit();
 
-    var group = zio.Group{};
-    defer group.wait() catch {};
-    try group.spawn(runRaftRuntime, .{&rt});
+    var group = runtime.Group(void).init(std.testing.allocator, .background);
+    defer {
+        group.wait();
+        group.deinit();
+    }
+    try group.spawn(.shared, runRaftRuntime, .{&rt});
 
     zio.sleep(zio.Duration.fromMilliseconds(50)) catch return;
     node.startShutdown();

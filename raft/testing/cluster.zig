@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const rt = @import("runtime");
 const raft = @import("raft");
 pub const Node = raft.Node;
 pub const NodeId = raft.NodeId;
@@ -44,7 +45,7 @@ pub const TestCluster = struct {
         node: *Node,
         wal: TestLog,
         peers: []const raft.Peer,
-        group: zio.Group,
+        group: rt.Group(void),
     };
 
     pub fn init(
@@ -66,7 +67,7 @@ pub const TestCluster = struct {
                 .node = undefined,
                 .wal = try TestLog.init(allocator, id),
                 .peers = peers,
-                .group = zio.Group{},
+                .group = rt.Group(void).init(allocator, .raft),
             };
             var ncfg = config;
             ncfg.id = id;
@@ -112,10 +113,10 @@ pub const TestCluster = struct {
         var node_it = cluster.nodes.valueIterator();
         while (node_it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
-            entry.group.spawn(Node.tickLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
-            entry.group.spawn(Node.mainLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
-            entry.group.spawn(Node.applyLoop, .{entry.node}) catch {};
-            entry.group.spawn(Node.callbackLoop, .{entry.node}) catch {};
+            entry.group.spawn(.exclusive, Node.tickLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
+            entry.group.spawn(.exclusive, Node.mainLoop, .{ entry.node, entry.node.config.tick_interval_ms }) catch {};
+            entry.group.spawn(.exclusive, Node.applyLoop, .{entry.node}) catch {};
+            entry.group.spawn(.shared, Node.callbackLoop, .{entry.node}) catch {};
         }
         std.debug.print("TestCluster.init: done\n", .{});
         return cluster;
@@ -130,12 +131,13 @@ pub const TestCluster = struct {
         // Wait for ALL coroutines to finish before any cleanup.
         var wait_it = self.nodes.valueIterator();
         while (wait_it.next()) |entry_ptr| {
-            entry_ptr.*.group.wait() catch {};
+            entry_ptr.*.group.wait();
         }
         // Now safe to clean up — no coroutines are running.
         var it = self.nodes.valueIterator();
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
+            entry.group.deinit();
             entry.node.deinitTransport();
             entry.node.deinit();
             entry.wal.deinit(self.allocator);

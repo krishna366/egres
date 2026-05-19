@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const zio = @import("zio");
+const rt = @import("runtime");
 const pgwire = @import("pgwire");
 
 const parser = pgwire.parser_mod;
@@ -164,11 +164,13 @@ test "parse: 1000 concurrent fibers parse distinct queries (no leaks, no races)"
         }
     };
 
-    var group = zio.Group{};
+    var group = rt.Group(void).init(a, .background);
+    defer group.deinit();
+    try group.ensureTotalCapacity(1000);
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
-        try group.spawn(Worker.run, .{ a, i, &failures });
+        try group.spawn(.shared, Worker.run, .{ a, i, &failures });
     }
-    try group.wait();
+    group.wait();
     try testing.expectEqual(@as(u32, 0), failures.load(.seq_cst));
 }

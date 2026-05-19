@@ -81,14 +81,6 @@ fn testStreamHandler(stream: *Mux.Stream) void {
 }
 
 test "Mux open stream and exchange frames" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-
-    var handle = try rt.spawn(muxExchangeTest, .{});
-    try handle.join();
-}
-
-fn muxExchangeTest() !void {
     const alloc = std.testing.allocator;
 
     // Create a loopback TCP pair.

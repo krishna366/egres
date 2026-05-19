@@ -494,7 +494,7 @@ test "P1 prioritized over P2" {
 
 // ── batchRead tests ─────────────────────────────────────────────────
 
-fn batchReadTestImpl() !void {
+test "batchRead 512 requests" {
     const alloc = testing.allocator;
     const path = "/tmp/vfs_test_batch_read";
     defer deleteFileAbs(path) catch {};
@@ -542,11 +542,4 @@ fn batchReadTestImpl() !void {
             try testing.expectEqual(expected_fill, b);
         }
     }
-}
-
-test "batchRead 512 requests" {
-    const rt = try zio.Runtime.init(testing.allocator, .{});
-    defer rt.deinit();
-    var handle = try rt.spawn(batchReadTestImpl, .{});
-    try handle.join();
 }

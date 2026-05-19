@@ -10,6 +10,7 @@
 const std = @import("std");
 const testing = std.testing;
 const zio = @import("zio");
+const rt = @import("runtime");
 const pgwire = @import("pgwire");
 
 const Channel = zio.Channel;
@@ -97,7 +98,7 @@ const TestCtx = struct {
     handler: *StubHandler,
 };
 
-fn serverFn(ctx: *TestCtx) !void {
+fn serverFn(ctx: *TestCtx) anyerror!void {
     const addr = try IpAddress.parseIp4("127.0.0.1", 0);
     const server = try addr.listen(.{});
     defer server.close();
@@ -110,7 +111,7 @@ fn serverFn(ctx: *TestCtx) !void {
     try pgwire.serve(ctx.a, &stream, ctx.handler, .{});
 }
 
-fn clientFn(ctx: *TestCtx) !void {
+fn clientFn(ctx: *TestCtx) anyerror!void {
     const port = try ctx.port_ch.receive();
     const addr = try IpAddress.parseIp4("127.0.0.1", port);
 
@@ -200,9 +201,6 @@ fn expectContainsInOrder(hay: []const u8, needle: []const u8) !void {
 test "driver: full startup + Query + Terminate round-trip" {
     const a = std.testing.allocator;
 
-    const runtime = try zio.Runtime.init(a, .{});
-    defer runtime.deinit();
-
     var handler = StubHandler{ .alloc = a };
     defer handler.deinit();
 
@@ -215,11 +213,11 @@ test "driver: full startup + Query + Terminate round-trip" {
         .handler = &handler,
     };
 
-    var group = zio.Group{};
-    defer group.cancel();
+    var group = rt.Group(anyerror!void).init(a, .background);
+    defer group.deinit();
 
-    try group.spawn(serverFn, .{&ctx});
-    try group.spawn(clientFn, .{&ctx});
+    try group.spawn(.shared, serverFn, .{&ctx});
+    try group.spawn(.shared, clientFn, .{&ctx});
 
-    try group.wait();
+    for (group.wait()) |r| try r;
 }
