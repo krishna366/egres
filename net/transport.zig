@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const runtime = @import("runtime");
 const serial_mod = @import("serial");
 const utils = @import("utils");
 const Serial = serial_mod.Serial;
@@ -64,7 +65,7 @@ pub const Transport = struct {
     listen_addr: zio.net.IpAddress,
     mu: utils.TrackedMutex,
     peers: std.AutoHashMap(u64, *PeerSlot),
-    group: zio.Group,
+    group: runtime.Group(void),
     listener: ?zio.net.Server,
     shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -78,7 +79,7 @@ pub const Transport = struct {
             .listen_addr = listen_addr,
             .mu = .{},
             .peers = peers,
-            .group = zio.Group{},
+            .group = runtime.Group(void).init(allocator, .raft),
             .listener = null,
         };
     }
@@ -106,7 +107,8 @@ pub const Transport = struct {
 
         if (self.listener) |*l| l.shutdown(.both) catch {};
         log.info("Transport l.close is done", .{});
-        self.group.wait() catch {};
+        self.group.wait();
+        self.group.deinit();
         log.debug("node {d}: Transport group stopped", .{self.cfg.self_id});
 
         var it = self.peers.valueIterator();
@@ -146,7 +148,7 @@ pub const Transport = struct {
             log.debug("addPeer got address {s} for peer {d}\n", .{ addr, id });
             slot.addr = try self.allocator.dupe(u8, addr);
             for ([_]Priority{ .p0, .p1 }) |pri| {
-                self.group.spawn(dialLoop, .{ self, id, pri }) catch |err| {
+                self.group.spawn(.shared, dialLoop, .{ self, id, pri }) catch |err| {
                     log.err("failed to spawn dial loop for peer {d}: {s}", .{ id, @errorName(err) });
                 };
             }
@@ -161,7 +163,7 @@ pub const Transport = struct {
 
         // Start dial loops for this peer.
         for ([_]Priority{ .p0, .p1 }) |pri| {
-            self.group.spawn(dialLoop, .{ self, id, pri }) catch {};
+            self.group.spawn(.shared, dialLoop, .{ self, id, pri }) catch {};
         }
     }
 
@@ -186,15 +188,15 @@ pub const Transport = struct {
         }
         log.info("node {d}: listening on {s}", .{ self.cfg.self_id, self.cfg.listen_addr });
 
-        try self.group.spawn(acceptLoop, .{self});
-        try self.group.spawn(livenessLoop, .{self});
+        try self.group.spawn(.shared, acceptLoop, .{self});
+        try self.group.spawn(.shared, livenessLoop, .{self});
 
         // Spawn one dial coroutine per (peer, priority) pair.
         var it = self.peers.iterator();
         while (it.next()) |kv| {
             const peer_id = kv.key_ptr.*;
             for ([_]Priority{ .p0, .p1 }) |pri| {
-                self.group.spawn(dialLoop, .{ self, peer_id, pri }) catch {};
+                self.group.spawn(.shared, dialLoop, .{ self, peer_id, pri }) catch {};
             }
         }
     }
@@ -250,7 +252,7 @@ pub const Transport = struct {
         while (true) {
             const conn = self.listener.?.accept(.{}) catch return;
             configureSocket(conn);
-            self.group.spawn(handleInbound, .{ self, conn }) catch {
+            self.group.spawn(.shared, handleInbound, .{ self, conn }) catch {
                 conn.close();
             };
         }

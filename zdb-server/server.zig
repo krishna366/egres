@@ -387,8 +387,11 @@ pub const ZdbServer = struct {
 
         log.info("client TCP listener started, accepting connections", .{});
 
-        var group = zio.Group{};
-        defer group.cancel();
+        // Per-connection handlers run on .query, cancelled collectively on
+        // shutdown so in-flight requests don't outlive the listener.
+        var g = runtime.Group(void).init(self.allocator, .query);
+        defer g.deinit();
+        defer g.cancel();
 
         var conn_id: u64 = 0;
         while (!self.node.isShuttingDown()) {
@@ -399,7 +402,7 @@ pub const ZdbServer = struct {
             stream.socket.setNoDelay(true) catch {};
             conn_id += 1;
             log.info("accepted client connection #{d}", .{conn_id});
-            group.spawn(handleClient, .{ self, stream }) catch {
+            g.spawn(.shared, handleClient, .{ self, stream }) catch {
                 log.err("failed to spawn handler for connection #{d}", .{conn_id});
                 stream.close();
             };
@@ -422,9 +425,26 @@ pub const ZdbServer = struct {
 
         const n_compactors = self.forest.opts.num_compactors;
         log.info("compaction loops started: num_compactors={d}", .{n_compactors});
-        var group = zio.Group{};
-        group.spawn(runMemtableLoop, .{self}) catch return;
-        group.spawn(runFlushLoop, .{self}) catch return;
+
+        // All compaction loops self-exit via isShuttingDown() — no collective
+        // cancel needed; `wait()` is enough. Background fibers don't need
+        // `.exclusive` placement: they're allocator-bound and I/O-bound with
+        // ample sleep windows, so co-scheduling on shared threads is fine.
+        var g = runtime.Group(void).init(self.allocator, .background);
+        defer g.deinit();
+        g.ensureTotalCapacity(3 + n_compactors) catch |err| {
+            log.err("runCompactionLoop: ensureTotalCapacity failed: {s}", .{@errorName(err)});
+            return;
+        };
+
+        g.spawn(.shared, runMemtableLoop, .{self}) catch |err| {
+            log.err("runCompactionLoop: spawn runMemtableLoop failed: {s}", .{@errorName(err)});
+            return;
+        };
+        g.spawn(.shared, runFlushLoop, .{self}) catch |err| {
+            log.err("runCompactionLoop: spawn runFlushLoop failed: {s}", .{@errorName(err)});
+            return;
+        };
         // Each levels-loop fiber claims one tree at a time via
         // `pickAndReserveCompactionTarget`; with N fibers we get N
         // tree-parallel compactions. Single-tree workloads degenerate
@@ -432,10 +452,17 @@ pub const ZdbServer = struct {
         // exactly the right behavior — multiple compactors on one
         // tree would race on level mutexes.
         for (0..n_compactors) |_| {
-            group.spawn(runLevelsLoop, .{self}) catch return;
+            g.spawn(.shared, runLevelsLoop, .{self}) catch |err| {
+                log.err("runCompactionLoop: spawn runLevelsLoop failed: {s}", .{@errorName(err)});
+                return;
+            };
         }
-        group.spawn(runInFlightWatchdog, .{self}) catch return;
-        group.wait() catch {};
+        g.spawn(.shared, runInFlightWatchdog, .{self}) catch |err| {
+            log.err("runCompactionLoop: spawn runInFlightWatchdog failed: {s}", .{@errorName(err)});
+            return;
+        };
+
+        g.wait();
         log.info("compaction loops exiting (shutdown)", .{});
     }
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const runtime = @import("runtime");
 const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.serial);
@@ -143,8 +144,9 @@ pub const Serial = struct {
     /// Reader calls on_message for each inbound frame.
     /// Writer drains the outbound channel and sends frames.
     pub fn run(self: *Serial, ctx: *anyopaque, on_message: OnMessageFn) void {
-        var group = zio.Group{};
-        group.spawn(writerLoop, .{self}) catch |err| {
+        var g = runtime.Group(void).init(self.allocator, .raft);
+        defer g.deinit();
+        g.spawn(.shared, writerLoop, .{self}) catch |err| {
             log.err("failed to spawn writer loop: {s}", .{@errorName(err)});
             return;
         };
@@ -154,9 +156,7 @@ pub const Serial = struct {
 
         // Reader exited (TCP closed). Close outbound channel so writer exits too.
         self.outbound.close(.graceful);
-        group.wait() catch |err| {
-            log.err("writer group wait error: {s}", .{@errorName(err)});
-        };
+        g.wait();
     }
 
     fn readerLoop(self: *Serial, ctx: *anyopaque, on_message: OnMessageFn) void {

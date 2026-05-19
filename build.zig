@@ -102,7 +102,9 @@ fn makeModules(
     const buffers_gen = makeModule(b, target, optimize, "zbuf/buffers.gen.zig");
     buffers_gen.addImport("zbuf", zbuf);
 
-    // Infra
+    // Infra. `runtime` is wired below; we attach it to utils/raft/zdb after
+    // creation so bare-`zio.spawn` sites in those modules can route through
+    // `runtime.spawnOn` (the egres↔zio seam — see runtime.zig).
     const utils = makeModule(b, target, optimize, "u/utils.zig");
     utils.addImport("zio", zio);
     // utils/compress.zig does @cImport for lz4/zstd. Bake the include paths
@@ -123,13 +125,21 @@ fn makeModules(
     const runtime = makeModule(b, target, optimize, "runtime.zig");
     runtime.addImport("zio", zio);
 
+    // Wire `runtime` into the modules whose source files spawn fibers.
+    // Done after both `utils` and `runtime` are constructed so there's no
+    // ordering issue. `runtime` itself only depends on zio, so no cycle.
+    utils.addImport("runtime", runtime);
+    // raft + zdb get it below alongside their other deps.
+
     // Wire
     const serial = makeModule(b, target, optimize, "net/serial.zig");
     serial.addImport("zio", zio);
+    serial.addImport("runtime", runtime);
     serial.addImport("utils", utils);
 
     const transport = makeModule(b, target, optimize, "net/transport.zig");
     transport.addImport("zio", zio);
+    transport.addImport("runtime", runtime);
     transport.addImport("serial", serial);
     transport.addImport("utils", utils);
 
@@ -146,6 +156,7 @@ fn makeModules(
     raft.addImport("zbuf", zbuf);
     raft.addImport("utils", utils);
     raft.addImport("zio", zio);
+    raft.addImport("runtime", runtime);
     raft.addImport("serial", serial);
     raft.addImport("transport", transport);
     raft.addImport("vfs", vfs);
@@ -155,6 +166,7 @@ fn makeModules(
     zdb.addImport("zbuf", zbuf);
     zdb.addImport("utils", utils);
     zdb.addImport("zio", zio);
+    zdb.addImport("runtime", runtime);
     zdb.addImport("vfs", vfs);
     zdb.addImport("metrics", metrics);
 

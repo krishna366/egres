@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const zio = @import("zio");
+const runtime = @import("runtime");
 const context = @import("context.zig");
 
 const tick_interval = zio.Duration.fromMilliseconds(1);
@@ -42,7 +43,7 @@ pub const Clock = struct {
         if (started.swap(true, .monotonic)) return;
         cached.store(nowMs(), .monotonic);
         stopping.store(false, .monotonic);
-        tick_handle = try zio.spawn(tickLoop, .{});
+        tick_handle = try runtime.spawnOn(.background, .exclusive, tickLoop, .{});
     }
 
     /// Signal the ticker fiber to exit and join it. Intended for tests

@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const runtime = @import("runtime");
 const raftwal_mod = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
@@ -1809,16 +1810,25 @@ pub const Node = struct {
     }
 
     pub fn blockingRunAllLoops(self: *Node) !void {
-        var group = zio.Group{};
-
-        try group.spawn(tickLoop, .{ self, self.config.tick_interval_ms });
-        try group.spawn(mainLoop, .{ self, self.config.tick_interval_ms });
-        try group.spawn(applyLoop, .{self});
-        try group.spawn(callbackLoop, .{self});
-        try group.spawn(clockTickLoop, .{self});
-        try group.spawn(commitPersistLoop, .{self});
-
-        group.wait() catch {};
+        // Every loop self-exits when `isShuttingDown()` flips, so we don't
+        // need `cancel()` — `wait()` suffices.
+        //
+        // mainLoop + applyLoop are `.exclusive` because they must not share
+        // a thread (see runtime.Sharing): mainLoop drives consensus and
+        // applyLoop drains the apply queue; co-scheduling them on the same
+        // thread serializes one behind the other and stalls Raft. Enforcement
+        // lands once we collapse to a single zio.Runtime + gain
+        // `zio.spawnOn(thread_idx)` upstream — today the markers are intent.
+        var g = runtime.Group(void).init(self.allocator, .raft);
+        defer g.deinit();
+        try g.ensureTotalCapacity(6);
+        try g.spawn(.exclusive, tickLoop, .{ self, self.config.tick_interval_ms });
+        try g.spawn(.exclusive, mainLoop, .{ self, self.config.tick_interval_ms });
+        try g.spawn(.exclusive, applyLoop, .{self});
+        try g.spawn(.shared, callbackLoop, .{self});
+        try g.spawn(.shared, clockTickLoop, .{self});
+        try g.spawn(.shared, commitPersistLoop, .{self});
+        g.wait();
     }
 
     /// Fires `apply_callbacks` with `.committed` once each entry commits.
@@ -2028,7 +2038,12 @@ pub const Node = struct {
             // broadcast (Raft paper §7 pipelining). `addEntries` already
             // populated cache + write_buf; the spawned `sync()` does the
             // pwrite (durable due to O_DSYNC) on a separate fiber.
-            var sync_handle = zio.spawn(syncLogTask, .{self}) catch @panic("zio.spawn syncLogTask");
+            var sync_handle = runtime.spawnOn(
+                .raft,
+                .shared,
+                syncLogTask,
+                .{self},
+            ) catch @panic("runtime.spawnOn syncLogTask");
             // Tracks whether we still need to join the sync handle. Set to
             // false in the q==1 branch (where we wait early). We capture
             // this decision *before* advance(), since advance can apply

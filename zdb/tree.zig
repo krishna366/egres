@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const runtime = @import("runtime");
 const utils = @import("utils");
 const config = @import("config.zig");
 const manifest = @import("manifest.zig");
@@ -160,13 +161,15 @@ pub const TableCache = struct {
         var tse: utils.ThreadSafeError = .{};
         var completed = std.atomic.Value(usize).init(0);
         const total = misses.items.len;
-        var group = zio.Group{};
-        defer group.cancel();
-        group.spawn(loadTablesWatchdog, .{ total, &completed }) catch {};
+        var g = runtime.Group(void).init(self.allocator, .query);
+        defer g.deinit();
+        defer g.cancel();
+        try g.ensureTotalCapacity(1 + misses.items.len);
+        g.spawn(.shared, loadTablesWatchdog, .{ total, &completed }) catch {};
         for (misses.items) |n| {
-            try group.spawn(openFiber, .{ self, n, &tse, &completed });
+            try g.spawn(.shared, openFiber, .{ self, n, &tse, &completed });
         }
-        group.wait() catch {};
+        g.wait();
         if (tse.get()) |err| return err;
     }
 
@@ -848,11 +851,10 @@ pub const Tree = struct {
         var bld = Builder.init(self.allocator, cfg);
         defer bld.deinit();
 
-        const FlushHandle = zio.JoinHandle(?FlushResult);
-        var flush_handles: std.ArrayList(FlushHandle) = .empty;
+        var flush_group = runtime.Group(?FlushResult).init(self.allocator, .background);
         defer {
-            for (flush_handles.items) |*h| _ = h.join();
-            flush_handles.deinit(self.allocator);
+            _ = flush_group.wait();
+            flush_group.deinit();
         }
 
         // Diagnostic: count items + bytes pulled from the merge iterator vs
@@ -878,7 +880,7 @@ pub const Tree = struct {
                 // find higher version keys at higher levels. This expectation is used by get fn to
                 // stop searching for key as soon as we're able to find a version >= search key.
                 if (!item.key.equalPrimary(bld.lastKey())) {
-                    try self.flushBuilderOutput(&bld, &flush_handles, file_ids);
+                    try self.flushBuilderOutput(&bld, &flush_group, file_ids);
                     bld.reset();
                 }
             }
@@ -889,7 +891,7 @@ pub const Tree = struct {
         }
 
         // Flush any remaining data.
-        try self.flushBuilderOutput(&bld, &flush_handles, file_ids);
+        try self.flushBuilderOutput(&bld, &flush_group, file_ids);
 
         // Sum up input key counts + on-disk byte sizes from every src + bot
         // SST's index for the "expected" baseline. If keys_in != expected,
@@ -929,15 +931,15 @@ pub const Tree = struct {
         // Start dir sync while we're waiting for file syncs to be done. We can do dir sync here
         // because files have already been created and written. So, dir should have everything it
         // needs.
-        var dir_sync = try zio.spawn(vfs.VFS.syncDir, .{self.opts.dir});
+        var dir_sync = try runtime.spawnOn(.background, .shared, vfs.VFS.syncDir, .{self.opts.dir});
         defer dir_sync.join();
 
         // Join all sync fibers and collect output file IDs.
-        for (flush_handles.items) |*h| {
-            const result = h.join() orelse return error.FlushFailed;
+        const results = flush_group.wait();
+        for (results) |r_opt| {
+            const result = r_opt orelse return error.FlushFailed;
             try output_file_ids.append(self.allocator, result.file_id);
         }
-        flush_handles.clearAndFree(self.allocator);
 
         // --- build manifest changes ---
         var changes = try std.ArrayList(manifest.TableChange).initCapacity(
@@ -1021,11 +1023,11 @@ pub const Tree = struct {
     const FlushResult = struct { file_id: u64 };
 
     /// flushBuilderOutput finishes the builder, writes bytes to a new SST file,
-    /// then spawns a fiber to sync it. The JoinHandle is appended to handles.
+    /// then spawns a sync fiber registered with the caller's Group.
     fn flushBuilderOutput(
         self: *Tree,
         bld: *Builder,
-        handles: *std.ArrayList(zio.JoinHandle(?FlushResult)),
+        group: *runtime.Group(?FlushResult),
         file_ids: *fi.FileIds,
     ) !void {
         var tb = try bld.finish();
@@ -1040,9 +1042,7 @@ pub const Tree = struct {
         try wh.write(tb.bytes, 0, bld.cfg.priority);
 
         // Sync in a fiber; data is in page cache after write.
-        try handles.append(self.allocator, try zio.spawn(syncFile, .{
-            self.allocator, wh, path, id,
-        }));
+        try group.spawn(.shared, syncFile, .{ self.allocator, wh, path, id });
     }
 
     fn syncFile(

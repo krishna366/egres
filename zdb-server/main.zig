@@ -112,18 +112,16 @@ pub fn main(init: std.process.Init) !void {
     const allocator = utils.context.g().gpa;
     const argv = try utils.context.g().argv();
 
-    // Runtime pool singleton — created first so all runtimes are available.
-    const pool = try runtime.Pool.init(allocator, .{});
-    defer deinitWithLog("pool", pool);
-    log.info("runtime pool initialized", .{});
+    // Single shared zio.Runtime. `total_threads = 0` → auto-detect from
+    // CPU count. Every fiber spawn for the rest of the process goes
+    // through `runtime.spawnOn` and lands on a thread here; thread-group
+    // routing (.raft / .query / .background) is recorded intent today,
+    // enforceable once zio gains `spawnOn(thread_idx, ...)`.
+    try runtime.init(allocator, .{});
+    defer runtime.deinit();
+    log.info("runtime initialized", .{});
 
-    // Single-executor bootstrap runtime. Everything from flag init
-    // onward runs in a fiber on it so flag locks and other zio-aware
-    // locks never block an executor thread across a yield.
-    const bootstrap_rt = try zio.Runtime.init(allocator, .{ .executors = .exact(1) });
-    defer bootstrap_rt.deinit();
-
-    var handle = try bootstrap_rt.spawn(bootstrap, .{ allocator, argv });
+    var handle = try runtime.spawnOn(.background, .shared, bootstrap, .{ allocator, argv });
     try handle.join();
 }
 
@@ -287,19 +285,25 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 
     // appMain(&raft_rt, &zdb_srv, node, &args);
     // // Entry point: spawn appMain on the raft pool. It orchestrates everything.
-    var handle = try runtime.pool().get(.raft).spawn(appMain, .{ &raft_rt, &zdb_srv, node, &args });
+    var handle = try runtime.spawnOn(.raft, .shared, appMain, .{ &raft_rt, &zdb_srv, node, &args });
     handle.join();
 
     log.info("shutting down...", .{});
 }
 
-/// Runs on the raft pool. Spawns raft runtime, client server (on query pool
-/// via runtime.pool() singleton), compaction loop (on background pool),
-/// and waits for SIGINT or SIGTERM to shut down.
+/// Runs on the shared runtime (.raft group). Spawns raft runtime, client
+/// server (.query), compaction + snapshot loops (.background) — all via
+/// `runtime.spawnOn` — then waits for SIGINT or SIGTERM to shut down.
 fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const Args) void {
     log.info("inside appMain", .{});
-    var group = zio.Group{};
-    defer group.cancel();
+    // The four shim fibers (runRaft, runServer, runCompaction, runSnapshot)
+    // run alongside appMain on the .raft runtime. When the signal handler
+    // fires below, `defer g.cancel()` propagates cancellation into each
+    // shim's `handle.join()`, which in turn cancels the inner loop running
+    // on its actual target runtime (.query / .background).
+    var g = runtime.Group(void).init(node.allocator, .background);
+    defer g.deinit();
+    defer g.cancel();
 
     // Initialize transport (needed for both join and raft loops).
     node.initTransport() catch |err| {
@@ -336,16 +340,28 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
     node.applyCommits();
 
     log.info("appMain: spawning raft runtime on raft pool", .{});
-    group.spawn(runRaft, .{raft_rt}) catch return;
+    g.spawn(.shared, runRaft, .{raft_rt}) catch |err| {
+        log.err("appMain: spawn runRaft failed: {s}", .{@errorName(err)});
+        return;
+    };
 
     log.info("appMain: spawning client server on query pool", .{});
-    group.spawn(runServer, .{zdb_srv}) catch return;
+    g.spawn(.shared, runServer, .{zdb_srv}) catch |err| {
+        log.err("appMain: spawn runServer failed: {s}", .{@errorName(err)});
+        return;
+    };
 
     log.info("appMain: spawning compaction loop on background pool", .{});
-    group.spawn(runCompaction, .{zdb_srv}) catch return;
+    g.spawn(.shared, runCompaction, .{zdb_srv}) catch |err| {
+        log.err("appMain: spawn runCompaction failed: {s}", .{@errorName(err)});
+        return;
+    };
 
     log.info("appMain: spawning snapshot loop on background pool", .{});
-    group.spawn(runSnapshot, .{zdb_srv}) catch return;
+    g.spawn(.shared, runSnapshot, .{zdb_srv}) catch |err| {
+        log.err("appMain: spawn runSnapshot failed: {s}", .{@errorName(err)});
+        return;
+    };
 
     log.info("appMain: waiting for SIGINT/SIGTERM to shutdown", .{});
     var sigint = zio.Signal.init(.interrupt) catch return;
@@ -385,10 +401,7 @@ fn runRaft(r: *raft.RaftRuntime) void {
 /// Spawn the client TCP accept loop on the query runtime pool.
 /// Must be called from a zio coroutine. Blocks until cancelled.
 fn runServer(s: *zdb_server.ZdbServer) void {
-    var handle = runtime.pool().get(.query).spawn(
-        zdb_server.ZdbServer.runClientLoop,
-        .{s},
-    ) catch |err| {
+    var handle = runtime.spawnOn(.query, .shared, zdb_server.ZdbServer.runClientLoop, .{s}) catch |err| {
         log.err("runServer err: {}", .{err});
         return;
     };
@@ -399,10 +412,7 @@ fn runServer(s: *zdb_server.ZdbServer) void {
 /// that polls WAL size/age and proposes snapshots through Raft.
 /// Must be called from a zio coroutine. Blocks until cancelled.
 fn runSnapshot(s: *zdb_server.ZdbServer) void {
-    var handle = runtime.pool().get(.background).spawn(
-        zdb_server.ZdbServer.runSnapshotLoop,
-        .{s},
-    ) catch |err| {
+    var handle = runtime.spawnOn(.background, .shared, zdb_server.ZdbServer.runSnapshotLoop, .{s}) catch |err| {
         log.err("runSnapshot err: {}", .{err});
         return;
     };
@@ -412,10 +422,7 @@ fn runSnapshot(s: *zdb_server.ZdbServer) void {
 /// Spawn the compaction loop on the background runtime pool.
 /// Must be called from a zio coroutine. Blocks until cancelled.
 fn runCompaction(s: *zdb_server.ZdbServer) void {
-    var handle = runtime.pool().get(.background).spawn(
-        zdb_server.ZdbServer.runCompactionLoop,
-        .{s},
-    ) catch |err| {
+    var handle = runtime.spawnOn(.background, .shared, zdb_server.ZdbServer.runCompactionLoop, .{s}) catch |err| {
         log.err("runCompaction err: {}", .{err});
         return;
     };

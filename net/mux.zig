@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const runtime = @import("runtime");
 const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.mux);
@@ -115,7 +116,7 @@ pub const Mux = struct {
     streams: std.AutoHashMap(u32, *Stream),
     next_stream_id: std.atomic.Value(u32),
     on_stream: *const fn (*Stream) void,
-    group: zio.Group,
+    group: runtime.Group(void),
     closed: bool,
     mu: utils.TrackedMutex,
 
@@ -133,7 +134,7 @@ pub const Mux = struct {
             .streams = std.AutoHashMap(u32, *Stream).init(allocator),
             .next_stream_id = std.atomic.Value(u32).init(initial_stream_id),
             .on_stream = on_stream,
-            .group = zio.Group{},
+            .group = runtime.Group(void).init(allocator, .raft),
             .closed = false,
             .mu = .{},
         };
@@ -146,9 +147,8 @@ pub const Mux = struct {
         self.closeChannels(); // close all channels, so we can exit the handlers.
 
         log.info("Mux.deinit. tcp closed", .{});
-        self.group.wait() catch |err| {
-            log.err("Mux.deinit group.wait err: {}", .{err});
-        };
+        self.group.wait();
+        self.group.deinit();
         log.info("Mux.deinit. group wait done", .{});
         self.destroyStreams();
         self.streams.deinit();
@@ -227,7 +227,7 @@ pub const Mux = struct {
                     continue;
                 };
 
-                self.group.spawn(handleInbound, .{ self, stream.? }) catch {
+                self.group.spawn(.shared, handleInbound, .{ self, stream.? }) catch {
                     // do nothing
                 };
             } else {

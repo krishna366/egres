@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = std.log.scoped(.forest);
 const zio = @import("zio");
+const runtime = @import("runtime");
 const utils = @import("utils");
 const config = @import("config.zig");
 const manifest = @import("manifest.zig");
@@ -473,10 +474,10 @@ pub const Forest = struct {
         // write path (finish → create file → write → sync → close) and returns
         // the manifest TableChange directly.
         var flush_err: utils.ThreadSafeError = .{};
-        var handles: std.ArrayList(zio.JoinHandle(?manifest.TableChange)) = .empty;
+        var g = runtime.Group(?manifest.TableChange).init(self.allocator, .background);
         defer {
-            for (handles.items) |*h| _ = h.join();
-            handles.deinit(self.allocator);
+            _ = g.wait();
+            g.deinit();
         }
 
         var bit = builders.iterator();
@@ -493,23 +494,23 @@ pub const Forest = struct {
             const file_id = try self.file_ids.allocate();
             const path = try fi.sstPath(self.allocator, self.opts.dir, file_id);
 
-            try handles.append(self.allocator, try zio.spawn(writeAndSyncTable, .{
+            try g.spawn(.shared, writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tree_id, &flush_err,
-            }));
+            });
         }
 
         // Join fibers and collect manifest changes.
+        const tcs = g.wait();
         var changes: std.ArrayList(manifest.TableChange) = .empty;
-        for (handles.items) |*h| {
-            const tc = h.join() orelse continue;
+        for (tcs) |tc_opt| {
+            const tc = tc_opt orelse continue;
             try changes.append(self.allocator, tc);
         }
-        handles.clearAndFree(self.allocator);
         if (flush_err.get()) |err| return err;
 
         // Best-effort directory sync.
         if (self.opts.dir.len > 0) {
-            var dir_sync = try zio.spawn(vfs.VFS.syncDir, .{self.opts.dir});
+            var dir_sync = try runtime.spawnOn(.background, .shared, vfs.VFS.syncDir, .{self.opts.dir});
             defer dir_sync.join();
         }
 
