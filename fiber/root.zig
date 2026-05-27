@@ -39,3 +39,27 @@ pub const tscNsPerCycleQ32 = rt.tscNsPerCycleQ32;
 
 // Lower-level data structure used by `Deadlines`.
 pub const heap = @import("heap.zig");
+
+// Sync primitives built on `park` / `wake`.
+const sync = @import("sync.zig");
+pub const WaitQueue = sync.WaitQueue;
+pub const Mutex = sync.Mutex;
+pub const Condition = sync.Condition;
+pub const RWMutex = sync.RWMutex;
+pub const Notify = sync.Notify;
+
+const channel_mod = @import("channel.zig");
+pub const Channel = channel_mod.Channel;
+pub const CloseMode = channel_mod.CloseMode;
+
+const watermark_mod = @import("watermark.zig");
+pub const Watermark = watermark_mod.Watermark;
+
+// From io.zig — I/O operations that cooperatively park.
+const io = @import("io.zig");
+
+pub const sleep = io.sleep;
+pub const Stream = io.Stream;
+pub const Listener = io.Listener;
+pub const listen = io.listen;
+pub const connect = io.connect;
