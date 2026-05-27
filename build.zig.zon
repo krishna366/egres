@@ -10,5 +10,8 @@
         .metrics = .{
             .path = "../source/metrics.zig",
         },
+        .xev = .{
+            .path = "../source/libxev",
+        },
     },
 }

@@ -34,6 +34,7 @@ const Modules = struct {
     raft: *std.Build.Module,              // raft/raft.zig
     zdb: *std.Build.Module,               // zdb.zig
     pgwire: *std.Build.Module,            // pgwire.zig (libpg_query include baked in)
+    fiber: *std.Build.Module,             // fiber/fiber.zig
 };
 
 pub fn build(b: *std.Build) void {
@@ -177,6 +178,12 @@ fn makeModules(
     // addLibpgQuerySources.
     pgwire.addIncludePath(b.path("third_party/libpg_query"));
 
+    const xev = b.dependency("xev", .{ .target = target, .optimize = optimize }).module("xev");
+
+    const fiber = makeModule(b, target, optimize, "fiber/root.zig");
+    fiber.addImport("zio", zio);
+    fiber.addImport("xev", xev);
+
     return .{
         .zio = zio,
         .metrics = metrics,
@@ -192,6 +199,7 @@ fn makeModules(
         .raft = raft,
         .zdb = zdb,
         .pgwire = pgwire,
+        .fiber = fiber,
     };
 }
 
@@ -418,8 +426,9 @@ fn addAllTests(
     // BIG/BENCH gating happens at runtime via the test_runner CLI flags
     // (`--bigtest`, `--bench`); no compile-time `build_options` flag needed.
     const test_imports = .{
-        "zbuf",    "zdb",         "raft",      "utils",  "zio", "vfs",
+        "zbuf",    "zdb",         "raft",      "utils",  "zio",    "vfs",
         "metrics", "buffers_gen", "transport", "serial", "pgwire", "runtime",
+        "fiber",
     };
 
     const root_mod = b.createModule(.{
