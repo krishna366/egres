@@ -20,7 +20,7 @@ fn deep(n: u32, acc: *u64) void {
 fn body(acc: *u64) void {
     var r: u32 = 0;
     while (r < 6) : (r += 1) {
-        fiber.sleep(1); // park + likely migrate to another worker
+        fiber.sleepMs(1); // park + likely migrate to another worker
         deep(24, acc); // ~24 KiB recursion + ~8 KiB toPosixPath frame, well past the 16 KiB commit
     }
 }

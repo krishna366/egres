@@ -36,6 +36,7 @@ const Stats = struct {
 };
 
 // ── I/O work ─────────────────────────────────────────────────────────
+// TODO: Add Fiber for benchmarking here
 
 fn ioWorkPosix(fd: std.posix.fd_t, offsets: []const u64, latencies: []u64) void {
     var buf: [BLOCK_SIZE]u8 align(4096) = undefined;

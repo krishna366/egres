@@ -1,6 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
-const rt = @import("runtime");
+const fiber = @import("fiber");
 const flags = @import("flags.zig");
 
 const RaftCfg = struct {
@@ -200,7 +199,7 @@ fn readerLoop(ctx: ConcurrentCtx) void {
             }
             _ = ctx.observed.fetchAdd(1, .monotonic);
         }
-        zio.yield() catch {};
+        fiber.yield();
     }
 }
 
@@ -221,8 +220,8 @@ test "concurrent readers do not see torn state" {
 
     // Use spawnWith so the fiber dump shows where each reader was
     // spawned, distinguishing them from the test fiber itself.
-    var handles: [4]zio.JoinHandle(void) = undefined;
-    for (&handles) |*h| h.* = try rt.underlying().spawnWith(.{ .spawn_loc = @src() }, readerLoop, .{ctx});
+    var handles: [4]fiber.JoinHandle(void) = undefined;
+    for (&handles) |*h| h.* = try fiber.spawn(.{}, readerLoop, .{ctx});
 
     // Hammer with updates. Each `i` writes a self-consistent triple
     // (name=v{i}, retries=i%10, tracing=i%2==0) that readers verify.
@@ -233,6 +232,12 @@ test "concurrent readers do not see torn state" {
         });
         defer alloc.free(buf);
         try live.update(buf);
+        // Yield so the co-located reader fibers get to run. fiber's scheduler
+        // is cooperative + no-work-stealing + local-first: fibers spawned from
+        // this worker sit on its local queue (no spill until the ring overflows
+        // at 16), so idle peers never pull them. A non-yielding writer would
+        // monopolize the worker and the readers would never observe an update.
+        fiber.yield();
     }
 
     stop.store(true, .release);
@@ -410,8 +415,8 @@ test "registry: concurrent updates same module are serialised" {
     var err_flag = std.atomic.Value(u16).init(0);
     const ctx = MultiUpdaterCtx{ .live = raft, .iters = 100, .err = &err_flag };
 
-    var handles: [4]zio.JoinHandle(void) = undefined;
-    for (&handles) |*h| h.* = try zio.spawn(updaterLoop, .{ctx});
+    var handles: [4]fiber.JoinHandle(void) = undefined;
+    for (&handles) |*h| h.* = try fiber.spawn(.{}, updaterLoop, .{ctx});
     for (&handles) |*h| h.join();
 
     try std.testing.expectEqual(@as(u16, 0), err_flag.load(.acquire));

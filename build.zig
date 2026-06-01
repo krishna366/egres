@@ -23,7 +23,6 @@ const Modules = struct {
     flags: *std.Build.Module,             // u/flags.zig
     utils: *std.Build.Module,             // u/utils.zig (lz4/zstd C includes baked in)
     vfs: *std.Build.Module,               // vfs/vfs.zig
-    runtime: *std.Build.Module,           // runtime.zig
 
     // Wire
     serial: *std.Build.Module,            // net/serial.zig
@@ -103,11 +102,9 @@ fn makeModules(
     const buffers_gen = makeModule(b, target, optimize, "zbuf/buffers.gen.zig");
     buffers_gen.addImport("zbuf", zbuf);
 
-    // Infra. `runtime` is wired below; we attach it to utils/raft/zdb after
-    // creation so bare-`zio.spawn` sites in those modules can route through
-    // `runtime.spawnOn` (the egres↔zio seam — see runtime.zig).
+    // Infra. Only `fiber` imports zio now (for its coroutine engine,
+    // `zio.coro`); every other module is zio-free post-migration.
     const utils = makeModule(b, target, optimize, "u/utils.zig");
-    utils.addImport("zio", zio);
     // utils/compress.zig does @cImport for lz4/zstd. Bake the include paths
     // onto the module so every consumer gets them automatically — no more
     // "remember to call addIncludePath" footgun across multiple addX functions.
@@ -116,31 +113,29 @@ fn makeModules(
     utils.addIncludePath(b.path("third_party/zstd/lib"));
 
     const flags = makeModule(b, target, optimize, "u/flags.zig");
-    flags.addImport("zio", zio);
     flags.addImport("utils", utils);
 
     const vfs = makeModule(b, target, optimize, "vfs/vfs.zig");
-    vfs.addImport("zio", zio);
     vfs.addImport("utils", utils);
 
-    const runtime = makeModule(b, target, optimize, "runtime.zig");
-    runtime.addImport("zio", zio);
+    // The in-tree fiber runtime — what production code spawns/parks on.
+    // Wired into every module that used to go through the `runtime` seam.
+    const xev = b.dependency("xev", .{ .target = target, .optimize = optimize }).module("xev");
+    const fiber = makeModule(b, target, optimize, "fiber/root.zig");
+    fiber.addImport("zio", zio);
+    fiber.addImport("xev", xev);
 
-    // Wire `runtime` into the modules whose source files spawn fibers.
-    // Done after both `utils` and `runtime` are constructed so there's no
-    // ordering issue. `runtime` itself only depends on zio, so no cycle.
-    utils.addImport("runtime", runtime);
-    // raft + zdb get it below alongside their other deps.
+    utils.addImport("fiber", fiber);
+    flags.addImport("fiber", fiber);
+    vfs.addImport("fiber", fiber);
 
     // Wire
     const serial = makeModule(b, target, optimize, "net/serial.zig");
-    serial.addImport("zio", zio);
-    serial.addImport("runtime", runtime);
+    serial.addImport("fiber", fiber);
     serial.addImport("utils", utils);
 
     const transport = makeModule(b, target, optimize, "net/transport.zig");
-    transport.addImport("zio", zio);
-    transport.addImport("runtime", runtime);
+    transport.addImport("fiber", fiber);
     transport.addImport("serial", serial);
     transport.addImport("utils", utils);
 
@@ -156,8 +151,7 @@ fn makeModules(
     raft.addImport("buffers_gen", raft_buffers_gen);
     raft.addImport("zbuf", zbuf);
     raft.addImport("utils", utils);
-    raft.addImport("zio", zio);
-    raft.addImport("runtime", runtime);
+    raft.addImport("fiber", fiber);
     raft.addImport("serial", serial);
     raft.addImport("transport", transport);
     raft.addImport("vfs", vfs);
@@ -166,23 +160,16 @@ fn makeModules(
     const zdb = makeModule(b, target, optimize, "zdb.zig");
     zdb.addImport("zbuf", zbuf);
     zdb.addImport("utils", utils);
-    zdb.addImport("zio", zio);
-    zdb.addImport("runtime", runtime);
+    zdb.addImport("fiber", fiber);
     zdb.addImport("vfs", vfs);
     zdb.addImport("metrics", metrics);
 
     const pgwire = makeModule(b, target, optimize, "pgwire.zig");
-    pgwire.addImport("zio", zio);
+    pgwire.addImport("fiber", fiber);
     // pgwire.parser does @cImport("pg_query.h"). Header path lives on the
     // module; the C archive itself is linked per-executable via
     // addLibpgQuerySources.
     pgwire.addIncludePath(b.path("third_party/libpg_query"));
-
-    const xev = b.dependency("xev", .{ .target = target, .optimize = optimize }).module("xev");
-
-    const fiber = makeModule(b, target, optimize, "fiber/root.zig");
-    fiber.addImport("zio", zio);
-    fiber.addImport("xev", xev);
 
     return .{
         .zio = zio,
@@ -192,7 +179,6 @@ fn makeModules(
         .flags = flags,
         .utils = utils,
         .vfs = vfs,
-        .runtime = runtime,
         .serial = serial,
         .transport = transport,
         .zbuf = zbuf,
@@ -307,7 +293,10 @@ fn isSkippedPath(path: []const u8) bool {
         std.mem.startsWith(u8, path, ".git/") or
         std.mem.startsWith(u8, path, "zig-out/") or
         std.mem.startsWith(u8, path, "node_modules/") or
-        std.mem.startsWith(u8, path, "third_party/");
+        std.mem.startsWith(u8, path, "third_party/") or
+        // Graveyard for code no longer wired into the build (e.g. the old
+        // Mux multiplexer + its tests). Excluded wholesale from discovery.
+        std.mem.startsWith(u8, path, "unused/");
 }
 
 fn testFileLessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -326,14 +315,12 @@ const extra_test_files = [_][]const u8{
 // `addTest` step either, so excluding them matches existing behavior.
 // Each entry should have a follow-up to rehabilitate or delete the file.
 //
-// - net/mux_test.zig:        references a `mux` module no one registers
-// - net/transport_test.zig:  TODO note in old build.zig says "rewrite to
-//                            use Serial instead of Mux"
+// (The Mux multiplexer + its mux_test/transport_test moved to `unused/`,
+//  which isSkippedPath excludes wholesale — no entries needed here.)
+//
 // - raft/meta_test.zig:      uses `next_seq` and integer enum literals
 //                            that no longer match raft.MetaStore / RoleEnum
 const skip_test_files = [_][]const u8{
-    "net/mux_test.zig",
-    "net/transport_test.zig",
     "raft/meta_test.zig",
     // Legacy thread-vs-fiber benchmark. Uses std.Thread.spawn (removed
     // elsewhere) and produces a multi-cell sweep + p50/p99 latencies that
@@ -425,9 +412,12 @@ fn addAllTests(
 
     // BIG/BENCH gating happens at runtime via the test_runner CLI flags
     // (`--bigtest`, `--bench`); no compile-time `build_options` flag needed.
+    // `zio` stays available because auto-discovered `benchmarks/*_bench.zig`
+    // tools (e.g. mutex_bench, zio_bench) still benchmark zio primitives; no
+    // *test* uses it. Production modules above are wired zio-free.
     const test_imports = .{
         "zbuf",    "zdb",         "raft",      "utils",  "zio",    "vfs",
-        "metrics", "buffers_gen", "transport", "serial", "pgwire", "runtime",
+        "metrics", "buffers_gen", "transport", "serial", "pgwire",
         "fiber",
     };
 
@@ -526,14 +516,14 @@ fn addZdbServer(
     regen_buffers_step: *std.Build.Step,
 ) void {
     const zdb_server_mod = makeModule(b, target, optimize, "zdb-server/server.zig");
-    addImports(zdb_server_mod, mods, .{ "zio", "raft", "zdb", "runtime", "metrics", "flags" });
+    addImports(zdb_server_mod, mods, .{ "raft", "zdb", "fiber", "metrics", "flags" });
 
     const exe = b.addExecutable(.{
         .name = "zdb-server",
         .root_module = makeModule(b, target, optimize, "zdb-server/main.zig"),
     });
     addVendoredCompressionSources(b, exe);
-    addImports(exe.root_module, mods, .{ "zio", "raft", "zdb", "runtime", "metrics", "flags", "utils" });
+    addImports(exe.root_module, mods, .{ "raft", "zdb", "fiber", "metrics", "flags", "utils" });
     exe.root_module.addImport("zdb_server", zdb_server_mod);
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);
@@ -710,7 +700,7 @@ fn addPgwireShakeout(
         .name = "pgwire-shakeout",
         .root_module = makeModule(b, target, optimize, "pgwire-shakeout/main.zig"),
     });
-    addImports(exe.root_module, mods, .{ "zio", "pgwire", "utils" });
+    addImports(exe.root_module, mods, .{ "fiber", "pgwire", "utils" });
     addLibpgQuerySources(b, exe);
     b.installArtifact(exe);
 

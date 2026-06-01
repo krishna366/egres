@@ -11,7 +11,7 @@ test "CoarseClock: ms() advances during a parked fiber's sleep" {
     // `coarseMs` deltas under-report by 10+ ms even when the sleep
     // ran fine. We sidestep that here by reading a fresh clock.
     const before_ms = fiber.clockMsUseRarely(.monotonic);
-    fiber.sleep(30);
+    fiber.sleepMs(30);
     const after_ms = fiber.clockMsUseRarely(.monotonic);
     const observed_delta = after_ms - before_ms;
 

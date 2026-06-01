@@ -257,22 +257,3 @@ test "fs: many fibers run full file lifecycles concurrently" {
 
     for (oks) |ok| try std.testing.expect(ok);
 }
-
-test "fs.File: syncAndClose persists data and releases the fd in one round-trip" {
-    const path = "/tmp/fiber_fs_test_synclose";
-    fiber.Dir.cwd().deleteFile(path) catch {};
-    defer fiber.Dir.cwd().deleteFile(path) catch {};
-
-    {
-        var w = try fiber.Dir.cwd().createFile(path, .{});
-        try writeAllAt(w, "sync-and-close", 0);
-        try w.syncAndClose(); // single offload: fsync + close, one park/wake
-    }
-
-    // Reopen: data is durable (sync ran) and the file is usable (closed cleanly).
-    var r = try fiber.Dir.cwd().openFile(path, .{});
-    defer r.close();
-    var buf: [14]u8 = undefined;
-    const n = try readAllAt(r, &buf, 0);
-    try std.testing.expectEqualStrings("sync-and-close", buf[0..n]);
-}

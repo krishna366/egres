@@ -1,4 +1,4 @@
-//! Timer-based `sleep` that cooperatively parks the calling fiber on a
+//! Timer-based `sleepMs` that cooperatively parks the calling fiber on a
 //! libxev timer completion. (TCP/file I/O live in `net.zig` / `fs.zig`.)
 
 const std = @import("std");
@@ -8,7 +8,7 @@ const rt = @import("runtime.zig");
 
 const Fiber = fb.Fiber;
 
-pub fn sleep(ms: u64) void {
+pub fn sleepMs(ms: u64) void {
     const w = rt.currentWorker();
     const f = w.current_fiber.?;
 

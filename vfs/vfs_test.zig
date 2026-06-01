@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
-const zio = @import("zio");
+const fiber = @import("fiber");
 const vfs = @import("vfs");
 const utils = @import("utils");
 const bandwidth = vfs.bandwidth;
@@ -126,44 +126,37 @@ test "readAligned alignment math" {
     try testing.expectEqual(@as(usize, 12), r.data.len);
 }
 
-// ── 5a. O_DIRECT honors unaligned writes (regression guard) ─────────
+// ── 5a. O_DIRECT page-aligned write round-trips intact (regression guard) ──
 //
-// We had a working hypothesis that vfs.write under O_DIRECT was silently
-// truncating unaligned-length tails (after observing an SST file with size
-// = exact multiple of page_size, missing its trailer). This test proves
-// the hypothesis WRONG on the platforms we care about: ext4 + iomap_dio_rw
-// on modern Linux honours unaligned addresses, lengths, and offsets — every
-// byte lands on disk intact, including the unaligned tail.
-//
-// The test puts a known checksum in the last 4 bytes (which would be lost
-// to silent truncation), writes the whole buffer with O_DIRECT, then reads
-// the file back and verifies BOTH size AND that the checksum still matches
-// the content. A pure size check would miss the case where the kernel
-// pads the tail with zeros or stale data.
+// O_DIRECT requires the buffer ADDRESS, LENGTH, and OFFSET to be page-aligned;
+// `vfs.FileHandle.write` asserts that contract and every in-tree direct writer
+// satisfies it at the source (the SST builder page-aligns + pads its output;
+// the snapshot-install path copies network data into an aligned buffer). This
+// test exercises that supported path on a ~16 MB SST-sized buffer and verifies
+// every byte lands on disk intact — it plants a checksum in the last 4 bytes
+// (which would be the casualty of any tail truncation / zero-padding) and
+// checks BOTH the file size AND that the checksum still matches the content
+// after a read-back through a plain (non-O_DIRECT) handle.
 //
 // Needs a real disk-backed filesystem (tmpfs falls back to non-direct).
 // Uses /data/egres/ which the project pins to ext4.
-test "O_DIRECT write honors unaligned address + length + offset (content verified)" {
+test "O_DIRECT page-aligned write round-trips intact (content verified)" {
     const dir = "/data/egres";
     accessAbs(dir) catch return error.SkipZigTest;
 
-    const path = dir ++ "/vfs_test_direct_unaligned";
+    const path = dir ++ "/vfs_test_direct_aligned";
     defer deleteFileAbs(path) catch {};
     deleteFileAbs(path) catch {};
 
-    // 16 MB + 1 page + 3 bytes — matches the size class where corruption
-    // was observed (~16 MB SST). Length is odd at every plausible device
-    // block size (512 / 4096).
-    const len: usize = 16 * 1024 * 1024 + vfs.page_size + 3;
-    // Slice 7 bytes into a page-aligned arena so the buffer ADDRESS isn't
-    // aligned either.
-    const raw = try testing.allocator.alignedAlloc(u8, vfs.page_alignment, len + 64);
-    defer testing.allocator.free(raw);
-    const data = raw[7..][0..len];
+    // 16 MB + 1 page — page-aligned length, the size class where SST-write
+    // corruption was once suspected. The buffer is page-aligned via
+    // alignedAlloc and written at offset 0, matching the direct-write contract.
+    const len: usize = 16 * 1024 * 1024 + vfs.page_size;
+    const data = try testing.allocator.alignedAlloc(u8, vfs.page_alignment, len);
+    defer testing.allocator.free(data);
 
-    // Fill body with a deterministic pattern, then plant a u32 checksum of
-    // the body in the LAST 4 bytes — those land in the unaligned tail and
-    // would be the casualty of any silent truncation.
+    // Fill body with a deterministic pattern, then plant a u32 checksum of the
+    // body in the LAST 4 bytes — the tail that any truncation would drop.
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     prng.fill(data[0 .. len - 4]);
     const expected_checksum = std.hash.XxHash32.hash(0, data[0 .. len - 4]);
@@ -400,7 +393,7 @@ test "write bandwidth enforcement" {
     defer (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(ioOf());
 
     var v = VFS.new(&limiter);
-    const fh = vfs.FileHandle{ .file = zio.File.fromFd(fd), .file_size = file_size, .vfs = &v };
+    const fh = vfs.FileHandle{ .file = fiber.File.fromFd(fd), .file_size = file_size, .vfs = &v };
 
     // Drain the bucket.
     _ = blk: {
@@ -474,10 +467,10 @@ test "P1 prioritized over P2" {
     var p2_ctx = PriorityTestCtx{ .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
 
     // Launch P2 first, then P1 — P1 should still finish first.
-    var p2_handle = try zio.spawn(PriorityTestCtx.readerFn, .{ &p2_ctx, .p2 });
+    var p2_handle = try fiber.spawn(.{}, PriorityTestCtx.readerFn, .{ &p2_ctx, .p2 });
     // Small delay so P2 enters the wait loop first.
-    try zio.sleep(zio.Duration.fromMilliseconds(5));
-    var p1_handle = try zio.spawn(PriorityTestCtx.readerFn, .{ &p1_ctx, .p1 });
+    fiber.sleepMs(5);
+    var p1_handle = try fiber.spawn(.{}, PriorityTestCtx.readerFn, .{ &p1_ctx, .p1 });
 
     p1_handle.join();
     p2_handle.join();

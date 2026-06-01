@@ -9,7 +9,7 @@ test "io.sleep: 100 fibers sleeping 10ms in parallel finish under 50ms" {
 
     const Body = struct {
         fn run(c: *std.atomic.Value(u32)) void {
-            fiber.sleep(10);
+            fiber.sleepMs(10);
             _ = c.fetchAdd(1, .acq_rel);
         }
     };
@@ -39,7 +39,7 @@ test "io.sleep: 100 fibers sleeping 10ms in parallel finish under 50ms" {
 test "io.sleep: single fiber sleeps for the requested duration" {
     const Body = struct {
         fn run() void {
-            fiber.sleep(20);
+            fiber.sleepMs(20);
         }
     };
 

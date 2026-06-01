@@ -1,7 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const zio = @import("zio");
-const rt = @import("runtime");
 const fiber = @import("fiber");
 const context = utils.context;
 
@@ -191,9 +189,6 @@ fn minimalPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 pub const panic = std.debug.FullPanic(minimalPanic);
 
 pub const std_options: std.Options = .{
-    .log_scope_levels = &.{
-        .{ .scope = .zio, .level = .info },
-    },
     .logFn = capturingLogFn,
 
     // TODO: escalate upstream in Zig forum / issue tracker.
@@ -209,14 +204,15 @@ pub const std_options: std.Options = .{
     // by our own `captureTrace(&f.park_trace)` in `park()`, and
     // by the panic handler itself.
     //
-    // Disabling stack tracing globally for this test binary
-    // sidesteps all of the above. `std.testing.allocator` still
-    // detects leaks (alloc/free balance) — we just lose the
-    // "allocated at:" source pointers in leak reports. Acceptable
-    // until the stdlib unwinder gets a mutex (or per-thread state).
-    // Our `minimalPanic` doesn't call `captureCurrentStackTrace`,
-    // and `std.testing.allocator`'s leak-trace path benefits from
-    // being disabled (concurrent Dwarf walks race). Keep off.
+    // Disabling stack tracing globally for this test binary sidesteps all of
+    // the above AND avoids the cost: it makes `captureCurrentStackTrace` a
+    // no-op, so `std.testing.allocator` stops doing a Dwarf unwind on EVERY
+    // allocation (it still detects leaks via alloc/free balance — we just lose
+    // the "allocated at:" source pointers). `runFiberOne` still surfaces WHERE
+    // a test failed by printing the raw `@errorReturnTrace()` addresses — that
+    // trace is compiler-recorded (build-mode error tracing), independent of
+    // `allow_stack_tracing`, so it costs nothing here and needs no runtime
+    // symbolization (resolve offline with `addr2line`). Keep off.
     .allow_stack_tracing = false,
 };
 
@@ -279,10 +275,10 @@ const FiberLog = struct {
 var log_map_mu: std.Io.Mutex = .init;
 var log_map: ?std.AutoHashMap(usize, *FiberLog) = null;
 
-/// Set in `main()` before the runtime starts; read from `runOne`/`runBench`
-/// after each test completion to bump the no-progress timer. A global is
-/// simpler than threading a pointer through `driver` and the three
-/// `SharedCtx` instances; null until set so a unit-test runner without a
+/// Set in `main()` before the runtime starts; read from `runFiberOne`/
+/// `runFiberBench` after each test completion to bump the no-progress timer.
+/// A global is simpler than threading a pointer through the driver and its
+/// `FiberCtx`; null until set so a unit-test runner without a
 /// watchdog (none today, but easy to imagine) is a no-op call.
 var thread_watchdog: ?*ThreadWatchdog = null;
 
@@ -291,12 +287,9 @@ var thread_watchdog: ?*ThreadWatchdog = null;
 /// fiber entered the test body but never finished.
 var verbose_start: bool = false;
 
-/// Identity used to key per-fiber log buffers. Phase A tests run as
-/// zio tasks; Phase B tests run as fiber.Fibers. Both are pointer
-/// types living in disjoint address spaces (different runtimes), so
-/// the raw pointer doubles as a unique key once cast to usize.
+/// Identity used to key per-fiber log buffers. Every test runs as a
+/// `fiber.Fiber`; its pointer (cast to usize) doubles as a unique key.
 fn currentLogKey() ?usize {
-    if (zio.getCurrentTaskOrNull()) |task| return @intFromPtr(task);
     if (fiber.currentFiberOrNull()) |f| return @intFromPtr(f);
     return null;
 }
@@ -350,8 +343,8 @@ const help_text =
     \\Usage: zig build test [-- <runner-flags>]
     \\
     \\Runs every discovered test (`*_test.zig`, `test.zig`, plus a few extras)
-    \\in one binary, on a zio runtime so test bodies can use zio APIs without
-    \\setting up their own runtime. Tests run concurrently as fibers.
+    \\in one binary, on the in-tree fiber runtime so test bodies can use fiber
+    \\APIs without setting up their own runtime. Tests run concurrently as fibers.
     \\
     \\std.log output is captured per-test and printed indented under each
     \\test's status line. std.debug.print is NOT captured (no stdlib hook in
@@ -436,31 +429,6 @@ const bench_iters_width: usize = 8; // right-aligned iters column
 const bench_total_width: usize = 10; // right-aligned total-bytes column
 const bench_dur_width: usize = 9; // right-aligned sample-duration column
 
-const SharedCtx = struct {
-    // Pacing primitive. Each spawned fiber gets a queue position
-    // (0-indexed) and waits for the watermark to reach `my_index + 1`
-    // before running. The watermark is pre-credited to `permits` so the
-    // first `permits` fibers proceed immediately. Each completion
-    // advances by 1 (offset by permits), which broadcasts — waiters
-    // re-check their target and either proceed or re-park.
-    watermark: *utils.Watermark,
-    completed_count: *std.atomic.Value(u64),
-    permits: u32,
-    print_mu: *zio.Mutex,
-    counters: *Counters,
-    seq: *std.atomic.Value(u32),
-    total: u32,
-    out: *std.Io.Writer,
-    tty: Tty,
-    // Set during the parallel round to collect failures for serial retry.
-    // Null during the retry round itself (one bite at the apple).
-    failures: ?*std.ArrayList(std.builtin.TestFn),
-    // Watchdog state: every running test pushes its entry on entry and pops
-    // on exit. The watchdog fiber periodically scans this list and dumps
-    // diagnostics if any test has been running longer than `stuck_after_s`.
-    running: *RunningSet,
-};
-
 /// Bookkeeping for the watchdog dump. `list` holds tests that have
 /// passed the watermark wait and entered the test body — i.e.
 /// "actually running" fibers, never queued ones. `queued` and
@@ -478,7 +446,7 @@ const RunningSet = struct {
     /// before `watermark.waitForUntimed` and decremented immediately
     /// after, so at any instant: `queued + list.len + completed ≈ total`.
     queued: std.atomic.Value(u32) = .init(0),
-    /// Completed-test counter pointer (shared with SharedCtx.seq) and
+    /// Completed-test counter pointer (shared with FiberCtx.seq) and
     /// the total test count for the current round. Null while no round
     /// is active. Used only by the watchdog for the dump header — not
     /// load-bearing for correctness.
@@ -693,23 +661,12 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
             const secs = @as(f64, @floatFromInt(ms)) / 1000.0;
             rawStderrPrint(&line_buf, "  RUNNING {d:.1}s: {s}\n", .{ secs, t.name });
         }
-        // Zio fiber state: same memory-buffer-then-raw-write trick so
-        // the dump bypasses any zio-backed I/O even when the runtime is
-        // wedged. `rt.stats()` and `rt.dumpFibers()` both lock
-        // `fibers_mutex` (an `os.Mutex` = std.Thread-safe), so calling
-        // them from the watchdog thread is fine.
-        const zrt = rt.underlying();
-        const zs = zrt.stats();
-        rawStderrPrint(&line_buf, "zio fibers: total={d} ready={d} blocked={d}\n", .{ zs.total, zs.ready, zs.blocked });
+        // Fiber runtime state: memory-buffer-then-raw-write so the dump
+        // bypasses runtime-backed I/O even when wedged. Safe from the
+        // watchdog thread — `fiber.Runtime` is the process singleton (live
+        // from main() entry) and stats()/dumpFibers() lock internally.
         var dump_writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer dump_writer.deinit();
-        zrt.dumpFibers(&dump_writer.writer) catch {};
-        rawStderrWriteAll(dump_writer.written());
-
-        // Phase B uses a dedicated fiber.Runtime; dump its state too.
-        // Safe to call from the watchdog thread — `fiber.Runtime` is
-        // initialized at main() entry, so the singleton is always
-        // live by the time the watchdog could fire.
         const frt = fiber.runtime();
         const fs = frt.stats();
         rawStderrPrint(&line_buf, "fiber.Runtime: total={d} new={d} ready={d} waiting={d} finished={d}\n", .{ fs.total, fs.new, fs.ready, fs.waiting, fs.finished });
@@ -806,534 +763,6 @@ fn writeDisplayName(out: *std.Io.Writer, tty: Tty, name: []const u8) void {
     out.writeAll(split.test_name) catch {};
 }
 
-fn runOne(t: std.builtin.TestFn, ctx: *SharedCtx, my_index: u64) void {
-    // Track the queue wait: `queued` is "spawned but not yet started".
-    // Watchdog reads this to label its dump with how many fibers are
-    // still queued vs. actually running.
-    _ = ctx.running.queued.fetchAdd(1, .seq_cst);
-    // The watermark was pre-advanced to `permits` before spawn, so
-    // fibers 0..permits-1 satisfy `value >= my_index + 1` immediately
-    // without entering cv.wait. Fibers from index `permits` onward
-    // park until enough completions arrive. Shielded against cancel
-    // so we never bail mid-wait — same contract as the old
-    // waitUncancelable.
-    {
-        ctx.watermark.waitForUntimed(my_index + 1) catch |e| {
-            std.log.err("watermark wait failed for {s}: {s}", .{ t.name, @errorName(e) });
-            return;
-        };
-    }
-    _ = ctx.running.queued.fetchSub(1, .seq_cst);
-    // Defer-last: advance the watermark by 1 past the permit floor for
-    // each completion. The pre-credit of `permits` means initial=
-    // permits, and after k completions value=permits+k. Every advance
-    // broadcasts, so all waiters re-check — no chain wake to lose.
-    //
-    // Diagnostic: stderr-print on every advance so we can confirm
-    // from outside the zio runtime that completions are firing.
-    // Bypasses the per-fiber log capture so this lands in the run log
-    // even when the runtime is mid-wedge.
-    defer {
-        const n = ctx.completed_count.fetchAdd(1, .monotonic) + 1;
-        ctx.watermark.advance(ctx.permits + n);
-    }
-
-    ctx.running.add(t.name);
-    defer {
-        ctx.running.remove(t.name);
-        if (thread_watchdog) |w| w.touch();
-    }
-
-    // Optional STARTING log — useful for diagnosing wedges. Disabled by
-    // default; the watchdog dump names stuck tests on its own.
-    if (verbose_start) {
-        ctx.print_mu.lockUncancelable();
-        ctx.out.print("  >> STARTING {s}\n", .{t.name}) catch {};
-        ctx.out.flush() catch {};
-        ctx.print_mu.unlock();
-    }
-
-    var fiber_log: FiberLog = .{};
-    defer fiber_log.bytes.deinit(std.heap.page_allocator);
-    registerFiberLog(&fiber_log);
-    defer unregisterFiberLog();
-
-    // Capture the error return trace into owned memory IMMEDIATELY in the
-    // catch arm. The trace lives in thread-local state; if the fiber yields
-    // and resumes on a different OS thread, the pointer would become stale.
-    // Copying the addresses sidesteps that.
-    var trace_addrs: []usize = &.{};
-    defer std.heap.page_allocator.free(trace_addrs);
-
-    // Per-test deadline: 30 s normally, 60 s for BIG:-prefixed tests
-    // that advertise longer runtimes. AutoCancel.set arms a timer on
-    // this fiber; when it fires, the next I/O yield (sleep, lock,
-    // recv, …) returns error.Canceled and `timeout.triggered` is set.
-    // A test stuck in a tight CPU loop without yielding cannot be
-    // canceled cooperatively.
-    const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
-        t.name[p + ".test.".len ..]
-    else
-        t.name;
-    const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
-    const is_hang = std.mem.startsWith(u8, user_name, "HANG: ");
-
-    var timeout = zio.AutoCancel.init;
-    defer timeout.clear();
-    // HANG: tests intentionally never finish — they exist to exercise the
-    // process-level watchdog (--wd-stuck-tick-s dumps + --wd-kill-s abort).
-    // Setting a per-test cancel would defeat the point: the fiber would
-    // wake at 30/60s with error.Canceled and report a normal failure, and
-    // the watchdog would never see a sustained no-progress window.
-    if (!is_hang) timeout.set(zio.Timeout.fromSeconds(if (is_big) 60 else 30));
-
-    const t0 = nowNs();
-    const result: ?anyerror = if (t.func()) |_| null else |e| blk: {
-        if (e != error.SkipZigTest) {
-            if (@errorReturnTrace()) |trace| {
-                const n = @min(trace.index, trace.instruction_addresses.len);
-                trace_addrs = std.heap.page_allocator.dupe(usize, trace.instruction_addresses[0..n]) catch &.{};
-            }
-        }
-        break :blk e;
-    };
-    const elapsed_ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
-    const timed_out = if (result) |e| e == error.Canceled and timeout.triggered else false;
-
-    const seq = ctx.seq.fetchAdd(1, .seq_cst) + 1;
-
-    ctx.print_mu.lockUncancelable();
-    defer ctx.print_mu.unlock();
-
-    // [N/M] prefix dimmed so the eye lands on the test name + status.
-    // Format into a small buffer first so we can pad to a fixed column width.
-    var prefix_buf: [32]u8 = undefined;
-    const prefix_str = std.fmt.bufPrint(&prefix_buf, "[{d}/{d}]", .{ seq, ctx.total }) catch unreachable;
-    writeColored(ctx.out, ctx.tty, .dim, "{s}", .{prefix_str});
-    const prefix_pad = if (prefix_width > prefix_str.len) prefix_width - prefix_str.len else 1;
-    for (0..prefix_pad) |_| ctx.out.writeByte(' ') catch {};
-
-    writeDisplayName(ctx.out, ctx.tty, t.name);
-    ctx.out.print(" ... ", .{}) catch {};
-
-    if (result) |err| switch (err) {
-        error.SkipZigTest => {
-            _ = ctx.counters.skipped.fetchAdd(1, .seq_cst);
-            writeColored(ctx.out, ctx.tty, .bright_yellow, "SKIP\n", .{});
-        },
-        else => {
-            _ = ctx.counters.failed.fetchAdd(1, .seq_cst);
-            if (timed_out) {
-                writeColored(ctx.out, ctx.tty, .bright_red, "FAIL: TIMEOUT", .{});
-            } else {
-                writeColored(ctx.out, ctx.tty, .bright_red, "FAIL: {s}", .{@errorName(err)});
-            }
-            writeColored(ctx.out, ctx.tty, .dim, " ({d}ms)\n", .{elapsed_ms});
-            // Capture for serial retry. We're inside print_mu, so the append
-            // is implicitly serialized.
-            if (ctx.failures) |list| list.append(std.heap.page_allocator, t) catch {};
-            // On timeout, log the test name once up front so the diag
-            // block self-identifies even if scrolled past the status line.
-            if (timed_out) {
-                writeColored(ctx.out, ctx.tty, .bright_red, "  | TIMEOUT in '{s}' — diagnostics follow\n", .{user_name});
-            }
-            // Dump the captured stack trace (writes to stderr directly via
-            // its own lock; flush our buffered writer first so order is
-            // preserved on the terminal).
-            if (trace_addrs.len > 0) {
-                ctx.out.flush() catch {};
-                // Zig 0.16 split StackTrace into a builtin variant
-                // (index + instruction_addresses) and a debug variant
-                // (return_addresses + skipped). dumpStackTrace wants the
-                // debug variant.
-                const dbg_trace: std.debug.StackTrace = .{
-                    .return_addresses = trace_addrs,
-                    .skipped = .none,
-                };
-                std.debug.dumpStackTrace(&dbg_trace);
-            }
-            // On timeout, also dump TrackedMutex state — currently-held
-            // locks are the most likely smoking gun for a deadlock.
-            if (timed_out) {
-                ctx.out.flush() catch {};
-                writeColored(ctx.out, ctx.tty, .dim, "  | TrackedMutex state for '{s}':\n", .{user_name});
-                utils.tracked_mutex.dump(ctx.out) catch {};
-                ctx.out.flush() catch {};
-            }
-        },
-    } else {
-        _ = ctx.counters.passed.fetchAdd(1, .seq_cst);
-        writeColored(ctx.out, ctx.tty, .bright_green, "OK", .{});
-        writeColored(ctx.out, ctx.tty, .dim, " ({d}ms)\n", .{elapsed_ms});
-    }
-
-    // Print captured log lines indented under the status line.
-    if (fiber_log.bytes.items.len > 0) {
-        var lines = std.mem.splitScalar(u8, fiber_log.bytes.items, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            writeColored(ctx.out, ctx.tty, .dim, "  | {s}\n", .{line});
-        }
-    }
-    if (fiber_log.overflowed) {
-        writeColored(ctx.out, ctx.tty, .dim, "  | (output truncated at {d} bytes)\n", .{FiberLog.max_size});
-    }
-    ctx.out.flush() catch {};
-}
-
-fn runBench(t: std.builtin.TestFn, ctx: *SharedCtx, my_index: u64) void {
-    _ = ctx.running.queued.fetchAdd(1, .seq_cst);
-    {
-        zio.beginShield();
-        defer zio.endShield();
-        ctx.watermark.waitForUntimed(my_index + 1) catch |e| {
-            std.log.err("watermark wait failed for {s}: {s}", .{ t.name, @errorName(e) });
-            return;
-        };
-    }
-    _ = ctx.running.queued.fetchSub(1, .seq_cst);
-    defer {
-        const n = ctx.completed_count.fetchAdd(1, .monotonic) + 1;
-        ctx.watermark.advance(ctx.permits + n);
-    }
-
-    ctx.running.add(t.name);
-    defer {
-        ctx.running.remove(t.name);
-        if (thread_watchdog) |w| w.touch();
-    }
-
-    var fiber_log: FiberLog = .{};
-    defer fiber_log.bytes.deinit(std.heap.page_allocator);
-    registerFiberLog(&fiber_log);
-    defer unregisterFiberLog();
-
-    var b: bench.Bench = .{};
-    bench.register(&b);
-    defer bench.unregister();
-
-    // Auto-tune: run the bench fn with growing n until a sample exceeds
-    // the target duration. The user-controlled timer (b.resetTimer /
-    // b.stopTimer / b.startTimer) decides what counts; setup outside
-    // those calls isn't measured.
-    const target_ns: i128 = 200 * std.time.ns_per_ms;
-    const max_n: u64 = 100_000_000_000;
-    const max_growth: u64 = 100;
-
-    var sample_ns: i128 = 0;
-    var err: ?anyerror = null;
-    while (true) {
-        // Reset per-sample state so the user starts each sample fresh.
-        // resetTimer() in the bench function will move the start point
-        // forward to discount setup; addBytes() accumulates into total_bytes.
-        b.elapsed_ns = 0;
-        b.start_ns = nowNs();
-        b.timer_running = true;
-        b.total_bytes = 0;
-        if (t.func()) |_| {} else |e| {
-            err = e;
-            break;
-        }
-        sample_ns = b.elapsed();
-        if (sample_ns >= target_ns) break;
-        if (b.n >= max_n) break;
-        const ns_u: u64 = @intCast(@max(1, sample_ns));
-        const target_u: u64 = @intCast(target_ns);
-        // Extrapolate: pick n such that sample reaches target. Cap growth
-        // factor so a sub-microsecond first sample doesn't request 1e12 iters.
-        var next_n = (b.n * target_u) / ns_u + 1;
-        if (next_n > b.n * max_growth) next_n = b.n * max_growth;
-        if (next_n > max_n) next_n = max_n;
-        if (next_n <= b.n) next_n = b.n + 1;
-        b.n = next_n;
-    }
-
-    const seq = ctx.seq.fetchAdd(1, .seq_cst) + 1;
-
-    ctx.print_mu.lockUncancelable();
-    defer ctx.print_mu.unlock();
-
-    var prefix_buf: [32]u8 = undefined;
-    const prefix_str = std.fmt.bufPrint(&prefix_buf, "[{d}/{d}]", .{ seq, ctx.total }) catch unreachable;
-    writeColored(ctx.out, ctx.tty, .dim, "{s}", .{prefix_str});
-    const prefix_pad = if (prefix_width > prefix_str.len) prefix_width - prefix_str.len else 1;
-    for (0..prefix_pad) |_| ctx.out.writeByte(' ') catch {};
-
-    // Module column (dim) + test name padded to a fixed width so the `→`
-    // and metric columns line up across all benches.
-    const split = splitModuleName(t.name);
-    writeColored(ctx.out, ctx.tty, .dim, "{s}", .{split.module});
-    const mod_pad = if (module_width > split.module.len) module_width - split.module.len else 1;
-    for (0..mod_pad) |_| ctx.out.writeByte(' ') catch {};
-    ctx.out.writeAll(split.test_name) catch {};
-    const name_pad = if (bench_name_width > split.test_name.len) bench_name_width - split.test_name.len else 1;
-    for (0..name_pad) |_| ctx.out.writeByte(' ') catch {};
-
-    if (err) |e| switch (e) {
-        error.SkipZigTest => {
-            _ = ctx.counters.skipped.fetchAdd(1, .seq_cst);
-            writeColored(ctx.out, ctx.tty, .bright_yellow, "SKIP\n", .{});
-        },
-        else => {
-            _ = ctx.counters.failed.fetchAdd(1, .seq_cst);
-            writeColored(ctx.out, ctx.tty, .bright_red, "FAIL: {s}\n", .{@errorName(e)});
-        },
-    } else {
-        _ = ctx.counters.passed.fetchAdd(1, .seq_cst);
-        const ns_per_op: f64 = @as(f64, @floatFromInt(sample_ns)) / @as(f64, @floatFromInt(b.n));
-        // Format each metric into a buffer, then right-pad to a fixed
-        // column. ns/op auto-scales to ns / µs / ms / s so a 9 ns hash
-        // and a 4 ms WAL append are both readable in the same column.
-        var ns_buf: [32]u8 = undefined;
-        const ns_str = formatDuration(&ns_buf, ns_per_op);
-        const ns_pad = if (bench_nsop_width > ns_str.len) bench_nsop_width - ns_str.len else 0;
-        for (0..ns_pad) |_| ctx.out.writeByte(' ') catch {};
-        writeColored(ctx.out, ctx.tty, .bright_green, "{s}/op", .{ns_str});
-
-        if (b.total_bytes > 0) {
-            const total_bytes: f64 = @floatFromInt(b.total_bytes);
-            const seconds: f64 = @as(f64, @floatFromInt(sample_ns)) / 1e9;
-            const bytes_per_s: f64 = total_bytes / seconds;
-            var tput_buf: [32]u8 = undefined;
-            const tput = formatBinaryBytes(&tput_buf, bytes_per_s, true);
-            ctx.out.writeAll("  ") catch {};
-            const tput_pad = if (bench_tput_width > tput.len) bench_tput_width - tput.len else 0;
-            for (0..tput_pad) |_| ctx.out.writeByte(' ') catch {};
-            writeColored(ctx.out, ctx.tty, .bright_green, "{s}", .{tput});
-        }
-
-        var count_buf: [16]u8 = undefined;
-        const iters = formatCount(&count_buf, b.n);
-        ctx.out.writeAll("  ") catch {};
-        const iters_pad = if (bench_iters_width > iters.len) bench_iters_width - iters.len else 0;
-        for (0..iters_pad) |_| ctx.out.writeByte(' ') catch {};
-        writeColored(ctx.out, ctx.tty, .dim, "{s} iters", .{iters});
-
-        if (b.total_bytes > 0) {
-            var total_buf: [32]u8 = undefined;
-            const total = formatBinaryBytes(&total_buf, @floatFromInt(b.total_bytes), false);
-            ctx.out.writeAll("  ") catch {};
-            const total_pad = if (bench_total_width > total.len) bench_total_width - total.len else 0;
-            for (0..total_pad) |_| ctx.out.writeByte(' ') catch {};
-            writeColored(ctx.out, ctx.tty, .dim, "{s} total", .{total});
-        }
-
-        // Wall-clock time the final sample took. Mostly an auto-tune sanity
-        // check — should be close to the 200ms target unless a single iter
-        // overshot.
-        var dur_buf: [32]u8 = undefined;
-        const dur_str = formatDuration(&dur_buf, @as(f64, @floatFromInt(sample_ns)));
-        ctx.out.writeAll("  ") catch {};
-        const dur_pad = if (bench_dur_width > dur_str.len) bench_dur_width - dur_str.len else 0;
-        for (0..dur_pad) |_| ctx.out.writeByte(' ') catch {};
-        writeColored(ctx.out, ctx.tty, .dim, "in {s}\n", .{dur_str});
-    }
-
-    if (fiber_log.bytes.items.len > 0) {
-        var lines = std.mem.splitScalar(u8, fiber_log.bytes.items, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            writeColored(ctx.out, ctx.tty, .dim, "  | {s}\n", .{line});
-        }
-    }
-    ctx.out.flush() catch {};
-}
-
-fn driver(
-    args: Args,
-    counters: *Counters,
-    retry_counters: *Counters,
-    bench_counters: *Counters,
-    alloc: std.mem.Allocator,
-    out: *std.Io.Writer,
-    tty: Tty,
-) !void {
-    // Spawn the coarse.Clock tick fiber on the runner's long-lived runtime
-    // so it survives across every test fiber. `Clock.start()` is idempotent
-    // and uses a process-global `started` flag — re-spawning it inside an
-    // individual test would attach the tick fiber to that test's runtime
-    // (or be a no-op if any earlier test had already set the flag), and
-    // when that runtime is deinit'd the fiber dies. Result: subsequent
-    // tests calling `Clock.ms()` would read a frozen cache. `Clock.stop()`
-    // in `main()` runs after all tests finish, draining this fiber.
-    try utils.coarse.Clock.start();
-
-    // Currently-running tests, owned by the std.Thread ThreadWatchdog so
-    // its diagnostics can name which tests are stuck. The watchdog itself
-    // is set up in main() before the zio runtime starts; here we just
-    // grab a pointer to its RunningSet for the test ctx.
-    const running: *RunningSet = if (thread_watchdog) |w| &w.running else unreachable;
-
-    var watermark: utils.Watermark = .{};
-    // Pre-credit `permits` slots so the first `permits` fibers
-    // satisfy their `value >= my_index + 1` check immediately
-    // without entering cv.wait.
-    watermark.advance(args.parallel);
-    var completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
-    var print_mu: zio.Mutex = .init;
-    var seq: std.atomic.Value(u32) = .{ .raw = 0 };
-    var failures: std.ArrayList(std.builtin.TestFn) = .empty;
-    defer failures.deinit(std.heap.page_allocator);
-
-    // Partition into regular tests and BENCH:-prefixed benchmarks. Regular
-    // tests run in parallel (with retry); benchmarks run serially with
-    // auto-tuned iteration counts.
-    var kept: std.ArrayList(std.builtin.TestFn) = .empty;
-    defer kept.deinit(alloc);
-    var bench_tests: std.ArrayList(std.builtin.TestFn) = .empty;
-    defer bench_tests.deinit(alloc);
-
-    for (builtin.test_functions) |t| {
-        if (std.mem.startsWith(u8, t.name, ".test_root.")) continue;
-        // fiber.* tests belong to Phase B (fiberDriver on fiber.Runtime).
-        // Skip here so we don't run them under zio.
-        if (std.mem.startsWith(u8, t.name, "fiber.")) continue;
-        const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
-            t.name[p + ".test.".len ..]
-        else
-            t.name;
-        const is_big = std.mem.startsWith(u8, user_name, "BIG: ");
-        const is_bench = std.mem.startsWith(u8, user_name, "BENCH: ");
-        const is_hang = std.mem.startsWith(u8, user_name, "HANG: ");
-        if (args.filter) |f| if (std.mem.indexOf(u8, t.name, f) == null) continue;
-        if (args.exclude) |x| if (std.mem.indexOf(u8, t.name, x) != null) continue;
-        if (is_bench) {
-            if (!args.only_bench) continue;
-            try bench_tests.append(alloc, t);
-            continue;
-        }
-        if (args.only_bench) continue;
-        if (is_big and !args.run_big) continue;
-        if (is_hang and !args.run_hang) continue;
-        try kept.append(alloc, t);
-    }
-
-    var ctx = SharedCtx{
-        .watermark = &watermark,
-        .completed_count = &completed_count,
-        .permits = args.parallel,
-        .print_mu = &print_mu,
-        .counters = counters,
-        .seq = &seq,
-        .total = @intCast(kept.items.len),
-        .out = out,
-        .tty = tty,
-        .failures = &failures,
-        .running = running,
-    };
-
-    // Parallel round: run all tests, collecting failures. Use
-    // `spawnWith` instead of `Group.spawn` so each test fiber carries a
-    // spawn-site `@src()` that `rt.dumpFibers()` can print in the
-    // watchdog dump.
-    {
-        running.completed = &seq;
-        running.total = @intCast(kept.items.len);
-        defer {
-            running.completed = null;
-            running.total = 0;
-        }
-        const zrt = rt.underlying();
-        var handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
-        defer handles.deinit(alloc);
-        for (kept.items, 0..) |t, i| {
-            const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runOne, .{ t, &ctx, @as(u64, i) });
-            try handles.append(alloc, h);
-        }
-        for (handles.items) |*h| h.join();
-    }
-
-    // Serial retry round: re-run any failures one at a time. Skips when
-    // parallel was already 1 (retry would be the same execution mode) or
-    // there's nothing to retry.
-    if (failures.items.len > 0 and args.parallel > 1) {
-        print_mu.lockUncancelable();
-        out.writeAll("\n") catch {};
-        writeColored(out, tty, .bright_yellow, "Retrying {d} failed test(s) serially...\n", .{failures.items.len});
-        out.flush() catch {};
-        print_mu.unlock();
-
-        var retry_watermark: utils.Watermark = .{};
-        retry_watermark.advance(1); // permits=1 for retry round
-        var retry_completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
-        var retry_seq: std.atomic.Value(u32) = .{ .raw = 0 };
-        var retry_ctx = SharedCtx{
-            .watermark = &retry_watermark,
-            .completed_count = &retry_completed_count,
-            .permits = 1,
-            .print_mu = &print_mu,
-            .counters = retry_counters,
-            .seq = &retry_seq,
-            .total = @intCast(failures.items.len),
-            .out = out,
-            .tty = tty,
-            .failures = null, // one round of retry only
-            .running = running,
-        };
-
-        running.completed = &retry_seq;
-        running.total = @intCast(failures.items.len);
-        defer {
-            running.completed = null;
-            running.total = 0;
-        }
-        const zrt = rt.underlying();
-        var retry_handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
-        defer retry_handles.deinit(alloc);
-        for (failures.items, 0..) |t, i| {
-            const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runOne, .{ t, &retry_ctx, @as(u64, i) });
-            try retry_handles.append(alloc, h);
-        }
-        for (retry_handles.items) |*h| h.join();
-    }
-
-    // Bench round: serial, auto-tuned iteration count. Only runs when
-    // there are BENCH:-prefixed tests in the kept set.
-    if (bench_tests.items.len == 0) return;
-
-    print_mu.lockUncancelable();
-    out.writeAll("\n") catch {};
-    writeColored(out, tty, .bright_yellow, "Running {d} benchmark(s)...\n", .{bench_tests.items.len});
-    out.flush() catch {};
-    print_mu.unlock();
-
-    // Sort benchmarks alphabetically by full name. Sequential dispatch
-    // means execution order = sort order, so output groups related
-    // variants together rather than declaration order.
-    std.mem.sort(std.builtin.TestFn, bench_tests.items, {}, struct {
-        fn lt(_: void, a: std.builtin.TestFn, b_: std.builtin.TestFn) bool {
-            return std.mem.lessThan(u8, a.name, b_.name);
-        }
-    }.lt);
-
-    var bench_watermark: utils.Watermark = .{};
-    bench_watermark.advance(1); // permits=1 for bench round
-    var bench_completed_count: std.atomic.Value(u64) = .{ .raw = 0 };
-    var bench_seq: std.atomic.Value(u32) = .{ .raw = 0 };
-    var bench_ctx = SharedCtx{
-        .watermark = &bench_watermark,
-        .completed_count = &bench_completed_count,
-        .permits = 1,
-        .print_mu = &print_mu,
-        .counters = bench_counters,
-        .seq = &bench_seq,
-        .total = @intCast(bench_tests.items.len),
-        .out = out,
-        .tty = tty,
-        .failures = null,
-        .running = running,
-    };
-
-    const zrt = rt.underlying();
-    var bench_handles: std.ArrayList(zio.JoinHandle(void)) = .empty;
-    defer bench_handles.deinit(alloc);
-    for (bench_tests.items, 0..) |t, i| {
-        const h = try zrt.spawnWith(.{ .spawn_loc = @src() }, runBench, .{ t, &bench_ctx, @as(u64, i) });
-        try bench_handles.append(alloc, h);
-    }
-    for (bench_handles.items) |*h| h.join();
-}
-
 // ── Phase B: fiber.* tests on a fiber.Runtime ────────────────────────
 //
 // `fiber.*` tests run as fibers on a dedicated fiber.Runtime — disjoint
@@ -1358,9 +787,8 @@ const FiberCtx = struct {
     out: *std.Io.Writer,
     tty: Tty,
     args: Args,
-    /// Watchdog's shared running-set so Phase B fiber tests show up
-    /// in the `RUNNING ...s: <name>` lines of stuck-state dumps. Same
-    /// pointer as Phase A's `SharedCtx.running`.
+    /// Watchdog's shared running-set so fiber tests show up in the
+    /// `RUNNING ...s: <name>` lines of stuck-state dumps.
     running: *RunningSet,
 };
 
@@ -1375,7 +803,6 @@ fn fiberDriver(fctx: *FiberCtx) void {
     defer kept.deinit(std.heap.page_allocator);
 
     for (builtin.test_functions) |t| {
-        if (!std.mem.startsWith(u8, t.name, "fiber.")) continue;
         if (std.mem.startsWith(u8, t.name, ".test_root.")) continue;
         const user_name = if (std.mem.indexOf(u8, t.name, ".test.")) |p|
             t.name[p + ".test.".len ..]
@@ -1386,8 +813,13 @@ fn fiberDriver(fctx: *FiberCtx) void {
         const is_hang = std.mem.startsWith(u8, user_name, "HANG: ");
         if (fctx.args.filter) |f| if (std.mem.indexOf(u8, t.name, f) == null) continue;
         if (fctx.args.exclude) |x| if (std.mem.indexOf(u8, t.name, x) != null) continue;
-        if (is_bench) continue; // No fiber benchmarks today; add when needed.
-        if (fctx.args.only_bench) continue;
+        // `--only-bench` (used by `zig build bench`) runs ONLY benchmarks;
+        // otherwise benchmarks are skipped (they're opt-in via the bench step).
+        if (fctx.args.only_bench) {
+            if (!is_bench) continue;
+        } else {
+            if (is_bench) continue;
+        }
         if (is_big and !fctx.args.run_big) continue;
         if (is_hang and !fctx.args.run_hang) continue;
         kept.append(std.heap.page_allocator, t) catch unreachable;
@@ -1407,7 +839,10 @@ fn fiberDriver(fctx: *FiberCtx) void {
     // execution at any moment, matching how the user-facing
     // `--parallel` knob is meant to behave.
     {
-        const num_workers: usize = @max(1, fctx.args.parallel);
+        // Benchmarks must run one at a time — concurrent benches contend for
+        // CPU/cache and skew the ns/op timing — so force a single worker in
+        // `--only-bench` mode regardless of `--parallel`.
+        const num_workers: usize = if (fctx.args.only_bench) 1 else @max(1, fctx.args.parallel);
         var ch: fiber.Channel(std.builtin.TestFn) = fiber.Channel(std.builtin.TestFn).initAlloc(std.heap.page_allocator, num_workers) catch unreachable;
         defer ch.deinit();
 
@@ -1449,12 +884,21 @@ fn fiberDriver(fctx: *FiberCtx) void {
     }
 }
 
+/// True for `BENCH:`-prefixed tests (after stripping Zig's `<mod>.test.` infix).
+fn isBench(name: []const u8) bool {
+    const user_name = if (std.mem.indexOf(u8, name, ".test.")) |p|
+        name[p + ".test.".len ..]
+    else
+        name;
+    return std.mem.startsWith(u8, user_name, "BENCH: ");
+}
+
 fn fiberTestWorker(ch: *fiber.Channel(std.builtin.TestFn), fctx: *FiberCtx) void {
     while (true) {
         const t = ch.receive() catch |err| switch (err) {
             error.ChannelClosed => return,
         };
-        runFiberOne(t, fctx);
+        if (isBench(t.name)) runFiberBench(t, fctx) else runFiberOne(t, fctx);
     }
 }
 
@@ -1463,6 +907,15 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
     defer {
         fctx.running.remove(t.name);
         if (thread_watchdog) |w| w.touch();
+    }
+
+    // Optional STARTING log (--verbose) — useful for diagnosing wedges so the
+    // run shows which test entered its body but never finished.
+    if (verbose_start) {
+        fctx.print_mu.lock();
+        fctx.out.print("  >> STARTING {s}\n", .{t.name}) catch {};
+        fctx.out.flush() catch {};
+        fctx.print_mu.unlock();
     }
 
     // Per-test log capture: any `std.log.*` emitted by this test
@@ -1475,8 +928,24 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
     registerFiberLog(&fiber_log);
     defer unregisterFiberLog();
 
+    // Capture the error-return-trace addresses IMMEDIATELY in the catch arm,
+    // before any yield: the trace is thread-local and would go stale if this
+    // fiber resumed on another worker. These are raw return addresses, cheaply
+    // recorded by the compiler (no Dwarf unwind, independent of
+    // `allow_stack_tracing`); printed raw on FAIL for offline `addr2line`.
+    var trace_buf: [16]usize = undefined;
+    var trace_len: usize = 0;
     const t0 = nowNs();
-    const result: ?anyerror = if (t.func()) |_| null else |e| e;
+    const result: ?anyerror = if (t.func()) |_| null else |e| blk: {
+        if (e != error.SkipZigTest) {
+            if (@errorReturnTrace()) |trace| {
+                const n = @min(trace.index, trace.instruction_addresses.len);
+                trace_len = @min(n, trace_buf.len);
+                @memcpy(trace_buf[0..trace_len], trace.instruction_addresses[0..trace_len]);
+            }
+        }
+        break :blk e;
+    };
     const elapsed_ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
 
     const target_counters = if (fctx.is_retry) fctx.retry_counters else fctx.counters;
@@ -1510,6 +979,14 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
                 defer fctx.failures_mu.unlock();
                 fctx.failures.append(std.heap.page_allocator, t) catch {};
             }
+            // Failure location: raw error-return-trace addresses (the `try`
+            // chain). Resolve offline: addr2line -fipe <test-binary> <addr>...
+            if (trace_len > 0) {
+                writeColored(fctx.out, fctx.tty, .dim, "  | error return trace (addr2line -fipe <test-binary>):\n", .{});
+                for (trace_buf[0..trace_len]) |addr| {
+                    writeColored(fctx.out, fctx.tty, .dim, "  |   0x{x}\n", .{addr});
+                }
+            }
         },
     } else {
         _ = target_counters.passed.fetchAdd(1, .seq_cst);
@@ -1517,8 +994,7 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
         writeColored(fctx.out, fctx.tty, .dim, " ({d}ms)\n", .{elapsed_ms});
     }
 
-    // Captured log lines indented under the status line, matching
-    // the Phase A `runOne` formatting.
+    // Captured log lines indented under the status line.
     if (fiber_log.bytes.items.len > 0) {
         var lines = std.mem.splitScalar(u8, fiber_log.bytes.items, '\n');
         while (lines.next()) |line| {
@@ -1528,6 +1004,148 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
     }
     if (fiber_log.overflowed) {
         writeColored(fctx.out, fctx.tty, .dim, "  | (output truncated at {d} bytes)\n", .{FiberLog.max_size});
+    }
+    fctx.out.flush() catch {};
+}
+
+// Runs a single `BENCH:` test on the fiber runtime (serially — see fiberDriver).
+// Auto-tunes the iteration count to a ~200ms sample, then prints ns/op (+ MiB/s
+// & totals when the bench called `b.addBytes`). The `bench.Bench` framework is
+// runtime-agnostic (utils), so only the harness plumbing differs from runFiberOne.
+fn runFiberBench(t: std.builtin.TestFn, fctx: *FiberCtx) void {
+    fctx.running.add(t.name);
+    defer {
+        fctx.running.remove(t.name);
+        if (thread_watchdog) |w| w.touch();
+    }
+
+    var fiber_log: FiberLog = .{};
+    defer fiber_log.bytes.deinit(std.heap.page_allocator);
+    registerFiberLog(&fiber_log);
+    defer unregisterFiberLog();
+
+    var b: bench.Bench = .{};
+    bench.register(&b);
+    defer bench.unregister();
+
+    // Auto-tune: grow `b.n` until a sample exceeds the target duration. The
+    // user-controlled timer (`b.resetTimer`/`stopTimer`/`startTimer`) decides
+    // what counts; setup outside those calls isn't measured.
+    const target_ns: i128 = 200 * std.time.ns_per_ms;
+    const max_n: u64 = 100_000_000_000;
+    const max_growth: u64 = 100;
+
+    var sample_ns: i128 = 0;
+    var err: ?anyerror = null;
+    while (true) {
+        // Reset per-sample timer/byte state before each run.
+        b.elapsed_ns = 0;
+        b.start_ns = nowNs();
+        b.timer_running = true;
+        b.total_bytes = 0;
+        if (t.func()) |_| {} else |e| {
+            err = e;
+            break;
+        }
+        sample_ns = b.elapsed();
+        if (sample_ns >= target_ns) break;
+        if (b.n >= max_n) break;
+        const ns_u: u64 = @intCast(@max(1, sample_ns));
+        const target_u: u64 = @intCast(target_ns);
+        // Extrapolate n toward the target; cap the growth factor so a sub-µs
+        // first sample doesn't request 1e12 iters.
+        var next_n = (b.n * target_u) / ns_u + 1;
+        if (next_n > b.n * max_growth) next_n = b.n * max_growth;
+        if (next_n > max_n) next_n = max_n;
+        if (next_n <= b.n) next_n = b.n + 1;
+        b.n = next_n;
+    }
+
+    const seq = fctx.seq.fetchAdd(1, .seq_cst) + 1;
+
+    fctx.print_mu.lock();
+    defer fctx.print_mu.unlock();
+
+    var prefix_buf: [32]u8 = undefined;
+    const prefix_str = std.fmt.bufPrint(&prefix_buf, "[{d}/{d}]", .{ seq, fctx.total }) catch unreachable;
+    writeColored(fctx.out, fctx.tty, .dim, "{s}", .{prefix_str});
+    const prefix_pad = if (prefix_width > prefix_str.len) prefix_width - prefix_str.len else 1;
+    for (0..prefix_pad) |_| fctx.out.writeByte(' ') catch {};
+
+    // Module column (dim) + test name padded to a fixed width so the metric
+    // columns line up across all benches.
+    const split = splitModuleName(t.name);
+    writeColored(fctx.out, fctx.tty, .dim, "{s}", .{split.module});
+    const mod_pad = if (module_width > split.module.len) module_width - split.module.len else 1;
+    for (0..mod_pad) |_| fctx.out.writeByte(' ') catch {};
+    fctx.out.writeAll(split.test_name) catch {};
+    const name_pad = if (bench_name_width > split.test_name.len) bench_name_width - split.test_name.len else 1;
+    for (0..name_pad) |_| fctx.out.writeByte(' ') catch {};
+
+    if (err) |e| switch (e) {
+        error.SkipZigTest => {
+            _ = fctx.counters.skipped.fetchAdd(1, .seq_cst);
+            writeColored(fctx.out, fctx.tty, .bright_yellow, "SKIP\n", .{});
+        },
+        else => {
+            _ = fctx.counters.failed.fetchAdd(1, .seq_cst);
+            writeColored(fctx.out, fctx.tty, .bright_red, "FAIL: {s}\n", .{@errorName(e)});
+        },
+    } else {
+        _ = fctx.counters.passed.fetchAdd(1, .seq_cst);
+        const ns_per_op: f64 = @as(f64, @floatFromInt(sample_ns)) / @as(f64, @floatFromInt(b.n));
+        // ns/op auto-scales (ns/µs/ms/s) so a 9 ns hash and a 4 ms WAL append
+        // are both readable in the same column.
+        var ns_buf: [32]u8 = undefined;
+        const ns_str = formatDuration(&ns_buf, ns_per_op);
+        const ns_pad = if (bench_nsop_width > ns_str.len) bench_nsop_width - ns_str.len else 0;
+        for (0..ns_pad) |_| fctx.out.writeByte(' ') catch {};
+        writeColored(fctx.out, fctx.tty, .bright_green, "{s}/op", .{ns_str});
+
+        if (b.total_bytes > 0) {
+            const total_bytes: f64 = @floatFromInt(b.total_bytes);
+            const seconds: f64 = @as(f64, @floatFromInt(sample_ns)) / 1e9;
+            const bytes_per_s: f64 = total_bytes / seconds;
+            var tput_buf: [32]u8 = undefined;
+            const tput = formatBinaryBytes(&tput_buf, bytes_per_s, true);
+            fctx.out.writeAll("  ") catch {};
+            const tput_pad = if (bench_tput_width > tput.len) bench_tput_width - tput.len else 0;
+            for (0..tput_pad) |_| fctx.out.writeByte(' ') catch {};
+            writeColored(fctx.out, fctx.tty, .bright_green, "{s}", .{tput});
+        }
+
+        var count_buf: [16]u8 = undefined;
+        const iters = formatCount(&count_buf, b.n);
+        fctx.out.writeAll("  ") catch {};
+        const iters_pad = if (bench_iters_width > iters.len) bench_iters_width - iters.len else 0;
+        for (0..iters_pad) |_| fctx.out.writeByte(' ') catch {};
+        writeColored(fctx.out, fctx.tty, .dim, "{s} iters", .{iters});
+
+        if (b.total_bytes > 0) {
+            var total_buf: [32]u8 = undefined;
+            const total = formatBinaryBytes(&total_buf, @floatFromInt(b.total_bytes), false);
+            fctx.out.writeAll("  ") catch {};
+            const total_pad = if (bench_total_width > total.len) bench_total_width - total.len else 0;
+            for (0..total_pad) |_| fctx.out.writeByte(' ') catch {};
+            writeColored(fctx.out, fctx.tty, .dim, "{s} total", .{total});
+        }
+
+        // Wall-clock of the final sample — an auto-tune sanity check (≈ the
+        // 200ms target unless a single iter overshot).
+        var dur_buf: [32]u8 = undefined;
+        const dur_str = formatDuration(&dur_buf, @as(f64, @floatFromInt(sample_ns)));
+        fctx.out.writeAll("  ") catch {};
+        const dur_pad = if (bench_dur_width > dur_str.len) bench_dur_width - dur_str.len else 0;
+        for (0..dur_pad) |_| fctx.out.writeByte(' ') catch {};
+        writeColored(fctx.out, fctx.tty, .dim, "in {s}\n", .{dur_str});
+    }
+
+    if (fiber_log.bytes.items.len > 0) {
+        var lines = std.mem.splitScalar(u8, fiber_log.bytes.items, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            writeColored(fctx.out, fctx.tty, .dim, "  | {s}\n", .{line});
+        }
     }
     fctx.out.flush() catch {};
 }
@@ -1576,25 +1194,11 @@ pub fn main(init: std.process.Init) !void {
         thread_watchdog = null;
     }
 
-    // Use the egres single-runtime seam so deeper code paths
-    // (coarse.Clock, raft loops, etc.) that call `runtime.spawnOn`
-    // share the same runtime as the test runner.
-    try rt.init(std.heap.page_allocator, .{ .total_threads = args.parallel });
-    defer rt.deinit();
-
-    // Bring up the Phase B fiber runtime now so `fiber.runtime()`
-    // works throughout — including from the watchdog thread during a
-    // Phase A wedge. `init` only allocates state and installs the
-    // process-wide singleton; worker threads aren't spawned until
-    // `fiber_rt.run()` is called in Phase B.
-    //
-    // Runtime worker count == all available cores. The `--parallel`
-    // knob bounds *test dispatch* concurrency (see fiberDriver), not
-    // the worker pool. Giving the runtime full hardware concurrency
-    // lets a single test's spawned child fibers (e.g. the io.sleep
-    // test's 100 sleepers) actually spread across cores, while
-    // bounding how many test bodies are mid-execution keeps timer +
-    // wake latency from getting squeezed.
+    // One in-tree fiber runtime; every test runs as a fiber on it.
+    // Worker count == all cores so a single test's child fibers (e.g.
+    // the io.sleep test's 100 sleepers) spread out; the `--parallel`
+    // knob bounds how many test *bodies* dispatch at once (see
+    // fiberDriver), not the worker pool.
     const fiber_workers: usize = std.Thread.getCpuCount() catch @as(usize, args.parallel);
     var fiber_rt: fiber.Runtime = undefined;
     try fiber_rt.init(std.heap.page_allocator, .{ .num_workers = fiber_workers });
@@ -1602,20 +1206,8 @@ pub fn main(init: std.process.Init) !void {
 
     var counters: Counters = .{};
     var retry_counters: Counters = .{};
-    var bench_counters: Counters = .{};
     const t0_all = nowNs();
 
-    var handle = try rt.spawnOn(.background, .shared, driver, .{ args, &counters, &retry_counters, &bench_counters, alloc, out, tty });
-    try handle.join();
-    // Drain the coarse.Clock tick fiber, if any test started it.
-    // Without this, `rt.deinit()` asserts task_count == 0 fails.
-    utils.coarse.Clock.stop();
-
-    // ── Phase B ─────────────────────────────────────────────────────
-    // fiber.* tests run on the dedicated `fiber.Runtime` initialized
-    // up at main() entry. Disjoint from zio: the fiber phase runs
-    // after the zio phase has drained so the output writer / counters
-    // have a single owner.
     {
         var fiber_failures: std.ArrayList(std.builtin.TestFn) = .empty;
         defer fiber_failures.deinit(std.heap.page_allocator);
@@ -1640,19 +1232,14 @@ pub fn main(init: std.process.Init) !void {
     const main_skipped = counters.skipped.load(.seq_cst);
     const retry_passed = retry_counters.passed.load(.seq_cst);
     const retry_failed = retry_counters.failed.load(.seq_cst);
-    const bench_passed = bench_counters.passed.load(.seq_cst);
-    const bench_failed = bench_counters.failed.load(.seq_cst);
-    const bench_skipped = bench_counters.skipped.load(.seq_cst);
 
-    // Effective totals across rounds. Retry: if a test failed parallel but
-    // passed serial, count it as passed and tag it flaky. Bench: passed/
-    // failed/skipped counts roll into the totals so the summary line is
-    // accurate when only benchmarks ran.
+    // Effective totals across rounds. Benchmarks run through the same
+    // `counters` (so they're already in main_*). Retry: if a test failed
+    // parallel but passed serial, count it as passed and tag it flaky.
     const had_retry = retry_passed + retry_failed > 0;
-    const eff_passed = main_passed + retry_passed + bench_passed;
-    const main_eff_failed = if (had_retry) retry_failed else main_failed;
-    const eff_failed = main_eff_failed + bench_failed;
-    const eff_skipped = main_skipped + bench_skipped;
+    const eff_passed = main_passed + retry_passed;
+    const eff_failed = if (had_retry) retry_failed else main_failed;
+    const eff_skipped = main_skipped;
     const flaky = retry_passed;
 
     out.writeAll("\n") catch {};

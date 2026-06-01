@@ -144,29 +144,10 @@ pub const File = struct {
         sioFile(self.fd).close(fsops.io());
     }
 
-    /// Fsync then close in a *single* pool round-trip: the fiber parks once
-    /// and wakes only after both have run (sequentially, on one pool thread).
-    /// Cheaper than `try f.sync(.{}); f.close()` — which would offload twice —
-    /// for the common "finished writing a file, make it durable, release it"
-    /// path (e.g. an SST after a flush). `close` runs even if `sync` fails.
-    ///
-    /// This is the general "batch blocking ops" pattern: any sequence can be
-    /// run with one park/wake by putting it in a single function handed to
-    /// `fsops.run`.
-    pub fn syncAndClose(self: File) !void {
-        return fsops.run(syncCloseImpl, .{self.fd});
-    }
 };
 
 fn syncImpl(fd: SioFile.Handle) !void {
     return sioFile(fd).sync(fsops.io());
-}
-
-fn syncCloseImpl(fd: SioFile.Handle) !void {
-    const f = sioFile(fd);
-    // Both ops run inline here — we're already on the pool thread.
-    defer f.close(fsops.io());
-    try f.sync(fsops.io());
 }
 
 fn setLengthImpl(fd: SioFile.Handle, length: u64) !void {
@@ -306,4 +287,28 @@ fn createImpl(path: []const u8) !File {
 fn openImpl(path: []const u8) !File {
     const f = try SioDir.cwd().openFile(fsops.io(), path, .{ .mode = .read_only });
     return File.fromFd(f.handle);
+}
+
+/// Open `path` with raw posix flags, offloaded to the `fsops` pool — open can
+/// block on disk metadata, and this way it runs on a pool thread's full-size
+/// stack instead of stalling the fiber's worker. Returns the raw fd.
+///
+/// Exists because callers needing O_DIRECT / O_DSYNC (e.g. `vfs`) can't express
+/// those through `std.Io.File`'s portable open flags, so they build the raw
+/// `posix.O` themselves and hand it here. `path` stays valid across the park
+/// (it lives on the parked fiber's stack).
+pub fn openPosix(
+    path: []const u8,
+    flags: std.posix.O,
+    mode: std.posix.mode_t,
+) std.posix.OpenError!std.posix.fd_t {
+    return fsops.run(openPosixImpl, .{ path, flags, mode });
+}
+
+fn openPosixImpl(
+    path: []const u8,
+    flags: std.posix.O,
+    mode: std.posix.mode_t,
+) std.posix.OpenError!std.posix.fd_t {
+    return std.posix.openat(std.posix.AT.FDCWD, path, flags, mode);
 }

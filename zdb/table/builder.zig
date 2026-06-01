@@ -71,7 +71,11 @@ const BlockInfo = struct {
 
 pub const TableBuffer = struct {
     allocator: std.mem.Allocator,
-    bytes: []u8,
+    // Page-aligned so O_DIRECT writers (SST flush in tree.zig, memtable flush
+    // in forest.zig) can hand it straight to `vfs.FileHandle.write` — O_DIRECT
+    // requires the buffer ADDRESS (as well as length + offset) to be page
+    // aligned, and `finish()` already pads the length to a page multiple.
+    bytes: []align(vfs.page_size) u8,
 
     pub fn deinit(self: *TableBuffer) void {
         self.allocator.free(self.bytes);
@@ -215,7 +219,7 @@ pub const Builder = struct {
         try self.finishBlock();
 
         if (self.block_infos.items.len == 0) {
-            return .{ .allocator = self.allocator, .bytes = try self.allocator.alloc(u8, 0) };
+            return .{ .allocator = self.allocator, .bytes = try self.allocator.alignedAlloc(u8, vfs.page_alignment, 0) };
         }
 
         var index_bytes = std.ArrayList(u8).empty;
@@ -352,8 +356,13 @@ pub const Builder = struct {
 
         std.debug.assert(self.table_bytes.items.len % vfs.page_size == 0);
 
-        const bytes = try self.table_bytes.toOwnedSlice(self.allocator);
-        self.table_bytes = .empty;
+        // Copy into a page-aligned buffer (an ArrayList's backing has only
+        // byte alignment) so the result satisfies O_DIRECT's address-alignment
+        // requirement. Retain the table_bytes capacity for the next SST.
+        const len = self.table_bytes.items.len;
+        const bytes = try self.allocator.alignedAlloc(u8, vfs.page_alignment, len);
+        @memcpy(bytes, self.table_bytes.items);
+        self.table_bytes.clearRetainingCapacity();
         return .{ .allocator = self.allocator, .bytes = bytes };
     }
 

@@ -9,6 +9,7 @@ pub const coro = fb.coro;
 pub const default_stack_max = fb.default_stack_max;
 pub const default_stack_commit = fb.default_stack_commit;
 pub const Priority = fb.Priority;
+pub const Lane = fb.Lane;
 pub const Tag = fb.Tag;
 pub const State = fb.State;
 pub const YieldIntent = fb.YieldIntent;
@@ -65,10 +66,10 @@ pub const Group = group_mod.Group;
 const watermark_mod = @import("watermark.zig");
 pub const Watermark = watermark_mod.Watermark;
 
-// From io.zig — timer-based sleep that cooperatively parks.
+// From io.zig — timer-based sleepMs that cooperatively parks.
 const io = @import("io.zig");
 
-pub const sleep = io.sleep;
+pub const sleepMs = io.sleepMs;
 
 // From fs.zig — file I/O that cooperatively parks (zio.File/Dir-compatible).
 pub const fs = @import("fs.zig");

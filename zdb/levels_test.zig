@@ -1,6 +1,5 @@
 const std = @import("std");
 const utils = @import("utils");
-const zio = @import("zio");
 const zdb = @import("zdb");
 
 fn noopPersist(_: *anyopaque, _: u64) anyerror!void {}

@@ -25,6 +25,13 @@ const spinlock = @import("spinlock.zig");
 const queue = @import("queue.zig");
 const fsops = @import("fsops.zig");
 
+/// Flush a busy worker's io_uring SQ once this many SQEs have queued, so reads
+/// issued by running fibers dispatch promptly instead of waiting for the ~1 ms
+/// pump. Small enough to bound dispatch latency, large enough to keep ~1
+/// `io_uring_enter` per batch; sub-threshold stragglers still flush on the idle
+/// path (when the ready queue drains) and on the pump backstop.
+const io_submit_batch: usize = 4;
+
 /// Q32.32 fixed point: `ns_per_cycle * 2^32`. Set exactly once by
 /// `calibrateTsc` via CAS; zero means "not yet calibrated." This is
 /// the global source of truth — each worker copies it into
@@ -75,6 +82,35 @@ const runfiber_guard = switch (builtin.mode) {
     .Debug, .ReleaseSafe => true,
     .ReleaseFast, .ReleaseSmall => false,
 };
+
+/// Capture a stack trace on every `park()` so `dumpFibers` can show WHERE each
+/// fiber is parked — the production deadlock/hang diagnostic the watchdog dumps
+/// when progress stalls.
+///
+/// DISABLED for now. The current capture (`captureTrace` →
+/// `std.debug.captureCurrentStackTrace`) uses Zig 0.16's Dwarf `SelfUnwinder`,
+/// which is NOT thread-safe: concurrent per-park unwinds of coroutine stacks
+/// across workers race and SEGV (confirmed to be the original crash source —
+/// the leak detector's concurrent captures were fine in testing, only this
+/// per-park coro-stack capture wasn't). It's also a full Dwarf unwind on every
+/// park (hot-path cost).
+///
+/// TODO(cheap park traces): don't capture at park AT ALL — reconstruct lazily.
+/// The coro already saves a parked fiber's register state on every yield:
+/// `f.coro.context` holds `rbp` (frame pointer), `rip` (where it yielded), and
+/// `stack_info` (stack bounds) — see coro's `Context`/`switchContext`. A parked
+/// fiber is SUSPENDED, so its stack is stable. So in `dumpFibers` (the only
+/// consumer — runs rarely, on a watchdog/hang dump), for each parked fiber walk
+/// the saved `rbp` chain: start at `ctx.rip`, then per frame read the return
+/// address at `[rbp+8]` and the next fp at `[rbp]`, bounded by `stack_info` (bail
+/// when fp leaves the stack region). Print raw addresses for offline
+/// `addr2line`/`llvm-addr2line`. This is ZERO per-park cost (nothing captured on
+/// the hot path), thread-safe (reads suspended stacks; no shared `SelfInfo`
+/// cache), and cheap (no Dwarf decode). Lets us DELETE the `park_trace` field +
+/// `captureTrace` entirely. Only requirement: build with frame pointers
+/// (`-fno-omit-frame-pointer`; ReleaseFast omits them) so the `rbp` chain is
+/// valid. Until then, park traces are off (this flag stays false).
+const capture_park_traces = false;
 
 /// Process-wide singleton runtime. There is exactly one runtime, so
 /// workers carry no backpointer — they and `spawn` resolve it through
@@ -366,12 +402,22 @@ pub const Worker = struct {
                 // migrated mid-step to a CPU with a slightly behind TSC).
                 if (exit >= enter) f.cpu_total_ns +%= cyclesToNs(exit - enter);
 
-                // Pump libxev periodically so timers (coarse clock,
-                // Deadlines) and async wakes (cross-thread remote pushes)
-                // stay responsive even when this worker is continuously
-                // busy. `no_wait` returns immediately if no completions
-                // are ready — one io_uring_enter syscall per ~1 ms of work.
-                if (cyclesToNs(exit -% self.last_pump_ticks) >= std.time.ns_per_ms) {
+                // Pump libxev when there's I/O to move, without waiting for the
+                // periodic backstop. Both ring peeks are free userspace reads
+                // (and 0 on non-io_uring backends):
+                //   - completionsReady: CQEs the kernel already posted → reap
+                //     now so the woken fibers join the ready queue THIS pass,
+                //     not up to ~1 ms later.
+                //   - pendingSubmissions: SQEs queued by running fibers → flush
+                //     a batch so the reads actually dispatch.
+                // `run(.no_wait)` submits + reaps in one syscall and returns
+                // immediately. The ~1 ms timer is the backstop (keeps timers /
+                // async wakes live when I/O is sparse) and is LAST in the `or`
+                // so its division is only computed when neither peek fired.
+                if (completionsReady(&self.loop) > 0 or
+                    pendingSubmissions(&self.loop) >= io_submit_batch or
+                    cyclesToNs(exit -% self.last_pump_ticks) >= std.time.ns_per_ms)
+                {
                     self.loop.run(.no_wait) catch {};
                     self.last_pump_ticks = exit;
                 }
@@ -426,16 +472,17 @@ pub const Stats = struct {
 };
 
 pub const InitOptions = struct {
-    /// Number of worker threads. `null` defaults to 1 today (so
-    /// existing single-thread call sites keep working unchanged).
-    /// Callers wanting multi-thread set this explicitly.
-    num_workers: ?usize = null,
+    /// Number of worker threads. 0 (default) means "auto" — use the CPU core
+    /// count (`std.Thread.getCpuCount`). A non-zero value is honored verbatim.
+    num_workers: usize = 0,
 
-    /// Workers reserved for the `.raft` lane. These are the LAST
-    /// `raft_workers` worker ids; the remaining (lower) ids form the
-    /// `.default` lane. Must be `< num_workers` so the default lane
-    /// (which owns lead worker 0) is never empty. 0 (default) leaves the
-    /// raft lane empty — `.raft` spawns then fall back to `.default`.
+    /// Workers reserved for the `.raft` lane (the FIRST `raft_workers` worker
+    /// ids; the remaining higher ids form the `.default` lane). 0 (default)
+    /// means "auto" — `raftWorkerCount` picks 0 below 8 workers, else ≈ 1/4 of
+    /// `num_workers` (capped at 4). A non-zero value is honored verbatim. Either
+    /// way raft takes at most half of `num_workers`, so the `.default` lane
+    /// (which owns lead worker 0) is never empty; an empty raft lane (0 workers)
+    /// makes `.raft` spawns fall back to `.default`.
     raft_workers: usize = 0,
 
     /// Threads in the blocking-I/O offload pool (`fsops`) used for fsync and
@@ -443,6 +490,35 @@ pub const InitOptions = struct {
     /// workers so fibers keep executing. Clamped to a minimum of 1.
     io_threads: usize = 4,
 };
+
+/// Resolve how many workers serve the `.raft` lane, as a fraction of the
+/// runtime's TOTAL worker count (`num_workers`).
+///
+/// `requested == 0` (the default) means "auto": below 8 workers reserve NONE —
+/// a dedicated raft lane isn't worth it on a small runtime, so raft fibers just
+/// share the `.default` lane's auto-scheduling. At ≥ 8 workers target a 1/4
+/// ratio capped at 4 (8 → 2, 16 → 4, 32 → 4). A non-zero `requested` is used
+/// as-is. Either way raft may claim at most half of `num_workers`, leaving the
+/// majority (and at least one worker) to `.default`.
+fn raftWorkerCount(num_workers: usize, requested: usize) usize {
+    const raft = if (requested != 0)
+        requested
+    else if (num_workers < 8)
+        0
+    else
+        @min(num_workers / 4, 4);
+
+    // Enforced in every build (not a debug-only assert): a raft lane bigger
+    // than half the workers would starve `.default`. A misconfigured count is a
+    // fatal startup error, so log it (lands in the server log) and then panic
+    // with the same message (panic text only reaches stderr).
+    if (raft > num_workers / 2) {
+        const msg = "fiber.Runtime: raft_workers ({d}) exceeds half of num_workers ({d}); raft must not take more than half the workers";
+        std.log.err(msg, .{ raft, num_workers });
+        std.debug.panic(msg, .{ raft, num_workers });
+    }
+    return raft;
+}
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -471,10 +547,15 @@ pub const Runtime = struct {
     idle: [Lane.count]IdleWorkers = .{ .{}, .{} },
 
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
-        const n = opts.num_workers orelse 1;
+        // num_workers == 0 means "auto" → the CPU core count.
+        const n = if (opts.num_workers == 0)
+            (std.Thread.getCpuCount() catch 1)
+        else
+            opts.num_workers;
         std.debug.assert(n >= 1);
         std.debug.assert(n <= std.math.maxInt(u8));
-        std.debug.assert(opts.raft_workers < n); // default lane (the fallback) is never empty
+        const raft_workers = raftWorkerCount(n, opts.raft_workers);
+        std.debug.assert(raft_workers < n); // default lane (the fallback) is never empty
 
         // Pay the 1 ms calibration cost up front so the first fiber
         // dispatch doesn't get charged with it. Idempotent across
@@ -490,9 +571,9 @@ pub const Runtime = struct {
         // Lane layout: raft takes the first worker ids, default the rest —
         //   raft    = [0, raft_workers)
         //   default = [raft_workers, n)
-        const raft_count: u8 = @intCast(opts.raft_workers);
+        const raft_count: u8 = @intCast(raft_workers);
         self.lane_ranges = .{
-            .{ .start = raft_count, .len = @intCast(n - opts.raft_workers) }, // .default
+            .{ .start = raft_count, .len = @intCast(n - raft_workers) }, // .default
             .{ .start = 0, .len = raft_count }, // .raft
         };
 
@@ -801,7 +882,7 @@ pub fn park() void {
     // our context is saved (which would let two workers step one coro).
     std.debug.assert(old.tag == .ready);
     f.parked_since_ms = runtime().clock.ms();
-    captureTrace(&f.park_trace);
+    if (comptime capture_park_traces) captureTrace(&f.park_trace);
 
     f.intent = .park;
     f.coro.yield();
@@ -860,7 +941,7 @@ pub fn stop() void {
 /// `current_fiber` null — after migration (a crash seen only in optimized
 /// builds). At the instant it runs the value is always correct.
 pub noinline fn currentWorkerOrNull() ?*Worker {
-    asm volatile ("" : : : .{ .memory = true });
+    asm volatile ("" ::: .{ .memory = true });
     return Worker.current_do_not_use_directly;
 }
 
@@ -901,6 +982,23 @@ pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {
 }
 
 /// Read the architecture's fastest monotonic counter. On x86_64
+/// Queued-but-unsubmitted SQEs in the worker's io_uring SQ — a free userspace
+/// read of the ring (no syscall). Returns 0 on backends without a submission
+/// ring (the `xev.backend != .io_uring` branch is comptime-dead there, so
+/// `loop.ring` is never referenced), where the worker falls back to its pump.
+inline fn pendingSubmissions(loop: *xev.Loop) usize {
+    if (comptime xev.backend == .io_uring) return loop.ring.sq_ready();
+    return 0;
+}
+
+/// Completions the kernel has posted to the CQ but we haven't reaped yet —
+/// also a free userspace read. 0 on non-io_uring backends, which only learn of
+/// readiness from the wait syscall.
+inline fn completionsReady(loop: *xev.Loop) usize {
+    if (comptime xev.backend == .io_uring) return loop.ring.cq_ready();
+    return 0;
+}
+
 /// and aarch64 this is a cycle count needing `cyclesToNs` to convert.
 /// Other architectures fall back to `monoNs()` (which is already in
 /// nanoseconds — `cyclesToNs` is the identity in that branch).

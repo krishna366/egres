@@ -6,7 +6,7 @@
 //! auth handshake details) without needing a real executor.
 
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("fiber");
 const pgwire = @import("pgwire");
 const utils = @import("utils");
 
@@ -153,7 +153,7 @@ fn firstKind(stmts: []std.json.Value) ?[]const u8 {
 // between the fiber and the listener stack frame.
 var g_alloc: std.mem.Allocator = undefined;
 
-fn handleConn(stream: zio.net.Stream, conn_id: u64) void {
+fn handleConn(stream: fiber.net.Stream, conn_id: u64) void {
     var s = stream;
     defer s.close();
 
@@ -166,27 +166,32 @@ fn handleConn(stream: zio.net.Stream, conn_id: u64) void {
     };
 }
 
-fn runListener(listen_addr: zio.net.IpAddress) !void {
-    const listener = try listen_addr.listen(.{ .reuse_address = true });
+fn runListener(listen_addr: fiber.net.IpAddress) void {
+    const listener = listen_addr.listen(.{ .reuse_address = true }) catch |err| {
+        log.err("listen failed: {s}", .{@errorName(err)});
+        return;
+    };
     defer listener.close();
 
+    const port = listener.port();
     log.info(
-        "listening on {f} (try: psql -h 127.0.0.1 -p {d} -U you -d db)",
-        .{ listen_addr, listen_addr.getPort() },
+        "listening on port {d} (try: psql -h 127.0.0.1 -p {d} -U you -d db)",
+        .{ port, port },
     );
 
-    var group = zio.Group{};
-    defer group.cancel();
+    // Per-connection handlers run as fibers; NODELAY is applied to each
+    // accepted stream inside fiber.net.accept, so no manual setsockopt.
+    var group = fiber.Group(void).init(g_alloc);
+    defer group.deinit();
 
     var conn_id: u64 = 0;
     while (true) {
         const stream = listener.accept(.{}) catch |err| {
             log.err("accept failed: {s}", .{@errorName(err)});
-            return err;
+            return;
         };
-        stream.socket.setNoDelay(true) catch {};
         conn_id += 1;
-        group.spawn(handleConn, .{ stream, conn_id }) catch |err| {
+        group.spawn(.{}, handleConn, .{ stream, conn_id }) catch |err| {
             log.err("conn #{d}: spawn failed: {s}", .{ conn_id, @errorName(err) });
             stream.close();
         };
@@ -202,11 +207,14 @@ pub fn main(init: std.process.Init) !void {
     const argv = try utils.context.g().argv();
     const addr_str = if (argv.len >= 2) argv[1] else default_addr;
 
-    const listen_addr = try zio.net.IpAddress.parseIpAndPort(addr_str);
+    const listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr_str);
 
-    const rt = try zio.Runtime.init(g_alloc, .{ .executors = .exact(1) });
+    var rt: fiber.Runtime = undefined;
+    try rt.init(g_alloc, .{ .num_workers = 1 });
     defer rt.deinit();
 
-    var handle = try rt.spawn(runListener, .{listen_addr});
-    try handle.join();
+    // runListener loops on accept forever; rt.run() blocks until stop()
+    // (which nothing calls here — the server runs until killed).
+    _ = try fiber.spawn(.{}, runListener, .{listen_addr});
+    rt.run();
 }
