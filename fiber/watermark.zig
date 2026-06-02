@@ -18,6 +18,7 @@
 const std = @import("std");
 const fb = @import("fiber.zig");
 const rt = @import("runtime.zig");
+const dd = @import("deadlines.zig");
 
 const Fiber = fb.Fiber;
 const Spinlock = rt.Spinlock;
@@ -26,7 +27,29 @@ const Allocator = std.mem.Allocator;
 const Entry = struct {
     fiber: *Fiber,
     target: u64,
+    /// Non-null for a timed wait. Lets `advance`/`close` claim the
+    /// timeout's first-fire token before waking, so the deadline can't
+    /// also act on a waiter that's already being woken (and vice-versa).
+    timeout: ?*dd.Timeout = null,
 };
+
+/// Per-timed-wait callback context. Lives on the waiter's stack; the
+/// deadline's `on_fire` (run on the owner worker) flips `timed_out` and
+/// wakes the parked fiber, which then self-removes its entry and returns
+/// `error.Timeout`. The "timed out" flag is the watermark's own state —
+/// `Deadlines` knows nothing about it.
+const TimeoutCtx = struct {
+    fiber: *Fiber,
+    timed_out: std.atomic.Value(bool) = .init(false),
+};
+
+fn timeoutFire(ptr: *anyopaque) void {
+    const ctx: *TimeoutCtx = @ptrCast(@alignCast(ptr));
+    // Release-store before the wake so the resumed waiter observes it;
+    // touch nothing after `wake` — the fiber may free `ctx`'s frame at once.
+    ctx.timed_out.store(true, .release);
+    rt.wake(ctx.fiber);
+}
 
 pub const Watermark = struct {
     allocator: Allocator,
@@ -75,15 +98,64 @@ pub const Watermark = struct {
     /// Block until `value >= target` or the watermark is closed.
     /// Returns `error.Closed` if `close()` was called or
     /// `error.OutOfMemory` if the waiter table can't grow.
-    pub fn waitFor(self: *Watermark, target: u64) error{ Closed, OutOfMemory }!void {
+    pub fn waitForUntimed(self: *Watermark, target: u64) error{ Closed, OutOfMemory }!void {
+        self.waitForImpl(target, null) catch |err| switch (err) {
+            error.Closed => return error.Closed,
+            error.OutOfMemory => return error.OutOfMemory,
+            // A null timeout never arms a deadline, so it can't time out.
+            error.Timeout => unreachable,
+        };
+    }
+
+    /// Like `waitForUntimed`, but gives up after `timeout_ms` with
+    /// `error.Timeout`.
+    pub fn waitFor(self: *Watermark, target: u64, timeout_ms: u64) error{ Closed, Timeout, OutOfMemory }!void {
+        return self.waitForImpl(target, timeout_ms);
+    }
+
+    /// Shared wait loop. `timeout_ms == null` is the untimed wait (no
+    /// `Deadlines` entry at all); a value arms a per-worker deadline that
+    /// fires, sets `timed_out`, and wakes us. `advance`/`close` and the
+    /// deadline arbitrate via the timeout's first-fire `claim()` so exactly
+    /// one of them wakes us — the loser never touches our stack frame.
+    fn waitForImpl(self: *Watermark, target: u64, timeout_ms: ?u64) error{ Closed, Timeout, OutOfMemory }!void {
+        // Fast paths — skip arming a timer when the answer is already known.
+        if (self.value.load(.acquire) >= target) return;
+        if (self.closed.load(.acquire)) return error.Closed;
+
+        const me = rt.currentFiber();
+        var ctx: TimeoutCtx = .{ .fiber = me };
+        var timeout: dd.Timeout = .{ .on_fire = &timeoutFire, .on_fire_ctx = &ctx };
+
+        // Arm a deadline only for a timed wait. Capture the owning
+        // Deadlines so the cancel targets the same heap even if we resume
+        // on a different worker after migration (`cancel` is spinlock-safe
+        // cross-thread).
+        const owner: ?*dd.Deadlines = if (timeout_ms) |ms| blk: {
+            const o = &rt.currentWorker().deadlines;
+            try o.register(&timeout, ms);
+            break :blk o;
+        } else null;
+        defer if (owner) |o| o.cancel(&timeout);
+
         while (true) {
-            // Fast path — predicate or close already observable.
             if (self.value.load(.acquire) >= target) return;
             if (self.closed.load(.acquire)) return error.Closed;
+            if (ctx.timed_out.load(.acquire)) {
+                // The deadline woke us and (unlike advance/close) left our
+                // entry queued; pull it before the frame dies. Prefer a
+                // satisfied/closed result if one landed alongside the timer.
+                self.sl.lock();
+                self.removeWaiter(me);
+                self.sl.unlock();
+                if (self.value.load(.acquire) >= target) return;
+                if (self.closed.load(.acquire)) return error.Closed;
+                return error.Timeout;
+            }
 
             self.sl.lock();
-            // Re-check under sl to close the race between
-            // predicate-load and entry-insert.
+            // Re-check under sl to close the race between predicate-load
+            // and entry-insert.
             if (self.value.load(.acquire) >= target) {
                 self.sl.unlock();
                 return;
@@ -92,17 +164,34 @@ pub const Watermark = struct {
                 self.sl.unlock();
                 return error.Closed;
             }
+            if (ctx.timed_out.load(.acquire)) {
+                self.sl.unlock();
+                continue; // re-loop to hit the removal branch above
+            }
             self.waiters.append(self.allocator, .{
-                .fiber = rt.currentFiber(),
+                .fiber = me,
                 .target = target,
+                .timeout = if (timeout_ms != null) &timeout else null,
             }) catch |err| {
                 self.sl.unlock();
                 return err;
             };
             self.sl.unlock();
             rt.park();
-            // On resume: the waker swap-removed our entry from
-            // the array. Loop and re-check predicate / closed.
+            // On resume: a waker removed our entry (timed-out path
+            // excepted). Loop and re-check predicate / closed / timed_out.
+        }
+    }
+
+    /// Remove this fiber's entry from the waiter array if present. Caller
+    /// holds `sl`. Used by the timed `waitFor` on the timeout path — the
+    /// deadline wakes us but doesn't touch the array.
+    fn removeWaiter(self: *Watermark, f: *Fiber) void {
+        for (self.waiters.items, 0..) |e, i| {
+            if (e.fiber == f) {
+                _ = self.waiters.swapRemove(i);
+                return;
+            }
         }
     }
 
@@ -119,6 +208,16 @@ pub const Watermark = struct {
         while (i < self.waiters.items.len) {
             const e = self.waiters.items[i];
             if (e.target <= new_value) {
+                // For a timed waiter, win its first-fire token before
+                // waking. If the deadline already claimed it, leave the
+                // entry — the deadline owns the wake and the waiter will
+                // self-remove on resume.
+                if (e.timeout) |t| {
+                    if (!t.claim()) {
+                        i += 1;
+                        continue;
+                    }
+                }
                 e.fiber.waker_next = to_wake;
                 to_wake = e.fiber;
                 _ = self.waiters.swapRemove(i);
@@ -140,16 +239,25 @@ pub const Watermark = struct {
     }
 
     /// Wake every queued waiter (used by `close`). They'll see
-    /// `closed == true` when they re-check and return
-    /// `error.Closed`.
+    /// `closed == true` when they re-check and return `error.Closed`.
+    /// Mirrors `wakeReached`'s first-fire claim: a timed waiter whose
+    /// deadline already fired is left for that deadline to wake.
     fn wakeAll(self: *Watermark) void {
         self.sl.lock();
         var to_wake: ?*Fiber = null;
-        for (self.waiters.items) |e| {
+        var i: usize = 0;
+        while (i < self.waiters.items.len) {
+            const e = self.waiters.items[i];
+            if (e.timeout) |t| {
+                if (!t.claim()) {
+                    i += 1;
+                    continue;
+                }
+            }
             e.fiber.waker_next = to_wake;
             to_wake = e.fiber;
+            _ = self.waiters.swapRemove(i);
         }
-        self.waiters.clearRetainingCapacity();
         self.sl.unlock();
 
         while (to_wake) |f| {

@@ -14,7 +14,7 @@ const NodeId = raft.NodeId;
 // 3-node cluster fully elects a leader, applies the bootstrap conf-change,
 // and replicates+commits it to all nodes (verified via debug logs). But it
 // then deadlocks in `cluster.waitForTicks(50)`: the fiber dump shows
-// ready=0, ~8 long-lived fibers parked ~20s (the tickLoop→event_ch→mainLoop
+// ready=0, ~8 long-lived fibers parked ~20s (the tickLoop→event_notify→mainLoop
 // chain appears to wedge) while transport connection churn continues
 // (finished≈276). Needs a focused debugging session (per-fiber stacks /
 // instrumentation). `cluster.zig` itself is now fixed for Zig 0.16
@@ -219,7 +219,7 @@ pub fn testCandidateStepsDownOnHigherTerm() !void {
         std.testing.allocator.free(owned);
         return error.ChannelSendFailed;
     };
-    leader_node.event_ch.trySend(1) catch {};
+    leader_node.event_notify.notify();
 
     cluster.waitForTicks(5);
 

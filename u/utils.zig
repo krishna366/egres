@@ -7,8 +7,7 @@ pub const bench = @import("bench.zig");
 pub const tracked_mutex = @import("tracked_mutex.zig");
 pub const TrackedMutex = tracked_mutex.TrackedMutex;
 pub const TrackedRwLock = tracked_mutex.TrackedRwLock;
-pub const context = @import("context.zig");
-pub const Watermark = @import("watermark.zig").Watermark;
+pub const context = fiber.context;
 
 /// WaitGroup provides Go-style Add/Done/Wait synchronization for zio coroutines.
 ///

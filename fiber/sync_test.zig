@@ -375,3 +375,83 @@ test "Notify: pending flag lets wait return immediately when notify ran first" {
     // Reaching here proves wait() took the fast path (no park).
     try std.testing.expect(!observed_wait_yielded);
 }
+
+test "Notify: notify/wait alternate any number of times in one fiber" {
+    // A single fiber drives the doorbell through many rounds, exercising
+    // both orderings: notify-then-wait (pending fast path) and a saturating
+    // double-notify that still lets exactly one wait through. The loop
+    // completing proves no round ever parked forever — i.e. notify and wait
+    // compose correctly when called repeatedly, in either order.
+    var sig: fiber.Notify = .{};
+
+    const Body = struct {
+        fn run(s: *fiber.Notify) void {
+            var round: usize = 0;
+            while (round < 1000) : (round += 1) {
+                // notify-before-wait: pending is set, wait returns immediately.
+                s.notify();
+                s.wait();
+                // Double notify coalesces to a single pending (it's a flag,
+                // not a counter); the single wait below consumes it. A leaked
+                // second pending would be harmless, a lost one would deadlock
+                // the *next* round's wait — which the loop would expose.
+                s.notify();
+                s.notify();
+                s.wait();
+            }
+        }
+    };
+
+    const h = try fiber.spawn(.{}, Body.run, .{&sig});
+    h.join();
+}
+
+test "Notify: one waiter, many notifiers, no lost wakeup" {
+    // The contract that raft's mainLoop relies on: producers enqueue work then
+    // notify; a single consumer waits, then drains *everything* visible before
+    // waiting again. Under arbitrary interleaving — and even though many
+    // notifies coalesce into one wakeup — the consumer must observe every
+    // increment and terminate. If any wakeup were lost, the consumer would park
+    // forever and Group.wait() below would hang (deadlock = test failure).
+    const producers = 4;
+    const per_producer = 100;
+    const total = producers * per_producer;
+
+    var sig: fiber.Notify = .{};
+    var produced = std.atomic.Value(usize).init(0);
+
+    const Producer = struct {
+        fn run(s: *fiber.Notify, p: *std.atomic.Value(usize)) void {
+            var i: usize = 0;
+            while (i < per_producer) : (i += 1) {
+                _ = p.fetchAdd(1, .release);
+                s.notify();
+                // Yield to shuffle the interleaving so the wakeups land in
+                // every relative position to the consumer's wait/drain.
+                fiber.yield();
+            }
+        }
+    };
+    const Consumer = struct {
+        fn run(s: *fiber.Notify, p: *std.atomic.Value(usize), seen: *usize) void {
+            // Re-read *after* each wait: a single coalesced wakeup may stand in
+            // for several notifies, and the post-wait load picks up all of them.
+            while (seen.* < total) {
+                s.wait();
+                seen.* = p.load(.acquire);
+            }
+        }
+    };
+
+    var seen: usize = 0;
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.spawn(.{}, Consumer.run, .{ &sig, &produced, &seen });
+    for (0..producers) |_| {
+        try g.spawn(.{}, Producer.run, .{ &sig, &produced });
+    }
+    g.wait();
+
+    try std.testing.expectEqual(@as(usize, total), produced.load(.acquire));
+    try std.testing.expectEqual(@as(usize, total), seen);
+}

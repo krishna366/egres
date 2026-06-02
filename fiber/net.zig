@@ -318,6 +318,7 @@ pub const Stream = struct {
 
 // ───────────────────────── low-level socket ops ─────────────────────────
 
+// TODO: Add timeouts to socketRead and socketWrite, perhaps.
 fn socketRead(tcp: xev.TCP, buf: []u8) xev.ReadError!usize {
     const w = rt.currentWorker();
     const f = w.current_fiber.?;
@@ -417,4 +418,3 @@ fn acceptCallback(
     rt.wake(w.fiber);
     return .disarm;
 }
-

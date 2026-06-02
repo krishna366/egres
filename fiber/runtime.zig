@@ -151,10 +151,18 @@ pub const Worker = struct {
     loop: xev.Loop,
     deadlines: Deadlines,
     current_fiber: ?*Fiber = null,
+
+    /// Track the total cpu time spent processing fibers on this worker. Helps
+    /// identify if the work is getting distributed evenly across workers.
+    cpu_total_ns: u64 = 0,
     /// TSC reading at the last libxev pump (see `dispatch`). Lets a
     /// continuously-busy worker still service timers / async wakes about
     /// once per millisecond without blocking.
     last_pump_ticks: u64 = 0,
+    /// TSC reading at this worker's last coarse-clock tick. Gates the
+    /// once-per-ms `clock.update()` at the top of the run loop. Every
+    /// worker drives the clock now, so every worker carries this.
+    last_coarse_clock_ticks: u64 = 0,
     /// Two ready rings, one per `Priority`. Owner-thread only — no work
     /// stealing, so no locking. `ready[normal]` spills to / refills from
     /// this lane's GlobalQueue; `ready[high]` is pinned and must not
@@ -176,24 +184,25 @@ pub const Worker = struct {
     /// the calling thread that invoked `Runtime.run`).
     thread: ?std.Thread = null,
 
-    pub fn init(w: *Worker, id: u8) !void {
+    pub fn init(w: *Worker, id: u8, allocator: std.mem.Allocator) !void {
         w.id = id;
         w.lane_idx = 0; // real value assigned in Runtime.init
         w.loop = try xev.Loop.init(.{});
         errdefer w.loop.deinit();
         w.wake_async = try xev.Async.init();
         errdefer w.wake_async.deinit();
-        w.deadlines = try Deadlines.init(&w.loop);
+        w.deadlines = try Deadlines.init(&w.loop, allocator);
         w.current_fiber = null;
         w.last_pump_ticks = 0;
+        w.last_coarse_clock_ticks = 0;
         w.ready = @splat(.{});
         w.remote_queue = .{};
         w.wake_completion = undefined;
         w.thread = null;
     }
 
-    pub fn deinit(self: *Worker, allocator: std.mem.Allocator) void {
-        self.deadlines.deinit(allocator);
+    pub fn deinit(self: *Worker) void {
+        self.deadlines.deinit();
         self.wake_async.deinit();
         self.loop.deinit();
     }
@@ -369,9 +378,14 @@ pub const Worker = struct {
         };
         defer fb.coro.cleanupStackGrowth();
 
-        // Lead worker drives the process-wide coarse clock.
-        if (self.id == 0) runtime().clock.start();
-        defer if (self.id == 0) runtime().clock.stop();
+        // Every worker advances the process-wide coarse clock from the top
+        // of its loop (gated to ~once/ms below). Many drivers means the
+        // clock stays fresh as long as ANY worker is busy; it only freezes
+        // in full-system idle, which is benign (no fiber is running to read
+        // it). Seed it once here so ms() is fresh before this worker
+        // dispatches its first fiber.
+        const clock = &runtime().clock;
+        clock.update();
 
         // Arm the cross-thread wake handle. The callback re-arms
         // automatically; its only job is to unstick `loop.run(.once)`
@@ -384,8 +398,12 @@ pub const Worker = struct {
             wakeAsyncCallback,
         );
 
-        // Seed the pump clock so the first periodic pump lands ~1 ms in.
-        self.last_pump_ticks = readTicks();
+        // Seed the pump + coarse-clock TSC gates so the first periodic pump
+        // and the next clock tick each land ~1 ms in (we just updated the
+        // clock above, so don't re-tick on the very first iteration).
+        const seed_ticks = readTicks();
+        self.last_pump_ticks = seed_ticks;
+        self.last_coarse_clock_ticks = seed_ticks;
         self.loop.update_now();
 
         const rt = runtime();
@@ -394,13 +412,25 @@ pub const Worker = struct {
             //    before normal). Only when they're empty do we reach for
             //    more work — drainRemote / refillFromGlobal are
             //    work-*finding* steps, not per-iteration overhead.
+            // Advance the coarse clock at most once per ms (TSC-gated, no
+            // syscall on the fast path). `enter` is reused for CPU
+            // accounting below, so the per-iteration cost is a subtract +
+            // compare; the write-guard in `update` keeps it to ~1 store/ms
+            // across all workers.
+            const enter = readTicks();
+            if (cyclesToNs(enter -% self.last_coarse_clock_ticks) >= std.time.ns_per_ms) {
+                clock.update();
+                self.last_coarse_clock_ticks = enter;
+            }
+
             if (self.popNextReady()) |f| {
-                const enter = readTicks();
                 self.runFiber(f);
                 const exit = readTicks();
                 // Skip the reading if the counter went backwards (thread
                 // migrated mid-step to a CPU with a slightly behind TSC).
-                if (exit >= enter) f.cpu_total_ns +%= cyclesToNs(exit - enter);
+                const cycNs = cyclesToNs(exit -| enter);
+                f.cpu_total_ns +%= cycNs;
+                self.cpu_total_ns +%= cycNs;
 
                 // Pump libxev when there's I/O to move, without waiting for the
                 // periodic backstop. Both ring peeks are free userspace reads
@@ -414,12 +444,13 @@ pub const Worker = struct {
                 // immediately. The ~1 ms timer is the backstop (keeps timers /
                 // async wakes live when I/O is sparse) and is LAST in the `or`
                 // so its division is only computed when neither peek fired.
+
                 if (completionsReady(&self.loop) > 0 or
                     pendingSubmissions(&self.loop) >= io_submit_batch or
-                    cyclesToNs(exit -% self.last_pump_ticks) >= std.time.ns_per_ms)
+                    cyclesToNs(enter -% self.last_pump_ticks) >= std.time.ns_per_ms)
                 {
                     self.loop.run(.no_wait) catch {};
-                    self.last_pump_ticks = exit;
+                    self.last_pump_ticks = enter;
                 }
                 continue;
             }
@@ -428,6 +459,17 @@ pub const Worker = struct {
             self.drainRemote();
             self.refillFromGlobal();
             if (self.hasReady()) continue;
+
+            // TODO(work-stealing): when local + global are both empty, steal a
+            // batch from a busy peer's local ring here before going idle. The
+            // rings are owner-only today (no stealing), so a CPU-bound spawn
+            // burst that fills the spawner's ring serializes on that one worker
+            // while peers sit idle — measured ~14x slower than std.Thread until
+            // fibers are manually pinned one-per-core. Fine for I/O-bound work
+            // (park/wake already redistributes); needed once core-heavy fan-out
+            // matters. A Chase-Lev stealable-deque prototype (LocalQueue with
+            // stealBatchTo, + steal_test.zig) is parked on the
+            // `abandon/task-stealing` branch — resurrect from there.
 
             // 3. Still nothing. Mark idle BEFORE a final work-find so a
             //    producer that pushes work and then consults the idle
@@ -477,13 +519,17 @@ pub const InitOptions = struct {
     num_workers: usize = 0,
 
     /// Workers reserved for the `.raft` lane (the FIRST `raft_workers` worker
-    /// ids; the remaining higher ids form the `.default` lane). 0 (default)
-    /// means "auto" — `raftWorkerCount` picks 0 below 8 workers, else ≈ 1/4 of
-    /// `num_workers` (capped at 4). A non-zero value is honored verbatim. Either
-    /// way raft takes at most half of `num_workers`, so the `.default` lane
-    /// (which owns lead worker 0) is never empty; an empty raft lane (0 workers)
-    /// makes `.raft` spawns fall back to `.default`.
-    raft_workers: usize = 0,
+    /// ids; the remaining higher ids form the `.default` lane).
+    ///
+    /// `null` (default) means "auto" — `raftWorkerCount` reserves 0 below 8
+    /// workers, else ≈ 1/4 of `num_workers` (capped at 4). An explicit value is
+    /// honored verbatim, INCLUDING `0`: pass `.raft_workers = 0` to put every
+    /// worker in the `.default` lane (no raft reservation). Optional so that a
+    /// requested 0 is distinguishable from "unset" — otherwise 0 and auto would
+    /// collide. Raft may claim at most half of `num_workers`, so `.default`
+    /// (which owns lead worker 0) is never starved; an empty raft lane makes
+    /// `.raft` spawns fall back to `.default`.
+    raft_workers: ?usize = null,
 
     /// Threads in the blocking-I/O offload pool (`fsops`) used for fsync and
     /// filesystem metadata syscalls. These run blocking ops off the fiber
@@ -494,15 +540,16 @@ pub const InitOptions = struct {
 /// Resolve how many workers serve the `.raft` lane, as a fraction of the
 /// runtime's TOTAL worker count (`num_workers`).
 ///
-/// `requested == 0` (the default) means "auto": below 8 workers reserve NONE —
-/// a dedicated raft lane isn't worth it on a small runtime, so raft fibers just
-/// share the `.default` lane's auto-scheduling. At ≥ 8 workers target a 1/4
-/// ratio capped at 4 (8 → 2, 16 → 4, 32 → 4). A non-zero `requested` is used
-/// as-is. Either way raft may claim at most half of `num_workers`, leaving the
-/// majority (and at least one worker) to `.default`.
-fn raftWorkerCount(num_workers: usize, requested: usize) usize {
-    const raft = if (requested != 0)
-        requested
+/// `requested == null` (the default) means "auto": below 8 workers reserve
+/// NONE — a dedicated raft lane isn't worth it on a small runtime, so raft
+/// fibers just share the `.default` lane's auto-scheduling. At ≥ 8 workers
+/// target a 1/4 ratio capped at 4 (8 → 2, 16 → 4, 32 → 4). An explicit
+/// `requested` (including 0) is used as-is. Either way raft may claim at most
+/// half of `num_workers`, leaving the majority (and at least one worker) to
+/// `.default`.
+fn raftWorkerCount(num_workers: usize, requested: ?usize) usize {
+    const raft = if (requested) |r|
+        r
     else if (num_workers < 8)
         0
     else
@@ -590,10 +637,10 @@ pub const Runtime = struct {
 
         var initialized: usize = 0;
         errdefer {
-            for (self.workers[0..initialized]) |*w| w.deinit(allocator);
+            for (self.workers[0..initialized]) |*w| w.deinit();
         }
         for (self.workers, 0..) |*w, i| {
-            try Worker.init(w, @intCast(i));
+            try Worker.init(w, @intCast(i), allocator);
             w.lane_idx = if (i < raft_count)
                 @intFromEnum(Lane.raft)
             else
@@ -601,8 +648,7 @@ pub const Runtime = struct {
             initialized += 1;
         }
 
-        self.clock = try CoarseClock.init();
-        self.clock.bind(&self.workers[0].loop);
+        self.clock = CoarseClock.init();
 
         // Blocking-I/O offload pool (fsync + fs metadata). Started before we
         // publish the singleton; no jobs arrive until fibers run.
@@ -623,7 +669,7 @@ pub const Runtime = struct {
         }
         self.fibers.deinit(self.allocator);
         self.clock.deinit();
-        for (self.workers) |*w| w.deinit(self.allocator);
+        for (self.workers) |*w| w.deinit();
         self.allocator.free(self.workers);
         for (&self.global) |*gq| gq.deinit();
         g_rt = null;

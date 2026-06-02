@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
     addZbufCli(b, target, optimize, mods);
     addZdbServer(b, target, optimize, mods, regen_buffers_step);
     addZdbBench(b, target, optimize, mods);
+    addZioBench(b, target, optimize, mods);
     // Deferred for Zig 0.16 migration: loadtest has heavy std.process.Child
     // and std.fs.cwd surface area; re-enable once those are migrated.
     // addLoadtestDriver(b, target, optimize, mods);
@@ -548,6 +549,45 @@ fn addZdbBench(
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("zdb-bench", "Build zdb YCSB benchmark client");
+    step.dependOn(&install.step);
+}
+
+/// Standalone thread-vs-zio-vs-fiber I/O & CPU micro-benchmark. Not a test
+/// (it has its own `main`), so it's excluded from auto-discovery and built
+/// here as its own exe.
+///
+/// ALWAYS ReleaseFast, regardless of `-Doptimize`: the benchmark's hot path
+/// runs through the fiber scheduler and zio, so Debug bounds-checks +
+/// allocator overhead there would dominate the inner loops and make the
+/// numbers meaningless. We rebuild `zio`/`xev`/`fiber` at ReleaseFast here
+/// (not reuse the shared `mods`, which follow the user's `-Doptimize`) so the
+/// benchmarked runtime is genuinely optimized, not just the harness shell.
+///
+/// Step-only (no `installArtifact`): a bare `zig build` won't pay for this
+/// ReleaseFast compile — it builds solely on `zig build bench-zio`.
+fn addZioBench(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    _: std.builtin.OptimizeMode, // ignored — always ReleaseFast (see above)
+    _: Modules, // ignored — deps rebuilt at ReleaseFast below
+) void {
+    const opt: std.builtin.OptimizeMode = .ReleaseFast;
+
+    const zio = b.dependency("zio", .{ .target = target, .optimize = opt }).module("zio");
+    const xev = b.dependency("xev", .{ .target = target, .optimize = opt }).module("xev");
+    const fiber = makeModule(b, target, opt, "fiber/root.zig");
+    fiber.addImport("zio", zio);
+    fiber.addImport("xev", xev);
+
+    const exe = b.addExecutable(.{
+        .name = "bench-zio",
+        .root_module = makeModule(b, target, opt, "benchmarks/zio_bench.zig"),
+    });
+    exe.root_module.addImport("zio", zio);
+    exe.root_module.addImport("fiber", fiber);
+
+    const install = b.addInstallArtifact(exe, .{});
+    const step = b.step("bench-zio", "Build the thread/zio/fiber benchmark (always ReleaseFast)");
     step.dependOn(&install.step);
 }
 

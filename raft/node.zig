@@ -55,8 +55,8 @@ pub const ConfigError = error{
 
 /// Monotonically-advancing u64 with wait/signal. Used for raft progress
 /// markers (applied HLC, commit index, etc.) where many tasks block until
-/// the value crosses a target. Re-exported from `utils.Watermark`.
-pub const Watermark = utils.Watermark;
+/// the value crosses a target. Re-exported from `fiber.Watermark`.
+pub const Watermark = fiber.Watermark;
 
 pub const DiskWAL = @import("diskwal.zig").DiskWAL;
 pub const RaftLogError = raftwal_mod.RaftLogError;
@@ -183,12 +183,14 @@ pub const Node = struct {
     state: State,
     /// Commit index. Lockless reads on hot replication paths via `commit_index.load()`;
     /// applyLoop and callbackLoop block on `commit_index.waitForUntimed(target)`.
-    commit_index: Watermark = .{},
+    /// Initialized in `init` (the fiber Watermark needs an allocator).
+    commit_index: Watermark,
     apply_index: std.atomic.Value(u64),
     /// HLC timestamp of the most-recently applied entry. Progress marker
     /// parallel to `apply_index`. Readers bounded by `read_ts` block until
     /// `applied_ts.load() >= read_ts` via `waitForApplied`.
-    applied_ts: Watermark = .{},
+    /// Initialized in `init` (the fiber Watermark needs an allocator).
+    applied_ts: Watermark,
     conf_applied_index: u64,
     leader_id: ?NodeId,
     pending_conf_change: bool,
@@ -208,7 +210,7 @@ pub const Node = struct {
     prng: std.Random.DefaultPrng,
     proposal_ch: fiber.Channel(ProposalRequest) = undefined,
     apply_callbacks: fiber.Channel(PendingApply) = undefined,
-    event_ch: fiber.Channel(u8) = undefined,
+    event_notify: fiber.Notify = .{},
     inbound_ch: fiber.Channel(InboundMsg) = undefined,
     shutting_down: std.atomic.Value(bool),
 
@@ -280,10 +282,11 @@ pub const Node = struct {
             .shutting_down = std.atomic.Value(bool).init(false),
             .file_acks = utils.SafeHashMap(u64, *PendingFileAck).init(allocator),
             .file_requests = utils.SafeHashMap(u64, *utils.WaitGroup).init(allocator),
+            .commit_index = Watermark.init(allocator),
+            .applied_ts = Watermark.init(allocator),
         };
         node.proposal_ch = try fiber.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
         node.apply_callbacks = try fiber.Channel(PendingApply).initAlloc(allocator, 1024);
-        node.event_ch = try fiber.Channel(u8).initAlloc(allocator, 1);
         node.inbound_ch = try fiber.Channel(InboundMsg).initAlloc(allocator, 1024);
         errdefer allocator.destroy(node);
         for (peers) |peer| {
@@ -373,8 +376,6 @@ pub const Node = struct {
         self.failAllPendingCallbacks(.shutdown);
         self.apply_callbacks.close(.immediate);
         self.apply_callbacks.deinit();
-        self.event_ch.close(.immediate);
-        self.event_ch.deinit();
 
         self.inbound_ch.close(.graceful);
         while (self.inbound_ch.tryReceive()) |msg| {
@@ -388,6 +389,10 @@ pub const Node = struct {
             if (p.addr.len > 0) self.allocator.free(p.addr);
         }
         self.peers.deinit();
+        // Free the watermark waiter tables. `startShutdown` already
+        // `close()`d both, so no fiber is still parked on them here.
+        self.commit_index.deinit();
+        self.applied_ts.deinit();
         self.allocator.destroy(self);
     }
 
@@ -442,7 +447,7 @@ pub const Node = struct {
                     self.allocator.free(owned);
                     return;
                 };
-                self.event_ch.trySend(1) catch {};
+                self.event_notify.notify();
             },
             serial_mod.msg_type_join_request => {
                 // Handle join requests in the Serial reader's coroutine directly.
@@ -879,7 +884,9 @@ pub const Node = struct {
     pub fn startShutdown(self: *Node) void {
         self.shutting_down.store(true, .release);
         self.proposal_ch.close(.graceful);
-        self.event_ch.close(.graceful);
+        // Wake mainLoop's blocked wait() so it observes `shutting_down`
+        // and returns (Notify has no close — a notify is the shutdown poke).
+        self.event_notify.notify();
         // Wake applyLoop + callbackLoop with error.Closed; wake any pending
         // proposeAndWaitForApply / waitForApplied callers the same way.
         self.commit_index.close();
@@ -1537,7 +1544,7 @@ pub const Node = struct {
             error.ChannelClosed => return error.QueueClosed,
             error.ChannelFull => return error.QueueFull,
         };
-        self.event_ch.trySend(1) catch {};
+        self.event_notify.notify();
     }
 
     /// Append the successful subset of `requests` to the leader's log,
@@ -1883,12 +1890,12 @@ pub const Node = struct {
         );
     }
 
-    /// Tick loop: periodically signals event_ch to trigger raft processing.
+    /// Tick loop: periodically notifies the event notifier to trigger raft processing.
     pub fn tickLoop(self: *Node, tick_interval_ms: u32) void {
         const tick_dur: u64 = tick_interval_ms;
         while (!self.isShuttingDown()) {
             fiber.sleepMs(tick_dur);
-            self.event_ch.trySend(1) catch {};
+            self.event_notify.notify();
         }
     }
 
@@ -1926,14 +1933,15 @@ pub const Node = struct {
         return self.log.sync();
     }
 
-    /// Main processing loop. Blocks on event_ch, drains inbound messages,
+    /// Main processing loop. Blocks on the event notifier, drains inbound messages,
     /// processes proposals, advances state, and broadcasts to peers.
     pub fn mainLoop(self: *Node, tick_interval_ms: u32) void {
         const tick_ms: i64 = @as(i64, tick_interval_ms);
         var last_tick: i64 = fiber.coarseMs();
 
         while (!self.isShuttingDown()) {
-            _ = self.event_ch.receive() catch return;
+            self.event_notify.wait();
+            if (self.isShuttingDown()) return;
 
             // Phase: inbound — drain inbound_ch (handle AE, AER, RV replies).
             // We observe even when the queue was empty: the histogram includes

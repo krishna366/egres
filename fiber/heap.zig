@@ -70,6 +70,11 @@ pub fn MinHeap(
         pub fn remove(self: *Self, t: *T) void {
             const idx = @field(t, index_field);
             if (idx == not_in_heap) return;
+            // The back-pointer must still name `t`'s own slot. A mismatch
+            // means a stale index (double-remove, or a remove against the
+            // wrong heap) that would otherwise silently relocate an unrelated
+            // entry and corrupt the heap.
+            std.debug.assert(self.items.items[idx] == t);
 
             const last = self.items.pop().?;
             if (last == t) {

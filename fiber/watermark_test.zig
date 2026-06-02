@@ -1,7 +1,13 @@
 const std = @import("std");
 const fiber = @import("fiber");
 
-test "Watermark: waitFor returns when value crosses target" {
+/// Direct vDSO monotonic ms — accurate elapsed measurement without the
+/// coarse clock's loop-tick lag.
+fn nowMs() i64 {
+    return fiber.clockMsUseRarely(.monotonic);
+}
+
+test "Watermark: waitForUntimed returns when value crosses target" {
     var wm = fiber.Watermark.init(std.testing.allocator);
     defer wm.deinit();
 
@@ -9,7 +15,7 @@ test "Watermark: waitFor returns when value crosses target" {
 
     const Waiter = struct {
         fn run(w: *fiber.Watermark, out: *u64) void {
-            w.waitFor(5) catch return;
+            w.waitForUntimed(5) catch return;
             out.* = w.load();
         }
     };
@@ -39,19 +45,19 @@ test "Watermark: advance wakes only waiters whose target is met" {
 
     const Low = struct {
         fn run(w: *fiber.Watermark, out: *bool) void {
-            w.waitFor(3) catch return;
+            w.waitForUntimed(3) catch return;
             out.* = true;
         }
     };
     const Mid = struct {
         fn run(w: *fiber.Watermark, out: *bool) void {
-            w.waitFor(5) catch return;
+            w.waitForUntimed(5) catch return;
             out.* = true;
         }
     };
     const High = struct {
         fn run(w: *fiber.Watermark, ok: *bool, closed: *bool) void {
-            w.waitFor(20) catch |err| {
+            w.waitForUntimed(20) catch |err| {
                 if (err == error.Closed) closed.* = true;
                 return;
             };
@@ -90,7 +96,7 @@ test "Watermark: close wakes everyone with error.Closed" {
 
     const Waiter = struct {
         fn run(w: *fiber.Watermark, count: *std.atomic.Value(u32)) void {
-            w.waitFor(100) catch |err| switch (err) {
+            w.waitForUntimed(100) catch |err| switch (err) {
                 error.Closed => _ = count.fetchAdd(1, .release),
                 else => return,
             };
@@ -121,7 +127,7 @@ test "Watermark: cross-worker — many waiters across multiple advances" {
 
     const Waiter = struct {
         fn run(w: *fiber.Watermark, target: u64, count: *std.atomic.Value(u32)) void {
-            w.waitFor(target) catch return;
+            w.waitForUntimed(target) catch return;
             _ = count.fetchAdd(1, .release);
         }
     };
@@ -151,4 +157,150 @@ test "Watermark: cross-worker — many waiters across multiple advances" {
     g.wait();
 
     try std.testing.expectEqual(@as(u32, N_WAITERS), completed.load(.acquire));
+}
+
+test "Watermark: waitFor times out when target never reached" {
+    var wm = fiber.Watermark.init(std.testing.allocator);
+    defer wm.deinit();
+
+    const Waiter = struct {
+        fn run(w: *fiber.Watermark, got: *bool, elapsed: *i64) void {
+            const before = nowMs();
+            w.waitFor(100, 20) catch |err| {
+                if (err == error.Timeout) got.* = true;
+            };
+            elapsed.* = nowMs() - before;
+        }
+    };
+
+    var got = false;
+    var elapsed: i64 = 0;
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.spawn(.{}, Waiter.run, .{ &wm, &got, &elapsed });
+    g.wait();
+
+    std.log.debug("timed out = {}, elapsed = {d} ms (timeout 20 ms)", .{ got, elapsed });
+    try std.testing.expect(got);
+    try std.testing.expect(elapsed >= 15);
+}
+
+test "Watermark: waitFor returns ok when advance beats the timeout" {
+    var wm = fiber.Watermark.init(std.testing.allocator);
+    defer wm.deinit();
+
+    const Waiter = struct {
+        fn run(w: *fiber.Watermark, ok: *bool) void {
+            if (w.waitFor(3, 5000)) {
+                ok.* = true;
+            } else |_| {}
+        }
+    };
+    const Bumper = struct {
+        fn run(w: *fiber.Watermark) void {
+            fiber.sleepMs(5);
+            w.advance(3);
+        }
+    };
+
+    var ok = false;
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.spawn(.{}, Waiter.run, .{ &wm, &ok });
+    try g.spawn(.{}, Bumper.run, .{&wm});
+    g.wait();
+
+    try std.testing.expect(ok);
+}
+
+test "Watermark: waitFor returns Closed when closed before the timeout" {
+    var wm = fiber.Watermark.init(std.testing.allocator);
+    defer wm.deinit();
+
+    const Waiter = struct {
+        fn run(w: *fiber.Watermark, closed: *bool) void {
+            w.waitFor(100, 5000) catch |err| {
+                if (err == error.Closed) closed.* = true;
+            };
+        }
+    };
+    const Closer = struct {
+        fn run(w: *fiber.Watermark) void {
+            fiber.sleepMs(5);
+            w.close();
+        }
+    };
+
+    var closed = false;
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.spawn(.{}, Waiter.run, .{ &wm, &closed });
+    try g.spawn(.{}, Closer.run, .{&wm});
+    g.wait();
+
+    try std.testing.expect(closed);
+}
+
+test "Watermark: early completion cancels the timeout (no late fire)" {
+    var wm = fiber.Watermark.init(std.testing.allocator);
+    defer wm.deinit();
+
+    const Waiter = struct {
+        fn run(w: *fiber.Watermark, ok: *bool) void {
+            if (w.waitFor(3, 30)) {
+                ok.* = true;
+            } else |_| {}
+        }
+    };
+
+    var ok = false;
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.spawn(.{}, Waiter.run, .{ &wm, &ok });
+    // Satisfy well before the 30 ms deadline. The advance runs on this
+    // (possibly different) worker, exercising the cross-worker cancel.
+    fiber.sleepMs(2);
+    wm.advance(3);
+    g.wait();
+    try std.testing.expect(ok);
+
+    // Linger past the original deadline. A timeout that wasn't cancelled
+    // would fire here against the (now dead) waiter frame or trip the heap
+    // back-pointer assert — so reaching the end cleanly is the assertion.
+    fiber.sleepMs(60);
+}
+
+test "Watermark: mixed timed waiters under concurrent advance" {
+    var wm = fiber.Watermark.init(std.testing.allocator);
+    defer wm.deinit();
+
+    const N = 50;
+    var resolved: std.atomic.Value(u32) = .init(0);
+
+    const Waiter = struct {
+        fn run(w: *fiber.Watermark, target: u64, count: *std.atomic.Value(u32)) void {
+            // Short timeout: some get satisfied by advance, others expire.
+            w.waitFor(target, 10) catch {};
+            _ = count.fetchAdd(1, .release);
+        }
+    };
+
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.ensureTotalCapacity(N);
+    for (0..N) |i| {
+        try g.spawn(.{}, Waiter.run, .{ &wm, @as(u64, @intCast(i + 1)), &resolved });
+    }
+
+    // Advance partway so the lower targets are satisfied while the rest
+    // race their deadlines — stresses claim() arbitration + cancel.
+    var v: u64 = 0;
+    while (v < N / 2) : (v += 5) {
+        wm.advance(v + 5);
+        fiber.sleepMs(1);
+    }
+    g.wait();
+
+    // Every waiter resolved exactly once (ok or Timeout); no hang/crash.
+    try std.testing.expectEqual(@as(u32, N), resolved.load(.acquire));
 }

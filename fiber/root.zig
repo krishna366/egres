@@ -66,6 +66,11 @@ pub const Group = group_mod.Group;
 const watermark_mod = @import("watermark.zig");
 pub const Watermark = watermark_mod.Watermark;
 
+// Process-wide context (gpa/arena/io/args). Lives here — the universal base
+// module — so any layer can reach it without a cycle (utils re-exports it as
+// `utils.context` for existing callers). `coarse_clock` reads `context.g().io`.
+pub const context = @import("context.zig");
+
 // From io.zig — timer-based sleepMs that cooperatively parks.
 const io = @import("io.zig");
 

@@ -140,8 +140,9 @@ pub fn main(init: std.process.Init) !void {
     // `run()` blocks this thread (worker 0) until `fiber.stop()`, which
     // `bootstrapAndStop` calls when bootstrap returns (i.e. on shutdown).
     var fiber_rt: fiber.Runtime = undefined;
-    // Both omitted (0) → auto: num_workers = CPU core count, raft_workers ≈ 1/4
-    // of workers capped at 4 (see fiber.runtime.raftWorkerCount).
+    // num_workers/raft_workers omitted → auto: workers = CPU core count,
+    // raft_workers ≈ 1/4 capped at 4 (see fiber.runtime.raftWorkerCount). The
+    // coarse clock reads time via `context.g().io`, already initialized above.
     try fiber_rt.init(allocator, .{});
     defer fiber_rt.deinit();
     log.info("runtime initialized: {d} workers", .{fiber_rt.workers.len});

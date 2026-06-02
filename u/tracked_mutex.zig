@@ -20,7 +20,7 @@
 //!     untracked. lock/unlock still work; they just don't appear in dumps.
 const std = @import("std");
 const fiber = @import("fiber");
-const context = @import("context.zig");
+const context = fiber.context;
 
 /// Cap on simultaneously-tracked locks. Sized to a ~512 KiB static
 /// storage budget so we don't have to revisit the constant when

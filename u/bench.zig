@@ -24,7 +24,7 @@
 
 const std = @import("std");
 const fiber = @import("fiber");
-const context = @import("context.zig");
+const context = fiber.context;
 
 inline fn nowNs() i128 {
     return std.Io.Timestamp.now(context.g().io, .real).nanoseconds;
