@@ -191,29 +191,21 @@ pub const panic = std.debug.FullPanic(minimalPanic);
 pub const std_options: std.Options = .{
     .logFn = capturingLogFn,
 
-    // TODO: escalate upstream in Zig forum / issue tracker.
-    // Zig 0.16's `std.debug.Dwarf.SelfUnwinder` is not thread-safe:
-    //   - Lazy init of `SelfInfo` races on first concurrent call.
-    //   - Even after init, `nextInner` mutates per-walk FDE/CIE
-    //     caches that get clobbered by concurrent walks.
-    // Symptoms under our multi-worker fiber runtime: SEGV inside
-    // `Dwarf.SelfUnwinder.nextInner(unwinder=0x0, cache_entry=0x0)`,
-    // followed by recursive-panic in the panic handler's own
-    // stack-walk. Triggered by `std.testing.allocator`'s leak-
-    // source recording (one captureCurrentStackTrace per alloc),
-    // by our own `captureTrace(&f.park_trace)` in `park()`, and
-    // by the panic handler itself.
-    //
-    // Disabling stack tracing globally for this test binary sidesteps all of
-    // the above AND avoids the cost: it makes `captureCurrentStackTrace` a
-    // no-op, so `std.testing.allocator` stops doing a Dwarf unwind on EVERY
-    // allocation (it still detects leaks via alloc/free balance — we just lose
-    // the "allocated at:" source pointers). `runFiberOne` still surfaces WHERE
-    // a test failed by printing the raw `@errorReturnTrace()` addresses — that
-    // trace is compiler-recorded (build-mode error tracing), independent of
-    // `allow_stack_tracing`, so it costs nothing here and needs no runtime
-    // symbolization (resolve offline with `addr2line`). Keep off.
-    .allow_stack_tracing = false,
+    // ON. This was OFF for a long time because Zig's `Dwarf.SelfUnwinder` used
+    // to race under our multi-worker runtime — concurrent `captureCurrentStack-
+    // Trace` calls (one per `std.testing.allocator` alloc) SEGV'd in
+    // `nextInner` on shared, unlocked FDE/CIE caches. Zig 0.16.0 fixed it:
+    // `SelfInfo` now holds an `Io.RwLock` (serializes module load/lookup) and
+    // `SelfUnwinder.nextInner` takes a caller-owned `*const CacheEntry` plus
+    // per-call unwinder state, so concurrent walks share nothing mutable.
+    // Verified: 18 full-suite runs at parallel=16, zero crashes; and the
+    // per-alloc unwind cost is lost in the noise (wall time is dominated by a
+    // few heavy disk/compute tests, not allocation count). Keeping it on so
+    // `std.testing.allocator` records "allocated at:" traces for leaks — real
+    // leak-debugging value at no measurable cost. (`runFiberOne` independently
+    // prints raw `@errorReturnTrace()` addresses on FAIL; resolve offline with
+    // `addr2line`.) If a `SelfUnwinder` race ever resurfaces, flip back to false.
+    .allow_stack_tracing = true,
 };
 
 const default_parallel: u6 = 0;

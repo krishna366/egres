@@ -179,7 +179,6 @@ pub const Fiber = struct {
     /// only, so 1 ms resolution is fine and the read is one atomic
     /// load (no syscall).
     parked_since_ms: i64,
-    park_trace: [8]usize,
 
     // Intrusive remote-queue link. Used when a peer worker pushes
     // this fiber onto its home worker's cross-thread injection
@@ -260,7 +259,6 @@ pub const Fiber = struct {
             .home_worker_id = opts.worker_id orelse 0,
             .cpu_total_ns = 0,
             .parked_since_ms = 0,
-            .park_trace = @splat(0),
             .remote_next = null,
             .waker_prev = null,
             .waker_next = null,

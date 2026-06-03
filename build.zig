@@ -523,6 +523,13 @@ fn addZdbServer(
         .name = "zdb-server",
         .root_module = makeModule(b, target, optimize, "zdb-server/main.zig"),
     });
+    // Keep the prod binary self-diagnosing: `dumpFibers` symbolizes parked
+    // fibers from the binary's own DWARF, so retain the line table (`strip`)
+    // and the rbp chain the frame-walk relies on (`omit_frame_pointer`).
+    // ReleaseFast keeps both by default today; pinning them stops a future
+    // default flip (or a `ReleaseSmall` switch) from silently gutting traces.
+    exe.root_module.strip = false;
+    exe.root_module.omit_frame_pointer = false;
     addVendoredCompressionSources(b, exe);
     addImports(exe.root_module, mods, .{ "raft", "zdb", "fiber", "metrics", "flags", "utils" });
     exe.root_module.addImport("zdb_server", zdb_server_mod);

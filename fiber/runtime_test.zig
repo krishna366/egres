@@ -277,39 +277,58 @@ test "Runtime: JoinHandle(void) blocks for completion without a value" {
     try std.testing.expect(produced);
 }
 
-test "Runtime: dumpFibers reflects a parked fiber" {
-    if (true) {
-        return error.SkipZigTest;
-    }
-    var producer_handle: ?*fiber.Fiber = null;
-
+test "Runtime: dumpFibers reflects a parked fiber and prints its trace" {
     const Producer = struct {
         out: *?*fiber.Fiber,
+        parked: *std.atomic.Value(bool),
 
         fn run(self: *@This()) void {
             self.out.* = fiber.currentFiber();
+            self.parked.store(true, .release);
             fiber.park();
         }
     };
 
-    var p_ctx = Producer{ .out = &producer_handle };
+    var producer_handle: ?*fiber.Fiber = null;
+    var parked = std.atomic.Value(bool).init(false);
+    var p_ctx = Producer{ .out = &producer_handle, .parked = &parked };
     const ph = try fiber.spawn(.{}, Producer.run, .{&p_ctx});
 
-    // Wait for the producer to record its handle (and thus park).
-    while (producer_handle == null) fiber.yield();
-    // One extra yield so the producer reaches the park() between
-    // setting `out` and parking.
-    fiber.yield();
+    // Wait until the producer flags intent-to-park, then sleep so it
+    // actually reaches `park()` and the worker commits it to `.waiting`
+    // (sleep is far more reliable here than counting bare yields).
+    while (!parked.load(.acquire)) fiber.yield();
+    fiber.sleepMs(5);
 
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     try fiber.dumpFibers(fiber.runtime(), &aw.writer);
     const text = aw.writer.buffered();
-    // dumpFibers shared across concurrent tests means we can't count
-    // parked fibers exactly. Just verify the format included at least
-    // one `parked_for=` entry (proving we saw a parked fiber).
-    try std.testing.expect(std.mem.indexOf(u8, text, "parked_for=") != null);
+    // dumpFibers is shared across concurrent tests, so we can't count parked
+    // fibers exactly — but our producer is guaranteed parked, so we must see:
+    //   - a `parked_for=` line,
+    //   - the raw `trace 0x...` frame-pointer walk, and
+    //   - a symbolized `<file>.zig:<line>:<col>` location. This last one proves
+    //     symbolization runs even though the test runner sets
+    //     `allow_stack_tracing = false` (it gates the unwinder, not lookups).
+    const has_parked = std.mem.indexOf(u8, text, "parked_for=") != null;
+    const has_trace = std.mem.indexOf(u8, text, "trace 0x") != null;
+    const has_symbols = std.mem.indexOf(u8, text, ".zig:") != null;
+    // Running/finished fibers are tallied, not listed (see dumpFibers).
+    const has_summary = std.mem.indexOf(u8, text, "waiting") != null;
 
+    // Emit the dump via std.log so the runner prints it (indented `  | ...`)
+    // under this test's line — lets you eyeball the symbolized parked-fiber
+    // traces with `zig build test -- --filter dumpFibers`.
+    std.log.info("dumpFibers output:\n{s}", .{text});
+
+    // Wake + join before asserting so a failed expectation can't leak the
+    // producer parked forever.
     fiber.wake(producer_handle.?);
     ph.join();
+
+    try std.testing.expect(has_parked);
+    try std.testing.expect(has_trace);
+    try std.testing.expect(has_symbols);
+    try std.testing.expect(has_summary);
 }

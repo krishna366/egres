@@ -24,6 +24,7 @@ const deadlines = @import("deadlines.zig");
 const spinlock = @import("spinlock.zig");
 const queue = @import("queue.zig");
 const fsops = @import("fsops.zig");
+const context = @import("context.zig");
 
 /// Flush a busy worker's io_uring SQ once this many SQEs have queued, so reads
 /// issued by running fibers dispatch promptly instead of waiting for the ~1 ms
@@ -82,35 +83,6 @@ const runfiber_guard = switch (builtin.mode) {
     .Debug, .ReleaseSafe => true,
     .ReleaseFast, .ReleaseSmall => false,
 };
-
-/// Capture a stack trace on every `park()` so `dumpFibers` can show WHERE each
-/// fiber is parked — the production deadlock/hang diagnostic the watchdog dumps
-/// when progress stalls.
-///
-/// DISABLED for now. The current capture (`captureTrace` →
-/// `std.debug.captureCurrentStackTrace`) uses Zig 0.16's Dwarf `SelfUnwinder`,
-/// which is NOT thread-safe: concurrent per-park unwinds of coroutine stacks
-/// across workers race and SEGV (confirmed to be the original crash source —
-/// the leak detector's concurrent captures were fine in testing, only this
-/// per-park coro-stack capture wasn't). It's also a full Dwarf unwind on every
-/// park (hot-path cost).
-///
-/// TODO(cheap park traces): don't capture at park AT ALL — reconstruct lazily.
-/// The coro already saves a parked fiber's register state on every yield:
-/// `f.coro.context` holds `rbp` (frame pointer), `rip` (where it yielded), and
-/// `stack_info` (stack bounds) — see coro's `Context`/`switchContext`. A parked
-/// fiber is SUSPENDED, so its stack is stable. So in `dumpFibers` (the only
-/// consumer — runs rarely, on a watchdog/hang dump), for each parked fiber walk
-/// the saved `rbp` chain: start at `ctx.rip`, then per frame read the return
-/// address at `[rbp+8]` and the next fp at `[rbp]`, bounded by `stack_info` (bail
-/// when fp leaves the stack region). Print raw addresses for offline
-/// `addr2line`/`llvm-addr2line`. This is ZERO per-park cost (nothing captured on
-/// the hot path), thread-safe (reads suspended stacks; no shared `SelfInfo`
-/// cache), and cheap (no Dwarf decode). Lets us DELETE the `park_trace` field +
-/// `captureTrace` entirely. Only requirement: build with frame pointers
-/// (`-fno-omit-frame-pointer`; ReleaseFast omits them) so the `rbp` chain is
-/// valid. Until then, park traces are off (this flag stays false).
-const capture_park_traces = false;
 
 /// Process-wide singleton runtime. There is exactly one runtime, so
 /// workers carry no backpointer — they and `spawn` resolve it through
@@ -928,7 +900,6 @@ pub fn park() void {
     // our context is saved (which would let two workers step one coro).
     std.debug.assert(old.tag == .ready);
     f.parked_since_ms = runtime().clock.ms();
-    if (comptime capture_park_traces) captureTrace(&f.park_trace);
 
     f.intent = .park;
     f.coro.yield();
@@ -1011,19 +982,50 @@ pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {
     rt.fibers_sl.lock();
     defer rt.fibers_sl.unlock();
     const now_ms = rt.clock.ms();
-    for (rt.fibers.items, 0..) |f, i| {
-        const s = f.loadState();
-        const letter: u8 = switch (s.tag) {
-            .new => 'N',
-            .ready => 'R',
-            .waiting => 'W',
-            .finished => 'F',
-        };
-        try writer.print("{c} {d:>5} fiber=0x{x}", .{ letter, i, @intFromPtr(f) });
-        if (s.tag == .waiting) {
-            try writer.print(" parked_for={d}ms", .{now_ms - f.parked_since_ms});
+
+    // Only `.waiting` fibers have a stable stack to walk and a `parked_for` to
+    // rank by; collect them so we can list the longest-parked first (most
+    // likely the root of a hang). Everything else is tallied, not listed: it's
+    // either running/runnable (no stable stack), done, or not yet started.
+    const Parked = struct { f: *Fiber, for_ms: i64 };
+    var parked: std.ArrayList(Parked) = .empty;
+    defer parked.deinit(context.g().gpa);
+    var n_running: usize = 0;
+    var n_finished: usize = 0;
+    var n_new: usize = 0;
+    var n_waiting: usize = 0;
+
+    for (rt.fibers.items) |f| {
+        switch (f.loadState().tag) {
+            .ready => n_running += 1,
+            .finished => n_finished += 1,
+            .new => n_new += 1,
+            .waiting => {
+                n_waiting += 1;
+                parked.append(context.g().gpa, .{
+                    .f = f,
+                    .for_ms = now_ms - f.parked_since_ms,
+                }) catch {}; // best-effort: under memory pressure, drop + note below
+            },
         }
-        try writer.print(" cpu_total={d}ms\n", .{@divTrunc(f.cpu_total_ns, std.time.ns_per_ms)});
+    }
+
+    // Longest-parked first.
+    std.mem.sort(Parked, parked.items, {}, struct {
+        fn descByAge(_: void, a: Parked, b: Parked) bool {
+            return a.for_ms > b.for_ms;
+        }
+    }.descByAge);
+
+    try writer.print("dumpFibers summary: {d} running, {d} finished, {d} new, {d} waiting (shown)\n", .{ n_running, n_finished, n_new, parked.items.len });
+    if (parked.items.len < n_waiting) {
+        try writer.print("({d} more waiting — out of memory to list)\n", .{n_waiting - parked.items.len});
+    }
+    for (parked.items, 0..) |e, idx| {
+        try writer.print("W {d:>5} fiber=0x{x} parked_for={d}ms cpu_total={d}ms\n", .{
+            idx, @intFromPtr(e.f), e.for_ms, @divTrunc(e.f.cpu_total_ns, std.time.ns_per_ms),
+        });
+        try writeStackTrace(writer, e.f); // re-checks `.waiting`; bails if it resumed
     }
 }
 
@@ -1174,7 +1176,114 @@ fn calibrateTsc() void {
     _ = tsc_ns_per_cycle_q32.cmpxchgStrong(0, median, .release, .acquire);
 }
 
-fn captureTrace(buf: *[8]usize) void {
-    @memset(buf, 0);
-    _ = std.debug.captureCurrentStackTrace(.{}, buf);
+/// Reconstruct a parked fiber's call stack lazily — ZERO cost on the `park()`
+/// hot path (nothing is captured there). A parked (`.waiting`) fiber is
+/// SUSPENDED: its coro saved `rip`/`rbp`/`stack_info` at the `coro.yield()`
+/// `switchContext`, and that stack won't change until a `wake` resumes it. We
+/// collect the saved `rip` (where it yielded), then walk the frame-pointer
+/// chain — each frame holds `[saved rbp | return address]` at `[rbp | rbp+8]`
+/// (System V x86_64 / AAPCS aarch64 with frame pointers). Every read is bounded
+/// by the coro's committed stack region and the chain must climb monotonically,
+/// so a racing resume can't fault us (worst case: torn reads, then the walk
+/// stops). To avoid PRINTING a torn trace, we re-check after the walk that the
+/// fiber is still `.waiting`: its `coro.context` and stack are only mutated
+/// while it RUNS, so if it's still parked the walk read a stable snapshot. If
+/// it resumed, we omit the trace rather than emit junk.
+///
+/// We always print the compact raw-address line — resolvable offline with
+/// `addr2line`, and the ONLY artifact when debug info or frame pointers are
+/// absent (e.g. ReleaseFast omits them, giving a short walk) — then symbolize
+/// each frame to `file:line:col in <fn>` via `symbolizeFrames`.
+fn writeStackTrace(writer: *std.Io.Writer, f: *const Fiber) !void {
+    const max_trace_depth = 32;
+    const ctx = &f.coro.context;
+    const pc, const start_fp = switch (builtin.cpu.arch) {
+        .x86_64 => .{ ctx.rip, ctx.rbp },
+        .aarch64 => .{ ctx.pc, ctx.fp },
+        else => return, // frame layout not implemented for this arch
+    };
+    const lo = ctx.stack_info.limit; // committed low bound
+    const hi = ctx.stack_info.base; // stack top (high)
+
+    // Walk the frame chain into a fixed buffer. addrs[0] is the resume point;
+    // the rest are return addresses climbing the call stack.
+    var addrs: [max_trace_depth]usize = undefined;
+    addrs[0] = pc;
+    var n: usize = 1;
+    var fp = start_fp;
+    while (n < max_trace_depth) {
+        // fp must sit inside the committed stack, be 8-aligned, and leave room
+        // to read [fp] (saved fp) and [fp+8] (return address). A garbage or
+        // torn fp fails one of these and we stop the walk.
+        if (fp < lo or fp +| 16 > hi or fp % 8 != 0) break;
+        const slot: [*]const usize = @ptrFromInt(fp);
+        const next_fp = slot[0];
+        const ret = slot[1];
+        if (ret == 0) break;
+        addrs[n] = ret;
+        n += 1;
+        if (next_fp <= fp) break; // chain must climb toward the stack base
+        fp = next_fp;
+    }
+
+    // Revalidate before trusting `addrs`: if a `wake` resumed the fiber while
+    // we walked, its stack was being overwritten, so the chain may be torn.
+    // Re-check the state — if it's no longer `.waiting`, the fiber moved; omit
+    // the trace rather than emit junk. (The bounds checks above already ruled
+    // out a fault; this rules out a misleading trace.) A resume that also
+    // re-parks within the walk is missed, but that's vanishingly rare.
+    if (f.loadState().tag != .waiting) {
+        try writer.writeAll("       (resumed mid-dump; trace omitted)\n");
+        return;
+    }
+
+    // Always emit the compact raw line (offline addr2line; survives missing
+    // debug info / omitted frame pointers).
+    try writer.writeAll("       trace");
+    for (addrs[0..n]) |a| try writer.print(" 0x{x}", .{a});
+    try writer.writeByte('\n');
+
+    // Then symbolize each frame to `file:line:col in <fn>`. Unconditional — a
+    // hang dump always wants the trace, and we deliberately do NOT consult
+    // `std.options.allow_stack_tracing`: that flag gates the *unwinder* (which
+    // raced); symbolization is a line-table lookup, safe when serialized.
+    symbolizeFrames(writer, addrs[0..n]);
+}
+
+/// Resolve raw return addresses to `file:line:col in <fn>`. This is a DWARF
+/// line-table lookup against the binary's OWN embedded debug info (the running
+/// executable — present in prod), NOT stack unwinding and NOT reading source
+/// files (those don't ship to a prod box). Safe to run regardless of
+/// `std.options.allow_stack_tracing`. No external lock needed: `SelfInfo` is
+/// internally thread-safe in Zig 0.16.0 (its own `Io.RwLock` serializes module
+/// load/lookup — the same fix that made concurrent unwinds safe), and the only
+/// caller, `dumpFibers`, already holds `fibers_sl` for its whole pass anyway.
+/// Best-effort: stripped / missing debug info degrades to the raw-address line
+/// already printed (resolve those offline with `addr2line` against the binary).
+fn symbolizeFrames(writer: *std.Io.Writer, addrs: []const usize) void {
+    const io = context.g().io;
+    const di = std.debug.getSelfDebugInfo() catch return; // stripped/unsupported
+    var arena: std.heap.ArenaAllocator = .init(std.debug.getDebugInfoAllocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (addrs) |ret| {
+        // `ret` is the return address (after the call); -1 lands inside the
+        // calling instruction so we report its line, not the next one.
+        var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+        di.getSymbols(io, a, a, ret -| 1, true, &symbols) catch {};
+        if (symbols.items.len == 0) {
+            writer.print("         0x{x} in ???\n", .{ret}) catch return;
+            continue;
+        }
+        for (symbols.items) |sym| {
+            if (sym.source_location) |sl| {
+                writer.print("         {s}:{d}:{d} in {s}\n", .{
+                    sl.file_name, sl.line, sl.column, sym.name orelse "???",
+                }) catch return;
+            } else {
+                writer.print("         0x{x} in {s}\n", .{ ret, sym.name orelse "???" }) catch return;
+            }
+        }
+    }
 }
