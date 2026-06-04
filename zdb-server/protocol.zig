@@ -12,12 +12,15 @@ pub const Command = union(enum) {
     raft: RaftCmd,
     vfs: VfsCmd,
     locks: LocksCmd,
+    workers: WorkersCmd,
     help: HelpCmd,
 };
 
 pub const VfsCmd = struct {};
 
 pub const LocksCmd = struct {};
+
+pub const WorkersCmd = struct {};
 
 pub const HelpCmd = struct {};
 
@@ -54,6 +57,8 @@ pub const help_text =
     \\  vfs                             VFS bandwidth limiter snapshot
     \\  locks                           dump every tracked mutex: holder src,
     \\                                  waiter count, last-waiter src
+    \\  workers                         per-worker CPU histogram + imbalance
+    \\                                  ratio (work distribution across workers)
     \\
 ;
 
@@ -432,6 +437,8 @@ pub fn parseLine(line: []const u8) !Command {
         return .{ .vfs = .{} };
     } else if (std.mem.eql(u8, cmd, "locks")) {
         return .{ .locks = .{} };
+    } else if (std.mem.eql(u8, cmd, "workers")) {
+        return .{ .workers = .{} };
     } else if (std.mem.eql(u8, cmd, "help")) {
         return .{ .help = .{} };
     } else {

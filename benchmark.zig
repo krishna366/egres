@@ -1,12 +1,17 @@
 const std = @import("std");
-const zio = @import("zio");
+const fiber = @import("zfiber");
 const flags = @import("flags");
 const utils = @import("utils");
 const proto = @import("zdb-server/protocol.zig");
 
-const Timestamp = zio.Timestamp;
-const Duration = zio.Duration;
 const log = std.log.scoped(.zdb_client);
+
+/// Monotonic nanoseconds. Zig 0.16 dropped `std.time.Instant`/`Timer`; the
+/// process io clock is the supported monotonic source. `std.Io.Clock` spells
+/// monotonic `.awake`. Used for latency histograms and phase elapsed timing.
+inline fn nowNs() i128 {
+    return std.Io.Timestamp.now(utils.context.g().io, .awake).nanoseconds;
+}
 
 /// Flag-registered config. `phase` is a string ("load" / "run" / "both")
 /// — flags.zig doesn't support enum-typed fields. Two callsites below
@@ -56,12 +61,12 @@ fn usage(alloc: std.mem.Allocator) void {
 
 // --- Text protocol (client side) ---
 
-fn sendSet(stream: zio.net.Stream, ns: u32, key: []const u8, value: []const u8) !void {
+fn sendSet(stream: fiber.net.Stream, ns: u32, key: []const u8, value: []const u8) !void {
     var hdr_buf: [128]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "set {d} {s} ", .{ ns, key }) catch unreachable;
-    try stream.writeAll(hdr, .none);
-    try stream.writeAll(value, .none);
-    try stream.writeAll("\n", .none);
+    try stream.writeAll(hdr);
+    try stream.writeAll(value);
+    try stream.writeAll("\n");
 }
 
 /// One-shot batch write in the human-friendly text protocol:
@@ -77,7 +82,7 @@ fn sendSet(stream: zio.net.Stream, ns: u32, key: []const u8, value: []const u8) 
 /// Packs everything into one buffer and sends with a single writeAll.
 fn sendSetBatch(
     allocator: std.mem.Allocator,
-    stream: zio.net.Stream,
+    stream: fiber.net.Stream,
     ns: u32,
     keys: []const []const u8,
     values: []const []const u8,
@@ -103,7 +108,7 @@ fn sendSetBatch(
         buf[off] = '\n';
         off += 1;
     }
-    try stream.writeAll(buf[0..off], .none);
+    try stream.writeAll(buf[0..off]);
 }
 
 const SetResult = struct {
@@ -115,7 +120,7 @@ const SetResult = struct {
     leader_id: u64 = 0,
 };
 
-fn recvSetResponse(stream: zio.net.Stream) !SetResult {
+fn recvSetResponse(stream: fiber.net.Stream) !SetResult {
     var buf: [256]u8 = undefined;
     const line = try readResponseLine(stream, &buf);
     if (std.mem.startsWith(u8, line, "OK ")) {
@@ -133,10 +138,10 @@ fn recvSetResponse(stream: zio.net.Stream) !SetResult {
     }
 }
 
-fn sendGet(stream: zio.net.Stream, ns: u32, key: []const u8, read_ts: u64) !void {
+fn sendGet(stream: fiber.net.Stream, ns: u32, key: []const u8, read_ts: u64) !void {
     var hdr_buf: [128]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "get {d} {s} {d}\n", .{ ns, key, read_ts }) catch unreachable;
-    try stream.writeAll(hdr, .none);
+    try stream.writeAll(hdr);
 }
 
 const GetResult = struct {
@@ -149,7 +154,7 @@ const GetResult = struct {
 /// Reads the response for a `get` into the caller-provided `buf` (which must
 /// be large enough for the header + value — callers size it for max value_size).
 /// On FOUND, `value` slices into `buf` past the "FOUND <ts> " header.
-fn recvGetResponse(stream: zio.net.Stream, buf: []u8) !GetResult {
+fn recvGetResponse(stream: fiber.net.Stream, buf: []u8) !GetResult {
     const line = try readResponseLine(stream, buf);
     if (std.mem.eql(u8, line, "NOT_FOUND")) {
         return .{ .found = false };
@@ -166,11 +171,16 @@ fn recvGetResponse(stream: zio.net.Stream, buf: []u8) !GetResult {
     }
 }
 
-fn readResponseLine(stream: zio.net.Stream, buf: []u8) ![]const u8 {
+fn readResponseLine(stream: fiber.net.Stream, buf: []u8) ![]const u8 {
     var pos: usize = 0;
     while (pos < buf.len) {
         var byte: [1]u8 = undefined;
-        const n = try stream.read(&byte, .none);
+        // fiber.net surfaces end-of-stream as error.EOF (zio returned 0);
+        // map it to EndOfStream so callers keep their existing contract.
+        const n = stream.read(&byte) catch |err| switch (err) {
+            error.EOF => return error.EndOfStream,
+            else => return err,
+        };
         if (n == 0) return error.EndOfStream;
         if (byte[0] == '\n') {
             const end = if (pos > 0 and buf[pos - 1] == '\r') pos - 1 else pos;
@@ -226,7 +236,7 @@ fn valueMatches(got: []const u8, id: u64) bool {
 /// Caller provides `buf` for the response (sized to hold header + value) and
 /// `read_ts` (typically `SharedState.max_commit_ts` so followers catch up to
 /// every previously-acked write).
-fn getWithRetry(stream: zio.net.Stream, ns: u32, key: []const u8, read_ts: u64, buf: []u8) !GetResult {
+fn getWithRetry(stream: fiber.net.Stream, ns: u32, key: []const u8, read_ts: u64, buf: []u8) !GetResult {
     const max_retries: u32 = 5;
     var delay_ms: u64 = 10;
     var attempt: u32 = 0;
@@ -235,7 +245,7 @@ fn getWithRetry(stream: zio.net.Stream, ns: u32, key: []const u8, read_ts: u64, 
         const result = try recvGetResponse(stream, buf);
         if (result.found) return result;
         if (attempt >= max_retries) return result;
-        zio.sleep(zio.Duration.fromMilliseconds(delay_ms)) catch return result;
+        fiber.sleepMs(delay_ms);
         delay_ms *= 2;
     }
 }
@@ -310,7 +320,7 @@ const WorkerStats = struct {
 const WorkerCtx = struct {
     id: u32,
     args: *const Args,
-    server_addr: zio.net.IpAddress,
+    server_addr: fiber.net.IpAddress,
     shared: *SharedState,
     stats: WorkerStats = .{},
     load_elapsed_ns: u64 = 0,
@@ -333,7 +343,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
         return err;
     };
     defer stream.close();
-    stream.socket.setNoDelay(true) catch {};
+    stream.setNoDelay(true) catch {};
     log.info("worker {d}: connected", .{ctx.id});
 
     const alloc = std.heap.page_allocator;
@@ -368,7 +378,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
         const end_key = if (ctx.id == args.clients - 1) total else start_key + per_worker;
 
         log.info("worker {d}: load phase keys [{d}..{d}) batch_size={d}", .{ ctx.id, start_key, end_key, bs });
-        const t0 = Timestamp.now(.monotonic);
+        const t0 = nowNs();
         var k: u64 = start_key;
         while (k < end_key) {
             // Fill the next batch — stop early on namespace boundary.
@@ -412,8 +422,8 @@ fn workerImpl(ctx: *WorkerCtx) !void {
                 });
             }
         }
-        const t1 = Timestamp.now(.monotonic);
-        ctx.load_elapsed_ns = Timestamp.durationTo(t0, t1).toNanoseconds();
+        const t1 = nowNs();
+        ctx.load_elapsed_ns = @intCast(t1 - t0);
         _ = ctx.shared.loaders_done.fetchAdd(1, .release);
         log.info("worker {d}: load complete — {d} ok, {d} err, {d:.1} ms", .{
             ctx.id,
@@ -427,7 +437,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
     // the returned value bytes against the expected deterministic pattern.
     if (std.mem.eql(u8, args.phase, "run") or std.mem.eql(u8, args.phase, "both")) {
         log.info("worker {d}: run phase — {d} ops, {d}% reads", .{ ctx.id, args.ops, args.read_pct });
-        const t0 = Timestamp.now(.monotonic);
+        const t0 = nowNs();
         var i: u64 = 0;
         while (i < args.ops) : (i += 1) {
             const r = prng.random().intRangeAtMost(u8, 0, 99);
@@ -438,12 +448,12 @@ fn workerImpl(ctx: *WorkerCtx) !void {
 
             if (r < args.read_pct) {
                 const read_ts = ctx.shared.max_commit_ts.load(.acquire);
-                const op_start = Timestamp.now(.monotonic);
+                const op_start = nowNs();
                 const result = getWithRetry(stream, ns, key, read_ts, &read_buf) catch {
                     ctx.stats.read_err += 1;
                     continue;
                 };
-                const lat = Timestamp.durationTo(op_start, Timestamp.now(.monotonic)).toNanoseconds();
+                const lat = @as(u64, @intCast(nowNs() - op_start));
                 ctx.stats.total_read_ns += lat;
                 ctx.stats.min_read_ns = @min(ctx.stats.min_read_ns, lat);
                 ctx.stats.max_read_ns = @max(ctx.stats.max_read_ns, lat);
@@ -461,7 +471,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
                 // Reuse slot 0 of the batch value buffer for this single write.
                 const vslot = vals_flat[0..value_size];
                 fillValue(vslot, key_id);
-                const op_start = Timestamp.now(.monotonic);
+                const op_start = nowNs();
                 sendSet(stream, ns, key, vslot) catch {
                     ctx.stats.write_err += 1;
                     continue;
@@ -470,7 +480,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
                     ctx.stats.write_err += 1;
                     continue;
                 };
-                const lat = Timestamp.durationTo(op_start, Timestamp.now(.monotonic)).toNanoseconds();
+                const lat = @as(u64, @intCast(nowNs() - op_start));
                 ctx.stats.total_write_ns += lat;
                 ctx.stats.min_write_ns = @min(ctx.stats.min_write_ns, lat);
                 ctx.stats.max_write_ns = @max(ctx.stats.max_write_ns, lat);
@@ -487,8 +497,8 @@ fn workerImpl(ctx: *WorkerCtx) !void {
                 log.info("worker {d}: {d}/{d} ops done", .{ ctx.id, done, args.ops });
             }
         }
-        const t1 = Timestamp.now(.monotonic);
-        ctx.run_elapsed_ns = Timestamp.durationTo(t0, t1).toNanoseconds();
+        const t1 = nowNs();
+        ctx.run_elapsed_ns = @intCast(t1 - t0);
         log.info("worker {d}: run complete — reads={d} writes={d} {d:.1} ms", .{
             ctx.id,
             ctx.stats.read_ok + ctx.stats.read_miss,
@@ -513,12 +523,11 @@ fn verifyWorkerImpl(ctx: *WorkerCtx) !void {
         return err;
     };
     defer stream.close();
-    stream.socket.setNoDelay(true) catch {};
+    stream.setNoDelay(true) catch {};
     log.info("verifier {d}: connected", .{ctx.id});
 
     var read_buf: [16 * 1024 + 256]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(@as(u64, ctx.id) ^ 0xcafebabe);
-    const wait = zio.Duration.fromMilliseconds(20);
 
     const per_worker = args.records / args.clients;
 
@@ -526,7 +535,7 @@ fn verifyWorkerImpl(ctx: *WorkerCtx) !void {
         const hw = ctx.shared.high_water.load(.acquire);
         if (hw == 0) {
             if (ctx.shared.loaders_done.load(.acquire) >= args.clients) return;
-            zio.sleep(wait) catch return;
+            fiber.sleepMs(20);
             continue;
         }
 
@@ -537,7 +546,7 @@ fn verifyWorkerImpl(ctx: *WorkerCtx) !void {
         const w = prng.random().intRangeLessThan(u32, 0, args.clients);
         const written = ctx.shared.per_worker_written[w].load(.acquire);
         if (written == 0) {
-            zio.sleep(wait) catch return;
+            fiber.sleepMs(20);
             continue;
         }
         const offset = prng.random().intRangeLessThan(u64, 0, written);
@@ -677,11 +686,25 @@ pub fn main(init: std.process.Init) !void {
     const allocator = utils.context.g().gpa;
     const argv = try utils.context.g().argv();
 
-    // Bootstrap fiber: runs flag init + benchmark setup in fiber context.
-    const bootstrap_rt = try zio.Runtime.init(allocator, .{ .executors = .exact(1) });
-    defer bootstrap_rt.deinit();
-    var handle = try bootstrap_rt.spawn(bootstrap, .{ allocator, argv });
-    try handle.join();
+    // The in-tree fiber runtime (one worker per core by default). The root
+    // fiber drives flag init + the whole benchmark in fiber context — the
+    // workers/verifiers and fiber.net all need a current worker. `run()`
+    // blocks until `fiber.stop()`, which `bootstrapAndStop` calls on exit.
+    var fiber_rt: fiber.Runtime = undefined;
+    try fiber_rt.init(allocator, .{});
+    defer fiber_rt.deinit();
+
+    _ = try fiber.spawn(.{}, bootstrapAndStop, .{ allocator, argv });
+    fiber_rt.run();
+}
+
+/// Root fiber: runs bootstrap, then stops the runtime so `run()` returns.
+/// Fatal arg/data errors call `std.process.exit` directly (as before).
+fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    defer fiber.stop();
+    bootstrap(allocator, argv) catch |err| {
+        log.err("benchmark failed: {s}", .{@errorName(err)});
+    };
 }
 
 fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
@@ -727,18 +750,11 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
         args.addr, args.clients, args.records, args.ops, args.read_pct, args.value_size, args.phase,
     });
 
-    const n_threads: u6 = @intCast(@max(2, args.clients));
-    var rt = try zio.Runtime.init(allocator, .{
-        .executors = @enumFromInt(n_threads),
-    });
-    defer rt.deinit();
-
-    log.info("runtime initialized with {d} threads, starting benchmark", .{n_threads});
-    // runBenchmark uses zio.Group{} / zio.net which require a current executor,
-    // so we spawn it as a root task on the runtime instead of calling from
-    // the main thread (which is never an executor after Runtime.init).
-    var root = try rt.spawn(runBenchmark, .{ allocator, &args });
-    const mismatches = root.join();
+    // Already running inside the fiber runtime (spawned from main), so call
+    // runBenchmark directly — it spawns its writer/verifier fibers via a
+    // fiber.Group, and fiber.net needs a current worker, which we have here.
+    log.info("starting benchmark", .{});
+    const mismatches = runBenchmark(allocator, &args);
     if (mismatches > 0) {
         std.debug.print("FAIL: {d} value mismatches observed — data integrity failure\n", .{mismatches});
         std.process.exit(1);
@@ -747,7 +763,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 
 fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) u64 {
     log.info("runBenchmark", .{});
-    const server_addr = zio.net.IpAddress.parseIpAndPort(args.addr) catch |err| {
+    const server_addr = fiber.net.IpAddress.parseIpAndPort(args.addr) catch |err| {
         log.err("invalid address '{s}': {s}", .{ args.addr, @errorName(err) });
         return 0;
     };
@@ -783,25 +799,25 @@ fn runBenchmark(allocator: std.mem.Allocator, args: *const Args) u64 {
 
     log.info("spawning {d} writer(s) + {d} verifier(s)", .{ args.clients, args.verify_clients });
 
-    var group = zio.Group{};
-    defer group.cancel();
+    var group = fiber.Group(void).init(allocator);
+    defer group.deinit();
 
     // Writers = contexts[0..clients]; verifiers = contexts[clients..]
     for (contexts[0..args.clients]) |*ctx| {
-        group.spawn(workerFn, .{ctx}) catch {
+        group.spawn(.{}, workerFn, .{ctx}) catch {
             log.err("failed to spawn worker {d}", .{ctx.id});
             return 0;
         };
     }
     for (contexts[args.clients..]) |*ctx| {
-        group.spawn(verifyWorkerFn, .{ctx}) catch {
+        group.spawn(.{}, verifyWorkerFn, .{ctx}) catch {
             log.err("failed to spawn verifier {d}", .{ctx.id});
             return 0;
         };
     }
 
-    // Wait for all workers.
-    group.wait() catch return 0;
+    // Wait for all workers (Group(void).wait() is infallible).
+    group.wait();
 
     log.info("all workers finished", .{});
     printResults(args, contexts, &shared);

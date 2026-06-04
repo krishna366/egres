@@ -1012,6 +1012,9 @@ pub const ZdbServer = struct {
                 .locks => {
                     self.handleLocks(stream) catch return;
                 },
+                .workers => {
+                    self.handleWorkers(stream) catch return;
+                },
                 .help => {
                     proto.writeHelp(stream) catch return;
                 },
@@ -1239,6 +1242,17 @@ pub const ZdbServer = struct {
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
         try fiber.dumpLocks(&body.writer);
+        try body.writer.writeByte('\n');
+        try stream.writeAll(body.writer.buffered());
+    }
+
+    fn handleWorkers(self: *ZdbServer, stream: fiber.net.Stream) !void {
+        // Per-worker accumulated CPU time as a histogram, plus a max/avg
+        // imbalance ratio (1.0 == perfectly balanced). Shows how evenly the
+        // fiber runtime spread work across its workers under load.
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+        try fiber.dumpWorkerCpu(&body.writer);
         try body.writer.writeByte('\n');
         try stream.writeAll(body.writer.buffered());
     }

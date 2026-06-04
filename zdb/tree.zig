@@ -620,9 +620,17 @@ pub const Tree = struct {
         // legibility (`stats forest`).
         const linfo = self.lowestLevelSize();
         const total = self.totalSize();
-        if (total > self.opts.tree_split_size) {
-            log.debug("split-trigger tree={d} total={d} deepest_level={d} lmax_size={d} > threshold={d}", .{
-                self.tree_id, total, linfo.level, linfo.size, self.opts.tree_split_size,
+        // Gate the split on Lmax feasibility: findSplitKey needs Lmax to hold
+        // at least min_lmax_tables_for_split tables to pick a boundary key. A
+        // tree can be oversized in total while its data is still stacked in the
+        // upper levels (Lmax near-empty) — triggering then spins forever:
+        // needs_split stays true, buildSplit returns null, proposeSplit skips.
+        // When infeasible, fall through to compaction, which drains data into
+        // Lmax until a split becomes possible.
+        const lmax_tables = self.levels[self.opts.max_levels - 1].numTables();
+        if (total > self.opts.tree_split_size and lmax_tables >= min_lmax_tables_for_split) {
+            log.debug("split-trigger tree={d} total={d} deepest_level={d} lmax_size={d} lmax_tables={d} > threshold={d}", .{
+                self.tree_id, total, linfo.level, linfo.size, lmax_tables, self.opts.tree_split_size,
             });
             self.compact_candidate = .{
                 .level = @intCast(linfo.level),

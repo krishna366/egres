@@ -41,6 +41,12 @@ pub const SkipList = struct {
     rng: std.Random.DefaultPrng,
     ref_count: Atomic(u32),
     node_count: Atomic(usize),
+    /// Live data bytes (key + value) written into this memtable. Used by
+    /// `memoryUsage`/`shouldFreeze` instead of arena capacity: the arena is
+    /// preheated to `max_arena_size`, so `queryCapacity()` reports the full
+    /// reservation even when empty — which would make an empty memtable look
+    /// "full" and trip the freeze threshold immediately.
+    used_bytes: Atomic(usize),
 
     pub fn init(allocator: Allocator) !*Self {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -65,6 +71,7 @@ pub const SkipList = struct {
             .rng = std.Random.DefaultPrng.init(@intCast(std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds)),
             .ref_count = Atomic(u32).init(1),
             .node_count = Atomic(usize).init(0),
+            .used_bytes = Atomic(usize).init(0),
         };
         return self;
     }
@@ -155,6 +162,9 @@ pub const SkipList = struct {
             // The previous value can't really be deallocated in arena allocator.
             // So, don't worry about it. Allocate a new one and move on.
             existing.value = alloc.dupe(u8, value) catch return Error.ArenaFull;
+            // Old value stays resident in the arena, so memory grows by the
+            // new value's bytes even on overwrite.
+            _ = self.used_bytes.fetchAdd(value.len, .monotonic);
             return;
         }
 
@@ -185,6 +195,7 @@ pub const SkipList = struct {
         }
 
         _ = self.node_count.fetchAdd(1, .monotonic);
+        _ = self.used_bytes.fetchAdd(keyWithTs.len + valOwn.len, .monotonic);
     }
 
     pub fn contains(self: *Self, key: Key) bool {
@@ -196,13 +207,12 @@ pub const SkipList = struct {
     }
 
     pub fn memoryUsage(self: *Self) usize {
-        // Zig 0.16: ArenaAllocator.State no longer exposes a single
-        // `end_index`; nodes form a linked list with per-node end_index.
-        // queryCapacity sums all node capacities — for a memtable that
-        // only grows (no reset), capacity == used.
-        // TODO: We should just track the size of key-values we're added,
-        // instead of relying on the arena to tell us that.
-        return self.arena.queryCapacity();
+        // Live data bytes (key + value) written, tracked on every `put`.
+        // We deliberately do NOT use `arena.queryCapacity()`: the arena is
+        // preheated to `max_arena_size`, so an empty memtable would report
+        // the full 64 MiB reservation and trip `shouldFreeze` immediately,
+        // spinning the newMemtable loop forever.
+        return self.used_bytes.load(.monotonic);
     }
 
     pub fn memoryCapacity(self: *Self) usize {

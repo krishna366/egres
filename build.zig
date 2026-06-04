@@ -57,9 +57,8 @@ pub fn build(b: *std.Build) void {
     addZdbServer(b, target, optimize, mods, regen_buffers_step);
     addZdbBench(b, target, optimize, mods);
     addZioBench(b, target, optimize, mods);
-    // Deferred for Zig 0.16 migration: loadtest has heavy std.process.Child
-    // and std.fs.cwd surface area; re-enable once those are migrated.
-    // addLoadtestDriver(b, target, optimize, mods);
+    // Load-test driver lives in `scripts/loadtest.py` (orchestration glue is
+    // far cleaner in Python than in Zig's std.process/std.Io.Dir surface).
     addSstVerify(b, target, optimize, mods);
     // `zig build test` — one binary, auto-discovered from `*_test.zig` /
     // `test.zig` files. Replaces the previous test-zdb / test-zbuf /
@@ -429,7 +428,14 @@ fn addAllTests(
     });
     addImports(root_mod, mods, test_imports);
 
+    // Name the binary by optimize mode so the Debug and ReleaseFast test
+    // binaries install SIDE BY SIDE (zig-out/bin/test-Debug vs
+    // zig-out/bin/test-ReleaseFast) instead of clobbering each other — handy
+    // for the compile-once / run-the-binary-many-times loop used to hunt
+    // intermittent races.
+    const test_bin_name = b.fmt("test-{s}", .{@tagName(optimize)});
     const all_tests = b.addTest(.{
+        .name = test_bin_name,
         .root_module = root_mod,
         .test_runner = .{
             .path = b.path("u/test_runner.zig"),
@@ -438,13 +444,25 @@ fn addAllTests(
     });
     addVendoredCompressionSources(b, all_tests);
     addLibpgQuerySources(b, all_tests);
+    all_tests.step.dependOn(regen_buffers_step);
+
+    // Install the test binary to zig-out/bin/<test_bin_name> so it sits at a
+    // stable path you can run directly (skips the per-iteration build graph).
+    const install_test = b.addInstallArtifact(all_tests, .{ .dest_dir = .{ .override = .bin } });
 
     const run = b.addRunArtifact(all_tests);
     run.step.dependOn(regen_buffers_step);
     if (b.args) |args| run.addArgs(args);
 
+    // `zig build test` builds + installs the binary, THEN runs it.
     const test_step = b.step("test", "Run every test in one binary (auto-discovered)");
+    test_step.dependOn(&install_test.step);
     test_step.dependOn(&run.step);
+
+    // `zig build test-bin` builds + installs WITHOUT running — for the
+    // compile-once, loop-the-binary workflow.
+    const test_bin_step = b.step("test-bin", "Build + install the test binary (no run)");
+    test_bin_step.dependOn(&install_test.step);
 
     // `zig build bench` always builds in ReleaseFast — Debug bounds checks
     // and allocator overhead would dominate the inner loops and make the
@@ -551,7 +569,7 @@ fn addZdbBench(
         .name = "zdb-bench",
         .root_module = makeModule(b, target, optimize, "benchmark.zig"),
     });
-    addImports(exe.root_module, mods, .{ "zio", "flags", "utils" });
+    addImports(exe.root_module, mods, .{ "zfiber", "flags", "utils" });
     b.installArtifact(exe);
 
     const install = b.addInstallArtifact(exe, .{});
@@ -595,24 +613,6 @@ fn addZioBench(
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("bench-zio", "Build the thread/zio/fiber benchmark (always ReleaseFast)");
-    step.dependOn(&install.step);
-}
-
-fn addLoadtestDriver(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    mods: Modules,
-) void {
-    const exe = b.addExecutable(.{
-        .name = "loadtest",
-        .root_module = makeModule(b, target, optimize, "scripts/loadtest.zig"),
-    });
-    addImports(exe.root_module, mods, .{ "zio", "flags", "utils" });
-    b.installArtifact(exe);
-
-    const install = b.addInstallArtifact(exe, .{});
-    const step = b.step("loadtest", "Build the zdb load-test driver");
     step.dependOn(&install.step);
 }
 

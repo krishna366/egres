@@ -85,10 +85,8 @@ pub const Watermark = watermark_mod.Watermark;
 // `utils.context` for existing callers). `coarse_clock` reads `context.g().io`.
 pub const context = @import("context.zig");
 
-// From io.zig — timer-based sleepMs that cooperatively parks.
-const io = @import("io.zig");
-
-pub const sleepMs = io.sleepMs;
+// `sleepMs` lives in deadlines.zig — it parks on the per-worker Deadlines heap.
+pub const sleepMs = @import("deadlines.zig").sleepMs;
 
 // From fs.zig — file I/O that cooperatively parks (zio.File/Dir-compatible).
 pub const fs = @import("fs.zig");

@@ -27,6 +27,11 @@ const std = @import("std");
 const xev = @import("xev");
 const heap = @import("heap.zig");
 const coarse = @import("coarse_clock.zig");
+// `sleepMs` (bottom of file) is the one fiber-aware helper here, so we import
+// the runtime for park/wake. The `Deadlines` struct itself stays oblivious to
+// fibers — this is a mutual file import, which Zig resolves lazily (runtime.zig
+// imports us back for the `Deadlines` type).
+const rt = @import("runtime.zig");
 
 const Spinlock = @import("spinlock.zig").Spinlock;
 const Allocator = std.mem.Allocator;
@@ -284,4 +289,41 @@ fn onTimer(
     // armForHead re-locks the heap and no-ops if it's empty.
     self.armForHead(now);
     return .disarm;
+}
+
+// ── sleepMs ─────────────────────────────────────────────────────────
+//
+// The simplest `Deadlines` consumer: park the calling fiber until the
+// deadline fires. Nothing competes with the timer to wake a pure sleep
+// (unlike a socket read or watermark wait), so there's no first-fire
+// `claim()` race to arbitrate. The `cancel` below still runs, but only as
+// defensive cleanup — a no-op once the deadline has removed our entry.
+
+/// Park the calling fiber for `ms` milliseconds on the current worker's
+/// `Deadlines` (one `xev.Timer` per worker, re-armed to the earliest pending
+/// deadline) rather than arming a fresh libxev timer per call. `ms` is clamped
+/// up to `min_timeout_ms` — to merely give up the CPU, use `yield`.
+pub fn sleepMs(ms: u64) void {
+    const w = rt.currentWorker();
+    const f = w.current_fiber.?;
+
+    // The Timeout lives on this fiber's stack; we park immediately and only
+    // resume once it fires, so the heap never sees a dangling pointer. `w` is
+    // captured before park, so it stays the *owning* worker even if we resume
+    // on another after migration — `cancel` is safe cross-thread.
+    var timeout: Timeout = .{ .on_fire = &wakeFiber, .on_fire_ctx = f };
+    w.deadlines.register(&timeout, ms) catch |err| {
+        std.debug.panic("sleepMs: deadline register failed: {}", .{err});
+    };
+    rt.park();
+
+    // Pure sleep: the deadline always fires and `drainExpired` has already
+    // pulled our entry, so this is a no-op on the common path. It also covers
+    // a park that returned for any other reason, removing the stack Timeout
+    // from the owner heap before this frame unwinds.
+    w.deadlines.cancel(&timeout);
+}
+
+fn wakeFiber(ctx: *anyopaque) void {
+    rt.wake(@ptrCast(@alignCast(ctx)));
 }
