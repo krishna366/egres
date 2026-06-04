@@ -19,7 +19,7 @@
 //!   - If the pool is exhausted, further locks silently degrade to
 //!     untracked. lock/unlock still work; they just don't appear in dumps.
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const context = fiber.context;
 
 /// Cap on simultaneously-tracked locks. Sized to a ~512 KiB static

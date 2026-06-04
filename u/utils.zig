@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const builtin = @import("builtin");
 pub const compression = @import("compress.zig");
 pub const hlc = @import("hlc.zig");

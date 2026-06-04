@@ -33,7 +33,7 @@ const Modules = struct {
     raft: *std.Build.Module,              // raft/raft.zig
     zdb: *std.Build.Module,               // zdb.zig
     pgwire: *std.Build.Module,            // pgwire.zig (libpg_query include baked in)
-    fiber: *std.Build.Module,             // fiber/fiber.zig
+    zfiber: *std.Build.Module,            // zfiber/fiber.zig
 };
 
 pub fn build(b: *std.Build) void {
@@ -122,21 +122,21 @@ fn makeModules(
     // The in-tree fiber runtime — what production code spawns/parks on.
     // Wired into every module that used to go through the `runtime` seam.
     const xev = b.dependency("xev", .{ .target = target, .optimize = optimize }).module("xev");
-    const fiber = makeModule(b, target, optimize, "fiber/root.zig");
+    const fiber = makeModule(b, target, optimize, "zfiber/root.zig");
     fiber.addImport("zio", zio);
     fiber.addImport("xev", xev);
 
-    utils.addImport("fiber", fiber);
-    flags.addImport("fiber", fiber);
-    vfs.addImport("fiber", fiber);
+    utils.addImport("zfiber", fiber);
+    flags.addImport("zfiber", fiber);
+    vfs.addImport("zfiber", fiber);
 
     // Wire
     const serial = makeModule(b, target, optimize, "net/serial.zig");
-    serial.addImport("fiber", fiber);
+    serial.addImport("zfiber", fiber);
     serial.addImport("utils", utils);
 
     const transport = makeModule(b, target, optimize, "net/transport.zig");
-    transport.addImport("fiber", fiber);
+    transport.addImport("zfiber", fiber);
     transport.addImport("serial", serial);
     transport.addImport("utils", utils);
 
@@ -152,7 +152,7 @@ fn makeModules(
     raft.addImport("buffers_gen", raft_buffers_gen);
     raft.addImport("zbuf", zbuf);
     raft.addImport("utils", utils);
-    raft.addImport("fiber", fiber);
+    raft.addImport("zfiber", fiber);
     raft.addImport("serial", serial);
     raft.addImport("transport", transport);
     raft.addImport("vfs", vfs);
@@ -161,12 +161,12 @@ fn makeModules(
     const zdb = makeModule(b, target, optimize, "zdb.zig");
     zdb.addImport("zbuf", zbuf);
     zdb.addImport("utils", utils);
-    zdb.addImport("fiber", fiber);
+    zdb.addImport("zfiber", fiber);
     zdb.addImport("vfs", vfs);
     zdb.addImport("metrics", metrics);
 
     const pgwire = makeModule(b, target, optimize, "pgwire.zig");
-    pgwire.addImport("fiber", fiber);
+    pgwire.addImport("zfiber", fiber);
     // pgwire.parser does @cImport("pg_query.h"). Header path lives on the
     // module; the C archive itself is linked per-executable via
     // addLibpgQuerySources.
@@ -186,7 +186,7 @@ fn makeModules(
         .raft = raft,
         .zdb = zdb,
         .pgwire = pgwire,
-        .fiber = fiber,
+        .zfiber = fiber,
     };
 }
 
@@ -419,7 +419,7 @@ fn addAllTests(
     const test_imports = .{
         "zbuf",    "zdb",         "raft",      "utils",  "zio",    "vfs",
         "metrics", "buffers_gen", "transport", "serial", "pgwire",
-        "fiber",
+        "zfiber",
     };
 
     const root_mod = b.createModule(.{
@@ -517,7 +517,7 @@ fn addZdbServer(
     regen_buffers_step: *std.Build.Step,
 ) void {
     const zdb_server_mod = makeModule(b, target, optimize, "zdb-server/server.zig");
-    addImports(zdb_server_mod, mods, .{ "raft", "zdb", "fiber", "metrics", "flags" });
+    addImports(zdb_server_mod, mods, .{ "raft", "zdb", "zfiber", "metrics", "flags" });
 
     const exe = b.addExecutable(.{
         .name = "zdb-server",
@@ -531,7 +531,7 @@ fn addZdbServer(
     exe.root_module.strip = false;
     exe.root_module.omit_frame_pointer = false;
     addVendoredCompressionSources(b, exe);
-    addImports(exe.root_module, mods, .{ "raft", "zdb", "fiber", "metrics", "flags", "utils" });
+    addImports(exe.root_module, mods, .{ "raft", "zdb", "zfiber", "metrics", "flags", "utils" });
     exe.root_module.addImport("zdb_server", zdb_server_mod);
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);
@@ -582,7 +582,7 @@ fn addZioBench(
 
     const zio = b.dependency("zio", .{ .target = target, .optimize = opt }).module("zio");
     const xev = b.dependency("xev", .{ .target = target, .optimize = opt }).module("xev");
-    const fiber = makeModule(b, target, opt, "fiber/root.zig");
+    const fiber = makeModule(b, target, opt, "zfiber/root.zig");
     fiber.addImport("zio", zio);
     fiber.addImport("xev", xev);
 
@@ -591,7 +591,7 @@ fn addZioBench(
         .root_module = makeModule(b, target, opt, "benchmarks/zio_bench.zig"),
     });
     exe.root_module.addImport("zio", zio);
-    exe.root_module.addImport("fiber", fiber);
+    exe.root_module.addImport("zfiber", fiber);
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("bench-zio", "Build the thread/zio/fiber benchmark (always ReleaseFast)");
@@ -747,7 +747,7 @@ fn addPgwireShakeout(
         .name = "pgwire-shakeout",
         .root_module = makeModule(b, target, optimize, "pgwire-shakeout/main.zig"),
     });
-    addImports(exe.root_module, mods, .{ "fiber", "pgwire", "utils" });
+    addImports(exe.root_module, mods, .{ "zfiber", "pgwire", "utils" });
     addLibpgQuerySources(b, exe);
     b.installArtifact(exe);
 

@@ -6,7 +6,7 @@
 //! auth handshake details) without needing a real executor.
 
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
 const utils = @import("utils");
 

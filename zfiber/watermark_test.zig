@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 /// Direct vDSO monotonic ms — accurate elapsed measurement without the
 /// coarse clock's loop-tick lag.

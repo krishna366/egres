@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 /// Fresh monotonic ms — same source `Deadlines.register` / `onTimer`
 /// use. Direct vDSO read; no cache lag under load.

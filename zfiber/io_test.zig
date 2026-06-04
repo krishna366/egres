@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "io.sleep: 100 fibers sleeping 10ms in parallel finish under 50ms" {
     // Atomic: the unlocked default + wake-on-push redirect spreads

@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "fsops: run round-trips an offloaded function's result through park/wake" {
     const Body = struct {

@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 pub const bandwidth = @import("bandwidth.zig");
 

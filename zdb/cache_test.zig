@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const zdb = @import("zdb");
 const Cache = zdb.cache.Cache;
 const ShardedCache = zdb.cache.ShardedCache;

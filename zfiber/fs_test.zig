@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "fs.File: write, sync, stat, read back at offsets" {
     const path = "/tmp/fiber_fs_test_rw";

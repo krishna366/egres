@@ -39,7 +39,7 @@
 //!    and breaks others.
 
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 const conn_state = @import("conn_state.zig");
 const proto = @import("proto.zig");

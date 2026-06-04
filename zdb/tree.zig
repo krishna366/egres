@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const config = @import("config.zig");
 const manifest = @import("manifest.zig");

@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const serial_mod = @import("serial");
 const utils = @import("utils");
 const Serial = serial_mod.Serial;

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
 
 const parser = pgwire.parser_mod;

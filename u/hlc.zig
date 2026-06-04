@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const context = fiber.context;
 
 // Hybrid Logical Clock.

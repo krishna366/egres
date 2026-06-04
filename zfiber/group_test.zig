@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "Group(void): wait synchronizes all fibers" {
     const N = 8;

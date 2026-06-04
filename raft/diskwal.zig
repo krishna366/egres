@@ -4,7 +4,7 @@ const raftlog = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
 const vfs_mod = @import("vfs");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const meta = @import("meta.zig");
 

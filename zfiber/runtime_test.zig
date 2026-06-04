@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "Runtime: 100 fibers each yielding 10 times all finish" {
     const N = 100;

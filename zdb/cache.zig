@@ -20,7 +20,7 @@
 //! For []const u8 keys, the cache takes ownership of the key on put.
 
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 

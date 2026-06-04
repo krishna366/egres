@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "CoarseClock: ms() advances during a parked fiber's sleep" {
     // Measure elapsed via direct vDSO CLOCK_MONOTONIC, not

@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const raftwal_mod = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;

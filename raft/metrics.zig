@@ -1,7 +1,7 @@
 const std = @import("std");
 const m = @import("metrics");
 const utils = @import("utils");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 // Raft-layer metrics. Same lifecycle pattern as zdb/metrics.zig: an
 // application creates a `Metrics` once, library code reaches it via the

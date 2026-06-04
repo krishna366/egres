@@ -1,5 +1,5 @@
 const std = @import("std");
-const heap = @import("fiber").heap;
+const heap = @import("zfiber").heap;
 
 const Item = struct {
     key: i64,

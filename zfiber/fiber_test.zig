@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "Fiber: two fibers, manual drive, both finish" {
     const Body = struct {

@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.serial);

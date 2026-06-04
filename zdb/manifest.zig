@@ -3,7 +3,7 @@ const zen = @import("buffers.gen.zig");
 const Key = @import("key.zig").Key;
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 // -------------------------------------------------------------------------
 // Error set

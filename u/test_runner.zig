@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const context = utils.context;
 
 // 0.16 helpers: std.Thread.Mutex / ResetEvent / time.nanoTimestamp are gone.

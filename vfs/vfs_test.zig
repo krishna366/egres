@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const vfs = @import("vfs");
 const utils = @import("utils");
 const bandwidth = vfs.bandwidth;

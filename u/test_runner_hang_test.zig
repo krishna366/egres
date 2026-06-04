@@ -15,7 +15,7 @@
 //! verify the dump cadence on its own.
 
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "HANG: hangs for 6 minutes (watchdog smoke test)" {
     fiber.sleepMs(6 * 60 * 1000);

@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const vfs = @import("vfs");
 const raft = @import("raft");
 pub const Node = raft.Node;

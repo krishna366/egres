@@ -1,6 +1,6 @@
 const std = @import("std");
 const raft = @import("raft");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const cluster_mod = @import("cluster.zig");
 const zen = raft.buffers;
 

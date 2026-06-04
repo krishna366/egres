@@ -15,7 +15,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const utils = @import("utils");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const bench = utils.bench;
 
 fn benchTrackedMutex(b: *bench.Bench) !void {

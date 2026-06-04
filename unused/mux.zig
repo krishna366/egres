@@ -1,6 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.mux);

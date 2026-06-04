@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 test "Channel: send + receive round-trip" {
     var ch = try fiber.Channel(u32).initAlloc(std.testing.allocator, 4);

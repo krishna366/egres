@@ -1,6 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const linux = std.os.linux;
 
 const BLOCK_SIZE: usize = 4096;

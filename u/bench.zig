@@ -23,7 +23,7 @@
 //! and reports `ns/op` (+ `MiB/s` when `setBytes` was called).
 
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 const context = fiber.context;
 
 inline fn nowNs() i128 {

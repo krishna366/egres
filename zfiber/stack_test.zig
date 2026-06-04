@@ -1,5 +1,5 @@
 const std = @import("std");
-const fiber = @import("fiber");
+const fiber = @import("zfiber");
 
 // Regression guard for fiber stack growth: large frames must grow the stack
 // correctly even when the fiber migrates threads (park/wake) and many fibers
