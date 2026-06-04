@@ -2,6 +2,10 @@
 //! consumers see one flat namespace (`fiber.Fiber`, `fiber.Runtime`,
 //! `fiber.spawn`, …) regardless of which file the symbol lives in.
 
+// The libxev backend the runtime drives (loops, async/eventfd wakes, timers).
+// Re-exported so tools/benches can use the same primitives the scheduler does.
+pub const xev = @import("xev");
+
 // From fiber.zig — the Fiber primitive and its types.
 const fb = @import("fiber.zig");
 
@@ -43,18 +47,28 @@ pub const currentWorkerOrNull = rt.currentWorkerOrNull;
 pub const currentFiber = rt.currentFiber;
 pub const currentFiberOrNull = rt.currentFiberOrNull;
 pub const dumpFibers = rt.dumpFibers;
+pub const dumpWorkerCpu = rt.dumpWorkerCpu;
 pub const tscNsPerCycleQ32 = rt.tscNsPerCycleQ32;
 
 // Lower-level data structure used by `Deadlines`.
 pub const heap = @import("heap.zig");
 
-// Sync primitives built on `park` / `wake`.
+// Sync primitives built on `park` / `wake`. `Mutex`/`RWMutex` are
+// type constructors: `Mutex(.tracked)` records its holder for `dumpLocks`,
+// `Mutex(.untracked)` is the zero-overhead variant.
 const sync = @import("sync.zig");
 pub const WaitQueue = sync.WaitQueue;
+pub const Track = sync.Track;
 pub const Mutex = sync.Mutex;
 pub const Condition = sync.Condition;
 pub const RWMutex = sync.RWMutex;
 pub const Notify = sync.Notify;
+
+// Lock-holder tracking for the tracked Mutex/RWMutex modes — `dumpLocks`
+// answers "which locks are held, by what code?" on a wedged server.
+const lock_registry = @import("lock_registry.zig");
+pub const dumpLocks = lock_registry.dumpLocks;
+pub const trackedLockCount = lock_registry.registeredCount;
 
 const channel_mod = @import("channel.zig");
 pub const Channel = channel_mod.Channel;

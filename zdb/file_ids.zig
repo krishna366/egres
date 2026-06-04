@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const fiber = @import("zfiber");
 
 /// Encoded file_id layout: 16 bits node_id (high) | 48 bits local counter (low).
 /// 48 bits is ~281T ids per node — at 1M ids/sec sustained that's ~9 years,
@@ -76,7 +77,7 @@ pub const FileIds = struct {
     lease_high: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Serializes lease extensions so concurrent allocators bump
     /// HardState exactly once per batch.
-    mu: utils.TrackedMutex = .{},
+    mu: fiber.Mutex(.untracked) = .{},
     node_id: u16 = 0,
     persist_fn: ?PersistFn = null,
     persist_ctx: ?*anyopaque = null,

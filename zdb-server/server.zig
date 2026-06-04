@@ -273,7 +273,7 @@ pub const ZdbServer = struct {
     storage: *StorageImpl,
     snapshot_cfg: *flags.Live(SnapshotCfg),
     listen_addr: fiber.net.IpAddress,
-    in_flight_mu: utils.TrackedMutex = .{},
+    in_flight_mu: fiber.Mutex(.tracked) = .{},
     in_flight: std.ArrayList(InFlight) = .empty,
     /// Monotonic per-call ID for proposeCompaction so we can grep its
     /// per-phase log lines (start/build_done/distribute_done/done) out
@@ -285,7 +285,7 @@ pub const ZdbServer = struct {
     /// fiber. Each fiber reserves its tree before starting work so
     /// two fibers never pick the same tree. Allocated lazily on init;
     /// the deinit code below frees it.
-    compacting_mu: utils.TrackedMutex = .{},
+    compacting_mu: fiber.Mutex(.tracked) = .{},
     compacting_trees: std.AutoHashMap(u64, void) = undefined,
 
     /// Serializes `proposeFlush` and `proposeSplit` end-to-end (build → propose
@@ -298,7 +298,7 @@ pub const ZdbServer = struct {
     /// L0 contents for a split after a flush. Compactions don't take this lock:
     /// they don't touch routes, and same-tree split↔compaction is already
     /// mutex'd via `compacting_trees`.
-    flush_split_mu: utils.TrackedMutex = .{},
+    flush_split_mu: fiber.Mutex(.tracked) = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -321,10 +321,10 @@ pub const ZdbServer = struct {
     }
 
     pub fn deinit(self: *ZdbServer) void {
-        self.in_flight_mu.lockUncancelable(@src());
+        self.in_flight_mu.lock(@src());
         self.in_flight.deinit(self.allocator);
         self.in_flight_mu.unlock();
-        self.compacting_mu.lockUncancelable(@src());
+        self.compacting_mu.lock(@src());
         self.compacting_trees.deinit();
         self.compacting_mu.unlock();
         self.in_flight_mu.deinit();
@@ -338,7 +338,7 @@ pub const ZdbServer = struct {
     /// `defer` in the caller). Race-safe because the candidate selection
     /// and the reservation insert happen under the same mutex.
     fn pickAndReserveCompactionTarget(self: *ZdbServer) ?Forest.CompactionTarget {
-        self.compacting_mu.lockUncancelable(@src());
+        self.compacting_mu.lock(@src());
         defer self.compacting_mu.unlock();
         const target = self.forest.bestCompactionCandidateExcluding(&self.compacting_trees) orelse return null;
         self.compacting_trees.put(target.tree_id, {}) catch return null;
@@ -346,7 +346,7 @@ pub const ZdbServer = struct {
     }
 
     fn releaseCompactingTree(self: *ZdbServer, tree_id: u64) void {
-        self.compacting_mu.lockUncancelable(@src());
+        self.compacting_mu.lock(@src());
         defer self.compacting_mu.unlock();
         _ = self.compacting_trees.remove(tree_id);
     }
@@ -355,13 +355,13 @@ pub const ZdbServer = struct {
     /// Caller is responsible for pairing exactly one `remove` per `add`,
     /// typically via `defer`.
     fn addInFlight(self: *ZdbServer, entry: InFlight) void {
-        self.in_flight_mu.lockUncancelable(@src());
+        self.in_flight_mu.lock(@src());
         defer self.in_flight_mu.unlock();
         self.in_flight.append(self.allocator, entry) catch {};
     }
 
     fn removeInFlight(self: *ZdbServer, kind: InFlight.Kind, tree_id: u64, src_level: u8) void {
-        self.in_flight_mu.lockUncancelable(@src());
+        self.in_flight_mu.lock(@src());
         defer self.in_flight_mu.unlock();
         // Match on (kind, tree_id, src_level) — multiple in-flight entries
         // with the same key would mean two concurrent compactions on the
@@ -473,7 +473,7 @@ pub const ZdbServer = struct {
         while (!self.node.isShuttingDown()) {
             fiber.sleepMs(poll);
             const now_ms = fiber.coarseMs();
-            self.in_flight_mu.lockUncancelable(@src());
+            self.in_flight_mu.lock(@src());
             defer self.in_flight_mu.unlock();
             for (self.in_flight.items) |it| {
                 const age_ms = now_ms - it.started_at_ms;
@@ -798,7 +798,7 @@ pub const ZdbServer = struct {
 
     fn proposeFlush(self: *ZdbServer) !void {
         // Block while a split is in-flight.
-        self.flush_split_mu.lockUncancelable(@src());
+        self.flush_split_mu.lock(@src());
         defer self.flush_split_mu.unlock();
 
         // Track the flush BUILD as in-flight (writing SSTs is the slow
@@ -867,7 +867,7 @@ pub const ZdbServer = struct {
 
     fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
         // Block while a flush is in-flight.
-        self.flush_split_mu.lockUncancelable(@src());
+        self.flush_split_mu.lock(@src());
         defer self.flush_split_mu.unlock();
 
         self.addInFlight(.{ .kind = .split, .tree_id = tree_id, .started_at_ms = fiber.coarseMs() });
@@ -933,8 +933,8 @@ pub const ZdbServer = struct {
         var ops: u64 = 0;
         // One buffered reader per connection — protocol reads (command
         // headers, batch tokens) come from the 256 KiB buffer instead of
-        // hitting io_uring per byte. Buffers heap-allocated because zio
-        // fibers have small stacks.
+        // hitting io_uring per byte. Buffers heap-allocated because fibers
+        // have small stacks.
         const reader_buf = self.allocator.alloc(u8, 256 * 1024) catch return;
         defer self.allocator.free(reader_buf);
         const line_buf = self.allocator.alloc(u8, 64 * 1024) catch return;
@@ -1233,12 +1233,12 @@ pub const ZdbServer = struct {
     }
 
     fn handleLocks(self: *ZdbServer, stream: fiber.net.Stream) !void {
-        // Walks the intrusive registry in u/tracked_mutex.zig and emits one
-        // line per registered mutex. Read while wedged to find the lock /
-        // call site that's blocking everyone.
+        // Walks the tracked-lock registry (zfiber/lock_registry.zig) and emits
+        // one line per held lock: holder @src, hold time, count, waiters. Read
+        // while wedged to find the lock / call site that's blocking everyone.
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
-        try utils.tracked_mutex.dump(&body.writer);
+        try fiber.dumpLocks(&body.writer);
         try body.writer.writeByte('\n');
         try stream.writeAll(body.writer.buffered());
     }
@@ -1449,7 +1449,7 @@ pub const ZdbServer = struct {
     /// compaction loop is starved (not picking up the candidate); a row
     /// that's been "in flight" for many seconds means a build is slow.
     fn writeInFlight(self: *ZdbServer, w: *std.Io.Writer) !void {
-        self.in_flight_mu.lockUncancelable(@src());
+        self.in_flight_mu.lock(@src());
         defer self.in_flight_mu.unlock();
         if (self.in_flight.items.len == 0) {
             try w.print("\n  in-flight: (none)\n", .{});

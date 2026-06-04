@@ -3,6 +3,7 @@ const Key = @import("key.zig").Key;
 const table = @import("table.zig");
 const vfs = @import("vfs");
 const utils = @import("utils");
+const fiber = @import("zfiber");
 
 const Table = table.Table;
 const TableIterator = table.TableIterator;
@@ -108,7 +109,7 @@ pub const TableEntry = struct {
 // ---------------------------------------------------------------------------
 
 pub const Level = struct {
-    mu: utils.TrackedRwLock,
+    mu: fiber.RWMutex(.tracked),
     tables: std.ArrayList(TableEntry),
     total_size: i64, // sum of each table's buf.len
     level: u8,
@@ -138,7 +139,7 @@ pub const Level = struct {
 
     /// initEntries bulk-sets entries, sorts them, and recomputes total_size.
     pub fn initEntries(self: *Level, new_entries: []const TableEntry) !void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         self.tables.clearRetainingCapacity();
@@ -172,7 +173,7 @@ pub const Level = struct {
 
     /// addEntry appends an entry, sorts, and increments the table's ref count.
     pub fn addEntry(self: *Level, id: u64, t: *Table) !void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         try self.tables.append(self.allocator, .{ .id = id, .table = t });
@@ -183,7 +184,7 @@ pub const Level = struct {
 
     /// deleteEntry removes a single entry by id and decrements the removed table's ref.
     pub fn deleteEntry(self: *Level, id: u64) void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         return self.deleteEntriesLocked(&.{.{ .id = id, .table = undefined }});
@@ -213,7 +214,7 @@ pub const Level = struct {
 
     /// replaceEntries is write-locked: deletes del_ids, appends to_add, then sorts.
     pub fn replaceEntries(self: *Level, to_del: []const TableEntry, to_add: []const TableEntry) !void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         self.deleteEntriesLocked(to_del);
@@ -232,7 +233,7 @@ pub const Level = struct {
     /// range overlaps kr. The caller must free the slice when done.
     /// L0: always all tables; L≥1: binary search on both ends.
     pub fn overlappingTables(self: *Level, allocator: std.mem.Allocator, kr: KeyRange) ![]TableEntry {
-        self.mu.lockSharedUncancelable(@src());
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
 
         const items = self.tables.items;
@@ -267,13 +268,13 @@ pub const Level = struct {
     }
 
     pub fn getTotalSize(self: *Level) i64 {
-        self.mu.lockSharedUncancelable(@src());
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.total_size;
     }
 
     pub fn numTables(self: *Level) usize {
-        self.mu.lockSharedUncancelable(@src());
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.tables.items.len;
     }
@@ -286,7 +287,7 @@ pub const Level = struct {
     /// L≥1: binary search for the one table that could contain the key.
     pub fn get(self: *Level, search_key: Key, priority: vfs.Priority) Error!?Item {
         if (self.level == 0) {
-            self.mu.lockSharedUncancelable(@src());
+            self.mu.lockShared(@src());
             defer self.mu.unlockShared();
 
             var ri: usize = self.tables.items.len;
@@ -305,7 +306,7 @@ pub const Level = struct {
             }
             return null;
         } else {
-            self.mu.lockSharedUncancelable(@src());
+            self.mu.lockShared(@src());
             defer self.mu.unlockShared();
 
             // First table whose biggest key >= search_key.

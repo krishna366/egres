@@ -413,7 +413,7 @@ fn runRaft(r: *raft.RaftRuntime) void {
 }
 
 /// Spawn the client TCP accept loop on the query runtime pool.
-/// Must be called from a zio coroutine. Blocks until cancelled.
+/// Must be called from a fiber coroutine. Blocks until cancelled.
 fn runServer(s: *zdb_server.ZdbServer) void {
     var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runClientLoop, .{s}) catch |err| {
         log.err("runServer err: {}", .{err});
@@ -424,7 +424,7 @@ fn runServer(s: *zdb_server.ZdbServer) void {
 
 /// Spawn the snapshot loop on the background runtime pool. Leader-only loop
 /// that polls WAL size/age and proposes snapshots through Raft.
-/// Must be called from a zio coroutine. Blocks until cancelled.
+/// Must be called from a fiber coroutine. Blocks until cancelled.
 fn runSnapshot(s: *zdb_server.ZdbServer) void {
     var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runSnapshotLoop, .{s}) catch |err| {
         log.err("runSnapshot err: {}", .{err});
@@ -434,7 +434,7 @@ fn runSnapshot(s: *zdb_server.ZdbServer) void {
 }
 
 /// Spawn the compaction loop on the background runtime pool.
-/// Must be called from a zio coroutine. Blocks until cancelled.
+/// Must be called from a fiber coroutine. Blocks until cancelled.
 fn runCompaction(s: *zdb_server.ZdbServer) void {
     var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runCompactionLoop, .{s}) catch |err| {
         log.err("runCompaction err: {}", .{err});

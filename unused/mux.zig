@@ -112,13 +112,13 @@ pub const Mux = struct {
 
     allocator: Allocator,
     tcp_stream: zio.net.Stream,
-    writer_mu: utils.TrackedMutex,
+    writer_mu: fiber.Mutex(.tracked),
     streams: std.AutoHashMap(u32, *Stream),
     next_stream_id: std.atomic.Value(u32),
     on_stream: *const fn (*Stream) void,
     group: fiber.Group(void),
     closed: bool,
-    mu: utils.TrackedMutex,
+    mu: fiber.Mutex(.tracked),
 
     pub fn init(
         allocator: Allocator,
@@ -159,7 +159,7 @@ pub const Mux = struct {
     }
 
     pub fn closeConn(self: *Mux) void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         self.mu.unlock();
 
         if (self.closed) return;
@@ -297,7 +297,7 @@ pub const Mux = struct {
     }
 
     fn closeChannels(self: *Mux) void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         var it = self.streams.valueIterator();
@@ -307,7 +307,7 @@ pub const Mux = struct {
     }
 
     fn destroyStreams(self: *Mux) void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         var it = self.streams.valueIterator();

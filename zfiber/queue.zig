@@ -91,6 +91,13 @@ pub const RemoteQueue = struct {
         }
         return fifo;
     }
+
+    /// Load-only emptiness peek — no swap, so it never dirties the cache
+    /// line. Lets the home worker cheaply skip `drainFifo` when no peer has
+    /// pushed: the head load stays a cache-hit until a `push` writes it.
+    pub fn isEmpty(self: *const RemoteQueue) bool {
+        return self.head.load(.acquire) == null;
+    }
 };
 
 /// Largest worker count we support; bounds the idle bitmap. Worker ids

@@ -6,7 +6,7 @@ const context = utils.context;
 // 0.16 helpers: std.Thread.Mutex / ResetEvent / time.nanoTimestamp are gone.
 // These wrap std.Io.Mutex / Event / Timestamp using the process-wide `io`.
 // Critical sections in this file are short / CPU-only, so the wrappers are
-// safe to call from both zio fibers and the watchdog std.Thread.
+// safe to call from both fibers and the watchdog std.Thread.
 inline fn ioOf() std.Io {
     return context.g().io;
 }
@@ -87,7 +87,7 @@ const bench = utils.bench;
 //   • Visible names + timings on every line — no IPC dance:
 //       [142/178]  zdb.cache_test    Cache basic put/get round-trip ... OK (5ms)
 //
-//   • Concurrent execution via zio fibers gated by a semaphore (default
+//   • Concurrent execution via fibers gated by a semaphore (default
 //     max(2, cpu_count/2)). On a 32-core box the suite drops from ~60s
 //     serial to ~8s with default parallelism.
 //
@@ -96,7 +96,7 @@ const bench = utils.bench;
 //     New test files are picked up without touching build.zig.
 //
 //   • Per-fiber log capture. `std.log` calls are routed to a per-task
-//     buffer (looked up via `zio.getCurrentTaskOrNull`) and printed
+//     buffer (looked up via `fiber.currentFiberOrNull`) and printed
 //     indented under each test's status line — concurrent output stops
 //     interleaving.
 //
@@ -247,9 +247,9 @@ const Counters = struct {
 // Per-fiber std.log capture (Option A).
 //
 // std.options.logFn intercepts every `std.log.info(...)` etc. call. We look
-// up the running zio task and write into a buffer registered under that
-// task. The runner then prints the captured lines indented under each
-// test's status. logs from contexts without a registered buffer (zio
+// up the running fiber and write into a buffer registered under that
+// fiber. The runner then prints the captured lines indented under each
+// test's status. logs from contexts without a registered buffer (runtime
 // internals, runner setup) fall through to the default stderr writer.
 // ---------------------------------------------------------------------------
 
@@ -260,10 +260,10 @@ const FiberLog = struct {
     const max_size: usize = 1 * 1024 * 1024; // 1 MiB cap per test
 };
 
-// Map keyed on the `*AnyTask` pointer (cast to usize for AutoHashMap).
-// Multi-threaded: zio executors live on separate OS threads and call into
-// logFn from any of them. std.Thread.Mutex (not zio.Mutex) because logFn
-// must work in any context, including when zio's scheduler is mid-handoff.
+// Map keyed on the current `*Fiber` pointer (cast to usize for AutoHashMap).
+// Multi-threaded: fiber workers live on separate OS threads and call into
+// logFn from any of them. A std.Io.Mutex (not a fiber.Mutex) because logFn
+// must work in any context, including when the scheduler is mid-handoff.
 var log_map_mu: std.Io.Mutex = .init;
 var log_map: ?std.AutoHashMap(usize, *FiberLog) = null;
 
@@ -477,8 +477,8 @@ const RunningSet = struct {
 
 /// Format into `buf` and write to stderr (fd 2) via the raw Linux
 /// write syscall — bypasses std.Io entirely. Used by the watchdog
-/// so its dumps land even when zio itself is wedged (the previous
-/// File.stderr().writer path would have blocked on zio's io).
+/// so its dumps land even when the runtime itself is wedged (the previous
+/// File.stderr().writer path would have blocked on the runtime's io).
 /// Truncates silently if the formatted string exceeds the buffer
 /// or the syscall returns an error.
 fn rawStderrWriteAll(bytes: []const u8) void {
@@ -497,7 +497,7 @@ fn rawStderrPrint(buf: []u8, comptime fmt: []const u8, args: anytype) void {
     rawStderrWriteAll(formatted);
 }
 
-/// std.Thread-based watchdog. Runs OUTSIDE the zio runtime, so it stays
+/// std.Thread-based watchdog. Runs OUTSIDE the fiber runtime, so it stays
 /// alive — and capable of dumping diagnostics — even when the runtime is
 /// mid-deinit (which is where a 64-hour wedge was observed). Operation:
 ///
@@ -575,10 +575,10 @@ const ThreadWatchdog = struct {
 /// the Zig backend bug "genSetReg called with a value larger than dst_reg"
 /// when it monomorphizes a method through `spawn(.{}, fn_ptr, ...)`.
 fn threadWatchdogLoop(self: *ThreadWatchdog) void {
-    // Write diagnostics straight to stderr (bypassing the zio-aware
+    // Write diagnostics straight to stderr (bypassing the fiber-aware
     // print_mu and io_writer). The runtime may be wedged; the print
     // mutex itself may be the deadlocked lock. Using stderr directly
-    // keeps the watchdog independent of any zio state.
+    // keeps the watchdog independent of any runtime state.
     // Wake every 1s regardless of the stuck threshold so the first dump
     // lands within ~1s of the threshold (instead of up to 2× threshold).
     // The threshold below still controls WHEN we declare "stuck"; tick
@@ -641,7 +641,7 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
 
         // Raw stderr via std.posix.write(2, …). The previous version
         // used `File.stderr().writer(ioOf(), &buf)` which goes through
-        // the zio-backed io; if zio itself is wedged (the very case we
+        // the fiber-backed io; if the runtime itself is wedged (the very case we
         // need to diagnose) that writer's flush blocks and the dump
         // never reaches the user. POSIX write bypasses io entirely.
         var line_buf: [1024]u8 = undefined;
@@ -669,7 +669,7 @@ fn threadWatchdogLoop(self: *ThreadWatchdog) void {
         // TrackedMutex dump (same buffered-then-raw-write pattern).
         rawStderrPrint(&line_buf, "TrackedMutex state:\n", .{});
         dump_writer.clearRetainingCapacity();
-        utils.tracked_mutex.dump(&dump_writer.writer) catch {};
+        fiber.dumpLocks(&dump_writer.writer) catch {};
         rawStderrWriteAll(dump_writer.written());
         rawStderrPrint(&line_buf, "\n", .{});
 
@@ -755,13 +755,14 @@ fn writeDisplayName(out: *std.Io.Writer, tty: Tty, name: []const u8) void {
     out.writeAll(split.test_name) catch {};
 }
 
-// ── Phase B: fiber.* tests on a fiber.Runtime ────────────────────────
+// ── Test execution: every test runs as a fiber on the fiber.Runtime ──
 //
-// `fiber.*` tests run as fibers on a dedicated fiber.Runtime — disjoint
-// from zio.  No cross-runtime sync: Phase B runs serially after Phase A
-// drains, so the output writer / counters have a single owner at a
-// time.  fiber tests use `fiber.runtime()` to access the shared
-// runtime + `Group.wait()` / `JoinHandle.join()` for sub-fiber sync.
+// All tests run as fibers on the one in-tree `fiber.Runtime` (see `main`).
+// `fiberDriver` dispatches test bodies with bounded concurrency; the
+// parallel round and the serial retry round don't overlap, so the output
+// writer / counters have a single owner at a time. Tests use
+// `fiber.runtime()` to reach the shared runtime + `Group.wait()` /
+// `JoinHandle.join()` for sub-fiber sync.
 
 const FiberCtx = struct {
     // Counters target for the current round. Parallel round writes to
@@ -770,10 +771,10 @@ const FiberCtx = struct {
     retry_counters: *Counters,
     // Filled by the parallel round. The serial round drains it.
     failures: *std.ArrayList(std.builtin.TestFn),
-    failures_mu: fiber.Mutex = .{},
+    failures_mu: fiber.Mutex(.untracked) = .{},
     // true while the serial retry round is active.
     is_retry: bool = false,
-    print_mu: fiber.Mutex = .{},
+    print_mu: fiber.Mutex(.untracked) = .{},
     seq: std.atomic.Value(u32) = .{ .raw = 0 },
     total: u32 = 0,
     out: *std.Io.Writer,
@@ -854,13 +855,13 @@ fn fiberDriver(fctx: *FiberCtx) void {
     }
 
     // ── Serial retry round ────────────────────────────────────────
-    // Mirrors zioDriver's retry path: re-run any parallel-round
+    // Mirrors fiberDriver's retry path: re-run any parallel-round
     // failures one at a time, writing into retry_counters so flaky
     // tests (failed parallel, passed serial) don't count as failures
     // in the final summary.
     if (fctx.failures.items.len == 0) return;
 
-    fctx.print_mu.lock();
+    fctx.print_mu.lock(@src());
     fctx.out.writeAll("\n") catch {};
     writeColored(fctx.out, fctx.tty, .bright_yellow, "Retrying {d} failed fiber test(s) serially...\n", .{fctx.failures.items.len});
     fctx.out.flush() catch {};
@@ -904,7 +905,7 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
     // Optional STARTING log (--verbose) — useful for diagnosing wedges so the
     // run shows which test entered its body but never finished.
     if (verbose_start) {
-        fctx.print_mu.lock();
+        fctx.print_mu.lock(@src());
         fctx.out.print("  >> STARTING {s}\n", .{t.name}) catch {};
         fctx.out.flush() catch {};
         fctx.print_mu.unlock();
@@ -943,7 +944,7 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
     const target_counters = if (fctx.is_retry) fctx.retry_counters else fctx.counters;
     const seq = fctx.seq.fetchAdd(1, .seq_cst) + 1;
 
-    fctx.print_mu.lock();
+    fctx.print_mu.lock(@src());
     defer fctx.print_mu.unlock();
 
     var prefix_buf: [32]u8 = undefined;
@@ -967,7 +968,7 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
             // Parallel-round failures get queued for the serial
             // retry; failures during retry are final.
             if (!fctx.is_retry) {
-                fctx.failures_mu.lock();
+                fctx.failures_mu.lock(@src());
                 defer fctx.failures_mu.unlock();
                 fctx.failures.append(std.heap.page_allocator, t) catch {};
             }
@@ -1055,7 +1056,7 @@ fn runFiberBench(t: std.builtin.TestFn, fctx: *FiberCtx) void {
 
     const seq = fctx.seq.fetchAdd(1, .seq_cst) + 1;
 
-    fctx.print_mu.lock();
+    fctx.print_mu.lock(@src());
     defer fctx.print_mu.unlock();
 
     var prefix_buf: [32]u8 = undefined;
@@ -1172,7 +1173,7 @@ pub fn main(init: std.process.Init) !void {
     bench.initRegistry(std.heap.page_allocator);
     defer bench.deinitRegistry();
 
-    // std.Thread watchdog: runs outside the zio runtime so it stays alive
+    // std.Thread watchdog: runs outside the fiber runtime so it stays alive
     // (and dumping) even when the runtime itself is mid-deinit. Defaults
     // are aggressive (20s dump-and-tick, 300s kill) — most tests finish
     // in <1s so a 20s gap already means something's stuck. Override per
@@ -1255,7 +1256,23 @@ pub fn main(init: std.process.Init) !void {
     }
     const total_s = @as(f64, @floatFromInt(total_ms)) / 1000.0;
     writeColored(out, tty, .dim, " in {d:.1}s (parallel={d})\n", .{ total_s, args.parallel });
+
+    // Per-worker CPU distribution — eyeball how evenly the scheduler spread
+    // test fibers across the worker pool.
+    fiber.dumpWorkerCpu(out) catch {};
+
+    // Tracked-lock leak check. In this binary every `.tracked` lock is
+    // transient and must `deinit()` (which unregisters it). By here every test
+    // fiber has finished and run its defers, so a non-zero count means some
+    // tracked lock was acquired but never deinit'd — a real bug that would
+    // dangle the lock registry. We count rather than walk: a leaked lock's
+    // node memory may already be freed.
+    const leaked_locks = fiber.trackedLockCount();
+    if (leaked_locks > 0) {
+        writeColored(out, tty, .bright_red, "\n{d} tracked lock(s) never deinit'd", .{leaked_locks});
+        out.writeAll(" — missing `mu.deinit()`; would dangle the lock registry\n") catch {};
+    }
     out.flush() catch {};
 
-    if (eff_failed > 0) std.process.exit(1);
+    if (eff_failed > 0 or leaked_locks > 0) std.process.exit(1);
 }

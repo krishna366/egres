@@ -27,7 +27,7 @@ pub const RaftRuntime = struct {
         self.node.deinitTransport();
     }
 
-    /// Main entry point. Must be called inside a zio coroutine.
+    /// Main entry point. Must be called inside a fiber coroutine.
     /// Initializes transport, starts peer connections, and runs concurrent
     /// coroutines for ticking, raft processing, and commit callbacks.
     /// Returns when node.isShuttingDown() or cancelled.
@@ -43,7 +43,7 @@ pub const RaftRuntime = struct {
 // -- requestJoin: client-side join protocol over mux --
 
 /// Join a cluster by connecting to the leader. Must be called from
-/// within a zio coroutine.
+/// within a fiber coroutine.
 pub fn requestJoin(
     allocator: std.mem.Allocator,
     leader_addr: []const u8,
@@ -85,7 +85,7 @@ pub fn requestJoin(
 }
 
 /// Try seeds in order, follow NOT_LEADER redirects, retry with backoff.
-/// Must be called from a zio coroutine.
+/// Must be called from a fiber coroutine.
 pub fn joinCluster(
     allocator: std.mem.Allocator,
     seeds: []const []const u8,

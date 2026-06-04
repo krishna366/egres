@@ -1,4 +1,4 @@
-//! Layer 2: zio-backed I/O driver for the pgwire state machine.
+//! Layer 2: fiber-backed I/O driver for the pgwire state machine.
 //!
 //! This is the *only* file in pgwire that is allowed to know about
 //! sockets — proto.zig / conn_state.zig / parser.zig must remain pure.
@@ -9,7 +9,7 @@
 //!         const stream = try server.accept();
 //!         try group.spawn(handle, .{ stream });
 //!     }
-//!     fn handle(stream: zio.net.Stream) !void {
+//!     fn handle(stream: fiber.net.Stream) !void {
 //!         defer stream.close();
 //!         var h = MyHandler{};
 //!         try pgwire.serve(allocator, &stream, &h, .{});
@@ -70,7 +70,7 @@ pub fn serve(
     handler: anytype,
     opts: Options,
 ) !void {
-    // Heap-allocated buffers — zio fibers have small stacks, so we
+    // Heap-allocated buffers — fibers have small stacks, so we
     // never put multi-KiB buffers on the stack here. (See
     // feedback_no_stack_buffers in the project memory.)
     const read_buf = try alloc.alloc(u8, opts.read_chunk);

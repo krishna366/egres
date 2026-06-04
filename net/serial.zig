@@ -28,7 +28,7 @@ pub const Serial = struct {
 
     allocator: Allocator,
     tcp_stream: fiber.net.Stream,
-    writer_mu: utils.TrackedMutex,
+    writer_mu: fiber.Mutex(.tracked),
     write_buf: []u8,
     read_buf: []u8,
     buf_reader: fiber.net.Stream.Reader,

@@ -417,7 +417,7 @@ pub fn ShardedCache(comptime K: type) type {
 
         const Shard = struct {
             cache: Cache(K),
-            lock: fiber.RWMutex,
+            lock: fiber.RWMutex(.untracked),
         };
 
         allocator: Allocator,
@@ -439,7 +439,10 @@ pub fn ShardedCache(comptime K: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.shards) |*s| s.cache.deinit();
+            for (self.shards) |*s| {
+                s.cache.deinit();
+                s.lock.deinit(); // no-op while shards are .untracked
+            }
             self.allocator.free(self.shards);
         }
 
@@ -449,7 +452,7 @@ pub fn ShardedCache(comptime K: type) type {
 
         pub fn get(self: *Self, key: K) ?*Value {
             const s = self.pickShard(key);
-            s.lock.lockShared();
+            s.lock.lockShared(@src());
             defer s.lock.unlockShared();
             return s.cache.get(key);
         }
@@ -457,7 +460,7 @@ pub fn ShardedCache(comptime K: type) type {
         /// See `Cache.put` for ownership semantics.
         pub fn put(self: *Self, key: K, val: *Value) !void {
             const s = self.pickShard(key);
-            s.lock.lock();
+            s.lock.lock(@src());
             defer s.lock.unlock();
             return s.cache.put(key, val);
         }
@@ -466,7 +469,7 @@ pub fn ShardedCache(comptime K: type) type {
         pub fn count(self: *Self) usize {
             var total: usize = 0;
             for (self.shards) |*s| {
-                s.lock.lockShared();
+                s.lock.lockShared(@src());
                 defer s.lock.unlockShared();
                 total += s.cache.count();
             }
@@ -477,7 +480,7 @@ pub fn ShardedCache(comptime K: type) type {
         pub fn byteSize(self: *Self) usize {
             var total: usize = 0;
             for (self.shards) |*s| {
-                s.lock.lockShared();
+                s.lock.lockShared(@src());
                 defer s.lock.unlockShared();
                 total += s.cache.byteSize();
             }
@@ -489,4 +492,3 @@ pub fn ShardedCache(comptime K: type) type {
 // Tests live in zdb/cache_test.zig. They access the cache module by name
 // (`@import("zdb").cache`) so cache.zig stays purely in the zdb module's
 // file tree without being claimed by the unified test binary.
-

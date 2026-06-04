@@ -396,7 +396,7 @@ pub const Node = struct {
         self.allocator.destroy(self);
     }
 
-    /// Create and start the transport. Must be called inside a zio coroutine.
+    /// Create and start the transport. Must be called inside a fiber coroutine.
     pub fn initTransport(self: *Node) !void {
         const tr = try self.allocator.create(Transport);
         tr.* = try Transport.init(self.allocator, .{

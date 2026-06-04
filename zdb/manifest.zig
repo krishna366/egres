@@ -36,7 +36,7 @@ pub const TreeState = struct {
 pub const ForestState = struct {
     allocator: std.mem.Allocator,
     trees: std.AutoHashMap(u64, TreeState),
-    mu: fiber.Mutex = .{},
+    mu: fiber.Mutex(.untracked) = .{},
 
     pub fn init(allocator: std.mem.Allocator) ForestState {
         return .{
@@ -114,7 +114,7 @@ pub const ForestState = struct {
     ) !void {
         if (table_changes.len == 0 and tree_changes.len == 0) return;
 
-        self.mu.lock();
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         for (tree_changes) |tc| try self.applyTreeChange(tc);

@@ -1,4 +1,4 @@
-//! Protocol-layer tests. NO zio, NO sockets — every byte goes through
+//! Protocol-layer tests. NO runtime, NO sockets — every byte goes through
 //! a memory buffer.
 //!
 //! Goldens are hand-crafted from the documented Postgres v3 wire

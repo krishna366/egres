@@ -246,7 +246,7 @@ pub const MetaStore = struct {
     /// The slot is a zbuf frame `[u64 hash | u32 len | HardState payload]`
     /// followed by zero padding to fill the 4 KiB slot.
     fn writeSlot(self: *MetaStore, hs: zen.HardStateStruct, slot_idx: u8) !void {
-        // Page-aligned heap buffer (zio fibers have small stacks; we don't
+        // Page-aligned heap buffer (fibers have small stacks; we don't
         // put 4 KiB on the stack). The alignment is forward-compat for a
         // possible later O_DIRECT switch.
         const page = try self.allocator.alignedAlloc(u8, vfs.page_alignment, slot_size);

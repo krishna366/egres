@@ -276,7 +276,7 @@ fn runRaftRuntime(t: *raft.RaftRuntime) void {
     t.run() catch {};
 }
 
-// ---- Transport tests (zio-based) ----
+// ---- Transport tests (fiber-based) ----
 
 pub fn testTransportStartsAndStopsCleanly() !void {
     var cfg = defaultConfig();

@@ -157,20 +157,18 @@ pub const Worker = struct {
     thread: ?std.Thread = null,
 
     pub fn init(w: *Worker, id: u8, allocator: std.mem.Allocator) !void {
-        w.id = id;
-        w.lane_idx = 0; // real value assigned in Runtime.init
-        w.loop = try xev.Loop.init(.{});
+        // Construct via a struct literal so every field with a declared
+        // default actually gets it.
+        w.* = .{
+            .id = id,
+            .loop = try xev.Loop.init(.{}),
+            .wake_async = undefined,
+            .deadlines = undefined,
+        };
         errdefer w.loop.deinit();
         w.wake_async = try xev.Async.init();
         errdefer w.wake_async.deinit();
         w.deadlines = try Deadlines.init(&w.loop, allocator);
-        w.current_fiber = null;
-        w.last_pump_ticks = 0;
-        w.last_coarse_clock_ticks = 0;
-        w.ready = @splat(.{});
-        w.remote_queue = .{};
-        w.wake_completion = undefined;
-        w.thread = null;
     }
 
     pub fn deinit(self: *Worker) void {
@@ -278,6 +276,20 @@ pub const Worker = struct {
 
     fn clearIdle(self: *Worker) void {
         runtime().idle[self.lane_idx].clearIdle(self.laneOffset());
+    }
+
+    /// Cross-thread wake: issue the `wake_async` notify (an eventfd write —
+    /// a syscall) ONLY if this worker is parked. A busy worker drains its
+    /// remote queue every loop pass, so it picks up the just-pushed fiber
+    /// without the syscall. The caller MUST `remote_queue.push` (a LOCKed
+    /// RMW) BEFORE calling this: that push is a full StoreLoad barrier on x86
+    /// ordered before the `isIdle` acquire-load here, and a parking worker
+    /// `markIdle`s before its pre-block `drainRemote`, so the two sides can't
+    /// both miss (Dekker double-check; same protocol the normal-priority path
+    /// relies on).
+    inline fn notifyIfParked(self: *Worker) void {
+        if (runtime().idle[self.lane_idx].isIdle(self.laneOffset()))
+            self.wake_async.notify() catch {};
     }
 
     /// Step one fiber, then handle completion (wake any parked joiner)
@@ -394,6 +406,17 @@ pub const Worker = struct {
                 clock.update();
                 self.last_coarse_clock_ticks = enter;
             }
+
+            // Drain cross-thread (high-priority) arrivals into our local ring
+            // every pass — even while busy. This is even more important
+            // considering the high priority fibers would be the ones getting
+            // pushed to remote queue, because they're tied to workers and
+            // don't move around.
+            //
+            // The `isEmpty` load is a plain cache-hit until a
+            // peer's `push` dirties the line, so it's ~free when no wake is
+            // pending; the cost tracks push frequency, not pass frequency.
+            if (!self.remote_queue.isEmpty()) self.drainRemote();
 
             if (self.popNextReady()) |f| {
                 self.runFiber(f);
@@ -701,7 +724,7 @@ pub const Runtime = struct {
     /// after worker 0 returns.
     pub fn run(self: *Runtime) void {
         for (self.workers[1..]) |*w| {
-            w.thread = std.Thread.spawn(.{}, workerEntry, .{w}) catch |err| {
+            w.thread = std.Thread.spawn(.{}, Worker.run, .{w}) catch |err| {
                 std.debug.panic("worker thread spawn failed: {}", .{err});
             };
         }
@@ -735,10 +758,6 @@ pub const Runtime = struct {
     }
 };
 
-fn workerEntry(w: *Worker) void {
-    w.run();
-}
-
 /// Route a ready fiber to a queue. Shared by `spawn` and `wake`.
 ///
 ///   - High priority is pinned: it goes to its home worker — directly to
@@ -755,8 +774,10 @@ fn routeReady(rt: *Runtime, f: *Fiber) void {
             if (currentWorkerOrNull() == home) {
                 home.scheduleLocal(f);
             } else {
+                // Push, then wake only if `home` is parked — order matters for
+                // the wakeup race (see `notifyIfParked`).
                 home.remote_queue.push(f);
-                home.wake_async.notify() catch {};
+                home.notifyIfParked();
             }
         },
         .normal => {
@@ -976,6 +997,43 @@ pub fn currentFiber() *Fiber {
 pub fn currentFiberOrNull() ?*Fiber {
     const w = currentWorkerOrNull() orelse return null;
     return w.current_fiber;
+}
+
+/// Write a per-worker CPU-time distribution: each worker's `cpu_total_ns`
+/// (the cumulative fiber-execution time charged to it) in ms, with a `#` bar,
+/// followed by total / min / max / avg and a max/avg imbalance ratio (1.0 ==
+/// perfectly even, higher == work piled onto one worker). Plain text — safe to
+/// drop into logs, an admin dump, or the test-runner summary. `cpu_total_ns` is
+/// read racily; fine for a coarse balance gauge.
+pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
+    const workers = runtime().workers;
+    var total_ns: u64 = 0;
+    var max_ns: u64 = 0;
+    var min_ns: u64 = std.math.maxInt(u64);
+    for (workers) |*w| {
+        total_ns +%= w.cpu_total_ns;
+        max_ns = @max(max_ns, w.cpu_total_ns);
+        min_ns = @min(min_ns, w.cpu_total_ns);
+    }
+    try writer.print("worker CPU ({d} workers):\n", .{workers.len});
+    for (workers) |*w| {
+        var bar: [24]u8 = undefined;
+        const bar_w: usize = if (max_ns == 0) 0 else @intCast((w.cpu_total_ns *| 24) / max_ns);
+        @memset(bar[0..bar_w], '#');
+        try writer.print("  W{d:>2} lane={d} {d:>6} ms  {s}\n", .{
+            w.id, w.lane_idx, @divTrunc(w.cpu_total_ns, std.time.ns_per_ms), bar[0..bar_w],
+        });
+    }
+    const avg_ns = if (workers.len > 0) total_ns / workers.len else 0;
+    // max/avg: 1.0 == perfectly balanced, higher == one worker hogged more.
+    const imbalance: f64 = if (avg_ns == 0) 0 else @as(f64, @floatFromInt(max_ns)) / @as(f64, @floatFromInt(avg_ns));
+    try writer.print("  total={d}ms min={d} max={d} avg={d} (max/avg={d:.2})\n", .{
+        @divTrunc(total_ns, std.time.ns_per_ms),
+        @divTrunc(if (min_ns == std.math.maxInt(u64)) 0 else min_ns, std.time.ns_per_ms),
+        @divTrunc(max_ns, std.time.ns_per_ms),
+        @divTrunc(avg_ns, std.time.ns_per_ms),
+        imbalance,
+    });
 }
 
 pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {

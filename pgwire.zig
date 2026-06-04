@@ -2,8 +2,8 @@
 //!
 //! Layered structure:
 //!   - proto / conn_state / parser / types: pure logic, no I/O. Do
-//!     not import zio in any of them.
-//!   - driver: the only place sockets / zio / syscalls appear.
+//!     not import the fiber runtime in any of them.
+//!   - driver: the only place sockets / fiber / syscalls appear.
 //!
 //! See pgwire/README.md for usage.
 
@@ -22,7 +22,7 @@ pub const Options = driver_mod.Options;
 pub const Stream = driver_mod.Stream;
 
 // State machine — exposed for callers that want to drive pgwire from
-// somewhere other than zio.net.Stream (e.g. tests, alternate runtimes).
+// somewhere other than fiber.net.Stream (e.g. tests, alternate runtimes).
 pub const ConnState = conn_state.ConnState;
 pub const Config = conn_state.Config;
 pub const Event = conn_state.Event;

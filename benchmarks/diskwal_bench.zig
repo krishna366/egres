@@ -16,7 +16,6 @@
 //     to the framework if you need them — see u/bench.zig + test_runner.zig.
 
 const std = @import("std");
-const zio = @import("zio");
 const raft = @import("raft");
 const vfs = @import("vfs");
 const utils = @import("utils");

@@ -63,7 +63,7 @@ pub const Transport = struct {
     allocator: Allocator,
     cfg: Config,
     listen_addr: fiber.net.IpAddress,
-    mu: utils.TrackedMutex,
+    mu: fiber.Mutex(.tracked),
     peers: std.AutoHashMap(u64, *PeerSlot),
     group: fiber.Group(void),
     listener: ?fiber.net.Server,
@@ -178,7 +178,7 @@ pub const Transport = struct {
     }
 
     /// Start the server. Spawns accept and dial coroutines.
-    /// Non-blocking — returns immediately. Must be called inside zio runtime.
+    /// Non-blocking — returns immediately. Must be called inside fiber runtime.
     pub fn run(self: *Transport) !void {
         if (self.listener == null) {
             self.listener = self.listen_addr.listen(.{ .reuse_address = true }) catch |err| {

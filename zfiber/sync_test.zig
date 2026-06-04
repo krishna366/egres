@@ -2,13 +2,13 @@ const std = @import("std");
 const fiber = @import("zfiber");
 
 test "Mutex: uncontended lock/unlock cycles correctly" {
-    var mu: fiber.Mutex = .{};
+    var mu: fiber.Mutex(.untracked) = .{};
     var counter: u32 = 0;
 
     const Body = struct {
-        fn run(m: *fiber.Mutex, c: *u32) void {
+        fn run(m: *fiber.Mutex(.untracked), c: *u32) void {
             for (0..100) |_| {
-                m.lock();
+                m.lock(@src());
                 c.* += 1;
                 m.unlock();
             }
@@ -22,13 +22,13 @@ test "Mutex: uncontended lock/unlock cycles correctly" {
 }
 
 test "Mutex: 10 fibers each incrementing 1000 times under lock" {
-    var mu: fiber.Mutex = .{};
+    var mu: fiber.Mutex(.untracked) = .{};
     var counter: u32 = 0;
 
     const Body = struct {
-        fn run(m: *fiber.Mutex, c: *u32) void {
+        fn run(m: *fiber.Mutex(.untracked), c: *u32) void {
             for (0..1000) |_| {
-                m.lock();
+                m.lock(@src());
                 c.* += 1;
                 m.unlock();
                 fiber.yield();
@@ -46,7 +46,7 @@ test "Mutex: 10 fibers each incrementing 1000 times under lock" {
 }
 
 test "Mutex: hand-off preserves FIFO order under contention" {
-    var mu: fiber.Mutex = .{};
+    var mu: fiber.Mutex(.untracked) = .{};
 
     // attempt[i] = id of the fiber that was the i-th to call mu.lock().
     // actual[i] = id of the fiber that was the i-th to be granted the
@@ -58,7 +58,7 @@ test "Mutex: hand-off preserves FIFO order under contention" {
     var acquired_idx: std.atomic.Value(usize) = .init(0);
 
     const Ctx = struct {
-        mu: *fiber.Mutex,
+        mu: *fiber.Mutex(.untracked),
         attempt: *[4]u8,
         actual: *[4]u8,
         attempt_idx: *std.atomic.Value(usize),
@@ -76,7 +76,7 @@ test "Mutex: hand-off preserves FIFO order under contention" {
             // attempt index matches the order we enter mu's queue.
             const my_attempt = c.attempt_idx.fetchAdd(1, .acq_rel);
             c.attempt[my_attempt] = c.id;
-            c.mu.lock();
+            c.mu.lock(@src());
             // Stamp our place in the grant order just after wake-up.
             const my_acquired = c.acquired_idx.fetchAdd(1, .acq_rel);
             c.actual[my_acquired] = c.id;
@@ -88,7 +88,7 @@ test "Mutex: hand-off preserves FIFO order under contention" {
     };
 
     // Pre-acquire the mutex so contenders queue up behind it.
-    std.debug.assert(mu.tryLock());
+    std.debug.assert(mu.tryLock(@src()));
 
     var g: fiber.Group(void) = .init(std.testing.allocator);
     defer g.deinit();
@@ -110,7 +110,7 @@ test "Mutex: hand-off preserves FIFO order under contention" {
 
     // Releaser unblocks the pre-acquired lock once it gets a turn.
     const Releaser = struct {
-        fn run(m: *fiber.Mutex) void {
+        fn run(m: *fiber.Mutex(.untracked)) void {
             m.unlock();
         }
     };
@@ -123,13 +123,13 @@ test "Mutex: hand-off preserves FIFO order under contention" {
 }
 
 test "Mutex: cross-worker contention preserves the increment count" {
-    var mu: fiber.Mutex = .{};
+    var mu: fiber.Mutex(.untracked) = .{};
     var counter: u64 = 0;
 
     const Body = struct {
-        fn run(m: *fiber.Mutex, c: *u64) void {
+        fn run(m: *fiber.Mutex(.untracked), c: *u64) void {
             for (0..500) |_| {
-                m.lock();
+                m.lock(@src());
                 c.* += 1;
                 m.unlock();
             }
@@ -158,13 +158,13 @@ test "RWMutex: multiple readers can hold simultaneously" {
     if (true) {
         return error.SkipZigTest;
     }
-    var rw: fiber.RWMutex = .{};
+    var rw: fiber.RWMutex(.untracked) = .{};
     var max_concurrent: u32 = 0;
     var active: u32 = 0;
 
     const Reader = struct {
-        fn run(l: *fiber.RWMutex, act: *u32, peak: *u32) void {
-            l.lockShared();
+        fn run(l: *fiber.RWMutex(.untracked), act: *u32, peak: *u32) void {
+            l.lockShared(@src());
             act.* += 1;
             if (act.* > peak.*) peak.* = act.*;
             // Yield while holding the shared lock so other readers
@@ -189,13 +189,13 @@ test "RWMutex: multiple readers can hold simultaneously" {
 }
 
 test "RWMutex: writer excludes other writers and readers" {
-    var rw: fiber.RWMutex = .{};
+    var rw: fiber.RWMutex(.untracked) = .{};
     var observed_inside: u32 = 0;
     var concurrent_in_writer: u32 = 0;
 
     const Writer = struct {
-        fn run(l: *fiber.RWMutex, obs: *u32, peak: *u32) void {
-            l.lock();
+        fn run(l: *fiber.RWMutex(.untracked), obs: *u32, peak: *u32) void {
+            l.lock(@src());
             obs.* += 1;
             if (obs.* > peak.*) peak.* = obs.*;
             fiber.yield();
@@ -214,12 +214,12 @@ test "RWMutex: writer excludes other writers and readers" {
 }
 
 test "RWMutex: writer-preferred — pending writer blocks new readers" {
-    var rw: fiber.RWMutex = .{};
+    var rw: fiber.RWMutex(.untracked) = .{};
     var order: [3]u8 = .{ 0, 0, 0 };
     var slot: usize = 0;
 
     const Ctx = struct {
-        rw: *fiber.RWMutex,
+        rw: *fiber.RWMutex(.untracked),
         order: *[3]u8,
         slot: *usize,
         id: u8,
@@ -230,7 +230,7 @@ test "RWMutex: writer-preferred — pending writer blocks new readers" {
 
     const WriterRun = struct {
         fn run(c: *Ctx) void {
-            c.rw.lock();
+            c.rw.lock(@src());
             c.order[c.slot.*] = c.id;
             c.slot.* += 1;
             c.rw.unlock();
@@ -238,7 +238,7 @@ test "RWMutex: writer-preferred — pending writer blocks new readers" {
     };
     const ReaderRun = struct {
         fn run(c: *Ctx) void {
-            c.rw.lockShared();
+            c.rw.lockShared(@src());
             c.order[c.slot.*] = c.id;
             c.slot.* += 1;
             c.rw.unlockShared();
@@ -246,7 +246,7 @@ test "RWMutex: writer-preferred — pending writer blocks new readers" {
     };
 
     // Pre-acquire as a reader.
-    std.debug.assert(rw.tryLockShared());
+    std.debug.assert(rw.tryLockShared(@src()));
 
     // The semantic under test ("a queued writer blocks new readers")
     // requires a sequencing precondition: the writer must already be
@@ -274,7 +274,7 @@ test "RWMutex: writer-preferred — pending writer blocks new readers" {
 }
 
 test "RWMutex: cross-worker torture — reader observations are monotonic" {
-    var rw: fiber.RWMutex = .{};
+    var rw: fiber.RWMutex(.untracked) = .{};
     // `u128` is two 64-bit stores even on x86_64 — a reader caught
     // mid-write (lock exclusion failed) could observe a torn value
     // with the lower half of update N and the upper half of N-1.
@@ -283,10 +283,10 @@ test "RWMutex: cross-worker torture — reader observations are monotonic" {
     var violation: std.atomic.Value(bool) = .init(false);
 
     const Reader = struct {
-        fn run(l: *fiber.RWMutex, c: *u128, v: *std.atomic.Value(bool)) void {
+        fn run(l: *fiber.RWMutex(.untracked), c: *u128, v: *std.atomic.Value(bool)) void {
             var last_seen: u128 = 0;
             for (0..200) |_| {
-                l.lockShared();
+                l.lockShared(@src());
                 const observed = c.*;
                 l.unlockShared();
                 if (observed < last_seen) {
@@ -298,10 +298,10 @@ test "RWMutex: cross-worker torture — reader observations are monotonic" {
         }
     };
     const Writer = struct {
-        fn run(l: *fiber.RWMutex, c: *u128) void {
+        fn run(l: *fiber.RWMutex(.untracked), c: *u128) void {
             const stride: u128 = (@as(u128, 1) << 64) + 1;
             for (0..100) |_| {
-                l.lock();
+                l.lock(@src());
                 c.* += stride;
                 l.unlock();
             }

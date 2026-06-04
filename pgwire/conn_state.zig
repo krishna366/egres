@@ -1,10 +1,10 @@
-//! Pure-logic Postgres connection state machine. NO sockets, NO zio.
+//! Pure-logic Postgres connection state machine. NO sockets, no runtime I/O.
 //!
 //! Caller pattern:
 //!   1. Construct a `ConnState` with input/output writers, allocator,
 //!      and config. The state machine pulls bytes from `in` and pushes
 //!      frames into `out` — both are `*std.Io.Reader` / `*std.Io.Writer`
-//!      interfaces, so production wires them to `zio.net.Stream.Reader`
+//!      interfaces, so production wires them to `fiber.net.Stream.Reader`
 //!      / `Writer` and tests use `Reader.fixed` / `Writer.Allocating`.
 //!   2. Call `nextEvent()` in a loop. It blocks pulling bytes from `in`
 //!      (or returns `error.EndOfStream` for an exhausted fixed reader),
@@ -15,7 +15,7 @@
 //!      `sendError`), then `endCommand` to emit ReadyForQuery.
 //!
 //! The split between "state machine" and "driver" exists so this file
-//! has zero socket / zio code. Tests drive it with byte fixtures via
+//! has zero socket / runtime code. Tests drive it with byte fixtures via
 //! `Reader.fixed` and inspect the output via `Allocating.writer.buffered()`.
 
 const std = @import("std");
@@ -164,13 +164,13 @@ pub const ConnState = struct {
     phase: Phase = .awaiting_startup,
 
     /// Caller-supplied reader the state machine pulls input bytes
-    /// from. Production: `zio.net.Stream.Reader`; tests:
+    /// from. Production: `fiber.net.Stream.Reader`; tests:
     /// `std.Io.Reader.fixed(bytes)`. The reader must have a buffer
     /// of at least 8 bytes (we peek the largest header — startup's
     /// length+code — before tossing).
     in: *std.Io.Reader,
     /// Caller-supplied writer the state machine sends frames into.
-    /// Production: `zio.net.Stream.Writer` for streaming flushes;
+    /// Production: `fiber.net.Stream.Writer` for streaming flushes;
     /// tests: `std.Io.Writer.Allocating` (inspect via `.buffered()`).
     out: *std.Io.Writer,
     /// Body of the *current* input frame. `clearRetainingCapacity`'d

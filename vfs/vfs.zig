@@ -41,7 +41,7 @@ pub const page_alignment = std.mem.Alignment.fromByteUnits(page_size);
 
 pub const Mode = enum {
     default, // default via filesystem
-    direct, // O_DIRECT + zio reads/writes
+    direct, // O_DIRECT, aligned reads/writes
     mmap, // mmap the file, reads are slices into the mapped region
     memory, // read entire file into owned buffer
 };

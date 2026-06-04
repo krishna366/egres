@@ -58,7 +58,7 @@ pub const TableCache = struct {
     allocator: std.mem.Allocator,
     dir: []const u8,
     tables: std.AutoHashMap(u64, *Table),
-    mu: utils.TrackedRwLock,
+    mu: fiber.RWMutex(.tracked),
 
     pub fn init(allocator: std.mem.Allocator, dir: []const u8) TableCache {
         return .{
@@ -88,7 +88,7 @@ pub const TableCache = struct {
 
     /// contains reports whether a table with this id is currently cached.
     pub fn contains(self: *TableCache, id: u64) bool {
-        self.mu.lockSharedUncancelable(@src());
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.tables.contains(id);
     }
@@ -98,7 +98,7 @@ pub const TableCache = struct {
     /// confirms no follower needs the backing SST file). Caller must not
     /// destroy t after this call.
     pub fn own(self: *TableCache, id: u64, t: *Table) !void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
         std.debug.assert(!self.tables.contains(id));
         t.incrRef();
@@ -109,7 +109,7 @@ pub const TableCache = struct {
     /// a table only becomes evictable after its cache ref is explicitly released
     /// (e.g. after a snapshot confirms no follower needs the SST file).
     pub fn clearStale(self: *TableCache) void {
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         defer self.mu.unlock();
 
         var to_evict: std.ArrayList(u64) = .empty;
@@ -131,7 +131,7 @@ pub const TableCache = struct {
     }
 
     /// loadTables serves each TableNeed from cache (read lock) or opens it
-    /// concurrently via zio fibers (write lock per miss). On return, each
+    /// concurrently via fibers (write lock per miss). On return, each
     /// need's .table field points to an open *Table owned by the cache.
     /// The caller is responsible for installing these tables into levels
     /// (e.g. via Level.addEntry) — this keeps loadTables free of any
@@ -141,7 +141,7 @@ pub const TableCache = struct {
         var misses: std.ArrayList(*TableNeed) = .empty;
         defer misses.deinit(self.allocator);
         {
-            self.mu.lockSharedUncancelable(@src());
+            self.mu.lockShared(@src());
             defer self.mu.unlockShared();
             for (needed) |*n| {
                 if (self.tables.get(n.id)) |t| {
@@ -198,7 +198,7 @@ pub const TableCache = struct {
     ) void {
         defer _ = completed.fetchAdd(1, .release);
         // Phase A: check under write lock (brief — no I/O).
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         if (self.tables.get(need.id)) |t| {
             self.mu.unlock();
             need.table = t;
@@ -221,7 +221,7 @@ pub const TableCache = struct {
         defer t.decrRef(); // Drop the open-time ref; own() takes its own.
 
         // Phase C: re-acquire write lock to insert; handle race with another fiber.
-        self.mu.lockUncancelable(@src());
+        self.mu.lock(@src());
         if (self.tables.get(need.id)) |existing| {
             // Another fiber opened the same table while we were in phase B.
             self.mu.unlock();
@@ -475,7 +475,7 @@ pub const Tree = struct {
         var cand_keys: std.ArrayList(Key) = .empty;
         {
             const lv = &self.levels[lmax_idx];
-            lv.mu.lockSharedUncancelable(@src());
+            lv.mu.lockShared(@src());
             defer lv.mu.unlockShared();
             if (lv.tables.items.len < min_lmax_tables_for_split) return .{};
             for (lv.tables.items[1..]) |tbe| {
@@ -489,7 +489,7 @@ pub const Tree = struct {
         const Entry = struct { smallest: Key, biggest: Key, size: u64 };
         var all_entries: std.ArrayList(Entry) = .empty;
         for (self.levels[1..]) |*lv| {
-            lv.mu.lockSharedUncancelable(@src());
+            lv.mu.lockShared(@src());
             defer lv.mu.unlockShared();
             for (lv.tables.items) |tbe| {
                 try all_entries.append(a, .{
@@ -770,7 +770,7 @@ pub const Tree = struct {
             // Snapshot the src table list under its own lock so the
             // per-iteration L1-overlap queries don't hold the src lock.
             const src_snapshot = ss: {
-                self.levels[src].mu.lockSharedUncancelable(@src());
+                self.levels[src].mu.lockShared(@src());
                 defer self.levels[src].mu.unlockShared();
                 const items = self.levels[src].tables.items;
                 if (items.len == 0) return .empty;

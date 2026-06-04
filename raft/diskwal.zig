@@ -1129,7 +1129,7 @@ pub const DiskWAL = struct {
     /// Single rwlock guarding all DiskWAL state — covers both `meta` and
     /// `wal_store` since the public API (hardState/snapshot/append/...)
     /// can read/mutate either. Shared for reads, exclusive for writes.
-    mu: fiber.RWMutex = .{},
+    mu: fiber.RWMutex(.tracked) = .{},
 
     pub fn openPath(
         path: []const u8,
@@ -1162,6 +1162,9 @@ pub const DiskWAL = struct {
     pub fn deinit(self: *DiskWAL) void {
         self.wal_store.deinit();
         self.meta.deinit();
+        // `mu` is .tracked — unlink it from the lock registry before the
+        // struct's memory dies, else a later dumpLocks/unregister walk dangles.
+        self.mu.deinit();
     }
 
     fn mapToRaftLogError(err: anyerror) raftlog.RaftLogError {
@@ -1183,7 +1186,7 @@ pub const DiskWAL = struct {
     // on cancellation isn't useful).
 
     pub fn hardState(self: *DiskWAL) *const raftlog.HardState {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.meta.hardState();
     }
@@ -1194,7 +1197,7 @@ pub const DiskWAL = struct {
     /// mainLoop persisting term/vote, commitPersistLoop persisting
     /// commit_index) can't race-clobber each other's fields.
     pub fn setHardState(self: *DiskWAL, update: raftlog.HardStateUpdate) raftlog.RaftLogError!void {
-        self.mu.lock();
+        self.mu.lock(@src());
         defer self.mu.unlock();
         var next = self.meta.hardState().*;
         if (update.current_term) |v| next.current_term = v;
@@ -1216,13 +1219,13 @@ pub const DiskWAL = struct {
     }
 
     pub fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.meta.snapshotState();
     }
 
     pub fn setSnapshot(self: *DiskWAL, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
-        self.mu.lock();
+        self.mu.lock(@src());
         defer self.mu.unlock();
         self.meta.setSnapshot(snap) catch |err| return mapToRaftLogError(err);
     }
@@ -1238,7 +1241,7 @@ pub const DiskWAL = struct {
         min_bytes: u64,
         min_age_seconds: u64,
     ) ?u64 {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
 
         const head = self.wal_store.lastIndex();
@@ -1266,25 +1269,25 @@ pub const DiskWAL = struct {
     }
 
     pub fn firstIndex(self: *DiskWAL) u64 {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.wal_store.firstIndex();
     }
 
     pub fn lastIndex(self: *DiskWAL) u64 {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.wal_store.lastIndex();
     }
 
     pub fn lastTimestamp(self: *DiskWAL) u64 {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.wal_store.lastTimestamp();
     }
 
     pub fn lastTerm(self: *DiskWAL) u64 {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         const last_idx = self.wal_store.lastIndex();
         const snap_term = self.meta.snapshotState().term;
@@ -1293,7 +1296,7 @@ pub const DiskWAL = struct {
     }
 
     pub fn term(self: *DiskWAL, idx: u64) raftlog.RaftLogError!?u64 {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         if (idx == 0) return 0;
         return self.wal_store.term(idx) catch |err| switch (err) {
@@ -1305,7 +1308,7 @@ pub const DiskWAL = struct {
     }
 
     pub fn entriesRange(self: *DiskWAL, opts: raftlog.EntriesRangeOpts) raftlog.RaftLogError!raftlog.EntriesResult {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.wal_store.allEntries(self.allocator, opts) catch |err| {
             return mapToRaftLogError(err);
@@ -1313,7 +1316,7 @@ pub const DiskWAL = struct {
     }
 
     pub fn firstIndexOfTerm(self: *DiskWAL, term_value: u64) u64 {
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         var idx = self.wal_store.firstIndex();
         const last = self.wal_store.lastIndex();
@@ -1325,19 +1328,19 @@ pub const DiskWAL = struct {
     }
 
     pub fn append(self: *DiskWAL, entries: []const raftlog.LogEntryBuffer) raftlog.RaftLogError!void {
-        self.mu.lock();
+        self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.addEntries(entries) catch |err| return mapToRaftLogError(err);
     }
 
     pub fn truncateFrom(self: *DiskWAL, from_index: u64) raftlog.RaftLogError!void {
-        self.mu.lock();
+        self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.truncateFrom(from_index) catch |err| return mapToRaftLogError(err);
     }
 
     pub fn compactUntil(self: *DiskWAL, index: u64) raftlog.RaftLogError!void {
-        self.mu.lock();
+        self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.deleteBefore(index);
     }
@@ -1346,7 +1349,7 @@ pub const DiskWAL = struct {
         // MetaStore writes are durable inline (state.bin opens with O_DSYNC,
         // snapshot.bin uses tmp+rename+dir-sync), so only the WAL needs an
         // explicit sync here.
-        self.mu.lockShared();
+        self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         self.wal_store.sync(true) catch |err| return mapToRaftLogError(err);
     }
