@@ -15,7 +15,7 @@ test "Mutex: uncontended lock/unlock cycles correctly" {
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{ &mu, &counter });
+    var h = try fiber.spawn(.{}, Body.run, .{ &mu, &counter });
     h.join();
 
     try std.testing.expectEqual(@as(u32, 100), counter);
@@ -253,12 +253,12 @@ test "RWMutex: writer-preferred — pending writer blocks new readers" {
     // parked on `rw` when the readers attempt their lockShared. We
     // poll the spawned fibers' state.tag instead of trusting spawn
     // order to translate into run order.
-    const wh = try fiber.spawn(.{}, WriterRun.run, .{&w_ctx});
+    var wh = try fiber.spawn(.{}, WriterRun.run, .{&w_ctx});
     while (wh.fiber.loadState().tag != .waiting) fiber.yield();
     // Writer is queued. Spawn the readers — writer-pref must make
     // them park instead of acquiring the shared lock.
-    const r1h = try fiber.spawn(.{}, ReaderRun.run, .{&r1_ctx});
-    const r2h = try fiber.spawn(.{}, ReaderRun.run, .{&r2_ctx});
+    var r1h = try fiber.spawn(.{}, ReaderRun.run, .{&r1_ctx});
+    var r2h = try fiber.spawn(.{}, ReaderRun.run, .{&r2_ctx});
     while (r1h.fiber.loadState().tag != .waiting) fiber.yield();
     while (r2h.fiber.loadState().tag != .waiting) fiber.yield();
     // All three parked. Release the pre-acquired shared lock —
@@ -369,7 +369,7 @@ test "Notify: pending flag lets wait return immediately when notify ran first" {
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{ &sig, &observed_wait_yielded });
+    var h = try fiber.spawn(.{}, Body.run, .{ &sig, &observed_wait_yielded });
     h.join();
 
     // Reaching here proves wait() took the fast path (no park).
@@ -402,7 +402,7 @@ test "Notify: notify/wait alternate any number of times in one fiber" {
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{&sig});
+    var h = try fiber.spawn(.{}, Body.run, .{&sig});
     h.join();
 }
 

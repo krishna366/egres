@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fiber = @import("zfiber");
+const GuardAllocator = utils.GuardAllocator;
 const context = utils.context;
 
 // 0.16 helpers: std.Thread.Mutex / ResetEvent / time.nanoTimestamp are gone.
@@ -235,6 +236,10 @@ const Args = struct {
     /// always one-dump-per-window. `wd_kill_s = 0` disables the kill.
     wd_stuck_tick_s: u64 = 20,
     wd_kill_s: u64 = 300,
+    /// Page-isolate the fiber runtime allocator with a `GuardAllocator` so a
+    /// use-after-free / overflow into runtime memory faults AT the write (the
+    /// work-stealing wild-write hunt). Slow; off by default.
+    guard: bool = false,
 };
 
 const Counters = struct {
@@ -390,6 +395,8 @@ fn parseArgs(alloc: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, a, "--parallel") and i + 1 < argv.len) {
             args.parallel = try std.fmt.parseInt(u6, argv[i + 1], 10);
             i += 1;
+        } else if (std.mem.eql(u8, a, "--guard")) {
+            args.guard = true;
         } else if (std.mem.eql(u8, a, "--verbose")) {
             verbose_start = true;
         } else if (std.mem.eql(u8, a, "--wd-stuck-tick-s") and i + 1 < argv.len) {
@@ -872,7 +879,7 @@ fn fiberDriver(fctx: *FiberCtx) void {
     fctx.seq.store(0, .seq_cst);
 
     for (fctx.failures.items) |t| {
-        const h = fiber.spawn(.{}, runFiberOne, .{ t, fctx }) catch unreachable;
+        var h = fiber.spawn(.{}, runFiberOne, .{ t, fctx }) catch unreachable;
         h.join();
     }
 }
@@ -1193,8 +1200,19 @@ pub fn main(init: std.process.Init) !void {
     // knob bounds how many test *bodies* dispatch at once (see
     // fiberDriver), not the worker pool.
     const fiber_workers: usize = std.Thread.getCpuCount() catch @as(usize, args.parallel);
+
+    // `--guard`: page-isolate the runtime allocator so a dangling/overflow write
+    // into runtime memory SIGSEGVs at the offending instruction. `guard` must
+    // outlive `fiber_rt` (its deinit frees through this allocator).
+    var guard: GuardAllocator = .init();
+    defer guard.deinit();
+    const rt_alloc = if (args.guard) guard.allocator() else std.heap.page_allocator;
+    if (args.guard) std.debug.print(
+        "[guard] fiber runtime allocator is page-isolated; UAF/overflow into runtime memory -> SIGSEGV at the write\n",
+        .{},
+    );
     var fiber_rt: fiber.Runtime = undefined;
-    try fiber_rt.init(std.heap.page_allocator, .{ .num_workers = fiber_workers });
+    try fiber_rt.init(rt_alloc, .{ .num_workers = fiber_workers });
     defer fiber_rt.deinit();
 
     var counters: Counters = .{};

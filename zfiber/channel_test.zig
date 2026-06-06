@@ -20,7 +20,7 @@ test "Channel: send + receive round-trip" {
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{ &ch, &received });
+    var h = try fiber.spawn(.{}, Body.run, .{ &ch, &received });
     h.join();
 
     try std.testing.expectEqualSlices(u32, &.{ 10, 20, 30, 40 }, &received);
@@ -80,7 +80,7 @@ test "Channel: trySend on full returns ChannelFull" {
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{ &ch, &saw_full });
+    var h = try fiber.spawn(.{}, Body.run, .{ &ch, &saw_full });
     h.join();
 
     try std.testing.expect(saw_full);
@@ -107,7 +107,7 @@ test "Channel: tryReceive on empty returns ChannelEmpty; on closed-empty returns
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{ &ch, &saw_empty, &saw_closed });
+    var h = try fiber.spawn(.{}, Body.run, .{ &ch, &saw_empty, &saw_closed });
     h.join();
 
     try std.testing.expect(saw_empty);
@@ -136,7 +136,7 @@ test "Channel: graceful close lets receivers drain buffered items" {
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{ &ch, &drained, &saw_closed });
+    var h = try fiber.spawn(.{}, Body.run, .{ &ch, &drained, &saw_closed });
     h.join();
 
     try std.testing.expectEqualSlices(u32, &.{ 7, 8, 9 }, &drained);
@@ -160,7 +160,7 @@ test "Channel: immediate close drops buffered items" {
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{ &ch, &saw_closed });
+    var h = try fiber.spawn(.{}, Body.run, .{ &ch, &saw_closed });
     h.join();
 
     try std.testing.expect(saw_closed);

@@ -1,27 +1,16 @@
-//! Per-worker timeout machinery: an intrusive min-heap of pending
-//! deadlines plus one `xev.Timer` re-armed dynamically to the
-//! earliest deadline.
+//! Per-worker timeout machinery: a flat array of pending deadlines plus one
+//! `xev.Timer` re-armed dynamically to the earliest deadline.
 //!
-//! Each `Worker` owns one `Deadlines` instance. Timeouts registered
-//! on worker N live in worker N's heap, and the xev `timer` is only
-//! ever armed/reset on worker N's thread — libxev per-loop state is
-//! not thread-safe, so `register`/`drainExpired`/`onTimer`/`armForHead`
-//! stay owner-thread-only.
+//! Each `Worker` owns one `Deadlines` instance. Timeouts registered on worker N
+//! live in worker N's array, and the xev `timer` is only ever armed/reset on
+//! worker N's thread — libxev per-loop state is not thread-safe, so
+//! `register`/`drainExpired`/`onTimer`/`armForHead` stay owner-thread-only.
 //!
-//! `cancel`, however, IS safe to call from any worker: a fiber that
-//! registered a timeout here can migrate and complete on a different
-//! worker, then cancel from there. The heap array is therefore guarded
-//! by `sl` (a spinlock) on every access — the only cross-thread
-//! mutation is `cancel`'s `heap.remove`; the timer SQE ops stay off the
+//! `cancel`, however, IS safe to call from any worker: a fiber that registered a
+//! timeout here can migrate and complete on a different worker, then cancel from
+//! there. The array is guarded by `sl` (a spinlock) on every access — the only
+//! cross-thread mutation is `cancel`'s removal; the timer SQE ops stay off the
 //! lock and on the owner thread.
-//!
-//! Heap impl lives in `fiber/heap.zig` as a generic intrusive
-//! `MinHeap(T, key_field, index_field)`. We pay one `usize` per
-//! `Timeout` (`heap_index`) in exchange for O(log N) push, pop, AND
-//! middle-remove. Middle-remove is the load-bearing op: typical
-//! pattern is "register a timeout, op completes first, cancel the
-//! timeout" — cancel runs roughly once per op, while the deadline
-//! firing only happens when things actually go wrong.
 
 const std = @import("std");
 const xev = @import("xev");
@@ -32,6 +21,8 @@ const coarse = @import("coarse_clock.zig");
 // fibers — this is a mutual file import, which Zig resolves lazily (runtime.zig
 // imports us back for the `Deadlines` type).
 const rt = @import("runtime.zig");
+const fb = @import("fiber.zig");
+const Fiber = fb.Fiber;
 
 const Spinlock = @import("spinlock.zig").Spinlock;
 const Allocator = std.mem.Allocator;
@@ -42,57 +33,20 @@ const Allocator = std.mem.Allocator;
 /// — neither useful. Pin the floor at the boundary instead.
 pub const min_timeout_ms: u64 = 1;
 
-/// One pending deadline. Lives on the consumer's stack (same pattern
-/// as the I/O `Waiter`s). The heap holds pointers to these so the
-/// caller's frame is the storage.
-///
-/// When the deadline fires (expires before `Deadlines.cancel(t)`), the
-/// owner worker invokes `on_fire(on_fire_ctx)` — exactly once, gated by
-/// `_done`. That callback owns everything that must run on this worker's
-/// thread: a watermark waiter sets its own flag and wakes itself; a
-/// socket read submits an io_uring cancel against the still-in-flight op.
-/// `Deadlines` itself stays oblivious to fibers and waking.
-pub const Timeout = struct {
-    on_fire: *const fn (ctx: *anyopaque) void,
-    on_fire_ctx: *anyopaque,
-
-    /// Absolute monotonic-ms deadline (signed: `armForHead` needs
-    /// `deadline - now` to go negative for already-past timers). Filled
-    /// in by `register` from `ms_from_now`; consumers leave it default.
-    _deadline_ms: i64 = 0,
-
-    /// First-fire-wins token: whichever of (deadline fires, the
-    /// underlying I/O op completes) gets to swap this from false to
-    /// true owns the wake. The loser is a no-op.
-    _done: std.atomic.Value(bool) = .init(false),
-
-    /// Slot in `Deadlines.heap`. Maintained by `MinHeap`; consumers
-    /// should not touch.
-    _heap_index: usize = Heap.not_in_heap,
-
-    /// Transient link used only by `drainExpired` to batch a tick's worth
-    /// of expired timeouts into a wake list under one lock, then wake them
-    /// after unlock. Not in use while parked.
-    _wake_next: ?*Timeout = null,
-
-    /// Win the first-fire race. Returns true if THIS caller claimed the
-    /// timeout (and now owns waking the parked fiber), false if it was
-    /// already claimed. Used by `drainExpired` (deadline fired) and by
-    /// consumers whose op completes first (e.g. the watermark's
-    /// advance/close path) to arbitrate which side does the single wake.
-    pub fn claim(t: *Timeout) bool {
-        return !t._done.swap(true, .acq_rel);
-    }
-};
-
-const Heap = heap.MinHeap(Timeout, "_deadline_ms", "_heap_index");
+/// The deadline heap entry. Each `Fiber` OWNS one (`Fiber.timeout`) so a fire
+/// that arrives after its op exited dereferences stable fiber memory and can
+/// only wake that one fiber — never an unrelated one via a reused stack frame.
+/// Definition lives in `fiber.zig` (the fiber owns it); see `Timeout` there.
+/// When the deadline fires (before `cancel`), the owner worker invokes
+/// `on_fire(on_fire_ctx)` exactly once (gated by `_done`).
+pub const Timeout = fb.Timeout;
 
 pub const Deadlines = struct {
     loop: *xev.Loop,
     timer: xev.Timer,
-    /// Owns the heap's backing array — grown by `register`, freed by
-    /// `deinit`. Captured at init (the runtime's allocator) so callers
-    /// never pass one and can't mismatch grow vs. free.
+    /// Backs the `timeouts` array — grown by `register`, freed by `deinit`.
+    /// Captured at init (the runtime's allocator) so callers never pass one and
+    /// can't mismatch grow vs. free.
     allocator: Allocator,
     /// SQE backing the in-flight timer expiration.
     completion: xev.Completion = undefined,
@@ -105,11 +59,14 @@ pub const Deadlines = struct {
     /// `armForHead` should call `timer.run` (fresh) or `timer.reset`
     /// (cancel-then-re-arm on the same completion).
     armed: bool = false,
-    heap: Heap = .{},
-    /// Guards every access to `heap`. The only cross-thread caller is
-    /// `cancel` (a migrated waiter removing its own timeout); the owner
-    /// thread holds it for the brief heap mutations in
-    /// `register`/`drainExpired`/`armForHead`. Uncontended on the hot path.
+    /// Pending timeouts as a flat array of pointers — NOT the `MinHeap`. We scan
+    /// it (O(N), N tiny) for the min deadline and for removal. Removal matches by
+    /// pointer identity.
+    timeouts: std.ArrayList(*Timeout) = .empty,
+    /// Guards every access to `timeouts`. The only cross-thread caller is
+    /// `cancel` (a migrated waiter removing its own timeout); the owner thread
+    /// holds it for the brief mutations in `register`/`drainExpired`/`armForHead`.
+    /// Uncontended on the hot path.
     sl: Spinlock = .{},
 
     pub fn init(loop: *xev.Loop, allocator: Allocator) !Deadlines {
@@ -121,13 +78,21 @@ pub const Deadlines = struct {
     }
 
     pub fn deinit(self: *Deadlines) void {
-        self.heap.deinit(self.allocator);
+        self.timeouts.deinit(self.allocator);
         self.timer.deinit();
     }
 
-    /// Register a deadline. `ms_from_now` is clamped up to
-    /// `min_timeout_ms`. The `Timeout` lives on the caller's stack;
-    /// this call only links it into the heap.
+    /// Earliest pending deadline, or null if none. Caller holds `sl`.
+    fn minDeadlineLocked(self: *const Deadlines) ?i64 {
+        var m: ?i64 = null;
+        for (self.timeouts.items) |e| {
+            if (m == null or e._deadline_ms < m.?) m = e._deadline_ms;
+        }
+        return m;
+    }
+
+    /// Register a deadline. `ms_from_now` is clamped up to `min_timeout_ms`.
+    /// Appends `t` to the `timeouts` array (the caller owns `t`'s storage).
     ///
     /// "Now" is read via `clockMsUseRarely(.monotonic)` — direct vDSO
     /// CLOCK_MONOTONIC, no caching. Using `loop.now()` would hand us
@@ -149,16 +114,21 @@ pub const Deadlines = struct {
         const ms = @max(ms_from_now, min_timeout_ms);
         t._deadline_ms = current_ms + @as(i64, @intCast(ms));
 
-        // Snapshot the head BEFORE push so we know whether the new
-        // entry will be the new minimum. A tie (equal deadline) is
-        // *not* a new minimum — the existing timer fires at the same
-        // moment and drainExpired sweeps both.
+        // Snapshot the min BEFORE append so we know whether the new entry is the
+        // new earliest. A tie is *not* a new minimum — the existing timer fires
+        // at the same moment and drainExpired sweeps both.
         self.sl.lock();
-        const becomes_head = blk: {
-            if (self.heap.peekMin()) |h| break :blk t._deadline_ms < h._deadline_ms;
-            break :blk true;
-        };
-        self.heap.push(self.allocator, t) catch |err| {
+        if (std.debug.runtime_safety) {
+            // Leak tripwire: a `Timeout` must never be registered twice (a
+            // missing cancel). With the array this is an O(N) scan, debug-only.
+            for (self.timeouts.items) |e| if (e == t) std.debug.panic(
+                "deadline register: timeout 0x{x} already registered (missing cancel)",
+                .{@intFromPtr(t)},
+            );
+        }
+        const prev_min = self.minDeadlineLocked();
+        const becomes_head = prev_min == null or t._deadline_ms < prev_min.?;
+        self.timeouts.append(self.allocator, t) catch |err| {
             self.sl.unlock();
             return err;
         };
@@ -167,22 +137,29 @@ pub const Deadlines = struct {
         // Arm outside the lock — `register` only ever runs on the owner
         // thread, so the timer SQE op is safe; keeping it off `sl` avoids
         // pinning a cross-thread `cancel` behind a libxev call.
-        if (becomes_head) self.armForHead(current_ms);
+        if (becomes_head) self.resetTimer(current_ms);
     }
 
-    /// O(log N) middle removal. Safe even when the entry isn't
-    /// enqueued (no-op). Hot path: called from an I/O completion
-    /// callback when the op finished before the deadline fired.
+    /// O(N) removal by POINTER IDENTITY. Safe even when `t` isn't enqueued
+    /// (no-op). Hot path: called from an I/O completion / wait exit when the op
+    /// finished before the deadline fired.
     ///
-    /// Doesn't reset the timer even when removing the current head —
-    /// the in-flight SQE will fire harmlessly (drainExpired finds the
-    /// new head's deadline still in the future and bails). The cost
-    /// is one spurious wake-up; the win is no extra reset SQE per
+    /// The reason we put spinlock here is to allow for cancel call by fibers
+    /// who have moved away to another worker.
+    ///
+    /// Doesn't reset the timer even when removing the current earliest — the
+    /// in-flight SQE fires harmlessly (drainExpired finds the new min still in
+    /// the future and bails). One spurious timer tick; no extra reset SQE per
     /// op-completes-first case (the common path).
     pub fn cancel(self: *Deadlines, t: *Timeout) void {
         self.sl.lock();
-        self.heap.remove(t);
-        self.sl.unlock();
+        defer self.sl.unlock();
+        for (self.timeouts.items, 0..) |e, i| {
+            if (e == t) {
+                _ = self.timeouts.swapRemove(i);
+                return;
+            }
+        }
     }
 
     /// Fire every entry whose deadline has passed. Owner-thread only.
@@ -196,14 +173,21 @@ pub const Deadlines = struct {
     pub fn drainExpired(self: *Deadlines, now: i64) void {
         var fire_list: ?*Timeout = null;
         self.sl.lock();
-        while (self.heap.peekMin()) |t| {
-            if (t._deadline_ms > now) break;
-            _ = self.heap.popMin();
-            // Loser (op completed first, already claimed) is dropped — that
-            // path owns the cleanup; we just needed it off the heap.
-            if (t.claim()) {
-                t._wake_next = fire_list;
-                fire_list = t;
+        var i: usize = 0;
+        while (i < self.timeouts.items.len) {
+            const t = self.timeouts.items[i];
+            if (t._deadline_ms <= now) {
+                // swap-remove: the last entry moves into slot i, so DON'T
+                // advance i — re-check the element now sitting here.
+                _ = self.timeouts.swapRemove(i);
+                // Loser (op completed first, already claimed) is dropped — that
+                // path owns the cleanup; we just needed it off the array.
+                if (t.winRace()) {
+                    t._wake_next = fire_list;
+                    fire_list = t;
+                }
+            } else {
+                i += 1;
             }
         }
         self.sl.unlock();
@@ -219,14 +203,13 @@ pub const Deadlines = struct {
         }
     }
 
-    /// Arm (or reset) the timer for the current heap head. Owner-thread
-    /// only (touches the xev timer). No-op when the heap is empty.
-    fn armForHead(self: *Deadlines, current_ms: i64) void {
+    /// Reset the timer for the earliest pending deadline. Owner-thread
+    /// only (touches the xev timer). No-op when there are no timeouts.
+    fn resetTimer(self: *Deadlines, current_ms: i64) void {
         self.sl.lock();
-        const head = self.heap.peekMin();
-        const deadline = if (head) |h| h._deadline_ms else 0;
+        const head = self.minDeadlineLocked();
         self.sl.unlock();
-        if (head == null) return;
+        const deadline = head orelse return;
 
         const delta = deadline - current_ms;
         const next_ms: u64 = if (delta < @as(i64, @intCast(min_timeout_ms)))
@@ -287,43 +270,70 @@ fn onTimer(
     self.drainExpired(now);
     self.armed = false;
     // armForHead re-locks the heap and no-ops if it's empty.
-    self.armForHead(now);
+    self.resetTimer(now);
     return .disarm;
 }
 
-// ── sleepMs ─────────────────────────────────────────────────────────
+// ── Per-fiber owned timeout: fire / arm / disarm ────────────────────────
 //
-// The simplest `Deadlines` consumer: park the calling fiber until the
-// deadline fires. Nothing competes with the timer to wake a pure sleep
-// (unlike a socket read or watermark wait), so there's no first-fire
-// `claim()` race to arbitrate. The `cancel` below still runs, but only as
-// defensive cleanup — a no-op once the deadline has removed our entry.
+// A timed op arms THIS fiber's own `Fiber.timeout`, parks, and disarms on exit.
+// Because the Timeout lives in the Fiber rather than on the op's stack, a fire
+// that races the disarm can only ever wake this fiber — never an unrelated one
+// through a reused frame.
+
+/// `on_fire` for a fiber's own timeout: record the fire (bump the generation)
+/// then wake the fiber. Runs on the owner worker (from `drainExpired`); `ctx`
+/// is the `*Fiber`.
+///
+/// NOTE that the caller of this function should already have won the race
+/// before calling this.
+pub fn wonRaceAndTimedOut(ctx: *anyopaque) void {
+    const f: *Fiber = @ptrCast(@alignCast(ctx));
+    f.timeout._fired.store(true, .release);
+    rt.wake(f);
+}
+
+/// Arm fiber `f`'s own timeout `ms` from now on its current worker's heap.
+/// Snapshot `f.timed_out` BEFORE calling to later detect the fire. Returns the
+/// OWNING `Deadlines` so a migrated op disarms on the same heap. Asserts the
+/// timeout isn't already armed — a leak tripwire: a fiber waits in one place at
+/// a time, so a previous op must have disarmed.
+pub fn armSelf(f: *Fiber, ms: u64) !*Deadlines {
+    f.timeout.reset();
+    f.timeout.on_fire = &wonRaceAndTimedOut;
+    f.timeout.on_fire_ctx = f;
+    const o = &rt.currentWorker().deadlines;
+    try o.register(&f.timeout, ms);
+    return o;
+}
+
+/// Disarm fiber `f`'s timeout on `owner` (captured by `armSelf`). Claims first —
+/// so a late `drainExpired` pop can't fire — then removes it from the heap.
+pub fn disarmSelf(f: *Fiber, owner: *Deadlines) void {
+    _ = f.timeout.winRace();
+    owner.cancel(&f.timeout);
+}
 
 /// Park the calling fiber for `ms` milliseconds on the current worker's
 /// `Deadlines` (one `xev.Timer` per worker, re-armed to the earliest pending
 /// deadline) rather than arming a fresh libxev timer per call. `ms` is clamped
 /// up to `min_timeout_ms` — to merely give up the CPU, use `yield`.
+///
+/// Parks EXACTLY ONCE and panics if resumed before our own deadline fired
+/// (`timed_out` unchanged). `fiberTimedOut` bumps `timed_out` (release) before
+/// it wakes us, so a resume from our own deadline is always observable here; any
+/// other resume is an unexplained spurious wake. We refuse to paper over it with
+/// a re-park — a park must only return for a real reason, so a violation is a
+/// runtime bug surfaced loudly with an attributable stack.
 pub fn sleepMs(ms: u64) void {
-    const w = rt.currentWorker();
-    const f = w.current_fiber.?;
-
-    // The Timeout lives on this fiber's stack; we park immediately and only
-    // resume once it fires, so the heap never sees a dangling pointer. `w` is
-    // captured before park, so it stays the *owning* worker even if we resume
-    // on another after migration — `cancel` is safe cross-thread.
-    var timeout: Timeout = .{ .on_fire = &wakeFiber, .on_fire_ctx = f };
-    w.deadlines.register(&timeout, ms) catch |err| {
+    const f = rt.currentFiber();
+    const owner = armSelf(f, ms) catch |err| {
         std.debug.panic("sleepMs: deadline register failed: {}", .{err});
     };
+    defer disarmSelf(f, owner);
     rt.park();
-
-    // Pure sleep: the deadline always fires and `drainExpired` has already
-    // pulled our entry, so this is a no-op on the common path. It also covers
-    // a park that returned for any other reason, removing the stack Timeout
-    // from the owner heap before this frame unwinds.
-    w.deadlines.cancel(&timeout);
-}
-
-fn wakeFiber(ctx: *anyopaque) void {
-    rt.wake(@ptrCast(@alignCast(ctx)));
+    if (!f.timeout.didFire()) std.debug.panic(
+        "sleepMs: resumed before our own deadline fired — spurious wake",
+        .{},
+    );
 }

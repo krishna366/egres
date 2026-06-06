@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
     addZdbServer(b, target, optimize, mods, regen_buffers_step);
     addZdbBench(b, target, optimize, mods);
     addZioBench(b, target, optimize, mods);
+    addStress(b, target, optimize, mods);
     // Load-test driver lives in `scripts/loadtest.py` (orchestration glue is
     // far cleaner in Python than in Zig's std.process/std.Io.Dir surface).
     addSstVerify(b, target, optimize, mods);
@@ -613,6 +614,26 @@ fn addZioBench(
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("bench-zio", "Build the thread/zio/fiber benchmark (always ReleaseFast)");
+    step.dependOn(&install.step);
+}
+
+/// `zig build stress` — the timeout/watermark/sleep correctness harness. Follows
+/// the user's `-Doptimize`; run it `-Doptimize=ReleaseSafe` so assertions and
+/// `strictSleepMs`'s spurious-wake panic are live. Installs to
+/// `zig-out/bin/timeout-stress`, run it with flags (see the file's doc).
+fn addStress(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    mods: Modules,
+) void {
+    const exe = b.addExecutable(.{
+        .name = "timeout-stress",
+        .root_module = makeModule(b, target, optimize, "benchmarks/timeout_stress.zig"),
+    });
+    addImports(exe.root_module, mods, .{ "zfiber", "utils" });
+    const install = b.addInstallArtifact(exe, .{});
+    const step = b.step("stress", "Build the timeout/watermark/sleep stress harness");
     step.dependOn(&install.step);
 }
 

@@ -12,7 +12,7 @@ test "fsops: run round-trips an offloaded function's result through park/wake" {
     };
 
     var out: u64 = 0;
-    const h = try fiber.spawn(.{}, Body.run, .{&out});
+    var h = try fiber.spawn(.{}, Body.run, .{&out});
     h.join();
     try std.testing.expectEqual(@as(u64, 49), out);
 }
@@ -49,7 +49,7 @@ test "fsops: an offloaded error union propagates back to the fiber" {
     };
 
     var out: anyerror!void = {};
-    const h = try fiber.spawn(.{}, Body.run, .{&out});
+    var h = try fiber.spawn(.{}, Body.run, .{&out});
     h.join();
     try std.testing.expectError(error.Boom, out);
 }

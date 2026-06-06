@@ -31,12 +31,20 @@ pub fn Group(comptime T: type) type {
         /// Pre-sized slot per spawn so `wait()` can write without
         /// allocating. Empty when `T == void`.
         results: std.ArrayList(T) = .empty,
+        /// Set once `wait()` has joined (and thereby freed) every handle, so a
+        /// second `wait()` is a no-op that returns the cached results instead of
+        /// double-joining the now-freed fibers. Internal to `wait()`.
+        done: bool = false,
 
         pub fn init(alloc: std.mem.Allocator) Self {
             return .{ .alloc = alloc };
         }
 
         pub fn deinit(self: *Self) void {
+            // `wait()` consumes (joins → frees) the handles, so after a wait
+            // there's nothing to dispose here — just free our own lists. A Group
+            // deinit'd WITHOUT a wait() leaves its fibers in the registry until
+            // `Runtime.deinit` (bounded). All current Group users wait() first.
             self.handles.deinit(self.alloc);
             self.results.deinit(self.alloc);
         }
@@ -77,12 +85,19 @@ pub fn Group(comptime T: type) type {
 
         const WaitResult = if (T == void) void else []const T;
 
-        /// Join every spawned fiber in spawn order. Idempotent — a
-        /// second `wait()` re-reads each handle's cached result.
+        /// Join every spawned fiber in spawn order, which frees each fiber
+        /// (`join()` is consuming). Idempotent: the first call joins + frees and
+        /// caches the results; a second call returns the cached results without
+        /// re-joining the now-freed fibers (so a defer-wait + body-wait pair is
+        /// safe). The returned slice is owned by the Group and valid until
+        /// `deinit()`.
         pub fn wait(self: *Self) WaitResult {
-            for (self.handles.items, 0..) |*h, i| {
-                const r = h.join();
-                if (comptime T != void) self.results.items[i] = r;
+            if (!self.done) {
+                for (self.handles.items, 0..) |*h, i| {
+                    const r = h.join();
+                    if (comptime T != void) self.results.items[i] = r;
+                }
+                self.done = true;
             }
             if (comptime T != void) return self.results.items;
         }

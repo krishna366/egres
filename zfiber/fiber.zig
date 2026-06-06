@@ -11,16 +11,19 @@
 //!     `state` (with awaken-bit CAS) and `intent` to distinguish
 //!     yield from park.
 //!
-//! Stacks are growable. Each fiber reserves `stack_max` virtual bytes
-//! (1 MiB default) with `stack_commit` committed up front (16 KiB
-//! default); the rest is `PROT_NONE`. The first write past the
-//! committed region traps SIGSEGV; the handler installed by
-//! `coro.setupStackGrowth` (called per-worker on `Worker.run` entry)
-//! commits more pages on the fly. The bottom-most page stays a guard:
-//! truly runaway recursion crashes with a real backtrace instead of
-//! silently chewing through 1 MiB before dying.
+//! Each fiber gets a FIXED stack of `stack_size` bytes (1 MiB default),
+//! fully committed (PROT_READ|WRITE) up front — there is NO on-demand
+//! growth. Physical pages are still backed lazily by the kernel, so a
+//! large `stack_size` costs only the pages actually touched, not real RAM.
+//! Dropping growth removes the process-wide SIGSEGV stack-growth handler,
+//! whose thread-local current-context assumption a work-stealing scheduler
+//! violates when it migrates a fiber mid-life. The bottom-most page stays a
+//! guard, so recursion past `stack_size` crashes with a normal backtrace.
+//! Bodies that recurse deeply (e.g. the SQL parser) pass a larger
+//! `stack_size` in `SpawnOptions`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zio = @import("zio");
 const spinlock = @import("spinlock.zig");
 
@@ -28,6 +31,53 @@ pub const coro = zio.coro;
 const Coroutine = coro.Coroutine;
 const Context = coro.Context;
 const Spinlock = spinlock.Spinlock;
+
+/// One pending deadline in a per-worker `Deadlines` min-heap. Each `Fiber`
+/// OWNS one of these (`Fiber.timeout`) rather than putting it on the caller's
+/// stack: a timeout that fires after its op already exited then dereferences
+/// STABLE fiber memory and can only ever wake THIS fiber — never an unrelated
+/// one through a reused stack frame (the stack-Timeout use-after-free). The
+/// deadline machinery in `deadlines.zig` operates on these by pointer.
+pub const Timeout = struct {
+    /// Invoked (on the owner worker) when the deadline fires before it is
+    /// cancelled. For a fiber's own timeout this bumps `Timeout._timed_out` and
+    /// wakes the fiber; `ctx` is the `*Fiber`.
+    on_fire: *const fn (ctx: *anyopaque) void,
+    on_fire_ctx: *anyopaque,
+    /// Set to true if timer actually fired.
+    _fired: std.atomic.Value(bool) = .init(false),
+    /// Absolute monotonic-ms deadline. Filled by `register`.
+    _deadline_ms: i64 = 0,
+    /// First-fire-wins token: whichever of (deadline fires, op completes) swaps
+    /// this false→true owns the wake; the loser is a no-op. Reset per arm.
+    _race: std.atomic.Value(bool) = .init(false),
+    /// Transient `drainExpired` fire-list link; unused while parked.
+    _wake_next: ?*Timeout = null,
+
+    /// didFire would return true if timeout did fire.
+    pub inline fn didFire(t: *Timeout) bool {
+        return t._fired.load(.acquire);
+    }
+    /// Win the first-fire race: true if THIS caller claimed it, false if
+    /// already claimed. Used by `drainExpired` and op-completes-first paths.
+    pub fn winRace(t: *Timeout) bool {
+        return !t._race.swap(true, .acq_rel);
+    }
+
+    /// reset sets the _done to false, so the caller can claim it and win the
+    /// race to wake up the fiber.
+    pub fn reset(t: *Timeout) void {
+        t._fired = .init(false);
+        t._race = .init(false);
+    }
+};
+
+/// Placeholder `on_fire` for an unarmed fiber timeout. A timed op installs the
+/// real callback (`deadlines.fiberTimedOut`) when it arms; an unarmed timeout is
+/// never in a heap, so this must never run — make it loud if the invariant breaks.
+fn timeoutUnarmed(_: *anyopaque) void {
+    @panic("fiber timeout fired while unarmed (in a deadline heap without being armed)");
+}
 
 pub fn ReturnOf(comptime func: anytype) type {
     return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
@@ -71,8 +121,7 @@ pub fn Ctx(comptime func: anytype) type {
     };
 }
 
-pub const default_stack_max: usize = 1 * 1024 * 1024;
-pub const default_stack_commit: usize = 16 * 1024;
+pub const default_stack_size: usize = 1 * 1024 * 1024;
 
 pub const Priority = enum(u1) {
     normal = 0,
@@ -120,15 +169,50 @@ pub const SpawnOptions = struct {
     worker_id: ?u8 = null,
     lane: Lane = .default,
     priority: Priority = .normal,
-    stack_max: usize = default_stack_max,
-    stack_commit: usize = default_stack_commit,
+    /// Bytes of stack reserved AND fully committed for this fiber. Fixed —
+    /// no on-demand growth, so a body that recurses past this hits the
+    /// guard page and crashes (raise it for deep-recursion bodies). Lazily
+    /// backed, so a large value only costs the pages actually touched.
+    stack_size: usize = default_stack_size,
 };
 
 /// Type-erased fiber body. A typed-args helper lives in `runtime.zig`.
 pub const FiberFn = *const fn (*anyopaque) void;
 
+/// Scheduler self-check level — the single knob for both guards below. Each
+/// level includes all lower ones and adds a costlier corruption tripwire, so
+/// level 2 is for an active hunt, not production.
+///   0 — off.
+///   1 — `runFiber` dispatch guards: the concurrency (`running`) counter + the
+///       ready-state assert (an atomic RMW per dispatch). (`Fiber.assertMagic`
+///       is separate — it's a plain load, so it runs at EVERY level incl. 0.)
+///   2 — + page-protect each fiber's `Coroutine` (saved register context +
+///       stack_info), kept mprotect'd READ-ONLY while the fiber is queued and
+///       writable only across `coro.step()`, so a wild write into a *queued*
+///       fiber's context faults at the exact culprit instruction. The Coroutine
+///       becomes its OWN page-aligned allocation (a `*Coroutine` Fiber field) so
+///       Zig's field reordering can't share its page with mutable scheduler state.
+/// Default: 1 in safety builds, 0 in release. Set to 2 by hand for a
+/// context-corruption hunt.
+pub const guard_level: u8 = switch (builtin.mode) {
+    .Debug, .ReleaseSafe => 1,
+    .ReleaseFast, .ReleaseSmall => 0,
+};
+
+const guard_page: usize = 4096;
+
+/// Magic written into `Fiber.magic` at init and verified at every dispatch via
+/// `assertMagic` (always on). A mismatch means EITHER the struct was clobbered (a wild
+/// write reached the magic) OR `f` doesn't point at a live Fiber (a stale,
+/// freed, or garbage pointer was dispatched). Portable — unlike a "does this
+/// pointer look like a code address" range check, it assumes nothing about
+/// where code or the heap sit in the address space.
+pub const fiber_magic: u64 = 0xF1BE_C0DE_F1BE_C0DE;
+
 pub const Fiber = struct {
-    coro: Coroutine,
+    /// Pointer (guard on) so the Coroutine can sit on its own guarded page;
+    /// inline (guard off) keeps the production layout unchanged.
+    coro: if (guard_level >= 2) *Coroutine else Coroutine,
     /// Saved register state of whoever last called `step`. Stored
     /// inline so its address is stable; `coro.parent_context_ptr`
     /// aliases this field.
@@ -155,6 +239,11 @@ pub const Fiber = struct {
     /// fiber — keeping the wake call inside the runtime avoids a
     /// cyclic `fiber.zig → runtime.zig` import.
     on_finished: *const fn (self: *Fiber) ?*Fiber,
+
+    /// Struct-integrity / live-Fiber magic — see `fiber_magic`. Default-init
+    /// so every Fiber creation writes the magic and freed/reused memory won't
+    /// carry it. Verified at every dispatch via `assertMagic`.
+    magic: u64 = fiber_magic,
 
     state: std.atomic.Value(u8),
     intent: YieldIntent,
@@ -195,6 +284,70 @@ pub const Fiber = struct {
     /// runtime's `appendFiber` / `removeFiber` so swap-remove can find
     /// the fiber in O(1). `maxInt` while not registered.
     registry_index: usize,
+
+    /// This fiber's OWN deadline timeout (see `Timeout`). Reused across every
+    /// timed op — `sleepMs`, watermark timed waits, and future timed I/O. Lives
+    /// here (in the leaked Fiber) instead of on the op's stack so a late fire
+    /// can't dangle. `on_fire`/`on_fire_ctx` are armed by `deadlines.armSelf`.
+    timeout: Timeout,
+
+    /// Queue-membership invariant: 0 = in no ready/global/remote queue,
+    /// 1 = in exactly one. `assertEnQ`/`assertDQ` maintain it and panic
+    /// on a double-queue (→ sequential double-dispatch, which the `running`
+    /// guard can't see) or double-dequeue. Compiled out without
+    /// runtime_safety; atomic because peers touch it cross-thread.
+    qstate: std.atomic.Value(u8) = .init(0),
+
+    /// Fire-and-forget marker — who frees this fiber. `false` (default) for a
+    /// `spawn`ed fiber: it has a `JoinHandle`, and that handle's `join()` is the
+    /// ONLY thing that frees it. The runtime never frees a joined fiber — when
+    /// the body returns it just leaves the fiber `.finished` in the registry for
+    /// `join` to reap (deterministic owner). `true` for a `spawnDetached` fiber:
+    /// it has no handle, so `runFiber` frees it itself when the body returns.
+    /// Set once at spawn, before the fiber can run; never mutated after.
+    detached: bool = false,
+
+    /// Assert this points at a live, un-clobbered Fiber: the magic must still
+    /// read `fiber_magic`. A mismatch means the struct was overwritten by a
+    /// wild write, or `f` is a stale/freed/garbage pointer that isn't a Fiber
+    /// at all. Left ON in every build (including release) — one u64 load +
+    /// compare per dispatch is negligible next to a context switch, and a
+    /// wild-dispatch crash is worth catching in production too. `inline` so
+    /// it's free at the call site.
+    pub inline fn assertMagic(self: *const Fiber) void {
+        if (self.magic != fiber_magic) std.debug.panic(
+            "fiber 0x{x} bad magic=0x{x} (want 0x{x}) — clobbered struct or non-Fiber pointer; state={x}",
+            .{ @intFromPtr(self), self.magic, fiber_magic, self.state.load(.monotonic) },
+        );
+    }
+
+    /// First-fire arbitration for a waker (e.g. `Watermark.advance`/`close`):
+    /// returns true if THIS caller won the right to wake the fiber. When a
+    /// deadline is armed (a timed wait), it competes on the same one-shot token,
+    /// so exactly one of {this waker, the deadline} wins and the loser bows out.
+    /// With no deadline armed there's no competitor, so the waker always wins.
+    /// Call under whatever lock publishes the waiter, so `timeout_armed` is seen.
+    pub inline fn winRace(self: *Fiber) bool {
+        return self.timeout.winRace();
+    }
+
+    pub fn assertEnQ(self: *Fiber) void {
+        if (comptime !std.debug.runtime_safety) return;
+        const prev = self.qstate.swap(1, .acq_rel);
+        if (prev != 0) std.debug.panic(
+            "fiber 0x{x} ENQUEUED while already queued (was {d}) state={x} prio={s}",
+            .{ @intFromPtr(self), prev, self.state.load(.monotonic), @tagName(self.priority) },
+        );
+    }
+
+    pub fn assertDQ(self: *Fiber) void {
+        if (comptime !std.debug.runtime_safety) return;
+        const prev = self.qstate.swap(0, .acq_rel);
+        if (prev != 1) std.debug.panic(
+            "fiber 0x{x} DEQUEUED while not queued (was {d}) state={x} prio={s}",
+            .{ @intFromPtr(self), prev, self.state.load(.monotonic), @tagName(self.priority) },
+        );
+    }
 
     /// Create a fiber that will run `func(args...)`. The args tuple is
     /// copied into a heap-allocated context owned by the Fiber; callers
@@ -242,7 +395,7 @@ pub const Fiber = struct {
 
         const init_state = State{ .tag = .new, .awaken = false };
         self.* = .{
-            .coro = .{
+            .coro = if (comptime guard_level >= 2) try allocCoro() else .{
                 .parent_context_ptr = &self.parent_context,
                 .context = undefined,
             },
@@ -263,22 +416,65 @@ pub const Fiber = struct {
             .waker_prev = null,
             .waker_next = null,
             .registry_index = std.math.maxInt(usize),
+            // Owned timeout: ctx is this (stable) fiber; `on_fire` is a tripwire
+            // until a timed op arms the real one via `deadlines.armSelf`.
+            .timeout = .{ .on_fire = &timeoutUnarmed, .on_fire_ctx = self },
+        };
+        errdefer if (comptime guard_level >= 2) freeCoro(self.coro);
+        if (comptime guard_level >= 2) self.coro.* = .{
+            .parent_context_ptr = &self.parent_context,
+            .context = undefined,
         };
 
         try coro.stackAlloc(
             &self.coro.context.stack_info,
-            opts.stack_max,
-            opts.stack_commit,
+            opts.stack_size, // maximum_size
+            opts.stack_size, // committed_size == maximum: fully committed, never grows
         );
         errdefer coro.stackFree(self.coro.context.stack_info);
 
         self.coro.setup(&fiberEntry, self);
+        // Context fully initialized → lock its page read-only. From here it is
+        // writable only across `coro.step()` (see runtime.runFiber).
+        self.protectContext();
         return self;
+    }
+
+    /// The Coroutine lives in its own page-aligned allocation so its page can be
+    /// mprotect'd independently of the always-mutable scheduler fields.
+    fn allocCoro() !*Coroutine {
+        const total = std.mem.alignForward(usize, @sizeOf(Coroutine), guard_page);
+        const mem = try std.heap.page_allocator.alloc(u8, total);
+        return @ptrCast(@alignCast(mem.ptr));
+    }
+    fn freeCoro(c: *Coroutine) void {
+        mprotectCoro(c, .{ .READ = true, .WRITE = true });
+        const total = std.mem.alignForward(usize, @sizeOf(Coroutine), guard_page);
+        std.heap.page_allocator.free(@as([*]u8, @ptrCast(c))[0..total]);
+    }
+
+    fn mprotectCoro(c: *Coroutine, prot: std.os.linux.PROT) void {
+        // Raw syscall: 0 on success, -errno (as usize) on failure.
+        const rc = std.os.linux.mprotect(@ptrCast(c), guard_page, prot);
+        if (@as(isize, @bitCast(rc)) != 0)
+            std.debug.panic("mprotect coro page failed: rc={d}", .{@as(isize, @bitCast(rc))});
+    }
+
+    /// Make the Coroutine page read-only / read-write. No-op when the guard is
+    /// off. `runtime.runFiber` brackets `coro.step()` with these.
+    pub fn protectContext(self: *Fiber) void {
+        if (comptime guard_level < 2) return;
+        mprotectCoro(self.coro, .{ .READ = true });
+    }
+    pub fn unprotectContext(self: *Fiber) void {
+        if (comptime guard_level < 2) return;
+        mprotectCoro(self.coro, .{ .READ = true, .WRITE = true });
     }
 
     pub fn deinit(self: *Fiber, allocator: std.mem.Allocator) void {
         self.ctx_destroy(self.ctx, allocator);
         coro.stackFree(self.coro.context.stack_info);
+        if (comptime guard_level >= 2) freeCoro(self.coro);
         allocator.destroy(self);
     }
 
@@ -286,7 +482,9 @@ pub const Fiber = struct {
     /// `parent_context` and resumes the fiber. Returns when the fiber
     /// yields or its body returns. Not for use under a Runtime.
     pub fn step(self: *Fiber) void {
+        self.unprotectContext();
         self.coro.step();
+        self.protectContext();
     }
 
     /// Manual mode: fiber -> caller. Jumps back to the most recent

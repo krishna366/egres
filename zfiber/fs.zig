@@ -59,7 +59,7 @@ pub const File = struct {
         var c: xev.Completion = undefined;
         var waiter: ReadWaiter = .{ .fiber = f, .result = 0 };
         xf.pread(&w.loop, &c, .{ .slice = buf }, offset, ReadWaiter, &waiter, preadCallback);
-        rt.park();
+        parkAssertDone(&waiter.done);
         return waiter.result;
     }
 
@@ -72,7 +72,7 @@ pub const File = struct {
         var c: xev.Completion = undefined;
         var waiter: WriteWaiter = .{ .fiber = f, .result = 0 };
         xf.pwrite(&w.loop, &c, .{ .slice = data }, offset, WriteWaiter, &waiter, pwriteCallback);
-        rt.park();
+        parkAssertDone(&waiter.done);
         return waiter.result;
     }
 
@@ -106,12 +106,18 @@ pub const File = struct {
 
         // Single shared waiter. Callbacks run on this worker's loop (one
         // thread), so the `remaining` countdown needs no atomics.
-        var batch: BatchWaiter = .{ .fiber = f, .remaining = ops.len };
+        var batch: BatchWaiter = .{ .fiber = f, .remaining = .init(ops.len) };
         for (ops, comps, ctxs) |*op, *c, *ctx| {
             ctx.* = .{ .batch = &batch, .op = op };
             xf.pread(&w.loop, c, .{ .slice = op.buf }, op.offset, BatchCtx, ctx, batchCallback);
         }
+        // Invariant: the LAST completion (which drives `remaining` to 0) is what
+        // wakes us, so on resume every CQE has been reaped and the stack `comps`
+        // (freed when this frame returns) safely outlived their ops. A resume
+        // with `remaining != 0` is a spurious wake — fail loud at the source.
         rt.park();
+        if (batch.remaining.load(.acquire) != 0)
+            @panic("fs.preadBatch: fiber woken before all reads completed — spurious wake");
     }
 
     /// Flush data + metadata to disk. libxev has no fsync op, so the blocking
@@ -143,7 +149,6 @@ pub const File = struct {
     pub fn close(self: File) void {
         sioFile(self.fd).close(fsops.io());
     }
-
 };
 
 fn syncImpl(fd: SioFile.Handle) !void {
@@ -154,9 +159,20 @@ fn setLengthImpl(fd: SioFile.Handle, length: u64) !void {
     return sioFile(fd).setLength(fsops.io(), length);
 }
 
+fn parkAssertDone(done: *std.atomic.Value(bool)) void {
+    rt.park();
+    // Invariant: resume ONLY when the io_uring completion fired and set `done`.
+    // A resume with `!done` is a spurious wake — fail loud at the source rather
+    // than silently re-parking.
+    if (!done.load(.acquire)) {
+        @panic("fs: fiber woken before its I/O completed — spurious wake");
+    }
+}
+
 const ReadWaiter = struct {
     fiber: *Fiber,
     result: xev.ReadError!usize,
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 fn preadCallback(
@@ -169,6 +185,7 @@ fn preadCallback(
 ) xev.CallbackAction {
     const w = ud.?;
     w.result = r;
+    w.done.store(true, .release);
     rt.wake(w.fiber);
     return .disarm;
 }
@@ -176,6 +193,7 @@ fn preadCallback(
 const WriteWaiter = struct {
     fiber: *Fiber,
     result: xev.WriteError!usize,
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 fn pwriteCallback(
@@ -188,13 +206,17 @@ fn pwriteCallback(
 ) xev.CallbackAction {
     const w = ud.?;
     w.result = r;
+    w.done.store(true, .release);
     rt.wake(w.fiber);
     return .disarm;
 }
 
 const BatchWaiter = struct {
     fiber: *Fiber,
-    remaining: usize,
+    /// Outstanding ops. Atomic: the owner thread decrements it in callbacks,
+    /// but the parked fiber loads it in its re-park loop (it may resume on a
+    /// different worker), so a plain field would be a data race.
+    remaining: std.atomic.Value(usize),
 };
 
 const BatchCtx = struct {
@@ -212,8 +234,8 @@ fn batchCallback(
 ) xev.CallbackAction {
     const ctx = ud.?;
     ctx.op.result = r;
-    ctx.batch.remaining -= 1;
-    if (ctx.batch.remaining == 0) rt.wake(ctx.batch.fiber);
+    // `- 1` returns the OLD value, so the op that drove it to 0 wakes the fiber.
+    if (ctx.batch.remaining.fetchSub(1, .acq_rel) == 1) rt.wake(ctx.batch.fiber);
     return .disarm;
 }
 

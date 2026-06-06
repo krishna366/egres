@@ -116,7 +116,7 @@ pub const IpAddress = struct {
         var c: xev.Completion = undefined;
         var waiter: ConnectWaiter = .{ .fiber = f, .result = {} };
         tcp.connect(&w.loop, &c, self.inner, ConnectWaiter, &waiter, connectCallback);
-        rt.park();
+        parkAssertDone(&waiter.done);
         try waiter.result;
         const stream: Stream = .{ .tcp = tcp };
         // NODELAY is a universal low-latency default — apply it to every
@@ -139,7 +139,7 @@ pub const Server = struct {
         var c: xev.Completion = undefined;
         var waiter: AcceptWaiter = .{ .fiber = f, .result = undefined };
         self.tcp.accept(&w.loop, &c, AcceptWaiter, &waiter, acceptCallback);
-        rt.park();
+        parkAssertDone(&waiter.done);
         const tcp = try waiter.result;
         const stream: Stream = .{ .tcp = tcp };
         stream.setNoDelay(true) catch {}; // low-latency default (see connect)
@@ -325,7 +325,7 @@ fn socketRead(tcp: xev.TCP, buf: []u8) xev.ReadError!usize {
     var c: xev.Completion = undefined;
     var waiter: ReadWaiter = .{ .fiber = f, .result = 0 };
     tcp.read(&w.loop, &c, .{ .slice = buf }, ReadWaiter, &waiter, readCallback);
-    rt.park();
+    parkAssertDone(&waiter.done);
     return waiter.result;
 }
 
@@ -335,7 +335,7 @@ fn socketWrite(tcp: xev.TCP, buf: []const u8) xev.WriteError!usize {
     var c: xev.Completion = undefined;
     var waiter: WriteWaiter = .{ .fiber = f, .result = 0 };
     tcp.write(&w.loop, &c, .{ .slice = buf }, WriteWaiter, &waiter, writeCallback);
-    rt.park();
+    parkAssertDone(&waiter.done);
     return waiter.result;
 }
 
@@ -346,9 +346,21 @@ fn writeAllTcp(tcp: xev.TCP, buf: []const u8) xev.WriteError!void {
     }
 }
 
+/// Park until the op's completion callback has fired (`done`).
+fn parkAssertDone(done: *std.atomic.Value(bool)) void {
+    rt.park();
+    // Invariant: resume ONLY when the io_uring completion fired and set `done`.
+    // A resume with `!done` is a spurious wake — fail loud at the source rather
+    // than silently re-parking.
+    if (!done.load(.acquire)) {
+        @panic("net: fiber woken before its I/O completed — spurious wake");
+    }
+}
+
 const ReadWaiter = struct {
     fiber: *Fiber,
     result: xev.ReadError!usize,
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 fn readCallback(
@@ -361,6 +373,7 @@ fn readCallback(
 ) xev.CallbackAction {
     const w = ud.?;
     w.result = r;
+    w.done.store(true, .release);
     rt.wake(w.fiber);
     return .disarm;
 }
@@ -368,6 +381,7 @@ fn readCallback(
 const WriteWaiter = struct {
     fiber: *Fiber,
     result: xev.WriteError!usize,
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 fn writeCallback(
@@ -380,6 +394,7 @@ fn writeCallback(
 ) xev.CallbackAction {
     const w = ud.?;
     w.result = r;
+    w.done.store(true, .release);
     rt.wake(w.fiber);
     return .disarm;
 }
@@ -387,6 +402,7 @@ fn writeCallback(
 const ConnectWaiter = struct {
     fiber: *Fiber,
     result: xev.ConnectError!void,
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 fn connectCallback(
@@ -398,6 +414,7 @@ fn connectCallback(
 ) xev.CallbackAction {
     const w = ud.?;
     w.result = r;
+    w.done.store(true, .release);
     rt.wake(w.fiber);
     return .disarm;
 }
@@ -405,6 +422,7 @@ fn connectCallback(
 const AcceptWaiter = struct {
     fiber: *Fiber,
     result: xev.AcceptError!xev.TCP,
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 fn acceptCallback(
@@ -415,6 +433,7 @@ fn acceptCallback(
 ) xev.CallbackAction {
     const w = ud.?;
     w.result = r;
+    w.done.store(true, .release);
     rt.wake(w.fiber);
     return .disarm;
 }

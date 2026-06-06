@@ -9,3 +9,9 @@ zig-out/
 .claude/
 
 *.log
+
+# timeout-stress harness scratch file (cwd-relative; normally unlinked on exit,
+# but left behind if the harness panics on a detected bug).
+timeout-stress.io
+
+patches/

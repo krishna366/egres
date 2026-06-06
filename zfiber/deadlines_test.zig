@@ -7,47 +7,56 @@ fn nowMs() i64 {
     return fiber.clockMsUseRarely(.monotonic);
 }
 
-/// Minimal `on_fire` context: record that we fired and wake the waiter.
-/// Mirrors how a real consumer (e.g. the watermark) supplies its own flag
-/// — `Deadlines` itself knows nothing about fibers or flags.
-const Waker = struct {
-    fiber: *fiber.Fiber,
-    fired: std.atomic.Value(bool) = .init(false),
-};
+/// Minimal `on_fire` context: stamps WHEN the timeout fired. `Timeout` is a
+/// pure primitive — `on_fire` can invoke anything — so these tests drive it
+/// directly by recording the fire time, with NO fiber wake/park coupling. That
+/// coupling was a real hazard: a stack `Timeout` whose callback `wake`s a fiber
+/// can fire into a SINCE-FREED fiber (the waiter observes the flag, returns, and
+/// is reclaimed before the callback's `wake` runs) → a spurious wake elsewhere.
+/// Recording a timestamp can't dangle. `at_ms == 0` means "not fired yet".
+const Fired = struct {
+    at_ms: std.atomic.Value(i64) = .init(0),
 
-fn wakeCb(ptr: *anyopaque) void {
-    const wk: *Waker = @ptrCast(@alignCast(ptr));
-    wk.fired.store(true, .release);
-    fiber.wake(wk.fiber);
-}
+    fn cb(ptr: *anyopaque) void {
+        const self: *Fired = @ptrCast(@alignCast(ptr));
+        self.at_ms.store(nowMs(), .release);
+    }
+    fn fired(self: *const Fired) bool {
+        return self.at_ms.load(.acquire) != 0;
+    }
+    fn at(self: *const Fired) i64 {
+        return self.at_ms.load(.acquire);
+    }
+};
 
 test "Deadlines: timer fires after the registered duration" {
     const w = fiber.currentWorker();
     const before = nowMs();
 
-    // Timeout + ctx live on this fiber's stack; valid until the test
-    // returns. We park before that and only resume after the deadline
-    // fires (its on_fire wakes us), so the heap never sees a dangling ptr.
-    var wk: Waker = .{ .fiber = fiber.currentFiber() };
-    var t: fiber.Timeout = .{ .on_fire = &wakeCb, .on_fire_ctx = &wk };
+    // `Timeout` + ctx live on this fiber's stack. `on_fire` only stamps the fire
+    // time — it wakes nobody — so we poll with `sleepMs` (a real deadline park)
+    // until it fires. A fired timeout is already out of the heap, so `defer
+    // cancel` is a no-op and nothing dangles when the frame unwinds. (Production
+    // code uses the fiber-OWNED timeout; this drives the low-level API directly.)
+    var f: Fired = .{};
+    var t: fiber.Timeout = .{ .on_fire = &Fired.cb, .on_fire_ctx = &f };
     try w.deadlines.register(&t, 20);
-    fiber.park();
+    defer w.deadlines.cancel(&t);
+    while (!f.fired()) fiber.sleepMs(1);
 
-    const elapsed = nowMs() - before;
-    std.log.debug("elapsed = {d} ms, fired = {} (registered for 20 ms)", .{ elapsed, wk.fired.load(.acquire) });
-    try std.testing.expect(wk.fired.load(.acquire));
+    const elapsed = f.at() - before;
+    std.log.debug("fired after {d} ms (registered for 20 ms)", .{elapsed});
     try std.testing.expect(elapsed >= 18);
     try std.testing.expect(elapsed < 200);
 }
 
 test "Deadlines: cancel(t) before fire prevents the timer" {
     const w = fiber.currentWorker();
-    const me = fiber.currentFiber();
 
-    var wk_canceled: Waker = .{ .fiber = me };
-    var wk_wake: Waker = .{ .fiber = me };
-    var t_canceled: fiber.Timeout = .{ .on_fire = &wakeCb, .on_fire_ctx = &wk_canceled };
-    var t_wake: fiber.Timeout = .{ .on_fire = &wakeCb, .on_fire_ctx = &wk_wake };
+    var f_canceled: Fired = .{};
+    var f_wake: Fired = .{};
+    var t_canceled: fiber.Timeout = .{ .on_fire = &Fired.cb, .on_fire_ctx = &f_canceled };
+    var t_wake: fiber.Timeout = .{ .on_fire = &Fired.cb, .on_fire_ctx = &f_wake };
 
     // Register the to-be-canceled one first (earlier — it's the heap head +
     // the in-flight timer's target). Cancel it, then register a later
@@ -55,11 +64,11 @@ test "Deadlines: cancel(t) before fire prevents the timer" {
     try w.deadlines.register(&t_canceled, 5);
     w.deadlines.cancel(&t_canceled);
     try w.deadlines.register(&t_wake, 30);
+    defer w.deadlines.cancel(&t_wake);
+    while (!f_wake.fired()) fiber.sleepMs(1);
 
-    fiber.park();
-
-    try std.testing.expect(wk_wake.fired.load(.acquire));
-    try std.testing.expect(!wk_canceled.fired.load(.acquire));
+    try std.testing.expect(f_wake.fired());
+    try std.testing.expect(!f_canceled.fired());
 }
 
 test "Deadlines: re-arm to earlier deadline registered after a later one" {
@@ -68,30 +77,25 @@ test "Deadlines: re-arm to earlier deadline registered after a later one" {
     // didn't happen, both timers would fire together at ~40 ms — the
     // short-deadline wall-time assertion catches that bug.
     const w = fiber.currentWorker();
-    const me = fiber.currentFiber();
     const now = nowMs();
 
-    var wk_long: Waker = .{ .fiber = me };
-    var wk_short: Waker = .{ .fiber = me };
-    var t_long: fiber.Timeout = .{ .on_fire = &wakeCb, .on_fire_ctx = &wk_long };
-    var t_short: fiber.Timeout = .{ .on_fire = &wakeCb, .on_fire_ctx = &wk_short };
+    var f_long: Fired = .{};
+    var f_short: Fired = .{};
+    var t_long: fiber.Timeout = .{ .on_fire = &Fired.cb, .on_fire_ctx = &f_long };
+    var t_short: fiber.Timeout = .{ .on_fire = &Fired.cb, .on_fire_ctx = &f_short };
 
     try w.deadlines.register(&t_long, 40); // arms timer for 40 ms
     try w.deadlines.register(&t_short, 10); // must reset to 10 ms
+    // We poll until both fire (and thus leave the heap); defer-cancel guarantees
+    // no stack `Timeout` lingers if the test exits early. Each `on_fire` stamps
+    // its own fire time — more accurate than a post-wake read, and wakes nobody.
+    defer w.deadlines.cancel(&t_long);
+    defer w.deadlines.cancel(&t_short);
 
-    // Each fire wakes us; record the resume time of each (≈ its fire time)
-    // and loop until both have fired.
-    var short_at: i64 = 0;
-    var long_at: i64 = 0;
-    while (short_at == 0 or long_at == 0) {
-        fiber.park();
-        const t = nowMs();
-        if (short_at == 0 and wk_short.fired.load(.acquire)) short_at = t;
-        if (long_at == 0 and wk_long.fired.load(.acquire)) long_at = t;
-    }
+    while (!f_short.fired() or !f_long.fired()) fiber.sleepMs(1);
 
-    const short_elapsed = short_at - now;
-    const long_elapsed = long_at - now;
+    const short_elapsed = f_short.at() - now;
+    const long_elapsed = f_long.at() - now;
     std.log.debug("short_elapsed = {d} ms (expected 8 <= ... < 25), long_elapsed = {d} ms (expected 35 <= ... < 250)", .{ short_elapsed, long_elapsed });
     // Short fires near 10 ms — if the reset didn't happen, this would be
     // near 40 ms instead. Tight gap catches the "reset didn't happen" bug;
@@ -149,7 +153,7 @@ test "sleepMs: single fiber sleeps for the requested duration" {
     };
 
     const start = fiber.coarseMs();
-    const h = try fiber.spawn(.{}, Body.run, .{});
+    var h = try fiber.spawn(.{}, Body.run, .{});
     h.join();
     const elapsed = fiber.coarseMs() - start;
 

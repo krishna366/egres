@@ -26,12 +26,13 @@ const rt = @import("runtime.zig");
 const Fiber = fb.Fiber;
 
 /// A unit of work on the pool. Embedded in the caller's `run` frame (which
-/// lives on the parked fiber's stack and so outlives the call).
+/// lives on the parked fiber's stack).
 pub const Job = struct {
     /// Runs the work; recovers the caller's frame via `@fieldParentPtr`.
     run_fn: *const fn (*Job) void,
     /// Fiber to wake once `run_fn` returns.
     fiber: *Fiber,
+    done: std.atomic.Value(bool) = .init(false),
     /// Intrusive FIFO link, owned by the pool while queued.
     next: ?*Job = null,
 };
@@ -138,6 +139,7 @@ fn workerLoop() void {
         pool.mu.unlock(io());
 
         job.run_fn(job);
+        job.done.store(true, .release);
         // Cross-thread wake: routes the fiber back to a worker + notifies it.
         rt.wake(job.fiber);
     }
@@ -170,9 +172,19 @@ pub fn run(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Retu
         .result = undefined,
     };
     enqueue(&frame.job);
-    // The pool thread may complete + wake before we park; the runtime's
-    // awaken-token fast path in `park()` handles that race (and provides the
-    // acquire/release ordering that makes `frame.result` visible here).
+    // Loop the park until the pool publishes `done`: the pool may complete +
+    // wake before we park (the awaken-token fast path in `park()` absorbs that),
+    // but a spurious/early wake must NOT let this frame die while the pool still
+    // holds the Job — so re-park until `done`. The acquire load pairs with the
+    // pool's release store to make `frame.result` visible. Mirrors the I/O
+    // waiters' `parkUntilDone` (net.zig / fs.zig).
     rt.park();
+    // Invariant: this fiber parks and resumes ONLY when the pool ran its job and
+    // set `done`. A resume with `!done` is a spurious wake — a bug at its source
+    // (e.g. a stale deadline firing into us), not something to silently re-park
+    // around. Fail loud so the next such regression is caught here.
+    if (!frame.job.done.load(.acquire)) {
+        @panic("fsops: fiber woken before its job completed — spurious wake");
+    }
     return frame.result;
 }

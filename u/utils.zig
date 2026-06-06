@@ -5,6 +5,7 @@ pub const compression = @import("compress.zig");
 pub const hlc = @import("hlc.zig");
 pub const bench = @import("bench.zig");
 pub const context = fiber.context;
+pub const GuardAllocator = @import("guard_allocator.zig").GuardAllocator;
 
 /// WaitGroup provides Go-style Add/Done/Wait synchronization for fiber coroutines.
 ///

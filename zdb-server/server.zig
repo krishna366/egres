@@ -386,11 +386,11 @@ pub const ZdbServer = struct {
 
         log.info("client TCP listener started, accepting connections", .{});
 
-        // Per-connection handlers run on .query, cancelled collectively on
-        // shutdown so in-flight requests don't outlive the listener.
-        var g = fiber.Group(void).init(self.allocator);
-        defer g.deinit();
-
+        // Per-connection handlers are detached: each frees itself when its
+        // connection closes and `handleClient` returns. Without this, the
+        // accumulating handles would pin one ~1 MiB-stack fiber per connection
+        // in the registry for the whole server lifetime. Handlers self-exit on
+        // `isShuttingDown()`, so no collective join is needed at shutdown.
         var conn_id: u64 = 0;
         while (!self.node.isShuttingDown()) {
             const stream = listener.accept(.{}) catch |err| {
@@ -399,9 +399,10 @@ pub const ZdbServer = struct {
             };
             conn_id += 1;
             log.info("accepted client connection #{d}", .{conn_id});
-            g.spawn(.{}, handleClient, .{ self, stream }) catch {
+            fiber.spawnDetached(.{}, handleClient, .{ self, stream }) catch {
                 log.err("failed to spawn handler for connection #{d}", .{conn_id});
                 stream.close();
+                continue;
             };
         }
     }

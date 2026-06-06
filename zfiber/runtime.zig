@@ -57,7 +57,7 @@ const SpawnOptions = fb.SpawnOptions;
 const FiberFn = fb.FiberFn;
 const YieldIntent = fb.YieldIntent;
 
-const LocalQueue = queue.LocalQueue;
+const LockedLocalQueue = queue.LocalQueue(.withlock);
 const GlobalQueue = queue.GlobalQueue;
 const RemoteQueue = queue.RemoteQueue;
 const IdleWorkers = queue.IdleWorkers;
@@ -75,14 +75,10 @@ const refill_batch: usize = 8;
 /// Initial slot count for each lane's GlobalQueue (grows by doubling).
 const global_queue_initial_capacity: usize = 256;
 
-/// Whether the `runFiber` concurrency guard is compiled in. It's a pure
-/// debug assertion (an atomic RMW per dispatch); gated to safety builds
-/// so the locked increment is fully eliminated from unsafe release builds
-/// — used with `if (comptime runfiber_guard)` so no runtime branch remains.
-const runfiber_guard = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => true,
-    .ReleaseFast, .ReleaseSmall => false,
-};
+/// Most fibers a thief takes from one victim in a single steal: half the
+/// local ring, matching `stealInto`'s ceil(size/2) cap. Bounds the thief's
+/// stack scratch buffer in `trySteal`.
+const steal_batch_max: usize = queue.local_queue_capacity / 2;
 
 /// Process-wide singleton runtime. There is exactly one runtime, so
 /// workers carry no backpointer — they and `spawn` resolve it through
@@ -135,11 +131,14 @@ pub const Worker = struct {
     /// once-per-ms `clock.update()` at the top of the run loop. Every
     /// worker drives the clock now, so every worker carries this.
     last_coarse_clock_ticks: u64 = 0,
-    /// Two ready rings, one per `Priority`. Owner-thread only — no work
-    /// stealing, so no locking. `ready[normal]` spills to / refills from
-    /// this lane's GlobalQueue; `ready[high]` is pinned and must not
-    /// overflow (see `scheduleLocal`).
-    ready: [Priority.count]LocalQueue = @splat(.{}),
+    /// Two ready rings, one per `Priority`. Spinlock-guarded
+    /// (`LocalQueue(.withlock)`) so a same-lane peer can steal from the
+    /// `ready[normal]` ring (see `trySteal`). The owner's own push/pop pay an
+    /// uncontended lock (~1.4 ns); `ready[high]` is pinned and never stolen,
+    /// so its lock is always uncontended. `ready[normal]` spills to / refills
+    /// from this lane's GlobalQueue; `ready[high]` must not overflow (see
+    /// `scheduleLocal`).
+    ready: [Priority.count]LockedLocalQueue = @splat(.{}),
 
     /// Cross-thread fiber injection. Pushed to by peer workers /
     /// external threads via `RemoteQueue.push`; drained by this
@@ -181,8 +180,9 @@ pub const Worker = struct {
     /// high priority panics (it's pinned and expected to fit); normal
     /// priority spills to this lane's GlobalQueue and pokes an idle peer.
     pub fn scheduleLocal(self: *Worker, f: *Fiber) void {
+        const is_normal = f.priority == .normal;
         self.ready[@intFromEnum(f.priority)].push(f) catch {
-            if (f.priority == .high) {
+            if (!is_normal) {
                 @panic("high-priority local queue overflow");
             }
             const rt = runtime();
@@ -190,7 +190,17 @@ pub const Worker = struct {
                 @panic("out of memory spilling fiber to global queue");
             };
             rt.notifyIdlePeer(self.lane_idx);
+            return;
         };
+        // Pushed locally. When normal work piles up (>1 queued) wake one idle
+        // lane peer to come steal a share: a peer that already parked won't
+        // otherwise notice a burst that fits within our ring (no spill, no
+        // notify). `claim` is a cheap atomic load when nobody is idle, and
+        // self-limits — each wake clears one idle bit, so we stop once the
+        // lane is busy. High-priority work is pinned and never stolen.
+        if (is_normal and self.ready[@intFromEnum(Priority.normal)].len() >= 2) {
+            runtime().notifyIdlePeer(self.lane_idx);
+        }
     }
 
     /// Commit a park that `park()` deferred. Runs on the worker AFTER the
@@ -265,6 +275,45 @@ pub const Worker = struct {
         _ = runtime().global[self.lane_idx].popBatchTo(dest, @min(room, refill_batch));
     }
 
+    /// Try to refill our (empty) normal ring by stealing a batch from a
+    /// busy peer in the SAME lane. Returns true if any work moved. Only
+    /// normal-priority work is stealable — high priority is pinned to its
+    /// home worker and never touched. Visits lane peers starting just past
+    /// ourselves (rotating by lane offset) so concurrent thieves spread
+    /// across victims instead of dogpiling the lane's first worker. The
+    /// stolen fibers are enqueued via `scheduleLocal` (NOT while holding the
+    /// victim's lock — `stealInto` already released it), so overflow spills
+    /// to the global queue through the normal path.
+    fn trySteal(self: *Worker) bool {
+        const rt = runtime();
+        if (!rt.steal_enabled) return false; // stealing disabled (InitOptions.steal)
+        const range = rt.lane_ranges[self.lane_idx];
+        if (range.len <= 1) return false; // lane has no peers to steal from
+
+        var buf: [steal_batch_max]*Fiber = undefined;
+        const me = self.laneOffset();
+        var k: u8 = 1;
+        while (k < range.len) : (k += 1) {
+            const off: u8 = @intCast((@as(usize, me) + k) % @as(usize, range.len));
+            const victim = &rt.workers[@as(usize, range.start) + off];
+            const n = victim.ready[@intFromEnum(Priority.normal)].stealInto(buf[0..]);
+            if (n == 0) continue;
+            for (buf[0..n]) |f| {
+                if (comptime fb.guard_level >= 1) {
+                    // The stolen fiber must be runnable in the victim's ring.
+                    const st = f.loadState();
+                    if (st.tag != .ready) std.debug.panic(
+                        "stole fiber 0x{x} state=.{s} awaken={} from W{d}→W{d} — non-runnable in victim ring",
+                        .{ @intFromPtr(f), @tagName(st.tag), st.awaken, victim.id, self.id },
+                    );
+                }
+                self.scheduleLocal(f);
+            }
+            return true;
+        }
+        return false;
+    }
+
     /// This worker's bit offset within its lane's idle bitmap.
     fn laneOffset(self: *const Worker) u8 {
         return self.id - runtime().lane_ranges[self.lane_idx].start;
@@ -292,12 +341,16 @@ pub const Worker = struct {
             self.wake_async.notify() catch {};
     }
 
-    /// Step one fiber, then handle completion (wake any parked joiner)
-    /// or its yield intent. CPU-time accounting and the periodic libxev
-    /// pump live in the run loop, which brackets this call with
-    /// `readTicks`. No live counting — the runtime keeps running until
-    /// `stop()`; a finished fiber simply leaves the scheduler.
-    fn runFiber(self: *Worker, f: *Fiber) void {
+    /// Step one fiber once. Returns true if its body finished this dispatch.
+    /// Does NOT wake the joiner or free the fiber — `Worker.run` does both AFTER
+    /// charging CPU time, so the per-fiber charge can't touch a fiber a joiner
+    /// (or the detached-free) already reclaimed. A non-finished fiber is
+    /// rescheduled / parked here and returns false.
+    fn runFiber(self: *Worker, f: *Fiber) bool {
+        // Catch a clobbered/garbage dispatch BEFORE the step jumps in, on a
+        // valid (the dispatching) stack rather than as a silent SIGSEGV. Always
+        // on — one u64 compare per dispatch is negligible next to the switch.
+        f.assertMagic();
         self.current_fiber = f;
 
         // Concurrency guard, held across the step AND the finish check:
@@ -311,30 +364,46 @@ pub const Worker = struct {
         // spill to the global queue, where a peer may legitimately pick
         // the fiber up the instant we let go.
         const finished = blk: {
-            if (comptime runfiber_guard) {
+            if (comptime fb.guard_level >= 1) {
+                // Claim the step FIRST: if `running` reaches 2 a peer is
+                // concurrently stepping this fiber, so the context reads below
+                // would be a torn-read race. Firing this guard (not the rsp one)
+                // disambiguates "double-step" from "real context corruption".
                 const concurrent = f.running.fetchAdd(1, .acq_rel) + 1;
                 if (concurrent >= 2) std.debug.panic(
                     "fiber 0x{x} stepped concurrently by {d} workers (this worker = {d})",
                     .{ @intFromPtr(f), concurrent, self.id },
                 );
+                // A fiber in a ready ring must be runnable (.ready). If a
+                // non-runnable fiber (.waiting/.finished/.new) reaches dispatch,
+                // a state/queue desync put it there — catch it before the step
+                // corrupts its coro stack. `awaken` may be set (a benign racing
+                // wake token); only `tag` matters.
+                const st = f.loadState();
+                if (st.tag != .ready) std.debug.panic(
+                    "dispatch fiber 0x{x} state=.{s} awaken={} on W{d} — non-runnable fiber in ready ring",
+                    .{ @intFromPtr(f), @tagName(st.tag), st.awaken, self.id },
+                );
             }
-            defer if (comptime runfiber_guard) {
+            defer if (comptime fb.guard_level >= 1) {
                 _ = f.running.fetchSub(1, .release);
             };
 
+            // SEED HUNT: page 0 (saved context) is read-only while queued;
+            // unlock it only for the step itself (which saves/restores rsp/rbp/
+            // rip + parent_context). A wild write while it was queued already
+            // faulted at the culprit. Compiles to nothing when the guard is off.
+            f.unprotectContext();
             f.coro.step();
+            f.protectContext();
             self.current_fiber = null;
 
-            if (f.isFinished()) {
-                // The fiber wrote its result into JoinState; the hook
-                // flips `finished=true` and returns any parked joiner.
-                // We wake it here so `fiber.zig` needn't import the runtime.
-                if (f.on_finished(f)) |waiter| wake(waiter);
-                break :blk true;
-            }
-            break :blk false;
+            break :blk f.isFinished();
         };
-        if (finished) return;
+        // Finished: leave waking the joiner + freeing to `Worker.run` (after it
+        // charges CPU). A finished fiber simply leaves the scheduler — don't
+        // reschedule it.
+        if (finished) return true;
 
         // Guard released and the fiber is now genuinely suspended, so it
         // is safe to make it re-runnable on any worker.
@@ -342,6 +411,7 @@ pub const Worker = struct {
             .reschedule => self.scheduleLocal(f),
             .park => self.commitPark(f),
         }
+        return false;
     }
 
     pub fn run(self: *Worker) void {
@@ -357,10 +427,10 @@ pub const Worker = struct {
         // atomic load on every dispatch.
         tsc_factor_tls = tsc_ns_per_cycle_q32.load(.acquire);
 
-        fb.coro.setupStackGrowth() catch |err| {
-            std.debug.panic("setupStackGrowth failed: {}", .{err});
-        };
-        defer fb.coro.cleanupStackGrowth();
+        // No `coro.setupStackGrowth`: fiber stacks are fully committed at
+        // alloc time and never grow (see `fiber.zig`), so we don't install
+        // the SIGSEGV growth handler. A body that overruns its `stack_size`
+        // hits the guard page → a normal segfault backtrace.
 
         // Every worker advances the process-wide coarse clock from the top
         // of its loop (gated to ~once/ms below). Many drivers means the
@@ -419,13 +489,24 @@ pub const Worker = struct {
             if (!self.remote_queue.isEmpty()) self.drainRemote();
 
             if (self.popNextReady()) |f| {
-                self.runFiber(f);
+                const finished = self.runFiber(f);
                 const exit = readTicks();
                 // Skip the reading if the counter went backwards (thread
                 // migrated mid-step to a CPU with a slightly behind TSC).
                 const cycNs = cyclesToNs(exit -| enter);
                 f.cpu_total_ns +%= cycNs;
                 self.cpu_total_ns +%= cycNs;
+
+                // Body returned: CPU is now charged, so a joiner reading
+                // `cpu_total_ns` sees this final slice — and, crucially, can't
+                // free `f` before we touched it (we wake it only now). Wake any
+                // parked joiner; a JOINED fiber is then freed by its handle's
+                // `join()`. A DETACHED fiber has no handle, so free it here.
+                // `f` must not be touched after this block.
+                if (finished) {
+                    if (f.on_finished(f)) |waiter| wake(waiter);
+                    if (f.detached) runtime().freeFiber(f);
+                }
 
                 // Pump libxev when there's I/O to move, without waiting for the
                 // periodic backstop. Both ring peeks are free userspace reads
@@ -455,24 +536,22 @@ pub const Worker = struct {
             self.refillFromGlobal();
             if (self.hasReady()) continue;
 
-            // TODO(work-stealing): when local + global are both empty, steal a
-            // batch from a busy peer's local ring here before going idle. The
-            // rings are owner-only today (no stealing), so a CPU-bound spawn
-            // burst that fills the spawner's ring serializes on that one worker
-            // while peers sit idle — measured ~14x slower than std.Thread until
-            // fibers are manually pinned one-per-core. Fine for I/O-bound work
-            // (park/wake already redistributes); needed once core-heavy fan-out
-            // matters. A Chase-Lev stealable-deque prototype (LocalQueue with
-            // stealBatchTo, + steal_test.zig) is parked on the
-            // `abandon/task-stealing` branch — resurrect from there.
+            // 2b. Nothing local or global: steal a batch of normal-priority
+            //     work from a busy peer in our lane before going idle. The
+            //     spinlock-guarded rings make this race-free against the
+            //     victim's own push/pop; high priority is pinned and never
+            //     stolen. Fixes the CPU-burst case where a spawn flood fills
+            //     one worker's ring while lane peers sit idle.
+            if (self.trySteal()) continue;
 
             // 3. Still nothing. Mark idle BEFORE a final work-find so a
             //    producer that pushes work and then consults the idle
-            //    bitmap can't slip into the gap (lost wakeup).
+            //    bitmap can't slip into the gap (lost wakeup). Re-steal here
+            //    too: a burst could have landed on a peer since step 2b.
             self.markIdle();
             self.drainRemote();
             self.refillFromGlobal();
-            if (self.hasReady()) {
+            if (self.hasReady() or self.trySteal()) {
                 self.clearIdle();
                 continue;
             }
@@ -530,6 +609,12 @@ pub const InitOptions = struct {
     /// filesystem metadata syscalls. These run blocking ops off the fiber
     /// workers so fibers keep executing. Clamped to a minimum of 1.
     io_threads: usize = 4,
+
+    /// Work stealing. `true` (default): an idle worker steals normal-priority
+    /// work from a busy lane peer. `false`: a fiber runs only on the worker it
+    /// was placed on (no migration) — used by the stress harness to A/B the
+    /// stealing path. High-priority work is pinned regardless.
+    steal: bool = true,
 };
 
 /// Resolve how many workers serve the `.raft` lane, as a fraction of the
@@ -578,6 +663,9 @@ pub const Runtime = struct {
     /// park when idle) — there is no live-fiber counting.
     stopping: std.atomic.Value(bool) = .init(false),
 
+    /// Work stealing on/off (`InitOptions.steal`). Read by `trySteal`.
+    steal_enabled: bool = true,
+
     /// Per-lane admission / overflow queues for normal-priority work.
     /// Indexed by `@intFromEnum(Lane)`.
     global: [Lane.count]GlobalQueue = undefined,
@@ -608,6 +696,7 @@ pub const Runtime = struct {
         self.fibers = .empty;
         self.fibers_sl = .{};
         self.stopping = .init(false);
+        self.steal_enabled = opts.steal;
         self.idle = .{ .{}, .{} };
 
         // Lane layout: raft takes the first worker ids, default the rest —
@@ -689,6 +778,16 @@ pub const Runtime = struct {
             self.fibers.items[idx].registry_index = idx;
         }
         f.registry_index = std.math.maxInt(usize);
+    }
+
+    /// Unregister and free a fiber (struct + ctx + coro stack). Single-owner:
+    /// a JOINED fiber is freed by its handle's `join()`; a DETACHED fiber by
+    /// `Worker.run` when its body returns. The two are mutually exclusive, so
+    /// each fiber is freed exactly once. The caller must hold no reference to
+    /// `f` afterward.
+    fn freeFiber(self: *Runtime, f: *Fiber) void {
+        self.removeFiber(f);
+        f.deinit(self.allocator);
     }
 
     /// Request shutdown: every worker's run loop exits after its current
@@ -800,62 +899,77 @@ fn routeReady(rt: *Runtime, f: *Fiber) void {
 /// `*JoinState(T)` into the fiber's heap context, so `join()` can park
 /// on the result without knowing the args' concrete type.
 ///
-/// Lifetime: the underlying `JoinState(T)` lives as long as the Fiber
-/// (freed by `Fiber.deinit`, which runs on `rt.deinit`). Call `join()`
-/// before tearing down the runtime.
+/// Lifetime: the handle is the fiber's SOLE owner. `join()` is the only thing
+/// that frees the fiber — it waits, captures the result and the fiber's
+/// `cpu_total_ns`, then frees it. Call `join()` exactly once and don't touch the
+/// handle afterward. (Fire-and-forget work that has no handle uses
+/// `spawnDetached`, which frees itself when its body returns.) A handle that is
+/// never joined leaves its fiber in the registry until `Runtime.deinit` sweeps
+/// it — bounded, but not eager.
 pub fn JoinHandle(comptime T: type) type {
     return struct {
         const Self = @This();
 
         fiber: *Fiber,
         state: *fb.JoinState(T),
+        /// Snapshot of `fiber.cpu_total_ns`, captured by `join()` just before
+        /// the fiber is freed, so callers can read CPU accounting post-join
+        /// (when `fiber` is gone). Zero until `join()` returns.
+        cpu_total_ns: u64 = 0,
 
-        /// Block until the fiber's body returns, then return its
-        /// value. Single-joiner: asserts no other fiber is already
-        /// parked on this handle. Must be called from a fiber
-        /// context — `park()` requires `currentFiber()`.
+        /// Block until the fiber's body returns, then return its value. Takes
+        /// `*Self` because it writes `cpu_total_ns` back into the handle. Must
+        /// be called from a fiber context — `park()` requires `currentFiber()`.
         ///
-        /// Idempotent after completion: a `join()` issued after the
-        /// fiber finished sees `.finished` on the fast path and
-        /// returns the cached result without touching the queue.
-        pub fn join(self: Self) T {
-            while (true) {
-                self.state.sl.lock();
-                if (self.fiber.isFinished()) {
-                    self.state.sl.unlock();
-                    return self.state.result;
-                }
-                std.debug.assert(self.state.joiner == null);
-                self.state.joiner = currentFiber();
+        /// CONSUMES the handle: captures the result + `cpu_total_ns`, then frees
+        /// the fiber. Call exactly ONCE. Enqueues-once / parks-once and PANICS on
+        /// a spurious wake — the only legitimate waker of a join-parked fiber is
+        /// the finish hook (`on_finished`), run after the body stored `.finished`
+        /// and cleared `joiner`, so on resume `isFinished()` must hold.
+        pub fn join(self: *Self) T {
+            self.state.sl.lock();
+            if (self.fiber.isFinished()) {
                 self.state.sl.unlock();
-                park();
-                // Loop: re-check. A spurious wake (someone else
-                // happened to call `wake(self)`) just re-parks here.
+                return self.reap();
             }
+            // Single-joiner: no OTHER fiber may already be parked on this handle.
+            std.debug.assert(self.state.joiner == null);
+            self.state.joiner = currentFiber();
+            self.state.sl.unlock();
+
+            park();
+            if (!self.fiber.isFinished()) std.debug.panic(
+                "JoinHandle.join: woken but fiber 0x{x} not finished — spurious wake",
+                .{@intFromPtr(self.fiber)},
+            );
+            return self.reap();
+        }
+
+        /// Capture the fiber's post-run stats + result, then free the fiber.
+        /// Run once the fiber is known finished (fast path or after the park).
+        /// Reads happen BEFORE the free so they can't race it; the returned `T`
+        /// is a value copy that outlives the fiber.
+        fn reap(self: *Self) T {
+            self.cpu_total_ns = self.fiber.cpu_total_ns;
+            const result = self.state.result;
+            runtime().freeFiber(self.fiber);
+            return result;
         }
     };
 }
 
-/// Spawn `func(args...)` as a new fiber on the singleton runtime. The
-/// args tuple is copied into a heap-allocated context owned by the Fiber
-/// (see `Fiber.init`); callers only need to keep alive what the args
-/// point to. Returns a `JoinHandle(T)` where `T` is `func`'s return type
-/// — `join()` retrieves the value once the body finishes.
-///
-/// Priority / addressing contract:
-///   - High priority is pinned and MUST name a `worker_id`. The id is
-///     *lane-relative*: the absolute home worker is
-///     `lane.start + worker_id % lane.len` — e.g. worker_id 3 in a
-///     2-worker raft lane resolves to lane offset 1.
-///   - Normal priority migrates freely within its lane and must NOT name
-///     a `worker_id`.
-/// `lane` selects the worker range (default `.default`, the fallback when
-/// the requested lane has no workers).
-pub fn spawn(
+/// Shared spawn body: init the fiber, register it, and make it runnable.
+/// `detached` (comptime) marks the fiber so `Worker.run` frees it on finish (it
+/// has no handle) — set BEFORE `routeReady` so a fiber that runs and finishes
+/// immediately is still freed. Returns the registered, runnable fiber. When
+/// `detached`, the caller must NOT touch the returned fiber: it may already have
+/// finished and been freed.
+fn spawnInner(
     opts: SpawnOptions,
     comptime func: anytype,
     args: std.meta.ArgsTuple(@TypeOf(func)),
-) !JoinHandle(fb.ReturnOf(func)) {
+    comptime detached: bool,
+) !*Fiber {
     const rt = runtime();
     switch (opts.priority) {
         .high => std.debug.assert(opts.worker_id != null),
@@ -872,17 +986,54 @@ pub fn spawn(
         f.home_worker_id = range.start + (opts.worker_id.? % range.len);
     }
 
+    if (detached) f.detached = true;
+
     try rt.appendFiber(f);
-
     f.state.store(@bitCast(State{ .tag = .ready, .awaken = false }), .release);
-
     routeReady(rt, f);
+    return f;
+}
 
-    // Same comptime-generated Ctx type Fiber.init used to allocate
-    // `f.ctx`. Accessing `&ctx.state` by name lets Zig compute the
-    // offset — no dependence on field order in `Ctx`.
+/// Spawn `func(args...)` as a new fiber on the singleton runtime. The args
+/// tuple is copied into a heap-allocated context owned by the Fiber (see
+/// `Fiber.init`); callers only need to keep alive what the args point to.
+/// Returns a `JoinHandle(T)` where `T` is `func`'s return type — you MUST
+/// `join()` it (exactly once) to retrieve the value and free the fiber. A
+/// never-joined handle leaves its fiber in the registry until `Runtime.deinit`.
+///
+/// Priority / addressing contract:
+///   - High priority is pinned and MUST name a `worker_id`. The id is
+///     *lane-relative*: the absolute home worker is
+///     `lane.start + worker_id % lane.len` — e.g. worker_id 3 in a
+///     2-worker raft lane resolves to lane offset 1.
+///   - Normal priority migrates freely within its lane and must NOT name
+///     a `worker_id`.
+/// `lane` selects the worker range (default `.default`, the fallback when
+/// the requested lane has no workers).
+pub fn spawn(
+    opts: SpawnOptions,
+    comptime func: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(func)),
+) !JoinHandle(fb.ReturnOf(func)) {
+    const f = try spawnInner(opts, func, args, false);
+    // Same comptime-generated Ctx type Fiber.init used to allocate `f.ctx`.
+    // Accessing `&ctx.state` by name lets Zig compute the offset — no dependence
+    // on field order in `Ctx`. Safe to deref: a non-detached fiber is freed only
+    // by `join()`, so it can't have freed itself even if it already ran.
     const ctx: *fb.Ctx(func) = @ptrCast(@alignCast(f.ctx));
     return .{ .fiber = f, .state = &ctx.state };
+}
+
+/// Like `spawn`, but returns NO handle: the fiber frees itself (via
+/// `Worker.run`) when its body returns. For fire-and-forget work whose result
+/// you don't need (e.g. per-connection handlers). Any value `func` returns is
+/// dropped. Same priority/addressing contract as `spawn`.
+pub fn spawnDetached(
+    opts: SpawnOptions,
+    comptime func: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(func)),
+) !void {
+    _ = try spawnInner(opts, func, args, true);
 }
 
 pub fn yield() void {

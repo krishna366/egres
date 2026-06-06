@@ -27,36 +27,21 @@ const Allocator = std.mem.Allocator;
 const Entry = struct {
     fiber: *Fiber,
     target: u64,
-    /// Non-null for a timed wait. Lets `advance`/`close` claim the
-    /// timeout's first-fire token before waking, so the deadline can't
-    /// also act on a waiter that's already being woken (and vice-versa).
-    timeout: ?*dd.Timeout = null,
+    /// Set to true if this entry was removed from waiters. Avoids an O(N) loop
+    /// for defer removal.
+    removed: bool = false,
 };
 
-/// Per-timed-wait callback context. Lives on the waiter's stack; the
-/// deadline's `on_fire` (run on the owner worker) flips `timed_out` and
-/// wakes the parked fiber, which then self-removes its entry and returns
-/// `error.Timeout`. The "timed out" flag is the watermark's own state —
-/// `Deadlines` knows nothing about it.
-const TimeoutCtx = struct {
-    fiber: *Fiber,
-    timed_out: std.atomic.Value(bool) = .init(false),
-};
-
-fn timeoutFire(ptr: *anyopaque) void {
-    const ctx: *TimeoutCtx = @ptrCast(@alignCast(ptr));
-    // Release-store before the wake so the resumed waiter observes it;
-    // touch nothing after `wake` — the fiber may free `ctx`'s frame at once.
-    ctx.timed_out.store(true, .release);
-    rt.wake(ctx.fiber);
-}
+// Timed waits arm the waiter fiber's OWN `Fiber.timeout` (via
+// `deadlines.armSelf`) and detect a fire through the `Fiber.timed_out`
+// generation — no per-wait stack `Timeout`/ctx, so a late fire can't dangle.
 
 pub const Watermark = struct {
     allocator: Allocator,
     value: std.atomic.Value(u64) = .init(0),
     closed: std.atomic.Value(bool) = .init(false),
     sl: Spinlock = .{},
-    waiters: std.ArrayList(Entry) = .empty,
+    waiters: std.ArrayList(*Entry) = .empty,
 
     pub fn init(allocator: Allocator) Watermark {
         return .{ .allocator = allocator };
@@ -113,74 +98,70 @@ pub const Watermark = struct {
         return self.waitForImpl(target, timeout_ms);
     }
 
-    /// Shared wait loop. `timeout_ms == null` is the untimed wait (no
-    /// `Deadlines` entry at all); a value arms a per-worker deadline that
-    /// fires, sets `timed_out`, and wakes us. `advance`/`close` and the
-    /// deadline arbitrate via the timeout's first-fire `claim()` so exactly
-    /// one of them wakes us — the loser never touches our stack frame.
+    /// Shared wait body. `timeout_ms == null` is the untimed wait (no `Deadlines`
+    /// entry); a value arms a per-worker deadline that fires, bumps `timed_out`,
+    /// and wakes us. Enqueues ONCE and parks ONCE: a parked waiter has exactly
+    /// three legitimate wakers — `advance` (sets `value >= target`), `close`
+    /// (sets `closed`), and the deadline (bumps `timed_out`) — each setting its
+    /// condition BEFORE the wake. So on resume one must hold; a wake with none is
+    /// a spurious wake and panics (a park must only return for a real reason).
     fn waitForImpl(self: *Watermark, target: u64, timeout_ms: ?u64) error{ Closed, Timeout, OutOfMemory }!void {
         // Fast paths — skip arming a timer when the answer is already known.
         if (self.value.load(.acquire) >= target) return;
         if (self.closed.load(.acquire)) return error.Closed;
 
         const me = rt.currentFiber();
-        var ctx: TimeoutCtx = .{ .fiber = me };
-        var timeout: dd.Timeout = .{ .on_fire = &timeoutFire, .on_fire_ctx = &ctx };
 
-        // Arm a deadline only for a timed wait. Capture the owning
-        // Deadlines so the cancel targets the same heap even if we resume
-        // on a different worker after migration (`cancel` is spinlock-safe
-        // cross-thread).
-        const owner: ?*dd.Deadlines = if (timeout_ms) |ms| blk: {
-            const o = &rt.currentWorker().deadlines;
-            try o.register(&timeout, ms);
-            break :blk o;
-        } else null;
-        defer if (owner) |o| o.cancel(&timeout);
+        // `armSelf` captures the owning `Deadlines` so `disarmSelf` hits the
+        // same one even after a work-stealing migration.
+        const owner: ?*dd.Deadlines = if (timeout_ms) |ms| try dd.armSelf(me, ms) else null;
+        defer if (owner) |o| dd.disarmSelf(me, o);
 
-        while (true) {
-            if (self.value.load(.acquire) >= target) return;
-            if (self.closed.load(.acquire)) return error.Closed;
-            if (ctx.timed_out.load(.acquire)) {
-                // The deadline woke us and (unlike advance/close) left our
-                // entry queued; pull it before the frame dies. Prefer a
-                // satisfied/closed result if one landed alongside the timer.
-                self.sl.lock();
-                self.removeWaiter(me);
-                self.sl.unlock();
-                if (self.value.load(.acquire) >= target) return;
-                if (self.closed.load(.acquire)) return error.Closed;
-                return error.Timeout;
-            }
-
-            self.sl.lock();
-            // Re-check under sl to close the race between predicate-load
-            // and entry-insert.
-            if (self.value.load(.acquire) >= target) {
-                self.sl.unlock();
-                return;
-            }
-            if (self.closed.load(.acquire)) {
-                self.sl.unlock();
-                return error.Closed;
-            }
-            if (ctx.timed_out.load(.acquire)) {
-                self.sl.unlock();
-                continue; // re-loop to hit the removal branch above
-            }
-            self.waiters.append(self.allocator, .{
-                .fiber = me,
-                .target = target,
-                .timeout = if (timeout_ms != null) &timeout else null,
-            }) catch |err| {
-                self.sl.unlock();
-                return err;
-            };
-            self.sl.unlock();
-            rt.park();
-            // On resume: a waker removed our entry (timed-out path
-            // excepted). Loop and re-check predicate / closed / timed_out.
+        if (timeout_ms == null) {
+            me.timeout.reset();
         }
+
+        // Enqueue ONCE under `sl`, re-checking the predicate to close the
+        // lost-wake race: an advance/close between the fast-path check and the
+        // enqueue takes `sl`, so it is either seen here (we return without
+        // parking) or finds our entry (and wakes us).
+        self.sl.lock();
+        if (self.value.load(.acquire) >= target) {
+            self.sl.unlock();
+            return;
+        }
+        if (self.closed.load(.acquire)) {
+            self.sl.unlock();
+            return error.Closed;
+        }
+        var entry = Entry{
+            .fiber = me,
+            .target = target,
+            .removed = false,
+        };
+        self.waiters.append(self.allocator, &entry) catch |err| {
+            self.sl.unlock();
+            return err;
+        };
+        self.sl.unlock();
+
+        defer if (!entry.removed) {
+            self.sl.lock();
+            self.removeWaiter(me);
+            self.sl.unlock();
+        };
+
+        rt.park();
+
+        // Resumed — exactly one waker condition must hold (see the doc comment).
+        // Prefer a satisfied/closed result over Timeout if both landed.
+        if (self.value.load(.acquire) >= target) return;
+        if (self.closed.load(.acquire)) return error.Closed;
+        if (owner != null and me.timeout.didFire()) return error.Timeout;
+        std.debug.panic(
+            "watermark.waitFor: woken with value={d} < target={d}, not closed, not timed out — spurious wake",
+            .{ self.value.load(.acquire), target },
+        );
     }
 
     /// Remove this fiber's entry from the waiter array if present. Caller
@@ -189,6 +170,7 @@ pub const Watermark = struct {
     fn removeWaiter(self: *Watermark, f: *Fiber) void {
         for (self.waiters.items, 0..) |e, i| {
             if (e.fiber == f) {
+                e.removed = true;
                 _ = self.waiters.swapRemove(i);
                 return;
             }
@@ -212,15 +194,14 @@ pub const Watermark = struct {
                 // waking. If the deadline already claimed it, leave the
                 // entry — the deadline owns the wake and the waiter will
                 // self-remove on resume.
-                if (e.timeout) |t| {
-                    if (!t.claim()) {
-                        i += 1;
-                        continue;
-                    }
+                if (!e.fiber.winRace()) {
+                    i += 1;
+                    continue;
                 }
                 e.fiber.waker_next = to_wake;
                 to_wake = e.fiber;
                 _ = self.waiters.swapRemove(i);
+                e.removed = true;
                 // Don't increment i — the entry now at slot i is
                 // whatever the last element was; we still need
                 // to check it.
@@ -248,15 +229,16 @@ pub const Watermark = struct {
         var i: usize = 0;
         while (i < self.waiters.items.len) {
             const e = self.waiters.items[i];
-            if (e.timeout) |t| {
-                if (!t.claim()) {
-                    i += 1;
-                    continue;
-                }
+            // Win the first-fire token (no-op claim for an untimed waiter); if
+            // the deadline already claimed it, leave the entry for it.
+            if (!e.fiber.winRace()) {
+                i += 1;
+                continue;
             }
             e.fiber.waker_next = to_wake;
             to_wake = e.fiber;
             _ = self.waiters.swapRemove(i);
+            e.removed = true;
         }
         self.sl.unlock();
 

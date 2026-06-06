@@ -86,9 +86,9 @@ test "Runtime: CPU accounting per fiber" {
     };
 
     var dummies = [_]u64{ 0, 0, 0 };
-    const h0 = try fiber.spawn(.{}, Body.run, .{&dummies[0]});
-    const h1 = try fiber.spawn(.{}, Body.run, .{&dummies[1]});
-    const h2 = try fiber.spawn(.{}, Body.run, .{&dummies[2]});
+    var h0 = try fiber.spawn(.{}, Body.run, .{&dummies[0]});
+    var h1 = try fiber.spawn(.{}, Body.run, .{&dummies[1]});
+    var h2 = try fiber.spawn(.{}, Body.run, .{&dummies[2]});
 
     h0.join();
     h1.join();
@@ -98,9 +98,11 @@ test "Runtime: CPU accounting per fiber" {
     // own clock_gettime overhead inflate the measured CPU slightly.
     const low: u64 = target_ns * 80 / 100;
     const high: u64 = target_ns * 130 / 100;
-    for ([_]*fiber.Fiber{ h0.fiber, h1.fiber, h2.fiber }) |f| {
-        try std.testing.expect(f.cpu_total_ns >= low);
-        try std.testing.expect(f.cpu_total_ns <= high);
+    // `join()` captured each fiber's cpu_total_ns onto its handle before
+    // freeing the fiber, so read it from the handle (h*.fiber is gone).
+    for ([_]u64{ h0.cpu_total_ns, h1.cpu_total_ns, h2.cpu_total_ns }) |cpu| {
+        try std.testing.expect(cpu >= low);
+        try std.testing.expect(cpu <= high);
     }
 }
 
@@ -120,11 +122,11 @@ test "Runtime: TSC accounting times a fibonacci workload" {
         }
     };
 
-    const h = try fiber.spawn(.{}, Body.run, .{N});
+    var h = try fiber.spawn(.{}, Body.run, .{N});
     const result = h.join();
 
     try std.testing.expectEqual(@as(u64, 317_811), result);
-    try std.testing.expect(h.fiber.cpu_total_ns > 0);
+    try std.testing.expect(h.cpu_total_ns > 0);
 
     // Convert the Q32.32 ns/cycle factor back to a real number and
     // derive an approximate TSC frequency from it.
@@ -140,8 +142,8 @@ test "Runtime: TSC accounting times a fibonacci workload" {
         .{
             N,
             result,
-            h.fiber.cpu_total_ns,
-            @as(f64, @floatFromInt(h.fiber.cpu_total_ns)) / @as(f64, std.time.ns_per_ms),
+            h.cpu_total_ns,
+            @as(f64, @floatFromInt(h.cpu_total_ns)) / @as(f64, std.time.ns_per_ms),
             factor_q32,
             ns_per_cycle,
             tsc_ghz,
@@ -238,7 +240,7 @@ test "Runtime: JoinHandle returns the spawned fiber's value" {
         }
     };
 
-    const ph = try fiber.spawn(.{}, Producer.run, .{21});
+    var ph = try fiber.spawn(.{}, Producer.run, .{21});
     try std.testing.expectEqual(@as(u64, 42), ph.join());
 }
 
@@ -250,7 +252,7 @@ test "Runtime: JoinHandle fast-path after producer already finished" {
     };
 
     std.log.debug("starting spawn\n", .{});
-    const ph = try fiber.spawn(.{}, Producer.run, .{});
+    var ph = try fiber.spawn(.{}, Producer.run, .{});
     std.log.debug("fiber spawn done\n", .{});
     // Yield enough times that the no-op producer finishes first.
     // join() should then take the fast path (sees .finished, returns
@@ -272,7 +274,7 @@ test "Runtime: JoinHandle(void) blocks for completion without a value" {
         }
     };
 
-    const ph = try fiber.spawn(.{}, Producer.run, .{&produced});
+    var ph = try fiber.spawn(.{}, Producer.run, .{&produced});
     ph.join();
     try std.testing.expect(produced);
 }
@@ -292,7 +294,7 @@ test "Runtime: dumpFibers reflects a parked fiber and prints its trace" {
     var producer_handle: ?*fiber.Fiber = null;
     var parked = std.atomic.Value(bool).init(false);
     var p_ctx = Producer{ .out = &producer_handle, .parked = &parked };
-    const ph = try fiber.spawn(.{}, Producer.run, .{&p_ctx});
+    var ph = try fiber.spawn(.{}, Producer.run, .{&p_ctx});
 
     // Wait until the producer flags intent-to-park, then sleep so it
     // actually reaches `park()` and the worker commits it to `.waiting`

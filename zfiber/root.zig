@@ -10,8 +10,7 @@ pub const xev = @import("xev");
 const fb = @import("fiber.zig");
 
 pub const coro = fb.coro;
-pub const default_stack_max = fb.default_stack_max;
-pub const default_stack_commit = fb.default_stack_commit;
+pub const default_stack_size = fb.default_stack_size;
 pub const Priority = fb.Priority;
 pub const Lane = fb.Lane;
 pub const Tag = fb.Tag;
@@ -37,6 +36,7 @@ pub const Timeout = rt.Timeout;
 pub const Stats = rt.Stats;
 pub const JoinHandle = rt.JoinHandle;
 pub const spawn = rt.spawn;
+pub const spawnDetached = rt.spawnDetached;
 pub const yield = rt.yield;
 pub const park = rt.park;
 pub const wake = rt.wake;
@@ -52,6 +52,13 @@ pub const tscNsPerCycleQ32 = rt.tscNsPerCycleQ32;
 
 // Lower-level data structure used by `Deadlines`.
 pub const heap = @import("heap.zig");
+
+// Per-worker ready queue + its lock-mode constructor. Exported so benches can
+// measure `LocalQueue(.none)` vs `LocalQueue(.withlock)` (the runtime uses
+// `.none`); the scheduler reaches `queue.zig` directly.
+const queue = @import("queue.zig");
+pub const LocalQueue = queue.LocalQueue;
+pub const QueueLockMode = queue.LockMode;
 
 // Sync primitives built on `park` / `wake`. `Mutex`/`RWMutex` are
 // type constructors: `Mutex(.tracked)` records its holder for `dumpLocks`,
@@ -85,7 +92,8 @@ pub const Watermark = watermark_mod.Watermark;
 // `utils.context` for existing callers). `coarse_clock` reads `context.g().io`.
 pub const context = @import("context.zig");
 
-// `sleepMs` lives in deadlines.zig — it parks on the per-worker Deadlines heap.
+// `sleepMs` lives in deadlines.zig — it parks on the per-worker Deadlines array
+// and PANICS on a spurious wake (resumed before its own deadline fired).
 pub const sleepMs = @import("deadlines.zig").sleepMs;
 
 // From fs.zig — file I/O that cooperatively parks (zio.File/Dir-compatible).

@@ -34,8 +34,8 @@ test "net.tcp: raw writeAll/readAll echo" {
     var ok = false;
     var sctx = ServerCtx{ .server = &server };
     var cctx = ClientCtx{ .addr = .{ .inner = server.bound_addr }, .ok = &ok };
-    const sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
-    const ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
+    var sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
+    var ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
     ch.join();
     sh.join();
 
@@ -85,8 +85,8 @@ test "net.tcp: reader/writer std.Io adapter round-trips a length-prefixed frame"
     var ok = false;
     var sctx = ServerCtx{ .server = &server, .got = &got, .ok = &ok };
     var cctx = ClientCtx{ .addr = .{ .inner = server.bound_addr } };
-    const sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
-    const ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
+    var sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
+    var ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
     ch.join();
     sh.join();
 
@@ -132,8 +132,8 @@ test "net.tcp: reader adapter takeDelimiterInclusive (internal-buffer fill path)
     var ok = false;
     var sctx = ServerCtx{ .server = &server, .line1 = &line1, .line2 = &line2, .ok = &ok };
     var cctx = ClientCtx{ .addr = .{ .inner = server.bound_addr } };
-    const sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
-    const ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
+    var sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
+    var ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
     ch.join();
     sh.join();
 
@@ -209,7 +209,7 @@ test "net.tcp: echo server with multiple concurrent clients" {
     defer clients.deinit();
     try clients.ensureTotalCapacity(N);
 
-    const acceptor_handle = try fiber.spawn(.{}, AcceptorCtx.run, .{&acceptor_ctx});
+    var acceptor_handle = try fiber.spawn(.{}, AcceptorCtx.run, .{&acceptor_ctx});
     for (&client_ctxs, &oks, 0..) |*c, *ok, i| {
         c.* = .{ .addr = .{ .inner = server.bound_addr }, .id = @intCast(i), .ok = ok };
         try clients.spawn(.{}, Client.run, .{c});
@@ -264,8 +264,8 @@ test "net.tcp: large payload echo (256 KiB)" {
     var ok = false;
     var sctx = ServerCtx{ .server = &server, .buf = srv_buf };
     var cctx = ClientCtx{ .addr = .{ .inner = server.bound_addr }, .send = send, .recv = recv, .ok = &ok };
-    const sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
-    const ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
+    var sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
+    var ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
     ch.join();
     sh.join();
     try std.testing.expect(ok);
@@ -324,8 +324,8 @@ test "net.tcp: reader/writer adapter streams several frames over one connection"
     var count: u32 = 0;
     var sctx = ServerCtx{ .server = &server, .count = &count };
     var cctx = ClientCtx{ .addr = .{ .inner = server.bound_addr } };
-    const sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
-    const ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
+    var sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
+    var ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
     ch.join();
     sh.join();
     try std.testing.expectEqual(@as(u32, 5), count);
@@ -369,8 +369,8 @@ test "net.tcp: shutdown(send) makes the peer observe end-of-stream" {
     var got_eof = false;
     var sctx = ServerCtx{ .server = &server };
     var cctx = ClientCtx{ .addr = .{ .inner = server.bound_addr }, .data_ok = &data_ok, .got_eof = &got_eof };
-    const sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
-    const ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
+    var sh = try fiber.spawn(.{}, ServerCtx.run, .{&sctx});
+    var ch = try fiber.spawn(.{}, ClientCtx.run, .{&cctx});
     ch.join();
     sh.join();
     try std.testing.expect(data_ok);
@@ -397,7 +397,7 @@ test "net.tcp: connect to an unused port fails" {
     };
     var connected = false;
     var ctx = Ctx{ .addr = dead, .connected = &connected };
-    const h = try fiber.spawn(.{}, Ctx.run, .{&ctx});
+    var h = try fiber.spawn(.{}, Ctx.run, .{&ctx});
     h.join();
     try std.testing.expect(!connected);
 }
