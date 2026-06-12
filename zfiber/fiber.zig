@@ -26,6 +26,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const spinlock = @import("spinlock.zig");
+const rt = @import("runtime.zig");
 
 pub const coro = zio.coro;
 const Coroutine = coro.Coroutine;
@@ -87,19 +88,20 @@ pub fn ReturnOf(comptime func: anytype) type {
 /// args context, so a `JoinHandle(T)` can recover `*JoinState(T)` from
 /// `fiber.arg` via a plain pointer cast — without knowing the args'
 /// concrete type. The trampoline writes `result`; the runtime's
-/// `on_finished` hook captures any parked joiner under `sl`. The
-/// "is the fiber done" signal lives on `Fiber.state.tag` already, so
-/// there's no separate finished flag here.
+/// `on_finished` hook captures any parked joiner under `sl`.
 pub fn JoinState(comptime T: type) type {
     return struct {
         /// User function's return value. Written by the trampoline
         /// just before the fiber's body returns; visible to `join()`
-        /// once it observes `Fiber.state.tag == .finished` (whose
-        /// release-store happens after the trampoline's write).
+        /// once it observes `released` under `sl`.
         result: T = undefined,
         /// At most one fiber parks here; `join()` asserts the slot
         /// is empty before claiming it.
         joiner: ?*Fiber = null,
+        /// Set under `sl` by the runtime's on-finished hook — the
+        /// worker's LAST touch of the Fiber. `join()`'s fast path may
+        /// only reap (and free the fiber) once it observes this.
+        released: bool = false,
         /// Serializes the "check fiber finished / register joiner"
         /// critical section in `join()` against the on-finished
         /// hook's "read and clear joiner" critical section.
@@ -107,10 +109,76 @@ pub fn JoinState(comptime T: type) type {
     };
 }
 
+/// Typed handle returned by `spawn`. Wraps the fiber pointer and a
+/// `*JoinState(T)` into the fiber's heap context, so `join()` can park
+/// on the result without knowing the args' concrete type.
+///
+/// Call `join()` exactly once and don't touch the
+/// handle afterward. (Fire-and-forget work that has no handle uses
+/// `spawnDetached`, which frees itself when its body returns.) A handle that is
+/// never joined leaves its fiber in the registry until `Runtime.deinit` sweeps
+/// it — bounded, but not eager.
+pub fn JoinHandle(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        fiber: *Fiber,
+        state: *JoinState(T),
+        /// Snapshot of `fiber.cpu_total_ns`, captured by `join()` just before
+        /// the fiber is freed, so callers can read CPU accounting post-join
+        /// (when `fiber` is gone). Zero until `join()` returns.
+        cpu_total_ns: u64 = 0,
+
+        /// Block until the fiber's body returns, then return its value. Takes
+        /// `*Self` because it writes `cpu_total_ns` back into the handle. Must
+        /// be called from a fiber context — `park()` requires `currentFiber()`.
+        ///
+        /// CONSUMES the handle: captures the result + `cpu_total_ns`, then frees
+        /// the fiber. Call exactly ONCE. Enqueues-once / parks-once and PANICS on
+        /// a spurious wake — the only legitimate waker of a join-parked fiber is
+        /// the finish hook (`on_finished`), run after the body stored `.finished`
+        /// and cleared `joiner`, so on resume `isFinished()` must hold.
+        pub fn join(self: *Self) T {
+            self.state.sl.lock();
+            // Fast path keys on `released` (the worker's last touch), NOT
+            // `isFinished()`: the body sets `.finished` while the worker
+            // still has CPU charging + the on-finished hook to run, so
+            // reaping on the tag alone frees the fiber under its feet. A
+            // join landing in that window parks instead; the hook wakes it.
+            if (self.state.released) {
+                self.state.sl.unlock();
+                return self.reap();
+            }
+            // Single-joiner: no OTHER fiber may already be parked on this handle.
+            std.debug.assert(self.state.joiner == null);
+            self.state.joiner = rt.currentFiber();
+            self.state.sl.unlock();
+
+            rt.park();
+            if (!self.fiber.isFinished()) std.debug.panic(
+                "JoinHandle.join: woken but fiber 0x{x} not finished — spurious wake",
+                .{@intFromPtr(self.fiber)},
+            );
+            return self.reap();
+        }
+
+        /// Capture the fiber's post-run stats + result, then free the fiber.
+        /// Run once the fiber is known finished (fast path or after the park).
+        /// Reads happen BEFORE the free so they can't race it; the returned `T`
+        /// is a value copy that outlives the fiber.
+        fn reap(self: *Self) T {
+            self.cpu_total_ns = self.fiber.cpu_total_ns;
+            const result = self.state.result;
+            rt.runtime().freeFiber(self.fiber);
+            return result;
+        }
+    };
+}
+
 /// Heap-allocated context attached to every Fiber. Holds the join
-/// sync state plus the user's args tuple. Defined here so `spawn`
+/// state plus the user's args tuple. Defined here so `spawn`
 /// (in `runtime.zig`) and `Fiber.init` can resolve the same
-/// comptime type via `Ctx(func)` and access `sync`/`args` by name
+/// comptime type via `Ctx(func)` and access `state`/`args` by name
 /// without depending on field order.
 pub fn Ctx(comptime func: anytype) type {
     const T = ReturnOf(func);
@@ -220,10 +288,10 @@ pub const Fiber = struct {
 
     /// Trampoline generated by `init`. Unwraps `ctx` (a heap-allocated
     /// `Ctx { state: JoinState(T), args: ArgsTuple }`) and invokes the
-    /// user's typed function, writing the result into `sync.result`.
+    /// user's typed function, writing the result into `state.result`.
     func: FiberFn,
-    /// Heap-allocated args+sync context. Owned by this Fiber; freed by
-    /// `ctx_destroy` on `deinit`. Starts with `JuinSync(T)` so a
+    /// Heap-allocated args+join-state context. Owned by this Fiber; freed
+    /// by `ctx_destroy` on `deinit`. Starts with `JoinState(T)` so a
     /// `JoinHandle(T)` can recover `*JoinState(T)` via a plain
     /// `@ptrCast(@alignCast(ctx))`.
     ctx: *anyopaque,
@@ -234,10 +302,10 @@ pub const Fiber = struct {
     ctx_destroy: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     /// Fires after the fiber's body returns (state == .finished).
     /// Generated at `init` time so it knows the JoinState layout. Sets
-    /// `sync.finished = true` and returns the captured joiner (or
-    /// null). The *worker* performs the actual `wake` on the returned
-    /// fiber — keeping the wake call inside the runtime avoids a
-    /// cyclic `fiber.zig → runtime.zig` import.
+    /// `state.released = true` under the join lock and returns the
+    /// captured joiner (or null). The *worker* performs the actual
+    /// `wake` on the returned fiber — the wake must come AFTER the
+    /// worker's CPU charge, and only `Worker.run` knows when that is.
     on_finished: *const fn (self: *Fiber) ?*Fiber,
 
     /// Struct-integrity / live-Fiber magic — see `fiber_magic`. Default-init
@@ -380,6 +448,7 @@ pub const Fiber = struct {
                 const c: *CtxT = @ptrCast(@alignCast(self.ctx));
                 c.state.sl.lock();
                 defer c.state.sl.unlock();
+                c.state.released = true;
                 const waiter = c.state.joiner;
                 c.state.joiner = null;
                 return waiter;

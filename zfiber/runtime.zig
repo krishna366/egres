@@ -1,8 +1,11 @@
-//! Multi-threaded fiber scheduler with home-worker pinning. The
-//! `Runtime` owns N `Worker`s, each driving its own `xev.Loop` on
-//! its own OS thread (worker 0 on the calling thread, workers
-//! 1..N-1 on `std.Thread.spawn`). A fiber's home worker is set at
-//! spawn time and never changes — no work stealing.
+//! Multi-threaded fiber scheduler. The `Runtime` owns N `Worker`s,
+//! each driving its own `xev.Loop` on its own OS thread (worker 0 on
+//! the calling thread, workers 1..N-1 on `std.Thread.spawn`).
+//! High-priority fibers are pinned to their home worker; normal
+//! priority runs anywhere in its lane — an out-of-work worker steals
+//! from busy lane peers, throttled by a per-lane `num_searching`
+//! count (Go/Tokio style: producers wake at most one searcher at a
+//! time, and the last searcher to find work wakes the next).
 //!
 //! Cross-thread injection: `spawn` / `wake` for a fiber whose home
 //! isn't the current worker pushes via a Treiber-stack `RemoteQueue`
@@ -80,6 +83,11 @@ const global_queue_initial_capacity: usize = 256;
 /// stack scratch buffer in `trySteal`.
 const steal_batch_max: usize = queue.local_queue_capacity / 2;
 
+/// Every this-many dispatches a worker services its lane's GlobalQueue
+/// AHEAD of its local normal ring (see `Worker.nextFiber`). Prime, so the
+/// interval can't resonate with power-of-two queue capacities.
+const global_queue_interval: u32 = 31;
+
 /// Process-wide singleton runtime. There is exactly one runtime, so
 /// workers carry no backpointer — they and `spawn` resolve it through
 /// `runtime()`. Set at the end of `Runtime.init`, cleared by `deinit`.
@@ -103,6 +111,11 @@ pub inline fn coarseMs() i64 {
 /// Contiguous worker-id range owned by a lane. `len == 0` means the
 /// lane has no workers configured; routing falls back to `.default`.
 const LaneRange = struct { start: u8, len: u8 };
+
+/// Cache-line-padded atomic counter; see `Runtime.num_searching`.
+const SearchCount = struct {
+    v: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
+};
 
 pub const Worker = struct {
     /// The worker running on this OS thread. Do NOT read directly — use
@@ -131,6 +144,20 @@ pub const Worker = struct {
     /// once-per-ms `clock.update()` at the top of the run loop. Every
     /// worker drives the clock now, so every worker carries this.
     last_coarse_clock_ticks: u64 = 0,
+    /// Dispatches since the lane's GlobalQueue was last serviced ahead of
+    /// the local normal ring; at `global_queue_interval` it is due
+    /// (fairness — see `nextFiber`).
+    tick: u16 = 0,
+    /// Whether this worker holds a +1 in its lane's `num_searching` — it is
+    /// out stealing, or was woken by a producer to steal. Spans from the
+    /// wake (or running dry) until work is found, NOT just the steal scan:
+    /// the +1 is what suppresses redundant producer wakes while this worker
+    /// travels to the work. Worker-private — only this worker writes it; a
+    /// producer hands the state off via the claimed idle bit (see `unpark`),
+    /// never by touching this field.
+    searching: bool = false,
+    /// xorshift64 state for steal-victim randomization; seeded in `run`.
+    rng_state: u64 = 1,
     /// Two ready rings, one per `Priority`. Spinlock-guarded
     /// (`LocalQueue(.withlock)`) so a same-lane peer can steal from the
     /// `ready[normal]` ring (see `trySteal`). The owner's own push/pop pay an
@@ -195,11 +222,17 @@ pub const Worker = struct {
         // Pushed locally. When normal work piles up (>1 queued) wake one idle
         // lane peer to come steal a share: a peer that already parked won't
         // otherwise notice a burst that fits within our ring (no spill, no
-        // notify). `claim` is a cheap atomic load when nobody is idle, and
-        // self-limits — each wake clears one idle bit, so we stop once the
-        // lane is busy. High-priority work is pinned and never stolen.
-        if (is_normal and self.ready[@intFromEnum(Priority.normal)].len() >= 2) {
-            runtime().notifyIdlePeer(self.lane_idx);
+        // notify). This per-push call is the IGNITION of a search cycle and
+        // is only affordable because `notifyIdlePeer` checks
+        // `num_searching == 0` before doing the actual notify — while a
+        // searcher is out, this costs one atomic load and no wake. Skipped
+        // when stealing is off (a peer couldn't take the work). High
+        // priority is pinned and never stolen.
+        const rt = runtime();
+        if (is_normal and rt.steal_enabled and
+            self.ready[@intFromEnum(Priority.normal)].len() >= 2)
+        {
+            rt.notifyIdlePeer(self.lane_idx);
         }
     }
 
@@ -233,13 +266,24 @@ pub const Worker = struct {
         }
     }
 
-    fn popNextReady(self: *Worker) ?*Fiber {
-        var i: usize = Priority.count;
-        while (i > 0) {
-            i -= 1;
-            if (self.ready[i].pop()) |f| return f;
+    /// Pick the next fiber to dispatch. High priority always first (pinned,
+    /// latency-sensitive). Every `global_queue_interval` dispatches, service
+    /// the lane's GlobalQueue BEFORE the local normal ring: a worker whose
+    /// ring never drains (fibers that yield and re-queue themselves) would
+    /// otherwise starve globally-queued work forever — the local-empty
+    /// refill can't help because a full ring never refills. Same fix as
+    /// Go's "check the global runq every 61 schedules". `tick` resets only
+    /// when the global check actually RUNS — a `% interval == 0` test would
+    /// silently skip the slot whenever a high-priority pop wins that tick,
+    /// and under steady high traffic skip it forever.
+    fn nextFiber(self: *Worker, rt: *Runtime) ?*Fiber {
+        self.tick += 1;
+        if (self.ready[@intFromEnum(Priority.high)].pop()) |f| return f;
+        if (self.tick >= global_queue_interval) {
+            self.tick = 0;
+            if (rt.global[self.lane_idx].popOne()) |f| return f;
         }
-        return null;
+        return self.ready[@intFromEnum(Priority.normal)].pop();
     }
 
     /// Whether any priority's local ready ring holds work. Lets the run
@@ -278,23 +322,26 @@ pub const Worker = struct {
     /// Try to refill our (empty) normal ring by stealing a batch from a
     /// busy peer in the SAME lane. Returns true if any work moved. Only
     /// normal-priority work is stealable — high priority is pinned to its
-    /// home worker and never touched. Visits lane peers starting just past
-    /// ourselves (rotating by lane offset) so concurrent thieves spread
-    /// across victims instead of dogpiling the lane's first worker. The
+    /// home worker and never touched. Visits lane peers from a RANDOM
+    /// start so repeat scans and concurrent thieves decorrelate (Go
+    /// randomizes its steal order, Tokio starts at a random peer). The
     /// stolen fibers are enqueued via `scheduleLocal` (NOT while holding the
     /// victim's lock — `stealInto` already released it), so overflow spills
     /// to the global queue through the normal path.
     fn trySteal(self: *Worker) bool {
         const rt = runtime();
         if (!rt.steal_enabled) return false; // stealing disabled (InitOptions.steal)
+
         const range = rt.lane_ranges[self.lane_idx];
         if (range.len <= 1) return false; // lane has no peers to steal from
 
         var buf: [steal_batch_max]*Fiber = undefined;
         const me = self.laneOffset();
-        var k: u8 = 1;
+        const r: usize = @intCast(self.nextRand() % range.len);
+        var k: usize = 0;
         while (k < range.len) : (k += 1) {
-            const off: u8 = @intCast((@as(usize, me) + k) % @as(usize, range.len));
+            const off: u8 = @intCast((r + k) % range.len);
+            if (off == me) continue;
             const victim = &rt.workers[@as(usize, range.start) + off];
             const n = victim.ready[@intFromEnum(Priority.normal)].stealInto(buf[0..]);
             if (n == 0) continue;
@@ -323,19 +370,79 @@ pub const Worker = struct {
         runtime().idle[self.lane_idx].markIdle(self.laneOffset());
     }
 
-    fn clearIdle(self: *Worker) void {
-        runtime().idle[self.lane_idx].clearIdle(self.laneOffset());
+    /// xorshift64 — cheap per-worker PRNG for steal-victim selection.
+    fn nextRand(self: *Worker) u64 {
+        var x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        return x;
+    }
+
+    /// Try to enter the searching (thief) state. Denied — the caller then
+    /// skips stealing and parks — when stealing is off, the lane has no
+    /// peers, or half the lane is already searching: more thieves than that
+    /// mostly contend on victim spinlocks without finding proportionally
+    /// more work (Go caps spinning Ms at GOMAXPROCS/2, Tokio searchers at
+    /// half the workers). The check-then-add can briefly overshoot the cap
+    /// under a race; both runtimes accept the same slack.
+    fn transitionToSearching(self: *Worker, rt: *Runtime) bool {
+        if (self.searching) return true;
+        if (!rt.steal_enabled) return false;
+
+        const range = rt.lane_ranges[self.lane_idx];
+        if (range.len <= 1) return false;
+
+        const n = &rt.num_searching[self.lane_idx].v;
+        if (2 * n.load(.seq_cst) >= range.len) return false;
+
+        _ = n.fetchAdd(1, .seq_cst);
+        self.searching = true;
+        return true;
+    }
+
+    /// Leave the searching state because we found work. If we were the LAST
+    /// searcher, hand the search to a parked peer (Go's resetspinning →
+    /// wakep, Tokio's transition_from_searching): what we found may not be
+    /// all the work, and with `num_searching` back at zero producers would
+    /// otherwise be the only ones able to restart the search.
+    fn exitSearchAndNotify(self: *Worker, rt: *Runtime, do_notify: bool) void {
+        // No-op unless we hold a +1: the park path calls this
+        // unconditionally, and a worker that was DENIED searching (cap /
+        // steal off / single-worker lane) parks with searching == false —
+        // an unguarded fetchSub would wrap num_searching to maxInt and
+        // permanently suppress every producer wake in the lane.
+        if (!self.searching) return;
+        self.searching = false;
+        if (rt.num_searching[self.lane_idx].v.fetchSub(1, .seq_cst) == 1) {
+            if (do_notify) {
+                rt.notifyIdlePeer(self.lane_idx);
+            }
+        }
+    }
+
+    /// Leave the parked state: atomically take our idle bit back. If a
+    /// producer claimed it first, this wake was deliberate — the producer
+    /// registered us in `num_searching` BEFORE claiming (`notifyIdlePeer`),
+    /// so we wake up already owning a searcher +1 and must adopt the state;
+    /// the dispatch / park paths balance it. A spurious wake (own timer,
+    /// I/O completion, stop) finds the bit still set and just clears it.
+    fn unpark(self: *Worker, rt: *Runtime) void {
+        if (!rt.idle[self.lane_idx].selfClear(self.laneOffset()))
+            self.searching = true;
     }
 
     /// Cross-thread wake: issue the `wake_async` notify (an eventfd write —
     /// a syscall) ONLY if this worker is parked. A busy worker drains its
     /// remote queue every loop pass, so it picks up the just-pushed fiber
-    /// without the syscall. The caller MUST `remote_queue.push` (a LOCKed
-    /// RMW) BEFORE calling this: that push is a full StoreLoad barrier on x86
-    /// ordered before the `isIdle` acquire-load here, and a parking worker
-    /// `markIdle`s before its pre-block `drainRemote`, so the two sides can't
-    /// both miss (Dekker double-check; same protocol the normal-priority path
-    /// relies on).
+    /// without the syscall. The caller MUST `remote_queue.push` BEFORE
+    /// calling this — push-then-peek against the parker's markIdle-then-
+    /// drain is a Dekker pair, closed by the seq_cst `isIdle` load and
+    /// `markIdle` fetchOr (either our load sees the bit and we notify, or
+    /// it ordered before the fetchOr, and then the parker's later drain —
+    /// an RMW swap, so never stale — must see our push). Portable; not
+    /// reliant on x86 locked-RMW fencing.
     inline fn notifyIfParked(self: *Worker) void {
         if (runtime().idle[self.lane_idx].isIdle(self.laneOffset()))
             self.wake_async.notify() catch {};
@@ -458,6 +565,9 @@ pub const Worker = struct {
         const seed_ticks = readTicks();
         self.last_pump_ticks = seed_ticks;
         self.last_coarse_clock_ticks = seed_ticks;
+        // Steal-victim PRNG: TSC entropy, id-mixed so workers starting the
+        // same cycle still diverge; `| 1` keeps the xorshift state nonzero.
+        self.rng_state = (seed_ticks ^ (@as(u64, self.id) << 32)) | 1;
         self.loop.update_now();
 
         const rt = runtime();
@@ -488,7 +598,11 @@ pub const Worker = struct {
             // pending; the cost tracks push frequency, not pass frequency.
             if (!self.remote_queue.isEmpty()) self.drainRemote();
 
-            if (self.popNextReady()) |f| {
+            if (self.nextFiber(rt)) |f| {
+                // A searcher that found work stops searching; the last one
+                // out hands the search to a parked peer (wake chain).
+                if (self.searching) self.exitSearchAndNotify(rt, true);
+
                 const finished = self.runFiber(f);
                 const exit = readTicks();
                 // Skip the reading if the counter went backwards (thread
@@ -498,14 +612,17 @@ pub const Worker = struct {
                 self.cpu_total_ns +%= cycNs;
 
                 // Body returned: CPU is now charged, so a joiner reading
-                // `cpu_total_ns` sees this final slice — and, crucially, can't
-                // free `f` before we touched it (we wake it only now). Wake any
-                // parked joiner; a JOINED fiber is then freed by its handle's
-                // `join()`. A DETACHED fiber has no handle, so free it here.
-                // `f` must not be touched after this block.
+                // `cpu_total_ns` sees this final slice. `on_finished` is our
+                // LAST touch of `f`: it sets `released` under the join lock,
+                // after which (or after the wake below) the joiner may reap
+                // and free `f` at any instant — hence `detached` is read
+                // BEFORE the hook, and nothing touches `f` afterward. A
+                // JOINED fiber is freed by its handle's `join()`; a DETACHED
+                // fiber has no handle, so free it here.
                 if (finished) {
+                    const detached = f.detached;
                     if (f.on_finished(f)) |waiter| wake(waiter);
-                    if (f.detached) runtime().freeFiber(f);
+                    if (detached) runtime().freeFiber(f);
                 }
 
                 // Pump libxev when there's I/O to move, without waiting for the
@@ -536,33 +653,41 @@ pub const Worker = struct {
             self.refillFromGlobal();
             if (self.hasReady()) continue;
 
-            // 2b. Nothing local or global: steal a batch of normal-priority
-            //     work from a busy peer in our lane before going idle. The
-            //     spinlock-guarded rings make this race-free against the
-            //     victim's own push/pop; high priority is pinned and never
-            //     stolen. Fixes the CPU-burst case where a spawn flood fills
-            //     one worker's ring while lane peers sit idle.
-            if (self.trySteal()) continue;
+            // 2b. Nothing local or global: become a searcher (throttled to
+            //     half the lane) and steal a batch of normal-priority work
+            //     from a busy peer. The spinlock-guarded rings make this
+            //     race-free against the victim's own push/pop; high
+            //     priority is pinned and never stolen. A stolen batch lands
+            //     in our ring; the `nextFiber` pop above then exits the
+            //     searching state (chain-notifying a peer if we were last).
+            if (self.transitionToSearching(rt) and self.trySteal()) continue;
 
-            // 3. Still nothing. Mark idle BEFORE a final work-find so a
-            //    producer that pushes work and then consults the idle
-            //    bitmap can't slip into the gap (lost wakeup). Re-steal here
-            //    too: a burst could have landed on a peer since step 2b.
+            // 3. Still nothing. Leave the searching state and mark idle
+            //    BEFORE a final work-recheck, in that order: producers push
+            //    work and THEN consult num_searching / the idle bitmap, so
+            //    re-checking every queue after the decrement + markIdle
+            //    guarantees the two sides can't both miss (Dekker; Go's
+            //    "delicate dance" before stopm, Tokio's
+            //    transition_to_parked recheck). A producer that skipped its
+            //    notify because it saw us searching is covered by exactly
+            //    this recheck.
+            self.exitSearchAndNotify(rt, false);
+
             self.markIdle();
             self.drainRemote();
             self.refillFromGlobal();
             if (self.hasReady() or self.trySteal()) {
-                self.clearIdle();
+                self.unpark(rt);
                 continue;
             }
 
             // 4. Block until a libxev completion (timer / I/O / cross-
-            //    thread async wake, including stop's) fires, then clear
-            //    our idle bit and re-find work on the next pass.
+            //    thread async wake, including stop's) fires, then leave the
+            //    parked state and re-find work on the next pass.
             self.loop.run(.once) catch |err| {
                 std.debug.panic("xev.Loop.run failed: {}", .{err});
             };
-            self.clearIdle();
+            self.unpark(rt);
         }
     }
 };
@@ -675,6 +800,11 @@ pub const Runtime = struct {
     /// Per-lane idle-worker bitmaps; producers `claim` one to wake a
     /// single parked peer in that lane.
     idle: [Lane.count]IdleWorkers = .{ .{}, .{} },
+    /// Per-lane count of workers in the searching (steal) state — the
+    /// Go/Tokio wake throttle. Producers skip the idle-peer wake while a
+    /// searcher is out (see `notifyIdlePeer`); workers cap themselves at
+    /// half the lane (see `transitionToSearching`).
+    num_searching: [Lane.count]SearchCount = @splat(.{}),
 
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
         // num_workers == 0 means "auto" → the CPU core count.
@@ -698,6 +828,7 @@ pub const Runtime = struct {
         self.stopping = .init(false);
         self.steal_enabled = opts.steal;
         self.idle = .{ .{}, .{} };
+        self.num_searching = @splat(.{});
 
         // Lane layout: raft takes the first worker ids, default the rest —
         //   raft    = [0, raft_workers)
@@ -784,8 +915,9 @@ pub const Runtime = struct {
     /// a JOINED fiber is freed by its handle's `join()`; a DETACHED fiber by
     /// `Worker.run` when its body returns. The two are mutually exclusive, so
     /// each fiber is freed exactly once. The caller must hold no reference to
-    /// `f` afterward.
-    fn freeFiber(self: *Runtime, f: *Fiber) void {
+    /// `f` afterward. `pub` only for `JoinHandle.reap` (fiber.zig) — not a
+    /// general API; nothing else may free fibers.
+    pub fn freeFiber(self: *Runtime, f: *Fiber) void {
         self.removeFiber(f);
         f.deinit(self.allocator);
     }
@@ -807,14 +939,39 @@ pub const Runtime = struct {
         return idx;
     }
 
-    /// Wake one parked worker in `lane_idx` to come pull from the global
-    /// queue. `claim` atomically takes a single idle bit, so exactly one
-    /// producer wakes exactly one peer; no-op when none are idle.
+    /// Wake one parked worker in `lane_idx` to come search for work.
+    /// Throttled (Go's wakep, Tokio's notify_parked_local): the
+    /// `num_searching == 0` check MUST run before the actual notify — a
+    /// searcher already out will find the work, or re-check every queue
+    /// after decrementing on its way to park, so nothing strands; per-push
+    /// callers pay one atomic load in that case. Also a no-op when nobody
+    /// is parked (loads only — the all-busy steady state pays no RMW).
+    /// Otherwise the 0→1 increment elects exactly ONE producer, which
+    /// registers the wakee as a searcher FIRST and then CAS-claims one
+    /// idle bit — a woken worker can thus never observe its claimed bit
+    /// (`Worker.unpark`) without the matching +1 already in place.
     fn notifyIdlePeer(self: *Runtime, lane_idx: u8) void {
+        const n = &self.num_searching[lane_idx].v;
+        if (n.load(.seq_cst) > 0) return; // a searcher is already out
+        if (!self.idle[lane_idx].anySet()) return; // nobody parked to wake
+
+        if (n.fetchAdd(1, .seq_cst) != 0) {
+            // Lost the 0→1 election to another producer (or a worker began
+            // searching on its own) — someone is looking; undo, let them.
+            _ = n.fetchSub(1, .seq_cst);
+            return;
+        }
+
+        // num_searching already incremented before reaching self.idle.claim.
         if (self.idle[lane_idx].claim()) |off| {
             const peer_id: usize = @as(usize, self.lane_ranges[lane_idx].start) + off;
             std.debug.assert(peer_id < self.workers.len);
+            // Expensive call: 1us
             self.workers[peer_id].wake_async.notify() catch {};
+        } else {
+            // Everyone un-parked on its own between the peek and the
+            // claim; the +1 has no owner — undo it.
+            _ = n.fetchSub(1, .seq_cst);
         }
     }
 
@@ -895,68 +1052,10 @@ fn routeReady(rt: *Runtime, f: *Fiber) void {
     }
 }
 
-/// Typed handle returned by `spawn`. Wraps the fiber pointer and a
-/// `*JoinState(T)` into the fiber's heap context, so `join()` can park
-/// on the result without knowing the args' concrete type.
-///
-/// Lifetime: the handle is the fiber's SOLE owner. `join()` is the only thing
-/// that frees the fiber — it waits, captures the result and the fiber's
-/// `cpu_total_ns`, then frees it. Call `join()` exactly once and don't touch the
-/// handle afterward. (Fire-and-forget work that has no handle uses
-/// `spawnDetached`, which frees itself when its body returns.) A handle that is
-/// never joined leaves its fiber in the registry until `Runtime.deinit` sweeps
-/// it — bounded, but not eager.
-pub fn JoinHandle(comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        fiber: *Fiber,
-        state: *fb.JoinState(T),
-        /// Snapshot of `fiber.cpu_total_ns`, captured by `join()` just before
-        /// the fiber is freed, so callers can read CPU accounting post-join
-        /// (when `fiber` is gone). Zero until `join()` returns.
-        cpu_total_ns: u64 = 0,
-
-        /// Block until the fiber's body returns, then return its value. Takes
-        /// `*Self` because it writes `cpu_total_ns` back into the handle. Must
-        /// be called from a fiber context — `park()` requires `currentFiber()`.
-        ///
-        /// CONSUMES the handle: captures the result + `cpu_total_ns`, then frees
-        /// the fiber. Call exactly ONCE. Enqueues-once / parks-once and PANICS on
-        /// a spurious wake — the only legitimate waker of a join-parked fiber is
-        /// the finish hook (`on_finished`), run after the body stored `.finished`
-        /// and cleared `joiner`, so on resume `isFinished()` must hold.
-        pub fn join(self: *Self) T {
-            self.state.sl.lock();
-            if (self.fiber.isFinished()) {
-                self.state.sl.unlock();
-                return self.reap();
-            }
-            // Single-joiner: no OTHER fiber may already be parked on this handle.
-            std.debug.assert(self.state.joiner == null);
-            self.state.joiner = currentFiber();
-            self.state.sl.unlock();
-
-            park();
-            if (!self.fiber.isFinished()) std.debug.panic(
-                "JoinHandle.join: woken but fiber 0x{x} not finished — spurious wake",
-                .{@intFromPtr(self.fiber)},
-            );
-            return self.reap();
-        }
-
-        /// Capture the fiber's post-run stats + result, then free the fiber.
-        /// Run once the fiber is known finished (fast path or after the park).
-        /// Reads happen BEFORE the free so they can't race it; the returned `T`
-        /// is a value copy that outlives the fiber.
-        fn reap(self: *Self) T {
-            self.cpu_total_ns = self.fiber.cpu_total_ns;
-            const result = self.state.result;
-            runtime().freeFiber(self.fiber);
-            return result;
-        }
-    };
-}
+/// Lives in `fiber.zig` next to `JoinState`/`onFinished` (the whole join
+/// protocol in one file); re-exported here because the handle is what
+/// `spawn` returns.
+pub const JoinHandle = fb.JoinHandle;
 
 /// Shared spawn body: init the fiber, register it, and make it runnable.
 /// `detached` (comptime) marks the fiber so `Worker.run` frees it on finish (it

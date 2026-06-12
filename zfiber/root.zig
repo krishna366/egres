@@ -20,6 +20,7 @@ pub const SpawnOptions = fb.SpawnOptions;
 pub const FiberFn = fb.FiberFn;
 pub const Fiber = fb.Fiber;
 pub const JoinState = fb.JoinState;
+pub const JoinHandle = fb.JoinHandle;
 pub const ReturnOf = fb.ReturnOf;
 
 // From runtime.zig — the scheduler.
@@ -34,7 +35,6 @@ pub const ClockKind = @import("coarse_clock.zig").ClockKind;
 pub const Deadlines = rt.Deadlines;
 pub const Timeout = rt.Timeout;
 pub const Stats = rt.Stats;
-pub const JoinHandle = rt.JoinHandle;
 pub const spawn = rt.spawn;
 pub const spawnDetached = rt.spawnDetached;
 pub const yield = rt.yield;

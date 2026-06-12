@@ -172,12 +172,7 @@ pub fn run(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Retu
         .result = undefined,
     };
     enqueue(&frame.job);
-    // Loop the park until the pool publishes `done`: the pool may complete +
-    // wake before we park (the awaken-token fast path in `park()` absorbs that),
-    // but a spurious/early wake must NOT let this frame die while the pool still
-    // holds the Job — so re-park until `done`. The acquire load pairs with the
-    // pool's release store to make `frame.result` visible. Mirrors the I/O
-    // waiters' `parkUntilDone` (net.zig / fs.zig).
+
     rt.park();
     // Invariant: this fiber parks and resumes ONLY when the pool ran its job and
     // set `done`. A resume with `!done` is a spurious wake — a bug at its source

@@ -193,41 +193,72 @@ const idle_words: usize = (max_workers + 63) / 64;
 
 /// Idle-worker bitmap for one lane. Bit `i` set ⇒ the worker at
 /// lane-relative offset `i` is parked in `loop.run(.once)` waiting for
-/// work. A producer that pushes to the lane's `GlobalQueue` (or injects
-/// a task) calls `claim` to atomically take one idle worker's bit, then
-/// wakes exactly that peer — see `Runtime.notifyIdlePeer`. Lane-agnostic
-/// (indexes by offset within a lane) so it unit-tests standalone.
+/// work. A producer making work available calls `claim` to atomically
+/// take one idle worker's bit, then wakes exactly that peer as a
+/// SEARCHER — see `Runtime.notifyIdlePeer` for the throttle around it.
+/// Lane-agnostic (indexes by offset within a lane) so it unit-tests
+/// standalone.
 ///
-/// **Why CAS-claim?** Without it, two producers seeing the same set bit
-/// would both notify the same peer. The CAS-claim ensures one producer
-/// clears one bit and wakes one peer; a racing producer either claims a
-/// different bit or gets `null`. Each worker only ever sets its own bit;
-/// producers (and the worker itself, on wake) only clear it, so the
-/// set/clear race is benign — a spurious wake just re-checks and re-parks.
+/// Bit ownership: a worker only ever sets its OWN bit (`markIdle`); it
+/// is cleared exactly once per park cycle, by either a producer's
+/// `claim` (a deliberate wake) or the worker's own `selfClear` (it woke
+/// for another reason — timer, I/O, stop). Both are single RMWs on the
+/// word, so the two sides can never both think they cleared it; that
+/// exactly-once handoff is what `Worker.unpark` uses to decide whether
+/// it inherited the searching state.
+///
+/// Memory ordering policy: EVERY atomic op here is seq_cst, uniformly.
+/// Several ops sit in Dekker (store-then-load-other-location) pairs with
+/// the producers' push-then-peek sequence, where acquire/release is
+/// formally insufficient (a plain acquire load may return a stale word and
+/// both sides can miss → lost wakeup); the rest could be weaker but are
+/// kept seq_cst so nobody has to re-derive which is which. This is free on
+/// our targets: seq_cst RMWs and loads compile to the same instructions as
+/// acq_rel RMWs and acquire loads on both x86-64 and aarch64. Two
+/// load-bearing invariants regardless: all mutations are RMWs (a plain
+/// store would sever the release sequence carrying the num_searching +1
+/// handoff from `claim` to `selfClear`), and RMW reads are never stale (an
+/// RMW always reads the latest value in modification order).
 pub const IdleWorkers = struct {
     words: [idle_words]std.atomic.Value(u64) align(std.atomic.cache_line) = @splat(.init(0)),
 
     pub fn markIdle(self: *IdleWorkers, i: u8) void {
         const w = @as(usize, i) >> 6;
         const bit = @as(u64, 1) << @as(u6, @intCast(i & 63));
-        _ = self.words[w].fetchOr(bit, .release);
+        _ = self.words[w].fetchOr(bit, .seq_cst);
     }
 
-    pub fn clearIdle(self: *IdleWorkers, i: u8) void {
+    /// Atomically clear worker `i`'s own bit, returning true if WE cleared
+    /// it. False means a producer's `claim` got there first: the wake was
+    /// deliberate and the worker was registered as a searcher (see
+    /// `Runtime.notifyIdlePeer`). The single RMW (vs. a load-then-clear
+    /// pair) is what makes the handoff exactly-once.
+    pub fn selfClear(self: *IdleWorkers, i: u8) bool {
         const w = @as(usize, i) >> 6;
         const bit = @as(u64, 1) << @as(u6, @intCast(i & 63));
-        _ = self.words[w].fetchAnd(~bit, .release);
+        return (self.words[w].fetchAnd(~bit, .seq_cst) & bit) != 0;
+    }
+
+    /// "Is anyone parked?" peek for producers — loads only, so the
+    /// all-workers-busy steady state pays no RMW on the notify path.
+    pub fn anySet(self: *IdleWorkers) bool {
+        for (&self.words) |*word| {
+            if (word.load(.seq_cst) != 0) return true;
+        }
+        return false;
     }
 
     /// Atomically claim (clear) one set bit and return its offset, or
-    /// null if no worker is idle.
+    /// null if no worker is idle. The successful CAS's write side also
+    /// publishes the producer's prior num_searching fetchAdd to the woken
+    /// worker's `selfClear` (the searcher +1 handoff).
     pub fn claim(self: *IdleWorkers) ?u8 {
         for (&self.words, 0..) |*word, wi| {
-            var m = word.load(.acquire);
+            var m = word.load(.seq_cst);
             while (m != 0) {
                 const bit_i: u6 = @intCast(@ctz(m));
                 const bit = @as(u64, 1) << bit_i;
-                if (word.cmpxchgWeak(m, m & ~bit, .acq_rel, .acquire)) |actual| {
+                if (word.cmpxchgWeak(m, m & ~bit, .seq_cst, .seq_cst)) |actual| {
                     m = actual;
                     continue;
                 }
@@ -237,10 +268,13 @@ pub const IdleWorkers = struct {
         return null;
     }
 
+    /// Targeted "is THIS worker parked?" peek — the producer side of the
+    /// high-priority push-then-peek Dekker pair (see
+    /// `Worker.notifyIfParked`); same shape as `anySet`.
     pub fn isIdle(self: *IdleWorkers, i: u8) bool {
         const w = @as(usize, i) >> 6;
         const bit = @as(u64, 1) << @as(u6, @intCast(i & 63));
-        return (self.words[w].load(.acquire) & bit) != 0;
+        return (self.words[w].load(.seq_cst) & bit) != 0;
     }
 };
 
@@ -322,6 +356,22 @@ pub const GlobalQueue = struct {
         self.fibers = new_fibers;
         self.mask = new_cap - 1;
         self.head = 0;
+    }
+
+    /// Pop a single fiber from the front, or null when empty. The fairness
+    /// path: every `global_queue_interval`-th dispatch a busy worker runs
+    /// one global fiber AHEAD of its local normal ring (see
+    /// `Worker.nextFiber`) so globally-queued work can't be starved by a
+    /// ring that never drains.
+    pub fn popOne(self: *GlobalQueue) ?*Fiber {
+        self.sl.lock();
+        defer self.sl.unlock();
+        if (self.size == 0) return null;
+        const f = self.fibers[self.head];
+        self.head = (self.head + 1) & self.mask;
+        self.size -= 1;
+        f.assertDQ();
+        return f;
     }
 
     /// Pull up to `max_take` fibers from the front of the global queue

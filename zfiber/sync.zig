@@ -13,8 +13,10 @@
 //! Mutex policy: **hand-off**. When `unlock` finds a waiter it
 //! transfers ownership directly rather than releasing the lock
 //! byte to 0. The woken waiter holds the lock the moment its
-//! `park` returns. Avoids spurious wakes (multi-thread concern)
-//! and gives FIFO fairness for free.
+//! `park` returns — and VERIFIES it: `unlock` records the grant in
+//! `granted_to` before the wake, and the waiter panics if it
+//! resumes without its own grant (park-once discipline; a wake
+//! must have a reason). FIFO fairness comes free.
 
 const std = @import("std");
 const fb = @import("fiber.zig");
@@ -94,6 +96,16 @@ pub fn Mutex(comptime track: Track) type {
         /// callers bypass it entirely.
         sl: Spinlock = .{},
         waiters: WaitQueue = .{},
+        /// Hand-off tripwire, guarded by `sl` like the rest of the
+        /// composite. `unlock` stores the waiter it pops (same critical
+        /// section, before the wake); that waiter clears it under `sl`
+        /// when its `park` returns. A resume that doesn't find its own
+        /// grant is a spurious wake — panic at the source rather than
+        /// silently run the critical section unowned. At most one grant
+        /// is outstanding: the grantee holds the lock, so the next
+        /// `unlock` (which writes the next grant) can only run after the
+        /// grantee cleared this one.
+        granted_to: ?*Fiber = null,
         /// Holder breadcrumb (acquire `@src` + timestamp + registry link), only
         /// when `.tracked`; `void` otherwise. Holder/waiter counts are derived
         /// from `state`/`waiters` at dump time, never stored here.
@@ -145,13 +157,28 @@ pub fn Mutex(comptime track: Track) type {
             rt.park();
             // Resumed by `unlock`'s hand-off: we now hold the lock,
             // `state` is still 1, and the critical section is ours.
+            // Verify the grant — a resume without it is a spurious wake.
+            self.sl.lock();
+            const granted = self.granted_to == f;
+            self.granted_to = null;
+            self.sl.unlock();
+            if (!granted) {
+                @panic("Mutex.lock: woken without lock hand-off — spurious wake");
+            }
             self.record(src);
         }
 
         pub fn unlock(self: *Self) void {
             self.sl.lock();
             const waiter = self.waiters.popHead();
-            if (waiter == null) self.state.store(0, .release);
+            if (waiter == null) {
+                self.state.store(0, .release);
+            } else {
+                // Hand-off: record the grant in the same critical section
+                // that popped the waiter, BEFORE the wake — the waiter's
+                // resume-side check can never miss it.
+                self.granted_to = waiter;
+            }
             self.sl.unlock();
 
             // Wake outside the spinlock: cross-thread wake may push to
