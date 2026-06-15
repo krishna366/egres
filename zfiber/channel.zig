@@ -15,7 +15,7 @@
 //! `{len, head, tail, closed, queue}` update; the fiber's
 //! awaken-bit handles the "wake fires while we're between
 //! sl.unlock and park" race; wake is always called outside the
-//! spinlock so cross-thread routing (remote_queue + eventfd
+//! spinlock so cross-thread routing (ring push + eventfd
 //! notify) doesn't pin a peer thread waiting for our sl.
 
 const std = @import("std");

@@ -180,7 +180,7 @@ pub const Watermark = struct {
     /// Walk the waiter array, swap-removing entries whose target
     /// is at or below `new_value`. Collected fibers are linked
     /// via the transient `waker_next` field and woken after sl
-    /// is released — cross-thread wake may push to remote_queue
+    /// is released — cross-thread wake may push into a worker ring
     /// + issue an eventfd notify, neither of which belongs under
     /// our spinlock.
     fn wakeReached(self: *Watermark, new_value: u64) void {

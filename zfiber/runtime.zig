@@ -3,15 +3,16 @@
 //! the calling thread, workers 1..N-1 on `std.Thread.spawn`).
 //! High-priority fibers are pinned to their home worker; normal
 //! priority runs anywhere in its lane — an out-of-work worker steals
-//! from busy lane peers, throttled by a per-lane `num_searching`
-//! count (Go/Tokio style: producers wake at most one searcher at a
-//! time, and the last searcher to find work wakes the next).
+//! from busy lane peers, throttled by a per-lane `num_thieves`
+//! count: producers wake at most one thief at a time, and the last
+//! thief to find work wakes the next.
 //!
-//! Cross-thread injection: `spawn` / `wake` for a fiber whose home
-//! isn't the current worker pushes via a Treiber-stack `RemoteQueue`
-//! on the home worker, then `xev.Async.notify()` unsticks the home
-//! worker's `loop.run(.once)`. The home worker drains the remote
-//! queue at the top of every outer-loop iteration.
+//! Cross-thread injection: `spawn` / `wake` for a fiber that can't go on
+//! the current worker pushes STRAIGHT into a target worker's spinlock-
+//! guarded ready ring (high → the home worker's `ready[high]`; normal →
+//! a lane worker via `injectNormal`), then `xev.Async.notify()` unsticks
+//! that worker's `loop.run(.once)` if it is parked. No side queues — the
+//! rings are the cross-thread inboxes.
 //!
 //! `yield()` / `park()` / `wake()` are namespace-level free functions
 //! that operate on the currently-running fiber, looked up via
@@ -61,8 +62,6 @@ const FiberFn = fb.FiberFn;
 const YieldIntent = fb.YieldIntent;
 
 const LockedLocalQueue = queue.LocalQueue(.withlock);
-const GlobalQueue = queue.GlobalQueue;
-const RemoteQueue = queue.RemoteQueue;
 const IdleWorkers = queue.IdleWorkers;
 
 pub const CoarseClock = coarse.CoarseClock;
@@ -70,23 +69,15 @@ pub const Deadlines = deadlines.Deadlines;
 pub const Timeout = deadlines.Timeout;
 pub const Spinlock = spinlock.Spinlock;
 
-/// Batch size for pulling normal-priority work out of a lane's
-/// GlobalQueue into a worker's local ring on each loop pass. Half the
-/// local ring so an idle peer can still grab a share; tunable.
-const refill_batch: usize = 8;
-
-/// Initial slot count for each lane's GlobalQueue (grows by doubling).
-const global_queue_initial_capacity: usize = 256;
-
-/// Most fibers a thief takes from one victim in a single steal: half the
-/// local ring, matching `stealInto`'s ceil(size/2) cap. Bounds the thief's
-/// stack scratch buffer in `trySteal`.
-const steal_batch_max: usize = queue.local_queue_capacity / 2;
-
-/// Every this-many dispatches a worker services its lane's GlobalQueue
-/// AHEAD of its local normal ring (see `Worker.nextFiber`). Prime, so the
-/// interval can't resonate with power-of-two queue capacities.
-const global_queue_interval: u32 = 31;
+/// Scratch chunk for `trySteal`: a thief copies up to this many fibers out of
+/// a victim under its lock, releases, enqueues them on its own ring, then
+/// RE-locks the victim to take more — looping until it's BALANCED with the
+/// victim (geometric load balancing: a burst spreads across the lane in
+/// ~log(workers) rounds, no single hot victim). Chunking (vs. one big copy)
+/// keeps each lock hold short — ~32 pointers — so several thieves can drain a
+/// deep victim concurrently instead of one monopolizing its lock. 32 = the
+/// initial ring capacity, so a shallow victim is balanced in a single bite.
+const steal_chunk: usize = 32;
 
 /// Process-wide singleton runtime. There is exactly one runtime, so
 /// workers carry no backpointer — they and `spawn` resolve it through
@@ -112,8 +103,8 @@ pub inline fn coarseMs() i64 {
 /// lane has no workers configured; routing falls back to `.default`.
 const LaneRange = struct { start: u8, len: u8 };
 
-/// Cache-line-padded atomic counter; see `Runtime.num_searching`.
-const SearchCount = struct {
+/// Cache-line-padded atomic counter; see `Runtime.num_thieves`.
+const ThiefCount = struct {
     v: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
 };
 
@@ -126,8 +117,8 @@ pub const Worker = struct {
     pub threadlocal var current_do_not_use_directly: ?*Worker = null;
 
     id: u8,
-    /// Index into `Runtime.lane_ranges` / `.global` / `.idle` for the
-    /// lane this worker belongs to. Set in `Runtime.init`.
+    /// Index into `Runtime.lane_ranges` / `.idle` for the lane this worker
+    /// belongs to. Set in `Runtime.init`.
     lane_idx: u8 = 0,
     loop: xev.Loop,
     deadlines: Deadlines,
@@ -144,37 +135,28 @@ pub const Worker = struct {
     /// once-per-ms `clock.update()` at the top of the run loop. Every
     /// worker drives the clock now, so every worker carries this.
     last_coarse_clock_ticks: u64 = 0,
-    /// Dispatches since the lane's GlobalQueue was last serviced ahead of
-    /// the local normal ring; at `global_queue_interval` it is due
-    /// (fairness — see `nextFiber`).
-    tick: u16 = 0,
-    /// Whether this worker holds a +1 in its lane's `num_searching` — it is
+    /// Whether this worker holds a +1 in its lane's `num_thieves` — it is
     /// out stealing, or was woken by a producer to steal. Spans from the
     /// wake (or running dry) until work is found, NOT just the steal scan:
     /// the +1 is what suppresses redundant producer wakes while this worker
     /// travels to the work. Worker-private — only this worker writes it; a
     /// producer hands the state off via the claimed idle bit (see `unpark`),
     /// never by touching this field.
-    searching: bool = false,
+    is_thief: bool = false,
     /// xorshift64 state for steal-victim randomization; seeded in `run`.
     rng_state: u64 = 1,
-    /// Two ready rings, one per `Priority`. Spinlock-guarded
-    /// (`LocalQueue(.withlock)`) so a same-lane peer can steal from the
-    /// `ready[normal]` ring (see `trySteal`). The owner's own push/pop pay an
-    /// uncontended lock (~1.4 ns); `ready[high]` is pinned and never stolen,
-    /// so its lock is always uncontended. `ready[normal]` spills to / refills
-    /// from this lane's GlobalQueue; `ready[high]` must not overflow (see
-    /// `scheduleLocal`).
-    ready: [Priority.count]LockedLocalQueue = @splat(.{}),
+    /// Two ready rings, one per `Priority`, allocated in `Worker.init`.
+    /// Spinlock-guarded (`LocalQueue(.withlock)`) so a same-lane peer can
+    /// steal from the `ready[normal]` ring (see `trySteal`). The owner's own
+    /// push/pop pay an uncontended lock (~1.4 ns); `ready[high]` is pinned and
+    /// never stolen, so its lock is always uncontended. Both rings grow on
+    /// demand — the normal ring under bursty load; the high ring (≈1 resident
+    /// in practice, measured) effectively never — so `push` never rejects.
+    ready: [Priority.count]LockedLocalQueue,
 
-    /// Cross-thread fiber injection. Pushed to by peer workers /
-    /// external threads via `RemoteQueue.push`; drained by this
-    /// worker at the top of every outer-loop iteration.
-    remote_queue: RemoteQueue = .{},
-
-    /// Cross-thread wake mechanism. Peer workers that pushed onto
-    /// `remote_queue` call `wake_async.notify()` to unstick our
-    /// `loop.run(.once)`.
+    /// Cross-thread wake mechanism. A producer that pushed a fiber into one
+    /// of our rings (high direct, normal via `injectNormal`) calls
+    /// `wake_async.notify()` to unstick our `loop.run(.once)` if we're parked.
     wake_async: xev.Async,
     wake_completion: xev.Completion = undefined,
 
@@ -190,46 +172,54 @@ pub const Worker = struct {
             .loop = try xev.Loop.init(.{}),
             .wake_async = undefined,
             .deadlines = undefined,
+            .ready = undefined,
         };
         errdefer w.loop.deinit();
         w.wake_async = try xev.Async.init();
         errdefer w.wake_async.deinit();
         w.deadlines = try Deadlines.init(&w.loop, allocator);
+        errdefer w.deadlines.deinit();
+        // Allocate the two per-priority ready rings; on a mid-loop failure,
+        // deinit the ones already built before propagating.
+        var made: usize = 0;
+        errdefer for (w.ready[0..made]) |*q| q.deinit();
+        for (&w.ready) |*q| {
+            q.* = try LockedLocalQueue.init(allocator, queue.local_queue_capacity);
+            made += 1;
+        }
     }
 
     pub fn deinit(self: *Worker) void {
+        for (&self.ready) |*q| q.deinit();
         self.deadlines.deinit();
         self.wake_async.deinit();
         self.loop.deinit();
     }
 
-    /// Enqueue `f` on this worker's matching priority ring. On overflow:
-    /// high priority panics (it's pinned and expected to fit); normal
-    /// priority spills to this lane's GlobalQueue and pokes an idle peer.
+    /// Enqueue `f` on this worker's matching priority ring. The ring grows on
+    /// demand, so a push can only fail on allocator OOM (fatal) — there is no
+    /// overflow/spill path anymore.
     pub fn scheduleLocal(self: *Worker, f: *Fiber) void {
-        const is_normal = f.priority == .normal;
-        self.ready[@intFromEnum(f.priority)].push(f) catch {
-            if (!is_normal) {
-                @panic("high-priority local queue overflow");
-            }
-            const rt = runtime();
-            rt.global[self.lane_idx].push(f) catch {
-                @panic("out of memory spilling fiber to global queue");
-            };
-            rt.notifyIdlePeer(self.lane_idx);
-            return;
-        };
+        self.ready[@intFromEnum(f.priority)].push(f) catch
+            @panic("out of memory growing local ready ring");
         // Pushed locally. When normal work piles up (>1 queued) wake one idle
         // lane peer to come steal a share: a peer that already parked won't
         // otherwise notice a burst that fits within our ring (no spill, no
-        // notify). This per-push call is the IGNITION of a search cycle and
+        // notify). This per-push call is the IGNITION of a steal cycle and
         // is only affordable because `notifyIdlePeer` checks
-        // `num_searching == 0` before doing the actual notify — while a
-        // searcher is out, this costs one atomic load and no wake. Skipped
-        // when stealing is off (a peer couldn't take the work). High
-        // priority is pinned and never stolen.
+        // `num_thieves == 0` before doing the actual notify. Skipped when
+        // stealing is off (a peer couldn't take the work). High priority is
+        // pinned and never stolen.
+        //
+        // `!self.is_thief` short-circuits the whole thing when WE are the
+        // thief — the common case here is a `trySteal` batch enqueuing
+        // stolen fibers, one `scheduleLocal` each. Our own `+1` is already in
+        // `num_thieves`, so `notifyIdlePeer` would just `load() > 0` and
+        // bail; skipping avoids re-reading that shared atomic for every fiber
+        // in the batch, and the thief handoff happens via the chain
+        // (`exitThiefAndNotify`) once we dispatch the loot, not here.
         const rt = runtime();
-        if (is_normal and rt.steal_enabled and
+        if (f.priority == .normal and rt.steal_enabled and !self.is_thief and
             self.ready[@intFromEnum(Priority.normal)].len() >= 2)
         {
             rt.notifyIdlePeer(self.lane_idx);
@@ -266,76 +256,60 @@ pub const Worker = struct {
         }
     }
 
-    /// Pick the next fiber to dispatch. High priority always first (pinned,
-    /// latency-sensitive). Every `global_queue_interval` dispatches, service
-    /// the lane's GlobalQueue BEFORE the local normal ring: a worker whose
-    /// ring never drains (fibers that yield and re-queue themselves) would
-    /// otherwise starve globally-queued work forever — the local-empty
-    /// refill can't help because a full ring never refills. Same fix as
-    /// Go's "check the global runq every 61 schedules". `tick` resets only
-    /// when the global check actually RUNS — a `% interval == 0` test would
-    /// silently skip the slot whenever a high-priority pop wins that tick,
-    /// and under steady high traffic skip it forever.
-    fn nextFiber(self: *Worker, rt: *Runtime) ?*Fiber {
-        self.tick += 1;
+    /// Pick the next fiber to dispatch: high priority first (pinned,
+    /// latency-sensitive), then normal. Ring FIFO order alone gives fairness
+    /// now that there's no global queue — a fiber that yields re-queues at the
+    /// back, so everything ahead of it drains first; nothing can be starved by
+    /// a worker keeping itself locally busy (the old per-N-dispatch global
+    /// poll is gone with the queue it served).
+    fn nextFiber(self: *Worker) ?*Fiber {
         if (self.ready[@intFromEnum(Priority.high)].pop()) |f| return f;
-        if (self.tick >= global_queue_interval) {
-            self.tick = 0;
-            if (rt.global[self.lane_idx].popOne()) |f| return f;
-        }
         return self.ready[@intFromEnum(Priority.normal)].pop();
     }
 
-    /// Whether any priority's local ready ring holds work. Lets the run
-    /// loop test for work after a find step without popping a fiber it
-    /// would then have to dispatch inline.
-    fn hasReady(self: *const Worker) bool {
+    /// Pre-park recheck of our own rings, BOTH under their locks so a
+    /// cross-thread push can't be missed. A lock-free `size` peek can read a
+    /// STALE value — the push stores `size` `.monotonic` under the lock, and
+    /// the parker-vs-producer pair is the store-buffering (Dekker) litmus, so
+    /// nothing short of locking (or seq_cst on the hot push, which we won't
+    /// pay) synchronizes them; the worker could otherwise block with work in
+    /// its ring (lost wakeup). The ring lock's acquire reads-from the push's
+    /// unlock-release — a genuine reads-from pair — which is the
+    /// synchronization the deleted global queue used to provide. Both
+    /// priorities now arrive by direct ring push (normal via `injectNormal`,
+    /// high via `routeReady`), so both need it.
+    fn hasReady(self: *Worker) bool {
         for (&self.ready) |*q| {
-            if (!q.isEmpty()) return true;
+            if (q.lenAcquire() > 0) return true;
         }
         return false;
     }
 
-    /// Move every fiber on our remote queue to our local ready queue.
-    /// Called at the top of every outer-loop iteration so cross-thread
-    /// (high-priority) arrivals get picked up promptly. `drainFifo`
-    /// returns them oldest-first so a burst keeps its spawn order.
-    fn drainRemote(self: *Worker) void {
-        var f: ?*Fiber = self.remote_queue.drainFifo();
-        while (f) |entry| {
-            f = entry.remote_next;
-            entry.remote_next = null;
-            self.scheduleLocal(entry);
-        }
-    }
-
-    /// Pull a batch of normal-priority work from this lane's GlobalQueue
-    /// into the local normal ring, when there's room. Cheap no-op when
-    /// the ring is full (skips taking the global spinlock).
-    fn refillFromGlobal(self: *Worker) void {
-        const dest = &self.ready[@intFromEnum(Priority.normal)];
-        const room = dest.capacity() - dest.len();
-        if (room == 0) return;
-        _ = runtime().global[self.lane_idx].popBatchTo(dest, @min(room, refill_batch));
-    }
-
-    /// Try to refill our (empty) normal ring by stealing a batch from a
-    /// busy peer in the SAME lane. Returns true if any work moved. Only
-    /// normal-priority work is stealable — high priority is pinned to its
-    /// home worker and never touched. Visits lane peers from a RANDOM
-    /// start so repeat scans and concurrent thieves decorrelate (Go
-    /// randomizes its steal order, Tokio starts at a random peer). The
-    /// stolen fibers are enqueued via `scheduleLocal` (NOT while holding the
-    /// victim's lock — `stealInto` already released it), so overflow spills
-    /// to the global queue through the normal path.
+    /// Try to refill our (empty) normal ring by stealing from a busy peer in
+    /// the SAME lane. Returns true if any work moved. Only normal-priority
+    /// work is stealable — high priority is pinned to its home worker and
+    /// never touched. Visits lane peers from a RANDOM start so repeat scans
+    /// and concurrent thieves decorrelate.
+    ///
+    /// For each candidate we first peek its size LOCK-FREE and skip it unless
+    /// it holds more than we do — so a scan over mostly-empty rings pays no
+    /// lock. From the first victim with a surplus we steal until BALANCED with
+    /// it (our normal ring ≈ the victim's), in `steal_chunk`-sized bites: each
+    /// `stealInto` takes half the CURRENT difference (we pass our own growing
+    /// ring size as `dest_sz`), copies under the victim's lock, releases, then
+    /// enqueues locally via `scheduleLocal` (one lock at a time — never two,
+    /// so no deadlock) before the next bite. Re-reading the difference each
+    /// bite lets several thieves share one deep victim: each stops at the
+    /// balance point instead of the first two draining it to empty. `stealInto`
+    /// returns 0 once we've reached balance (or the victim drained).
     fn trySteal(self: *Worker) bool {
         const rt = runtime();
-        if (!rt.steal_enabled) return false; // stealing disabled (InitOptions.steal)
+        if (!rt.steal_enabled) return false; // stealing off (InitOptions.steal)
 
         const range = rt.lane_ranges[self.lane_idx];
         if (range.len <= 1) return false; // lane has no peers to steal from
 
-        var buf: [steal_batch_max]*Fiber = undefined;
+        const sq = &self.ready[@intFromEnum(Priority.normal)];
         const me = self.laneOffset();
         const r: usize = @intCast(self.nextRand() % range.len);
         var k: usize = 0;
@@ -343,20 +317,35 @@ pub const Worker = struct {
             const off: u8 = @intCast((r + k) % range.len);
             if (off == me) continue;
             const victim = &rt.workers[@as(usize, range.start) + off];
-            const n = victim.ready[@intFromEnum(Priority.normal)].stealInto(buf[0..]);
-            if (n == 0) continue;
-            for (buf[0..n]) |f| {
-                if (comptime fb.guard_level >= 1) {
-                    // The stolen fiber must be runnable in the victim's ring.
-                    const st = f.loadState();
-                    if (st.tag != .ready) std.debug.panic(
-                        "stole fiber 0x{x} state=.{s} awaken={} from W{d}→W{d} — non-runnable in victim ring",
-                        .{ @intFromPtr(f), @tagName(st.tag), st.awaken, victim.id, self.id },
-                    );
+            const vq = &victim.ready[@intFromEnum(Priority.normal)];
+
+            // Lock-free pre-check: only a victim with a surplus over us is
+            // worth locking (this is `stealInto`'s `size <= dest_sz` guard,
+            // peeked without the lock so we skip empties for free).
+            if (vq.len() <= sq.len()) continue;
+
+            var scratch: [steal_chunk]*Fiber = undefined;
+            var moved = false;
+            // Pass our own (growing) ring size so each bite targets the
+            // victim/thief balance point; stops when stealInto returns 0.
+            while (true) {
+                const n = vq.stealInto(sq.len(), scratch[0..]);
+                if (n == 0) break; // balanced with the victim, or it drained
+
+                for (scratch[0..n]) |f| {
+                    if (comptime fb.guard_level >= 1) {
+                        // The stolen fiber must be runnable in the victim's ring.
+                        const st = f.loadState();
+                        if (st.tag != .ready) std.debug.panic(
+                            "stole fiber 0x{x} state=.{s} awaken={} from W{d}→W{d} — non-runnable in victim ring",
+                            .{ @intFromPtr(f), @tagName(st.tag), st.awaken, victim.id, self.id },
+                        );
+                    }
+                    self.scheduleLocal(f);
                 }
-                self.scheduleLocal(f);
+                moved = true;
             }
-            return true;
+            if (moved) return true;
         }
         return false;
     }
@@ -380,42 +369,40 @@ pub const Worker = struct {
         return x;
     }
 
-    /// Try to enter the searching (thief) state. Denied — the caller then
-    /// skips stealing and parks — when stealing is off, the lane has no
-    /// peers, or half the lane is already searching: more thieves than that
-    /// mostly contend on victim spinlocks without finding proportionally
-    /// more work (Go caps spinning Ms at GOMAXPROCS/2, Tokio searchers at
-    /// half the workers). The check-then-add can briefly overshoot the cap
-    /// under a race; both runtimes accept the same slack.
-    fn transitionToSearching(self: *Worker, rt: *Runtime) bool {
-        if (self.searching) return true;
+    /// Try to become a thief (enter the thieving state). Denied — the caller
+    /// then skips stealing and parks — when stealing is off, the lane has no
+    /// peers, or half the lane is already thieving: more thieves than that
+    /// mostly contend on victim spinlocks without finding proportionally more
+    /// work. The check-then-add can briefly overshoot the cap under a race;
+    /// harmless slack.
+    fn becomeThief(self: *Worker, rt: *Runtime) bool {
+        if (self.is_thief) return true;
         if (!rt.steal_enabled) return false;
 
         const range = rt.lane_ranges[self.lane_idx];
         if (range.len <= 1) return false;
 
-        const n = &rt.num_searching[self.lane_idx].v;
+        const n = &rt.num_thieves[self.lane_idx].v;
         if (2 * n.load(.seq_cst) >= range.len) return false;
 
         _ = n.fetchAdd(1, .seq_cst);
-        self.searching = true;
+        self.is_thief = true;
         return true;
     }
 
-    /// Leave the searching state because we found work. If we were the LAST
-    /// searcher, hand the search to a parked peer (Go's resetspinning →
-    /// wakep, Tokio's transition_from_searching): what we found may not be
-    /// all the work, and with `num_searching` back at zero producers would
-    /// otherwise be the only ones able to restart the search.
-    fn exitSearchAndNotify(self: *Worker, rt: *Runtime, do_notify: bool) void {
+    /// Leave the thieving state because we found work. If we were the LAST
+    /// thief, hand the hunt to a parked peer: what we found may not be all
+    /// the work, and with `num_thieves` back at zero, producers would
+    /// otherwise be the only ones able to restart the hunt.
+    fn exitThiefAndNotify(self: *Worker, rt: *Runtime, do_notify: bool) void {
         // No-op unless we hold a +1: the park path calls this
-        // unconditionally, and a worker that was DENIED searching (cap /
-        // steal off / single-worker lane) parks with searching == false —
-        // an unguarded fetchSub would wrap num_searching to maxInt and
+        // unconditionally, and a worker that was DENIED thieving (cap /
+        // steal off / single-worker lane) parks with is_thief == false —
+        // an unguarded fetchSub would wrap num_thieves to maxInt and
         // permanently suppress every producer wake in the lane.
-        if (!self.searching) return;
-        self.searching = false;
-        if (rt.num_searching[self.lane_idx].v.fetchSub(1, .seq_cst) == 1) {
+        if (!self.is_thief) return;
+        self.is_thief = false;
+        if (rt.num_thieves[self.lane_idx].v.fetchSub(1, .seq_cst) == 1) {
             if (do_notify) {
                 rt.notifyIdlePeer(self.lane_idx);
             }
@@ -424,25 +411,27 @@ pub const Worker = struct {
 
     /// Leave the parked state: atomically take our idle bit back. If a
     /// producer claimed it first, this wake was deliberate — the producer
-    /// registered us in `num_searching` BEFORE claiming (`notifyIdlePeer`),
-    /// so we wake up already owning a searcher +1 and must adopt the state;
+    /// registered us in `num_thieves` BEFORE claiming (`notifyIdlePeer`),
+    /// so we wake up already owning a thief +1 and must adopt the state;
     /// the dispatch / park paths balance it. A spurious wake (own timer,
     /// I/O completion, stop) finds the bit still set and just clears it.
     fn unpark(self: *Worker, rt: *Runtime) void {
         if (!rt.idle[self.lane_idx].selfClear(self.laneOffset()))
-            self.searching = true;
+            self.is_thief = true;
     }
 
     /// Cross-thread wake: issue the `wake_async` notify (an eventfd write —
-    /// a syscall) ONLY if this worker is parked. A busy worker drains its
-    /// remote queue every loop pass, so it picks up the just-pushed fiber
-    /// without the syscall. The caller MUST `remote_queue.push` BEFORE
-    /// calling this — push-then-peek against the parker's markIdle-then-
-    /// drain is a Dekker pair, closed by the seq_cst `isIdle` load and
-    /// `markIdle` fetchOr (either our load sees the bit and we notify, or
-    /// it ordered before the fetchOr, and then the parker's later drain —
-    /// an RMW swap, so never stale — must see our push). Portable; not
-    /// reliant on x86 locked-RMW fencing.
+    /// a syscall) ONLY if this worker is parked. A busy worker finds the
+    /// just-pushed work on its own next pass, no syscall needed. The caller
+    /// MUST publish the work BEFORE calling this — a `ready[high]` push (high
+    /// priority) or a `ready[normal]` push (`injectNormal`). Push-then-peek
+    /// against the parker's markIdle-then-recheck is a Dekker pair, closed by
+    /// the seq_cst `isIdle` load and `markIdle` fetchOr: either our load sees
+    /// the bit and we notify, or it ordered before the fetchOr and then the
+    /// parker's later recheck must see our push — and that recheck
+    /// (`hasReady`) takes the ring lock, whose acquire reads-from our push's
+    /// unlock-release, so it's never stale. Portable; not reliant on x86
+    /// locked-RMW fencing.
     inline fn notifyIfParked(self: *Worker) void {
         if (runtime().idle[self.lane_idx].isIdle(self.laneOffset()))
             self.wake_async.notify() catch {};
@@ -521,7 +510,7 @@ pub const Worker = struct {
         return false;
     }
 
-    pub fn run(self: *Worker) void {
+    pub fn runMain(self: *Worker) void {
         // The one legitimate site that writes the thread-local. Reads go
         // through `currentWorkerOrNull()`; here we own it directly.
         const prev = current_do_not_use_directly;
@@ -573,35 +562,26 @@ pub const Worker = struct {
         const rt = runtime();
         while (!rt.stopping.load(.acquire)) {
             // 1. Run the local ready queues to exhaustion first (high
-            //    before normal). Only when they're empty do we reach for
-            //    more work — drainRemote / refillFromGlobal are
-            //    work-*finding* steps, not per-iteration overhead.
-            // Advance the coarse clock at most once per ms (TSC-gated, no
-            // syscall on the fast path). `enter` is reused for CPU
-            // accounting below, so the per-iteration cost is a subtract +
-            // compare; the write-guard in `update` keeps it to ~1 store/ms
-            // across all workers.
+            //    before normal). Cross-thread arrivals land directly in
+            //    these rings, so `nextFiber` (which pops high first) picks
+            //    them up every pass — no separate drain step. trySteal is
+            //    the only work-*finding* step, taken only when we run dry.
+
             const enter = readTicks();
             if (cyclesToNs(enter -% self.last_coarse_clock_ticks) >= std.time.ns_per_ms) {
+                // Advance the coarse clock at most once per ms (TSC-gated, no
+                // syscall on the fast path). `enter` is reused for CPU
+                // accounting below, so the per-iteration cost is a subtract +
+                // compare; the write-guard in `update` keeps it to ~1 store/ms
+                // across all workers.
                 clock.update();
                 self.last_coarse_clock_ticks = enter;
             }
 
-            // Drain cross-thread (high-priority) arrivals into our local ring
-            // every pass — even while busy. This is even more important
-            // considering the high priority fibers would be the ones getting
-            // pushed to remote queue, because they're tied to workers and
-            // don't move around.
-            //
-            // The `isEmpty` load is a plain cache-hit until a
-            // peer's `push` dirties the line, so it's ~free when no wake is
-            // pending; the cost tracks push frequency, not pass frequency.
-            if (!self.remote_queue.isEmpty()) self.drainRemote();
-
-            if (self.nextFiber(rt)) |f| {
-                // A searcher that found work stops searching; the last one
-                // out hands the search to a parked peer (wake chain).
-                if (self.searching) self.exitSearchAndNotify(rt, true);
+            if (self.nextFiber()) |f| {
+                // A thief that found work stops thieving; the last one
+                // out hands the hunt to a parked peer (wake chain).
+                if (self.is_thief) self.exitThiefAndNotify(rt, true);
 
                 const finished = self.runFiber(f);
                 const exit = readTicks();
@@ -648,34 +628,37 @@ pub const Worker = struct {
                 continue;
             }
 
-            // 2. Local empty: find work, then loop back to run it.
-            self.drainRemote();
-            self.refillFromGlobal();
-            if (self.hasReady()) continue;
+            // 2. `nextFiber` just did a LOCKED pop of both rings and found
+            //    nothing, so re-checking our own rings here would be redundant
+            //    — become a thief (throttled to half the lane) and try to
+            //    steal a batch of normal-priority work from a busy peer. The
+            //    spinlock-guarded rings make this race-free against the
+            //    victim's own push/pop; high priority is pinned and never
+            //    stolen. A stolen batch lands in our ring; the `nextFiber` pop
+            //    above then exits the thieving state (chain-notifying a peer
+            //    if we were last). A cross-thread push that lands in our OWN
+            //    ring after nextFiber is caught by step 3's locked pre-park
+            //    recheck, so we don't re-check before stealing.
+            if (self.becomeThief(rt) and self.trySteal()) continue;
 
-            // 2b. Nothing local or global: become a searcher (throttled to
-            //     half the lane) and steal a batch of normal-priority work
-            //     from a busy peer. The spinlock-guarded rings make this
-            //     race-free against the victim's own push/pop; high
-            //     priority is pinned and never stolen. A stolen batch lands
-            //     in our ring; the `nextFiber` pop above then exits the
-            //     searching state (chain-notifying a peer if we were last).
-            if (self.transitionToSearching(rt) and self.trySteal()) continue;
-
-            // 3. Still nothing. Leave the searching state and mark idle
-            //    BEFORE a final work-recheck, in that order: producers push
-            //    work and THEN consult num_searching / the idle bitmap, so
-            //    re-checking every queue after the decrement + markIdle
-            //    guarantees the two sides can't both miss (Dekker; Go's
-            //    "delicate dance" before stopm, Tokio's
-            //    transition_to_parked recheck). A producer that skipped its
-            //    notify because it saw us searching is covered by exactly
-            //    this recheck.
-            self.exitSearchAndNotify(rt, false);
-
+            // 3. Still nothing — about to park. Drop the thieving state and
+            //    markIdle BEFORE the final recheck, because producers publish
+            //    work and THEN consult num_thieves / the idle bitmap; doing
+            //    it after guarantees the two sides can't both miss (Dekker).
+            self.exitThiefAndNotify(rt, false);
             self.markIdle();
-            self.drainRemote();
-            self.refillFromGlobal();
+
+            // The recheck has TWO halves,
+            // one per way a producer may have SKIPPED its notify expecting
+            // us to find the work ourselves:
+            //   - saw us not-yet-idle (`notifyIfParked`) → it pushed into
+            //     one of OUR rings; `hasReady` (both rings, LOCKED) catches
+            //     it now that markIdle has run.
+            //   - saw us thieving (`notifyIdlePeer`, e.g. a peer's pile-up)
+            //     → the work sits in THAT PEER's ring, un-notified; only
+            //     `trySteal` can reach it, and only now that we've left the
+            //     thieving state. So this trySteal isn't "thieving again"
+            //     — it's the peer-ring half of the lost-wakeup recheck.
             if (self.hasReady() or self.trySteal()) {
                 self.unpark(rt);
                 continue;
@@ -791,20 +774,17 @@ pub const Runtime = struct {
     /// Work stealing on/off (`InitOptions.steal`). Read by `trySteal`.
     steal_enabled: bool = true,
 
-    /// Per-lane admission / overflow queues for normal-priority work.
-    /// Indexed by `@intFromEnum(Lane)`.
-    global: [Lane.count]GlobalQueue = undefined,
     /// Contiguous worker-id range each lane owns. A `len == 0` lane
     /// falls back to `.default` (see `effectiveLaneIdx`).
     lane_ranges: [Lane.count]LaneRange = undefined,
     /// Per-lane idle-worker bitmaps; producers `claim` one to wake a
     /// single parked peer in that lane.
     idle: [Lane.count]IdleWorkers = .{ .{}, .{} },
-    /// Per-lane count of workers in the searching (steal) state — the
-    /// Go/Tokio wake throttle. Producers skip the idle-peer wake while a
-    /// searcher is out (see `notifyIdlePeer`); workers cap themselves at
-    /// half the lane (see `transitionToSearching`).
-    num_searching: [Lane.count]SearchCount = @splat(.{}),
+    /// Per-lane count of workers in the thieving (steal) state — the wake
+    /// throttle. Producers skip the idle-peer wake while a thief is out (see
+    /// `notifyIdlePeer`); workers cap themselves at half the lane (see
+    /// `becomeThief`).
+    num_thieves: [Lane.count]ThiefCount = @splat(.{}),
 
     pub fn init(self: *Runtime, allocator: std.mem.Allocator, opts: InitOptions) !void {
         // num_workers == 0 means "auto" → the CPU core count.
@@ -828,7 +808,7 @@ pub const Runtime = struct {
         self.stopping = .init(false);
         self.steal_enabled = opts.steal;
         self.idle = .{ .{}, .{} };
-        self.num_searching = @splat(.{});
+        self.num_thieves = @splat(.{});
 
         // Lane layout: raft takes the first worker ids, default the rest —
         //   raft    = [0, raft_workers)
@@ -838,14 +818,6 @@ pub const Runtime = struct {
             .{ .start = raft_count, .len = @intCast(n - raft_workers) }, // .default
             .{ .start = 0, .len = raft_count }, // .raft
         };
-
-        // Per-lane global queues for normal-priority work.
-        var g_inited: usize = 0;
-        errdefer for (self.global[0..g_inited]) |*gq| gq.deinit();
-        for (&self.global) |*gq| {
-            gq.* = try GlobalQueue.init(allocator, global_queue_initial_capacity);
-            g_inited += 1;
-        }
 
         self.workers = try allocator.alloc(Worker, n);
         errdefer allocator.free(self.workers);
@@ -886,7 +858,6 @@ pub const Runtime = struct {
         self.clock.deinit();
         for (self.workers) |*w| w.deinit();
         self.allocator.free(self.workers);
-        for (&self.global) |*gq| gq.deinit();
         g_rt = null;
     }
 
@@ -939,30 +910,29 @@ pub const Runtime = struct {
         return idx;
     }
 
-    /// Wake one parked worker in `lane_idx` to come search for work.
-    /// Throttled (Go's wakep, Tokio's notify_parked_local): the
-    /// `num_searching == 0` check MUST run before the actual notify — a
-    /// searcher already out will find the work, or re-check every queue
+    /// Wake one parked worker in `lane_idx` to come steal work. Throttled:
+    /// the `num_thieves == 0` check MUST run before the actual notify — a
+    /// thief already out will find the work, or re-check every queue
     /// after decrementing on its way to park, so nothing strands; per-push
     /// callers pay one atomic load in that case. Also a no-op when nobody
     /// is parked (loads only — the all-busy steady state pays no RMW).
     /// Otherwise the 0→1 increment elects exactly ONE producer, which
-    /// registers the wakee as a searcher FIRST and then CAS-claims one
+    /// registers the wakee as a thief FIRST and then CAS-claims one
     /// idle bit — a woken worker can thus never observe its claimed bit
     /// (`Worker.unpark`) without the matching +1 already in place.
     fn notifyIdlePeer(self: *Runtime, lane_idx: u8) void {
-        const n = &self.num_searching[lane_idx].v;
-        if (n.load(.seq_cst) > 0) return; // a searcher is already out
+        const n = &self.num_thieves[lane_idx].v;
+        if (n.load(.seq_cst) > 0) return; // a thief is already out
         if (!self.idle[lane_idx].anySet()) return; // nobody parked to wake
 
         if (n.fetchAdd(1, .seq_cst) != 0) {
             // Lost the 0→1 election to another producer (or a worker began
-            // searching on its own) — someone is looking; undo, let them.
+            // thieving on its own) — someone is looking; undo, let them.
             _ = n.fetchSub(1, .seq_cst);
             return;
         }
 
-        // num_searching already incremented before reaching self.idle.claim.
+        // num_thieves already incremented before reaching self.idle.claim.
         if (self.idle[lane_idx].claim()) |off| {
             const peer_id: usize = @as(usize, self.lane_ranges[lane_idx].start) + off;
             std.debug.assert(peer_id < self.workers.len);
@@ -975,16 +945,46 @@ pub const Runtime = struct {
         }
     }
 
+    /// Admit a normal-priority fiber to `lane_idx` from off-lane / off-worker
+    /// / bootstrap (the cases `routeReady` can't hand to a same-lane current
+    /// worker). With no global queue, we push STRAIGHT into a lane worker's
+    /// ring — safe cross-thread because the ring is spinlock-guarded — and
+    /// poke that worker if it is parked. Idle peers can then steal a share.
+    ///
+    /// Prefer a parked worker (so the fiber runs promptly); else spread by
+    /// hashing the fiber pointer — stateless, so it works from non-worker
+    /// inject contexts (bootstrap, pool threads). The idle peek is a racy hint
+    /// — correctness rests on the target's LOCKED pre-park recheck
+    /// (`hasReady`), which synchronizes with the push here, so the worker can
+    /// never park with our fiber unseen in its ring.
+    ///
+    /// No `num_thieves` involvement: the wake carries its own work, so it's
+    /// never a wasted steal (and we don't `claim`, so the woken worker
+    /// `selfClear`s its own bit and stays a non-thief).
+    fn injectNormal(self: *Runtime, lane_idx: u8, f: *Fiber) void {
+        const range = self.lane_ranges[lane_idx];
+        std.debug.assert(range.len > 0);
+        const off: u8 = self.idle[lane_idx].anyOffset() orelse blk: {
+            // Fibonacci mix so clustered pool addresses still scatter.
+            const h = (@intFromPtr(f) *% 0x9E3779B97F4A7C15) >> 32;
+            break :blk @intCast(h % range.len);
+        };
+        const peer = &self.workers[@as(usize, range.start) + off];
+        peer.ready[@intFromEnum(Priority.normal)].push(f) catch
+            @panic("out of memory injecting fiber into a worker ring");
+        peer.notifyIfParked();
+    }
+
     /// Start the scheduler. Spawns OS threads for workers 1..N-1,
     /// runs worker 0 on the calling thread, joins the peer threads
     /// after worker 0 returns.
     pub fn run(self: *Runtime) void {
         for (self.workers[1..]) |*w| {
-            w.thread = std.Thread.spawn(.{}, Worker.run, .{w}) catch |err| {
+            w.thread = std.Thread.spawn(.{}, Worker.runMain, .{w}) catch |err| {
                 std.debug.panic("worker thread spawn failed: {}", .{err});
             };
         }
-        self.workers[0].run();
+        self.workers[0].runMain();
         for (self.workers[1..]) |*w| {
             if (w.thread) |t| t.join();
             w.thread = null;
@@ -1016,13 +1016,13 @@ pub const Runtime = struct {
 
 /// Route a ready fiber to a queue. Shared by `spawn` and `wake`.
 ///
-///   - High priority is pinned: it goes to its home worker — directly to
-///     the home's local ring when we're already on the home thread, else
-///     onto the home's remote queue with an async notify.
-///   - Normal priority is lane-bound but worker-free: when we're running
-///     on a worker in the fiber's lane, push to that local ring (spilling
-///     to the lane's global queue on overflow via `scheduleLocal`);
-///     otherwise admit to the lane's global queue and wake an idle peer.
+///   - High priority is pinned: it goes to its home worker's `ready[high]`
+///     ring — via `scheduleLocal` when we're already on the home thread,
+///     else a direct cross-thread ring push with an async notify.
+///   - Normal priority is lane-bound but worker-free: when we're running on a
+///     worker in the fiber's lane, push to that local ring (which grows on
+///     demand via `scheduleLocal`); otherwise `injectNormal` pushes straight
+///     into a lane worker's ring and pokes it if parked.
 fn routeReady(rt: *Runtime, f: *Fiber) void {
     switch (f.priority) {
         .high => {
@@ -1030,9 +1030,12 @@ fn routeReady(rt: *Runtime, f: *Fiber) void {
             if (currentWorkerOrNull() == home) {
                 home.scheduleLocal(f);
             } else {
-                // Push, then wake only if `home` is parked — order matters for
-                // the wakeup race (see `notifyIfParked`).
-                home.remote_queue.push(f);
+                // Push straight into the home's high ring (spinlock-guarded,
+                // so the cross-thread push is safe), then wake only if `home`
+                // is parked — order matters for the wakeup race (see
+                // `notifyIfParked`).
+                home.ready[@intFromEnum(Priority.high)].push(f) catch
+                    @panic("out of memory pushing high-priority fiber to home ring");
                 home.notifyIfParked();
             }
         },
@@ -1044,10 +1047,7 @@ fn routeReady(rt: *Runtime, f: *Fiber) void {
                     return;
                 }
             }
-            rt.global[lane_idx].push(f) catch {
-                @panic("out of memory admitting fiber to global queue");
-            };
-            rt.notifyIdlePeer(lane_idx);
+            rt.injectNormal(lane_idx, f);
         },
     }
 }
@@ -1252,26 +1252,38 @@ pub fn currentFiberOrNull() ?*Fiber {
 /// Write a per-worker CPU-time distribution: each worker's `cpu_total_ns`
 /// (the cumulative fiber-execution time charged to it) in ms, with a `#` bar,
 /// followed by total / min / max / avg and a max/avg imbalance ratio (1.0 ==
-/// perfectly even, higher == work piled onto one worker). Plain text — safe to
-/// drop into logs, an admin dump, or the test-runner summary. `cpu_total_ns` is
-/// read racily; fine for a coarse balance gauge.
+/// perfectly even, higher == work piled onto one worker). Each row also shows
+/// that worker's ready-ring CAPACITIES (`hiCap`/`nmCap`): rings only grow
+/// (doubling) and never shrink, so the current capacity is a free high-water
+/// gauge — the deepest the ring was ever driven lies in `[cap/2, cap)`. A
+/// `nmCap` above the initial size means the normal ring absorbed a burst; the
+/// high ring should stay at the initial size (≈1 pinned loop per home worker).
+/// Plain text — safe to drop into logs, an admin dump, or the test-runner
+/// summary. All counters are read racily; fine for a coarse gauge.
 pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
     const workers = runtime().workers;
+    const hi = @intFromEnum(Priority.high);
+    const nm = @intFromEnum(Priority.normal);
     var total_ns: u64 = 0;
     var max_ns: u64 = 0;
     var min_ns: u64 = std.math.maxInt(u64);
+    var cap_hi: usize = 0;
+    var cap_nm: usize = 0;
     for (workers) |*w| {
         total_ns +%= w.cpu_total_ns;
         max_ns = @max(max_ns, w.cpu_total_ns);
         min_ns = @min(min_ns, w.cpu_total_ns);
+        cap_hi = @max(cap_hi, w.ready[hi].capacity());
+        cap_nm = @max(cap_nm, w.ready[nm].capacity());
     }
     try writer.print("worker CPU ({d} workers):\n", .{workers.len});
     for (workers) |*w| {
         var bar: [24]u8 = undefined;
         const bar_w: usize = if (max_ns == 0) 0 else @intCast((w.cpu_total_ns *| 24) / max_ns);
         @memset(bar[0..bar_w], '#');
-        try writer.print("  W{d:>2} lane={d} {d:>6} ms  {s}\n", .{
-            w.id, w.lane_idx, @divTrunc(w.cpu_total_ns, std.time.ns_per_ms), bar[0..bar_w],
+        try writer.print("  W{d:>2} lane={d} {d:>6} ms  hiCap={d:>4} nmCap={d:>5}  {s}\n", .{
+            w.id,                   w.lane_idx,             @divTrunc(w.cpu_total_ns, std.time.ns_per_ms),
+            w.ready[hi].capacity(), w.ready[nm].capacity(), bar[0..bar_w],
         });
     }
     const avg_ns = if (workers.len > 0) total_ns / workers.len else 0;
@@ -1283,6 +1295,12 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
         @divTrunc(max_ns, std.time.ns_per_ms),
         @divTrunc(avg_ns, std.time.ns_per_ms),
         imbalance,
+    });
+    // Largest ring capacity across all workers — since rings never shrink, a
+    // cap above the initial size means that priority's ring absorbed a burst
+    // (peak depth was in [cap/2, cap)).
+    try writer.print("  ring capacity (never shrinks → ≈ peak): hi_max={d} nm_max={d} (init {d})\n", .{
+        cap_hi, cap_nm, queue.local_queue_capacity,
     });
 }
 

@@ -181,8 +181,8 @@ pub fn Mutex(comptime track: Track) type {
             }
             self.sl.unlock();
 
-            // Wake outside the spinlock: cross-thread wake may push to
-            // the home worker's remote_queue and issue an eventfd
+            // Wake outside the spinlock: cross-thread wake may push into
+            // a target worker's ready ring and issue an eventfd
             // notify (kernel syscall). Holding sl during that would
             // pin a peer thread to a cache line for an entire syscall.
             if (waiter) |w| rt.wake(w);
@@ -246,7 +246,7 @@ pub const Condition = struct {
     /// Wake every fiber currently in the wait queue. We collect the
     /// fibers under `sl` (using their now-free `waker_next` field
     /// as a transient local-list link) then wake them outside the
-    /// spinlock — wake may push to a peer worker's remote_queue +
+    /// spinlock — wake may push into a peer worker's ring +
     /// `wake_async.notify()`, and we don't want a syscall under
     /// `sl`.
     pub fn broadcast(self: *Condition) void {

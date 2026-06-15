@@ -25,7 +25,7 @@ const bench = utils.bench;
 const Bench = bench.Bench;
 
 const Fiber = fiber.Fiber;
-const cap = 16; // == queue.local_queue_capacity
+const cap = 16; // bench ring depth; seeded as the ring's initial capacity
 
 // A pool of distinct, never-dereferenced dummy `*Fiber` pointers. Distinct
 // values (rather than one repeated pointer) keep the stored slots varying so
@@ -41,7 +41,8 @@ fn dummies() [cap]*Fiber {
 // depth 0↔1. ns/op = time for a single push+pop PAIR. In `.withlock` this is
 // two uncontended lock/unlock cycles; in `.none`, none.
 fn benchPushPop(b: *Bench, comptime mode: fiber.QueueLockMode) !void {
-    var q: fiber.LocalQueue(mode) = .{};
+    var q = try fiber.LocalQueue(mode).init(std.heap.page_allocator, cap);
+    defer q.deinit();
     const ds = dummies();
     b.resetTimer();
 
@@ -59,7 +60,10 @@ fn benchPushPop(b: *Bench, comptime mode: fiber.QueueLockMode) !void {
 // always-near-empty fast path. ns/op = time for one full fill+drain cycle of
 // (cap-1) pushes and (cap-1) pops.
 fn benchFillDrain(b: *Bench, comptime mode: fiber.QueueLockMode) !void {
-    var q: fiber.LocalQueue(mode) = .{};
+    // Seed at `cap` so the fill-to-`cap-1` loop never triggers a grow — we're
+    // measuring steady-state push/pop + lock cost, not the realloc path.
+    var q = try fiber.LocalQueue(mode).init(std.heap.page_allocator, cap);
+    defer q.deinit();
     const ds = dummies();
     b.resetTimer();
 

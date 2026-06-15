@@ -326,7 +326,7 @@ pub const Fiber = struct {
 
     priority: Priority,
     /// Placement lane (`.default` / `.raft`). Set at spawn; used by
-    /// normal-priority routing to pick the right per-lane GlobalQueue.
+    /// normal-priority routing to pick a worker ring in the right lane.
     lane: Lane,
     home_worker_id: u8,
 
@@ -337,11 +337,6 @@ pub const Fiber = struct {
     /// load (no syscall).
     parked_since_ms: i64,
 
-    // Intrusive remote-queue link. Used when a peer worker pushes
-    // this fiber onto its home worker's cross-thread injection
-    // stack. Disjoint from ready_next — a fiber is either in the
-    // remote queue or the local ready queue, never both.
-    remote_next: ?*Fiber,
     // Intrusive wait-queue links. A fiber is in at most one wait
     // queue at a time (parked on a Mutex, Condition, Channel, etc.),
     // so a single pair of pointers suffices. Both null when not in
@@ -481,7 +476,6 @@ pub const Fiber = struct {
             .home_worker_id = opts.worker_id orelse 0,
             .cpu_total_ns = 0,
             .parked_since_ms = 0,
-            .remote_next = null,
             .waker_prev = null,
             .waker_next = null,
             .registry_index = std.math.maxInt(usize),
