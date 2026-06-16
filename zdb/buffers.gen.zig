@@ -37,10 +37,11 @@ pub fn parseMessageWithTail(buf: []const u8) Error!MessageReader {
         TableIndexReader.TABLE_ID => .{ .TableIndex = try TableIndexReader.init(payload_buf, 0) },
         BinaryFuseFilterReader.TABLE_ID => .{ .BinaryFuseFilter = try BinaryFuseFilterReader.init(payload_buf, 0) },
         TreeChangeReader.TABLE_ID => .{ .TreeChange = try TreeChangeReader.init(payload_buf, 0) },
-        TableChangeReader.TABLE_ID => .{ .TableChange = try TableChangeReader.init(payload_buf, 0) },
+        SSTableChangeReader.TABLE_ID => .{ .SSTableChange = try SSTableChangeReader.init(payload_buf, 0) },
         ManifestChangeReader.TABLE_ID => .{ .ManifestChange = try ManifestChangeReader.init(payload_buf, 0) },
         KeyValueReader.TABLE_ID => .{ .KeyValue = try KeyValueReader.init(payload_buf, 0) },
         MutationsReader.TABLE_ID => .{ .Mutations = try MutationsReader.init(payload_buf, 0) },
+        TableIdReader.TABLE_ID => .{ .TableId = try TableIdReader.init(payload_buf, 0) },
         else => zbuf.Error.Invalid,
     };
 }
@@ -50,10 +51,11 @@ pub const MessageReader = union(enum) {
     TableIndex: TableIndexReader,
     BinaryFuseFilter: BinaryFuseFilterReader,
     TreeChange: TreeChangeReader,
-    TableChange: TableChangeReader,
+    SSTableChange: SSTableChangeReader,
     ManifestChange: ManifestChangeReader,
     KeyValue: KeyValueReader,
     Mutations: MutationsReader,
+    TableId: TableIdReader,
 };
 
 pub const BlockIndexStruct = struct {
@@ -1088,7 +1090,7 @@ pub const BinaryFuseFilterWriter = struct {
 
 pub const TreeChangeStruct = struct {
     op: OpEnum = @enumFromInt(0),
-    namespace_id: u32 = 0,
+    namespace_id: u64 = 0,
     tree_id: u64 = 0,
     left_key: []const u8 = &.{},
     right_key: []const u8 = &.{},
@@ -1142,7 +1144,7 @@ pub const TreeChangeReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 31;
+    pub const SIZE_BYTES: u16 = 35;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -1166,36 +1168,36 @@ pub const TreeChangeReader = struct {
         return @enumFromInt(v);
     }
 
-    pub fn namespaceId(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 7;
+    pub fn namespaceId(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 11;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 3)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 3)) catch 0;
     }
 
     pub fn treeId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 15;
+        const slot_end = @as(u32, self.base) + 19;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 7)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 11)) catch 0;
     }
 
     pub fn leftKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 23;
+        const slot_end = @as(u32, self.base) + 27;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 15)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 19)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 19)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 23)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
     pub fn rightKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 31;
+        const slot_end = @as(u32, self.base) + 35;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 23)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 27)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 27)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
@@ -1214,18 +1216,18 @@ pub const TreeChangeReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_15 = @as(u32, self.base) + 23;
-        if (slot_end_15 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 15));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 19));
+        const slot_end_19 = @as(u32, self.base) + 27;
+        if (slot_end_19 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 19));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 23));
             if (data_len > 0) {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
-        const slot_end_23 = @as(u32, self.base) + 31;
-        if (slot_end_23 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 23));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 27));
+        const slot_end_27 = @as(u32, self.base) + 35;
+        if (slot_end_27 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 27));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 31));
             if (data_len > 0) {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
@@ -1285,7 +1287,7 @@ pub const TreeChangeWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 31;
+    pub const SIZE_BYTES: u16 = 35;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -1311,40 +1313,40 @@ pub const TreeChangeWriter = struct {
         try zbuf.patchU8(out.items, self.base + 2, @intFromEnum(v));
     }
 
-    pub fn setNamespaceId(self: *Self, v: u32) Error!void {
+    pub fn setNamespaceId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 3, v);
+        try zbuf.patchU64(out.items, self.base + 3, v);
     }
 
     pub fn setTreeId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 7, v);
+        try zbuf.patchU64(out.items, self.base + 11, v);
     }
 
     pub fn setLeftKey(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
         if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 15, 0);
             try zbuf.patchU32(out.items, self.base + 19, 0);
+            try zbuf.patchU32(out.items, self.base + 23, 0);
             return;
         }
         const abs_off = try zbuf.appendBytes(out, self.alloc, data);
         const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 15, off);
-        try zbuf.patchU32(out.items, self.base + 19, @as(u32, @intCast(data.len)));
+        try zbuf.patchU32(out.items, self.base + 19, off);
+        try zbuf.patchU32(out.items, self.base + 23, @as(u32, @intCast(data.len)));
     }
 
     pub fn setRightKey(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
         if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 23, 0);
             try zbuf.patchU32(out.items, self.base + 27, 0);
+            try zbuf.patchU32(out.items, self.base + 31, 0);
             return;
         }
         const abs_off = try zbuf.appendBytes(out, self.alloc, data);
         const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 23, off);
-        try zbuf.patchU32(out.items, self.base + 27, @as(u32, @intCast(data.len)));
+        try zbuf.patchU32(out.items, self.base + 27, off);
+        try zbuf.patchU32(out.items, self.base + 31, @as(u32, @intCast(data.len)));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -1393,29 +1395,31 @@ pub const TreeChangeWriter = struct {
     }
 };
 
-pub const TableChangeStruct = struct {
+pub const SSTableChangeStruct = struct {
     op: OpEnum = @enumFromInt(0),
     level: u32 = 0,
-    table_id: u64 = 0,
+    sst_id: u64 = 0,
     tree_id: u64 = 0,
+    namespace_id: u64 = 0,
     checksum: u32 = 0,
     size: u64 = 0,
-    pub fn deinit(self: *TableChangeStruct, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *SSTableChangeStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
     }
 
-    pub fn destroy(self: *TableChangeStruct, alloc: std.mem.Allocator) void {
+    pub fn destroy(self: *SSTableChangeStruct, alloc: std.mem.Allocator) void {
         self.deinit(alloc);
         alloc.destroy(self);
     }
 
-    fn cloneValue(self: TableChangeStruct, alloc: std.mem.Allocator) Error!TableChangeStruct {
-        var s = TableChangeStruct{
+    fn cloneValue(self: SSTableChangeStruct, alloc: std.mem.Allocator) Error!SSTableChangeStruct {
+        var s = SSTableChangeStruct{
             .op = self.op,
             .level = self.level,
-            .table_id = self.table_id,
+            .sst_id = self.sst_id,
             .tree_id = self.tree_id,
+            .namespace_id = self.namespace_id,
             .checksum = self.checksum,
             .size = self.size,
         };
@@ -1423,19 +1427,20 @@ pub const TableChangeStruct = struct {
         return s;
     }
 
-    pub fn clone(self: TableChangeStruct, alloc: std.mem.Allocator) Error!*TableChangeStruct {
-        const ptr = try alloc.create(TableChangeStruct);
+    pub fn clone(self: SSTableChangeStruct, alloc: std.mem.Allocator) Error!*SSTableChangeStruct {
+        const ptr = try alloc.create(SSTableChangeStruct);
         errdefer alloc.destroy(ptr);
         ptr.* = try self.cloneValue(alloc);
         return ptr;
     }
 
-    pub fn marshalTo(self: TableChangeStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
-        var writer = try TableChangeWriter.initWithBuf(alloc, out);
+    pub fn marshalTo(self: SSTableChangeStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try SSTableChangeWriter.initWithBuf(alloc, out);
         try writer.setOp(self.op);
         try writer.setLevel(self.level);
-        try writer.setTableId(self.table_id);
+        try writer.setSstId(self.sst_id);
         try writer.setTreeId(self.tree_id);
+        try writer.setNamespaceId(self.namespace_id);
         try writer.setChecksum(self.checksum);
         try writer.setSize(self.size);
         const result = try writer.finish();
@@ -1443,14 +1448,14 @@ pub const TableChangeStruct = struct {
     }
 };
 
-pub const TableChangeReader = struct {
+pub const SSTableChangeReader = struct {
     const Self = @This();
     buf: []const u8,
     base: u32,
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46597;
-    pub const SIZE_BYTES: u16 = 35;
+    pub const SIZE_BYTES: u16 = 43;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -1481,7 +1486,7 @@ pub const TableChangeReader = struct {
         return zbuf.readU32(self.buf, @as(usize, self.base + 3)) catch 0;
     }
 
-    pub fn tableId(self: Self) u64 {
+    pub fn sstId(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 15;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
@@ -1495,26 +1500,34 @@ pub const TableChangeReader = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 15)) catch 0;
     }
 
-    pub fn checksum(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 27;
+    pub fn namespaceId(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 31;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 23)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 23)) catch 0;
     }
 
-    pub fn size(self: Self) u64 {
+    pub fn checksum(self: Self) u32 {
         const slot_end = @as(u32, self.base) + 35;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 27)) catch 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch 0;
+    }
+
+    pub fn size(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 43;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 35)) catch 0;
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
-        var writer = try TableChangeWriter.initWithBuf(alloc, out);
+        var writer = try SSTableChangeWriter.initWithBuf(alloc, out);
         try writer.setOp(self.op());
         try writer.setLevel(self.level());
-        try writer.setTableId(self.tableId());
+        try writer.setSstId(self.sstId());
         try writer.setTreeId(self.treeId());
+        try writer.setNamespaceId(self.namespaceId());
         try writer.setChecksum(self.checksum());
         try writer.setSize(self.size());
         const result = try writer.finish();
@@ -1524,27 +1537,28 @@ pub const TableChangeReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
     }
-    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableChangeStruct {
-        var s = TableChangeStruct{
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!SSTableChangeStruct {
+        var s = SSTableChangeStruct{
             .op = self.op(),
             .level = self.level(),
-            .table_id = self.tableId(),
+            .sst_id = self.sstId(),
             .tree_id = self.treeId(),
+            .namespace_id = self.namespaceId(),
             .checksum = self.checksum(),
             .size = self.size(),
         };
         errdefer s.deinit(alloc);
         return s;
     }
-    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TableChangeStruct {
-        const ptr = try alloc.create(TableChangeStruct);
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*SSTableChangeStruct {
+        const ptr = try alloc.create(SSTableChangeStruct);
         errdefer alloc.destroy(ptr);
         ptr.* = try self.toStructValue(alloc);
         return ptr;
     }
 };
 
-pub const TableChangeBuffer = struct {
+pub const SSTableChangeBuffer = struct {
     alloc: std.mem.Allocator,
     offset: u32,
     bytes: ?[]u8,
@@ -1552,15 +1566,15 @@ pub const TableChangeBuffer = struct {
     has_tail: bool,
     pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
         const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != TableChangeReader.TABLE_ID) return zbuf.Error.Invalid;
+        if (tail.table_id != SSTableChangeReader.TABLE_ID) return zbuf.Error.Invalid;
         return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
     }
     pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
         return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
     }
-    pub fn initReader(self: @This()) Error!TableChangeReader {
+    pub fn initReader(self: @This()) Error!SSTableChangeReader {
         const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return TableChangeReader.init(payload, self.offset);
+        return SSTableChangeReader.init(payload, self.offset);
     }
     pub fn deinit(self: *@This()) void {
         if (self.bytes) |bytes| {
@@ -1571,7 +1585,7 @@ pub const TableChangeBuffer = struct {
     }
 };
 
-pub const TableChangeWriter = struct {
+pub const SSTableChangeWriter = struct {
     const Self = @This();
     buf: ?*std.ArrayList(u8),
     owns_buf: bool,
@@ -1579,7 +1593,7 @@ pub const TableChangeWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46597;
-    pub const SIZE_BYTES: u16 = 35;
+    pub const SIZE_BYTES: u16 = 43;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -1610,7 +1624,7 @@ pub const TableChangeWriter = struct {
         try zbuf.patchU32(out.items, self.base + 3, v);
     }
 
-    pub fn setTableId(self: *Self, v: u64) Error!void {
+    pub fn setSstId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
         try zbuf.patchU64(out.items, self.base + 7, v);
     }
@@ -1620,14 +1634,19 @@ pub const TableChangeWriter = struct {
         try zbuf.patchU64(out.items, self.base + 15, v);
     }
 
+    pub fn setNamespaceId(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 23, v);
+    }
+
     pub fn setChecksum(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 23, v);
+        try zbuf.patchU32(out.items, self.base + 31, v);
     }
 
     pub fn setSize(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 27, v);
+        try zbuf.patchU64(out.items, self.base + 35, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -1637,13 +1656,14 @@ pub const TableChangeWriter = struct {
         }
         if (@hasField(Values, "op")) try self.setOp(@field(values, "op"));
         if (@hasField(Values, "level")) try self.setLevel(@field(values, "level"));
-        if (@hasField(Values, "table_id")) try self.setTableId(@field(values, "table_id"));
+        if (@hasField(Values, "sst_id")) try self.setSstId(@field(values, "sst_id"));
         if (@hasField(Values, "tree_id")) try self.setTreeId(@field(values, "tree_id"));
+        if (@hasField(Values, "namespace_id")) try self.setNamespaceId(@field(values, "namespace_id"));
         if (@hasField(Values, "checksum")) try self.setChecksum(@field(values, "checksum"));
         if (@hasField(Values, "size")) try self.setSize(@field(values, "size"));
     }
 
-    pub fn finish(self: *Self) Error!TableChangeBuffer {
+    pub fn finish(self: *Self) Error!SSTableChangeBuffer {
         if (self.owns_buf) {
             const owned = self.buf orelse return zbuf.Error.Invalid;
             const bytes = try owned.toOwnedSlice(self.alloc);
@@ -1656,7 +1676,7 @@ pub const TableChangeWriter = struct {
 
     /// Root must be at payload offset 0. Initialize the root writer first
     /// on an empty buffer; children built later land at higher offsets.
-    pub fn finishWithTail(self: *Self) Error!TableChangeBuffer {
+    pub fn finishWithTail(self: *Self) Error!SSTableChangeBuffer {
         if (self.base != 0) return zbuf.Error.Invalid;
         const out = self.bufMut();
         try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
@@ -1679,16 +1699,21 @@ pub const TableChangeWriter = struct {
 
 pub const ManifestChangeStruct = struct {
     tree_changes: []TreeChangeStruct = &.{},
-    table_changes: []TableChangeStruct = &.{},
+    sstable_changes: []SSTableChangeStruct = &.{},
     cmd: u32 = 0,
     memtable_id: u64 = 0,
+    next_table_ids: []TableIdStruct = &.{},
+    next_ns_id: u64 = 0,
     pub fn deinit(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
         for (self.tree_changes) |*_b| _b.deinit(alloc);
         alloc.free(self.tree_changes);
         self.tree_changes = &.{};
-        for (self.table_changes) |*_b| _b.deinit(alloc);
-        alloc.free(self.table_changes);
-        self.table_changes = &.{};
+        for (self.sstable_changes) |*_b| _b.deinit(alloc);
+        alloc.free(self.sstable_changes);
+        self.sstable_changes = &.{};
+        for (self.next_table_ids) |*_b| _b.deinit(alloc);
+        alloc.free(self.next_table_ids);
+        self.next_table_ids = &.{};
     }
 
     pub fn destroy(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
@@ -1700,6 +1725,7 @@ pub const ManifestChangeStruct = struct {
         var s = ManifestChangeStruct{
             .cmd = self.cmd,
             .memtable_id = self.memtable_id,
+            .next_ns_id = self.next_ns_id,
         };
         errdefer s.deinit(alloc);
         {
@@ -1710,10 +1736,17 @@ pub const ManifestChangeStruct = struct {
             }
         }
         {
-            s.table_changes = try alloc.alloc(TableChangeStruct, self.table_changes.len);
-            @memset(s.table_changes, .{});
-            for (self.table_changes, 0..) |_child, _i| {
-                s.table_changes[_i] = try _child.cloneValue(alloc);
+            s.sstable_changes = try alloc.alloc(SSTableChangeStruct, self.sstable_changes.len);
+            @memset(s.sstable_changes, .{});
+            for (self.sstable_changes, 0..) |_child, _i| {
+                s.sstable_changes[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        {
+            s.next_table_ids = try alloc.alloc(TableIdStruct, self.next_table_ids.len);
+            @memset(s.next_table_ids, .{});
+            for (self.next_table_ids, 0..) |_child, _i| {
+                s.next_table_ids[_i] = try _child.cloneValue(alloc);
             }
         }
         return s;
@@ -1736,16 +1769,25 @@ pub const ManifestChangeStruct = struct {
             }
             try writer.setTreeChanges(offsets);
         }
-        if (self.table_changes.len > 0) {
-            const offsets = try alloc.alloc(u32, self.table_changes.len);
+        if (self.sstable_changes.len > 0) {
+            const offsets = try alloc.alloc(u32, self.sstable_changes.len);
             defer alloc.free(offsets);
-            for (self.table_changes, 0..) |child, ci| {
+            for (self.sstable_changes, 0..) |child, ci| {
                 offsets[ci] = try child.marshalTo(alloc, out);
             }
-            try writer.setTableChanges(offsets);
+            try writer.setSstableChanges(offsets);
         }
         try writer.setCmd(self.cmd);
         try writer.setMemtableId(self.memtable_id);
+        if (self.next_table_ids.len > 0) {
+            const offsets = try alloc.alloc(u32, self.next_table_ids.len);
+            defer alloc.free(offsets);
+            for (self.next_table_ids, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setNextTableIds(offsets);
+        }
+        try writer.setNextNsId(self.next_ns_id);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1758,7 +1800,7 @@ pub const ManifestChangeReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 30;
+    pub const SIZE_BYTES: u16 = 46;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -1798,7 +1840,7 @@ pub const ManifestChangeReader = struct {
         return TreeChangeReader.init(self.buf, child_off);
     }
 
-    fn tableChangesSlice(self: Self) []const u8 {
+    fn sstableChangesSlice(self: Self) []const u8 {
         const slot_end = @as(u32, self.base) + 18;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &.{};
@@ -1810,16 +1852,16 @@ pub const ManifestChangeReader = struct {
         return self.buf[index_off..end];
     }
 
-    pub fn tableChangesLen(self: Self) u32 {
-        return @intCast(self.tableChangesSlice().len / 4);
+    pub fn sstableChangesLen(self: Self) u32 {
+        return @intCast(self.sstableChangesSlice().len / 4);
     }
 
-    pub fn tableChangesAt(self: Self, i: u32) Error!TableChangeReader {
-        const s = self.tableChangesSlice();
+    pub fn sstableChangesAt(self: Self, i: u32) Error!SSTableChangeReader {
+        const s = self.sstableChangesSlice();
         const off = @as(usize, i) * 4;
         if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
         const child_off = zbuf.readU32(s, off) catch unreachable;
-        return TableChangeReader.init(self.buf, child_off);
+        return SSTableChangeReader.init(self.buf, child_off);
     }
 
     pub fn cmd(self: Self) u32 {
@@ -1836,6 +1878,37 @@ pub const ManifestChangeReader = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 22)) catch 0;
     }
 
+    fn nextTableIdsSlice(self: Self) []const u8 {
+        const slot_end = @as(u32, self.base) + 38;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 30)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 34)) catch return &.{};
+        if (elem_count == 0) return &.{};
+        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn nextTableIdsLen(self: Self) u32 {
+        return @intCast(self.nextTableIdsSlice().len / 4);
+    }
+
+    pub fn nextTableIdsAt(self: Self, i: u32) Error!TableIdReader {
+        const s = self.nextTableIdsSlice();
+        const off = @as(usize, i) * 4;
+        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
+        const child_off = zbuf.readU32(s, off) catch unreachable;
+        return TableIdReader.init(self.buf, child_off);
+    }
+
+    pub fn nextNsId(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 46;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 38)) catch 0;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try ManifestChangeWriter.initWithBuf(alloc, out);
         const count_treeChanges: u32 = self.treeChangesLen();
@@ -1849,19 +1922,31 @@ pub const ManifestChangeReader = struct {
             }
             try writer.setTreeChanges(child_offsets_treeChanges);
         }
-        const count_tableChanges: u32 = self.tableChangesLen();
-        if (count_tableChanges != 0) {
-            var child_offsets_tableChanges = try alloc.alloc(u32, @intCast(count_tableChanges));
-            defer alloc.free(child_offsets_tableChanges);
-            var i_tableChanges: u32 = 0;
-            while (i_tableChanges < count_tableChanges) : (i_tableChanges += 1) {
-                const child = try self.tableChangesAt(i_tableChanges);
-                child_offsets_tableChanges[@intCast(i_tableChanges)] = try child.cloneInto(alloc, out);
+        const count_sstableChanges: u32 = self.sstableChangesLen();
+        if (count_sstableChanges != 0) {
+            var child_offsets_sstableChanges = try alloc.alloc(u32, @intCast(count_sstableChanges));
+            defer alloc.free(child_offsets_sstableChanges);
+            var i_sstableChanges: u32 = 0;
+            while (i_sstableChanges < count_sstableChanges) : (i_sstableChanges += 1) {
+                const child = try self.sstableChangesAt(i_sstableChanges);
+                child_offsets_sstableChanges[@intCast(i_sstableChanges)] = try child.cloneInto(alloc, out);
             }
-            try writer.setTableChanges(child_offsets_tableChanges);
+            try writer.setSstableChanges(child_offsets_sstableChanges);
         }
         try writer.setCmd(self.cmd());
         try writer.setMemtableId(self.memtableId());
+        const count_nextTableIds: u32 = self.nextTableIdsLen();
+        if (count_nextTableIds != 0) {
+            var child_offsets_nextTableIds = try alloc.alloc(u32, @intCast(count_nextTableIds));
+            defer alloc.free(child_offsets_nextTableIds);
+            var i_nextTableIds: u32 = 0;
+            while (i_nextTableIds < count_nextTableIds) : (i_nextTableIds += 1) {
+                const child = try self.nextTableIdsAt(i_nextTableIds);
+                child_offsets_nextTableIds[@intCast(i_nextTableIds)] = try child.cloneInto(alloc, out);
+            }
+            try writer.setNextTableIds(child_offsets_nextTableIds);
+        }
+        try writer.setNextNsId(self.nextNsId());
         const result = try writer.finish();
         return result.offset;
     }
@@ -1893,10 +1978,25 @@ pub const ManifestChangeReader = struct {
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
             }
         }
-        const count_tableChanges: u32 = self.tableChangesLen();
-        var i_tableChanges: u32 = 0;
-        while (i_tableChanges < count_tableChanges) : (i_tableChanges += 1) {
-            const child_view = try self.tableChangesAt(i_tableChanges);
+        const count_sstableChanges: u32 = self.sstableChangesLen();
+        var i_sstableChanges: u32 = 0;
+        while (i_sstableChanges < count_sstableChanges) : (i_sstableChanges += 1) {
+            const child_view = try self.sstableChangesAt(i_sstableChanges);
+            try child_view.verify();
+        }
+        const slot_end_arr_30 = @as(u32, self.base) + 38;
+        if (slot_end_arr_30 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 30));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 34));
+            if (elem_count > 0) {
+                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
+                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
+            }
+        }
+        const count_nextTableIds: u32 = self.nextTableIdsLen();
+        var i_nextTableIds: u32 = 0;
+        while (i_nextTableIds < count_nextTableIds) : (i_nextTableIds += 1) {
+            const child_view = try self.nextTableIdsAt(i_nextTableIds);
             try child_view.verify();
         }
     }
@@ -1904,6 +2004,7 @@ pub const ManifestChangeReader = struct {
         var s = ManifestChangeStruct{
             .cmd = self.cmd(),
             .memtable_id = self.memtableId(),
+            .next_ns_id = self.nextNsId(),
         };
         errdefer s.deinit(alloc);
         {
@@ -1916,12 +2017,21 @@ pub const ManifestChangeReader = struct {
             }
         }
         {
-            const _cnt = self.tableChangesLen();
-            s.table_changes = try alloc.alloc(TableChangeStruct, @intCast(_cnt));
-            @memset(s.table_changes, .{});
+            const _cnt = self.sstableChangesLen();
+            s.sstable_changes = try alloc.alloc(SSTableChangeStruct, @intCast(_cnt));
+            @memset(s.sstable_changes, .{});
             for (0.._cnt) |_i| {
-                const _child = try self.tableChangesAt(@intCast(_i));
-                s.table_changes[_i] = try _child.toStructValue(alloc);
+                const _child = try self.sstableChangesAt(@intCast(_i));
+                s.sstable_changes[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        {
+            const _cnt = self.nextTableIdsLen();
+            s.next_table_ids = try alloc.alloc(TableIdStruct, @intCast(_cnt));
+            @memset(s.next_table_ids, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.nextTableIdsAt(@intCast(_i));
+                s.next_table_ids[_i] = try _child.toStructValue(alloc);
             }
         }
         return s;
@@ -1969,7 +2079,7 @@ pub const ManifestChangeWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 30;
+    pub const SIZE_BYTES: u16 = 46;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -2003,7 +2113,7 @@ pub const ManifestChangeWriter = struct {
         try zbuf.patchU32(out.items, self.base + 6, @as(u32, @intCast(values.len)));
     }
 
-    pub fn setTableChanges(self: *Self, values: []const u32) Error!void {
+    pub fn setSstableChanges(self: *Self, values: []const u32) Error!void {
         const out = self.bufMut();
         if (values.len == 0) {
             try zbuf.patchU32(out.items, self.base + 10, 0);
@@ -2026,15 +2136,35 @@ pub const ManifestChangeWriter = struct {
         try zbuf.patchU64(out.items, self.base + 22, v);
     }
 
+    pub fn setNextTableIds(self: *Self, values: []const u32) Error!void {
+        const out = self.bufMut();
+        if (values.len == 0) {
+            try zbuf.patchU32(out.items, self.base + 30, 0);
+            try zbuf.patchU32(out.items, self.base + 34, 0);
+            return;
+        }
+        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
+        const index_off = abs_index_off;
+        try zbuf.patchU32(out.items, self.base + 30, index_off);
+        try zbuf.patchU32(out.items, self.base + 34, @as(u32, @intCast(values.len)));
+    }
+
+    pub fn setNextNsId(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 38, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
         if (@hasField(Values, "tree_changes")) try self.setTreeChanges(@field(values, "tree_changes"));
-        if (@hasField(Values, "table_changes")) try self.setTableChanges(@field(values, "table_changes"));
+        if (@hasField(Values, "sstable_changes")) try self.setSstableChanges(@field(values, "sstable_changes"));
         if (@hasField(Values, "cmd")) try self.setCmd(@field(values, "cmd"));
         if (@hasField(Values, "memtable_id")) try self.setMemtableId(@field(values, "memtable_id"));
+        if (@hasField(Values, "next_table_ids")) try self.setNextTableIds(@field(values, "next_table_ids"));
+        if (@hasField(Values, "next_ns_id")) try self.setNextNsId(@field(values, "next_ns_id"));
     }
 
     pub fn finish(self: *Self) Error!ManifestChangeBuffer {
@@ -2322,7 +2452,8 @@ pub const KeyValueWriter = struct {
 };
 
 pub const MutationsStruct = struct {
-    namespace: u32 = 0,
+    namespace: u64 = 0,
+    table_id: u32 = 0,
     kvs: []KeyValueStruct = &.{},
     pub fn deinit(self: *MutationsStruct, alloc: std.mem.Allocator) void {
         for (self.kvs) |*_b| _b.deinit(alloc);
@@ -2338,6 +2469,7 @@ pub const MutationsStruct = struct {
     fn cloneValue(self: MutationsStruct, alloc: std.mem.Allocator) Error!MutationsStruct {
         var s = MutationsStruct{
             .namespace = self.namespace,
+            .table_id = self.table_id,
         };
         errdefer s.deinit(alloc);
         {
@@ -2360,6 +2492,7 @@ pub const MutationsStruct = struct {
     pub fn marshalTo(self: MutationsStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try MutationsWriter.initWithBuf(alloc, out);
         try writer.setNamespace(self.namespace);
+        try writer.setTableId(self.table_id);
         if (self.kvs.len > 0) {
             const offsets = try alloc.alloc(u32, self.kvs.len);
             defer alloc.free(offsets);
@@ -2380,7 +2513,7 @@ pub const MutationsReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46600;
-    pub const SIZE_BYTES: u16 = 14;
+    pub const SIZE_BYTES: u16 = 22;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -2396,19 +2529,26 @@ pub const MutationsReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn namespace(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 6;
+    pub fn namespace(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 10;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
+    }
+
+    pub fn tableId(self: Self) u32 {
+        const slot_end = @as(u32, self.base) + 14;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch 0;
     }
 
     fn kvsSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 14;
+        const slot_end = @as(u32, self.base) + 22;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 18)) catch return &.{};
         if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
         if (end > self.buf.len) return &.{};
@@ -2430,6 +2570,7 @@ pub const MutationsReader = struct {
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try MutationsWriter.initWithBuf(alloc, out);
         try writer.setNamespace(self.namespace());
+        try writer.setTableId(self.tableId());
         const count_kvs: u32 = self.kvsLen();
         if (count_kvs != 0) {
             var child_offsets_kvs = try alloc.alloc(u32, @intCast(count_kvs));
@@ -2448,10 +2589,10 @@ pub const MutationsReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_arr_6 = @as(u32, self.base) + 14;
-        if (slot_end_arr_6 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
+        const slot_end_arr_14 = @as(u32, self.base) + 22;
+        if (slot_end_arr_14 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 18));
             if (elem_count > 0) {
                 const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
@@ -2467,6 +2608,7 @@ pub const MutationsReader = struct {
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!MutationsStruct {
         var s = MutationsStruct{
             .namespace = self.namespace(),
+            .table_id = self.tableId(),
         };
         errdefer s.deinit(alloc);
         {
@@ -2523,6 +2665,231 @@ pub const MutationsWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46600;
+    pub const SIZE_BYTES: u16 = 22;
+
+    fn bufMut(self: *Self) *std.ArrayList(u8) {
+        return self.buf orelse @panic("zbuf writer missing buffer");
+    }
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
+        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
+        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
+        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+    }
+
+    pub fn init(alloc: std.mem.Allocator) Error!Self {
+        const owned = try alloc.create(std.ArrayList(u8));
+        owned.* = .empty;
+        errdefer alloc.destroy(owned);
+        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
+        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
+        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+    }
+
+    pub fn setNamespace(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 2, v);
+    }
+
+    pub fn setTableId(self: *Self, v: u32) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU32(out.items, self.base + 10, v);
+    }
+
+    pub fn setKvs(self: *Self, values: []const u32) Error!void {
+        const out = self.bufMut();
+        if (values.len == 0) {
+            try zbuf.patchU32(out.items, self.base + 14, 0);
+            try zbuf.patchU32(out.items, self.base + 18, 0);
+            return;
+        }
+        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
+        const index_off = abs_index_off;
+        try zbuf.patchU32(out.items, self.base + 14, index_off);
+        try zbuf.patchU32(out.items, self.base + 18, @as(u32, @intCast(values.len)));
+    }
+
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "namespace")) try self.setNamespace(@field(values, "namespace"));
+        if (@hasField(Values, "table_id")) try self.setTableId(@field(values, "table_id"));
+        if (@hasField(Values, "kvs")) try self.setKvs(@field(values, "kvs"));
+    }
+
+    pub fn finish(self: *Self) Error!MutationsBuffer {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return zbuf.Error.Invalid;
+            const bytes = try owned.toOwnedSlice(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
+        }
+        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+    }
+
+    /// Root must be at payload offset 0. Initialize the root writer first
+    /// on an empty buffer; children built later land at higher offsets.
+    pub fn finishWithTail(self: *Self) Error!MutationsBuffer {
+        if (self.base != 0) return zbuf.Error.Invalid;
+        const out = self.bufMut();
+        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
+        var result = try self.finish();
+        result.has_tail = true;
+        return result;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return;
+            owned.deinit(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            self.base = 0;
+            self.owns_buf = false;
+        }
+    }
+};
+
+pub const TableIdStruct = struct {
+    namespace: u64 = 0,
+    next_table_id: u32 = 0,
+    pub fn deinit(self: *TableIdStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+
+    pub fn destroy(self: *TableIdStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: TableIdStruct, alloc: std.mem.Allocator) Error!TableIdStruct {
+        var s = TableIdStruct{
+            .namespace = self.namespace,
+            .next_table_id = self.next_table_id,
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn clone(self: TableIdStruct, alloc: std.mem.Allocator) Error!*TableIdStruct {
+        const ptr = try alloc.create(TableIdStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: TableIdStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TableIdWriter.initWithBuf(alloc, out);
+        try writer.setNamespace(self.namespace);
+        try writer.setNextTableId(self.next_table_id);
+        const result = try writer.finish();
+        return result.offset;
+    }
+};
+
+pub const TableIdReader = struct {
+    const Self = @This();
+    buf: []const u8,
+    base: u32,
+    size_bytes: u16,
+
+    pub const TABLE_ID: u16 = 46601;
+    pub const SIZE_BYTES: u16 = 14;
+
+    pub fn parseRoot(buf: []const u8) Error!Self {
+        const tail = try zbuf.readMessageTail(buf);
+        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
+        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
+        return init(payload_buf, 0);
+    }
+
+    pub fn init(buf: []const u8, base: u32) Error!Self {
+        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
+        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
+        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
+        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+    }
+
+    pub fn namespace(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 10;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
+    }
+
+    pub fn nextTableId(self: Self) u32 {
+        const slot_end = @as(u32, self.base) + 14;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch 0;
+    }
+
+    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try TableIdWriter.initWithBuf(alloc, out);
+        try writer.setNamespace(self.namespace());
+        try writer.setNextTableId(self.nextTableId());
+        const result = try writer.finish();
+        return result.offset;
+    }
+
+    pub fn verify(self: Self) Error!void {
+        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableIdStruct {
+        var s = TableIdStruct{
+            .namespace = self.namespace(),
+            .next_table_id = self.nextTableId(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*TableIdStruct {
+        const ptr = try alloc.create(TableIdStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const TableIdBuffer = struct {
+    alloc: std.mem.Allocator,
+    offset: u32,
+    bytes: ?[]u8,
+    ownership: Ownership,
+    has_tail: bool,
+    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
+        const tail = try zbuf.readMessageTail(bytes);
+        if (tail.table_id != TableIdReader.TABLE_ID) return zbuf.Error.Invalid;
+        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
+    }
+    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
+        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
+    }
+    pub fn initReader(self: @This()) Error!TableIdReader {
+        const payload = self.bytes orelse return zbuf.Error.Invalid;
+        return TableIdReader.init(payload, self.offset);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| {
+            if (self.ownership == .owned) self.alloc.free(bytes);
+            self.bytes = null;
+            self.ownership = .borrowed;
+        }
+    }
+};
+
+pub const TableIdWriter = struct {
+    const Self = @This();
+    buf: ?*std.ArrayList(u8),
+    owns_buf: bool,
+    alloc: std.mem.Allocator,
+    base: u32,
+
+    pub const TABLE_ID: u16 = 46601;
     pub const SIZE_BYTES: u16 = 14;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
@@ -2544,22 +2911,14 @@ pub const MutationsWriter = struct {
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
     }
 
-    pub fn setNamespace(self: *Self, v: u32) Error!void {
+    pub fn setNamespace(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 2, v);
+        try zbuf.patchU64(out.items, self.base + 2, v);
     }
 
-    pub fn setKvs(self: *Self, values: []const u32) Error!void {
+    pub fn setNextTableId(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 6, 0);
-            try zbuf.patchU32(out.items, self.base + 10, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 6, index_off);
-        try zbuf.patchU32(out.items, self.base + 10, @as(u32, @intCast(values.len)));
+        try zbuf.patchU32(out.items, self.base + 10, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -2568,10 +2927,10 @@ pub const MutationsWriter = struct {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
         if (@hasField(Values, "namespace")) try self.setNamespace(@field(values, "namespace"));
-        if (@hasField(Values, "kvs")) try self.setKvs(@field(values, "kvs"));
+        if (@hasField(Values, "next_table_id")) try self.setNextTableId(@field(values, "next_table_id"));
     }
 
-    pub fn finish(self: *Self) Error!MutationsBuffer {
+    pub fn finish(self: *Self) Error!TableIdBuffer {
         if (self.owns_buf) {
             const owned = self.buf orelse return zbuf.Error.Invalid;
             const bytes = try owned.toOwnedSlice(self.alloc);
@@ -2584,7 +2943,7 @@ pub const MutationsWriter = struct {
 
     /// Root must be at payload offset 0. Initialize the root writer first
     /// on an empty buffer; children built later land at higher offsets.
-    pub fn finishWithTail(self: *Self) Error!MutationsBuffer {
+    pub fn finishWithTail(self: *Self) Error!TableIdBuffer {
         if (self.base != 0) return zbuf.Error.Invalid;
         const out = self.bufMut();
         try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);

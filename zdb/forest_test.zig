@@ -10,10 +10,28 @@ const Table = table_mod.Table;
 
 const manifest = zdb.manifest;
 const KeyRange = zdb.level.KeyRange;
+const Tree = zdb.tree.Tree;
+
+// A stand-in Tree for TableTrees unit tests: only `tree_id` and `key_range`
+// are read by addTree/lookup/removeTree, so the rest is left undefined.
+fn fakeTree(tree_id: u64, range: KeyRange) Tree {
+    var t: Tree = undefined;
+    t.tree_id = tree_id;
+    t.key_range = range;
+    return t;
+}
+
+// Total trees across all table buckets (replaces the old Forest.trees count).
+fn treeCount(f: *Forest) usize {
+    var n: usize = 0;
+    var it = f.tables.valueIterator();
+    while (it.next()) |trees| n += trees.*.entries.items.len;
+    return n;
+}
 
 const forest_mod = zdb.forest;
 const Forest = forest_mod.Forest;
-const RouteTable = forest_mod.RouteTable;
+const TableTrees = forest_mod.TableTrees;
 
 const config = zdb.config;
 
@@ -29,24 +47,34 @@ fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
     return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
 }
 
+// Force semantic analysis of every Forest/TableTrees method, even ones the
+// other tests never call (e.g. the flush path). Zig only type-checks functions
+// that are referenced, so an uninstantiated method can carry a type error
+// indefinitely; this makes those surface as a compile error in `zig build test`.
+test "forest: all decls type-check" {
+    std.testing.refAllDecls(Forest);
+    std.testing.refAllDecls(TableTrees);
+}
+
 // ---------------------------------------------------------------------------
-// 1. RouteTable lookup
+// 1. TableTrees lookup
 // ---------------------------------------------------------------------------
 
 test "forest: route table single entry" {
     const alloc = std.testing.allocator;
-    var rt = RouteTable.init(alloc, 1);
-    defer rt.deinit();
+    var trees = TableTrees.init(alloc);
+    defer trees.deinit();
 
     // Single tree with infinite range covers everything.
-    try rt.addRoute(10, .{ .inf = true });
-    try std.testing.expectEqual(@as(u64, 10), rt.lookup(.{ .namespace = 1, .primary = "anything" }).?);
+    var t10 = fakeTree(10, .{ .inf = true });
+    try trees.addTree(&t10);
+    try std.testing.expectEqual(@as(u64, 10), trees.lookup(.{ .namespace = 1, .primary = "anything" }).?.tree_id);
 }
 
 test "forest: route table multi-entry" {
     const alloc = std.testing.allocator;
-    var rt = RouteTable.init(alloc, 1);
-    defer rt.deinit();
+    var trees = TableTrees.init(alloc);
+    defer trees.deinit();
 
     // Two trees: [a, m) and [m, z].
     const ak = try (Key{ .namespace = 1, .primary = "a" }).marshal(alloc);
@@ -58,13 +86,15 @@ test "forest: route table multi-entry" {
     const zk = try (Key{ .namespace = 1, .primary = "z" }).marshal(alloc);
     defer alloc.free(zk);
 
-    try rt.addRoute(1, .{ .left = Key.init(ak), .right = Key.init(lk) });
-    try rt.addRoute(2, .{ .left = Key.init(mk), .right = Key.init(zk) });
+    var t1 = fakeTree(1, .{ .left = Key.init(ak), .right = Key.init(lk) });
+    var t2 = fakeTree(2, .{ .left = Key.init(mk), .right = Key.init(zk) });
+    try trees.addTree(&t1);
+    try trees.addTree(&t2);
 
     // "c" falls in tree 1.
-    try std.testing.expectEqual(@as(u64, 1), rt.lookup(.{ .namespace = 1, .primary = "c" }).?);
+    try std.testing.expectEqual(@as(u64, 1), trees.lookup(.{ .namespace = 1, .primary = "c" }).?.tree_id);
     // "n" falls in tree 2.
-    try std.testing.expectEqual(@as(u64, 2), rt.lookup(.{ .namespace = 1, .primary = "n" }).?);
+    try std.testing.expectEqual(@as(u64, 2), trees.lookup(.{ .namespace = 1, .primary = "n" }).?.tree_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -96,12 +126,13 @@ test "forest: create tree and get" {
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
-    // Create a tree for namespace 1 covering all keys.
-    const tree_id = try f.createTree(1, .{ .inf = true });
-    try std.testing.expect(tree_id > 0);
+    // Create a tree for namespace 1's default bucket (table_id 0). A fresh
+    // bucket starts at split 0, so the derived tree_id is 0.
+    const tree_id = try f.createTree(1, 0, .{ .inf = true });
+    try std.testing.expectEqual(@as(u64, 0), tree_id);
 
     // Verify the tree exists.
-    const tree = f.getTree(tree_id);
+    const tree = f.getTree(1, tree_id);
     try std.testing.expect(tree != null);
     try std.testing.expectEqual(tree_id, tree.?.tree_id);
 }
@@ -144,8 +175,9 @@ test "forest: split tree" {
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
-    const tree_id = try f.createTree(42, .{ .inf = true });
-    try std.testing.expectEqual(@as(u64, 1), tree_id);
+    // Default bucket (table_id 0) → derived tree_id 0.
+    const tree_id = try f.createTree(42, 0, .{ .inf = true });
+    try std.testing.expectEqual(@as(u64, 0), tree_id);
 
     const table_keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (table_keys, 1..) |key, tbl_id| {
@@ -155,9 +187,9 @@ test "forest: split tree" {
     }
 
     {
-        const tree_ptr = f.getTree(tree_id).?;
-        var changes: [10]manifest.TableChange = undefined;
-        for (&changes, 1..) |*c, tbl_id| c.* = manifest.createTableChange(@intCast(tbl_id), tree_id, 3); // L3
+        const tree_ptr = f.getTree(42, tree_id).?;
+        var changes: [10]manifest.SSTableChange = undefined;
+        for (&changes, 1..) |*c, tbl_id| c.* = manifest.createSSTableChange(@intCast(tbl_id), 42, tree_id, 3); // L3
         try tree_ptr.applyCompaction(&changes);
         try std.testing.expectEqual(@as(usize, 10), tree_ptr.levels[3].numTables());
     }
@@ -166,17 +198,18 @@ test "forest: split tree" {
     {
         f.mu.lock(@src());
         defer f.mu.unlock();
-        try f.splitTreeForTests(1);
+        try f.splitTreeForTests(42, tree_id);
     }
 
     // Now 2 trees should exist.
-    try std.testing.expectEqual(@as(usize, 2), f.trees.count());
+    try std.testing.expectEqual(@as(usize, 2), treeCount(f));
 
     // Best balance with 10 equal-size L3 tables: split at items[5].smallest
     // = "k06" (left=5 tables, right=5 tables, |L−R| = 0). Old tree keeps
-    // [k01..k05]; new tree gets [k06..k10].
-    const old_tree = f.trees.get(1).?;
-    const new_tree = f.trees.get(2).?;
+    // [k01..k05]; new tree gets [k06..k10]. The split's new half is the
+    // bucket's next split index → tree_id 1; the parent stays tree_id 0.
+    const old_tree = f.getTree(42, 0).?;
+    const new_tree = f.getTree(42, 1).?;
     try std.testing.expectEqual(@as(usize, 5), old_tree.levels[3].numTables());
     try std.testing.expectEqual(@as(usize, 5), new_tree.levels[3].numTables());
 
@@ -184,13 +217,244 @@ test "forest: split tree" {
     try std.testing.expectEqualStrings("k06", old_tree.key_range.right.primary);
     try std.testing.expectEqualStrings("k06", new_tree.key_range.left.primary);
 
-    // Route table for namespace 42 should have 2 entries.
-    const rt = f.ns_routes.get(42).?;
-    try std.testing.expectEqual(@as(usize, 2), rt.entries.items.len);
+    // Route table for namespace 42, table bucket 0, should have 2 entries.
+    const trees = f.tables.get(.{ .namespace = 42, .table_id = 0 }).?;
+    try std.testing.expectEqual(@as(usize, 2), trees.entries.items.len);
 
-    // Routing: "k01" → old tree (1), "k10" → new tree (2).
-    try std.testing.expectEqual(@as(u64, 1), rt.lookup(.{ .primary = "k01" }).?);
-    try std.testing.expectEqual(@as(u64, 2), rt.lookup(.{ .primary = "k10" }).?);
+    // Routing: "k01" → old tree (0), "k10" → new tree (1).
+    try std.testing.expectEqual(@as(u64, 0), trees.lookup(.{ .primary = "k01" }).?.tree_id);
+    try std.testing.expectEqual(@as(u64, 1), trees.lookup(.{ .primary = "k10" }).?.tree_id);
+}
+
+// ---------------------------------------------------------------------------
+// 6b. Two-level routing — per-table_id bucket isolation
+// ---------------------------------------------------------------------------
+
+// Build a one-key SST carrying the full (namespace, table_id, primary) key so
+// the stored key is bucket-specific, and write it to disk.
+fn buildAndWriteTableKV(alloc: std.mem.Allocator, path: []const u8, key: Key, value: []const u8) !void {
+    var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    defer bld.deinit();
+    try bld.add(key, value);
+    var tb = try bld.finish();
+    defer tb.deinit();
+    try vfs.writeFile(path, tb.bytes);
+}
+
+test "forest: two-level routing isolates by table_id" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    // Three buckets in namespace 2: table_id 0 (the default), 1, and 2. Each is its
+    // own tree, so the same primary key "row" lives independently in each.
+    const t0 = try f.createTree(2, 0, .{ .inf = true });
+    const t1 = try f.createTree(2, 1, .{ .inf = true });
+    const t2 = try f.createTree(2, 2, .{ .inf = true });
+    try std.testing.expect(t0 != t1 and t1 != t2 and t0 != t2);
+    // An unrouted table_id has no bucket.
+    try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 3 }) == null);
+
+    // One SST per bucket: same primary, distinct value, installed at L1.
+    const Bucket = struct { tid: u32, tree: u64, val: []const u8 };
+    const buckets = [_]Bucket{
+        .{ .tid = 0, .tree = t0, .val = "v0" },
+        .{ .tid = 1, .tree = t1, .val = "v1" },
+        .{ .tid = 2, .tree = t2, .val = "v2" },
+    };
+    for (buckets, 1..) |b, file_id| {
+        const path = try zdb.file_ids.sstPath(alloc, dir_path, file_id);
+        defer alloc.free(path);
+        try buildAndWriteTableKV(alloc, path, .{
+            .namespace = 2,
+            .table_id = b.tid,
+            .primary = "row",
+            .timestamp = 1,
+        }, b.val);
+        const changes = [_]manifest.SSTableChange{manifest.createSSTableChange(@intCast(file_id), 2, b.tree, 1)};
+        try f.getTree(2, b.tree).?.applyCompaction(&changes);
+    }
+
+    // A get routes to the tree for its (namespace, table_id) bucket, so each
+    // table_id returns only its own value despite sharing the primary key.
+    for (buckets) |b| {
+        const got = try f.get(alloc, .{
+            .namespace = 2,
+            .table_id = b.tid,
+            .primary = "row",
+            .timestamp = std.math.maxInt(u64),
+        }, .p0);
+        try std.testing.expect(got != null);
+        defer got.?.free(alloc);
+        try std.testing.expectEqualStrings(b.val, got.?.value);
+    }
+
+    // Unrouted bucket (table_id 3) and an absent primary both miss.
+    try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 3, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
+    try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 1, .primary = "absent", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
+}
+
+// ---------------------------------------------------------------------------
+// 6c. create_tree / drop_tree manifest ops
+// ---------------------------------------------------------------------------
+
+test "forest: create_tree + drop_tree round-trip" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    // Create a new table bucket (ns=2, table_id=100) via the manifest op.
+    const mc = try f.buildCreateTree(alloc, 2, 100);
+    defer alloc.free(mc.tree_changes);
+    try f.applyCreateTree(mc);
+    const tree_id = mc.tree_changes[0].tree_id;
+    try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 100 }) != null);
+
+    // Install one SST and confirm the row reads back through routing.
+    const path = try zdb.file_ids.sstPath(alloc, dir_path, 1);
+    defer alloc.free(path);
+    try buildAndWriteTableKV(alloc, path, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = 1 }, "v");
+    {
+        const ch = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, tree_id, 1)};
+        try f.getTree(2, tree_id).?.applyCompaction(&ch);
+    }
+    {
+        const got = try f.get(alloc, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0);
+        try std.testing.expect(got != null);
+        defer got.?.free(alloc);
+        try std.testing.expectEqualStrings("v", got.?.value);
+    }
+
+    // Drop the table: one tree in the bucket → one delete change.
+    const dc = try f.buildDropTable(alloc, 2, 100);
+    defer alloc.free(dc.tree_changes);
+    try std.testing.expectEqual(@as(usize, 1), dc.tree_changes.len);
+    try f.applyDropTree(dc);
+
+    // Data is gone, the tree is gone, the bucket is removed.
+    try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
+    try std.testing.expect(f.getTree(2, tree_id) == null);
+    try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 100 }) == null);
+}
+
+test "forest: drop_tree keeps an SST shared with another tree" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    // Two tables (buckets 100 and 101) that share one SST file (id 1) — the
+    // shape a cheap CLONE produces: the same *Table referenced by both trees.
+    const mcA = try f.buildCreateTree(alloc, 2, 100);
+    defer alloc.free(mcA.tree_changes);
+    try f.applyCreateTree(mcA);
+    const treeA = mcA.tree_changes[0].tree_id;
+
+    const mcB = try f.buildCreateTree(alloc, 2, 101);
+    defer alloc.free(mcB.tree_changes);
+    try f.applyCreateTree(mcB);
+    const treeB = mcB.tree_changes[0].tree_id;
+
+    const path = try zdb.file_ids.sstPath(alloc, dir_path, 1);
+    defer alloc.free(path);
+    try buildAndWriteTableKV(alloc, path, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = 1 }, "shared");
+    {
+        const cha = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, treeA, 1)};
+        const chb = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, treeB, 1)};
+        try f.getTree(2, treeA).?.applyCompaction(&cha);
+        try f.getTree(2, treeB).?.applyCompaction(&chb);
+    }
+    try std.testing.expect(f.table_cache.contains(1));
+
+    // Drop table A. The shared SST must survive — table B still references it,
+    // so the refcount stays > 0 and the *Table is neither freed nor evicted.
+    const dc = try f.buildDropTable(alloc, 2, 100);
+    defer alloc.free(dc.tree_changes);
+    try f.applyDropTree(dc);
+
+    try std.testing.expect(f.getTree(2, treeA) == null);
+    try std.testing.expect(f.getTree(2, treeB) != null);
+    try std.testing.expect(f.table_cache.contains(1));
+    try std.testing.expectEqual(@as(usize, 1), f.getTree(2, treeB).?.levels[1].numTables());
+}
+
+// ---------------------------------------------------------------------------
+// 6d. buildCreateTable allocates table_ids; DROP never reuses one
+// ---------------------------------------------------------------------------
+
+test "forest: buildCreateTable allocates and never reuses a dropped id" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    const first = manifest.first_table_id;
+
+    // First user table in namespace 2 gets first_table_id; second gets +1.
+    const r1 = try f.buildCreateTable(alloc, 2);
+    defer alloc.free(r1.change.tree_changes);
+    try std.testing.expectEqual(first, r1.table_id);
+    try f.applyCreateTree(r1.change);
+    try std.testing.expect(f.hasBucket(2, first));
+
+    const r2 = try f.buildCreateTable(alloc, 2);
+    defer alloc.free(r2.change.tree_changes);
+    try std.testing.expectEqual(first + 1, r2.table_id);
+    try f.applyCreateTree(r2.change);
+
+    // Drop the first table — its id must NOT be handed out again.
+    const dc = try f.buildDropTable(alloc, 2, r1.table_id);
+    defer alloc.free(dc.tree_changes);
+    try f.applyDropTree(dc);
+    try std.testing.expect(!f.hasBucket(2, r1.table_id));
+
+    const r3 = try f.buildCreateTable(alloc, 2);
+    defer alloc.free(r3.change.tree_changes);
+    try std.testing.expectEqual(first + 2, r3.table_id);
+}
+
+test "forest: buildCreateNamespace allocates global namespace ids" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    const first = manifest.first_namespace;
+
+    // CREATE DATABASE allocates the next namespace and installs its default bucket.
+    const r1 = try f.buildCreateNamespace(alloc);
+    defer alloc.free(r1.change.tree_changes);
+    try std.testing.expectEqual(first, r1.namespace);
+    try f.applyNamespaceCreate(r1.change);
+    try std.testing.expect(f.hasNamespace(first));
+
+    const r2 = try f.buildCreateNamespace(alloc);
+    defer alloc.free(r2.change.tree_changes);
+    try std.testing.expectEqual(first + 1, r2.namespace);
+    try f.applyNamespaceCreate(r2.change);
+    try std.testing.expect(f.hasNamespace(first + 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -219,17 +483,19 @@ test "forest: snapshot manifest round-trip" {
         const src = try Forest.open(alloc, .{ .dir = dir_path });
         defer src.close();
 
-        // Tree 1: ns=42, range [a, m). Tree 2: ns=43, infinite.
-        _ = try src.createTree(42, .{ .left = Key.init(ak), .right = Key.init(mk) });
-        _ = try src.createTree(43, .{ .inf = true });
+        // Tree in ns=42, range [a, m). Tree in ns=43, infinite. Both are the
+        // default bucket (table_id 0) of their namespace → tree_id 0, distinct
+        // because the namespace is part of the tree's global identity.
+        _ = try src.createTree(42, 0, .{ .left = Key.init(ak), .right = Key.init(mk) });
+        _ = try src.createTree(43, 0, .{ .inf = true });
 
-        // Drop one SST into tree 1's L1, both on disk and in the manifest.
+        // Drop one SST into the ns=42 tree's L1, both on disk and in the manifest.
         const sst_path = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(sst_path);
         try buildAndWriteTable(alloc, sst_path, "ccc");
 
-        const tree1 = src.getTree(1).?;
-        const changes = [_]manifest.TableChange{manifest.createTableChange(1, 1, 1)};
+        const tree1 = src.getTree(42, 0).?;
+        const changes = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 42, 0, 1)};
         try tree1.applyCompaction(&changes);
 
         break :blk try src.ms.serialize(alloc);
@@ -243,25 +509,23 @@ test "forest: snapshot manifest round-trip" {
     try dst.ms.restoreFrom(bytes);
     try dst.openTablesFromManifest();
 
-    // Both trees present.
-    try std.testing.expectEqual(@as(u32, 2), dst.trees.count());
-    try std.testing.expect(dst.trees.contains(1));
-    try std.testing.expect(dst.trees.contains(2));
+    // Both trees present — same namespace-local tree_id 0, distinct namespaces.
+    try std.testing.expectEqual(@as(usize, 2), treeCount(dst));
+    try std.testing.expect(dst.getTree(42, 0) != null);
+    try std.testing.expect(dst.getTree(43, 0) != null);
 
     // Namespace routes wired.
-    try std.testing.expect(dst.ns_routes.contains(42));
-    try std.testing.expect(dst.ns_routes.contains(43));
-    try std.testing.expectEqual(@as(u64, 1), dst.ns_routes.get(42).?.lookup(.{ .namespace = 42, .primary = "ccc" }).?);
-    try std.testing.expectEqual(@as(u64, 2), dst.ns_routes.get(43).?.lookup(.{ .namespace = 43, .primary = "any" }).?);
+    try std.testing.expect(dst.tables.contains(.{ .namespace = 42, .table_id = 0 }));
+    try std.testing.expect(dst.tables.contains(.{ .namespace = 43, .table_id = 0 }));
+    try std.testing.expectEqual(@as(u64, 0), dst.tables.get(.{ .namespace = 42, .table_id = 0 }).?.lookup(.{ .namespace = 42, .primary = "ccc" }).?.tree_id);
+    try std.testing.expectEqual(@as(u64, 0), dst.tables.get(.{ .namespace = 43, .table_id = 0 }).?.lookup(.{ .namespace = 43, .primary = "any" }).?.tree_id);
 
-    // Tree 1's L1 contains the SST.
-    try std.testing.expectEqual(@as(usize, 1), dst.trees.get(1).?.levels[1].numTables());
+    // The ns=42 tree's L1 contains the SST.
+    try std.testing.expectEqual(@as(usize, 1), dst.getTree(42, 0).?.levels[1].numTables());
 
-    // tree-id counter advanced past the existing IDs (trees 1,2 → next 3).
-    // file_id counter is NOT touched by openTablesFromManifest — that lives
-    // in the per-node HardState lease (`Forest.file_ids`), restored from
-    // disk independently of the manifest.
-    try std.testing.expect(dst.next_tree_id.load(.monotonic) > 2);
+    // No tree-id counter to recover: ids are derived from (table_id, split_id).
+    // The file_id counter is restored from the per-node HardState lease
+    // (`Forest.file_ids`), independently of the manifest.
 }
 
 // ---------------------------------------------------------------------------
@@ -406,14 +670,14 @@ test "forest: routes to correct tree" {
     defer f.close();
 
     // Create two trees in different namespaces.
-    _ = try f.createTree(1, .{ .inf = true });
-    _ = try f.createTree(2, .{ .inf = true });
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    _ = try f.createTree(2, 0, .{ .inf = true });
 
     // Both namespaces should have a route table.
     {
         f.mu.lockShared(@src());
         defer f.mu.unlockShared();
-        try std.testing.expect(f.ns_routes.contains(1));
-        try std.testing.expect(f.ns_routes.contains(2));
+        try std.testing.expect(f.tables.contains(.{ .namespace = 1, .table_id = 0 }));
+        try std.testing.expect(f.tables.contains(.{ .namespace = 2, .table_id = 0 }));
     }
 }

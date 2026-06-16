@@ -12,7 +12,7 @@ const Table = table_mod.Table;
 const TableIterator = table_mod.TableIterator;
 
 const manifest = zdb.manifest;
-const createTableChange = manifest.createTableChange;
+const createSSTableChange = manifest.createSSTableChange;
 const createTreeChange = manifest.createTreeChange;
 
 const level_mod = zdb.level;
@@ -355,14 +355,14 @@ test "levels: open" {
     defer ms.deinit();
     try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
     try ms.commit(&.{
-        createTableChange(1, test_tree_id, 0),
-        createTableChange(2, test_tree_id, 1),
+        createSSTableChange(1, 0, test_tree_id, 0),
+        createSSTableChange(2, 0, test_tree_id, 1),
     }, &.{});
 
     const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
+    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
     defer tree.close();
 
     try std.testing.expectEqual(@as(usize, 1), tree.levels[0].numTables());
@@ -400,7 +400,7 @@ test "levels: pick compact level" {
 
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
+    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
     defer tree.close();
 
     // Manually plant a large table in L1.
@@ -451,16 +451,16 @@ test "levels: doCompact L0 L1" {
     }
     try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
     try ms.commit(&.{
-        createTableChange(1, test_tree_id, 0),
-        createTableChange(2, test_tree_id, 0),
-        createTableChange(3, test_tree_id, 0),
+        createSSTableChange(1, 0, test_tree_id, 0),
+        createSSTableChange(2, 0, test_tree_id, 0),
+        createSSTableChange(3, 0, test_tree_id, 0),
     }, &.{});
 
     // Use max_levels=2 so base_level=1 and doCompact(0) goes L0→L1.
     const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
+    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
     defer tree.close();
 
     // All three tables should be in L0 before compaction.
@@ -532,16 +532,16 @@ test "levels: doCompact L0 L1 with dest overlap" {
     }
     try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
     try ms.commit(&.{
-        createTableChange(1, test_tree_id, 0),
-        createTableChange(2, test_tree_id, 0),
-        createTableChange(3, test_tree_id, 1),
+        createSSTableChange(1, 0, test_tree_id, 0),
+        createSSTableChange(2, 0, test_tree_id, 0),
+        createSSTableChange(3, 0, test_tree_id, 1),
     }, &.{});
 
     // max_levels=2: L0 compacts directly to L1 (base_level=1).
     const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
+    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
     defer tree.close();
 
     try std.testing.expectEqual(@as(usize, 2), tree.levels[0].numTables());
@@ -609,15 +609,15 @@ test "levels: doCompact L1 L2" {
     }
     try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
     try ms.commit(&.{
-        createTableChange(1, test_tree_id, 1),
-        createTableChange(2, test_tree_id, 2),
+        createSSTableChange(1, 0, test_tree_id, 1),
+        createSSTableChange(2, 0, test_tree_id, 2),
     }, &.{});
 
     // max_levels=3: doCompact(1) goes L1→L2 (dest = src + 1 = 2).
     const opts = config.Config{ .dir = dir_path, .max_levels = 3 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
+    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
     defer tree.close();
 
     try std.testing.expectEqual(@as(usize, 1), tree.levels[1].numTables());
@@ -666,7 +666,7 @@ test "levels: get L0 shadows L1" {
     const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, test_tree_id, &ms, &cache);
+    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
     defer tree.close();
 
     // Plant in-memory tables directly into the level handlers.

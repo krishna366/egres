@@ -26,13 +26,50 @@ pub const Item = struct {
     }
 };
 
+/// Global identity of an LSM tree: a namespace (u64, global) plus a
+/// namespace-local tree_id. The tree_id packs `(table_id << 32) | split_id`
+/// (see makeTreeId), so a tree's SQL table bucket is derivable from it and is
+/// never stored separately. Two namespaces can reuse the same tree_id, so the
+/// namespace must always travel with it — this struct is the map key for both
+/// `Forest.trees` and `ForestState.trees`.
+pub const TreeKey = packed struct(u128) {
+    namespace: u64,
+    tree_id: u64,
+};
+
+/// Global identity of a table (one routing bucket): a namespace (u64) plus a
+/// namespace-local table_id (u32), muxed into a single u96. The map key for
+/// `Forest.tables`. table_id 0 is the namespace's default (raw-KV)
+/// bucket, so a namespace "exists" iff its `{namespace, 0}` key is present.
+pub const TableKey = packed struct(u96) {
+    namespace: u64,
+    table_id: u32,
+};
+
+/// Compose a namespace-local tree_id from its table bucket (high 32 bits) and
+/// split index (low 32 bits). split_id 0 is the table's first/only tree; it
+/// grows by one on every split.
+pub inline fn makeTreeId(table_id: u32, split_id: u32) u64 {
+    return (@as(u64, table_id) << 32) | @as(u64, split_id);
+}
+
+/// The SQL table bucket a tree belongs to (high 32 bits of its tree_id).
+pub inline fn treeTableId(tree_id: u64) u32 {
+    return @intCast(tree_id >> 32);
+}
+
+/// The split index of a tree within its table (low 32 bits of its tree_id).
+pub inline fn treeSplitId(tree_id: u64) u32 {
+    return @truncate(tree_id);
+}
+
 pub const Key = struct {
-    namespace: u32 = 0,
+    namespace: u64 = 0,
     table_id: u32 = 0,
     primary: []const u8 = "",
     timestamp: u64 = 0,
 
-    /// Parse a marshaled key: [ns:u32 BE][tid:u32 BE][primary][ts:u64 BE].
+    /// Parse a marshaled key: [ns:u64 BE][tid:u32 BE][primary][ts:u64 BE].
     /// For keys without the full prefix/suffix, construct Key directly via
     /// Key{ .primary = ... }.
     pub fn init(raw: []const u8) Key {
@@ -41,9 +78,9 @@ pub const Key = struct {
         }
         const ts_idx = raw.len - 8;
         return .{
-            .namespace = std.mem.readInt(u32, raw[0..4], .big),
-            .table_id = std.mem.readInt(u32, raw[4..8], .big),
-            .primary = raw[8..ts_idx],
+            .namespace = std.mem.readInt(u64, raw[0..8], .big),
+            .table_id = std.mem.readInt(u32, raw[8..12], .big),
+            .primary = raw[12..ts_idx],
             .timestamp = std.mem.readInt(u64, raw[ts_idx..][0..8], .big),
         };
     }
@@ -70,7 +107,7 @@ pub const Key = struct {
         if (self.primary.len == 0) {
             return allocator.alloc(u8, 0);
         }
-        const buf = try allocator.alloc(u8, 8 + self.primary.len + 8);
+        const buf = try allocator.alloc(u8, 12 + self.primary.len + 8);
         self.writeTo(buf);
         return buf;
     }
@@ -80,7 +117,7 @@ pub const Key = struct {
             return allocator.alloc(u8, 0);
         }
         const start = data.items.len;
-        try data.appendNTimes(allocator, 0, 8 + self.primary.len + 8);
+        try data.appendNTimes(allocator, 0, 12 + self.primary.len + 8);
         const buf = data.items[start..];
         self.writeTo(buf);
         return buf;
@@ -91,10 +128,10 @@ pub const Key = struct {
     // into comparison, making it wrong. As such, we can just do a basic u64 comparison, instead
     // of relying on a std.mem.order.
     fn writeTo(self: Key, buf: []u8) void {
-        std.mem.writeInt(u32, buf[0..4], self.namespace, .big);
-        std.mem.writeInt(u32, buf[4..8], self.table_id, .big);
-        @memcpy(buf[8 .. 8 + self.primary.len], self.primary);
-        std.mem.writeInt(u64, buf[8 + self.primary.len ..][0..8], self.timestamp, .big);
+        std.mem.writeInt(u64, buf[0..8], self.namespace, .big);
+        std.mem.writeInt(u32, buf[8..12], self.table_id, .big);
+        @memcpy(buf[12 .. 12 + self.primary.len], self.primary);
+        std.mem.writeInt(u64, buf[12 + self.primary.len ..][0..8], self.timestamp, .big);
     }
 
     pub fn order(self: Key, other: Key) std.math.Order {
@@ -107,14 +144,10 @@ pub const Key = struct {
     }
 
     pub fn orderWithoutTs(self: Key, other: Key) std.math.Order {
-        if (self.namespace != 0 and other.namespace != 0) {
-            const ns_ord = std.math.order(self.namespace, other.namespace);
-            if (ns_ord != .eq) return ns_ord;
-        }
-        if (self.table_id != 0 and other.table_id != 0) {
-            const tid_ord = std.math.order(self.table_id, other.table_id);
-            if (tid_ord != .eq) return tid_ord;
-        }
+        const ns_ord = std.math.order(self.namespace, other.namespace);
+        if (ns_ord != .eq) return ns_ord;
+        const tid_ord = std.math.order(self.table_id, other.table_id);
+        if (tid_ord != .eq) return tid_ord;
         return std.mem.order(u8, self.primary, other.primary);
     }
 
@@ -122,7 +155,7 @@ pub const Key = struct {
         if (self.primary.len == 0) {
             return 0;
         }
-        return 8 + self.primary.len + 8;
+        return 12 + self.primary.len + 8;
     }
 
     /// Hash primary key only (for bloom filter).

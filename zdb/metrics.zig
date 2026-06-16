@@ -12,13 +12,13 @@ const utils = @import("utils");
 
 /// Labels for `flushes`: which tree (in which namespace) this flush targeted.
 pub const FlushLabels = struct {
-    namespace_id: u32,
+    namespace_id: u64,
     tree_id: u64,
 };
 
 /// Labels for `compactions`: which tree, at which destination level.
 pub const CompactionLabels = struct {
-    namespace_id: u32,
+    namespace_id: u64,
     tree_id: u64,
     level: u8,
 };
@@ -29,7 +29,7 @@ pub const CompactionLabels = struct {
 /// Write amp = sum(bytes_written) / sum(bytes_written{source="user"}).
 pub const BytesWrittenLabels = struct {
     source: []const u8,
-    namespace_id: u32 = 0,
+    namespace_id: u64 = 0,
     tree_id: u64 = 0,
     level: u8 = 0,
 };

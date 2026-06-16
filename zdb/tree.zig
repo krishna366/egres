@@ -273,6 +273,7 @@ pub const split_priority_score: f64 = 100.0;
 pub const Tree = struct {
     allocator: std.mem.Allocator,
     opts: config.Config,
+    namespace: u64,
     tree_id: u64,
     ms: *manifest.ForestState,
     cache: *TableCache,
@@ -283,7 +284,7 @@ pub const Tree = struct {
     /// open builds a Tree from an existing manifest state.
     /// Tables are loaded via cache, which opens SST files concurrently for misses
     /// and reuses already-open *Table objects for cache hits.
-    pub fn open(allocator: std.mem.Allocator, opts: config.Config, tree_id: u64, ms: *manifest.ForestState, cache: *TableCache) !Tree {
+    pub fn open(allocator: std.mem.Allocator, opts: config.Config, namespace: u64, tree_id: u64, ms: *manifest.ForestState, cache: *TableCache) !Tree {
         const levels = try allocator.alloc(Level, opts.max_levels);
         errdefer allocator.free(levels);
         for (levels, 0..) |*l, i| {
@@ -297,7 +298,7 @@ pub const Tree = struct {
             kr.right.free(allocator);
         }
 
-        if (ms.trees.getPtr(tree_id)) |tree| {
+        if (ms.trees.getPtr(.{ .namespace = namespace, .tree_id = tree_id })) |tree| {
             kr.left = try tree.left.dupe(allocator);
             kr.right = try tree.right.dupe(allocator);
             if (kr.left.len() == 0 and kr.right.len() == 0) {
@@ -322,6 +323,7 @@ pub const Tree = struct {
         var tree: Tree = .{
             .allocator = allocator,
             .opts = opts,
+            .namespace = namespace,
             .tree_id = tree_id,
             .ms = ms,
             .cache = cache,
@@ -746,10 +748,10 @@ pub const Tree = struct {
     }
 
     /// buildCompaction is Phase A: merges src tables with overlapping dest tables,
-    /// writes new SST files, and returns the manifest TableChange list describing
+    /// writes new SST files, and returns the manifest SSTableChange list describing
     /// the result. The caller is responsible for proposing these changes (e.g.
     /// through Raft) and then calling applyCompaction.
-    pub fn buildCompaction(self: *Tree, src_level: u8, file_ids: *fi.FileIds) !std.ArrayList(manifest.TableChange) {
+    pub fn buildCompaction(self: *Tree, src_level: u8, file_ids: *fi.FileIds) !std.ArrayList(manifest.SSTableChange) {
         const src: usize = src_level;
         const prio: vfs.Priority = if (src_level == 0) .p1 else .p2;
 
@@ -948,21 +950,21 @@ pub const Tree = struct {
         }
 
         // --- build manifest changes ---
-        var changes = try std.ArrayList(manifest.TableChange).initCapacity(
+        var changes = try std.ArrayList(manifest.SSTableChange).initCapacity(
             self.allocator,
             src_entries_slice.len + bot_entries_slice.len + output_file_ids.items.len,
         );
 
         for (src_entries_slice) |e| try changes.append(
             self.allocator,
-            manifest.deleteTableChange(e.id, self.tree_id, @intCast(src)),
+            manifest.deleteSSTableChange(e.id, self.namespace, self.tree_id, @intCast(src)),
         );
         for (bot_entries_slice) |e| try changes.append(
             self.allocator,
-            manifest.deleteTableChange(e.id, self.tree_id, @intCast(dest)),
+            manifest.deleteSSTableChange(e.id, self.namespace, self.tree_id, @intCast(dest)),
         );
         for (output_file_ids.items) |fid| {
-            try changes.append(self.allocator, manifest.createTableChange(fid, self.tree_id, @intCast(dest))); // usize → u32
+            try changes.append(self.allocator, manifest.createSSTableChange(fid, self.namespace, self.tree_id, @intCast(dest))); // usize → u32
         }
 
         return changes;
@@ -971,7 +973,7 @@ pub const Tree = struct {
     /// applyCompaction is Phase B: commits the manifest changes and updates the
     /// in-memory levels by opening tables from the SST directory.
     /// Called after Raft commit on all nodes (leader and followers).
-    pub fn applyCompaction(self: *Tree, changes: []const manifest.TableChange) !void {
+    pub fn applyCompaction(self: *Tree, changes: []const manifest.SSTableChange) !void {
         if (changes.len == 0) return;
 
         // Commit to manifest (durable) before touching the levels.
@@ -984,7 +986,7 @@ pub const Tree = struct {
         defer needed.deinit(self.allocator);
         for (changes) |c| {
             if (c.op == .create) {
-                try needed.append(self.allocator, .{ .id = c.table_id, .level = c.level });
+                try needed.append(self.allocator, .{ .id = c.sst_id, .level = c.level });
             }
         }
         try self.cache.loadTables(needed.items);
@@ -996,11 +998,11 @@ pub const Tree = struct {
         var dest_level: ?u8 = null;
         for (changes) |c| {
             if (c.op == .delete) { // DELETE
-                self.levels[c.level].deleteEntry(c.table_id);
+                self.levels[c.level].deleteEntry(c.sst_id);
             } else if (c.op == .create) { // CREATE
                 const n = needed.items[need_idx];
                 need_idx += 1;
-                std.debug.assert(c.table_id == n.id);
+                std.debug.assert(c.sst_id == n.id);
                 try self.levels[c.level].addEntry(n.id, n.table.?);
                 bytes_out += n.table.?.fileSize();
                 dest_level = @intCast(c.level);
@@ -1008,7 +1010,7 @@ pub const Tree = struct {
         }
 
         // Metrics: one compaction run, plus bytes written to the dest level.
-        const ns_id: u32 = if (self.ms.trees.get(self.tree_id)) |ts| ts.namespace_id else 0;
+        const ns_id = self.namespace;
         if (dest_level) |lvl| {
             try metrics.g().compactions.incr(.{
                 .namespace_id = ns_id,
