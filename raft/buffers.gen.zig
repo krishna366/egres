@@ -38,6 +38,15 @@ pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: ty
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, offset);
 }
 
+pub fn marshalRoot(alloc: std.mem.Allocator, value: anytype) Error![]u8 {
+    if (!@hasDecl(@TypeOf(value), "TABLE_ID")) @compileError("marshalRoot expects a generated *Struct with a TABLE_ID; got " ++ @typeName(@TypeOf(value)));
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    const offset = try value.marshalTo(alloc, &buf);
+    try addTail(alloc, &buf, @TypeOf(value), offset);
+    return buf.toOwnedSlice(alloc);
+}
+
 pub fn parseTail(buf: []const u8) Error!zbuf.MessageTail {
     return zbuf.readMessageTail(buf);
 }
@@ -84,6 +93,7 @@ pub const MessageReader = union(enum) {
 };
 
 pub const ConfChangeStruct = struct {
+    pub const TABLE_ID: u16 = 42241;
     change_type: ChangeTypeEnum = @enumFromInt(0),
     node_id: u64 = 0,
     addr: []const u8 = &.{},
@@ -334,6 +344,7 @@ pub const ConfChangeWriter = struct {
 };
 
 pub const LogEntryStruct = struct {
+    pub const TABLE_ID: u16 = 42242;
     index: u64 = 0,
     term: u64 = 0,
     timestamp: u64 = 0,
@@ -657,6 +668,7 @@ pub const LogEntryWriter = struct {
 };
 
 pub const RequestVoteStruct = struct {
+    pub const TABLE_ID: u16 = 42243;
     is_prevote: bool = false,
     term: u64 = 0,
     candidate_id: u64 = 0,
@@ -695,12 +707,12 @@ pub const RequestVoteStruct = struct {
 
     pub fn marshalTo(self: RequestVoteStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try RequestVoteWriter.initWithBuf(alloc, out);
-        try writer.setIsPrevote(self.is_prevote);
         try writer.setTerm(self.term);
         try writer.setCandidateId(self.candidate_id);
         try writer.setLastLogIndex(self.last_log_index);
         try writer.setLastLogTerm(self.last_log_term);
         try writer.setStatus(self.status);
+        try writer.setIsPrevote(self.is_prevote);
         const result = try writer.finish();
         return result.offset;
     }
@@ -983,6 +995,7 @@ pub const RequestVoteWriter = struct {
 };
 
 pub const RequestVoteReplyStruct = struct {
+    pub const TABLE_ID: u16 = 42244;
     is_prevote: bool = false,
     vote_granted: bool = false,
     term: u64 = 0,
@@ -1019,11 +1032,11 @@ pub const RequestVoteReplyStruct = struct {
 
     pub fn marshalTo(self: RequestVoteReplyStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try RequestVoteReplyWriter.initWithBuf(alloc, out);
-        try writer.setIsPrevote(self.is_prevote);
-        try writer.setVoteGranted(self.vote_granted);
         try writer.setTerm(self.term);
         try writer.setFrom(self.from);
         try writer.setStatus(self.status);
+        try writer.setIsPrevote(self.is_prevote);
+        try writer.setVoteGranted(self.vote_granted);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1299,6 +1312,7 @@ pub const RequestVoteReplyWriter = struct {
 };
 
 pub const AppendEntriesStruct = struct {
+    pub const TABLE_ID: u16 = 42245;
     term: u64 = 0,
     leader_id: u64 = 0,
     leader_commit: u64 = 0,
@@ -1655,6 +1669,7 @@ pub const AppendEntriesWriter = struct {
 };
 
 pub const AppendEntriesReplyStruct = struct {
+    pub const TABLE_ID: u16 = 42246;
     success: bool = false,
     term: u64 = 0,
     status: u16 = 0,
@@ -1695,13 +1710,13 @@ pub const AppendEntriesReplyStruct = struct {
 
     pub fn marshalTo(self: AppendEntriesReplyStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try AppendEntriesReplyWriter.initWithBuf(alloc, out);
-        try writer.setSuccess(self.success);
         try writer.setTerm(self.term);
         try writer.setStatus(self.status);
         try writer.setFrom(self.from);
         try writer.setLastIndex(self.last_index);
         try writer.setConflictTerm(self.conflict_term);
         try writer.setConflictIndex(self.conflict_index);
+        try writer.setSuccess(self.success);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1999,6 +2014,7 @@ pub const AppendEntriesReplyWriter = struct {
 };
 
 pub const TransportHandshakeStruct = struct {
+    pub const TABLE_ID: u16 = 42247;
     cluster_id: u64 = 0,
     node_id: u64 = 0,
     pub fn deinit(self: *TransportHandshakeStruct, alloc: std.mem.Allocator) void {
@@ -2210,6 +2226,7 @@ pub const TransportHandshakeWriter = struct {
 };
 
 pub const JoinRequestStruct = struct {
+    pub const TABLE_ID: u16 = 42248;
     cluster_id: u64 = 0,
     node_id: u64 = 0,
     addr: []const u8 = &.{},
@@ -2459,6 +2476,7 @@ pub const JoinRequestWriter = struct {
 };
 
 pub const JoinResponseStruct = struct {
+    pub const TABLE_ID: u16 = 42249;
     accepted: bool = false,
     status: u16 = 0,
     leader_id: u64 = 0,
@@ -2495,11 +2513,11 @@ pub const JoinResponseStruct = struct {
 
     pub fn marshalTo(self: JoinResponseStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try JoinResponseWriter.initWithBuf(alloc, out);
-        try writer.setAccepted(self.accepted);
         try writer.setStatus(self.status);
         try writer.setLeaderId(self.leader_id);
         try writer.setReasonCode(self.reason_code);
         try writer.setLeaderAddr(self.leader_addr);
+        try writer.setAccepted(self.accepted);
         const result = try writer.finish();
         return result.offset;
     }
@@ -2787,6 +2805,7 @@ pub const JoinResponseWriter = struct {
 };
 
 pub const ConfStatePeerStruct = struct {
+    pub const TABLE_ID: u16 = 42250;
     id: u64 = 0,
     addr: []const u8 = &.{},
     role: RoleEnum = @enumFromInt(0),
@@ -3037,6 +3056,7 @@ pub const ConfStatePeerWriter = struct {
 };
 
 pub const ConfStateStruct = struct {
+    pub const TABLE_ID: u16 = 42251;
     peers: []ConfStatePeerStruct = &.{},
     pub fn deinit(self: *ConfStateStruct, alloc: std.mem.Allocator) void {
         for (self.peers) |*_b| _b.deinit(alloc);
@@ -3301,6 +3321,7 @@ pub const ConfStateWriter = struct {
 };
 
 pub const HardStateStruct = struct {
+    pub const TABLE_ID: u16 = 42252;
     seq: u64 = 0,
     current_term: u64 = 0,
     voted_for: u64 = 0,
@@ -3602,6 +3623,7 @@ pub const HardStateWriter = struct {
 };
 
 pub const SnapshotStruct = struct {
+    pub const TABLE_ID: u16 = 42253;
     index: u64 = 0,
     term: u64 = 0,
     data: []const u8 = &.{},
@@ -3906,6 +3928,7 @@ pub const SnapshotWriter = struct {
 };
 
 pub const WalSlotStruct = struct {
+    pub const TABLE_ID: u16 = 42254;
     term: u64 = 0,
     index: u64 = 0,
     timestamp: u64 = 0,
@@ -4208,6 +4231,7 @@ pub const WalSlotWriter = struct {
 };
 
 pub const WalHeaderStruct = struct {
+    pub const TABLE_ID: u16 = 42255;
     slots: []WalSlotStruct = &.{},
     pub fn deinit(self: *WalHeaderStruct, alloc: std.mem.Allocator) void {
         for (self.slots) |*_b| _b.deinit(alloc);

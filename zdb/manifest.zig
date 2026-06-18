@@ -251,7 +251,14 @@ pub const ForestState = struct {
             try next_table_ids.append(a, .{ .namespace = kv.key_ptr.*, .next_table_id = kv.value_ptr.* });
         }
 
-        return encodeChangeSet(allocator, table_changes.items, tree_changes.items, next_table_ids.items, self.next_ns_id);
+        // The arena holds the source changes; marshalRoot copies them into a
+        // fresh `allocator`-owned payload, so the arena can be torn down after.
+        return zen.marshalRoot(allocator, ManifestChange{
+            .tree_changes = tree_changes.items,
+            .sstable_changes = table_changes.items,
+            .next_table_ids = next_table_ids.items,
+            .next_ns_id = self.next_ns_id,
+        });
     }
 
     /// Replace the receiver's tree contents with the deserialized state from
@@ -350,70 +357,3 @@ pub fn updateTreeChange(tree_id: u64, namespace_id: u64, left_key: []const u8, r
 // Encoding helpers
 // -------------------------------------------------------------------------
 
-fn encodeChangeSet(
-    allocator: std.mem.Allocator,
-    table_changes: []const SSTableChange,
-    tree_changes: []const TreeChange,
-    next_table_ids: []const TableId,
-    next_ns_id: u64,
-) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    var mw = try zen.ManifestChangeWriter.initWithBuf(allocator, &buf);
-    if (next_ns_id != 0) try mw.setNextNsId(next_ns_id);
-
-    if (tree_changes.len > 0) {
-        const offsets = try allocator.alloc(u32, tree_changes.len);
-        defer allocator.free(offsets);
-
-        for (tree_changes, 0..) |tc, i| {
-            var tw = try zen.TreeChangeWriter.initWithBuf(allocator, &buf);
-            try tw.setOp(tc.op);
-            try tw.setTreeId(tc.tree_id);
-            if (tc.namespace_id != 0) try tw.setNamespaceId(tc.namespace_id);
-            if (tc.left_key.len > 0) try tw.setLeftKey(tc.left_key);
-            if (tc.right_key.len > 0) try tw.setRightKey(tc.right_key);
-            const result = try tw.finish();
-            offsets[i] = result.offset;
-        }
-
-        try mw.setTreeChanges(offsets);
-    }
-
-    if (table_changes.len > 0) {
-        const offsets = try allocator.alloc(u32, table_changes.len);
-        defer allocator.free(offsets);
-
-        for (table_changes, 0..) |tc, i| {
-            var tw = try zen.SSTableChangeWriter.initWithBuf(allocator, &buf);
-            try tw.setOp(tc.op);
-            try tw.setLevel(tc.level);
-            try tw.setSstId(tc.sst_id);
-            try tw.setTreeId(tc.tree_id);
-            if (tc.namespace_id != 0) try tw.setNamespaceId(tc.namespace_id);
-            const result = try tw.finish();
-            offsets[i] = result.offset;
-        }
-
-        try mw.setSstableChanges(offsets);
-    }
-
-    if (next_table_ids.len > 0) {
-        const offsets = try allocator.alloc(u32, next_table_ids.len);
-        defer allocator.free(offsets);
-
-        for (next_table_ids, 0..) |c, i| {
-            var cw = try zen.TableIdWriter.initWithBuf(allocator, &buf);
-            try cw.setNamespace(c.namespace);
-            try cw.setNextTableId(c.next_table_id);
-            const result = try cw.finish();
-            offsets[i] = result.offset;
-        }
-
-        try mw.setNextTableIds(offsets);
-    }
-
-    _ = try mw.finishWithTail();
-    return buf.toOwnedSlice(allocator);
-}

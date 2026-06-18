@@ -414,6 +414,13 @@ pub fn parseLine(line: []const u8) !Command {
         const k = sub[0..eq];
         const v = sub[eq + 1 ..];
         if (std.mem.eql(u8, k, "tree")) {
+            // tree=<id> targets namespace 0; tree=<ns>:<id> a namespace-local tree
+            // (tree ids are only unique within a namespace).
+            if (std.mem.indexOfScalar(u8, v, ':')) |c| {
+                const ns = std.fmt.parseInt(u32, v[0..c], 10) catch return error.InvalidZdbFilter;
+                const id = std.fmt.parseInt(u64, v[c + 1 ..], 10) catch return error.InvalidZdbFilter;
+                return .{ .zdb = .{ .filter = .tree, .ns_id = ns, .tree_id = id } };
+            }
             const id = std.fmt.parseInt(u64, v, 10) catch return error.InvalidZdbFilter;
             return .{ .zdb = .{ .filter = .tree, .tree_id = id } };
         }

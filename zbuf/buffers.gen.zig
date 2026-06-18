@@ -19,6 +19,15 @@ pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: ty
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, offset);
 }
 
+pub fn marshalRoot(alloc: std.mem.Allocator, value: anytype) Error![]u8 {
+    if (!@hasDecl(@TypeOf(value), "TABLE_ID")) @compileError("marshalRoot expects a generated *Struct with a TABLE_ID; got " ++ @typeName(@TypeOf(value)));
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    const offset = try value.marshalTo(alloc, &buf);
+    try addTail(alloc, &buf, @TypeOf(value), offset);
+    return buf.toOwnedSlice(alloc);
+}
+
 pub fn parseTail(buf: []const u8) Error!zbuf.MessageTail {
     return zbuf.readMessageTail(buf);
 }
@@ -49,6 +58,7 @@ pub const MessageReader = union(enum) {
 };
 
 pub const CellStruct = struct {
+    pub const TABLE_ID: u16 = 1;
     cell_hot: bool = false,
     tag: u32 = 0,
     data: []const u8 = &.{},
@@ -83,10 +93,10 @@ pub const CellStruct = struct {
 
     pub fn marshalTo(self: CellStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try CellWriter.initWithBuf(alloc, out);
-        try writer.setCellHot(self.cell_hot);
         try writer.setTag(self.tag);
         try writer.setData(self.data);
         try writer.setCellFlags(self.cell_flags);
+        try writer.setCellHot(self.cell_hot);
         const result = try writer.finish();
         return result.offset;
     }
@@ -359,6 +369,7 @@ pub const CellWriter = struct {
 };
 
 pub const RowStruct = struct {
+    pub const TABLE_ID: u16 = 2;
     is_pinned: bool = false,
     is_deleted: bool = false,
     name: []const u8 = &.{},
@@ -422,8 +433,6 @@ pub const RowStruct = struct {
 
     pub fn marshalTo(self: RowStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try RowWriter.initWithBuf(alloc, out);
-        try writer.setIsPinned(self.is_pinned);
-        try writer.setIsDeleted(self.is_deleted);
         try writer.setName(self.name);
         try writer.setValue(self.value);
         if (self.cells.len > 0) {
@@ -442,6 +451,8 @@ pub const RowStruct = struct {
         try writer.setLifecycle(self.lifecycle);
         if (self.u32_values.len > 0) try writer.setU32Values(self.u32_values);
         if (self.u64_values.len > 0) try writer.setU64Values(self.u64_values);
+        try writer.setIsPinned(self.is_pinned);
+        try writer.setIsDeleted(self.is_deleted);
         const result = try writer.finish();
         return result.offset;
     }
@@ -975,6 +986,7 @@ pub const RowWriter = struct {
 };
 
 pub const TableStruct = struct {
+    pub const TABLE_ID: u16 = 3;
     rows: []RowStruct = &.{},
     payload: []const u8 = &.{},
     count: u32 = 0,
@@ -1335,6 +1347,7 @@ pub const TableWriter = struct {
 };
 
 pub const U32ArrayOnlyStruct = struct {
+    pub const TABLE_ID: u16 = 4;
     values: []u32 = &.{},
     pub fn deinit(self: *U32ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
@@ -1573,6 +1586,7 @@ pub const U32ArrayOnlyWriter = struct {
 };
 
 pub const U64ArrayOnlyStruct = struct {
+    pub const TABLE_ID: u16 = 5;
     values: []u64 = &.{},
     pub fn deinit(self: *U64ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
@@ -1811,6 +1825,7 @@ pub const U64ArrayOnlyWriter = struct {
 };
 
 pub const U16ArrayOnlyStruct = struct {
+    pub const TABLE_ID: u16 = 6;
     values: []u16 = &.{},
     pub fn deinit(self: *U16ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);
@@ -2049,6 +2064,7 @@ pub const U16ArrayOnlyWriter = struct {
 };
 
 pub const U8ArrayOnlyStruct = struct {
+    pub const TABLE_ID: u16 = 7;
     values: []u8 = &.{},
     pub fn deinit(self: *U8ArrayOnlyStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.values);

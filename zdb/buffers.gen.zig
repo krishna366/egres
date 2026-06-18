@@ -25,6 +25,15 @@ pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: ty
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, offset);
 }
 
+pub fn marshalRoot(alloc: std.mem.Allocator, value: anytype) Error![]u8 {
+    if (!@hasDecl(@TypeOf(value), "TABLE_ID")) @compileError("marshalRoot expects a generated *Struct with a TABLE_ID; got " ++ @typeName(@TypeOf(value)));
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    const offset = try value.marshalTo(alloc, &buf);
+    try addTail(alloc, &buf, @TypeOf(value), offset);
+    return buf.toOwnedSlice(alloc);
+}
+
 pub fn parseTail(buf: []const u8) Error!zbuf.MessageTail {
     return zbuf.readMessageTail(buf);
 }
@@ -59,6 +68,7 @@ pub const MessageReader = union(enum) {
 };
 
 pub const BlockIndexStruct = struct {
+    pub const TABLE_ID: u16 = 46593;
     key: []const u8 = &.{},
     offset: u32 = 0,
     len: u32 = 0,
@@ -308,6 +318,7 @@ pub const BlockIndexWriter = struct {
 };
 
 pub const TableIndexStruct = struct {
+    pub const TABLE_ID: u16 = 46594;
     max_version: u64 = 0,
     key_count: u32 = 0,
     uncompressed_size: u32 = 0,
@@ -759,6 +770,7 @@ pub const TableIndexWriter = struct {
 };
 
 pub const BinaryFuseFilterStruct = struct {
+    pub const TABLE_ID: u16 = 46595;
     seed: u64 = 0,
     segment_length: u32 = 0,
     segment_length_mask: u32 = 0,
@@ -1089,6 +1101,7 @@ pub const BinaryFuseFilterWriter = struct {
 };
 
 pub const TreeChangeStruct = struct {
+    pub const TABLE_ID: u16 = 46596;
     op: OpEnum = @enumFromInt(0),
     namespace_id: u64 = 0,
     tree_id: u64 = 0,
@@ -1396,6 +1409,7 @@ pub const TreeChangeWriter = struct {
 };
 
 pub const SSTableChangeStruct = struct {
+    pub const TABLE_ID: u16 = 46597;
     op: OpEnum = @enumFromInt(0),
     level: u32 = 0,
     sst_id: u64 = 0,
@@ -1698,6 +1712,7 @@ pub const SSTableChangeWriter = struct {
 };
 
 pub const ManifestChangeStruct = struct {
+    pub const TABLE_ID: u16 = 46598;
     tree_changes: []TreeChangeStruct = &.{},
     sstable_changes: []SSTableChangeStruct = &.{},
     cmd: u32 = 0,
@@ -2202,6 +2217,7 @@ pub const ManifestChangeWriter = struct {
 };
 
 pub const KeyValueStruct = struct {
+    pub const TABLE_ID: u16 = 46599;
     key: []const u8 = &.{},
     value: []const u8 = &.{},
     pub fn deinit(self: *KeyValueStruct, alloc: std.mem.Allocator) void {
@@ -2452,6 +2468,7 @@ pub const KeyValueWriter = struct {
 };
 
 pub const MutationsStruct = struct {
+    pub const TABLE_ID: u16 = 46600;
     namespace: u64 = 0,
     table_id: u32 = 0,
     kvs: []KeyValueStruct = &.{},
@@ -2754,6 +2771,7 @@ pub const MutationsWriter = struct {
 };
 
 pub const TableIdStruct = struct {
+    pub const TABLE_ID: u16 = 46601;
     namespace: u64 = 0,
     next_table_id: u32 = 0,
     pub fn deinit(self: *TableIdStruct, alloc: std.mem.Allocator) void {

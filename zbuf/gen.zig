@@ -260,7 +260,7 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
     // -------------------------
     // Struct type (owned, allocator-backed)
     // -------------------------
-    try emitStructType(alloc, table_name, infos, w);
+    try emitStructType(alloc, table_name, table_id, infos, w);
 
     // -------------------------
     // Reader type
@@ -882,8 +882,12 @@ fn emitTable(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime
 // emitStructType emits {Name}Struct with deinit(self*, alloc), cloneValue, and clone.
 // Decoding from a Reader lives on the Reader itself (toStruct/toStructValue).
 // Fields are decoded into owned Zig values — no Reader needed after construction.
-fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, comptime infos: anytype, w: anytype) !void {
+fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, table_id: u16, comptime infos: anytype, w: anytype) !void {
     try w.print("pub const {s}Struct = struct {{\n", .{table_name});
+    // The message's type id, mirrored from {Name}Reader. marshalRoot reads it
+    // off the struct, so callers serialize a root payload without naming the
+    // Reader — and a struct that lacks it fails marshalRoot at comptime.
+    try w.print("    pub const TABLE_ID: u16 = {d};\n", .{table_id});
 
     // Field declarations with defaults.
     inline for (infos) |info| {
@@ -1075,13 +1079,17 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
     // marshalTo: serialize struct fields into a shared output buffer, return offset.
     try w.print("\n    pub fn marshalTo(self: {s}Struct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {{\n", .{table_name});
     try w.print("        var writer = try {s}Writer.initWithBuf(alloc, out);\n", .{table_name});
+    // Pass 1: scalars (incl. any flags backing field), tables, arrays — in
+    // declaration order. Bool overlays are deferred to pass 2.
     inline for (infos) |info| {
+        if (comptime schema.kindOf(info.ty) == .bool) continue;
         const name_camel = try schema.camelNameCapitalized(alloc, info.name);
         defer alloc.free(name_camel);
         switch (comptime schema.kindOf(info.ty)) {
-            .u8, .u16, .u32, .u64, .bytes, .bool, .enum_ => {
+            .u8, .u16, .u32, .u64, .bytes, .enum_ => {
                 try w.print("        try writer.set{s}(self.{s});\n", .{ name_camel, info.name });
             },
+            .bool => unreachable, // skipped above; handled in pass 2
             .table => {
                 try w.print("        if (self.{s}) |child| {{\n", .{info.name});
                 try w.writeAll("            const child_off = try child.marshalTo(alloc, out);\n");
@@ -1109,6 +1117,15 @@ fn emitStructType(alloc: std.mem.Allocator, comptime table_name: []const u8, com
                 }
             },
         }
+    }
+    // Pass 2: bool overlays last, so each folds its bit into the backing flags
+    // scalar written in pass 1 (rather than being overwritten by it). Lets a
+    // fresh `*Struct{ .dropped = true }` serialize correctly with no bit math.
+    inline for (infos) |info| {
+        if (comptime schema.kindOf(info.ty) != .bool) continue;
+        const name_camel = try schema.camelNameCapitalized(alloc, info.name);
+        defer alloc.free(name_camel);
+        try w.print("        try writer.set{s}(self.{s});\n", .{ name_camel, info.name });
     }
     try w.writeAll("        const result = try writer.finish();\n");
     try w.writeAll("        return result.offset;\n");
@@ -1271,6 +1288,18 @@ fn emitTailHelpers(w: anytype) !void {
     // ensure the root table sits at payload offset 0.
     try w.writeAll("pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {\n");
     try w.writeAll("    try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, offset);\n");
+    try w.writeAll("}\n\n");
+    // marshalRoot serializes a *Struct into a fresh, self-contained payload that
+    // parseRoot can read: marshalTo writes the body at offset 0, addTail appends
+    // the type-id tail (read off the struct's own TABLE_ID). Caller owns the
+    // returned slice.
+    try w.writeAll("pub fn marshalRoot(alloc: std.mem.Allocator, value: anytype) Error![]u8 {\n");
+    try w.writeAll("    if (!@hasDecl(@TypeOf(value), \"TABLE_ID\")) @compileError(\"marshalRoot expects a generated *Struct with a TABLE_ID; got \" ++ @typeName(@TypeOf(value)));\n");
+    try w.writeAll("    var buf: std.ArrayList(u8) = .empty;\n");
+    try w.writeAll("    errdefer buf.deinit(alloc);\n");
+    try w.writeAll("    const offset = try value.marshalTo(alloc, &buf);\n");
+    try w.writeAll("    try addTail(alloc, &buf, @TypeOf(value), offset);\n");
+    try w.writeAll("    return buf.toOwnedSlice(alloc);\n");
     try w.writeAll("}\n\n");
     try w.writeAll("pub fn parseTail(buf: []const u8) Error!zbuf.MessageTail {\n");
     try w.writeAll("    return zbuf.readMessageTail(buf);\n");

@@ -1481,6 +1481,7 @@ pub const Node = struct {
             raft_log.err("proposeAndWaitForApply: wait for commit failed: {s}", .{@errorName(err)});
             return error.CommitFailed;
         };
+
         const commit_ms = fiber.coarseMs();
         if (commit_ms - start_ms > 5_000) {
             raft_log.warn("proposeAndWaitForApply: commit phase slow type={s} ms={d}", .{
