@@ -34,6 +34,7 @@ const Modules = struct {
     zdb: *std.Build.Module,               // zdb.zig
     pgwire: *std.Build.Module,            // pgwire.zig (libpg_query include baked in)
     zfiber: *std.Build.Module,            // zfiber/fiber.zig
+    sql: *std.Build.Module,               // sql.zig (physical row codec, std-only)
 };
 
 pub fn build(b: *std.Build) void {
@@ -172,6 +173,10 @@ fn makeModules(
     // addLibpgQuerySources.
     pgwire.addIncludePath(b.path("third_party/libpg_query"));
 
+    // The SQL row codec is pure logic (native-endian byte twiddling), so it
+    // needs no imports beyond std — not even pgwire.
+    const sql = makeModule(b, target, optimize, "sql.zig");
+
     return .{
         .zio = zio,
         .metrics = metrics,
@@ -187,6 +192,7 @@ fn makeModules(
         .zdb = zdb,
         .pgwire = pgwire,
         .zfiber = fiber,
+        .sql = sql,
     };
 }
 
@@ -419,7 +425,7 @@ fn addAllTests(
     const test_imports = .{
         "zbuf",    "zdb",         "raft",      "utils",  "zio",    "vfs",
         "metrics", "buffers_gen", "transport", "serial", "pgwire",
-        "zfiber",
+        "zfiber",  "sql",
     };
 
     const root_mod = b.createModule(.{
