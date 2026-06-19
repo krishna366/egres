@@ -2,7 +2,7 @@ const std = @import("std");
 const fiber = @import("zfiber");
 const flags = @import("flags");
 const utils = @import("utils");
-const proto = @import("zdb-server/protocol.zig");
+const proto = @import("engine/admin.zig");
 
 const log = std.log.scoped(.zdb_client);
 

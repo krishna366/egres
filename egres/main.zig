@@ -2,7 +2,8 @@ const std = @import("std");
 const raft = @import("raft");
 const zdb = @import("zdb");
 const fiber = @import("zfiber");
-const zdb_server = @import("zdb_server");
+const pgwire = @import("pgwire");
+const engine = @import("engine");
 const flags = @import("flags");
 const utils = @import("utils");
 
@@ -16,16 +17,18 @@ pub const std_options = std.Options{
 /// per-node port assignments.
 const ListenCfg = struct {
     host: []const u8 = "127.0.0.1",
-    raft_port: u16 = 9000,
-    client_port: u16 = 8000,
+    raft_port: u16 = 4210,
+    client_port: u16 = 5210,
+    sql_port: u16 = 3210,
     offset: u16 = 0,
 
     pub const docs = .{
-        .self = "Where the server listens. Both raft and client ports get +offset.",
-        .host = "Hostname/IP to bind both the raft and client listeners on.",
+        .self = "Where the server listens. raft, admin (client), and SQL ports each get +offset.",
+        .host = "Hostname/IP to bind the raft, admin, and SQL listeners on.",
         .raft_port = "Base port for raft peer connections. Actual port = raft_port + offset.",
-        .client_port = "Base port for client/stats connections. Actual port = client_port + offset.",
-        .offset = "Added to both raft_port and client_port. Convenient when running several servers on one host (e.g. offset=2 ⇒ raft=9002, client=8002).",
+        .client_port = "Base port for the admin protocol. Actual port = client_port + offset.",
+        .sql_port = "Base port for the SQL listener (pgwire protocol). Actual port = sql_port + offset.",
+        .offset = "Added to every port. Convenient when running several servers on one host (e.g. offset=1 ⇒ raft=4211, admin=5211, sql=3211).",
     };
 };
 
@@ -83,7 +86,7 @@ fn usage(alloc: std.mem.Allocator) void {
     stderr.writeStreamingAll(io, "\n") catch {};
 }
 
-const log = std.log.scoped(.zdb_main);
+const log = std.log.scoped(.egres);
 
 fn deinitWithLog(comptime msg: []const u8, ptr: anytype) void {
     ptr.deinit();
@@ -167,7 +170,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const live_listen = try flags.g().register("listen", ListenCfg);
     const live_raft = try flags.g().register("raft", RaftCfg);
     const live_data = try flags.g().register("data", DataCfg);
-    const live_snapshot = try flags.g().register("snapshot", zdb_server.SnapshotCfg);
+    const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
 
     // --help is terminal; handle after registration so writeHelpAll has
     // every module's fields populated.
@@ -205,6 +208,9 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     defer allocator.free(raft_addr);
     const client_addr = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ listen.host, listen.client_port + listen.offset });
     defer allocator.free(client_addr);
+    // SQL (pgwire protocol) listen address.
+    const sql_addr = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ listen.host, listen.sql_port + listen.offset });
+    defer allocator.free(sql_addr);
 
     // wal_dir defaults to data dir when empty — the common single-disk
     // case. Setting it lets you put WAL on a faster device than the LSM.
@@ -222,8 +228,8 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
         .wal_dir = wal_dir,
     };
 
-    log.info("starting zdb-server id={d} cluster={d} raft={s} client={s} dir={s} wal={s} tick={d}ms seeds={d}", .{
-        raft_cfg.id, raft_cfg.cluster_id, raft_addr, client_addr, data_cfg.dir, wal_dir, raft_cfg.tick_ms, seeds.len,
+    log.info("starting egres id={d} cluster={d} raft={s} admin={s} sql={s} dir={s} wal={s} tick={d}ms seeds={d}", .{
+        raft_cfg.id, raft_cfg.cluster_id, raft_addr, client_addr, sql_addr, data_cfg.dir, wal_dir, raft_cfg.tick_ms, seeds.len,
     });
 
     // Initialize VFS with bandwidth limit.
@@ -269,116 +275,59 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     }
     log.info("forest opened", .{});
 
-    // Wire the file_id allocator: node_id = raft node id; initial local
-    // counter restored from HardState's persisted max_file_id (any id we
-    // could have written to disk before the crash is < that value, so we
-    // resume past every possibly-orphaned SST without a disk scan).
-    forest.file_ids.bind(
-        @intCast(raft_cfg.id),
-        node.log.hardState().max_file_id,
-        @ptrCast(&wal),
-        raft.DiskWAL.persistMaxFileId,
-    );
+    // The replicated storage engine: builds the apply state machine + raft
+    // runtime, installs the SM on the node, and binds the forest's file-id
+    // allocator to the node + WAL. Owns all that node/forest wiring.
+    const eng = try engine.Engine.open(allocator, node, forest, &wal, live_snapshot, raft_cfg.id);
+    defer deinitWithLog("engine", eng);
 
-    // Storage interface bridges raft commits to forest.
-    var storage_impl = zdb_server.StorageImpl{
-        .forest = forest,
-        .allocator = allocator,
-        .node = node,
-    };
-    var sm = storage_impl.asStateMachine();
-    node.state_machine = &sm;
+    // The admin protocol front-end over the engine.
+    var admin_srv = try engine.AdminServer.init(eng, args.client_addr);
+    defer deinitWithLog("admin_srv", &admin_srv);
 
-    var raft_rt = raft.RaftRuntime.init(allocator, node);
-    defer deinitWithLog("raft_rt", &raft_rt);
-
-    // ZDB server (client-facing).
-    var zdb_srv = try zdb_server.ZdbServer.init(
-        allocator,
-        forest,
-        node,
-        &storage_impl,
-        live_snapshot,
-        args.client_addr,
-    );
-    defer deinitWithLog("zdb_srv", &zdb_srv);
+    // The SQL front-end (pgwire protocol) over the same engine.
+    var sql_srv = try SqlServer.init(eng, sql_addr);
 
     log.info("all components initialized", .{});
 
-    var handle = try fiber.spawn(.{}, appMain, .{ &raft_rt, &zdb_srv, node, &args });
+    var handle = try fiber.spawn(.{}, appMain, .{ eng, &admin_srv, &sql_srv, node, &args });
     handle.join();
 
     log.info("shutting down...", .{});
 }
 
-/// Runs on the shared runtime (.raft group). Spawns raft runtime, client
-/// server (.query), compaction + snapshot loops (.background) — all via
-/// `runtime.spawnOn` — then waits for SIGINT or SIGTERM to shut down.
-fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *raft.Node, args: *const Args) void {
+/// Drives the node lifecycle: bring up transport, (optionally) join the
+/// cluster, then hand off to the engine (recovery + loops) and register the
+/// admin front-end, finally blocking until a shutdown signal.
+fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *SqlServer, node: *raft.Node, args: *const Args) void {
     log.info("inside appMain", .{});
-    // The four shim fibers (runRaft, runServer, runCompaction, runSnapshot)
-    // run alongside appMain on the .raft runtime. When the signal handler
-    // fires below, `defer g.cancel()` propagates cancellation into each
-    // shim's `handle.join()`, which in turn cancels the inner loop running
-    // on its actual target runtime (.query / .background).
-    var g = fiber.Group(void).init(node.allocator);
-    defer g.deinit();
 
-    // Initialize transport (needed for both join and raft loops).
+    // Transport must be up before the cluster join (seeded nodes) and before
+    // recovery fetches missing SSTs from the leader.
     node.initTransport() catch |err| {
         log.err("failed to init transport: {s}", .{@errorName(err)});
         return;
     };
 
-    // If we have seeds, join the cluster before starting raft loops.
-    // This ensures the node receives its add_learner entry and doesn't
-    // accidentally bootstrap as a single-node cluster.
+    // Seeded nodes join before any loop runs, so they receive their
+    // add_learner entry instead of bootstrapping as a single-node cluster.
     if (args.seeds.len > 0) {
         log.info("appMain: joining cluster via seeds", .{});
-        runJoin(args, raft_rt);
+        runJoin(args, eng.allocator);
     }
 
-    // Sequenced startup, before any raft / compaction / snapshot loop runs:
-    //   1. Install the snapshot manifest. Forest is now in a valid state.
-    //   2. Synchronously apply every committed WAL entry on disk
-    //      (apply_index → commit_index).
-    // This eliminates the race where the compaction loop would propose
-    // new SST ids that collide with ids replay is about to install
-    // (PathAlreadyExists).
-    log.info("appMain: synchronous recovery", .{});
-    zdb_srv.recoverFromSnapshot() catch |err| {
-        log.err("recoverFromSnapshot err: {}", .{err});
+    // The engine owns recovery + applyCommits + the raft/compaction/snapshot
+    // loops; register the admin front-end into its loop group.
+    eng.start() catch |err| {
+        log.err("engine.start failed: {s}", .{@errorName(err)});
         return;
     };
-
-    // It's safe to apply all the commits before joining Raft group, because if
-    // a log entry was acknowledged by this node, it would already have
-    // downloaded the SSTable files, because we consider them to be part of the
-    // WAL log. We have everything we need to replay the committed log.
-    log.info("appMain: synchronous applyCommits", .{});
-    node.applyCommits();
-
-    log.info("appMain: spawning raft runtime on raft pool", .{});
-    g.spawn(.{}, runRaft, .{raft_rt}) catch |err| {
-        log.err("appMain: spawn runRaft failed: {s}", .{@errorName(err)});
+    eng.spawnListener(engine.AdminServer.runListener, .{admin_srv}) catch |err| {
+        log.err("appMain: spawn admin server failed: {s}", .{@errorName(err)});
         return;
     };
-
-    log.info("appMain: spawning client server on query pool", .{});
-    g.spawn(.{}, runServer, .{zdb_srv}) catch |err| {
-        log.err("appMain: spawn runServer failed: {s}", .{@errorName(err)});
-        return;
-    };
-
-    log.info("appMain: spawning compaction loop on background pool", .{});
-    g.spawn(.{}, runCompaction, .{zdb_srv}) catch |err| {
-        log.err("appMain: spawn runCompaction failed: {s}", .{@errorName(err)});
-        return;
-    };
-
-    log.info("appMain: spawning snapshot loop on background pool", .{});
-    g.spawn(.{}, runSnapshot, .{zdb_srv}) catch |err| {
-        log.err("appMain: spawn runSnapshot failed: {s}", .{@errorName(err)});
+    eng.spawnListener(SqlServer.runListener, .{sql_srv}) catch |err| {
+        log.err("appMain: spawn sql server failed: {s}", .{@errorName(err)});
         return;
     };
 
@@ -391,61 +340,80 @@ fn appMain(raft_rt: *raft.RaftRuntime, zdb_srv: *zdb_server.ZdbServer, node: *ra
         fiber.sleepMs(100);
     }
     log.info("received shutdown signal, shutting down...", .{});
-    node.startShutdown();
-    g.wait();
+    eng.requestShutdown();
+    eng.wait();
 }
 
-fn runRaft(r: *raft.RaftRuntime) void {
-    r.run() catch |err| {
-        if (err == error.Canceled) return;
-        std.log.err("raft runtime error: {s}", .{@errorName(err)});
-        if (@errorReturnTrace()) |bt| {
-            // Zig 0.16 split StackTrace: `@errorReturnTrace` returns
-            // `builtin.StackTrace`, but `dumpStackTrace` expects
-            // `debug.StackTrace`. Bridge by repacking the fields.
-            const dbg_trace: std.debug.StackTrace = .{
-                .return_addresses = bt.instruction_addresses[0..bt.index],
-                .skipped = .none,
+/// SQL front-end (pgwire protocol) over the engine. Skeleton: the handshake and
+/// simple-query loop work; each query echoes its text back as one row until
+/// the executor + catalog land. Mirrors AdminServer's accept loop, and shuts
+/// down with the engine via `node.isShuttingDown()`.
+const SqlServer = struct {
+    engine: *engine.Engine,
+    listen_addr: fiber.net.IpAddress,
+
+    fn init(eng: *engine.Engine, addr: []const u8) !SqlServer {
+        return .{ .engine = eng, .listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr) };
+    }
+
+    fn runListener(self: *SqlServer) void {
+        const listener = self.listen_addr.listen(.{ .reuse_address = true }) catch |err| {
+            log.err("sql: listen failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer listener.close();
+        log.info("sql listener started on port {d} (pgwire)", .{listener.port()});
+        var conn_id: u64 = 0;
+        while (!self.engine.node.isShuttingDown()) {
+            const stream = listener.accept(.{}) catch |err| {
+                log.err("sql: accept failed: {s}", .{@errorName(err)});
+                return;
             };
-            std.debug.dumpStackTrace(&dbg_trace);
+            conn_id += 1;
+            fiber.spawnDetached(.{}, handleSqlConn, .{ self, stream }) catch {
+                stream.close();
+                continue;
+            };
         }
+    }
+};
+
+fn handleSqlConn(self: *SqlServer, stream: fiber.net.Stream) void {
+    var s = stream;
+    defer s.close();
+
+    var handler = SqlHandler{ .engine = self.engine, .alloc = self.engine.allocator };
+    pgwire.serve(self.engine.allocator, &s, &handler, .{}) catch |err| {
+        log.warn("sql conn serve error: {s}", .{@errorName(err)});
     };
 }
 
-/// Spawn the client TCP accept loop on the query runtime pool.
-/// Must be called from a fiber coroutine. Blocks until cancelled.
-fn runServer(s: *zdb_server.ZdbServer) void {
-    var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runClientLoop, .{s}) catch |err| {
-        log.err("runServer err: {}", .{err});
-        return;
-    };
-    handle.join();
-}
+/// Minimal pgwire handler. Only `onQuery` is required by `pgwire.serve`
+/// (onExecute/onDescribe are @hasDecl-gated). The stub round-trips the wire so
+/// `psql` connects and queries return a row; real execution comes later.
+const SqlHandler = struct {
+    engine: *engine.Engine,
+    alloc: std.mem.Allocator,
 
-/// Spawn the snapshot loop on the background runtime pool. Leader-only loop
-/// that polls WAL size/age and proposes snapshots through Raft.
-/// Must be called from a fiber coroutine. Blocks until cancelled.
-fn runSnapshot(s: *zdb_server.ZdbServer) void {
-    var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runSnapshotLoop, .{s}) catch |err| {
-        log.err("runSnapshot err: {}", .{err});
-        return;
-    };
-    handle.join();
-}
+    pub fn onQuery(self: *SqlHandler, state: *pgwire.ConnState, sql: []const u8) !void {
+        _ = self;
+        const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+        if (trimmed.len == 0) {
+            try state.sendEmptyQueryResponse();
+            return;
+        }
+        const fields = [_]pgwire.FieldDescription{
+            .{ .name = "egres", .type_oid = pgwire.oid.text },
+        };
+        try state.sendRowDescription(&fields);
+        try state.sendDataRow(&[_]pgwire.DataValue{.{ .text = sql }});
+        try state.sendCommandComplete("SELECT 1");
+    }
+};
 
-/// Spawn the compaction loop on the background runtime pool.
-/// Must be called from a fiber coroutine. Blocks until cancelled.
-fn runCompaction(s: *zdb_server.ZdbServer) void {
-    var handle = fiber.spawn(.{}, zdb_server.ZdbServer.runCompactionLoop, .{s}) catch |err| {
-        log.err("runCompaction err: {}", .{err});
-        return;
-    };
-    handle.join();
-}
-
-fn runJoin(args: *const Args, raft_rt: *raft.RaftRuntime) void {
+fn runJoin(args: *const Args, allocator: std.mem.Allocator) void {
     raft.joinCluster(
-        raft_rt.allocator,
+        allocator,
         args.seeds,
         args.raft.cluster_id,
         args.raft.id,

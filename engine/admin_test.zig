@@ -1,5 +1,5 @@
 const std = @import("std");
-const proto = @import("protocol.zig");
+const proto = @import("admin.zig");
 
 // Build a set-batch body in memory: `count` records of (key + ' ' + value + '\n'),
 // where key is 24 bytes zero-padded and value is `value_size` bytes of 'v'.
@@ -78,5 +78,5 @@ test "readToken: odd-length hex returns error.BadHex" {
 }
 
 // Throughput benchmark (was here as a `test "readToken: benchmark parse
-// throughput"`) is now in `zdb-server/protocol_bench.zig` and runs via
+// throughput"`) is now in `engine/admin_bench.zig` and runs via
 // `zig build bench`.

@@ -1037,7 +1037,7 @@ pub const Forest = struct {
 
     /// Check if the current memtable should be frozen.
     /// Largest L0 table count among the trees that own data for this
-    /// namespace. Used by the write-path backpressure in zdb-server so a
+    /// namespace. Used by the write-path backpressure in the engine so a
     /// hot namespace's bloated L0 throttles only its own writers, not
     /// every namespace on the node. After a tree split, a namespace can
     /// own multiple trees; we take the worst of them. Returns 0 if the
@@ -1385,7 +1385,7 @@ pub const Forest = struct {
     /// bottommost level, locally, without going through Raft. **Test-only**
     /// — production must propose splits through the manifest pipeline so
     /// all nodes apply the same split deterministically; see
-    /// `proposeSplit` in zdb-server. Caller must hold the write lock.
+    /// `proposeSplit` in the engine. Caller must hold the write lock.
     pub fn splitTreeForTests(self: *Forest, namespace_id: u64, tree_id: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();

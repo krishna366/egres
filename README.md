@@ -20,7 +20,7 @@ zig build zbuf -- path/to/buffers.zig
 
 ## Load Testing
 
-A load test spins up one or more `zdb-server` nodes, creates a namespace, and
+A load test spins up one or more `egres` nodes, creates a namespace, and
 drives writes through the `zdb-bench` client. It exists to validate correctness
 and surface deadlocks / runaway loops under sustained write load.
 
@@ -31,7 +31,7 @@ Always build in `ReleaseFast` for load tests. The default `zig build` is
 meaningless.
 
 ```bash
-zig build --release=fast zdb-server zdb-bench
+zig build --release=fast egres zdb-bench
 ```
 
 Binaries land in `zig-out/bin/`.
@@ -79,21 +79,21 @@ python3 scripts/loadtest.py stats --node 1   # one-shot Prometheus stats dump
 python3 scripts/loadtest.py clean            # wipe data/ logs/ metrics.tsv
 ```
 
-> The driver applies `offset=i` per node, so node 1 binds client port `8001`
-> and raft port `9001`. `--nodes N` runs a real N-voter cluster (it promotes
+> The driver applies `offset=i` per node, so node 1 binds admin port `5211`
+> and raft port `4211`. `--nodes N` runs a real N-voter cluster (it promotes
 > the joiners from learner to voter before loading).
 
 ### 3. Manual single-server run (for debugging)
 
 When you want to poke at a running server yourself, start one directly. With
-`offset=0` it binds the client port at `8000` and raft at `9000`:
+`offset=0` it binds the admin port at `5210` and raft at `4210`:
 
 ```bash
 rm -rf /data/egres/node1 && mkdir -p /data/egres/node1 /tmp/zdb
-./zig-out/bin/zdb-server \
+./zig-out/bin/egres \
     --raft="id=1; cluster-id=1" \
     --data="dir=/data/egres/node1" \
-    --listen="client-port=8000; raft-port=9000" \
+    --listen="client-port=5210; raft-port=4210" \
     > /tmp/zdb/server.log 2>&1 &
 ```
 
@@ -103,7 +103,7 @@ so create one first — the protocol is line-based text, so a bash `/dev/tcp`
 one-liner is enough:
 
 ```bash
-exec 3<>/dev/tcp/127.0.0.1/8000
+exec 3<>/dev/tcp/127.0.0.1/5210
 printf 'ns create 1\n' >&3
 head -1 <&3            # expect: OK
 exec 3>&-
@@ -112,10 +112,10 @@ exec 3>&-
 Then drive the load, and stop the server with `SIGTERM` when done:
 
 ```bash
-./zig-out/bin/zdb-bench --bench="addr=127.0.0.1:8000; clients=16; \
+./zig-out/bin/zdb-bench --bench="addr=127.0.0.1:5210; clients=16; \
     records=10500000; value-size=1024; batch-size=256; namespaces=1; phase=load"
 
-pkill -TERM -x zdb-server      # -KILL if it won't stop
+pkill -TERM -x egres      # -KILL if it won't stop
 ```
 
 ### 4. Health checks
@@ -139,8 +139,8 @@ returns a blank-line-terminated dump): `workers` (per-worker CPU histogram),
 `locks` (held tracked mutexes), `vfs` (bandwidth limiter), and `zdb` (stats):
 
 ```bash
-# worker CPU distribution from a running server on client port 8000
-exec 3<>/dev/tcp/127.0.0.1/8000
+# worker CPU distribution from a running server on admin port 5210
+exec 3<>/dev/tcp/127.0.0.1/5210
 printf 'workers\n' >&3
 while IFS= read -r line <&3; do [ -z "$line" ] && break; echo "$line"; done
 exec 3>&-

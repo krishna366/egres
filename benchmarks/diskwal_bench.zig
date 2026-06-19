@@ -1,7 +1,7 @@
 // DiskWAL micro-benchmarks: append + (optionally) fsync records through the
 // raw `raft.diskwal` layer, bypassing Raft itself. Isolates the WAL from
 // the propose queue / quorum / apply loop so we can tell whether the
-// end-to-end ceiling we see in the zdb-server load test is the WAL or
+// end-to-end ceiling we see in the egres load test is the WAL or
 // something upstream.
 //
 // Run via `zig build bench`. Each cell auto-tunes its iteration count;

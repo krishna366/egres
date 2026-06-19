@@ -317,7 +317,7 @@ pub const Node = struct {
         }
 
         // If a snapshot is on disk, resume apply from snapshot.index+1.
-        // The storage layer's `recoverFromSnapshot` (in zdb-server) handles
+        // The storage layer's `recoverFromSnapshot` (in the engine) handles
         // installing the snapshot's manifest + fetching missing SSTs before
         // the apply gate opens. commit_index is safe to seed here too: the
         // snapshot was built strictly from committed entries.
@@ -1439,11 +1439,10 @@ pub const Node = struct {
     /// the byte-identical proposal via AppendEntries; on apply, every node
     /// (leader included) installs via `Node.applySnapshotEntry`.
     pub fn proposeSnapshot(self: *Node, snap: raftwal_mod.Snapshot) RaftError!void {
-        var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(self.allocator);
-        const off = try snap.marshalTo(self.allocator, &buf);
-        try zbuf.appendMessageTail(&buf, self.allocator, zen.SnapshotReader.TABLE_ID, off);
-        try self.proposeAndWaitForApply(buf.items, .snapshot);
+        const buf = try zen.marshalRoot(self.allocator, snap);
+        defer self.allocator.free(buf);
+
+        try self.proposeAndWaitForApply(buf, .snapshot);
     }
 
     /// Propose a data change (normal mutation) through the raft proposal queue.
@@ -1474,9 +1473,11 @@ pub const Node = struct {
         std.debug.assert(proposal_type != .any);
         const start_ms = fiber.coarseMs();
         var ctx = WaitCtx{ .status = .committed };
+        // TODO: the ctx.wg should be a notify.
         ctx.wg.init();
         ctx.wg.add(1);
         try self.proposeWithCallback(data, &onWaitCommit, @ptrCast(&ctx), proposal_type);
+
         ctx.wg.wait() catch |err| {
             raft_log.err("proposeAndWaitForApply: wait for commit failed: {s}", .{@errorName(err)});
             return error.CommitFailed;
@@ -1758,12 +1759,14 @@ pub const Node = struct {
         var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
         try g.ensureTotalCapacity(6);
+
         try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 0 }, mainLoop, .{ self, self.config.tick_interval_ms });
         try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 1 }, applyLoop, .{self});
         try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 2 }, tickLoop, .{ self, self.config.tick_interval_ms });
         try g.spawn(.{ .lane = .raft }, callbackLoop, .{self});
         try g.spawn(.{ .lane = .raft }, clockTickLoop, .{self});
         try g.spawn(.{ .lane = .raft }, commitPersistLoop, .{self});
+
         g.wait();
     }
 

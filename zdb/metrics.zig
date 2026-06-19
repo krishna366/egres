@@ -3,7 +3,7 @@ const m = @import("metrics");
 const utils = @import("utils");
 
 // Storage-layer metrics. The `Metrics` struct is owned by the application
-// (e.g. zdb-server), not by Forest — so multiple Forest instances (tests,
+// (e.g. egres), not by Forest — so multiple Forest instances (tests,
 // future tenants) can share or swap the metric sink.
 //
 // Library code uses these via a `*Metrics` pointer. The `noop` variant of

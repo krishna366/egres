@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Load-test driver for a local zdb Raft cluster.
 
-Spawns N `zdb-server` processes, bootstraps namespaces, drives the `zdb-bench`
+Spawns N `egres` processes, bootstraps namespaces, drives the `zdb-bench`
 load generator, and samples each node's `/stats` into a metrics TSV.
 
 Subcommands (default `run`):
@@ -30,7 +30,7 @@ from pathlib import Path
 log = logging.getLogger("loadtest")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SERVER_BIN = REPO_ROOT / "zig-out" / "bin" / "zdb-server"
+SERVER_BIN = REPO_ROOT / "zig-out" / "bin" / "egres"
 BENCH_BIN = REPO_ROOT / "zig-out" / "bin" / "zdb-bench"
 
 METRICS_HEADER = (
@@ -47,8 +47,8 @@ class Ports:
     (the server applies `offset=i` to both bases).
     """
 
-    raft_base: int = 9000
-    client_base: int = 8000
+    raft_base: int = 4210
+    client_base: int = 5210
 
     def raft(self, node: int) -> int:
         return self.raft_base + node
@@ -155,7 +155,7 @@ class Server:
 def spawn_server(
     ports: Ports, data_dir: Path, log_path: Path, node: int, seed: str | None
 ) -> Server:
-    """Launch one zdb-server, redirecting stdout+stderr into `log_path`.
+    """Launch one egres, redirecting stdout+stderr into `log_path`.
     `seed` is empty for node 1 (self-bootstrap) and the seed raft addr
     otherwise (the joiner learns the cluster from it)."""
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +196,7 @@ def kill_stale() -> None:
     """Best-effort SIGKILL of leftover servers/benches from a crashed run.
     Matches the exact process name (`-x`, not `-f`) so this script — whose
     own argv mentions the binaries — never targets itself."""
-    for name in ("zdb-server", "zdb-bench"):
+    for name in ("egres", "zdb-bench"):
         subprocess.run(["pkill", "-9", "-x", name], check=False)
         log.info("killed any stale %s", name)
     time.sleep(0.5)
@@ -322,7 +322,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 log.info("  node %d → client 127.0.0.1:%d (pid %d)",
                          srv.node, ports.client(srv.node), srv.proc.pid)
             log.info("inspect e.g. `workers` / `zdb` on those ports; "
-                     "stop with: pkill -TERM -x zdb-server")
+                     "stop with: pkill -TERM -x egres")
         else:
             for srv in servers:
                 stop_server(srv, args.stop_grace)
@@ -453,7 +453,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--bootstrap-timeout", type=float, default=30.0, help="seconds")
     run.add_argument("--stop-grace", type=float, default=10.0, help="seconds")
     run.add_argument("--kill-existing", action="store_true",
-                     help="SIGKILL stale zdb-server/zdb-bench first")
+                     help="SIGKILL stale egres/zdb-bench first")
     run.add_argument("--keep-alive", action="store_true",
                      help="leave the server(s) running after the load (to inspect)")
     run.set_defaults(func=cmd_run)

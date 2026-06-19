@@ -420,7 +420,7 @@ fn parseArgs(alloc: std.mem.Allocator) !Args {
 // Fixed column widths. Test names overflowing these will push the line
 // right but won't bloat the column for everyone else.
 const prefix_width: usize = 10; // "[NNN/NNN] " up to 999 tests
-const module_width: usize = 28; // longest module today: "zdb-server.protocol_test" (24)
+const module_width: usize = 28; // longest module today: "engine.admin_test" (17)
 const bench_name_width: usize = 50; // longest BENCH name today: ~45 chars
 const bench_nsop_width: usize = 12; // right-aligned ns/op column
 const bench_tput_width: usize = 12; // right-aligned throughput column

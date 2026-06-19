@@ -21,6 +21,7 @@ pub const GuardAllocator = @import("guard_allocator.zig").GuardAllocator;
 ///
 /// Safe to call done() from any fiber runtime or coroutine.
 /// Not reusable — create a new WaitGroup for each synchronization point.
+/// TODO: Reconsider if we still need it with zfiber sync structs.
 pub const WaitGroup = struct {
     counter: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     ch_buf: [1]u8 = undefined,
@@ -200,4 +201,3 @@ pub fn SafeHashMap(comptime K: type, comptime V: type) type {
         }
     };
 }
-
