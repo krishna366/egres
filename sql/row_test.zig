@@ -67,7 +67,7 @@ test "sql.row: end-to-end — logical schema, compile, marshal, read all back" {
     // column_id order, into a reusable Row.
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &ps, bytes, &[_]u32{}, &r);
+    try sql.unmarshalRow(alloc, &ps, bytes, &[_]u32{}, &r);
     try testing.expectEqual(@as(usize, 13), r.len());
 
     try testing.expectEqual(@as(i64, 42), r.at(0).int8);
@@ -101,7 +101,7 @@ test "sql.row: empty projection selects every column in column_id order" {
 
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &ps, bytes, &[_]u32{}, &r);
+    try sql.unmarshalRow(alloc, &ps, bytes, &[_]u32{}, &r);
     try testing.expectEqual(@as(usize, 3), r.len());
     try testing.expectEqual(@as(i32, 7), r.at(0).int4);
     try testing.expectEqualStrings("hi", r.at(1).text);
@@ -131,7 +131,7 @@ test "sql.row: round-trip every type" {
     const proj = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &ps, bytes, &proj, &r);
+    try sql.unmarshalRow(alloc, &ps, bytes, &proj, &r);
 
     try testing.expectEqual(true, r.at(0).bool_);
     try testing.expectEqual(@as(i16, -7), r.at(1).int2);
@@ -143,6 +143,31 @@ test "sql.row: round-trip every type" {
     try testing.expectEqual(@as(i64, 1_700_000_000_000_000), r.at(7).timestamp);
     try testing.expectEqualStrings("hello", r.at(8).text);
     try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, r.at(9).bytea);
+}
+
+test "sql.row: round-trip unsigned ints at full-range maxima" {
+    const alloc = testing.allocator;
+    const cols = [_]LogicalColumn{ col(1, .uint2), col(2, .uint4), col(3, .uint8) };
+    var ps = try sql.compile(alloc, .{ .columns = &cols, .current_version = 1 }, 1);
+    defer ps.deinit(alloc);
+
+    // Maxima exceed the signed counterparts (i16/i32/i64), so a round-trip
+    // proves true unsigned storage — no sign-bit truncation or wrap.
+    const vals = [_]Value{
+        .{ .uint2 = std.math.maxInt(u16) },
+        .{ .uint4 = std.math.maxInt(u32) },
+        .{ .uint8 = std.math.maxInt(u64) },
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const bytes = try sql.marshalRow(alloc, &ps, &vals, &buf);
+
+    var r: sql.Row = .{};
+    defer r.deinit(alloc);
+    try sql.unmarshalRow(alloc, &ps, bytes, &[_]u32{}, &r);
+    try testing.expectEqual(@as(u16, std.math.maxInt(u16)), r.at(0).uint2);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), r.at(1).uint4);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), r.at(2).uint8);
 }
 
 test "sql.row: round-trip time/timestamptz/interval/uuid" {
@@ -167,7 +192,7 @@ test "sql.row: round-trip time/timestamptz/interval/uuid" {
     const proj = [_]u32{ 1, 2, 3, 4 };
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &ps, bytes, &proj, &r);
+    try sql.unmarshalRow(alloc, &ps, bytes, &proj, &r);
     try testing.expectEqual(@as(i64, 3_600_000_000), r.at(0).time);
     try testing.expectEqual(@as(i64, 1_700_000_000_000_000), r.at(1).timestamptz);
     const iv = r.at(2).interval;
@@ -196,7 +221,7 @@ test "sql.row: projection fetches a sorted subset; absent id reads null" {
     const proj = [_]u32{ 2, 4, 99 };
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &ps, bytes, &proj, &r);
+    try sql.unmarshalRow(alloc, &ps, bytes, &proj, &r);
     try testing.expectEqual(@as(usize, 3), r.len());
     try testing.expectEqual(@as(i32, 20), r.at(0).int4);
     try testing.expectEqual(@as(i32, 40), r.at(1).int4);
@@ -221,7 +246,7 @@ test "sql.row: null fixed, null varlen, and empty-not-null varlen are distinct" 
 
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &ps, bytes, &[_]u32{}, &r);
+    try sql.unmarshalRow(alloc, &ps, bytes, &[_]u32{}, &r);
 
     try expectNull(r.at(0)); // null fixed
     try testing.expectEqual(@as(i32, 99), r.at(1).int4);
@@ -241,7 +266,7 @@ test "sql.row: varlen directory holds cumulative ends; empty middle slices empty
 
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &ps, bytes, &[_]u32{}, &r);
+    try sql.unmarshalRow(alloc, &ps, bytes, &[_]u32{}, &r);
     try testing.expectEqualStrings("abc", r.at(0).text);
     try testing.expectEqualStrings("", r.at(1).text);
     try testing.expectEqualStrings("defgh", r.at(2).text);
@@ -274,7 +299,7 @@ test "sql.row: a column added after the row's version reads as null" {
     const proj = [_]u32{ 1, 2, 3 };
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &v1, bytes, &proj, &r);
+    try sql.unmarshalRow(alloc, &v1, bytes, &proj, &r);
     try testing.expectEqual(@as(i32, 7), r.at(0).int4);
     try testing.expectEqualStrings("old", r.at(1).text);
     try expectNull(r.at(2)); // C (added v2) absent in a v1 row
@@ -295,7 +320,7 @@ test "sql.row: empty schema encodes just the version stamp" {
     const proj = [_]u32{ 1, 2 };
     var r: sql.Row = .{};
     defer r.deinit(alloc);
-    try sql.unmarshalProjectedRow(alloc, &ps, bytes, &proj, &r);
+    try sql.unmarshalRow(alloc, &ps, bytes, &proj, &r);
     try expectNull(r.at(0));
     try expectNull(r.at(1));
 }
@@ -315,7 +340,7 @@ test "sql.row: row and buffer are reusable across rows" {
     {
         const vals = [_]Value{ .{ .int4 = 111 }, .{ .text = "aaa" } };
         const bytes = try sql.marshalRow(alloc, &ps, &vals, &buf);
-        try sql.unmarshalProjectedRow(alloc, &ps, bytes, &[_]u32{}, &r);
+        try sql.unmarshalRow(alloc, &ps, bytes, &[_]u32{}, &r);
         try testing.expectEqual(@as(i32, 111), r.at(0).int4);
         try testing.expectEqualStrings("aaa", r.at(1).text);
     }
@@ -324,7 +349,7 @@ test "sql.row: row and buffer are reusable across rows" {
         // stale bytes or stale cells leaking through.
         const vals = [_]Value{ .{ .int4 = 222 }, .{ .text = "bbbbbb" } };
         const bytes = try sql.marshalRow(alloc, &ps, &vals, &buf);
-        try sql.unmarshalProjectedRow(alloc, &ps, bytes, &[_]u32{}, &r);
+        try sql.unmarshalRow(alloc, &ps, bytes, &[_]u32{}, &r);
         try testing.expectEqual(@as(i32, 222), r.at(0).int4);
         try testing.expectEqualStrings("bbbbbb", r.at(1).text);
     }

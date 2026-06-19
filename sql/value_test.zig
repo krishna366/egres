@@ -8,6 +8,9 @@ test "sql.value: fixedWidth and isVarlen per type" {
     try testing.expectEqual(@as(?u8, 2), Type.int2.fixedWidth());
     try testing.expectEqual(@as(?u8, 4), Type.int4.fixedWidth());
     try testing.expectEqual(@as(?u8, 8), Type.int8.fixedWidth());
+    try testing.expectEqual(@as(?u8, 2), Type.uint2.fixedWidth());
+    try testing.expectEqual(@as(?u8, 4), Type.uint4.fixedWidth());
+    try testing.expectEqual(@as(?u8, 8), Type.uint8.fixedWidth());
     try testing.expectEqual(@as(?u8, 4), Type.float4.fixedWidth());
     try testing.expectEqual(@as(?u8, 8), Type.float8.fixedWidth());
     try testing.expectEqual(@as(?u8, 4), Type.date.fixedWidth());

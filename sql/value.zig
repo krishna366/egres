@@ -17,11 +17,22 @@ const std = @import("std");
 /// `time` = int8 µs since midnight, `timestamp`/`timestamptz` = int8 µs,
 /// `interval` = int8 µs + int4 days + int4 months (16 bytes). `uuid` is 16
 /// opaque bytes — not byte-swapped, since it isn't an integer.
+///
+/// Postgres has no unsigned integers, so `uint2`/`uint4`/`uint8` are ours,
+/// stored as native-LE u16/u32/u64. On the wire each widens to the smallest
+/// signed pg type that holds it — uint2→int4, uint4→int8 (both lossless,
+/// native integers to the client) — except uint8, which no signed pg type
+/// holds, so it is advertised as `numeric` (decimal text). The type NAME is
+/// resolved by our DDL binder (libpg_query parses `uint8` as a generic type
+/// name); Postgres itself never needs to know it.
 pub const Type = enum {
     bool_,
     int2,
     int4,
     int8,
+    uint2,
+    uint4,
+    uint8,
     float4,
     float8,
     date,
@@ -37,9 +48,9 @@ pub const Type = enum {
     pub inline fn fixedWidth(self: Type) ?u8 {
         return switch (self) {
             .bool_ => 1,
-            .int2 => 2,
-            .int4, .float4, .date => 4,
-            .int8, .float8, .time, .timestamp, .timestamptz => 8,
+            .int2, .uint2 => 2,
+            .int4, .uint4, .float4, .date => 4,
+            .int8, .uint8, .float8, .time, .timestamp, .timestamptz => 8,
             .interval, .uuid => 16,
             .text, .bytea => null,
         };
@@ -69,6 +80,9 @@ pub const Value = union(enum) {
     int2: i16,
     int4: i32,
     int8: i64,
+    uint2: u16,
+    uint4: u32,
+    uint8: u64,
     float4: f32,
     float8: f64,
     date: i32,
@@ -83,7 +97,7 @@ pub const Value = union(enum) {
 
 /// A decoded (possibly projected) row: one Value per requested column, in
 /// the caller's projection order. Reusable — pass the same Row to repeated
-/// `unmarshalProjectedRow` calls and its backing store is refilled instead
+/// `unmarshalRow` calls and its backing store is refilled instead
 /// of reallocated per row. A struct (not a bare slice) so row operations
 /// (iteration, formatting, re-projection) can hang off it later.
 pub const Row = struct {

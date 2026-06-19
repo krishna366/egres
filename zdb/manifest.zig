@@ -32,12 +32,14 @@ pub const TreeState = struct {
     right: Key = .{},
 };
 
-/// table_id 0 is reserved for a namespace's raw-KV / default bucket; user tables
-/// start here. nextTableId floors every namespace's counter at this value.
-pub const first_table_id: u32 = 1;
+/// table_ids 0–15 are reserved per namespace (0 = raw-KV / default bucket,
+/// 1 = the namespace's SQL catalog, the rest for future system tables); user
+/// tables start here. nextTableId floors every namespace's counter at this.
+pub const first_table_id: u32 = 16;
 
-/// namespaces 1–15 are reserved (1 = catalog; the rest for future engine use).
-/// User databases start here. nextNamespace floors next_ns_id at this value.
+/// namespaces 1–15 are reserved (1 = the databases registry; the rest for
+/// future engine use). User databases start here. nextNamespace floors
+/// next_ns_id at this value.
 pub const first_namespace: u64 = 16;
 
 /// In-memory manifest state. Durability comes from the Raft log + periodic

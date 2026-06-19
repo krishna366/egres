@@ -1212,7 +1212,7 @@ pub fn main(init: std.process.Init) !void {
         .{},
     );
     var fiber_rt: fiber.Runtime = undefined;
-    try fiber_rt.init(rt_alloc, .{ .num_workers = fiber_workers });
+    try fiber_rt.init(rt_alloc, .{ .num_workers = fiber_workers, .raft_workers = 0 });
     defer fiber_rt.deinit();
 
     var counters: Counters = .{};

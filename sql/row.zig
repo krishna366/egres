@@ -75,7 +75,7 @@ pub fn marshalRow(
 /// absent in this row's version (or whose null bit is set) decodes to
 /// `.null_value`. text/bytea Values borrow `buffer`; the Row stays valid
 /// only while `buffer` does.
-pub fn unmarshalProjectedRow(
+pub fn unmarshalRow(
     alloc: std.mem.Allocator,
     ps: *const PhysicalSchema,
     buffer: []const u8,
@@ -135,6 +135,9 @@ fn readValue(ps: *const PhysicalSchema, buffer: []const u8, col: ColumnLayout) V
         .int2 => .{ .int2 = std.mem.readInt(i16, buffer[off..][0..2], .little) },
         .int4 => .{ .int4 = std.mem.readInt(i32, buffer[off..][0..4], .little) },
         .int8 => .{ .int8 = std.mem.readInt(i64, buffer[off..][0..8], .little) },
+        .uint2 => .{ .uint2 = std.mem.readInt(u16, buffer[off..][0..2], .little) },
+        .uint4 => .{ .uint4 = std.mem.readInt(u32, buffer[off..][0..4], .little) },
+        .uint8 => .{ .uint8 = std.mem.readInt(u64, buffer[off..][0..8], .little) },
         .float4 => .{ .float4 = @bitCast(std.mem.readInt(u32, buffer[off..][0..4], .little)) },
         .float8 => .{ .float8 = @bitCast(std.mem.readInt(u64, buffer[off..][0..8], .little)) },
         .date => .{ .date = std.mem.readInt(i32, buffer[off..][0..4], .little) },
@@ -168,6 +171,9 @@ fn writeFixed(dst: []u8, val: Value) void {
         .int2 => |v| std.mem.writeInt(i16, dst[0..2], v, .little),
         .int4 => |v| std.mem.writeInt(i32, dst[0..4], v, .little),
         .int8 => |v| std.mem.writeInt(i64, dst[0..8], v, .little),
+        .uint2 => |v| std.mem.writeInt(u16, dst[0..2], v, .little),
+        .uint4 => |v| std.mem.writeInt(u32, dst[0..4], v, .little),
+        .uint8 => |v| std.mem.writeInt(u64, dst[0..8], v, .little),
         .float4 => |v| std.mem.writeInt(u32, dst[0..4], @bitCast(v), .little),
         .float8 => |v| std.mem.writeInt(u64, dst[0..8], @bitCast(v), .little),
         .date => |v| std.mem.writeInt(i32, dst[0..4], v, .little),
