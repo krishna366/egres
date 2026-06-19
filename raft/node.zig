@@ -212,7 +212,12 @@ pub const Node = struct {
     apply_callbacks: fiber.Channel(PendingApply) = undefined,
     event_notify: fiber.Notify = .{},
     inbound_ch: fiber.Channel(InboundMsg) = undefined,
-    shutting_down: std.atomic.Value(bool),
+    /// One-shot shutdown signal: fire via `shutdown.start()` (POSIX signal,
+    /// fatal path, or the binary). Loops poll it via `isShuttingDown()`;
+    /// fibers that must block until shutdown (the engine's listener
+    /// watchers) park on `shutdown.wait()`; `shutdownWatchLoop` reacts by
+    /// tearing down everything a raft fiber can park on.
+    shutdown: fiber.Shutdown = undefined,
 
     transport: ?*Transport = null,
 
@@ -279,7 +284,6 @@ pub const Node = struct {
             .config = config,
             .allocator = allocator,
             .prng = prng,
-            .shutting_down = std.atomic.Value(bool).init(false),
             .file_acks = utils.SafeHashMap(u64, *PendingFileAck).init(allocator),
             .file_requests = utils.SafeHashMap(u64, *utils.WaitGroup).init(allocator),
             .commit_index = Watermark.init(allocator),
@@ -288,6 +292,7 @@ pub const Node = struct {
         node.proposal_ch = try fiber.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
         node.apply_callbacks = try fiber.Channel(PendingApply).initAlloc(allocator, 1024);
         node.inbound_ch = try fiber.Channel(InboundMsg).initAlloc(allocator, 1024);
+        node.shutdown = try fiber.Shutdown.init(allocator);
         errdefer allocator.destroy(node);
         for (peers) |peer| {
             try node.peers.put(peer.id, peer);
@@ -376,6 +381,9 @@ pub const Node = struct {
         self.failAllPendingCallbacks(.shutdown);
         self.apply_callbacks.close(.immediate);
         self.apply_callbacks.deinit();
+        // Fires start() (idempotent) then joins the signal-watcher fiber (if
+        // install() was used) before freeing — nothing stays parked.
+        self.shutdown.deinit();
 
         self.inbound_ch.close(.graceful);
         while (self.inbound_ch.tryReceive()) |msg| {
@@ -389,7 +397,7 @@ pub const Node = struct {
             if (p.addr.len > 0) self.allocator.free(p.addr);
         }
         self.peers.deinit();
-        // Free the watermark waiter tables. `startShutdown` already
+        // Free the watermark waiter tables. `shutdownWatchLoop` already
         // `close()`d both, so no fiber is still parked on them here.
         self.commit_index.deinit();
         self.applied_ts.deinit();
@@ -881,20 +889,35 @@ pub const Node = struct {
         return .{ .peers = cs_peers };
     }
 
-    pub fn startShutdown(self: *Node) void {
-        self.shutting_down.store(true, .release);
+    /// Parks until the shutdown signal fires — `shutdown.start()` from any
+    /// source (a POSIX signal via `shutdown.install()`, an internal fatal
+    /// path, or the binary) — then closes everything a raft loop can park on
+    /// so all of them unwind. Runs as one of the loop-group fibers
+    /// (`blockingRunAllLoops`, test cluster harness), so the teardown is
+    /// joined with the loops it wakes. `wait()` returns immediately if
+    /// shutdown already started, so spawn order doesn't matter.
+    pub fn shutdownWatchLoop(self: *Node) void {
+        self.shutdown.wait();
         self.proposal_ch.close(.graceful);
-        // Wake mainLoop's blocked wait() so it observes `shutting_down`
-        // and returns (Notify has no close — a notify is the shutdown poke).
+        // Wake mainLoop's blocked wait() so it observes shutdown and returns
+        // (Notify has no close — a notify is the shutdown poke).
         self.event_notify.notify();
-        // Wake applyLoop + callbackLoop with error.Closed; wake any pending
-        // proposeAndWaitForApply / waitForApplied callers the same way.
+        // Wake applyLoop + any pending proposeAndWaitForApply / waitForApplied
+        // callers with error.Closed.
         self.commit_index.close();
         self.applied_ts.close();
+        // callbackLoop idles parked on apply_callbacks.receive(), NOT on
+        // commit_index — so closing the watermarks above doesn't wake it. Close
+        // the channel here too or that loop never observes shutdown and
+        // blockingRunAllLoops' join hangs forever. Graceful, not immediate: any
+        // buffered callbacks stay drainable for deinit's failAllPendingCallbacks
+        // to fail with .shutdown (immediate would clear them and wedge their
+        // waiters).
+        self.apply_callbacks.close(.graceful);
     }
 
     pub fn isShuttingDown(self: *const Node) bool {
-        return self.shutting_down.load(.acquire);
+        return self.shutdown.hasStarted();
     }
 
     /// Returns true if a heartbeat is due (leader only).
@@ -1758,7 +1781,7 @@ pub const Node = struct {
         // lane-relative and wraps if the raft lane has < 3 workers.
         var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
-        try g.ensureTotalCapacity(6);
+        try g.ensureTotalCapacity(7);
 
         try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 0 }, mainLoop, .{ self, self.config.tick_interval_ms });
         try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 1 }, applyLoop, .{self});
@@ -1766,6 +1789,9 @@ pub const Node = struct {
         try g.spawn(.{ .lane = .raft }, callbackLoop, .{self});
         try g.spawn(.{ .lane = .raft }, clockTickLoop, .{self});
         try g.spawn(.{ .lane = .raft }, commitPersistLoop, .{self});
+        // Reacts to the shutdown signal (from wherever it fires) by closing
+        // everything the loops above can park on, then exits with them.
+        try g.spawn(.{ .lane = .raft }, shutdownWatchLoop, .{self});
 
         g.wait();
     }
@@ -2284,7 +2310,7 @@ pub const Node = struct {
                 .remove_node => {
                     // We've been removed from the cluster. Shut down.
                     dbg("node {d} removed from cluster, shutting down", .{self.id});
-                    self.startShutdown();
+                    self.shutdown.start();
                 },
                 .update_addr => {}, // Our own address — nothing to do locally.
                 .unknown, _ => {},

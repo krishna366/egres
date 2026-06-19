@@ -87,6 +87,10 @@ pub const Group = group_mod.Group;
 const watermark_mod = @import("watermark.zig");
 pub const Watermark = watermark_mod.Watermark;
 
+// One-shot shutdown signal: pollable (`hasStarted`), blockable (`wait`),
+// with optional SIGINT/SIGTERM wiring via the self-pipe trick.
+pub const Shutdown = @import("shutdown.zig").Shutdown;
+
 // Process-wide context (gpa/arena/io/args). Lives here — the universal base
 // module — so any layer can reach it without a cycle (utils re-exports it as
 // `utils.context` for existing callers). `coarse_clock` reads `context.g().io`.

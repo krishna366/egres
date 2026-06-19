@@ -13,7 +13,7 @@ const WaitGroup = utils.WaitGroup;
 pub const SnapshotCfg = struct {
     min_bytes: u64 = 1 << 30, // 1 GiB
     min_age_seconds: u64 = 10 * 60, // 10 minutes
-    poll_interval_seconds: u64 = 30,
+    poll_interval_seconds: u64 = 5,
 
     pub const docs = .{
         .self = "Raft snapshot triggers. Leader proposes a snapshot when WAL tail bytes from head reach min_bytes OR an entry crosses min_age_seconds.",
@@ -422,9 +422,24 @@ pub const Engine = struct {
         try self.bg.spawn(.{}, f, args);
     }
 
-    /// Signal every loop to stop (they poll `node.isShuttingDown()`).
-    pub fn requestShutdown(self: *Engine) void {
-        self.node.startShutdown();
+    /// Watcher fiber — one per front-end listener, spawned detached by each
+    /// `runListener`. Blocks until the node's shutdown signal fires, then
+    /// wakes the listener's parked `accept()` by opening a throwaway connection
+    /// to its own address. `accept` has no per-op cancellation in the fiber
+    /// runtime, so a sibling fiber has to break it from the outside — and a
+    /// real self-connection makes `accept()` return a live stream *cleanly*,
+    /// after which the loop sees `isShuttingDown()` and exits. We connect
+    /// rather than `shutdown()` the listen socket because `shutdown()` wakes
+    /// accept but completes it with EINVAL (Linux returns EINVAL for accept on
+    /// a shut-down listener) — a noisy `unexpectedErrno` dump in debug builds
+    /// plus a spurious "accept failed" on every shutdown.
+    pub fn stopListenerOnShutdown(self: *Engine, listen_addr: fiber.net.IpAddress) void {
+        self.node.shutdown.wait();
+        var stream = listen_addr.connect(.{}) catch |err| {
+            log.warn("shutdown self-connect failed: {s}", .{@errorName(err)});
+            return;
+        };
+        stream.close();
     }
 
     /// Block until every background fiber (loops + front-ends) has exited.
@@ -613,6 +628,7 @@ pub const Engine = struct {
             const cfg = self.snapshot_cfg.snapshot();
             fiber.sleepMs(cfg.poll_interval_seconds * 1000);
             if (!self.node.isLeader()) continue;
+            if (self.node.isShuttingDown()) return;
 
             self.maybeProposeSnapshot() catch |err| {
                 log.warn("maybeProposeSnapshot: {s}", .{@errorName(err)});

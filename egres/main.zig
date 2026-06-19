@@ -108,29 +108,6 @@ const Args = struct {
     wal_dir: []const u8,
 };
 
-/// Set by the SIGINT/SIGTERM handler; appMain polls it to begin shutdown.
-/// A signal handler must be async-signal-safe, so it does nothing but store
-/// this flag — it never touches the fiber runtime.
-var g_shutdown_requested: std.atomic.Value(bool) = .init(false);
-
-fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
-    g_shutdown_requested.store(true, .release);
-}
-
-/// Install SIGINT/SIGTERM handlers that flag shutdown. POSIX-only for now;
-/// Windows console-ctrl handling is a TODO.
-fn installShutdownSignals() void {
-    if (@import("builtin").os.tag == .windows) return;
-    const posix = std.posix;
-    var sa = posix.Sigaction{
-        .handler = .{ .handler = shutdownSignalHandler },
-        .mask = posix.sigemptyset(),
-        .flags = posix.SA.RESTART,
-    };
-    posix.sigaction(posix.SIG.INT, &sa, null);
-    posix.sigaction(posix.SIG.TERM, &sa, null);
-}
-
 pub fn main(init: std.process.Init) !void {
     defer log.info("shutdown complete", .{});
     utils.context.initGlobal(init);
@@ -331,16 +308,17 @@ fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *SqlSer
         return;
     };
 
-    installShutdownSignals();
+    node.shutdown.install() catch |err| {
+        log.err("appMain: installing signal handlers failed: {s}", .{@errorName(err)});
+        return;
+    };
     log.info("appMain: waiting for SIGINT/SIGTERM to shutdown", .{});
-    // Poll the async-signal-safe flag (the handler can't touch the runtime).
-    // 100 ms is plenty responsive for Ctrl-C; `isShuttingDown()` also covers
-    // shutdown requested from elsewhere (e.g. a fatal loop error).
-    while (!g_shutdown_requested.load(.acquire) and !node.isShuttingDown()) {
-        fiber.sleepMs(100);
-    }
+    // Blocks until SIGINT/SIGTERM fires the shutdown signal or an internal
+    // fatal path fires it. The node reacts on its own (`shutdownWatchLoop`
+    // closes everything raft fibers park on), so there is nothing to invoke
+    // here — just wait for the fibers to drain.
+    node.shutdown.wait();
     log.info("received shutdown signal, shutting down...", .{});
-    eng.requestShutdown();
     eng.wait();
 }
 
@@ -362,6 +340,9 @@ const SqlServer = struct {
             return;
         };
         defer listener.close();
+        // Break the blocking `accept()` at shutdown (see AdminServer): a watcher
+        // fiber self-connects to our address when the shutdown channel closes.
+        fiber.spawnDetached(.{}, engine.Engine.stopListenerOnShutdown, .{ self.engine, self.listen_addr }) catch {};
         log.info("sql listener started on port {d} (pgwire)", .{listener.port()});
         var conn_id: u64 = 0;
         while (!self.engine.node.isShuttingDown()) {
@@ -369,6 +350,11 @@ const SqlServer = struct {
                 log.err("sql: accept failed: {s}", .{@errorName(err)});
                 return;
             };
+            // Shutdown watcher's self-connection: drop it and exit.
+            if (self.engine.node.isShuttingDown()) {
+                stream.close();
+                return;
+            }
             conn_id += 1;
             fiber.spawnDetached(.{}, handleSqlConn, .{ self, stream }) catch {
                 stream.close();

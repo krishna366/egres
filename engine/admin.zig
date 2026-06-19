@@ -594,6 +594,11 @@ pub const AdminServer = struct {
         };
         defer listener.close();
 
+        // Break out of the blocking `accept()` at shutdown: a watcher fiber
+        // self-connects to our address when the engine's shutdown channel
+        // closes, so the `accept()` below returns and this loop exits.
+        fiber.spawnDetached(.{}, Engine.stopListenerOnShutdown, .{ self.engine, self.listen_addr }) catch {};
+
         log.info("client TCP listener started, accepting connections", .{});
 
         // Per-connection handlers are detached: each frees itself when its
@@ -607,6 +612,12 @@ pub const AdminServer = struct {
                 log.err("runListener: accept failed: {}", .{err});
                 return;
             };
+            // The shutdown watcher wakes this accept by self-connecting; once
+            // shutting down, drop that throwaway connection and exit.
+            if (self.engine.node.isShuttingDown()) {
+                stream.close();
+                return;
+            }
             conn_id += 1;
             log.info("accepted client connection #{d}", .{conn_id});
             fiber.spawnDetached(.{}, handleClient, .{ self, stream }) catch {

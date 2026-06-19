@@ -307,7 +307,7 @@ pub fn testTransportStartsAndStopsCleanly() !void {
     try group.spawn(.{}, runRaftRuntime, .{&rt});
 
     fiber.sleepMs(50);
-    node.startShutdown();
+    node.shutdown.start();
 }
 
 pub fn testTransportProcessesProposal() !void {
@@ -362,7 +362,7 @@ pub fn testTransportProcessesProposal() !void {
     }
 
     try std.testing.expect(observed);
-    node.startShutdown();
+    node.shutdown.start();
 }
 
 pub fn testTransportStopIsClean() !void {
@@ -393,7 +393,7 @@ pub fn testTransportStopIsClean() !void {
     try group.spawn(.{}, runRaftRuntime, .{&rt});
 
     fiber.sleepMs(50);
-    node.startShutdown();
+    node.shutdown.start();
 }
 
 pub fn testProposeAfterShutdownReturnsQueueClosed() !void {
@@ -411,7 +411,7 @@ pub fn testProposeAfterShutdownReturnsQueueClosed() !void {
     );
     defer node.deinit();
 
-    node.startShutdown();
+    node.shutdown.start();
     const callback = struct {
         fn run(_: *anyopaque, _: raft.Entry, _: raft.CommitStatus) void {}
     };
