@@ -29,6 +29,7 @@ const manifest = zdb.manifest;
 const Forest = zdb.forest.Forest;
 const Item = zdb.key.Item;
 const Key = zdb.key.Key;
+const TreeKey = zdb.key.TreeKey;
 const vfs = zdb.vfs;
 const metrics = zdb.metrics;
 const log = std.log.scoped(.zdb_server);
@@ -155,18 +156,18 @@ pub const StorageImpl = struct {
         // TRACE: pinpoints which entry / cmd hangs the apply path. Last
         // "enter" without a matching "exit" is the wedge.
         log.info("applyManifestChange enter idx={d} cmd={d} mt={d} tcs={d}", .{
-            index, mcs.cmd, mcs.memtable_id, mcs.table_changes.len,
+            index, mcs.cmd, mcs.memtable_id, mcs.sstable_changes.len,
         });
         defer log.info("applyManifestChange exit  idx={d} cmd={d}", .{ index, mcs.cmd });
 
         switch (mcs.cmd) {
             1 => try self.forest.newMemtable(mcs.memtable_id, index),
-            2 => try self.forest.applyFlush(mcs.table_changes, mcs.memtable_id),
+            2 => try self.forest.applyFlush(mcs.sstable_changes, mcs.memtable_id),
             3 => {
-                if (mcs.table_changes.len > 0) {
-                    const tree_id = mcs.table_changes[0].tree_id;
-                    if (self.forest.trees.get(tree_id)) |tree| {
-                        try tree.applyCompaction(mcs.table_changes);
+                if (mcs.sstable_changes.len > 0) {
+                    const sc = mcs.sstable_changes[0];
+                    if (self.forest.getTree(sc.namespace_id, sc.tree_id)) |tree| {
+                        try tree.applyCompaction(mcs.sstable_changes);
                     }
                 }
             },
@@ -218,11 +219,11 @@ pub const StorageImpl = struct {
             if (data.len == 0) continue;
 
             const mc = zdb_bufs.ManifestChangeReader.parseRoot(data) catch continue;
-            const tc_len = mc.tableChangesLen();
+            const tc_len = mc.sstableChangesLen();
             for (0..tc_len) |i| {
-                const tc = mc.tableChangesAt(@intCast(i)) catch continue;
-                if (tc.op() == .create and !self.forest.hasFile(tc.tableId())) {
-                    missing.append(self.allocator, tc.tableId()) catch continue;
+                const tc = mc.sstableChangesAt(@intCast(i)) catch continue;
+                if (tc.op() == .create and !self.forest.hasFile(tc.sstId())) {
+                    missing.append(self.allocator, tc.sstId()) catch continue;
                 }
             }
         }
@@ -286,7 +287,7 @@ pub const ZdbServer = struct {
     /// two fibers never pick the same tree. Allocated lazily on init;
     /// the deinit code below frees it.
     compacting_mu: fiber.Mutex(.tracked) = .{},
-    compacting_trees: std.AutoHashMap(u64, void) = undefined,
+    compacting_trees: std.AutoHashMap(TreeKey, void) = undefined,
 
     /// Serializes `proposeFlush` and `proposeSplit` end-to-end (build → propose
     /// → wait-for-apply). Without this, a flush whose `buildFlush` ran before a
@@ -316,7 +317,7 @@ pub const ZdbServer = struct {
             .storage = storage,
             .snapshot_cfg = snapshot_cfg,
             .listen_addr = addr,
-            .compacting_trees = std.AutoHashMap(u64, void).init(allocator),
+            .compacting_trees = std.AutoHashMap(TreeKey, void).init(allocator),
         };
     }
 
@@ -341,14 +342,14 @@ pub const ZdbServer = struct {
         self.compacting_mu.lock(@src());
         defer self.compacting_mu.unlock();
         const target = self.forest.bestCompactionCandidateExcluding(&self.compacting_trees) orelse return null;
-        self.compacting_trees.put(target.tree_id, {}) catch return null;
+        self.compacting_trees.put(target.key, {}) catch return null;
         return target;
     }
 
-    fn releaseCompactingTree(self: *ZdbServer, tree_id: u64) void {
+    fn releaseCompactingTree(self: *ZdbServer, key: TreeKey) void {
         self.compacting_mu.lock(@src());
         defer self.compacting_mu.unlock();
-        _ = self.compacting_trees.remove(tree_id);
+        _ = self.compacting_trees.remove(key);
     }
 
     /// Add an in-flight record. Returns the slice index for `removeInFlight`.
@@ -685,7 +686,7 @@ pub const ZdbServer = struct {
                         mcs.deinit(self.allocator);
                         self.allocator.destroy(mcs);
                     }
-                    try draft.commit(mcs.table_changes, mcs.tree_changes);
+                    try draft.commit(mcs.sstable_changes, mcs.tree_changes);
                 },
                 else => continue,
             }
@@ -770,15 +771,15 @@ pub const ZdbServer = struct {
                 fiber.sleepMs(interval);
                 continue;
             };
-            defer self.releaseCompactingTree(target.tree_id);
+            defer self.releaseCompactingTree(target.key);
             // The candidate carries `needs_split=true` when the tree's
             // Lmax has outgrown the split threshold. updateCompactCandidate
             // sets this in the apply path (after every compaction/flush),
             // so the dispatch here always reflects the latest applied
             // state — no separate polling for splits is needed.
             if (target.candidate.needs_split) {
-                self.proposeSplit(target.tree_id) catch |err| {
-                    log.err("proposeSplit failed for tree {d}: {s}", .{ target.tree_id, @errorName(err) });
+                self.proposeSplit(target.key) catch |err| {
+                    log.err("proposeSplit failed for tree {d}: {s}", .{ target.key.tree_id, @errorName(err) });
                 };
             } else {
                 self.proposeCompaction(target) catch |err| {
@@ -792,7 +793,7 @@ pub const ZdbServer = struct {
         self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_ms = fiber.coarseMs() });
         defer self.removeInFlight(.new_memtable, 0, 0);
         const new_id = try self.forest.file_ids.allocate();
-        const payload = try encodeManifestChange(self.allocator, 1, &.{}, &.{}, new_id);
+        const payload = try zdb_bufs.marshalRoot(self.allocator, manifest.ManifestChange{ .cmd = 1, .memtable_id = new_id });
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
     }
@@ -833,18 +834,18 @@ pub const ZdbServer = struct {
         // on a build/sync that hasn't proposed yet.
         self.addInFlight(.{
             .kind = .compaction,
-            .tree_id = target.tree_id,
+            .tree_id = target.key.tree_id,
             .src_level = @intCast(target.candidate.level),
             .dest_level = @intCast(@as(usize, target.candidate.level) + 1),
             .cid = cid,
             .started_at_ms = fiber.coarseMs(),
         });
-        defer self.removeInFlight(.compaction, target.tree_id, @intCast(target.candidate.level));
+        defer self.removeInFlight(.compaction, target.key.tree_id, @intCast(target.candidate.level));
 
         const src = target.candidate.level;
         const dst: usize = @as(usize, src) + 1;
         const t0 = fiber.coarseMs();
-        log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.tree_id, src, dst });
+        log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.key.tree_id, src, dst });
 
         var changes = try target.tree.buildCompaction(src, &self.forest.file_ids);
         defer changes.deinit(self.allocator);
@@ -866,14 +867,14 @@ pub const ZdbServer = struct {
         log.info("compact cid={d} done propose_ms={d} total_ms={d}", .{ cid, t3 - t2, t3 - t0 });
     }
 
-    fn proposeSplit(self: *ZdbServer, tree_id: u64) !void {
+    fn proposeSplit(self: *ZdbServer, key: TreeKey) !void {
         // Block while a flush is in-flight.
         self.flush_split_mu.lock(@src());
         defer self.flush_split_mu.unlock();
 
-        self.addInFlight(.{ .kind = .split, .tree_id = tree_id, .started_at_ms = fiber.coarseMs() });
-        defer self.removeInFlight(.split, tree_id, 0);
-        // buildSplit allocates table_changes / tree_changes on the arena;
+        self.addInFlight(.{ .kind = .split, .tree_id = key.tree_id, .started_at_ms = fiber.coarseMs() });
+        defer self.removeInFlight(.split, key.tree_id, 0);
+        // buildSplit allocates sstable_changes / tree_changes on the arena;
         // encodeManifestChange copies the bytes into a self-owned payload,
         // so the arena can be torn down right after encode. No new SST
         // files are produced (split just remaps existing tables between
@@ -881,36 +882,36 @@ pub const ZdbServer = struct {
         // through applyManifestChange to applySplit on every node.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const mc = try self.forest.buildSplit(arena.allocator(), tree_id) orelse {
+        const mc = try self.forest.buildSplit(arena.allocator(), key.namespace, key.tree_id) orelse {
             // No split key (Lmax has < 2 tables). The candidate that sent
             // us here was stale — refresh it so the next levels-loop
             // iteration picks a different (real) candidate instead of
             // hammering this tree forever. Without this, the loop spins
             // on the same `needs_split=true` tree and starves every
             // other tree's pending compactions.
-            if (self.forest.trees.get(tree_id)) |t| t.updateCompactCandidate() catch {};
-            log.warn("proposeSplit tree={d} skipped: no split key (refreshed candidate)", .{tree_id});
+            if (self.forest.getTree(key.namespace, key.tree_id)) |t| t.updateCompactCandidate() catch {};
+            log.warn("proposeSplit tree={d} skipped: no split key (refreshed candidate)", .{key.tree_id});
             return;
         };
 
-        // Diagnostic: dump the split's TC layout so we can correlate the
-        // trigger size (logged by Tree.updateCompactCandidate) with what
+        // Diagnostic: dump the split's SST-change layout so we can correlate
+        // the trigger size (logged by Tree.updateCompactCandidate) with what
         // the split actually proposes — table count, new tree id, etc.
         var n_create: usize = 0;
         var n_delete: usize = 0;
-        for (mc.table_changes) |tc| switch (tc.op) {
+        for (mc.sstable_changes) |tc| switch (tc.op) {
             .create => n_create += 1,
             .delete => n_delete += 1,
             else => {},
         };
-        log.info("proposeSplit tree={d} table_changes={d} (create={d} delete={d}) tree_changes={d}", .{
-            tree_id, mc.table_changes.len, n_create, n_delete, mc.tree_changes.len,
+        log.info("proposeSplit tree={d} sstable_changes={d} (create={d} delete={d}) tree_changes={d}", .{
+            key.tree_id, mc.sstable_changes.len, n_create, n_delete, mc.tree_changes.len,
         });
 
         const payload = try encodeManifestChange(
             self.allocator,
             mc.cmd,
-            mc.table_changes,
+            mc.sstable_changes,
             mc.tree_changes,
             0,
         );
@@ -919,11 +920,11 @@ pub const ZdbServer = struct {
     }
 
     /// Send new SST files to peers and wait for quorum acks.
-    fn distributeNewFiles(self: *ZdbServer, changes: []const manifest.TableChange) !void {
+    fn distributeNewFiles(self: *ZdbServer, changes: []const manifest.SSTableChange) !void {
         var file_ids = std.ArrayList(u64).empty;
         defer file_ids.deinit(self.allocator);
         for (changes) |c| {
-            if (c.op == .create) try file_ids.append(self.allocator, c.table_id);
+            if (c.op == .create) try file_ids.append(self.allocator, c.sst_id);
         }
         if (file_ids.items.len == 0) return;
         try self.node.sendAndWaitForFileQuorum(file_ids.items);
@@ -1450,7 +1451,7 @@ pub const ZdbServer = struct {
                 try self.forest.writeStats(&body.writer, .{ .scope = .forest });
                 try self.writeInFlight(&body.writer);
             },
-            .tree => try self.forest.writeStats(&body.writer, .{ .scope = .{ .tree = req.tree_id } }),
+            .tree => try self.forest.writeStats(&body.writer, .{ .scope = .{ .tree = .{ .namespace = req.ns_id, .tree_id = req.tree_id } } }),
             .namespace => try self.forest.writeStats(&body.writer, .{ .scope = .{ .namespace = req.ns_id } }),
         }
         try body.writer.writeByte('\n');
@@ -1506,7 +1507,7 @@ pub const ZdbServer = struct {
         const payload = encodeManifestChange(
             self.allocator,
             mc.cmd,
-            mc.table_changes,
+            mc.sstable_changes,
             mc.tree_changes,
             mc.memtable_id,
         ) catch |err| {
@@ -1592,13 +1593,13 @@ fn formatEntry(alloc: std.mem.Allocator, w: *std.Io.Writer, stored: raft.StoredE
                         mcs.deinit(alloc);
                         alloc.destroy(mcs);
                     }
-                    try w.print(" detail=ManifestChange cmd={d} memtable_id={d} table_changes={d} tree_changes={d}", .{
-                        mcs.cmd, mcs.memtable_id, mcs.table_changes.len, mcs.tree_changes.len,
+                    try w.print(" detail=ManifestChange cmd={d} memtable_id={d} sstable_changes={d} tree_changes={d}", .{
+                        mcs.cmd, mcs.memtable_id, mcs.sstable_changes.len, mcs.tree_changes.len,
                     });
                     try w.writeByte('\n');
-                    for (mcs.table_changes, 0..) |tc, idx| {
+                    for (mcs.sstable_changes, 0..) |tc, idx| {
                         try w.print("  tc[{d}]=(op={s} fid={d} tree={d} lvl={d})\n", .{
-                            idx, @tagName(tc.op), tc.table_id, tc.tree_id, tc.level,
+                            idx, @tagName(tc.op), tc.sst_id, tc.tree_id, tc.level,
                         });
                     }
                 },
@@ -1615,47 +1616,19 @@ fn formatEntry(alloc: std.mem.Allocator, w: *std.Io.Writer, stored: raft.StoredE
 fn encodeManifestChange(
     allocator: std.mem.Allocator,
     cmd: u32,
-    table_changes: []const manifest.TableChange,
-    tree_changes: []const manifest.TreeChange,
+    sstable_changes: []manifest.SSTableChange,
+    tree_changes: []manifest.TreeChange,
     memtable_id: u64,
 ) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    var mw = try zdb_bufs.ManifestChangeWriter.initWithBuf(allocator, &buf);
-
-    if (table_changes.len > 0) {
-        const offsets = try allocator.alloc(u32, table_changes.len);
-        defer allocator.free(offsets);
-        for (table_changes, 0..) |tc, i| {
-            var tw = try zdb_bufs.TableChangeWriter.initWithBuf(allocator, &buf);
-            try tw.set(.{ .op = tc.op, .level = tc.level, .table_id = tc.table_id, .tree_id = tc.tree_id });
-            offsets[i] = (try tw.finish()).offset;
-        }
-        try mw.setTableChanges(offsets);
-    }
-
-    if (tree_changes.len > 0) {
-        const offsets = try allocator.alloc(u32, tree_changes.len);
-        defer allocator.free(offsets);
-        for (tree_changes, 0..) |tc, i| {
-            var tw = try zdb_bufs.TreeChangeWriter.initWithBuf(allocator, &buf);
-            try tw.set(.{
-                .op = tc.op,
-                .tree_id = tc.tree_id,
-                .namespace_id = tc.namespace_id,
-                .left_key = tc.left_key,
-                .right_key = tc.right_key,
-            });
-            offsets[i] = (try tw.finish()).offset;
-        }
-        try mw.setTreeChanges(offsets);
-    }
-
-    try mw.setCmd(cmd);
-    if (memtable_id != 0) try mw.setMemtableId(memtable_id);
-    _ = try mw.finishWithTail();
-    return buf.toOwnedSlice(allocator);
+    // marshalRoot serializes every field of the nested SSTableChange /
+    // TreeChange (namespace_id, checksum, size, …); a hand-written writer
+    // that copies only a subset would silently drop the new id-model fields.
+    return zdb_bufs.marshalRoot(allocator, manifest.ManifestChange{
+        .cmd = cmd,
+        .sstable_changes = sstable_changes,
+        .tree_changes = tree_changes,
+        .memtable_id = memtable_id,
+    });
 }
 
 /// Encode one or more key-value writes as a single `Mutations` payload for
