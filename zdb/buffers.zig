@@ -46,15 +46,21 @@ pub const Op = schema.EnumDef(.{
 
 // TreeChange is used to create a new tree, delete a tree or update a tree's
 // range. `tree_id` is namespace-local and packs (table_id << 32) | split_id, so
-// the tree's SQL table bucket is derived from it (Key.treeTableId) and never
+// the tree's SQL table is derived from it (Key.treeTableId) and never
 // stored separately. `namespace_id` + `tree_id` together are the tree's global
 // identity (Key.TreeKey).
+//
+// `name` names the object a CREATE introduces: the namespace's name on an
+// ns_create (its tree_id-0 change, live and in snapshots), a table's name on
+// a create_tree (future). Empty everywhere else (splits, drops, legacy admin
+// namespaces).
 pub const TreeChange = schema.Table(.{
     .{ .id = 1, .name = "op", .ty = schema.Enum(Op) }, // 0=CREATE, 1=DELETE, 2=UPDATE
     .{ .id = 2, .name = "namespace_id", .ty = schema.U64 },
     .{ .id = 3, .name = "tree_id", .ty = schema.U64 },
     .{ .id = 4, .name = "left_key", .ty = schema.Bytes },
     .{ .id = 5, .name = "right_key", .ty = schema.Bytes },
+    .{ .id = 6, .name = "name", .ty = schema.Bytes },
 });
 
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a
@@ -74,13 +80,15 @@ pub const SSTableChange = schema.Table(.{
     .{ .id = 7, .name = "size", .ty = schema.U64 }, // file size in bytes (CREATE only)
 });
 
-// A namespace's next-free table_id high-water-mark. Persisted ONLY inside a
-// snapshot (a serialized ForestState), so a re-elected leader never re-issues a
-// table_id even after the table's tree was dropped from the manifest. Live
-// (non-snapshot) ManifestChanges leave table_counters empty.
-pub const TableId = schema.Table(.{
-    .{ .id = 1, .name = "namespace", .ty = schema.U64 },
+// Per-namespace manifest state, persisted ONLY inside a snapshot (a
+// serialized ForestState): the next-free table_id high-water-mark (so a
+// re-elected leader never re-issues an id even after a DROP) and the
+// database name (SQL CREATE DATABASE; empty for unnamed legacy namespaces).
+// Live (non-snapshot) ManifestChanges leave `namespaces` empty.
+pub const Namespace = schema.Table(.{
+    .{ .id = 1, .name = "id", .ty = schema.U64 },
     .{ .id = 2, .name = "next_table_id", .ty = schema.U32 },
+    .{ .id = 3, .name = "name", .ty = schema.Bytes },
 });
 
 pub const ManifestChange = schema.Table(.{
@@ -89,7 +97,7 @@ pub const ManifestChange = schema.Table(.{
     // TODO: cmd needs to switch to enum.
     .{ .id = 3, .name = "cmd", .ty = schema.U32 }, // 1=new_memtable, 2=flush, 3=compaction, 4=tree_split, 5=ns_create, 6=create_tree, 7=drop_tree
     .{ .id = 4, .name = "memtable_id", .ty = schema.U64 }, // for flush: which memtable was flushed
-    .{ .id = 5, .name = "next_table_ids", .ty = schema.Array(TableId) }, // snapshot only
+    .{ .id = 5, .name = "namespaces", .ty = schema.Array(Namespace) }, // snapshot only
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 }, // snapshot only: global namespace counter
 });
 
@@ -103,8 +111,8 @@ pub const KeyValue = schema.Table(.{
 /// One or more key-value writes proposed through raft as a single entry. The
 /// enclosing `LogEntry.timestamp` is the commit HLC for the whole batch (all kvs
 /// share it). `namespace` + `table_id` sit at the Mutations level so every kv
-/// lands in the same (namespace, table_id) bucket — keeps routing + apply
-/// simple. table_id 0 is the raw-KV / default bucket.
+/// lands in the same (namespace, table_id) table — keeps routing + apply
+/// simple. table_id 0 is the raw-KV / default table.
 pub const Mutations = schema.Table(.{
     .{ .id = 1, .name = "namespace", .ty = schema.U64 },
     .{ .id = 2, .name = "table_id", .ty = schema.U32 },
@@ -129,5 +137,5 @@ pub const tables = .{
     .{ .name = "ManifestChange", .ty = ManifestChange, .id = tableId(6) },
     .{ .name = "KeyValue", .ty = KeyValue, .id = tableId(7) },
     .{ .name = "Mutations", .ty = Mutations, .id = tableId(8) },
-    .{ .name = "TableId", .ty = TableId, .id = tableId(9) },
+    .{ .name = "Namespace", .ty = Namespace, .id = tableId(9) },
 };

@@ -25,21 +25,20 @@ pub const LevelState = struct {
 
 pub const TreeState = struct {
     namespace_id: u64 = 0,
-    // The SQL table bucket is derived from the tree_id (Key.treeTableId), not
+    // The SQL table is derived from the tree_id (Key.treeTableId), not
     // stored — the tree_id is the map key alongside namespace_id (Key.TreeKey).
     levels: std.ArrayList(LevelState),
     left: Key = .{},
     right: Key = .{},
 };
 
-/// table_ids 0–15 are reserved per namespace (0 = raw-KV / default bucket,
+/// table_ids 0–15 are reserved per namespace (0 = raw-KV / default table,
 /// 1 = the namespace's SQL catalog, the rest for future system tables); user
 /// tables start here. nextTableId floors every namespace's counter at this.
 pub const first_table_id: u32 = 16;
 
-/// namespaces 1–15 are reserved (1 = the databases registry; the rest for
-/// future engine use). User databases start here. nextNamespace floors
-/// next_ns_id at this value.
+/// namespaces 1–15 are reserved for future engine use. User databases start
+/// here. nextNamespace floors next_ns_id at this value.
 pub const first_namespace: u64 = 16;
 
 /// In-memory manifest state. Durability comes from the Raft log + periodic
@@ -50,22 +49,38 @@ pub const first_namespace: u64 = 16;
 pub const ForestState = struct {
     allocator: std.mem.Allocator,
     trees: std.AutoHashMap(TreeKey, TreeState),
-    /// Per-namespace next-free user table_id. The only authoritative source of
-    /// table_id allocation: bumped on apply of every create (advanceTableId) and
-    /// reserved by the leader (nextTableId), and snapshot-persisted so a
-    /// re-elected leader never re-issues an id even after a DROP removed the
-    /// tree. A namespace with no entry is treated as `first_table_id`.
-    next_table_id: std.AutoHashMap(u64, u32),
+    /// Per-namespace manifest state (see `Namespace`), snapshot-persisted and
+    /// maintained by the apply paths on every node — so a re-elected leader
+    /// never re-issues a table_id, and database-name resolution is native
+    /// manifest state. A namespace with no entry allocates from
+    /// `first_table_id`.
+    namespaces: std.AutoHashMap(u64, Namespace),
+    /// Reverse index for name → namespace resolution (per-connection hot
+    /// path). Keys borrow the name strings owned by `namespaces`.
+    names: std.StringHashMap(u64),
     /// Next-free namespace id (global). Same allocate-on-leader / advance-on-
-    /// apply / snapshot-persist discipline as next_table_id, one level up.
+    /// apply / snapshot-persist discipline as the per-namespace table_id
+    /// counter, one level up.
     next_ns_id: u64 = first_namespace,
     mu: fiber.Mutex(.untracked) = .{},
+
+    pub const Namespace = struct {
+        /// Next-free user table_id: the only authoritative source of
+        /// table_id allocation — bumped on apply of every create
+        /// (advanceTableId), reserved by the leader (nextTableId).
+        next_table_id: u32 = first_table_id,
+        /// Database name (SQL: CREATE DATABASE), owned by the map. Empty for
+        /// unnamed namespaces (legacy admin KV path) — those never resolve
+        /// by name.
+        name: []const u8 = "",
+    };
 
     pub fn init(allocator: std.mem.Allocator) ForestState {
         return .{
             .allocator = allocator,
             .trees = std.AutoHashMap(TreeKey, TreeState).init(allocator),
-            .next_table_id = std.AutoHashMap(u64, u32).init(allocator),
+            .namespaces = std.AutoHashMap(u64, Namespace).init(allocator),
+            .names = std.StringHashMap(u64).init(allocator),
         };
     }
 
@@ -97,24 +112,77 @@ pub const ForestState = struct {
     pub fn nextTableId(self: *ForestState, namespace: u64) !u32 {
         self.mu.lock(@src());
         defer self.mu.unlock();
-        const slot = try self.next_table_id.getOrPut(namespace);
-        // The id to hand out: the current counter (never below the floor), or
-        // first_table_id for a namespace's first table. Then reserve the next.
-        const id = if (slot.found_existing) @max(slot.value_ptr.*, first_table_id) else first_table_id;
-        slot.value_ptr.* = id + 1;
+
+        const slot = try self.namespaces.getOrPut(namespace);
+        if (!slot.found_existing) slot.value_ptr.* = .{};
+
+        // Hand out the current counter (never below the floor), reserve next.
+        const id = @max(slot.value_ptr.next_table_id, first_table_id);
+        slot.value_ptr.next_table_id = id + 1;
         return id;
     }
 
     /// Raise `namespace`'s counter past `table_id` (apply path, all nodes).
     /// Idempotent; never lowers it (so re-applying or applying a low system
-    /// bucket leaves a higher user counter untouched). Floors at first_table_id.
+    /// table leaves a higher user counter untouched). Floors at first_table_id.
     pub fn advanceTableId(self: *ForestState, namespace: u64, table_id: u32) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
-        const slot = try self.next_table_id.getOrPut(namespace);
+
+        const slot = try self.namespaces.getOrPut(namespace);
+        if (!slot.found_existing) slot.value_ptr.* = .{};
+
         // Floor the current counter, then raise it past table_id; never lowers.
-        const floor = if (slot.found_existing) @max(slot.value_ptr.*, first_table_id) else first_table_id;
-        slot.value_ptr.* = @max(floor, table_id +| 1);
+        const floor = @max(slot.value_ptr.next_table_id, first_table_id);
+        slot.value_ptr.next_table_id = @max(floor, table_id +| 1);
+    }
+
+    /// Record `namespace`'s database name (ns_create apply path, all nodes).
+    /// Idempotent for re-applies; an empty name (legacy unnamed namespace)
+    /// records nothing. A name held by ANOTHER namespace is a build-side bug
+    /// (uniqueness is checked before propose) — logged and skipped, never
+    /// clobbered.
+    pub fn registerNamespaceName(self: *ForestState, namespace: u64, name: []const u8) !void {
+        if (name.len == 0) return;
+
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+
+        if (self.names.get(name)) |owner| {
+            if (owner != namespace)
+                std.log.err("namespace name '{s}' already owned by ns={d}, not renaming ns={d}", .{ name, owner, namespace });
+            return;
+        }
+        const slot = try self.namespaces.getOrPut(namespace);
+        if (!slot.found_existing) slot.value_ptr.* = .{};
+        if (slot.value_ptr.name.len > 0) return; // re-apply; name is immutable
+
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.names.put(owned, namespace);
+        slot.value_ptr.name = owned;
+    }
+
+    /// Resolve a database name to its namespace.
+    pub fn lookupNamespace(self: *ForestState, name: []const u8) ?u64 {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        return self.names.get(name);
+    }
+
+    /// Forget `namespace`'s state — counter and name (drop_ns apply path).
+    /// Safe because namespace ids are never reused: no later create can see
+    /// the missing entry as a lowered floor, and freeing the name is by
+    /// design (DROP DATABASE then CREATE DATABASE of the same name works).
+    pub fn dropNamespace(self: *ForestState, namespace: u64) void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        if (self.namespaces.fetchRemove(namespace)) |kv| {
+            if (kv.value.name.len > 0) {
+                _ = self.names.remove(kv.value.name);
+                self.allocator.free(kv.value.name);
+            }
+        }
     }
 
     fn freeTree(self: *ForestState, tree: *TreeState) void {
@@ -128,7 +196,12 @@ pub const ForestState = struct {
         var it = self.trees.iterator();
         while (it.next()) |kv| self.freeTree(kv.value_ptr);
         self.trees.deinit();
-        self.next_table_id.deinit();
+        self.names.deinit(); // keys borrow the names owned below
+        var nit = self.namespaces.valueIterator();
+        while (nit.next()) |n| {
+            if (n.name.len > 0) self.allocator.free(n.name);
+        }
+        self.namespaces.deinit();
     }
 
     /// Applies a single table CREATE or DELETE to the tree's levels.
@@ -247,10 +320,14 @@ pub const ForestState = struct {
             }
         }
 
-        var next_table_ids: std.ArrayList(TableId) = .empty;
-        var cit = self.next_table_id.iterator();
+        var namespaces: std.ArrayList(zen.NamespaceStruct) = .empty;
+        var cit = self.namespaces.iterator();
         while (cit.next()) |kv| {
-            try next_table_ids.append(a, .{ .namespace = kv.key_ptr.*, .next_table_id = kv.value_ptr.* });
+            try namespaces.append(a, .{
+                .id = kv.key_ptr.*,
+                .next_table_id = kv.value_ptr.next_table_id,
+                .name = @constCast(kv.value_ptr.name),
+            });
         }
 
         // The arena holds the source changes; marshalRoot copies them into a
@@ -258,7 +335,7 @@ pub const ForestState = struct {
         return zen.marshalRoot(allocator, ManifestChange{
             .tree_changes = tree_changes.items,
             .sstable_changes = table_changes.items,
-            .next_table_ids = next_table_ids.items,
+            .namespaces = namespaces.items,
             .next_ns_id = self.next_ns_id,
         });
     }
@@ -267,11 +344,17 @@ pub const ForestState = struct {
     /// `bytes` (as produced by `serialize`). Failure mid-decode leaves the
     /// state empty, not partial.
     pub fn restoreFrom(self: *ForestState, bytes: []const u8) !void {
-        // Drop existing trees + counters first; restore is a full replace.
+        // Drop existing trees + namespace state first; restore is a full
+        // replace.
         var it = self.trees.iterator();
         while (it.next()) |kv| self.freeTree(kv.value_ptr);
         self.trees.clearRetainingCapacity();
-        self.next_table_id.clearRetainingCapacity();
+        self.names.clearRetainingCapacity(); // keys borrow the names below
+        var nit = self.namespaces.valueIterator();
+        while (nit.next()) |n| {
+            if (n.name.len > 0) self.allocator.free(n.name);
+        }
+        self.namespaces.clearRetainingCapacity();
 
         const reader = try zen.ManifestChangeReader.parseRoot(bytes);
 
@@ -302,11 +385,12 @@ pub const ForestState = struct {
             });
         }
 
-        const ctr_len = reader.nextTableIdsLen();
+        const ns_len = reader.namespacesLen();
         i = 0;
-        while (i < ctr_len) : (i += 1) {
-            const c = try reader.nextTableIdsAt(i);
-            try self.next_table_id.put(c.namespace(), c.nextTableId());
+        while (i < ns_len) : (i += 1) {
+            const c = try reader.namespacesAt(i);
+            try self.namespaces.put(c.id(), .{ .next_table_id = c.nextTableId() });
+            try self.registerNamespaceName(c.id(), c.name());
         }
 
         self.next_ns_id = @max(reader.nextNsId(), first_namespace);
@@ -358,4 +442,3 @@ pub fn updateTreeChange(tree_id: u64, namespace_id: u64, left_key: []const u8, r
 // -------------------------------------------------------------------------
 // Encoding helpers
 // -------------------------------------------------------------------------
-

@@ -21,7 +21,7 @@ fn fakeTree(tree_id: u64, range: KeyRange) Tree {
     return t;
 }
 
-// Total trees across all table buckets (replaces the old Forest.trees count).
+// Total trees across all tables (replaces the old Forest.trees count).
 fn treeCount(f: *Forest) usize {
     var n: usize = 0;
     var it = f.tables.valueIterator();
@@ -126,8 +126,8 @@ test "forest: create tree and get" {
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
-    // Create a tree for namespace 1's default bucket (table_id 0). A fresh
-    // bucket starts at split 0, so the derived tree_id is 0.
+    // Create a tree for namespace 1's default table (table_id 0). A fresh
+    // table starts at split 0, so the derived tree_id is 0.
     const tree_id = try f.createTree(1, 0, .{ .inf = true });
     try std.testing.expectEqual(@as(u64, 0), tree_id);
 
@@ -175,7 +175,7 @@ test "forest: split tree" {
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
-    // Default bucket (table_id 0) → derived tree_id 0.
+    // Default table (table_id 0) → derived tree_id 0.
     const tree_id = try f.createTree(42, 0, .{ .inf = true });
     try std.testing.expectEqual(@as(u64, 0), tree_id);
 
@@ -207,7 +207,7 @@ test "forest: split tree" {
     // Best balance with 10 equal-size L3 tables: split at items[5].smallest
     // = "k06" (left=5 tables, right=5 tables, |L−R| = 0). Old tree keeps
     // [k01..k05]; new tree gets [k06..k10]. The split's new half is the
-    // bucket's next split index → tree_id 1; the parent stays tree_id 0.
+    // table's next split index → tree_id 1; the parent stays tree_id 0.
     const old_tree = f.getTree(42, 0).?;
     const new_tree = f.getTree(42, 1).?;
     try std.testing.expectEqual(@as(usize, 5), old_tree.levels[3].numTables());
@@ -217,7 +217,7 @@ test "forest: split tree" {
     try std.testing.expectEqualStrings("k06", old_tree.key_range.right.primary);
     try std.testing.expectEqualStrings("k06", new_tree.key_range.left.primary);
 
-    // Route table for namespace 42, table bucket 0, should have 2 entries.
+    // Route table for namespace 42, table 0, should have 2 entries.
     const trees = f.tables.get(.{ .namespace = 42, .table_id = 0 }).?;
     try std.testing.expectEqual(@as(usize, 2), trees.entries.items.len);
 
@@ -227,11 +227,11 @@ test "forest: split tree" {
 }
 
 // ---------------------------------------------------------------------------
-// 6b. Two-level routing — per-table_id bucket isolation
+// 6b. Two-level routing — per-table_id table isolation
 // ---------------------------------------------------------------------------
 
 // Build a one-key SST carrying the full (namespace, table_id, primary) key so
-// the stored key is bucket-specific, and write it to disk.
+// the stored key is table-specific, and write it to disk.
 fn buildAndWriteTableKV(alloc: std.mem.Allocator, path: []const u8, key: Key, value: []const u8) !void {
     var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer bld.deinit();
@@ -251,23 +251,23 @@ test "forest: two-level routing isolates by table_id" {
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
-    // Three buckets in namespace 2: table_id 0 (the default), 1, and 2. Each is its
+    // Three tables in namespace 2: table_id 0 (the default), 1, and 2. Each is its
     // own tree, so the same primary key "row" lives independently in each.
     const t0 = try f.createTree(2, 0, .{ .inf = true });
     const t1 = try f.createTree(2, 1, .{ .inf = true });
     const t2 = try f.createTree(2, 2, .{ .inf = true });
     try std.testing.expect(t0 != t1 and t1 != t2 and t0 != t2);
-    // An unrouted table_id has no bucket.
+    // An unrouted table_id has no table.
     try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 3 }) == null);
 
-    // One SST per bucket: same primary, distinct value, installed at L1.
-    const Bucket = struct { tid: u32, tree: u64, val: []const u8 };
-    const buckets = [_]Bucket{
+    // One SST per table: same primary, distinct value, installed at L1.
+    const Case = struct { tid: u32, tree: u64, val: []const u8 };
+    const cases = [_]Case{
         .{ .tid = 0, .tree = t0, .val = "v0" },
         .{ .tid = 1, .tree = t1, .val = "v1" },
         .{ .tid = 2, .tree = t2, .val = "v2" },
     };
-    for (buckets, 1..) |b, file_id| {
+    for (cases, 1..) |b, file_id| {
         const path = try zdb.file_ids.sstPath(alloc, dir_path, file_id);
         defer alloc.free(path);
         try buildAndWriteTableKV(alloc, path, .{
@@ -280,9 +280,9 @@ test "forest: two-level routing isolates by table_id" {
         try f.getTree(2, b.tree).?.applyCompaction(&changes);
     }
 
-    // A get routes to the tree for its (namespace, table_id) bucket, so each
+    // A get routes to the tree for its (namespace, table_id) table, so each
     // table_id returns only its own value despite sharing the primary key.
-    for (buckets) |b| {
+    for (cases) |b| {
         const got = try f.get(alloc, .{
             .namespace = 2,
             .table_id = b.tid,
@@ -294,7 +294,7 @@ test "forest: two-level routing isolates by table_id" {
         try std.testing.expectEqualStrings(b.val, got.?.value);
     }
 
-    // Unrouted bucket (table_id 3) and an absent primary both miss.
+    // Unrouted table (table_id 3) and an absent primary both miss.
     try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 3, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
     try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 1, .primary = "absent", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
 }
@@ -313,7 +313,7 @@ test "forest: create_tree + drop_tree round-trip" {
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
-    // Create a new table bucket (ns=2, table_id=100) via the manifest op.
+    // Create a new table (ns=2, table_id=100) via the manifest op.
     const mc = try f.buildCreateTree(alloc, 2, 100);
     defer alloc.free(mc.tree_changes);
     try f.applyCreateTree(mc);
@@ -335,16 +335,76 @@ test "forest: create_tree + drop_tree round-trip" {
         try std.testing.expectEqualStrings("v", got.?.value);
     }
 
-    // Drop the table: one tree in the bucket → one delete change.
+    // Drop the table: one tree in the table → one delete change.
     const dc = try f.buildDropTable(alloc, 2, 100);
     defer alloc.free(dc.tree_changes);
     try std.testing.expectEqual(@as(usize, 1), dc.tree_changes.len);
     try f.applyDropTree(dc);
 
-    // Data is gone, the tree is gone, the bucket is removed.
+    // Data is gone, the tree is gone, the table is removed.
     try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
     try std.testing.expect(f.getTree(2, tree_id) == null);
     try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 100 }) == null);
+}
+
+test "forest: drop_ns removes every table and forgets the id counter" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    // Namespace 7 with three tables: the default (installed by ns_create),
+    // a system tree at a reserved table_id, and an allocated user table.
+    const nc = try f.buildNamespaceCreate(alloc, 7, "seven");
+    defer alloc.free(nc.tree_changes);
+    try f.applyNamespaceCreate(nc);
+    try std.testing.expect(f.hasNamespace(7));
+    try std.testing.expectEqual(@as(?u64, 7), f.lookupNamespace("seven"));
+
+    const sys = try f.buildCreateTree(alloc, 7, 2);
+    defer alloc.free(sys.tree_changes);
+    try f.applyCreateTree(sys);
+
+    const ct = try f.buildCreateTable(alloc, 7);
+    defer alloc.free(ct.change.tree_changes);
+    try f.applyCreateTree(ct.change);
+    try std.testing.expectEqual(manifest.first_table_id, ct.table_id);
+
+    // Drop the namespace: one delete per tree across all three tables.
+    const dc = try f.buildDropNamespace(alloc, 7);
+    defer alloc.free(dc.tree_changes);
+    try std.testing.expectEqual(@as(usize, 3), dc.tree_changes.len);
+    try std.testing.expectEqual(@as(u32, 8), dc.cmd);
+    try f.applyDropNamespace(dc);
+
+    try std.testing.expect(!f.hasNamespace(7));
+    try std.testing.expect(!f.hasTable(7, 2));
+    // The name died with the namespace and is free for a re-CREATE.
+    try std.testing.expect(f.lookupNamespace("seven") == null);
+    try std.testing.expect(f.tables.get(.{ .namespace = 7, .table_id = ct.table_id }) == null);
+
+    // Idempotent: a rebuild on the dropped namespace is empty and re-applies
+    // cleanly.
+    const dc2 = try f.buildDropNamespace(alloc, 7);
+    defer alloc.free(dc2.tree_changes);
+    try std.testing.expectEqual(@as(usize, 0), dc2.tree_changes.len);
+    try f.applyDropNamespace(dc2);
+
+    // Re-creating the namespace works, and its table ids restart at the
+    // floor — the counter was forgotten with the namespace. (Production
+    // never reuses a namespace id; the same-id re-create here just
+    // exercises idempotence.)
+    const nc2 = try f.buildNamespaceCreate(alloc, 7, "seven");
+    defer alloc.free(nc2.tree_changes);
+    try f.applyNamespaceCreate(nc2);
+    const ct2 = try f.buildCreateTable(alloc, 7);
+    defer alloc.free(ct2.change.tree_changes);
+    try std.testing.expectEqual(manifest.first_table_id, ct2.table_id);
+    try std.testing.expectEqual(@as(?u64, 7), f.lookupNamespace("seven"));
 }
 
 test "forest: drop_tree keeps an SST shared with another tree" {
@@ -357,7 +417,7 @@ test "forest: drop_tree keeps an SST shared with another tree" {
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
-    // Two tables (buckets 100 and 101) that share one SST file (id 1) — the
+    // Two tables (tables 100 and 101) that share one SST file (id 1) — the
     // shape a cheap CLONE produces: the same *Table referenced by both trees.
     const mcA = try f.buildCreateTree(alloc, 2, 100);
     defer alloc.free(mcA.tree_changes);
@@ -413,7 +473,7 @@ test "forest: buildCreateTable allocates and never reuses a dropped id" {
     defer alloc.free(r1.change.tree_changes);
     try std.testing.expectEqual(first, r1.table_id);
     try f.applyCreateTree(r1.change);
-    try std.testing.expect(f.hasBucket(2, first));
+    try std.testing.expect(f.hasTable(2, first));
 
     const r2 = try f.buildCreateTable(alloc, 2);
     defer alloc.free(r2.change.tree_changes);
@@ -424,7 +484,7 @@ test "forest: buildCreateTable allocates and never reuses a dropped id" {
     const dc = try f.buildDropTable(alloc, 2, r1.table_id);
     defer alloc.free(dc.tree_changes);
     try f.applyDropTree(dc);
-    try std.testing.expect(!f.hasBucket(2, r1.table_id));
+    try std.testing.expect(!f.hasTable(2, r1.table_id));
 
     const r3 = try f.buildCreateTable(alloc, 2);
     defer alloc.free(r3.change.tree_changes);
@@ -443,18 +503,23 @@ test "forest: buildCreateNamespace allocates global namespace ids" {
 
     const first = manifest.first_namespace;
 
-    // CREATE DATABASE allocates the next namespace and installs its default bucket.
-    const r1 = try f.buildCreateNamespace(alloc);
+    // CREATE DATABASE allocates the next namespace and installs its default table.
+    const r1 = try f.buildCreateNamespace(alloc, "one");
     defer alloc.free(r1.change.tree_changes);
     try std.testing.expectEqual(first, r1.namespace);
     try f.applyNamespaceCreate(r1.change);
     try std.testing.expect(f.hasNamespace(first));
 
-    const r2 = try f.buildCreateNamespace(alloc);
+    const r2 = try f.buildCreateNamespace(alloc, "two");
     defer alloc.free(r2.change.tree_changes);
     try std.testing.expectEqual(first + 1, r2.namespace);
     try f.applyNamespaceCreate(r2.change);
     try std.testing.expect(f.hasNamespace(first + 1));
+
+    // Names resolve to their namespaces; a taken name is rejected at build.
+    try std.testing.expectEqual(@as(?u64, first), f.lookupNamespace("one"));
+    try std.testing.expectEqual(@as(?u64, first + 1), f.lookupNamespace("two"));
+    try std.testing.expectError(error.NameExists, f.buildCreateNamespace(alloc, "one"));
 }
 
 // ---------------------------------------------------------------------------
@@ -484,10 +549,11 @@ test "forest: snapshot manifest round-trip" {
         defer src.close();
 
         // Tree in ns=42, range [a, m). Tree in ns=43, infinite. Both are the
-        // default bucket (table_id 0) of their namespace → tree_id 0, distinct
+        // default table (table_id 0) of their namespace → tree_id 0, distinct
         // because the namespace is part of the tree's global identity.
         _ = try src.createTree(42, 0, .{ .left = Key.init(ak), .right = Key.init(mk) });
         _ = try src.createTree(43, 0, .{ .inf = true });
+        try src.ms.registerNamespaceName(42, "answers");
 
         // Drop one SST into the ns=42 tree's L1, both on disk and in the manifest.
         const sst_path = try zdb.file_ids.sstPath(alloc, dir_path, 1);
@@ -512,6 +578,8 @@ test "forest: snapshot manifest round-trip" {
     // Both trees present — same namespace-local tree_id 0, distinct namespaces.
     try std.testing.expectEqual(@as(usize, 2), treeCount(dst));
     try std.testing.expect(dst.getTree(42, 0) != null);
+    // Database names ride the snapshot.
+    try std.testing.expectEqual(@as(?u64, 42), dst.lookupNamespace("answers"));
     try std.testing.expect(dst.getTree(43, 0) != null);
 
     // Namespace routes wired.

@@ -1,5 +1,5 @@
 const std = @import("std");
-const proto = @import("admin.zig");
+const proto = @import("engine").admin;
 
 // Build a set-batch body in memory: `count` records of (key + ' ' + value + '\n'),
 // where key is 24 bytes zero-padded and value is `value_size` bytes of 'v'.

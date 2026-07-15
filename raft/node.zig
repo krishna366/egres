@@ -292,7 +292,7 @@ pub const Node = struct {
         node.proposal_ch = try fiber.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
         node.apply_callbacks = try fiber.Channel(PendingApply).initAlloc(allocator, 1024);
         node.inbound_ch = try fiber.Channel(InboundMsg).initAlloc(allocator, 1024);
-        node.shutdown = try fiber.Shutdown.init(allocator);
+        node.shutdown = fiber.Shutdown.init(allocator);
         errdefer allocator.destroy(node);
         for (peers) |peer| {
             try node.peers.put(peer.id, peer);
@@ -2119,7 +2119,7 @@ pub const Node = struct {
         const interval: u64 = 1000;
         const min_advance: u64 = 100;
         while (!self.isShuttingDown()) {
-            fiber.sleepMs(interval);
+            if (self.shutdown.waitTimeout(interval)) return;
             const ci = self.commit_index.load();
             const persisted = self.log.hardState().commit_index;
             if (ci < persisted + min_advance) continue;

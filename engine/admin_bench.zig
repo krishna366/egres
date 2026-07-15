@@ -5,7 +5,7 @@
 //! rule it out as the bottleneck.
 
 const std = @import("std");
-const proto = @import("admin.zig");
+const proto = @import("engine").admin;
 const utils = @import("utils");
 const bench = utils.bench;
 const Bench = bench.Bench;

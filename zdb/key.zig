@@ -28,7 +28,7 @@ pub const Item = struct {
 
 /// Global identity of an LSM tree: a namespace (u64, global) plus a
 /// namespace-local tree_id. The tree_id packs `(table_id << 32) | split_id`
-/// (see makeTreeId), so a tree's SQL table bucket is derivable from it and is
+/// (see makeTreeId), so a tree's SQL table is derivable from it and is
 /// never stored separately. Two namespaces can reuse the same tree_id, so the
 /// namespace must always travel with it — this struct is the map key for both
 /// `Forest.trees` and `ForestState.trees`.
@@ -37,23 +37,23 @@ pub const TreeKey = packed struct(u128) {
     tree_id: u64,
 };
 
-/// Global identity of a table (one routing bucket): a namespace (u64) plus a
+/// Global identity of a table (one routing entry): a namespace (u64) plus a
 /// namespace-local table_id (u32), muxed into a single u96. The map key for
 /// `Forest.tables`. table_id 0 is the namespace's default (raw-KV)
-/// bucket, so a namespace "exists" iff its `{namespace, 0}` key is present.
+/// table, so a namespace "exists" iff its `{namespace, 0}` key is present.
 pub const TableKey = packed struct(u96) {
     namespace: u64,
     table_id: u32,
 };
 
-/// Compose a namespace-local tree_id from its table bucket (high 32 bits) and
+/// Compose a namespace-local tree_id from its table (high 32 bits) and
 /// split index (low 32 bits). split_id 0 is the table's first/only tree; it
 /// grows by one on every split.
 pub inline fn makeTreeId(table_id: u32, split_id: u32) u64 {
     return (@as(u64, table_id) << 32) | @as(u64, split_id);
 }
 
-/// The SQL table bucket a tree belongs to (high 32 bits of its tree_id).
+/// The SQL table a tree belongs to (high 32 bits of its tree_id).
 pub inline fn treeTableId(tree_id: u64) u32 {
     return @intCast(tree_id >> 32);
 }

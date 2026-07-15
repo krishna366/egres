@@ -30,7 +30,7 @@ const LogicalColumn = schema.LogicalColumn;
 const LogicalSchema = schema.LogicalSchema;
 
 /// Every namespace reserves table_id 1 for its catalog (0 is the raw-KV
-/// default bucket; user tables start at zdb's first_table_id, 16).
+/// default table; user tables start at zdb's first_table_id, 16).
 pub const table_id: u32 = 1;
 
 /// The catalog's own columns, by stable column_id. Their ascending order is

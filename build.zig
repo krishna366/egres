@@ -34,7 +34,8 @@ const Modules = struct {
     zdb: *std.Build.Module, // zdb.zig
     pgwire: *std.Build.Module, // pgwire.zig (libpg_query include baked in)
     zfiber: *std.Build.Module, // zfiber/fiber.zig
-    sql: *std.Build.Module, // sql.zig (physical row codec, std-only)
+    engine: *std.Build.Module, // engine/root.zig (zdb+raft fused behind one API)
+    sql: *std.Build.Module, // sql.zig (row codec + catalog/registry + store)
 };
 
 pub fn build(b: *std.Build) void {
@@ -173,9 +174,20 @@ fn makeModules(
     // addLibpgQuerySources.
     pgwire.addIncludePath(b.path("third_party/libpg_query"));
 
-    // The SQL row codec is pure logic (native-endian byte twiddling), so it
-    // needs no imports beyond std — not even pgwire.
+    // The engine: zdb (storage) + raft (consensus) fused behind one API.
+    // Front-ends (egres exe, the sql store) sit on top; it never imports sql.
+    const engine = makeModule(b, target, optimize, "engine/root.zig");
+    engine.addImport("raft", raft);
+    engine.addImport("zdb", zdb);
+    engine.addImport("zfiber", fiber);
+    engine.addImport("metrics", metrics);
+    engine.addImport("flags", flags);
+
+    // sql: the row codec is pure std logic; the DDL parser reuses pgwire's
+    // libpg_query binding (the C archive itself is linked per-executable via
+    // addLibpgQuerySources).
     const sql = makeModule(b, target, optimize, "sql.zig");
+    sql.addImport("pgwire", pgwire);
 
     return .{
         .zio = zio,
@@ -192,6 +204,7 @@ fn makeModules(
         .zdb = zdb,
         .pgwire = pgwire,
         .zfiber = fiber,
+        .engine = engine,
         .sql = sql,
     };
 }
@@ -426,7 +439,7 @@ fn addAllTests(
     const test_imports = .{
         "zbuf",    "zdb",         "raft",      "utils",  "zio",    "vfs",
         "metrics", "buffers_gen", "transport", "serial", "pgwire", "zfiber",
-        "sql",
+        "sql",     "engine",      "flags",
     };
 
     const root_mod = b.createModule(.{
@@ -546,9 +559,6 @@ fn addEgres(
     mods: Modules,
     regen_buffers_step: *std.Build.Step,
 ) void {
-    const engine_mod = makeModule(b, target, optimize, "engine/root.zig");
-    addImports(engine_mod, mods, .{ "raft", "zdb", "zfiber", "metrics", "flags" });
-
     const exe = b.addExecutable(.{
         .name = "egres",
         .root_module = makeModule(b, target, optimize, "egres/main.zig"),
@@ -557,8 +567,7 @@ fn addEgres(
     exe.root_module.omit_frame_pointer = false;
     addVendoredCompressionSources(b, exe); // zdb compression (via engine)
     addLibpgQuerySources(b, exe); // pgwire's libpg_query
-    addImports(exe.root_module, mods, .{ "raft", "zdb", "zfiber", "metrics", "flags", "utils", "pgwire" });
-    exe.root_module.addImport("engine", engine_mod);
+    addImports(exe.root_module, mods, .{ "raft", "zdb", "zfiber", "metrics", "flags", "utils", "pgwire", "engine", "sql" });
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);
 

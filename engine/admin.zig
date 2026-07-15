@@ -741,9 +741,12 @@ pub const AdminServer = struct {
         // Encode as a single-item Mutations batch — the wire format is the
         // same regardless of batch size, so the apply path doesn't need to
         // know whether this write came from a `set` or a `set_batch`.
-        const proposal_bytes = try encodeMutations(self.engine.allocator, req.ns, &.{
-            .{ .key = req.key, .value = req.value },
-        });
+        const proposal_bytes = try Engine.encodeMutations(
+            self.engine.allocator,
+            req.ns,
+            0,
+            &[_]proto.KV{.{ .key = req.key, .value = req.value }},
+        );
         defer self.engine.allocator.free(proposal_bytes);
 
         // TODO: Fire callback at commit time (quorum achieved) instead of after apply.
@@ -798,7 +801,12 @@ pub const AdminServer = struct {
             return;
         }
         self.engine.applyWriteBackpressure(batch.ns);
-        const proposal_bytes = try encodeMutations(self.engine.allocator, batch.ns, batch.kvs);
+        const proposal_bytes = try Engine.encodeMutations(
+            self.engine.allocator,
+            batch.ns,
+            0,
+            batch.kvs,
+        );
         defer self.engine.allocator.free(proposal_bytes);
 
         var ctx = CommitCtx{ .status = .committed };
@@ -1147,7 +1155,14 @@ pub const AdminServer = struct {
             try proto.writeNotLeader(stream, leader);
             return;
         }
-        self.engine.proposeNamespaceCreate(req.ns) catch |err| {
+        var arena = std.heap.ArenaAllocator.init(self.engine.allocator);
+        defer arena.deinit();
+        const mc = self.engine.forest.buildNamespaceCreate(arena.allocator(), req.ns, "") catch |err| {
+            log.err("ns create failed: {s}", .{@errorName(err)});
+            try proto.writeErr(stream, @errorName(err));
+            return;
+        };
+        self.engine.proposeManifestChange(mc) catch |err| {
             log.err("ns create failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;
@@ -1240,26 +1255,4 @@ fn formatEntry(alloc: std.mem.Allocator, w: *std.Io.Writer, stored: raft.StoredE
         .snapshot => try w.print(" detail=Snapshot\n", .{}),
         else => try w.print(" detail=unknown\n", .{}),
     }
-}
-
-/// Encode one or more key-value writes as a single `Mutations` payload for
-/// proposeDataChange. All kvs in a batch share a namespace (keeps tree
-/// routing + apply simple) and land as one Raft log entry (one commit HLC).
-fn encodeMutations(allocator: std.mem.Allocator, namespace: u32, kvs: []const proto.KV) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    var mw = try zdb_bufs.MutationsWriter.initWithBuf(allocator, &buf);
-
-    const offsets = try allocator.alloc(u32, kvs.len);
-    defer allocator.free(offsets);
-    for (kvs, 0..) |kv, i| {
-        var kvw = try zdb_bufs.KeyValueWriter.initWithBuf(allocator, &buf);
-        try kvw.set(.{ .key = kv.key, .value = kv.value });
-        offsets[i] = (try kvw.finish()).offset;
-    }
-    try mw.setNamespace(namespace);
-    try mw.setKvs(offsets);
-    _ = try mw.finishWithTail();
-    return buf.toOwnedSlice(allocator);
 }

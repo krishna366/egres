@@ -5,8 +5,10 @@
 //!         logical catalog view and the compiled byte layout for a version.
 //! row:    marshalRow / unmarshalRow — encode a row, and decode a
 //!         projection of columns in O(1) each.
-//! catalog: table 0 — the on-disk store of every table's logical schema,
-//!         plus its own binary-compiled bootstrap schema.
+//! catalog: table 1 of every namespace — the on-disk store of that
+//!         database's table schemas, plus its own binary-compiled
+//!         bootstrap schema.
+//! ddl:    parseDdl — SQL text → typed DDL statements via libpg_query.
 
 const std = @import("std");
 
@@ -14,6 +16,7 @@ pub const value = @import("sql/value.zig");
 pub const schema = @import("sql/schema.zig");
 pub const row = @import("sql/row.zig");
 pub const catalog = @import("sql/catalog.zig");
+pub const ddl = @import("sql/ddl.zig");
 
 pub const Type = value.Type;
 pub const Value = value.Value;

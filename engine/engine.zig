@@ -106,6 +106,9 @@ pub const StorageImpl = struct {
                 if (entry.index < self.oldest_memtable_index) return;
 
                 const ns = ms.namespace();
+                // Routes the batch to its table; 0 (the wire default)
+                // is the raw-KV table, so legacy admin writes are unchanged.
+                const tid = ms.tableId();
                 const count = ms.kvsLen();
 
                 var items: std.ArrayList(Item) = .empty;
@@ -119,6 +122,7 @@ pub const StorageImpl = struct {
                     items.appendAssumeCapacity(.{
                         .key = .{
                             .namespace = ns,
+                            .table_id = tid,
                             .primary = kv.key(),
                             // Timestamp comes from the raft Entry (one per batch).
                             .timestamp = entry.timestamp,
@@ -172,6 +176,9 @@ pub const StorageImpl = struct {
             },
             4 => try self.forest.applySplit(mcs.*),
             5 => try self.forest.applyNamespaceCreate(mcs.*),
+            6 => try self.forest.applyCreateTree(mcs.*),
+            7 => try self.forest.applyDropTree(mcs.*),
+            8 => try self.forest.applyDropNamespace(mcs.*),
             else => log.err("unknown ManifestChange cmd={d}", .{mcs.cmd}),
         }
     }
@@ -554,7 +561,7 @@ pub const Engine = struct {
         const poll: u64 = 15000;
         const stuck_threshold_ms: i64 = 30_000;
         while (!self.node.isShuttingDown()) {
-            fiber.sleepMs(poll);
+            if (self.node.shutdown.waitTimeout(poll)) return;
             const now_ms = fiber.coarseMs();
             self.in_flight_mu.lock(@src());
             defer self.in_flight_mu.unlock();
@@ -626,9 +633,8 @@ pub const Engine = struct {
 
         while (!self.node.isShuttingDown()) {
             const cfg = self.snapshot_cfg.snapshot();
-            fiber.sleepMs(cfg.poll_interval_seconds * 1000);
+            if (self.node.shutdown.waitTimeout(cfg.poll_interval_seconds * 1000)) return;
             if (!self.node.isLeader()) continue;
-            if (self.node.isShuttingDown()) return;
 
             self.maybeProposeSnapshot() catch |err| {
                 log.warn("maybeProposeSnapshot: {s}", .{@errorName(err)});
@@ -811,12 +817,12 @@ pub const Engine = struct {
             const needs = self.node.isLeader() and
                 (self.forest.memtables.currentId() == 0 or self.forest.shouldFreeze());
             if (!needs) {
-                fiber.sleepMs(interval);
+                if (self.node.shutdown.waitTimeout(interval)) return;
                 continue;
             }
             self.proposeNewMemtable() catch |err| {
                 log.err("proposeNewMemtable failed: {s}", .{@errorName(err)});
-                fiber.sleepMs(interval);
+                if (self.node.shutdown.waitTimeout(interval)) return;
             };
         }
     }
@@ -825,7 +831,7 @@ pub const Engine = struct {
         const interval: u64 = 200;
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader() or !self.forest.hasFrozenMemtables()) {
-                fiber.sleepMs(interval);
+                if (self.node.shutdown.waitTimeout(interval)) return;
                 continue;
             }
             self.proposeFlush() catch |err| {
@@ -849,11 +855,11 @@ pub const Engine = struct {
         const interval: u64 = 500;
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader()) {
-                fiber.sleepMs(interval);
+                if (self.node.shutdown.waitTimeout(interval)) return;
                 continue;
             }
             const target = self.pickAndReserveCompactionTarget() orelse {
-                fiber.sleepMs(interval);
+                if (self.node.shutdown.waitTimeout(interval)) return;
                 continue;
             };
             defer self.releaseCompactingTree(target.key);
@@ -1064,12 +1070,12 @@ pub const Engine = struct {
         }
     }
 
-    /// Create a namespace (and its table-0 tree) by proposing the manifest
-    /// change through Raft and waiting for apply. Replicated to every node.
-    pub fn proposeNamespaceCreate(self: *Engine, ns: u32) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const mc = try self.forest.buildNamespaceCreate(arena.allocator(), ns);
+    /// Replicate a forest manifest change (ns/tree create or drop, …) through
+    /// Raft, blocking until it is applied on this node. Pairs with the forest
+    /// `build*` constructors: the caller builds the change (leader side), this
+    /// makes it real everywhere. Control-plane rule: manifest proposals wait
+    /// for APPLY, not just commit.
+    pub fn proposeManifestChange(self: *Engine, mc: manifest.ManifestChange) !void {
         const payload = try encodeManifestChange(
             self.allocator,
             mc.cmd,
@@ -1079,6 +1085,31 @@ pub const Engine = struct {
         );
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
+    }
+
+    /// Encode key-value writes as one `Mutations` payload for a .data
+    /// proposal. All kvs in a batch share (namespace, table_id) — one
+    /// table, one Raft entry, one commit HLC. `kvs` is any slice whose
+    /// elements carry `.key`/`.value` byte slices (admin proto.KV, sql rows);
+    /// table_id 0 is the raw-KV default table.
+    pub fn encodeMutations(allocator: std.mem.Allocator, namespace: u64, table_id: u32, kvs: anytype) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+
+        var mw = try zdb_bufs.MutationsWriter.initWithBuf(allocator, &buf);
+
+        const offsets = try allocator.alloc(u32, kvs.len);
+        defer allocator.free(offsets);
+        for (kvs, 0..) |kv, i| {
+            var kvw = try zdb_bufs.KeyValueWriter.initWithBuf(allocator, &buf);
+            try kvw.set(.{ .key = kv.key, .value = kv.value });
+            offsets[i] = (try kvw.finish()).offset;
+        }
+        try mw.setNamespace(namespace);
+        try mw.setTableId(table_id);
+        try mw.setKvs(offsets);
+        _ = try mw.finishWithTail();
+        return buf.toOwnedSlice(allocator);
     }
 };
 

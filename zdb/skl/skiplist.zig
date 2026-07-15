@@ -141,9 +141,9 @@ pub const SkipList = struct {
         const result = self.findNode(key, null);
         const node = result.node orelse return null;
         const found = Key.init(node.key);
-        // The memtable is global across namespaces and table buckets, so a
+        // The memtable is global across namespaces and tables, so a
         // findNode landing on the next key ≥ search can be a same-primary key
-        // in a different (namespace, table_id) bucket. Filter all three.
+        // under a different (namespace, table_id). Filter all three.
         if (found.namespace != key.namespace) return null;
         if (found.table_id != key.table_id) return null;
         if (!found.equalPrimary(key)) return null;

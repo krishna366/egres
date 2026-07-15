@@ -32,8 +32,8 @@ const merge_iterator = table_mod.merge_iterator;
 // TableTrees
 // ---------------------------------------------------------------------------
 
-/// TableTrees holds the LSM trees of a single table (one `{namespace, table_id}`
-/// bucket) and maps a key to the tree that owns it. A table is one tree until it
+/// TableTrees holds the LSM trees of a single `{namespace, table_id}` table
+/// and maps a key to the tree that owns it. A table is one tree until it
 /// grows past `tree_split_size`, then splits at the primary-key median into more
 /// trees; entries are kept sorted by range.left so we can binary-search.
 pub const TableTrees = struct {
@@ -401,7 +401,7 @@ pub const Forest = struct {
         // Per-tree builders, keyed by the tree's global identity. Keys within
         // each tree are already in sorted order because the skiplist is
         // globally sorted and each tree covers a contiguous key range within
-        // its (namespace, table_id) bucket.
+        // its (namespace, table_id) table.
         var builders = std.AutoHashMap(TreeKey, *Builder).init(self.allocator);
         defer {
             var bit = builders.valueIterator();
@@ -640,7 +640,7 @@ pub const Forest = struct {
             {
                 self.mu.lockShared(@src());
                 defer self.mu.unlockShared();
-                // A scan stays within a single table_id bucket; current_left
+                // A scan stays within a single table_id table; current_left
                 // carries that table_id (== scan_range.left.table_id throughout).
                 const trees = self.treesFor(ns, current_left.table_id) orelse return emitted;
                 const found: ?*Tree = blk: {
@@ -692,7 +692,7 @@ pub const Forest = struct {
     }
 
     /// installTree opens the in-memory Tree for the given id and adds it to its
-    /// table's TableTrees (bucketed by the high 32 bits of tree_id). Tree.open
+    /// table's TableTrees (keyed by the high 32 bits of tree_id). Tree.open
     /// reads the tree's key range from the manifest, so the caller must have
     /// already committed the TreeChange and must hold the forest write lock.
     fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
@@ -747,9 +747,9 @@ pub const Forest = struct {
         }
     }
 
-    /// Create a new tree for the given namespace, table bucket, and key range.
+    /// Create a new tree for the given namespace, table, and key range.
     /// Single-node path (no Raft) — used by tests. Returns the new tree_id,
-    /// derived from the bucket's next free split index.
+    /// derived from the table's next free split index.
     pub fn createTree(self: *Forest, namespace_id: u64, table_id: u32, range: KeyRange) !u64 {
         self.mu.lock(@src());
         defer self.mu.unlock();
@@ -768,24 +768,28 @@ pub const Forest = struct {
 
     /// buildNamespaceCreate is Phase A of the Raft-replicated namespace create:
     /// returns a ManifestChange with one TreeChange for the namespace's default
-    /// (raw-KV) bucket — table_id 0, split 0, so tree_id 0 — carrying an
-    /// infinite range (empty left+right). No state mutates, so a failed propose
-    /// costs nothing. Caller owns the returned slice.
+    /// (raw-KV) table — table_id 0, split 0, so tree_id 0 — carrying an
+    /// infinite range (empty left+right) and the namespace's `name` (a SQL
+    /// database name; empty for unnamed namespaces). No state mutates,
+    /// so a failed propose costs nothing. Caller owns the returned slice;
+    /// `name` must outlive the change (it is marshalled at propose).
     ///
-    /// Errors with `NamespaceAlreadyExists` if `namespace_id`'s default bucket
-    /// already exists.
-    pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64) !manifest.ManifestChange {
+    /// Errors with `NamespaceAlreadyExists` if `namespace_id`'s default table
+    /// already exists, `NameExists` if another namespace holds `name`.
+    pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, name: []const u8) !manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
         {
             self.mu.lockShared(@src());
             defer self.mu.unlockShared();
             if (self.tables.contains(.{ .namespace = namespace_id, .table_id = 0 })) return error.NamespaceAlreadyExists;
         }
-        // table_id 0: the namespace's default (raw-KV) bucket → tree_id 0.
+        if (self.ms.lookupNamespace(name)) |_| return error.NameExists;
+        // table_id 0: the namespace's default (raw-KV) table → tree_id 0.
         const tree_id = makeTreeId(0, 0);
 
         const tree_changes = try alloc.alloc(manifest.TreeChange, 1);
         tree_changes[0] = manifest.createTreeChange(tree_id, namespace_id, "", "");
+        tree_changes[0].name = @constCast(name);
 
         return .{
             .tree_changes = tree_changes,
@@ -795,33 +799,40 @@ pub const Forest = struct {
         };
     }
 
-    /// Result of buildCreateNamespace: the allocated namespace id (to map to a
-    /// database name in the catalog) plus the ns_create ManifestChange.
+    /// Result of buildCreateNamespace: the allocated namespace id plus the
+    /// ns_create ManifestChange carrying the database name.
     pub const CreateNamespaceResult = struct {
         namespace: u64,
         change: manifest.ManifestChange,
     };
 
-    /// buildCreateNamespace is the allocating namespace create: reserve the next
-    /// namespace id and build its ns_create change (default bucket). The leader
-    /// records `namespace` (e.g. in a catalog database row) and proposes
-    /// `change`; applyNamespaceCreate advances the same counter on every node,
-    /// so a re-elected leader never re-issues a namespace. Caller owns
-    /// `change.tree_changes`.
-    pub fn buildCreateNamespace(self: *Forest, alloc: std.mem.Allocator) !CreateNamespaceResult {
+    /// buildCreateNamespace is the allocating namespace create (SQL: CREATE
+    /// DATABASE `name`): reserve the next namespace id and build its ns_create
+    /// change. applyNamespaceCreate advances the same counter and records the
+    /// name on every node, so a re-elected leader never re-issues a namespace
+    /// and name → namespace resolution is manifest state everywhere. Caller
+    /// owns `change.tree_changes`.
+    pub fn buildCreateNamespace(self: *Forest, alloc: std.mem.Allocator, name: []const u8) !CreateNamespaceResult {
         const namespace = self.ms.nextNamespace();
         return .{
             .namespace = namespace,
-            .change = try self.buildNamespaceCreate(alloc, namespace),
+            .change = try self.buildNamespaceCreate(alloc, namespace, name),
         };
     }
 
+    /// Resolve a database name to its namespace id (manifest state, current
+    /// on every node via the apply path).
+    pub fn lookupNamespace(self: *Forest, name: []const u8) ?u64 {
+        return self.ms.lookupNamespace(name);
+    }
+
     /// applyNamespaceCreate is Phase B: commits each TreeChange to the manifest,
-    /// installs the in-memory Tree + namespace route, and advances the global
-    /// namespace counter (idempotent — keeps a re-elected leader current).
-    /// Called on all nodes after Raft commit (cmd=5).
+    /// installs the in-memory Tree + namespace route, records the namespace's
+    /// name, and advances the global namespace counter (idempotent — keeps a
+    /// re-elected leader current). Called on all nodes after Raft commit
+    /// (cmd=5).
     ///
-    /// Skips any TreeChange whose namespace already has its default bucket.
+    /// Skips any TreeChange whose namespace already has its default table.
     pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
@@ -829,21 +840,22 @@ pub const Forest = struct {
         for (mc.tree_changes) |tc| {
             if (tc.op != .create) continue; // only CREATE for ns_create
             self.ms.advanceNamespace(tc.namespace_id);
+            try self.ms.registerNamespaceName(tc.namespace_id, tc.name);
             if (self.tables.contains(.{ .namespace = tc.namespace_id, .table_id = 0 })) {
                 std.log.warn("applyNamespaceCreate: ns={d} already exists, skipping tree_id={d}", .{ tc.namespace_id, tc.tree_id });
                 continue;
             }
             try self.ms.commit(&.{}, &.{tc});
             // Empty left/right encodes the infinite range; ns_create trees land
-            // in the namespace's default bucket (table_id 0, derived from tree_id).
+            // in the namespace's default table (table_id 0, derived from tree_id).
             try self.installTree(tc.namespace_id, tc.tree_id);
         }
     }
 
     /// buildCreateTree is Phase A of a per-table tree create: derive the tree_id
-    /// for a NEW table bucket (Key.table_id) in an existing namespace — a fresh
-    /// bucket starts at split 0, so tree_id = (table_id << 32). The tree is
-    /// infinite-range *within* its bucket — routing isolates by
+    /// for a NEW table (Key.table_id) in an existing namespace — a fresh
+    /// table starts at split 0, so tree_id = (table_id << 32). The tree is
+    /// infinite-range *within* its table — routing isolates by
     /// (namespace, table_id), so no key-range bound is needed. No state mutates,
     /// so a failed propose costs nothing. cmd=6. Caller owns the returned slice.
     pub fn buildCreateTree(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_id: u32) !manifest.ManifestChange {
@@ -884,8 +896,8 @@ pub const Forest = struct {
     }
 
     /// applyCreateTree is Phase B: commit each TreeChange and install an empty
-    /// infinite-range tree in its (namespace, table_id) bucket, registering the
-    /// namespace/bucket if absent. Also advances the namespace's table_id
+    /// infinite-range tree in its (namespace, table_id) table, registering the
+    /// namespace/table if absent. Also advances the namespace's table_id
     /// counter past the created table (idempotent; this is what keeps a
     /// re-elected leader's allocator current). Idempotent on (namespace,
     /// tree_id). Called on all nodes after Raft commit (cmd=6).
@@ -903,10 +915,10 @@ pub const Forest = struct {
     }
 
     /// buildDropTable is Phase A of DROP TABLE: emit a delete change for every
-    /// tree in the (namespace, table_id) bucket — a table can span >1 tree after
+    /// tree of the table — a table can span >1 tree after
     /// splits. The table_id counter is NOT rewound (ids are never reused, since
     /// a dropped SST may still be clone-shared). cmd=7. Returns an empty change
-    /// set if the bucket has no trees. Caller owns the returned slice.
+    /// set if the table has no trees. Caller owns the returned slice.
     pub fn buildDropTable(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_id: u32) !manifest.ManifestChange {
         var ids: std.ArrayList(u64) = .empty;
         defer ids.deinit(alloc);
@@ -931,7 +943,7 @@ pub const Forest = struct {
     }
 
     /// applyDropTree is Phase B of DROP: for each delete change, remove the route
-    /// entry (dropping the bucket once empty), tear down the in-memory tree
+    /// entry (dropping the table once empty), tear down the in-memory tree
     /// (Tree.close releases its level refs on its SSTs — SSTs shared with another
     /// tree survive via refcount), and remove the tree from the manifest.
     /// Idempotent. cmd=7.
@@ -943,21 +955,26 @@ pub const Forest = struct {
     pub fn applyDropTree(self: *Forest, mc: manifest.ManifestChange) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
+        try self.applyTreeDeletesLocked(mc);
+    }
 
+    /// The delete-changes walk shared by applyDropTree and applyDropNamespace.
+    /// Caller holds `self.mu` exclusively.
+    fn applyTreeDeletesLocked(self: *Forest, mc: manifest.ManifestChange) !void {
         for (mc.tree_changes) |tc| {
             if (tc.op != .delete) continue;
 
-            // Remove the tree from its table bucket (derived from the tree_id's
+            // Remove the tree from its table (derived from the tree_id's
             // high 32 bits) and tear it down (releases its level refs on its
-            // SSTs). Drop the bucket once it has no trees left.
-            const bucket = TableKey{ .namespace = tc.namespace_id, .table_id = treeTableId(tc.tree_id) };
-            if (self.tables.get(bucket)) |trees| {
+            // SSTs). Drop the table once it has no trees left.
+            const table = TableKey{ .namespace = tc.namespace_id, .table_id = treeTableId(tc.tree_id) };
+            if (self.tables.get(table)) |trees| {
                 if (trees.removeTree(tc.tree_id)) |tree| {
                     tree.close();
                     self.allocator.destroy(tree);
                 }
                 if (trees.entries.items.len == 0) {
-                    _ = self.tables.remove(bucket);
+                    _ = self.tables.remove(table);
                     trees.deinit();
                     self.allocator.destroy(trees);
                 }
@@ -968,6 +985,49 @@ pub const Forest = struct {
         }
     }
 
+    /// buildDropNamespace is Phase A of DROP DATABASE: emit a delete change for
+    /// every tree in every table of the namespace — the default table, system
+    /// tables (catalog etc.), and user tables alike. cmd=8. Namespace ids are
+    /// never reused, so no counter rewind is needed; applyDropNamespace forgets
+    /// the counter entirely. Returns an empty change set for an unknown
+    /// namespace (idempotent). Caller owns the returned slice.
+    pub fn buildDropNamespace(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64) !manifest.ManifestChange {
+        var changes: std.ArrayList(manifest.TreeChange) = .empty;
+        defer changes.deinit(alloc);
+        {
+            self.mu.lockShared(@src());
+            defer self.mu.unlockShared();
+            var it = self.tables.iterator();
+            while (it.next()) |kv| {
+                if (kv.key_ptr.namespace != namespace_id) continue;
+                for (kv.value_ptr.*.entries.items) |e| {
+                    try changes.append(alloc, manifest.deleteTreeChange(e.tree_id, namespace_id));
+                }
+            }
+        }
+        return .{
+            .tree_changes = try changes.toOwnedSlice(alloc),
+            .sstable_changes = &.{},
+            .cmd = 8, // drop_ns
+            .memtable_id = 0,
+        };
+    }
+
+    /// applyDropNamespace is Phase B of DROP DATABASE: tear down every tree of
+    /// the namespace (same per-tree semantics as applyDropTree — SSTs shared via
+    /// refcount survive; physical reclaim is snapshot GC's job), then forget the
+    /// namespace's manifest state (table_id counter + name, freeing the name
+    /// for re-CREATE). Leftover memtable entries for the namespace are dropped
+    /// at flush (buildFlush skips items with no route). Idempotent. cmd=8.
+    pub fn applyDropNamespace(self: *Forest, mc: manifest.ManifestChange) !void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        try self.applyTreeDeletesLocked(mc);
+        if (mc.tree_changes.len > 0) {
+            self.ms.dropNamespace(mc.tree_changes[0].namespace_id);
+        }
+    }
+
     /// Get a tree by its global identity (namespace + namespace-local tree_id).
     pub fn getTree(self: *Forest, namespace_id: u64, tree_id: u64) ?*Tree {
         self.mu.lockShared(@src());
@@ -975,15 +1035,15 @@ pub const Forest = struct {
         return self.treeById(namespace_id, tree_id);
     }
 
-    /// True iff a tree bucket exists for (namespace, table_id). Used by catalog
+    /// True iff a table exists for (namespace, table_id). Used by catalog
     /// bootstrap to make create_tree idempotent across restarts.
-    pub fn hasBucket(self: *Forest, namespace_id: u64, table_id: u32) bool {
+    pub fn hasTable(self: *Forest, namespace_id: u64, table_id: u32) bool {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.treesFor(namespace_id, table_id) != null;
     }
 
-    /// True iff the namespace has been created (its default bucket exists).
+    /// True iff the namespace has been created (its default table exists).
     /// Used by the leader to reject mutations destined for unknown
     /// namespaces — those would otherwise pile up in immutable memtables
     /// since `buildFlush` silently drops items whose namespace has no
@@ -991,7 +1051,7 @@ pub const Forest = struct {
     pub fn hasNamespace(self: *Forest, namespace_id: u64) bool {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        // A namespace exists iff its default bucket (table_id 0) is present —
+        // A namespace exists iff its default table (table_id 0) is present —
         // ns_create always installs it.
         return self.tables.contains(.{ .namespace = namespace_id, .table_id = 0 });
     }
@@ -1397,7 +1457,7 @@ pub const Forest = struct {
     /// a ManifestChange with the table and tree changes. All allocations go on
     /// the provided allocator (typically an arena). The caller proposes the
     /// ManifestChange through Raft. The new half stays in the parent's table
-    /// bucket, so its tree_id is the bucket's next free split index.
+    /// table, so its tree_id is the table's next free split index.
     pub fn buildSplit(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, tree_id: u64) !?manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
         const left_tree = self.treeById(namespace_id, tree_id) orelse return null;
@@ -1462,7 +1522,7 @@ pub const Forest = struct {
     /// applySplit is Phase B: commits the manifest changes, opens the new tree,
     /// updates the old tree's key range, removes migrated tables, and updates
     /// namespace routing. Called on all nodes after Raft commit. The new tree_id
-    /// is derived deterministically (bucket's next split index), so there is no
+    /// is derived deterministically (table's next split index), so there is no
     /// counter for a new leader to re-issue.
     pub fn applySplit(self: *Forest, mc: manifest.ManifestChange) !void {
         // Commit MANIFEST so we can recover from a crash.
@@ -1505,10 +1565,10 @@ pub const Forest = struct {
             }
         }
 
-        // Add the new tree to its table bucket — same bucket as the parent (a
+        // Add the new tree to its table — same table as the parent (a
         // split shares the high 32 bits of the tree_id). Its key range was set
         // by Tree.open from the post-commit manifest, and addTree re-sorts the
-        // bucket. The old tree's range was narrowed in place above; its left
+        // table. The old tree's range was narrowed in place above; its left
         // edge is unchanged, so the sort order holds and needs no fixup.
         const new_ptr = try self.allocator.create(Tree);
         errdefer self.allocator.destroy(new_ptr);
@@ -1526,13 +1586,13 @@ pub const Forest = struct {
     }
 
     /// Route to a table's trees by its `{namespace, table_id}` identity. Returns
-    /// null if no bucket exists for that table. Caller holds the forest lock.
+    /// null if no table exists for that table. Caller holds the forest lock.
     fn treesFor(self: *Forest, namespace_id: u64, table_id: u32) ?*TableTrees {
         return self.tables.get(.{ .namespace = namespace_id, .table_id = table_id });
     }
 
     /// Look up a tree by its `(namespace, tree_id)` without a routing key: find
-    /// the table bucket (high 32 bits of tree_id) and scan its trees. The scan
+    /// the table (high 32 bits of tree_id) and scan its trees. The scan
     /// is over one table's trees (one until it splits), so effectively O(1).
     /// Caller holds the forest lock.
     fn treeById(self: *Forest, namespace_id: u64, tree_id: u64) ?*Tree {
@@ -1543,14 +1603,14 @@ pub const Forest = struct {
         return null;
     }
 
-    /// Derive the next free tree_id for a (namespace, table_id) bucket:
+    /// Derive the next free tree_id for a (namespace, table_id) table:
     /// (table_id << 32) | (max_existing_split_id + 1), or split 0 when the
-    /// bucket has no trees yet. Replaces the old global next_tree_id counter —
-    /// the id is a pure function of the bucket's current trees, so every node
+    /// table has no trees yet. Replaces the old global next_tree_id counter —
+    /// the id is a pure function of the table's current trees, so every node
     /// derives the same value and there is nothing to recover on leader change.
     /// Caller holds at least the shared forest lock.
     fn nextTreeId(self: *Forest, namespace_id: u64, table_id: u32) u64 {
-        var max_tree_id: u64 = makeTreeId(table_id, 0); // bucket's first tree_id
+        var max_tree_id: u64 = makeTreeId(table_id, 0); // table's first tree_id
         if (self.treesFor(namespace_id, table_id)) |trees| {
             for (trees.entries.items) |e| {
                 max_tree_id = @max(max_tree_id, e.tree_id + 1);

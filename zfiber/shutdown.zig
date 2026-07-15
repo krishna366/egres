@@ -1,10 +1,16 @@
-//! Shutdown — a one-shot "shutdown has begun" signal that is both pollable
-//! and blockable, with optional SIGINT/SIGTERM wiring.
+//! Shutdown — a one-shot "shutdown has begun" signal that is pollable,
+//! blockable, and timed-blockable, with optional SIGINT/SIGTERM wiring.
 //!
 //! One instance lives at process scope (the raft Node owns it): fatal paths
-//! call `start()`, hot loops poll `hasStarted()`, and fibers that must sleep
-//! until shutdown and then act (listener watchers breaking a parked
-//! accept()) block in `wait()`.
+//! call `start()`, hot loops poll `hasStarted()`, fibers that must sleep
+//! until shutdown and then act block in `wait()`, and periodic background
+//! loops replace `sleepMs(interval)` with `waitTimeout(interval)` so they
+//! keep their cadence but react to shutdown instantly.
+//!
+//! Built on a `Watermark` that nothing ever advances: waiters park on target
+//! 1, which is never reached, so a wait ends only via `close()` (= start) or
+//! its own timeout — and the Watermark's timeout/claim machinery is the
+//! battle-tested path for exactly that race.
 //!
 //! Signal path: a POSIX handler may only use async-signal-safe operations —
 //! no spinlocks, no rt.wake (pushes onto growable spinlocked worker rings),
@@ -15,24 +21,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const rt = @import("runtime.zig");
-const channel = @import("channel.zig");
+const watermark = @import("watermark.zig");
 const sleepMs = @import("deadlines.zig").sleepMs;
 
-/// How often the watcher checks the handler's flag. Bounds both Ctrl-C
-/// latency and how long `deinit`'s join can take.
+/// How often the signal watcher checks the handler's flag. Bounds both
+/// Ctrl-C latency and how long `deinit`'s join can take.
 const poll_ms: u64 = 300;
 
 pub const Shutdown = struct {
     started: std.atomic.Value(bool) = .init(false),
-    /// Nothing is ever sent — `wait` parks on receive; `start`'s close wakes
-    /// every waiter at once.
-    ch: channel.Channel(void),
+    wm: watermark.Watermark,
     watcher: ?rt.JoinHandle(void) = null,
 
-    pub fn init(allocator: std.mem.Allocator) !Shutdown {
-        // Capacity 1 (Channel.init asserts > 0); the channel is only ever
-        // closed, never sent to — and `void` items are zero bytes anyway.
-        return .{ .ch = try channel.Channel(void).initAlloc(allocator, 1) };
+    pub fn init(allocator: std.mem.Allocator) Shutdown {
+        return .{ .wm = watermark.Watermark.init(allocator) };
     }
 
     /// Start first (idempotent) so the watcher's next poll sees it and
@@ -40,13 +42,13 @@ pub const Shutdown = struct {
     pub fn deinit(self: *Shutdown) void {
         self.start();
         if (self.watcher) |*h| h.join();
-        self.ch.deinit();
+        self.wm.deinit();
     }
 
-    /// Begin shutdown: flip `hasStarted` and wake every `wait`er. Idempotent.
+    /// Begin shutdown: flip `hasStarted` and wake every waiter. Idempotent.
     pub fn start(self: *Shutdown) void {
         self.started.store(true, .release);
-        self.ch.close(.immediate);
+        self.wm.close();
     }
 
     pub fn hasStarted(self: *const Shutdown) bool {
@@ -56,7 +58,28 @@ pub const Shutdown = struct {
     /// Block until `start` runs; returns immediately if it already has. The
     /// blocking complement of polling `hasStarted`.
     pub fn wait(self: *Shutdown) void {
-        self.ch.receive() catch {}; // ChannelClosed == start() ran
+        while (!self.hasStarted()) {
+            self.wm.waitForUntimed(1) catch |err| switch (err) {
+                error.Closed => return,
+                error.OutOfMemory => sleepMs(poll_ms), // degrade to polling
+            };
+        }
+    }
+
+    /// Block until shutdown starts or `timeout_ms` elapses: true = shutdown
+    /// has started (before or during the wait), false = timed out. The
+    /// shutdown-aware replacement for `sleepMs` in periodic loops:
+    ///     if (node.shutdown.waitTimeout(interval_ms)) return;
+    pub fn waitTimeout(self: *Shutdown, timeout_ms: u64) bool {
+        if (self.hasStarted()) return true;
+        self.wm.waitFor(1, timeout_ms) catch |err| switch (err) {
+            error.Closed => return true,
+            error.Timeout => return false,
+            error.OutOfMemory => sleepMs(@min(timeout_ms, poll_ms)), // degrade
+        };
+        // Target 1 is never reached (nothing advances the watermark), so a
+        // successful wait can't happen; only the OOM fallback lands here.
+        return self.hasStarted();
     }
 
     /// Install SIGINT/SIGTERM handlers that trigger `start()`. Call once,

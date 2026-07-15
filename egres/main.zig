@@ -4,6 +4,7 @@ const zdb = @import("zdb");
 const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
 const engine = @import("engine");
+const sql = @import("sql");
 const flags = @import("flags");
 const utils = @import("utils");
 
@@ -87,6 +88,54 @@ fn usage(alloc: std.mem.Allocator) void {
 }
 
 const log = std.log.scoped(.egres);
+
+/// The default database, present from a node's very first boot — created by
+/// the WAL's genesis entry (see seedGenesis), never at runtime.
+const default_database = "egres";
+
+/// Seed a fresh WAL with the deterministic genesis prefix: entry 1 creates
+/// the default database at the first user namespace id ('egres' is ns 16 on
+/// every cluster). Every node writes the same bytes — fixed ids, term 0,
+/// fixed timestamp — so raft's log matching holds across fresh nodes, and
+/// the entry is committed by construction (HardState.commit_index covers
+/// it): engine recovery applies it before any election or client traffic.
+/// A restarted or joining node with a non-empty WAL skips this.
+fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
+    if (wal.lastIndex() != 0) return;
+
+    var tc = [_]zdb.manifest.TreeChange{
+        zdb.manifest.createTreeChange(0, zdb.manifest.first_namespace, "", ""),
+    };
+    tc[0].name = @constCast(default_database);
+    const payload = try zdb.buffers.marshalRoot(allocator, zdb.manifest.ManifestChange{
+        .cmd = 5, // ns_create
+        .tree_changes = &tc,
+        .sstable_changes = &.{},
+        .memtable_id = 0,
+    });
+    defer allocator.free(payload);
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var writer = try raft.buffers.LogEntryWriter.initWithBuf(allocator, &buf);
+    defer writer.deinit();
+    try writer.set(.{
+        .index = 1,
+        .term = 0,
+        .timestamp = 1, // fixed; real HLC values are far larger
+        .data = payload,
+        .entry_type = .manifest,
+    });
+    _ = try writer.finishWithTail();
+    const data = try buf.toOwnedSlice(allocator);
+    var entry = try raft.buffers.LogEntryBuffer.initWithTail(allocator, data, .owned);
+    defer entry.deinit();
+
+    try wal.append(&.{entry});
+    try wal.sync();
+    try wal.setHardState(.{ .commit_index = 1 });
+    log.info("seeded genesis: database '{s}' -> ns={d}", .{ default_database, zdb.manifest.first_namespace });
+}
 
 fn deinitWithLog(comptime msg: []const u8, ptr: anytype) void {
     ptr.deinit();
@@ -225,6 +274,9 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     log.info("opening raft WAL at {s}", .{wal_dir});
     var wal = try raft.DiskWAL.openPath(wal_dir, allocator, 1024);
     defer deinitWithLog("wal", &wal);
+    // Genesis before the node reads the log: a fresh WAL gets its
+    // deterministic bootstrap prefix (default database), pre-committed.
+    try seedGenesis(allocator, &wal);
 
     const node = try raft.Node.init(
         allocator,
@@ -262,7 +314,9 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     var admin_srv = try engine.AdminServer.init(eng, args.client_addr);
     defer deinitWithLog("admin_srv", &admin_srv);
 
-    // The SQL front-end (pgwire protocol) over the same engine.
+    // The SQL front-end (pgwire protocol) over the same engine. Database
+    // names live in the zdb manifest, so there is no separate SQL store —
+    // DDL resolves names via the forest and proposes manifest changes.
     var sql_srv = try SqlServer.init(eng, sql_addr);
 
     log.info("all components initialized", .{});
@@ -322,16 +376,24 @@ fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *SqlSer
     eng.wait();
 }
 
-/// SQL front-end (pgwire protocol) over the engine. Skeleton: the handshake and
-/// simple-query loop work; each query echoes its text back as one row until
-/// the executor + catalog land. Mirrors AdminServer's accept loop, and shuts
-/// down with the engine via `node.isShuttingDown()`.
+/// SQL front-end (pgwire protocol) over the engine. The handshake and
+/// simple-query loop work; CREATE/DROP DATABASE execute against the manifest
+/// (names resolve via the forest, changes replicate via raft). Mirrors
+/// AdminServer's accept loop, and shuts down with the engine via
+/// `node.isShuttingDown()`.
 const SqlServer = struct {
     engine: *engine.Engine,
     listen_addr: fiber.net.IpAddress,
+    /// Serializes DDL: the leader-side name-uniqueness check in
+    /// buildCreateNamespace is only sound if one DDL runs at a time.
+    ddl_mu: fiber.Mutex(.tracked) = .{},
 
     fn init(eng: *engine.Engine, addr: []const u8) !SqlServer {
         return .{ .engine = eng, .listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr) };
+    }
+
+    fn deinit(self: *SqlServer) void {
+        self.ddl_mu.deinit();
     }
 
     fn runListener(self: *SqlServer) void {
@@ -368,34 +430,93 @@ fn handleSqlConn(self: *SqlServer, stream: fiber.net.Stream) void {
     var s = stream;
     defer s.close();
 
-    var handler = SqlHandler{ .engine = self.engine, .alloc = self.engine.allocator };
+    var handler = SqlHandler{ .srv = self };
     pgwire.serve(self.engine.allocator, &s, &handler, .{}) catch |err| {
         log.warn("sql conn serve error: {s}", .{@errorName(err)});
     };
 }
 
-/// Minimal pgwire handler. Only `onQuery` is required by `pgwire.serve`
-/// (onExecute/onDescribe are @hasDecl-gated). The stub round-trips the wire so
-/// `psql` connects and queries return a row; real execution comes later.
+/// pgwire handler. Only `onQuery` is required by `pgwire.serve`
+/// (onExecute/onDescribe are @hasDecl-gated). Parses via libpg_query and
+/// dispatches the DDL this slice supports; everything else is a clean error.
 const SqlHandler = struct {
-    engine: *engine.Engine,
-    alloc: std.mem.Allocator,
+    srv: *SqlServer,
 
-    pub fn onQuery(self: *SqlHandler, state: *pgwire.ConnState, sql: []const u8) !void {
-        _ = self;
-        const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+    pub fn onQuery(self: *SqlHandler, state: *pgwire.ConnState, sql_text: []const u8) !void {
+        const alloc = self.srv.engine.allocator;
+        const trimmed = std.mem.trim(u8, sql_text, " \t\r\n;");
         if (trimmed.len == 0) {
             try state.sendEmptyQueryResponse();
             return;
         }
-        const fields = [_]pgwire.FieldDescription{
-            .{ .name = "egres", .type_oid = pgwire.oid.text },
+        var stmt = sql.ddl.parseDdl(alloc, sql_text) catch {
+            try state.sendError(.{
+                .code = pgwire.sqlstate_syntax_error,
+                .message = "syntax error",
+            });
+            return;
         };
-        try state.sendRowDescription(&fields);
-        try state.sendDataRow(&[_]pgwire.DataValue{.{ .text = sql }});
-        try state.sendCommandComplete("SELECT 1");
+        defer stmt.deinit(alloc);
+        switch (stmt) {
+            .create_database => |name| try self.createDatabase(state, name),
+            .drop_database => |name| try self.dropDatabase(state, name),
+            .unsupported => try replyError(state, "only CREATE DATABASE and DROP DATABASE are supported yet"),
+        }
+    }
+
+    fn createDatabase(self: *SqlHandler, state: *pgwire.ConnState, name: []const u8) !void {
+        const eng = self.srv.engine;
+        self.srv.ddl_mu.lock(@src());
+        defer self.srv.ddl_mu.unlock();
+
+        var arena = std.heap.ArenaAllocator.init(eng.allocator);
+        defer arena.deinit();
+        const created = eng.forest.buildCreateNamespace(arena.allocator(), name) catch |err| switch (err) {
+            error.NameExists => return replyError(state, "database already exists"),
+            else => |e| {
+                log.err("create database '{s}': {s}", .{ name, @errorName(e) });
+                return replyError(state, "create database failed");
+            },
+        };
+        eng.proposeManifestChange(created.change) catch |err| {
+            log.err("create database '{s}': propose: {s}", .{ name, @errorName(err) });
+            return replyError(state, "create database proposal failed");
+        };
+        log.info("created database '{s}' -> ns={d}", .{ name, created.namespace });
+        try state.sendCommandComplete("CREATE DATABASE");
+    }
+
+    fn dropDatabase(self: *SqlHandler, state: *pgwire.ConnState, name: []const u8) !void {
+        const eng = self.srv.engine;
+        self.srv.ddl_mu.lock(@src());
+        defer self.srv.ddl_mu.unlock();
+
+        if (std.mem.eql(u8, name, default_database))
+            return replyError(state, "cannot drop the default database");
+        const ns = eng.forest.lookupNamespace(name) orelse
+            return replyError(state, "database does not exist");
+
+        var arena = std.heap.ArenaAllocator.init(eng.allocator);
+        defer arena.deinit();
+        const mc = eng.forest.buildDropNamespace(arena.allocator(), ns) catch |err| {
+            log.err("drop database '{s}': {s}", .{ name, @errorName(err) });
+            return replyError(state, "drop database failed");
+        };
+        eng.proposeManifestChange(mc) catch |err| {
+            log.err("drop database '{s}': propose: {s}", .{ name, @errorName(err) });
+            return replyError(state, "drop database proposal failed");
+        };
+        log.info("dropped database '{s}' (ns={d})", .{ name, ns });
+        try state.sendCommandComplete("DROP DATABASE");
     }
 };
+
+fn replyError(state: *pgwire.ConnState, msg: []const u8) !void {
+    try state.sendError(.{
+        .code = pgwire.sqlstate_internal_error,
+        .message = msg,
+    });
+}
 
 fn runJoin(args: *const Args, allocator: std.mem.Allocator) void {
     raft.joinCluster(

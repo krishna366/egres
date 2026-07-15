@@ -1,6 +1,6 @@
 const std = @import("std");
 const fiber = @import("zfiber");
-const flags = @import("flags.zig");
+const flags = @import("flags");
 
 const RaftCfg = struct {
     name: []const u8 = "default",
