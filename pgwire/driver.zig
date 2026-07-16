@@ -22,6 +22,11 @@
 //!    RowDescription (0..1) → DataRow (0..N) → CommandComplete (or
 //!    sendError on failure). Driver emits the trailing RFQ.
 //!
+//!  - `fn onStartup(self, state: *ConnState, params: StartupParams) !void`
+//!    Optional. Fires once after the startup handshake with the
+//!    client's session parameters (database, user, …). The param
+//!    slices borrow the read buffer — dupe anything you keep.
+//!
 //!  - `fn onExecute(self, state: *ConnState, ctx: ExecuteCtx) !void`
 //!    Optional. Required if any client uses the extended-query
 //!    protocol (most non-libpq drivers). Handler emits the row
@@ -104,10 +109,11 @@ fn handleEvent(state: *conn_state.ConnState, handler: anytype) !void {
     const H = @TypeOf(handler.*);
     const ev = try state.nextEvent();
     switch (ev) {
-        .startup_complete => {
+        .startup_complete => |params| {
             // State machine has already enqueued the AuthOk +
-            // ParameterStatus + ReadyForQuery batch. Nothing more
-            // for us to do — outer loop flushes.
+            // ParameterStatus + ReadyForQuery batch — nothing to emit.
+            // Hand the session params to the handler if it wants them.
+            if (@hasDecl(H, "onStartup")) try handler.onStartup(state, params);
         },
         .query => |sql| {
             try handler.onQuery(state, sql);

@@ -357,34 +357,40 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const f = try Forest.open(alloc, .{ .dir = dir_path });
     defer f.close();
 
-    // Namespace 7 with three tables: the default (installed by ns_create),
-    // a system tree at a reserved table_id, and an allocated user table.
+    // Namespace 7 with four tables: the default + catalog (installed by
+    // ns_create), a system tree at a reserved table_id, and an allocated,
+    // named user table.
     const nc = try f.buildNamespaceCreate(alloc, 7, "seven");
     defer alloc.free(nc.tree_changes);
     try f.applyNamespaceCreate(nc);
     try std.testing.expect(f.hasNamespace(7));
+    try std.testing.expect(f.hasTable(7, manifest.catalog_table_id));
     try std.testing.expectEqual(@as(?u64, 7), f.lookupNamespace("seven"));
 
     const sys = try f.buildCreateTree(alloc, 7, 2);
     defer alloc.free(sys.tree_changes);
     try f.applyCreateTree(sys);
 
-    const ct = try f.buildCreateTable(alloc, 7);
+    const ct = try f.buildCreateTable(alloc, 7, "users");
     defer alloc.free(ct.change.tree_changes);
     try f.applyCreateTree(ct.change);
     try std.testing.expectEqual(manifest.first_table_id, ct.table_id);
+    try std.testing.expectEqual(@as(?u32, ct.table_id), f.lookupTable(7, "users"));
 
-    // Drop the namespace: one delete per tree across all three tables.
+    // Drop the namespace: one delete per tree across all four tables.
     const dc = try f.buildDropNamespace(alloc, 7);
     defer alloc.free(dc.tree_changes);
-    try std.testing.expectEqual(@as(usize, 3), dc.tree_changes.len);
+    try std.testing.expectEqual(@as(usize, 4), dc.tree_changes.len);
     try std.testing.expectEqual(@as(u32, 8), dc.cmd);
     try f.applyDropNamespace(dc);
 
     try std.testing.expect(!f.hasNamespace(7));
     try std.testing.expect(!f.hasTable(7, 2));
-    // The name died with the namespace and is free for a re-CREATE.
+    try std.testing.expect(!f.hasTable(7, manifest.catalog_table_id));
+    // Names — database and table — died with the namespace and are free
+    // for a re-CREATE.
     try std.testing.expect(f.lookupNamespace("seven") == null);
+    try std.testing.expect(f.lookupTable(7, "users") == null);
     try std.testing.expect(f.tables.get(.{ .namespace = 7, .table_id = ct.table_id }) == null);
 
     // Idempotent: a rebuild on the dropped namespace is empty and re-applies
@@ -401,7 +407,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const nc2 = try f.buildNamespaceCreate(alloc, 7, "seven");
     defer alloc.free(nc2.tree_changes);
     try f.applyNamespaceCreate(nc2);
-    const ct2 = try f.buildCreateTable(alloc, 7);
+    const ct2 = try f.buildCreateTable(alloc, 7, "users");
     defer alloc.free(ct2.change.tree_changes);
     try std.testing.expectEqual(manifest.first_table_id, ct2.table_id);
     try std.testing.expectEqual(@as(?u64, 7), f.lookupNamespace("seven"));
@@ -469,13 +475,14 @@ test "forest: buildCreateTable allocates and never reuses a dropped id" {
     const first = manifest.first_table_id;
 
     // First user table in namespace 2 gets first_table_id; second gets +1.
-    const r1 = try f.buildCreateTable(alloc, 2);
+    // (Unnamed — id allocation is what's under test here.)
+    const r1 = try f.buildCreateTable(alloc, 2, "");
     defer alloc.free(r1.change.tree_changes);
     try std.testing.expectEqual(first, r1.table_id);
     try f.applyCreateTree(r1.change);
     try std.testing.expect(f.hasTable(2, first));
 
-    const r2 = try f.buildCreateTable(alloc, 2);
+    const r2 = try f.buildCreateTable(alloc, 2, "");
     defer alloc.free(r2.change.tree_changes);
     try std.testing.expectEqual(first + 1, r2.table_id);
     try f.applyCreateTree(r2.change);
@@ -486,7 +493,7 @@ test "forest: buildCreateTable allocates and never reuses a dropped id" {
     try f.applyDropTree(dc);
     try std.testing.expect(!f.hasTable(2, r1.table_id));
 
-    const r3 = try f.buildCreateTable(alloc, 2);
+    const r3 = try f.buildCreateTable(alloc, 2, "");
     defer alloc.free(r3.change.tree_changes);
     try std.testing.expectEqual(first + 2, r3.table_id);
 }
@@ -520,6 +527,64 @@ test "forest: buildCreateNamespace allocates global namespace ids" {
     try std.testing.expectEqual(@as(?u64, first), f.lookupNamespace("one"));
     try std.testing.expectEqual(@as(?u64, first + 1), f.lookupNamespace("two"));
     try std.testing.expectError(error.NameExists, f.buildCreateNamespace(alloc, "one"));
+}
+
+test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    const nc = try f.buildNamespaceCreate(alloc, 9, "nine");
+    defer alloc.free(nc.tree_changes);
+    try std.testing.expectEqual(@as(usize, 2), nc.tree_changes.len);
+    try f.applyNamespaceCreate(nc);
+    try std.testing.expect(f.hasTable(9, 0));
+    try std.testing.expect(f.hasTable(9, manifest.catalog_table_id));
+
+    // Re-apply (WAL replay shape): both trees already exist — no error, no
+    // duplicates. Regression: the old per-namespace check skipped the
+    // catalog tree whenever table 0 existed.
+    try f.applyNamespaceCreate(nc);
+    try std.testing.expect(f.hasTable(9, 0));
+    try std.testing.expect(f.hasTable(9, manifest.catalog_table_id));
+}
+
+test "forest: table names — create registers, duplicate rejects, drop frees" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    const ct = try f.buildCreateTable(alloc, 3, "users");
+    defer alloc.free(ct.change.tree_changes);
+    try f.applyCreateTree(ct.change);
+    try std.testing.expectEqual(@as(?u32, ct.table_id), f.lookupTable(3, "users"));
+
+    // A taken name is rejected at build; re-applying the create is a no-op.
+    try std.testing.expectError(error.NameExists, f.buildCreateTable(alloc, 3, "users"));
+    try f.applyCreateTree(ct.change);
+    try std.testing.expectEqual(@as(?u32, ct.table_id), f.lookupTable(3, "users"));
+
+    // DROP frees the name for a re-CREATE, which gets a fresh id.
+    const dc = try f.buildDropTable(alloc, 3, ct.table_id);
+    defer alloc.free(dc.tree_changes);
+    try f.applyDropTree(dc);
+    try std.testing.expect(f.lookupTable(3, "users") == null);
+
+    const ct2 = try f.buildCreateTable(alloc, 3, "users");
+    defer alloc.free(ct2.change.tree_changes);
+    try f.applyCreateTree(ct2.change);
+    try std.testing.expect(ct2.table_id > ct.table_id);
+    try std.testing.expectEqual(@as(?u32, ct2.table_id), f.lookupTable(3, "users"));
 }
 
 // ---------------------------------------------------------------------------

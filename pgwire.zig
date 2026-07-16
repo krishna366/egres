@@ -43,8 +43,7 @@ pub const FieldDescription = types_mod.FieldDescription;
 pub const Oid = types_mod.Oid;
 pub const oid = types_mod.oid;
 pub const TxStatus = types_mod.TxStatus;
-pub const sqlstate_internal_error = types_mod.sqlstate_internal_error;
-pub const sqlstate_syntax_error = types_mod.sqlstate_syntax_error;
+pub const sqlstate = types_mod.sqlstate;
 
 // Re-export proto.* for callers that want to talk frames directly
 // (test fixtures, alternative drivers).

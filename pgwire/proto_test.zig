@@ -312,7 +312,7 @@ test "encode: ErrorResponse contains expected fields" {
     var scratch: std.Io.Writer.Allocating = .init(a);
     defer scratch.deinit();
     try proto.encodeErrorResponse(&scratch, .{
-        .code = types.sqlstate_syntax_error,
+        .code = types.sqlstate.syntax_error,
         .message = "boom",
         .position = 7,
     });

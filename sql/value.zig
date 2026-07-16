@@ -59,6 +59,20 @@ pub const Type = enum {
     pub inline fn isVarlen(self: Type) bool {
         return self.fixedWidth() == null;
     }
+
+    /// Resolve a DDL type name to a storage Type, or null if unsupported.
+    /// libpg_query normalizes pg_catalog spellings to internal names before
+    /// we see them (int/integer→int4, bigint→int8, real→float4, boolean→
+    /// bool, character varying→varchar), and those internal names ARE our
+    /// variant names — so the enum itself is the lookup table. Only two
+    /// spellings can't come from it: `bool` (the variant is bool_; `bool`
+    /// is a Zig primitive) and `varchar` (folds into text; any length
+    /// modifier is dropped).
+    pub fn fromName(name: []const u8) ?Type {
+        if (std.mem.eql(u8, name, "bool")) return .bool_;
+        if (std.mem.eql(u8, name, "varchar")) return .text;
+        return std.meta.stringToEnum(Type, name);
+    }
 };
 
 /// A Postgres interval: months + days + microseconds kept separate (a

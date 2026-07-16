@@ -29,3 +29,26 @@ test "sql.value: fixedWidth and isVarlen per type" {
     try testing.expect(Type.text.isVarlen());
     try testing.expect(Type.bytea.isVarlen());
 }
+
+test "sql.value: Type.fromName resolves DDL type names" {
+    try testing.expectEqual(@as(?Type, .int2), Type.fromName("int2"));
+    try testing.expectEqual(@as(?Type, .int4), Type.fromName("int4"));
+    try testing.expectEqual(@as(?Type, .int8), Type.fromName("int8"));
+    try testing.expectEqual(@as(?Type, .uint2), Type.fromName("uint2"));
+    try testing.expectEqual(@as(?Type, .uint4), Type.fromName("uint4"));
+    try testing.expectEqual(@as(?Type, .uint8), Type.fromName("uint8"));
+    try testing.expectEqual(@as(?Type, .float4), Type.fromName("float4"));
+    try testing.expectEqual(@as(?Type, .float8), Type.fromName("float8"));
+    try testing.expectEqual(@as(?Type, .bool_), Type.fromName("bool"));
+    // varchar folds into text (length modifier dropped).
+    try testing.expectEqual(@as(?Type, .text), Type.fromName("text"));
+    try testing.expectEqual(@as(?Type, .text), Type.fromName("varchar"));
+    try testing.expectEqual(@as(?Type, .bytea), Type.fromName("bytea"));
+    try testing.expectEqual(@as(?Type, .date), Type.fromName("date"));
+    try testing.expectEqual(@as(?Type, .timestamptz), Type.fromName("timestamptz"));
+    try testing.expectEqual(@as(?Type, .uuid), Type.fromName("uuid"));
+    // Unsupported names miss — the DDL layer turns these into errors.
+    try testing.expect(Type.fromName("serial") == null);
+    try testing.expect(Type.fromName("numeric") == null);
+    try testing.expect(Type.fromName("") == null);
+}

@@ -2119,13 +2119,25 @@ pub const Node = struct {
         const interval: u64 = 1000;
         const min_advance: u64 = 100;
         while (!self.isShuttingDown()) {
-            if (self.shutdown.waitTimeout(interval)) return;
+            if (self.shutdown.waitTimeout(interval)) break;
+
             const ci = self.commit_index.load();
             const persisted = self.log.hardState().commit_index;
             if (ci < persisted + min_advance) continue;
             self.log.setHardState(.{ .commit_index = ci }) catch |err| {
                 raft_log.warn("commitPersistLoop: setHardState failed: {s}", .{@errorName(err)});
                 continue;
+            };
+        }
+
+        // Final persist on the way out: a graceful restart then applies the
+        // full committed tail during recovery, BEFORE any listener serves —
+        // otherwise a short-lived node (< min_advance entries) restarts at
+        // the stale index and clients race the post-election re-commit.
+        const ci = self.commit_index.load();
+        if (ci > self.log.hardState().commit_index) {
+            self.log.setHardState(.{ .commit_index = ci }) catch |err| {
+                raft_log.warn("commitPersistLoop: final setHardState failed: {s}", .{@errorName(err)});
             };
         }
     }

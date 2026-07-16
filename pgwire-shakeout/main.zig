@@ -93,7 +93,7 @@ const ShakeoutHandler = struct {
                     var details = info.?;
                     defer details.deinit(self.alloc);
                     try state.sendError(.{
-                        .code = pgwire.sqlstate_syntax_error,
+                        .code = pgwire.sqlstate.syntax_error,
                         .message = details.message,
                         .position = details.cursor_pos,
                     });

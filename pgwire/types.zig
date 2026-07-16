@@ -44,12 +44,19 @@ pub const FieldDescription = struct {
     column_attr: i16 = 0,
 };
 
-/// SQLSTATE code 'XX000' is the catch-all "internal_error". We use it
-/// for everything that doesn't have a specific code below.
+/// SQLSTATE codes for ErrorResponse 'C' fields (like `oid` above, a
+/// namespace so one export covers them all). 'XX000' is the catch-all
+/// "internal_error" — used for everything without a specific code yet.
 /// TODO: mirror Postgres' SQLSTATE taxonomy and emit the correct code
 /// per error class (constraint violation, type mismatch, etc.).
-pub const sqlstate_internal_error: [5]u8 = .{ 'X', 'X', '0', '0', '0' };
-pub const sqlstate_syntax_error: [5]u8 = .{ '4', '2', '6', '0', '1' };
+pub const sqlstate = struct {
+    pub const internal_error: [5]u8 = .{ 'X', 'X', '0', '0', '0' };
+    pub const syntax_error: [5]u8 = .{ '4', '2', '6', '0', '1' };
+    pub const duplicate_table: [5]u8 = .{ '4', '2', 'P', '0', '7' };
+    pub const undefined_table: [5]u8 = .{ '4', '2', 'P', '0', '1' };
+    pub const invalid_catalog_name: [5]u8 = .{ '3', 'D', '0', '0', '0' };
+    pub const feature_not_supported: [5]u8 = .{ '0', 'A', '0', '0', '0' };
+};
 
 /// Severity strings used in ErrorResponse 'S' / 'V' fields.
 pub const severity_error = "ERROR";

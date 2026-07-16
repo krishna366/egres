@@ -185,9 +185,13 @@ fn makeModules(
 
     // sql: the row codec is pure std logic; the DDL parser reuses pgwire's
     // libpg_query binding (the C archive itself is linked per-executable via
-    // addLibpgQuerySources).
+    // addLibpgQuerySources); the server (pgwire front-end) drives the
+    // engine — the sanctioned direction is sql → engine → zdb/raft, and
+    // engine never imports sql.
     const sql = makeModule(b, target, optimize, "sql.zig");
     sql.addImport("pgwire", pgwire);
+    sql.addImport("engine", engine);
+    sql.addImport("zfiber", fiber);
 
     return .{
         .zio = zio,

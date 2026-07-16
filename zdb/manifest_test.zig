@@ -167,7 +167,13 @@ test "manifest serialize/restoreFrom round-trip" {
     try src.commit(&.{}, &.{
         createTreeChange(1, 7, a_raw, m_raw),
         createTreeChange(2, 7, m_raw, z_raw),
+        // A named user table, split into two trees — the name must survive
+        // the round-trip via its FIRST tree (the one with the open left
+        // bound; serialize stamps only that one).
+        createTreeChange(zdb.key.makeTreeId(16, 0), 7, &.{}, m_raw),
+        createTreeChange(zdb.key.makeTreeId(16, 1), 7, m_raw, &.{}),
     });
+    try src.registerTableName(7, 16, "users");
     try src.commit(&.{
         createSSTableChange(10, 7, 1, 0),
         createSSTableChange(11, 7, 1, 0),
@@ -211,6 +217,9 @@ test "manifest serialize/restoreFrom round-trip" {
     try std.testing.expectEqualStrings("zzz", t2.right.primary);
     try std.testing.expect(t2.levels.items[2].tables.contains(20));
     try std.testing.expect(t2.levels.items[3].tables.contains(50));
+
+    // The table name rode the snapshot (stamped on its tree's change).
+    try std.testing.expectEqual(@as(?u32, 16), dst.lookupTable(7, "users"));
 }
 
 // -------------------------------------------------------------------------
@@ -232,6 +241,7 @@ test "manifest restoreFrom replaces existing state" {
     defer dst.deinit();
     try dst.commit(&.{}, &.{createTreeChange(99, 0, &.{}, &.{})});
     try dst.commit(&.{createSSTableChange(999, 0, 99, 0)}, &.{});
+    try dst.registerTableName(0, 55, "stale");
     try std.testing.expect(dst.trees.contains(tk(0, 99)));
 
     try dst.restoreFrom(bytes);
@@ -239,6 +249,46 @@ test "manifest restoreFrom replaces existing state" {
     try std.testing.expect(!dst.trees.contains(tk(0, 99)));
     try std.testing.expect(dst.trees.contains(tk(0, 1)));
     try std.testing.expectEqual(@as(u32, 1), dst.tableCount());
+    // Pre-restore table names are gone too (freed, not leaked).
+    try std.testing.expect(dst.lookupTable(0, "stale") == null);
+}
+
+// -------------------------------------------------------------------------
+// Table names: register / lookup / drop
+// -------------------------------------------------------------------------
+
+test "manifest table names: register/lookup/drop" {
+    const alloc = std.testing.allocator;
+    var ms = manifest.ForestState.init(alloc);
+    defer ms.deinit();
+
+    try ms.registerTableName(5, 16, "users");
+    try std.testing.expectEqual(@as(?u32, 16), ms.lookupTable(5, "users"));
+
+    // Idempotent re-apply; a collision (build-side bug) is skipped, never
+    // clobbered.
+    try ms.registerTableName(5, 16, "users");
+    try ms.registerTableName(5, 17, "users");
+    try std.testing.expectEqual(@as(?u32, 16), ms.lookupTable(5, "users"));
+
+    // Empty names record nothing; lookups are namespace-scoped.
+    try ms.registerTableName(5, 18, "");
+    try std.testing.expect(ms.lookupTable(5, "") == null);
+    try std.testing.expect(ms.lookupTable(6, "users") == null);
+
+    // dropTable frees the name for a re-register at a fresh id; idempotent.
+    ms.dropTable(5, 16);
+    try std.testing.expect(ms.lookupTable(5, "users") == null);
+    ms.dropTable(5, 16);
+    try ms.registerTableName(5, 19, "users");
+    try std.testing.expectEqual(@as(?u32, 19), ms.lookupTable(5, "users"));
+
+    // dropNamespace forgets every table name (leak-checked by the test
+    // allocator).
+    try ms.registerTableName(5, 20, "orders");
+    ms.dropNamespace(5);
+    try std.testing.expect(ms.lookupTable(5, "users") == null);
+    try std.testing.expect(ms.lookupTable(5, "orders") == null);
 }
 
 // -------------------------------------------------------------------------

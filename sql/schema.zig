@@ -35,6 +35,11 @@ pub const LogicalColumn = struct {
     /// column is retained in the catalog so older versions' layouts (which
     /// included it) stay reconstructable.
     dropped_in_version: ?u16 = null,
+    /// 1-based position of this column in the table's PRIMARY KEY, or null
+    /// when not part of it. Layout-irrelevant (compile never reads it);
+    /// stored so the catalog fully describes the table. u16 leaves room
+    /// for composite keys — today only 1 is ever written.
+    pkey_position: ?u16 = null,
 
     /// Live at version v iff added by v and not yet dropped at v.
     pub inline fn liveAt(self: LogicalColumn, v: u16) bool {

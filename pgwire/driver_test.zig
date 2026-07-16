@@ -20,7 +20,19 @@ const Stream = fiber.net.Stream;
 const StubHandler = struct {
     last_sql: std.ArrayList(u8) = .empty,
     call_count: u32 = 0,
+    database: std.ArrayList(u8) = .empty,
     alloc: std.mem.Allocator,
+
+    /// Optional hook: capture the session's database (params borrow the
+    /// read buffer, so copy).
+    pub fn onStartup(
+        self: *StubHandler,
+        state: *pgwire.ConnState,
+        params: pgwire.proto.StartupParams,
+    ) !void {
+        _ = state;
+        if (params.database) |d| try self.database.appendSlice(self.alloc, d);
+    }
 
     pub fn onQuery(
         self: *StubHandler,
@@ -44,6 +56,7 @@ const StubHandler = struct {
 
     pub fn deinit(self: *StubHandler) void {
         self.last_sql.deinit(self.alloc);
+        self.database.deinit(self.alloc);
     }
 };
 
@@ -225,4 +238,8 @@ test "driver: full startup + Query + Terminate round-trip" {
     try group.spawn(.{}, clientFn, .{&ctx});
 
     for (group.wait()) |r| try r;
+
+    // The onStartup hook saw the session params (buildStartup sends
+    // database=d).
+    try std.testing.expectEqualStrings("d", handler.database.items);
 }

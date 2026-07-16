@@ -294,6 +294,9 @@ pub const Engine = struct {
     /// of a noisy log without picking up unrelated compactions. Wraps
     /// at u64 — we'll never wrap in practice.
     next_compaction_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+    /// Last term in which `catchUp` barriered on a caught-up leader. 0 =
+    /// never; a leadership change bumps the term and re-arms the barrier.
+    catchup_term: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Set of trees currently being compacted/split by some compactor
     /// fiber. Each fiber reserves its tree before starting work so
@@ -1070,12 +1073,37 @@ pub const Engine = struct {
         }
     }
 
+    /// Ensure this node is a leader that has APPLIED every entry committed
+    /// before now, erroring NotLeader instead of waiting for leadership.
+    ///
+    /// NOT a serializer — competing DDLs are serialized by sql.Server's
+    /// ddl_mu (held across check → propose → apply). This barrier fixes the
+    /// one bug that funnel can't see: a freshly-elected leader reading
+    /// STALE applied state. A crashed node restarts with a lagging
+    /// persisted commit_index, so recovery applies only a prefix; the tail
+    /// re-commits only after election, racing the first DDL's name check
+    /// and id allocation. waitForQuorum proposes an empty entry and waits
+    /// for its apply — applies are ordered, so every surviving prior-term
+    /// entry (necessarily already in this leader's log) applies first.
+    /// After that no foreign entry can enter this term's log, so once per
+    /// term suffices (cached; concurrent callers may double-barrier,
+    /// harmless).
+    pub fn catchUp(self: *Engine) !void {
+        if (!self.node.isLeader()) return error.NotLeader;
+        // Read the term BEFORE the barrier: if leadership changes mid-wait,
+        // we cache the old term and the next DDL re-barriers — safe side.
+        const term = self.node.current_term;
+        if (self.catchup_term.load(.acquire) == term) return;
+        try self.node.waitForQuorum();
+        self.catchup_term.store(term, .release);
+    }
+
     /// Replicate a forest manifest change (ns/tree create or drop, …) through
     /// Raft, blocking until it is applied on this node. Pairs with the forest
     /// `build*` constructors: the caller builds the change (leader side), this
     /// makes it real everywhere. Control-plane rule: manifest proposals wait
     /// for APPLY, not just commit.
-    pub fn proposeManifestChange(self: *Engine, mc: manifest.ManifestChange) !void {
+    pub fn proposeAndApplyMC(self: *Engine, mc: manifest.ManifestChange) !void {
         const payload = try encodeManifestChange(
             self.allocator,
             mc.cmd,
@@ -1085,6 +1113,18 @@ pub const Engine = struct {
         );
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
+    }
+
+    /// Replicate key-value writes to (namespace, table_id) through Raft,
+    /// blocking until they are applied on this node. Same control-plane rule
+    /// as proposeAndApplyMC — DDL metadata (catalog rows) must be locally
+    /// readable the moment the client sees CommandComplete, so commit-wait
+    /// (the admin `set` path) is not enough. Not for user-data writes; those
+    /// get a commit-wait path when the time comes.
+    pub fn proposeAndApplyKVs(self: *Engine, namespace: u64, table_id: u32, kvs: anytype) !void {
+        const payload = try encodeMutations(self.allocator, namespace, table_id, kvs);
+        defer self.allocator.free(payload);
+        try self.node.proposeAndWaitForApply(payload, .data);
     }
 
     /// Encode key-value writes as one `Mutations` payload for a .data

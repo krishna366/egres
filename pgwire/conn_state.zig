@@ -422,7 +422,7 @@ pub const ConnState = struct {
                 }
                 try self.emitFatal(
                     "unknown frontend message",
-                    types.sqlstate_internal_error,
+                    types.sqlstate.internal_error,
                 );
                 self.phase = .closed;
                 return .terminate;
@@ -481,7 +481,7 @@ pub const ConnState = struct {
                 else => {
                     try self.emitErrorReady(
                         "unsupported message",
-                        types.sqlstate_internal_error,
+                        types.sqlstate.internal_error,
                     );
                     self.ext_failed = true;
                     continue;
@@ -516,7 +516,7 @@ pub const ConnState = struct {
         const p = proto.parseParse(body, &oids_storage) catch {
             try self.extError(
                 "malformed Parse message",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return;
         };
@@ -556,7 +556,7 @@ pub const ConnState = struct {
         ) catch {
             try self.extError(
                 "malformed Bind message",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return;
         };
@@ -564,7 +564,7 @@ pub const ConnState = struct {
         if (!self.statements.contains(b.statement_name)) {
             try self.extError(
                 "Bind references unknown prepared statement",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return;
         }
@@ -578,14 +578,14 @@ pub const ConnState = struct {
         for (b.param_formats) |f| if (f != 0 and f != 1) {
             try self.extError(
                 "invalid parameter format code (must be 0 or 1)",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return;
         };
         for (b.result_formats) |f| if (f != 0 and f != 1) {
             try self.extError(
                 "invalid result format code (must be 0 or 1)",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return;
         };
@@ -629,7 +629,7 @@ pub const ConnState = struct {
         } else {
             try self.extError(
                 "Bind: param_formats count must be 0, 1, or n_params",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return;
         }
@@ -658,14 +658,14 @@ pub const ConnState = struct {
         const e = proto.parseExecute(body) catch {
             try self.extError(
                 "malformed Execute message",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return null;
         };
         const portal = self.portals.get(e.portal_name) orelse {
             try self.extError(
                 "Execute references unknown portal",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return null;
         };
@@ -674,7 +674,7 @@ pub const ConnState = struct {
             // statement name, but defensively close out.
             try self.extError(
                 "Execute portal references missing statement",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return null;
         };
@@ -694,7 +694,7 @@ pub const ConnState = struct {
         const d = proto.parseDescribe(body) catch {
             try self.extError(
                 "malformed Describe message",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return null;
         };
@@ -703,7 +703,7 @@ pub const ConnState = struct {
                 const stmt = self.statements.get(d.name) orelse {
                     try self.extError(
                         "Describe references unknown statement",
-                        types.sqlstate_internal_error,
+                        types.sqlstate.internal_error,
                     );
                     return null;
                 };
@@ -721,14 +721,14 @@ pub const ConnState = struct {
                 const portal = self.portals.get(d.name) orelse {
                     try self.extError(
                         "Describe references unknown portal",
-                        types.sqlstate_internal_error,
+                        types.sqlstate.internal_error,
                     );
                     return null;
                 };
                 const stmt = self.statements.get(portal.stmt_name) orelse {
                     try self.extError(
                         "Describe portal missing statement",
-                        types.sqlstate_internal_error,
+                        types.sqlstate.internal_error,
                     );
                     return null;
                 };
@@ -746,7 +746,7 @@ pub const ConnState = struct {
         const c = proto.parseClose(body) catch {
             try self.extError(
                 "malformed Close message",
-                types.sqlstate_internal_error,
+                types.sqlstate.internal_error,
             );
             return;
         };
