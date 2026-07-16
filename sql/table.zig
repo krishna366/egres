@@ -17,9 +17,9 @@ const row = @import("row.zig");
 const catalog = @import("catalog.zig");
 
 const Forest = zdb.forest.Forest;
-const Key = zdb.key.Key;
+const Key = zdb.kv.Key;
 const KeyRange = zdb.level.KeyRange;
-const Item = zdb.key.Item;
+const Item = zdb.kv.Item;
 
 pub const Error = error{UndefinedTable};
 
@@ -133,7 +133,7 @@ pub fn loadTableSchema(
     var ctx = LoadCtx{ .a = a, .catalog_ps = catalog_ps };
     // scan uses `alloc` for its own transient arena (freed at scan end); the
     // callback dupes anything it keeps into `a` (the Table's arena).
-    _ = try forest.scan(alloc, scan_range, std.math.maxInt(u64), .p0, &ctx, LoadCtx.emit);
+    _ = try forest.scan(alloc, scan_range, .{}, &ctx, LoadCtx.emit);
     if (ctx.err) |e| return e;
     if (ctx.all.items.len == 0) return error.UndefinedTable;
 

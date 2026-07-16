@@ -12,13 +12,12 @@ const skl = @import("skl/skiplist.zig");
 const metrics = @import("metrics.zig");
 const fi = @import("file_ids.zig");
 
-const keymod = @import("key.zig");
-const Key = keymod.Key;
-const TreeKey = keymod.TreeKey;
-const TableKey = keymod.TableKey;
-const makeTreeId = keymod.makeTreeId;
-const treeTableId = keymod.treeTableId;
-const treeSplitId = keymod.treeSplitId;
+const Key = @import("kv.zig").Key;
+const TreeKey = @import("kv.zig").TreeKey;
+const TableKey = @import("kv.zig").TableKey;
+const makeTreeId = @import("kv.zig").makeTreeId;
+const treeTableId = @import("kv.zig").treeTableId;
+const treeSplitId = @import("kv.zig").treeSplitId;
 const KeyRange = level.KeyRange;
 const Tree = tree_mod.Tree;
 const TableCache = tree_mod.TableCache;
@@ -125,10 +124,10 @@ pub const Memtables = struct {
         self.immutables.deinit(self.allocator);
     }
 
-    pub fn put(self: *Memtables, key: Key, value: []const u8) !void {
+    pub fn putItem(self: *Memtables, item: Item) !void {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        try self.current.put(key, value);
+        try self.current.putItem(item);
     }
 
     pub fn memoryUsage(self: *Memtables) usize {
@@ -315,6 +314,19 @@ pub const Forest = struct {
     table_cache: TableCache,
     mu: fiber.RWMutex(.tracked),
     memtables: Memtables,
+    /// The oldest timestamp any reader is still allowed to ask for. Reads
+    /// below it are rejected (`error.ReadBelowMinRead`), which is exactly what
+    /// makes data below it unobservable and therefore safe to discard: bottom-
+    /// level compaction drops a tombstone older than this along with every
+    /// version it shadows (see `Tree.buildCompaction`).
+    ///
+    /// ZDB does not derive this itself — it has no reader registry. The
+    /// embedder (egres) owns the value and pushes it in via
+    /// `setGlobalMinRead`. It only ever moves forward.
+    ///
+    /// 0 means "nothing is droppable", the safe default: no timestamp is
+    /// below it, so no read is rejected and no row is ever dropped.
+    global_min_read: std.atomic.Value(u64),
 
     /// Open a forest with empty in-memory state. Persistent state is restored
     /// later via `installManifest` (called by recovery if a Raft snapshot is
@@ -341,8 +353,31 @@ pub const Forest = struct {
             .table_cache = TableCache.init(allocator, opts.dir),
             .mu = .{},
             .memtables = Memtables.init(allocator, mt),
+            .global_min_read = std.atomic.Value(u64).init(0),
         };
         return self;
+    }
+
+    /// Raise the read horizon. Monotonic: a lower value is ignored rather
+    /// than rejected, so a caller racing with a newer update can't walk the
+    /// horizon backwards and un-discard data that a compaction already
+    /// dropped. Returns the value in force afterward.
+    pub fn setGlobalMinRead(self: *Forest, ts: u64) u64 {
+        var cur = self.global_min_read.load(.acquire);
+        while (ts > cur) {
+            const prev = self.global_min_read.cmpxchgWeak(
+                cur,
+                ts,
+                .acq_rel,
+                .acquire,
+            ) orelse return ts;
+            cur = prev;
+        }
+        return cur;
+    }
+
+    pub fn globalMinRead(self: *Forest) u64 {
+        return self.global_min_read.load(.acquire);
     }
 
     pub fn close(self: *Forest) void {
@@ -372,7 +407,7 @@ pub const Forest = struct {
     /// a memtable freeze through Raft.
     pub fn put(self: *Forest, items: []const Item) !void {
         for (items) |item| {
-            try self.memtables.put(item.key, item.value);
+            try self.memtables.putItem(item);
         }
     }
 
@@ -440,7 +475,7 @@ pub const Forest = struct {
                 try builders.put(tk, b);
                 break :blk b;
             };
-            try bld.add(item.key, item.value);
+            try bld.addItem(item);
             try iter.next();
         }
 
@@ -581,7 +616,34 @@ pub const Forest = struct {
     /// Get a value by key. Checks memtables first (current, then immutables
     /// newest-to-oldest), then routes to the correct tree.
     /// Returned Item is owned by the caller; call item.free(allocator) when done.
+    ///
+    /// A key deleted at or below `search_key.timestamp` reads as absent: the
+    /// tombstone wins the lookup and is reported as null. Rejects reads below
+    /// `global_min_read`, whose versions may already have been compacted away.
     pub fn get(self: *Forest, allocator: std.mem.Allocator, search_key: Key, priority: vfs.Priority) !?Item {
+        if (search_key.timestamp < self.globalMinRead()) {
+            return error.ReadBelowMinRead;
+        }
+
+        const found = try self.getRaw(allocator, search_key, priority);
+        // Every layer stops at its first hit, and versions sort newest-first,
+        // so `found` is the newest version at or below the read timestamp. If
+        // that version is a tombstone, the key is deleted as of this read —
+        // older versions behind it are shadowed and must not surface.
+        if (found) |item| {
+            if (item.meta.isDeleted()) {
+                item.free(allocator);
+                return null;
+            }
+        }
+        return found;
+    }
+
+    /// get without the tombstone filter or the horizon check: returns the
+    /// winning version verbatim, tombstone or not. For callers that need to
+    /// see deletions as data (compaction diagnostics, tests, repair tools)
+    /// rather than as absence.
+    pub fn getRaw(self: *Forest, allocator: std.mem.Allocator, search_key: Key, priority: vfs.Priority) !?Item {
         if (try self.memtables.get(allocator, search_key)) |item| {
             return item;
         }
@@ -596,15 +658,67 @@ pub const Forest = struct {
 
     pub const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
 
+    /// How much of a key's version history a scan should surface.
+    ///
+    /// The merge iterator hands us every version of every primary, newest
+    /// first; these decide which of them reach the callback. The defaults
+    /// make a scan agree with `get`: the current value of each live key, and
+    /// nothing for a deleted one.
+    pub const ScanOptions = struct {
+        /// Stop after handing this many items to the callback. Bounds what the
+        /// caller RECEIVES, not what the scan walks past: versions skipped by
+        /// the filters below are free. 0 returns nothing. The default is
+        /// unbounded — the whole range.
+        max_rows: u64 = std.math.maxInt(u64),
+        /// Max versions to emit per primary, newest first. 1 (the default) is
+        /// "just the current value". Clamped up to 1 — there's no use for a
+        /// scan that returns zero versions of every key, and `max_rows = 0`
+        /// already says "return nothing".
+        num_versions: u32 = 1,
+        /// When false, a primary stops emitting at its first tombstone: the
+        /// tombstone is not emitted, and neither is anything older than it,
+        /// regardless of `num_versions`. That is what makes a deleted key look
+        /// absent.
+        ///
+        /// When true, tombstones are emitted like any other version and older
+        /// versions behind them keep coming, up to `num_versions`. For callers
+        /// that need deletions as data — replication, repair, debugging.
+        include_deleted: bool = false,
+        /// Report the world as of this timestamp: versions above it are not
+        /// visible and are skipped as though they had not been written. The
+        /// default, maxInt, means "latest".
+        ///
+        /// This is the same view `get` gives for one key, so a scan at
+        /// `read_ts` and a `get` at `read_ts` agree — including on deletion: a
+        /// tombstone ABOVE read_ts hasn't happened yet from here, so it does
+        /// not hide the key, and the live version under it is what surfaces.
+        ///
+        /// Must be at or above `global_min_read`, like any other read.
+        read_ts: u64 = std.math.maxInt(u64),
+        /// I/O priority for the SST reads this scan issues (see vfs). `.p0` is
+        /// the foreground/interactive class every current caller wants;
+        /// background sweeps should pick a lower one so they queue behind
+        /// user-facing reads.
+        priority: vfs.Priority = .p0,
+    };
+
     /// Forward scan over a table-limited `scan_range` — a KeyRange run through
     /// `KeyRange.limitToTable`, so its bounds are full keys confined to one
     /// `(namespace, table_id)` (which ride the `left` bound). That confinement
     /// keeps the scan from spilling across the namespace-wide memtable into an
     /// adjacent table.
     ///
+    /// `opts` carries everything else: how many items to return, the view
+    /// (as-of timestamp, versions per key, deletions as data or absence), and
+    /// the read priority — see `ScanOptions`. The defaults emit every live
+    /// key's current value once and hide deleted keys, matching `get`.
+    ///
+    /// `scan_range`'s own timestamps only position the seek — `opts.read_ts`
+    /// is what decides visibility.
+    ///
     /// One tree at a time: look up the tree owning `current_left`, snapshot its
     /// range, open a cursor (with a fresh memtable iter snapshot), drain to the
-    /// cursor's end (or max_count), then advance past the snapshotted right
+    /// cursor's end (or max_rows), then advance past the snapshotted right
     /// boundary and re-look-up. Re-looking-up per hop keeps the scan safe
     /// against splits firing mid-scan. Per-cursor memtable snapshots also pick
     /// up newly-flushed data.
@@ -612,12 +726,15 @@ pub const Forest = struct {
         self: *Forest,
         allocator: std.mem.Allocator,
         scan_range: KeyRange,
-        max_count: u64,
-        priority: vfs.Priority,
+        opts: ScanOptions,
         ctx: *anyopaque,
         cb: ScanCallback,
     ) !u64 {
-        if (max_count == 0) return 0;
+        if (opts.max_rows == 0) return 0;
+        if (opts.read_ts < self.globalMinRead()) {
+            return error.ReadBelowMinRead;
+        }
+        const want_versions: u32 = @max(opts.num_versions, 1);
 
         // Per-call arena — used to dupe each visited tree's
         // right-boundary key so it stays alive across iterations
@@ -633,7 +750,26 @@ pub const Forest = struct {
         var emitted: u64 = 0;
         var current_left = scan_range.left;
 
-        while (emitted < max_count) {
+        // Per-primary emit state. A primary's versions arrive contiguously,
+        // newest first, so this only ever tracks one run at a time.
+        //
+        // The state deliberately spans tree hops rather than resetting per
+        // tree: a primary can't straddle two trees (findSplitKey pins the
+        // split above every version of its key), so a hop always lands on a
+        // new primary anyway — and if that ever stops holding, carrying the
+        // state is the behaviour that stays correct.
+        //
+        // `cur_primary` owns its bytes: item.key.primary points into the block
+        // iterator's key_buf, which the next merge.next() overwrites. Empty
+        // doubles as "no run yet" — a stored primary is never empty (an empty
+        // primary is the open-bound sentinel, and Key.marshalTo encodes it as
+        // zero bytes), so the first item can never compare equal to it.
+        var cur_primary: std.ArrayList(u8) = .empty;
+        defer cur_primary.deinit(allocator);
+        var versions_emitted: u32 = 0;
+        var skip_versions = false;
+
+        while (emitted < opts.max_rows) {
             // Find the tree owning current_left + snapshot its range
             // (tree.key_range stays in sync with the manifest via
             // applySplit). Re-doing the lookup per hop keeps the scan
@@ -659,16 +795,51 @@ pub const Forest = struct {
             // returns a fresh slice; freeing it through the arena at
             // end-of-scope is fine.)
             const mem_iters = try self.memtables.getIterators(a);
-            var merge = try tree.openMerge(a, visit_range, priority, mem_iters);
+            var merge = try tree.openMerge(a, visit_range, opts.priority, mem_iters);
 
-            // Drain (or hit max_count). Use a labeled block so merge.deinit
+            // Drain (or hit max_rows). Use a labeled block so merge.deinit
             // fires on every exit path before we either return or hop to
             // the next tree.
             const stop_early = drain: {
-                while (emitted < max_count) {
+                while (emitted < opts.max_rows) {
                     const item = merge.itemRef() orelse break :drain false;
+
+                    // Not written yet, as far as this scan is concerned.
+                    // Filtered before everything below on purpose: before the
+                    // tombstone rule, so a delete above read_ts can't hide a
+                    // key that is still live at read_ts; and before the
+                    // version cap, so invisible versions don't consume it.
+                    if (item.key.timestamp > opts.read_ts) {
+                        try merge.next();
+                        continue;
+                    }
+
+                    if (!item.key.equalPrimary(.{ .primary = cur_primary.items })) {
+                        cur_primary.clearRetainingCapacity();
+                        try cur_primary.appendSlice(allocator, item.key.primary);
+                        versions_emitted = 0;
+                        skip_versions = false;
+                    }
+
+                    // Skipped versions don't count against max_rows — that
+                    // bounds what the caller receives, not what we walk past.
+                    if (skip_versions or versions_emitted >= want_versions) {
+                        // TODO: Add a nextKey in underlying iterators.
+                        try merge.next();
+                        continue;
+                    }
+
+                    if (item.meta.isDeleted() and !opts.include_deleted) {
+                        // Deleted as of this version: suppress the tombstone
+                        // and everything older behind it.
+                        skip_versions = true;
+                        try merge.next();
+                        continue;
+                    }
+
                     const cont = try cb(ctx, item);
                     emitted += 1;
+                    versions_emitted += 1;
                     if (!cont) break :drain true;
                     try merge.next();
                 }
@@ -745,7 +916,7 @@ pub const Forest = struct {
         // [floor, table end): floor (if any) is an in-table key we keep; no
         // floor limits to the table start. limitToTable confines the memtable.
         const scan_range = (KeyRange{ .left = floor orelse Key{} }).limitToTable(ns, table_id);
-        _ = try self.scan(allocator, scan_range, std.math.maxInt(u64), .p0, &ctx, Ctx.emit);
+        _ = try self.scan(allocator, scan_range, .{}, &ctx, Ctx.emit);
 
         // A memtable row above floor wins; otherwise floor stands (or null if
         // the table had no SSTs and no rows).

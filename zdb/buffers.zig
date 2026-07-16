@@ -36,6 +36,9 @@ pub const TableIndex = schema.Table(.{
     .{ .id = 7, .name = "last_key", .ty = schema.Bytes },
     .{ .id = 8, .name = "blocks", .ty = schema.Array(BlockIndex) },
     .{ .id = 9, .name = "binary_fuse", .ty = BinaryFuseFilter },
+    // Bumped whenever the per-entry block encoding changes (table/builder.zig
+    // is the source of truth for that layout).
+    .{ .id = 10, .name = "format_version", .ty = schema.U32 },
 });
 
 pub const Op = schema.EnumDef(.{
@@ -118,9 +121,12 @@ pub const ManifestChange = schema.Table(.{
 
 /// A single key-value tuple. Carried inside `Mutations` which groups them
 /// by namespace — so the per-tuple envelope only holds the bytes themselves.
+/// `meta` is zdb.Meta packed into a byte (see zdb/kv.zig); 0 is Meta.raw, so
+/// a writer that never sets it produces a plain put.
 pub const KeyValue = schema.Table(.{
     .{ .id = 1, .name = "key", .ty = schema.Bytes },
     .{ .id = 2, .name = "value", .ty = schema.Bytes },
+    .{ .id = 3, .name = "meta", .ty = schema.U8 },
 });
 
 /// One or more key-value writes proposed through raft as a single entry. The

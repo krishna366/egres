@@ -5,7 +5,7 @@ const zdb = @import("zdb");
 fn noopPersist(_: *anyopaque, _: u64) anyerror!void {}
 const vfs = zdb.vfs;
 
-const Key = zdb.key.Key;
+const Key = zdb.kv.Key;
 const table_mod = zdb.table;
 const Builder = table_mod.builder.Builder;
 const Table = table_mod.Table;
@@ -50,6 +50,59 @@ fn buildTable(
         try b.add(.{ .primary = e.key, .timestamp = e.ts }, e.val);
     }
     return b.finish();
+}
+
+/// One row for buildTableMeta. Named rather than anonymous so helpers can
+/// pass the same slice along — Zig gives each anonymous struct literal its
+/// own distinct type.
+const MetaEntry = struct {
+    key: []const u8,
+    ts: u64,
+    val: []const u8,
+    meta: zdb.kv.Meta = .{},
+};
+
+/// buildTable, but each entry carries a Meta. Entries must already be in
+/// sort order: primary ascending, then timestamp DESCENDING.
+fn buildTableMeta(
+    alloc: std.mem.Allocator,
+    entries: []const MetaEntry,
+) !table_mod.builder.TableBuffer {
+    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    defer b.deinit();
+    for (entries) |e| {
+        try b.addItem(.{
+            .key = .{ .primary = e.key, .timestamp = e.ts },
+            .value = e.val,
+            .meta = e.meta,
+        });
+    }
+    return b.finish();
+}
+
+/// Install `tb` as SST `id` at `level` for `tree_id`, on disk + in the manifest.
+fn installTable(
+    alloc: std.mem.Allocator,
+    ms: *manifest.ForestState,
+    dir_path: []const u8,
+    tb: *table_mod.builder.TableBuffer,
+    id: u64,
+    tree_id: u64,
+    level: u32,
+) !void {
+    const path = try zdb.file_ids.sstPath(alloc, dir_path, id);
+    defer alloc.free(path);
+    try vfs.writeFile(path, tb.bytes);
+    try ms.commit(&.{createSSTableChange(id, 0, tree_id, level)}, &.{});
+}
+
+/// Sum of stale_data_size across a level's tables. buildCompaction records it
+/// per output SST; nothing in production reads it back yet, so the test reaches
+/// into the index directly rather than through a helper on Level.
+fn levelStaleBytes(level: *Level) u64 {
+    var total: u64 = 0;
+    for (level.tables.items) |e| total += e.table.index.stale_data_size;
+    return total;
 }
 
 /// Test helper: create an in-memory FileHandle from a buffer (dupes the data).
@@ -469,7 +522,7 @@ test "levels: doCompact L0 L1" {
 
     var file_ids: zdb.file_ids.FileIds = .{};
     file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
-    try tree.doCompact(0, &file_ids);
+    try tree.doCompact(0, &file_ids, 0);
 
     // After compaction L0 must be empty and keys must live in L1.
     try std.testing.expectEqual(@as(usize, 0), tree.levels[0].numTables());
@@ -549,7 +602,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
 
     var file_ids: zdb.file_ids.FileIds = .{};
     file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
-    try tree.doCompact(0, &file_ids);
+    try tree.doCompact(0, &file_ids, 0);
 
     // L0 must be empty; L1 holds the merged result in a single table.
     try std.testing.expectEqual(@as(usize, 0), tree.levels[0].numTables());
@@ -625,7 +678,7 @@ test "levels: doCompact L1 L2" {
 
     var file_ids: zdb.file_ids.FileIds = .{};
     file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
-    try tree.doCompact(1, &file_ids);
+    try tree.doCompact(1, &file_ids, 0);
 
     // L1 must be empty; L2 holds the original {cc} table plus new {aa, bb}.
     try std.testing.expectEqual(@as(usize, 0), tree.levels[1].numTables());
@@ -711,3 +764,367 @@ test "levels: get L0 shadows L1" {
         try std.testing.expectEqualStrings("l1_val", item.?.value);
     }
 }
+
+test "levels: overlappingTables finds a dest table sharing the boundary primary" {
+    const alloc = std.testing.allocator;
+
+    // Dest table holding an OLDER version of "k", plus a later primary.
+    // Sort order is primary asc, then ts DESC, so this is ascending.
+    var tb = try buildTable(alloc, &.{
+        .{ .key = "k", .ts = 50, .val = "old" },
+        .{ .key = "m", .ts = 20, .val = "v" },
+    });
+    defer tb.deinit();
+    const t = try openTableOwned(alloc, &tb);
+    defer destroyTable(t);
+
+    var level = Level.init(alloc, 1);
+    defer level.deinit();
+    try level.addEntry(1, t);
+
+    // A src table {(a,10), (k,100), (k,90)} has smallest=(a,10) and
+    // biggest=(k,90) — biggest is the LOWEST-ts version of its largest
+    // primary, because ts sorts descending. That's the range a compaction
+    // probes dest with.
+    const left = try (Key{ .primary = "a", .timestamp = 10 }).marshal(alloc);
+    defer alloc.free(left);
+    const right = try (Key{ .primary = "k", .timestamp = 90 }).marshal(alloc);
+    defer alloc.free(right);
+
+    const result = try level.overlappingTables(alloc, .{
+        .left = Key.init(left),
+        .right = Key.init(right),
+    });
+    defer alloc.free(result);
+
+    // The dest table holds "k" and MUST participate: otherwise the compaction
+    // writes k@100/k@90 into dest while k@50 stays in a separate dest table,
+    // putting two tables at the same level in charge of one primary.
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+}
+
+// ---------------------------------------------------------------------------
+// Tombstone dropping in compaction
+// ---------------------------------------------------------------------------
+
+/// Open a one-tree forest-less Tree over `dir_path` with `max_levels`, holding
+/// a single L0 SST built from `entries`. Returns the tree; caller closes it.
+const TombstoneFixture = struct {
+    ms: manifest.ForestState,
+    cache: TableCache,
+    tree: Tree,
+    file_ids: zdb.file_ids.FileIds,
+
+    fn deinit(self: *TombstoneFixture) void {
+        self.tree.close();
+        self.cache.deinit();
+        self.ms.deinit();
+    }
+};
+
+fn setupTombstoneTree(
+    alloc: std.mem.Allocator,
+    fx: *TombstoneFixture,
+    dir_path: []const u8,
+    max_levels: u8,
+    entries: []const MetaEntry,
+) !void {
+    const tree_id: u64 = 1;
+    fx.ms = manifest.ForestState.init(alloc);
+    errdefer fx.ms.deinit();
+    try fx.ms.commit(&.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+
+    var tb = try buildTableMeta(alloc, entries);
+    defer tb.deinit();
+    try installTable(alloc, &fx.ms, dir_path, &tb, 1, tree_id, 0);
+
+    const opts = config.Config{ .dir = dir_path, .max_levels = max_levels };
+    fx.cache = TableCache.init(alloc, opts.dir);
+    errdefer fx.cache.deinit();
+    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.ms, &fx.cache);
+    fx.file_ids = .{};
+    fx.file_ids.bind(1, 100, @ptrCast(&fx.file_ids), noopPersist);
+}
+
+test "compaction: bottom level drops a tombstone below the horizon and what it shadows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // max_levels=2 → L0's dest is L1, which IS the bottom level.
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 2, &.{
+        .{ .key = "k", .ts = 100, .val = "", .meta = .{ .kind = .deleted } },
+        .{ .key = "k", .ts = 50, .val = "old" },
+    });
+    defer fx.deinit();
+
+    // Horizon above the tombstone: nothing can read at or below ts=100 any
+    // more, so the tombstone and the version it shadows are both unreachable.
+    try fx.tree.doCompact(0, &fx.file_ids, 200);
+
+    try std.testing.expect((try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    )) == null);
+}
+
+test "compaction: a tombstone above the horizon is retained with the state it shadows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 2, &.{
+        .{ .key = "k", .ts = 100, .val = "", .meta = .{ .kind = .deleted } },
+        .{ .key = "k", .ts = 50, .val = "old" },
+    });
+    defer fx.deinit();
+
+    // Horizon below the tombstone: the deletion is not settled. The tombstone
+    // is the newest version and stays — and so does the state it shadows,
+    // because the state@50 is the first terminal at or below the horizon (50),
+    // i.e. the oldest version an allowed read can still resolve to.
+    try fx.tree.doCompact(0, &fx.file_ids, 50);
+
+    const got = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    try std.testing.expect(got.meta.isDeleted());
+    try std.testing.expectEqual(@as(u64, 100), got.key.timestamp);
+
+    // A read at 60 (>= horizon, so allowed) sees the pre-delete value: the
+    // tombstone at 100 hasn't happened yet from there, so the shadowed state
+    // is exactly what a correct MVCC read returns — and thus must survive GC.
+    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 60 }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("old", mid.value);
+}
+
+test "compaction: a non-bottom level never drops tombstones" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // max_levels=4 → L0's dest is L1, and L2/L3 sit below it. An older
+    // version of "k" could be down there, so dropping here would resurrect it.
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 4, &.{
+        .{ .key = "k", .ts = 100, .val = "", .meta = .{ .kind = .deleted } },
+        .{ .key = "k", .ts = 50, .val = "old" },
+    });
+    defer fx.deinit();
+
+    // Horizon is way above the tombstone — eligible on every count EXCEPT
+    // that this compaction isn't writing into the bottom level.
+    try fx.tree.doCompact(0, &fx.file_ids, 200);
+
+    const got = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    try std.testing.expect(got.meta.isDeleted());
+}
+
+test "compaction: a put above the horizon survives a lower tombstone's drop" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // The key is re-created after being deleted. Sort order is ts descending.
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 2, &.{
+        .{ .key = "k", .ts = 300, .val = "new" },
+        .{ .key = "k", .ts = 100, .val = "", .meta = .{ .kind = .deleted } },
+        .{ .key = "k", .ts = 50, .val = "old" },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 200);
+
+    // k@300 is above the horizon: still readable, untouched.
+    const got = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("new", got.value);
+    try std.testing.expect(!got.meta.isDeleted());
+
+    // k@100 and k@50 are gone. A read at 250 used to find the tombstone and
+    // report "deleted"; now it finds nothing — the same answer, which is
+    // exactly why the drop was legal.
+    try std.testing.expect((try fx.tree.get(
+        .{ .primary = "k", .timestamp = 250 },
+        .p0,
+    )) == null);
+}
+
+test "compaction: dropping one primary does not disturb its neighbours" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // "j" and "m" bracket the dropped primary: the skip must end when the
+    // primary changes, not run on and eat them.
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 2, &.{
+        .{ .key = "j", .ts = 10, .val = "jv" },
+        .{ .key = "k", .ts = 100, .val = "", .meta = .{ .kind = .deleted } },
+        .{ .key = "k", .ts = 50, .val = "old" },
+        .{ .key = "m", .ts = 10, .val = "mv" },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 200);
+
+    const j = try fx.tree.get(.{ .primary = "j", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("jv", j.value);
+    const m = try fx.tree.get(.{ .primary = "m", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("mv", m.value);
+    try std.testing.expect((try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    )) == null);
+}
+
+// ---------------------------------------------------------------------------
+// Version GC: shadowed updates + stale accounting
+// ---------------------------------------------------------------------------
+
+test "compaction: bottom level drops shadowed versions once they reach the horizon" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Three plain (no tombstone) versions of "k".
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 2, &.{
+        .{ .key = "k", .ts = 500, .val = "v500" },
+        .{ .key = "k", .ts = 300, .val = "v300" },
+        .{ .key = "k", .ts = 100, .val = "v100" },
+    });
+    defer fx.deinit();
+
+    // Horizon 600: all three are at or below it, so the two older versions are
+    // collectable. The newest value (k@500) is the current value and stays.
+    try fx.tree.doCompact(0, &fx.file_ids, 600);
+
+    const got = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("v500", got.value);
+    // A read that would have landed on k@300 finds nothing — it's collected.
+    try std.testing.expect((try fx.tree.get(.{ .primary = "k", .timestamp = 400 }, .p0)) == null);
+    // Only the newest survived → nothing shadowed remains → no stale data.
+    try std.testing.expectEqual(@as(u64, 0), levelStaleBytes(&fx.tree.levels[1]));
+}
+
+test "compaction: bottom level keeps a shadowed version above the horizon and counts it stale" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 2, &.{
+        .{ .key = "k", .ts = 500, .val = "v500" },
+        .{ .key = "k", .ts = 300, .val = "v300" },
+    });
+    defer fx.deinit();
+
+    // Horizon 200: both versions are above it, so nothing is collected yet — a
+    // read at 400 legitimately sees k@300, and it stays until the horizon
+    // rises past 300.
+    try fx.tree.doCompact(0, &fx.file_ids, 200);
+
+    const newest = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("v500", newest.value);
+    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 350 }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("v300", mid.value);
+    // k@300 is shadowed by the newer full row k@500 → counted stale: primary
+    // "k" (1) + value "v300" (4). Reclaimed once the horizon rises past 500.
+    try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
+}
+
+test "compaction: a non-bottom level keeps everything but still counts stale" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // max_levels=4 → L0's dest is L1, well above the bottom (L3). Nothing is
+    // dropped no matter how far the horizon has advanced, but the shadowed
+    // version is still accounted so a future trigger can see the garbage.
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 4, &.{
+        .{ .key = "k", .ts = 500, .val = "v500" },
+        .{ .key = "k", .ts = 300, .val = "v300" },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 600); // horizon irrelevant: not bottom
+
+    // Both versions survive — a non-bottom compaction never drops.
+    const newest = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("v500", newest.value);
+    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 350 }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("v300", mid.value);
+    // The shadowed k@300 is counted stale even though nothing was dropped.
+    try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
+}
+
+test "compaction: a delta above the newest state is live, not stale" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Newest-first: a delta on top of a full state, with an older state beneath
+    // it. Only the version BELOW the newest terminal (state@200) is stale — the
+    // delta and the state it rebuilds on are both live. This is the case the old
+    // "every non-newest version is stale" rule got wrong. Non-bottom keeps the
+    // drop path out of it, isolating the stale rule.
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 4, &.{
+        .{ .key = "k", .ts = 300, .val = "d300", .meta = .{ .kind = .delta } },
+        .{ .key = "k", .ts = 200, .val = "s200", .meta = .{ .kind = .state } },
+        .{ .key = "k", .ts = 100, .val = "s100", .meta = .{ .kind = .state } },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 0);
+
+    // All three survive (a non-bottom compaction drops nothing).
+    const top = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expect(top.meta.isDelta());
+    const base = try fx.tree.get(.{ .primary = "k", .timestamp = 250 }, .p0) orelse
+        return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("s200", base.value);
+
+    // Only k@100 sits below the newest terminal (state@200) → stale: "k" (1) +
+    // "s100" (4). The delta and its base state are NOT counted.
+    try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
+}
+

@@ -11,9 +11,9 @@ const Engine = @import("engine.zig").Engine;
 const zdb_bufs = zdb.buffers;
 const manifest = zdb.manifest;
 const Forest = zdb.forest.Forest;
-const Item = zdb.key.Item;
-const Key = zdb.key.Key;
-const TreeKey = zdb.key.TreeKey;
+const Item = zdb.kv.Item;
+const Key = zdb.kv.Key;
+const TreeKey = zdb.kv.TreeKey;
 const vfs = zdb.vfs;
 const metrics = zdb.metrics;
 const log = std.log.scoped(.admin);
@@ -24,6 +24,7 @@ const proto = @This();
 
 pub const Command = union(enum) {
     set: SetCmd,
+    del: DelCmd,
     set_batch: SetBatchCmd,
     get: GetCmd,
     scan: ScanCmd,
@@ -53,18 +54,30 @@ pub const help_text =
     \\
     \\  help                            show this message
     \\  set <ns> <key> <value>          single write
+    \\  del <ns> <key>                  delete: writes a tombstone version, so
+    \\                                  the key reads as absent from now on.
+    \\                                  Bytes are reclaimed later, by compaction
     \\  set-batch <ns> <count>          batch write; followed by count*2
     \\                                  whitespace-separated tokens (k1 v1 k2 v2 ...)
     \\                                  tokens prefixed with 0x are hex-decoded
     \\  get <ns> <key> [<read_ts>]      read; optional read_ts blocks until
     \\                                  this node's apply_ts >= read_ts
     \\  scan <ns> <start_key> <end_key> <max_count> [keys|kv|sizes]
+    \\       [versions=<n>] [deleted] [read_ts=<n>]
     \\                                  forward range scan over [start_key,
     \\                                  end_key). Pass `_` for either bound
     \\                                  to leave it open. One ITEM per
     \\                                  line, hex-encoded key + value.
     \\                                  END <count> terminates. Default
     \\                                  mode kv.
+    \\                                  versions=<n>: up to n versions per
+    \\                                  key, newest first (default 1).
+    \\                                  deleted: also emit tombstones and the
+    \\                                  versions behind them; without it a
+    \\                                  deleted key is skipped entirely.
+    \\                                  read_ts=<n>: scan as of timestamp n,
+    \\                                  blocking until apply_ts >= n first
+    \\                                  (same contract as get). Default latest.
     \\  conf <action> <node_id> [<addr>] cluster membership change
     \\                                  actions: add, to_voter, to_learner, remove, addr
     \\  ns create <ns>                  create a namespace
@@ -117,6 +130,15 @@ pub const SetCmd = struct {
     value: []const u8,
 };
 
+/// `del <ns> <key>` — write a tombstone over `key`. A delete is a write, not
+/// an erasure: it appends a new version whose meta kind is `deleted`, which
+/// shadows every older version on read. The bytes go away later, when a bottom-
+/// level compaction finds the tombstone below `global_min_read`.
+pub const DelCmd = struct {
+    ns: u32,
+    key: []const u8,
+};
+
 /// Header for a batched write. The body is `count * 2` whitespace-delimited
 /// tokens (key1, value1, key2, value2, ...). Whitespace is any run of
 /// space / tab / LF / CR — newlines are cosmetic. A token starting with `0x`
@@ -137,11 +159,17 @@ pub const GetCmd = struct {
     read_ts: u64 = 0,
 };
 
-/// `scan <ns> <start_key> <end_key> <max_count> [keys|kv|sizes]` —
+/// `scan <ns> <start_key> <end_key> <max_count> [keys|kv|sizes]
+///      [versions=<n>] [deleted]` —
 /// forward range scan over [start_key, end_key) on the tree owning
 /// `start_key`. The literal token `_` in either bound means "open"
 /// (no lower / no upper bound). Returns up to `max_count` `ITEM`
 /// lines, then a single `END <emitted>` line.
+///
+/// `versions=<n>` returns up to n versions of each key, newest first
+/// (default 1). `deleted` also surfaces tombstones and the versions behind
+/// them; without it a deleted key is skipped entirely. `read_ts=<n>` scans
+/// as of that timestamp.
 pub const ScanCmd = struct {
     ns: u32,
     start_key: []const u8,
@@ -150,6 +178,13 @@ pub const ScanCmd = struct {
     end_key: []const u8,
     max_count: u64,
     mode: Mode = .kv,
+    num_versions: u32 = 1,
+    include_deleted: bool = false,
+    /// Optional read timestamp, same convention as `get`: 0 means "serve
+    /// local applied state without blocking, at the latest version." If > 0,
+    /// the server waits until this node's apply_ts reaches it, then reports
+    /// the world as of that timestamp.
+    read_ts: u64 = 0,
 
     pub const Mode = enum { keys, kv, sizes };
 };
@@ -207,7 +242,15 @@ pub const max_token_size: usize = 64 * 1024;
 /// surrounding `ParsedBatch.buf` (or in line_buf for single-set
 /// commands); the consumer must not retain them past the parse's
 /// owning structure's deinit.
-pub const KV = struct { key: []const u8, value: []const u8 };
+/// `meta` defaults to `.raw`, so `set` and `set-batch` construct these
+/// unchanged and produce plain puts. `del` sets `kind = .deleted`. The field is
+/// what `Engine.encodeMutations` probes for to decide whether to put a meta
+/// byte on the wire.
+pub const KV = struct {
+    key: []const u8,
+    value: []const u8,
+    meta: zdb.kv.Meta = .{},
+};
 
 /// Fully parsed `set-batch` body: `count * 2` whitespace-delimited
 /// tokens organized into `count` (key, value) pairs. `buf` owns the
@@ -349,6 +392,13 @@ pub fn parseLine(line: []const u8) !Command {
             .key = key,
             .value = value,
         } };
+    } else if (std.mem.eql(u8, cmd, "del")) {
+        const ns_str = it.next() orelse return error.MissingNamespace;
+        const key = it.next() orelse return error.MissingKey;
+        return .{ .del = .{
+            .ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace,
+            .key = key,
+        } };
     } else if (std.mem.eql(u8, cmd, "set-batch")) {
         const ns_str = it.next() orelse return error.MissingNamespace;
         const count_str = it.next() orelse return error.MissingCount;
@@ -375,12 +425,33 @@ pub fn parseLine(line: []const u8) !Command {
         const start_tok = it.next() orelse return error.MissingKey;
         const end_tok = it.next() orelse return error.MissingKey;
         const count_str = it.next() orelse return error.MissingCount;
-        const mode: ScanCmd.Mode = if (it.next()) |m_str| blk: {
-            if (std.mem.eql(u8, m_str, "keys")) break :blk .keys;
-            if (std.mem.eql(u8, m_str, "kv")) break :blk .kv;
-            if (std.mem.eql(u8, m_str, "sizes")) break :blk .sizes;
-            return error.InvalidArg;
-        } else .kv;
+        // Trailing options in any order: a mode name, versions=<n>, deleted,
+        // read_ts=<n>.
+        var mode: ScanCmd.Mode = .kv;
+        var num_versions: u32 = 1;
+        var include_deleted = false;
+        var scan_read_ts: u64 = 0;
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, "keys")) {
+                mode = .keys;
+            } else if (std.mem.eql(u8, tok, "kv")) {
+                mode = .kv;
+            } else if (std.mem.eql(u8, tok, "sizes")) {
+                mode = .sizes;
+            } else if (std.mem.eql(u8, tok, "deleted")) {
+                include_deleted = true;
+            } else if (std.mem.startsWith(u8, tok, "versions=")) {
+                const n_str = tok["versions=".len..];
+                num_versions = std.fmt.parseInt(u32, n_str, 10) catch
+                    return error.InvalidArg;
+            } else if (std.mem.startsWith(u8, tok, "read_ts=")) {
+                const ts_str = tok["read_ts=".len..];
+                scan_read_ts = std.fmt.parseInt(u64, ts_str, 10) catch
+                    return error.InvalidArg;
+            } else {
+                return error.InvalidArg;
+            }
+        }
         // `_` is the open-bound sentinel (a literal underscore would need
         // to be sent hex-encoded — not currently supported by the scan
         // parser, which takes raw text tokens like `get`).
@@ -392,6 +463,9 @@ pub fn parseLine(line: []const u8) !Command {
             .end_key = end_key,
             .max_count = std.fmt.parseInt(u64, count_str, 10) catch return error.InvalidCount,
             .mode = mode,
+            .num_versions = num_versions,
+            .include_deleted = include_deleted,
+            .read_ts = scan_read_ts,
         } };
     } else if (std.mem.eql(u8, cmd, "conf")) {
         const action_str = it.next() orelse return error.MissingAction;
@@ -678,6 +752,10 @@ pub const AdminServer = struct {
                     });
                     self.handleSet(stream, req) catch return;
                 },
+                .del => |req| {
+                    log.debug("DEL ns={d} key={s}", .{ req.ns, req.key });
+                    self.handleDel(stream, req) catch return;
+                },
                 .set_batch => |req| {
                     log.debug("SET_BATCH ns={d} count={d}", .{ req.ns, req.count });
                     var batch = proto.readSetBatchBody(r, req.ns, req.count, self.engine.allocator) catch |err| {
@@ -692,8 +770,9 @@ pub const AdminServer = struct {
                     self.handleGet(stream, req) catch return;
                 },
                 .scan => |req| {
-                    log.debug("SCAN ns={d} start_key={s} max={d} mode={s}", .{
-                        req.ns, req.start_key, req.max_count, @tagName(req.mode),
+                    log.debug("SCAN ns={d} start_key={s} max={d} mode={s} versions={d} deleted={}", .{
+                        req.ns,           req.start_key,      req.max_count,
+                        @tagName(req.mode), req.num_versions, req.include_deleted,
                     });
                     self.handleScan(stream, req) catch return;
                 },
@@ -729,23 +808,49 @@ pub const AdminServer = struct {
     }
 
     fn handleSet(self: *AdminServer, stream: fiber.net.Stream, req: proto.SetCmd) !void {
+        return self.proposeOneKV(stream, req.ns, .{
+            .key = req.key,
+            .value = req.value,
+        }, "SET");
+    }
+
+    /// A delete is a put of an empty value with meta kind `deleted` — same wire
+    /// shape, same propose path, same commit semantics as `set`.
+    fn handleDel(self: *AdminServer, stream: fiber.net.Stream, req: proto.DelCmd) !void {
+        return self.proposeOneKV(stream, req.ns, .{
+            .key = req.key,
+            .value = "",
+            .meta = .{ .kind = .deleted },
+        }, "DEL");
+    }
+
+    /// Propose a single KV through Raft and block until it commits. `verb` is
+    /// only used to label log lines, so `set` and `del` stay distinguishable
+    /// in the log while sharing one code path.
+    fn proposeOneKV(
+        self: *AdminServer,
+        stream: fiber.net.Stream,
+        ns: u32,
+        kv: proto.KV,
+        comptime verb: []const u8,
+    ) !void {
         // Reject up-front if the destination namespace has no route table.
         // Otherwise the mutation is durably committed through Raft but
         // `buildFlush` will silently drop it (no tree to route to), and the
         // immutable memtable never gets popped — RAM grows without bound.
-        if (!self.engine.forest.hasNamespace(req.ns)) {
-            try writeUnknownNamespace(stream, req.ns);
+        if (!self.engine.forest.hasNamespace(ns)) {
+            try writeUnknownNamespace(stream, ns);
             return;
         }
-        self.engine.applyWriteBackpressure(req.ns);
+        self.engine.applyWriteBackpressure(ns);
         // Encode as a single-item Mutations batch — the wire format is the
         // same regardless of batch size, so the apply path doesn't need to
         // know whether this write came from a `set` or a `set_batch`.
         const proposal_bytes = try Engine.encodeMutations(
             self.engine.allocator,
-            req.ns,
+            ns,
             0,
-            &[_]proto.KV{.{ .key = req.key, .value = req.value }},
+            &[_]proto.KV{kv},
         );
         defer self.engine.allocator.free(proposal_bytes);
 
@@ -769,23 +874,23 @@ pub const AdminServer = struct {
 
         // Block until the commit callback fires.
         ctx.wg.wait() catch {
-            log.err("wg.wait failed for set", .{});
+            log.err("wg.wait failed for " ++ verb, .{});
             try proto.writeErr(stream, "commit wait failed");
             return;
         };
 
         switch (ctx.status) {
             .committed => {
-                log.debug("SET committed", .{});
+                log.debug(verb ++ " committed", .{});
                 try proto.writeOk(stream);
             },
             .not_leader => {
                 const leader = self.engine.node.getLeaderId() orelse 0;
-                log.info("SET rejected: not leader (leader={d})", .{leader});
+                log.info(verb ++ " rejected: not leader (leader={d})", .{leader});
                 try proto.writeNotLeader(stream, leader);
             },
             else => {
-                log.err("SET failed: status={s}", .{@tagName(ctx.status)});
+                log.err(verb ++ " failed: status={s}", .{@tagName(ctx.status)});
                 try proto.writeErr(stream, @tagName(ctx.status));
             },
         }
@@ -863,10 +968,22 @@ pub const AdminServer = struct {
     }
 
     fn handleScan(self: *AdminServer, stream: fiber.net.Stream, req: proto.ScanCmd) !void {
+        // Same read_ts contract as `get`: a positive value is first a
+        // freshness barrier (wait for this node to have applied that far),
+        // then the as-of timestamp for the scan itself. 0 → latest.
+        if (req.read_ts > 0) {
+            self.engine.node.waitForApplied(req.read_ts, 5000) catch {
+                try proto.writeErr(stream, "read_stale");
+                return;
+            };
+        }
+        const read_ts: u64 = if (req.read_ts == 0) std.math.maxInt(u64) else req.read_ts;
+
         // Scan range = [start, end). Both bounds use ts=maxInt so the
         // primary-key compare comes first and same-primary versions
-        // sort newest-first inside the bound. An empty primary on
-        // either side means "open."
+        // sort newest-first inside the bound. Visibility is decided by
+        // read_ts, not by these bounds. An empty primary on either side
+        // means "open."
         const scan_start = Key{
             .namespace = req.ns,
             .primary = req.start_key,
@@ -896,7 +1013,7 @@ pub const AdminServer = struct {
             mode: proto.ScanCmd.Mode,
             ns: u32,
 
-            fn emit(ctx_raw: *anyopaque, item: zdb.key.Item) anyerror!bool {
+            fn emit(ctx_raw: *anyopaque, item: zdb.kv.Item) anyerror!bool {
                 const c: *@This() = @ptrCast(@alignCast(ctx_raw));
                 // Memtables are forest-wide; an item with a different
                 // namespace means we've walked off the end of ours.
@@ -916,8 +1033,12 @@ pub const AdminServer = struct {
         const emitted = self.engine.forest.scan(
             self.engine.allocator,
             scan_range,
-            req.max_count,
-            .p0,
+            .{
+                .max_rows = req.max_count,
+                .num_versions = req.num_versions,
+                .include_deleted = req.include_deleted,
+                .read_ts = read_ts,
+            },
             @ptrCast(&cctx),
             &Ctx.emit,
         ) catch |err| {

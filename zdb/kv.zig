@@ -1,8 +1,94 @@
 const std = @import("std");
 
+/// How a value's bytes are encoded. Lives in Meta's high nibble.
+///
+/// Non-exhaustive on purpose: Meta is @bitCast from bytes we read off disk, so
+/// every u4 must be a legal value. An exhaustive enum would make an unknown tag
+/// illegal behavior at the bitCast — a panic in Debug, UB in ReleaseFast — on
+/// data some future writer produced. Switches on this must carry an `else`.
+pub const Encoding = enum(u4) {
+    raw = 0,
+    roaring = 1,
+    _,
+};
+
+/// What a row version is, relative to the older versions of the same key.
+/// Compaction consults this to decide how far down a key's history it must keep
+/// (see Tree.buildCompaction).
+///
+/// Non-exhaustive for the same reason as Encoding: Meta is @bitCast from disk
+/// bytes, so the fourth (unused) u2 value must stay legal. `state` is 0 so a
+/// zeroed Meta is a self-contained row — the safe default. Switches must carry
+/// an `else`.
+pub const Kind = enum(u2) {
+    /// A complete row: reading it needs nothing older. Once the read horizon
+    /// passes it, every version beneath it is dead history.
+    state = 0,
+    /// A partial row layered on the versions below it. The nearest `state`
+    /// (and any deltas between) must survive for this to be reconstructable, so
+    /// compaction never seals a key on a delta.
+    delta = 1,
+    /// A tombstone: the key reads as absent from this version onward.
+    deleted = 2,
+    _,
+};
+
+/// One byte of metadata about a row, carried verbatim end-to-end: wire →
+/// memtable → SST → compaction → read. Low nibble holds the row `kind`, high
+/// nibble the value `encoding`.
+///
+/// `kind` is interpreted: `deleted` makes a key read as absent (Forest.get) and
+/// lets bottom-level compaction forget it, while `state`/`delta` decide how much
+/// version history that compaction must retain (Tree.buildCompaction). The
+/// `encoding` nibble is still mechanism-only — `roaring` has no implementation
+/// behind it yet.
+///
+/// Meta belongs to a row (an Item), never to a Key. A Key doubles as a bare
+/// position in keyspace — tree boundaries, iterator bounds, block base keys —
+/// where "is this a tombstone" has no meaning. Keeping meta off Key is what
+/// stops e.g. Tree.findSplitKey from minting a boundary that claims to be
+/// deleted.
+///
+/// Zig packs LSB-first (u/hlc.zig relies on the same), so the bit positions
+/// below are the on-disk positions. They are frozen: zdb/kv_test.zig asserts
+/// them, and SSTs on disk depend on them.
+pub const Meta = packed struct(u8) {
+    kind: Kind = .state, // bits 0-1
+    _reserved: u2 = 0, // bits 2-3
+    encoding: Encoding = .raw, // bits 4-7
+
+    /// A plain state row, raw value. The default for anything that doesn't care.
+    pub const raw: Meta = .{};
+
+    pub inline fn isState(self: Meta) bool {
+        return self.kind == .state;
+    }
+
+    pub inline fn isDelta(self: Meta) bool {
+        return self.kind == .delta;
+    }
+
+    pub inline fn isDeleted(self: Meta) bool {
+        return self.kind == .deleted;
+    }
+
+    pub inline fn toByte(self: Meta) u8 {
+        return @bitCast(self);
+    }
+
+    pub inline fn fromByte(b: u8) Meta {
+        return @bitCast(b);
+    }
+};
+
+/// One row: where it lives (key), what it holds (value), and what's true about
+/// it (meta).
 pub const Item = struct {
     key: Key,
     value: []const u8,
+    // No default. Every construction site is a place where silently defaulting
+    // to .raw would drop a row's metadata, so let the compiler catch a new one.
+    meta: Meta,
 
     pub fn dupe(self: Item, allocator: std.mem.Allocator) !Item {
         const primary = try allocator.dupe(u8, self.key.primary);
@@ -17,6 +103,7 @@ pub const Item = struct {
                 .timestamp = self.key.timestamp,
             },
             .value = v,
+            .meta = self.meta,
         };
     }
 

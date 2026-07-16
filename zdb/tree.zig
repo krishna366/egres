@@ -14,7 +14,7 @@ const TableIterator = table_mod.TableIterator;
 const Item = table_mod.table.Item;
 const Level = level_handler.Level;
 const TableEntry = level_handler.TableEntry;
-const Key = @import("key.zig").Key;
+const Key = @import("kv.zig").Key;
 const KeyRange = level_handler.KeyRange;
 const MergeIterator = table_mod.merge_iterator.MergeIterator;
 const ConcatIterator = table_mod.merge_iterator.ConcatIterator;
@@ -42,6 +42,74 @@ const LevelPriority = struct {
     level: usize,
     score: f64,
     adjusted: f64,
+};
+
+/// Tracks the version run for one primary during compaction.
+///
+/// A terminal is a complete state or tombstone. Versions after the newest
+/// terminal are shadowed and count as stale. At the bottom level, the first
+/// terminal at or below the read horizon establishes a discard boundary.
+/// A settled tombstone is itself unreachable and is discarded.
+const VersionTracker = struct {
+    const Update = struct {
+        discard: bool = false,
+        stale_bytes: usize = 0,
+    };
+
+    allocator: std.mem.Allocator,
+    can_discard_versions: bool,
+    global_min_read_ts: u64,
+
+    primary: std.ArrayList(u8) = .empty,
+    stale_below: u64 = 0,
+    discard_below: u64 = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        global_min_read_ts: u64,
+        can_discard_versions: bool,
+    ) VersionTracker {
+        return .{
+            .allocator = allocator,
+            .global_min_read_ts = global_min_read_ts,
+            .can_discard_versions = can_discard_versions,
+        };
+    }
+
+    fn deinit(self: *VersionTracker) void {
+        self.primary.deinit(self.allocator);
+    }
+
+    fn update(self: *VersionTracker, item: Item) !Update {
+        if (!item.key.equalPrimary(.{ .primary = self.primary.items })) {
+            self.primary.clearRetainingCapacity();
+            try self.primary.appendSlice(self.allocator, item.key.primary);
+
+            self.stale_below = 0;
+            self.discard_below = 0;
+        }
+
+        if (item.key.timestamp < self.discard_below) {
+            return .{ .discard = true };
+        }
+        const stale_bytes = if (item.key.timestamp < self.stale_below)
+            item.key.primary.len + item.value.len
+        else
+            0;
+
+        if (item.meta.isState() or item.meta.isDeleted()) {
+            if (self.stale_below == 0) {
+                self.stale_below = item.key.timestamp;
+            }
+
+            if (self.can_discard_versions and item.key.timestamp <= self.global_min_read_ts) {
+                self.discard_below = item.key.timestamp;
+                if (item.meta.isDeleted()) return .{ .discard = true };
+            }
+        }
+
+        return .{ .stale_bytes = stale_bytes };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -668,10 +736,10 @@ pub const Tree = struct {
 
         // L≥1: size-based score.
         for (1..n) |j| {
-            const sz = self.levels[j].getTotalSize();
             const target = t.target_sz[j];
             const score = if (target > 0)
-                @as(f64, @floatFromInt(sz)) / @as(f64, @floatFromInt(target))
+                @as(f64, @floatFromInt(self.levels[j].getTotalSize())) /
+                    @as(f64, @floatFromInt(target))
             else
                 0.0;
             prios[j] = .{ .level = j, .score = score, .adjusted = score };
@@ -741,8 +809,8 @@ pub const Tree = struct {
     /// doCompact runs the full compaction pipeline: buildCompaction (Phase A)
     /// then applyCompaction (Phase B). For Raft integration, callers can use
     /// buildCompaction and applyCompaction separately.
-    pub fn doCompact(self: *Tree, src_level: u8, file_ids: *fi.FileIds) !void {
-        var changes = try self.buildCompaction(src_level, file_ids);
+    pub fn doCompact(self: *Tree, src_level: u8, file_ids: *fi.FileIds, global_min_read: u64) !void {
+        var changes = try self.buildCompaction(src_level, file_ids, global_min_read);
         defer changes.deinit(self.allocator);
         try self.applyCompaction(changes.items);
     }
@@ -751,7 +819,11 @@ pub const Tree = struct {
     /// writes new SST files, and returns the manifest SSTableChange list describing
     /// the result. The caller is responsible for proposing these changes (e.g.
     /// through Raft) and then calling applyCompaction.
-    pub fn buildCompaction(self: *Tree, src_level: u8, file_ids: *fi.FileIds) !std.ArrayList(manifest.SSTableChange) {
+    ///
+    /// `global_min_read` is the oldest timestamp a reader may still ask for
+    /// (`Forest.global_min_read`); anything strictly below it is unobservable
+    /// and eligible to be discarded. Pass 0 to discard nothing.
+    pub fn buildCompaction(self: *Tree, src_level: u8, file_ids: *fi.FileIds, global_min_read: u64) !std.ArrayList(manifest.SSTableChange) {
         const src: usize = src_level;
         const prio: vfs.Priority = if (src_level == 0) .p1 else .p2;
 
@@ -865,21 +937,47 @@ pub const Tree = struct {
             flush_group.deinit();
         }
 
-        // Diagnostic: count items + bytes pulled from the merge iterator vs
-        // items + bytes accepted by the builder. Pre-fix expectation (no
-        // tombstones, no shadowing because the bench writes each primary at
-        // most once): in/out should be EQUAL on both axes, AND keys should
-        // equal the sum of `index.key_count` across all input tables.
-        // `bytes_*` count user data only (key.primary + value), not the
-        // 16-byte ns/tid/ts framing.
-        var keys_in: u64 = 0;
-        var keys_out: u64 = 0;
-        var bytes_in: u64 = 0;
-        var bytes_out: u64 = 0;
+        // Only the bottom level may discard history: lower levels could still
+        // contain a version that an early tombstone would otherwise resurrect.
+        var version_tracker = VersionTracker.init(
+            self.allocator,
+            global_min_read,
+            dest == @as(usize, self.opts.max_levels) - 1,
+        );
+        defer version_tracker.deinit();
+
+        // Diagnostics. `keys_in - keys_out` is what this compaction discarded on
+        // purpose (settled history below the horizon); 0 above the bottom level.
+        // `stale_bytes` is kept-but-shadowed data, recorded per output table in
+        // stale_data_size. A nonzero `expected_in - keys_in` is never expected —
+        // it means the merge iterator lost rows. `bytes_*` count user data only
+        // (key.primary + value), not framing.
+        const Metrics = struct {
+            keys_in: u64 = 0,
+            keys_out: u64 = 0,
+            bytes_in: u64 = 0,
+            bytes_out: u64 = 0,
+            dropped_bytes: u64 = 0,
+            stale_bytes: u64 = 0,
+            src_keys: u64 = 0,
+            src_bytes_disk: u64 = 0,
+            bot_keys: u64 = 0,
+            bot_bytes_disk: u64 = 0,
+        };
+        var stats: Metrics = .{};
 
         while (merge.itemRef()) |item| {
-            keys_in += 1;
-            bytes_in += item.key.primary.len + item.value.len;
+            stats.keys_in += 1;
+            const nbytes = item.key.primary.len + item.value.len;
+            stats.bytes_in += nbytes;
+
+            const version = try version_tracker.update(item);
+            if (version.discard) {
+                stats.dropped_bytes += nbytes;
+                try merge.next();
+                continue;
+            }
+
             if (bld.table_bytes.items.len >= file_sz) {
                 // We are not going to break up a primary key across tables. All the versions for
                 // this key should live in the same table. This avoids a scenario where a table with
@@ -892,9 +990,13 @@ pub const Tree = struct {
                     bld.reset();
                 }
             }
-            try bld.add(item.key, item.value);
-            keys_out += 1;
-            bytes_out += item.key.primary.len + item.value.len;
+            try bld.addItem(item);
+            if (version.stale_bytes > 0) {
+                bld.addStaleBytes(version.stale_bytes);
+                stats.stale_bytes += version.stale_bytes;
+            }
+            stats.keys_out += 1;
+            stats.bytes_out += nbytes;
             try merge.next();
         }
 
@@ -902,37 +1004,32 @@ pub const Tree = struct {
         try self.flushBuilderOutput(&bld, &flush_group, file_ids);
 
         // Sum up input key counts + on-disk byte sizes from every src + bot
-        // SST's index for the "expected" baseline. If keys_in != expected,
-        // the merge iterator is dropping items. If keys_out != keys_in, the
-        // builder is dropping.
-        var src_keys: u64 = 0;
-        var src_bytes_disk: u64 = 0;
-        var src_min_ts: u64 = std.math.maxInt(u64);
-        var src_max_ts: u64 = 0;
+        // SST's index for the "expected" baseline. If keys_in != expected, the
+        // merge iterator is losing items and something is wrong. keys_out <
+        // keys_in is normal now: it's what this compaction discarded.
         for (src_entries_slice) |e| {
-            src_keys += @intCast(e.table.index.key_count);
-            src_bytes_disk += e.table.fileSize();
-            const mv = e.table.index.max_version;
-            if (mv > src_max_ts) src_max_ts = mv;
-            if (mv < src_min_ts) src_min_ts = mv;
+            stats.src_keys += @intCast(e.table.index.key_count);
+            stats.src_bytes_disk += e.table.fileSize();
         }
-        var bot_keys: u64 = 0;
-        var bot_bytes_disk: u64 = 0;
         for (bot_entries_slice) |e| {
-            bot_keys += @intCast(e.table.index.key_count);
-            bot_bytes_disk += e.table.fileSize();
+            stats.bot_keys += @intCast(e.table.index.key_count);
+            stats.bot_bytes_disk += e.table.fileSize();
         }
-        const expected_in = src_keys + bot_keys;
-        const expected_bytes_disk = src_bytes_disk + bot_bytes_disk;
+        const expected_in = stats.src_keys + stats.bot_keys;
+        const expected_bytes_disk =
+            stats.src_bytes_disk + stats.bot_bytes_disk;
+        const lost_in_iter = expected_in -| stats.keys_in;
+        const discarded = stats.keys_in -| stats.keys_out;
         log.info(
-            "compact tree={d} L{d}->L{d} src_tables={d} src_keys={d} src_bytes_disk={d} bot_tables={d} bot_keys={d} bot_bytes_disk={d} expected_in={d} expected_bytes_disk={d} keys_in={d} keys_out={d} bytes_in={d} bytes_out={d} dropped_in_iter={d} dropped_in_builder={d}",
+            "compact tree={d} L{d}->L{d} src_tables={d} src_keys={d} src_bytes_disk={d} bot_tables={d} bot_keys={d} bot_bytes_disk={d} expected_in={d} expected_bytes_disk={d} keys_in={d} keys_out={d} bytes_in={d} bytes_out={d} lost_in_iter={d} discarded={d} discarded_bytes={d} stale_bytes={d} min_read={d}",
             .{
-                self.tree_id,           src,                 dest,
-                src_entries_slice.len,  src_keys,            src_bytes_disk,
-                bot_entries_slice.len,  bot_keys,            bot_bytes_disk,
-                expected_in,            expected_bytes_disk, keys_in,
-                keys_out,               bytes_in,            bytes_out,
-                expected_in -| keys_in, keys_in -| keys_out,
+                self.tree_id,          src,                 dest,
+                src_entries_slice.len, stats.src_keys,      stats.src_bytes_disk,
+                bot_entries_slice.len, stats.bot_keys,      stats.bot_bytes_disk,
+                expected_in,           expected_bytes_disk, stats.keys_in,
+                stats.keys_out,        stats.bytes_in,      stats.bytes_out,
+                lost_in_iter,          discarded,           stats.dropped_bytes,
+                stats.stale_bytes,     global_min_read,
             },
         );
 

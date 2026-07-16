@@ -341,6 +341,7 @@ pub const TableIndexStruct = struct {
     last_key: []const u8 = &.{},
     blocks: []BlockIndexStruct = &.{},
     binary_fuse: ?BinaryFuseFilterStruct = null,
+    format_version: u32 = 0,
     pub fn deinit(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.last_key);
         self.last_key = &.{};
@@ -364,6 +365,7 @@ pub const TableIndexStruct = struct {
             .compressed_size = self.compressed_size,
             .stale_data_size = self.stale_data_size,
             .compression = self.compression,
+            .format_version = self.format_version,
         };
         errdefer s.deinit(alloc);
         s.last_key = try alloc.dupe(u8, self.last_key);
@@ -408,6 +410,7 @@ pub const TableIndexStruct = struct {
             const child_off = try child.marshalTo(alloc, out);
             try writer.setBinaryFuse(child_off);
         }
+        try writer.setFormatVersion(self.format_version);
         const result = try writer.finish();
         return result.offset;
     }
@@ -420,7 +423,7 @@ pub const TableIndexReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46594;
-    pub const SIZE_BYTES: u16 = 47;
+    pub const SIZE_BYTES: u16 = 51;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -522,6 +525,13 @@ pub const TableIndexReader = struct {
         return BinaryFuseFilterReader.init(self.buf, off) catch null;
     }
 
+    pub fn formatVersion(self: Self) u32 {
+        const slot_end = @as(u32, self.base) + 51;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 47)) catch 0;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try TableIndexWriter.initWithBuf(alloc, out);
         try writer.setMaxVersion(self.maxVersion());
@@ -546,6 +556,7 @@ pub const TableIndexReader = struct {
             const child_off = try child.cloneInto(alloc, out);
             try writer.setBinaryFuse(child_off);
         }
+        try writer.setFormatVersion(self.formatVersion());
         const result = try writer.finish();
         return result.offset;
     }
@@ -588,6 +599,7 @@ pub const TableIndexReader = struct {
             .compressed_size = self.compressedSize(),
             .stale_data_size = self.staleDataSize(),
             .compression = self.compression(),
+            .format_version = self.formatVersion(),
         };
         errdefer s.deinit(alloc);
         s.last_key = try alloc.dupe(u8, self.lastKey());
@@ -648,7 +660,7 @@ pub const TableIndexWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46594;
-    pub const SIZE_BYTES: u16 = 47;
+    pub const SIZE_BYTES: u16 = 51;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -732,6 +744,11 @@ pub const TableIndexWriter = struct {
         try zbuf.patchU32(out.items, self.base + 43, child_off);
     }
 
+    pub fn setFormatVersion(self: *Self, v: u32) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU32(out.items, self.base + 47, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -746,6 +763,7 @@ pub const TableIndexWriter = struct {
         if (@hasField(Values, "last_key")) try self.setLastKey(@field(values, "last_key"));
         if (@hasField(Values, "blocks")) try self.setBlocks(@field(values, "blocks"));
         if (@hasField(Values, "binary_fuse")) try self.setBinaryFuse(@field(values, "binary_fuse"));
+        if (@hasField(Values, "format_version")) try self.setFormatVersion(@field(values, "format_version"));
     }
 
     pub fn finish(self: *Self) Error!TableIndexBuffer {
@@ -2273,6 +2291,7 @@ pub const KeyValueStruct = struct {
     pub const TABLE_ID: u16 = 46599;
     key: []const u8 = &.{},
     value: []const u8 = &.{},
+    meta: u8 = 0,
     pub fn deinit(self: *KeyValueStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         self.key = &.{};
@@ -2286,7 +2305,9 @@ pub const KeyValueStruct = struct {
     }
 
     fn cloneValue(self: KeyValueStruct, alloc: std.mem.Allocator) Error!KeyValueStruct {
-        var s = KeyValueStruct{};
+        var s = KeyValueStruct{
+            .meta = self.meta,
+        };
         errdefer s.deinit(alloc);
         s.key = try alloc.dupe(u8, self.key);
         s.value = try alloc.dupe(u8, self.value);
@@ -2304,6 +2325,7 @@ pub const KeyValueStruct = struct {
         var writer = try KeyValueWriter.initWithBuf(alloc, out);
         try writer.setKey(self.key);
         try writer.setValue(self.value);
+        try writer.setMeta(self.meta);
         const result = try writer.finish();
         return result.offset;
     }
@@ -2316,7 +2338,7 @@ pub const KeyValueReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46599;
-    pub const SIZE_BYTES: u16 = 18;
+    pub const SIZE_BYTES: u16 = 19;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -2352,10 +2374,18 @@ pub const KeyValueReader = struct {
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
+    pub fn meta(self: Self) u8 {
+        const slot_end = @as(u32, self.base) + 19;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU8(self.buf, @as(usize, self.base + 18)) catch 0;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try KeyValueWriter.initWithBuf(alloc, out);
         try writer.setKey(self.key());
         try writer.setValue(self.value());
+        try writer.setMeta(self.meta());
         const result = try writer.finish();
         return result.offset;
     }
@@ -2381,7 +2411,9 @@ pub const KeyValueReader = struct {
         }
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!KeyValueStruct {
-        var s = KeyValueStruct{};
+        var s = KeyValueStruct{
+            .meta = self.meta(),
+        };
         errdefer s.deinit(alloc);
         s.key = try alloc.dupe(u8, self.key());
         s.value = try alloc.dupe(u8, self.value());
@@ -2430,7 +2462,7 @@ pub const KeyValueWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46599;
-    pub const SIZE_BYTES: u16 = 18;
+    pub const SIZE_BYTES: u16 = 19;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -2477,6 +2509,11 @@ pub const KeyValueWriter = struct {
         try zbuf.patchU32(out.items, self.base + 14, @as(u32, @intCast(data.len)));
     }
 
+    pub fn setMeta(self: *Self, v: u8) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU8(out.items, self.base + 18, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -2484,6 +2521,7 @@ pub const KeyValueWriter = struct {
         }
         if (@hasField(Values, "key")) try self.setKey(@field(values, "key"));
         if (@hasField(Values, "value")) try self.setValue(@field(values, "value"));
+        if (@hasField(Values, "meta")) try self.setMeta(@field(values, "meta"));
     }
 
     pub fn finish(self: *Self) Error!KeyValueBuffer {

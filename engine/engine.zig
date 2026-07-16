@@ -26,9 +26,10 @@ pub const SnapshotCfg = struct {
 const zdb_bufs = zdb.buffers;
 const manifest = zdb.manifest;
 const Forest = zdb.forest.Forest;
-const Item = zdb.key.Item;
-const Key = zdb.key.Key;
-const TreeKey = zdb.key.TreeKey;
+const Item = zdb.kv.Item;
+const Key = zdb.kv.Key;
+const Meta = zdb.kv.Meta;
+const TreeKey = zdb.kv.TreeKey;
 const vfs = zdb.vfs;
 const metrics = zdb.metrics;
 const log = std.log.scoped(.engine);
@@ -41,7 +42,7 @@ const log = std.log.scoped(.engine);
 /// without re-scanning. MUST NOT block, propose, or re-enter the engine.
 pub const ApplyObserver = struct {
     ctx: *anyopaque,
-    onData: *const fn (ctx: *anyopaque, namespace: u64, table_id: u32, items: []const zdb.key.Item) void,
+    onData: *const fn (ctx: *anyopaque, namespace: u64, table_id: u32, items: []const zdb.kv.Item) void,
 };
 
 pub const StorageImpl = struct {
@@ -143,6 +144,7 @@ pub const StorageImpl = struct {
                             .timestamp = entry.timestamp,
                         },
                         .value = val,
+                        .meta = Meta.fromByte(kv.meta()),
                     });
                     total_bytes += val.len;
                 }
@@ -982,7 +984,11 @@ pub const Engine = struct {
         const t0 = fiber.coarseMs();
         log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.key.tree_id, src, dst });
 
-        var changes = try target.tree.buildCompaction(src, &self.forest.file_ids);
+        var changes = try target.tree.buildCompaction(
+            src,
+            &self.forest.file_ids,
+            self.forest.globalMinRead(),
+        );
         defer changes.deinit(self.allocator);
         if (changes.items.len == 0) {
             log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});
@@ -1200,6 +1206,11 @@ pub const Engine = struct {
         for (kvs, 0..) |kv, i| {
             var kvw = try zdb_bufs.KeyValueWriter.initWithBuf(allocator, &buf);
             try kvw.set(.{ .key = kv.key, .value = kv.value });
+            // Callers whose element type carries meta (future tombstone /
+            // roaring writers) put it on the wire; everyone else leaves the
+            // slot at its zeroed default, which decodes as Meta.raw — exactly
+            // a plain put. Mirrors the generated set()'s own @hasField probe.
+            if (@hasField(@TypeOf(kv), "meta")) try kvw.setMeta(kv.meta.toByte());
             offsets[i] = (try kvw.finish()).offset;
         }
         try mw.setNamespace(namespace);

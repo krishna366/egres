@@ -1,11 +1,22 @@
 const std = @import("std");
 
-pub const magic: u32 = 0x3154425A; // "ZTB1" as little-endian u32
+/// Version of the per-entry block encoding, stored in TableIndex.format_version
+/// and checked when a table is opened. Bump this whenever the entry layout in
+/// table/builder.zig changes — including a change to what the meta byte's bits
+/// MEAN (kv.zig Meta), since that mis-decodes just as silently as a shifted
+/// field would.
+///
+/// 0 is never legal: an SST written before the field existed reads back 0 (zbuf
+/// readers return 0 for slots past size_bytes), and that's exactly the case we
+/// need to reject.
+///
+/// 1: [u16 key_overlap][u16 key_diff_len][u8 meta][key diff][value]
+pub const format_version: u32 = 1;
+
 pub const trailer_len: usize = 12;
 
 pub const Error = error{
     CorruptTable,
-    InvalidMagic,
     OutOfBounds,
 };
 

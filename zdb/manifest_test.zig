@@ -3,7 +3,7 @@ const zdb = @import("zdb");
 
 const manifest = zdb.manifest;
 const ManifestError = manifest.ManifestError;
-const TreeKey = zdb.key.TreeKey;
+const TreeKey = zdb.kv.TreeKey;
 const createSSTableChange = manifest.createSSTableChange;
 const deleteSSTableChange = manifest.deleteSSTableChange;
 const createTreeChange = manifest.createTreeChange;
@@ -101,7 +101,7 @@ test "manifest tree key range update" {
     var ms = manifest.ForestState.init(alloc);
     defer ms.deinit();
 
-    const Key = zdb.key.Key;
+    const Key = zdb.kv.Key;
 
     const left = Key{ .primary = "aaa" };
     const mid = Key{ .primary = "mmm" };
@@ -156,7 +156,7 @@ test "manifest serialize/restoreFrom round-trip" {
     var src = manifest.ForestState.init(alloc);
     defer src.deinit();
 
-    const Key = zdb.key.Key;
+    const Key = zdb.kv.Key;
     const a_raw = try (Key{ .primary = "aaa" }).marshal(alloc);
     defer alloc.free(a_raw);
     const m_raw = try (Key{ .primary = "mmm" }).marshal(alloc);
@@ -170,8 +170,8 @@ test "manifest serialize/restoreFrom round-trip" {
         // A named user table, split into two trees — the name must survive
         // the round-trip via its FIRST tree (the one with the open left
         // bound; serialize stamps only that one).
-        createTreeChange(zdb.key.makeTreeId(16, 0), 7, &.{}, m_raw),
-        createTreeChange(zdb.key.makeTreeId(16, 1), 7, m_raw, &.{}),
+        createTreeChange(zdb.kv.makeTreeId(16, 0), 7, &.{}, m_raw),
+        createTreeChange(zdb.kv.makeTreeId(16, 1), 7, m_raw, &.{}),
     });
     try src.registerTableName(7, 16, "users");
     try src.commit(&.{

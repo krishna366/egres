@@ -47,14 +47,14 @@ pub const Server = struct {
     /// hand-out and on the apply fiber via onDataApplied). Entries are
     /// heap-allocated so held pointers stay valid across map growth.
     tables_mu: fiber.Mutex(.tracked) = .{},
-    tables: std.AutoHashMap(zdb.key.TableKey, *table.Table),
+    tables: std.AutoHashMap(zdb.kv.TableKey, *table.Table),
 
     pub fn init(eng: *engine.Engine, addr: []const u8) !Server {
         return .{
             .engine = eng,
             .listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr),
             .catalog_ps = try schema.compile(eng.allocator, catalog.logical_schema, catalog.logical_schema.current_version),
-            .tables = std.AutoHashMap(zdb.key.TableKey, *table.Table).init(eng.allocator),
+            .tables = std.AutoHashMap(zdb.kv.TableKey, *table.Table).init(eng.allocator),
         };
     }
 
@@ -80,7 +80,7 @@ pub const Server = struct {
     /// on all nodes is what lets a new leader hand out ids without a re-scan.
     /// Uncached tables are skipped — they get seeded from forest.maxKey when
     /// first cached, which covers rows applied before caching.
-    fn onDataApplied(ctx: *anyopaque, namespace: u64, table_id: u32, items: []const zdb.key.Item) void {
+    fn onDataApplied(ctx: *anyopaque, namespace: u64, table_id: u32, items: []const zdb.kv.Item) void {
         const self: *Server = @ptrCast(@alignCast(ctx));
         self.tables_mu.lock(@src());
         defer self.tables_mu.unlock();
@@ -95,7 +95,7 @@ pub const Server = struct {
     /// The cached Table for (namespace, table_id), loading + seeding it on
     /// first use. Caller holds `tables_mu`.
     fn openTableLocked(self: *Server, ns: u64, table_id: u32) !*table.Table {
-        const key = zdb.key.TableKey{ .namespace = ns, .table_id = table_id };
+        const key = zdb.kv.TableKey{ .namespace = ns, .table_id = table_id };
         if (self.tables.get(key)) |t| return t;
 
         var loaded = try table.loadTableSchema(self.engine.allocator, self.engine.forest, &self.catalog_ps, ns, table_id);
@@ -540,7 +540,7 @@ const Handler = struct {
         if (egid_filter) |e| {
             // One-hop point get on the egid key.
             const k = rowkey.encodeEgid(e);
-            const search = zdb.key.Key{ .namespace = ns, .table_id = table_id, .primary = &k, .timestamp = std.math.maxInt(u64) };
+            const search = zdb.kv.Key{ .namespace = ns, .table_id = table_id, .primary = &k, .timestamp = std.math.maxInt(u64) };
             if (try eng.forest.get(eng.allocator, search, .p0)) |item| {
                 defer item.free(eng.allocator);
                 _ = try emitter.emit(item);
@@ -549,7 +549,7 @@ const Handler = struct {
             // Full-table scan in egid order (limitToTable confines it to this
             // table across the namespace-wide memtable).
             const scan_range = (zdb.level.KeyRange{}).limitToTable(ns, table_id);
-            _ = eng.forest.scan(eng.allocator, scan_range, std.math.maxInt(u64), .p0, &emitter, RowEmitter.scanCb) catch |err| {
+            _ = eng.forest.scan(eng.allocator, scan_range, .{}, &emitter, RowEmitter.scanCb) catch |err| {
                 log.err("select from '{s}': scan: {s}", .{ sel.table, @errorName(err) });
                 return replyError(state, "scan failed");
             };
@@ -615,7 +615,7 @@ const RowEmitter = struct {
     }
 
     /// Filter, project, and send one row (true if sent, false if filtered out).
-    fn emit(self: *RowEmitter, item: zdb.key.Item) !bool {
+    fn emit(self: *RowEmitter, item: zdb.kv.Item) !bool {
         try row.unmarshalRow(self.stmt_alloc, self.ps, item.value, &.{}, &self.decoded);
         if (self.cell_filter) |cf| {
             if (!value.valuesEqual(self.decoded.at(cf.idx), cf.val)) return false;
@@ -639,7 +639,7 @@ const RowEmitter = struct {
     }
 
     /// forest.scan callback: emit, capturing any error so the scan stops.
-    fn scanCb(raw: *anyopaque, item: zdb.key.Item) anyerror!bool {
+    fn scanCb(raw: *anyopaque, item: zdb.kv.Item) anyerror!bool {
         const self: *RowEmitter = @ptrCast(@alignCast(raw));
         _ = self.emit(item) catch |e| {
             self.err = e;

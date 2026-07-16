@@ -1,8 +1,8 @@
 const std = @import("std");
 const zbuf = @import("zbuf").zbuf;
-const key_mod = @import("../key.zig");
-const Key = key_mod.Key;
-pub const Item = key_mod.Item;
+const Key = @import("../kv.zig").Key;
+const Meta = @import("../kv.zig").Meta;
+pub const Item = @import("../kv.zig").Item;
 const idx = @import("index.zig");
 const buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
@@ -24,7 +24,10 @@ pub const Error = idx.Error || buffers.Error || compress.Error ||
     std.mem.Allocator.Error || error{
     ChecksumMismatch,
     CorruptTable,
+    UnsupportedTableFormat,
 };
+
+const log = std.log.scoped(.table);
 
 // TODO: Consider using zbuf to store this.
 pub const BlockLayout = struct {
@@ -110,6 +113,18 @@ pub const Table = struct {
         const index_reader = try buffers.TableIndexReader.init(index_bytes, 0);
         var table_index = try index_reader.toStruct(allocator);
         errdefer table_index.deinit(allocator);
+
+        // Refuse any SST whose entry encoding we don't speak. The block
+        // checksums can't catch this: a stale table's blocks are internally
+        // consistent, so they verify fine and then decode into keys shifted by
+        // a byte. There is no migration path — wipe the data dir and reload.
+        if (table_index.format_version != idx.format_version) {
+            log.err(
+                "SST format_version={d}, expected {d}: wipe the data dir and reload",
+                .{ table_index.format_version, idx.format_version },
+            );
+            return error.UnsupportedTableFormat;
+        }
 
         const codec: compress.Codec = @enumFromInt(@intFromEnum(table_index.compression));
 
@@ -288,6 +303,7 @@ pub const BlockIterator = struct {
     base_key: []const u8,
     entry_idx: usize,
     val: []const u8,
+    meta: Meta,
     is_valid: bool,
 
     pub fn deinit(self: *BlockIterator) void {
@@ -300,7 +316,7 @@ pub const BlockIterator = struct {
         // that's already done in readBlockUncached's decompress step.
         if (block.len < 12) return error.CorruptTable;
 
-		// TODO: We should be running block checksums.
+        // TODO: We should be running block checksums.
         const checksum_off = block.len - 8;
         const count_off = checksum_off - 4;
         const entry_count_u32 = try idx.readU32LE(block, count_off);
@@ -334,7 +350,7 @@ pub const BlockIterator = struct {
         // Each entry is stored as such:
         // | ----------------------------------------------------------------------||
         // | -- u16 key overlap with base -- | -- u16 key diff length from base -- |
-        // | -- key diff bytes -- | -- value bytes ------------------------------- |
+        // | -- u8 meta -- | -- key diff bytes -- | -- value bytes --------------- |
         // | ----------------------------------------------------------------------||
         const layout = try parseBlockLayout(block);
 
@@ -347,6 +363,7 @@ pub const BlockIterator = struct {
             .base_key = base_key,
             .entry_idx = 0,
             .val = &[_]u8{},
+            .meta = .{},
             .is_valid = false,
         };
     }
@@ -395,7 +412,11 @@ pub const BlockIterator = struct {
 
     pub fn itemRef(self: *const BlockIterator) ?Item {
         if (!self.is_valid) return null;
-        return .{ .key = Key.init(self.key_buf.items), .value = self.val };
+        return .{
+            .key = Key.init(self.key_buf.items),
+            .value = self.val,
+            .meta = self.meta,
+        };
     }
 
     inline fn getOffset(self: *BlockIterator, i: usize) Error!usize {
@@ -410,13 +431,15 @@ pub const BlockIterator = struct {
         }
 
         const off = try self.getOffset(i);
-        if (off + 4 > self.entries_region.len) return error.CorruptTable;
+        // 5-byte fixed header: [u16 overlap][u16 diff_len][u8 meta].
+        if (off + 5 > self.entries_region.len) return error.CorruptTable;
 
         const key_overlap: usize = @intCast(try idx.readU16LE(self.entries_region, off));
         const key_diff_len: usize = @intCast(try idx.readU16LE(self.entries_region, off + 2));
         if (key_overlap > self.base_key.len) return error.CorruptTable;
+        const meta = Meta.fromByte(self.entries_region[off + 4]);
 
-        const diff_start = off + 4;
+        const diff_start = off + 5;
         const diff_end = diff_start + key_diff_len;
         if (diff_end > self.entries_region.len) return error.CorruptTable;
         const diff = self.entries_region[diff_start..diff_end];
@@ -432,6 +455,7 @@ pub const BlockIterator = struct {
         if (value_end < value_start or value_end > self.entries_region.len) return error.CorruptTable;
 
         self.val = self.entries_region[value_start..value_end];
+        self.meta = meta;
         self.entry_idx = i;
         self.is_valid = true;
     }

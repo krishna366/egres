@@ -5,8 +5,8 @@ const sql = @import("sql");
 const utils = @import("utils");
 
 const Forest = zdb.forest.Forest;
-const Key = zdb.key.Key;
-const Item = zdb.key.Item;
+const Key = zdb.kv.Key;
+const Item = zdb.kv.Item;
 
 const catalog = sql.catalog;
 const schema = sql.schema;
@@ -62,6 +62,7 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
                 .timestamp = 1,
             },
             .value = try a.dupe(u8, bytes),
+            .meta = .{},
         });
     }
     try f.put(items.items);

@@ -1,8 +1,9 @@
 const std = @import("std");
 const zen = @import("buffers.gen.zig");
-const keymod = @import("key.zig");
-const Key = keymod.Key;
-const TreeKey = keymod.TreeKey;
+const Key = @import("kv.zig").Key;
+const TreeKey = @import("kv.zig").TreeKey;
+const TableKey = @import("kv.zig").TableKey;
+const treeTableId = @import("kv.zig").treeTableId;
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
 const fiber = @import("zfiber");
@@ -374,7 +375,7 @@ pub const ForestState = struct {
         // Reverse map (ns, table_id) → table name, so a tree's CREATE change
         // below can carry its table's name — the same vehicle the live
         // create_tree apply uses (TreeChange.name).
-        var tnames = std.AutoHashMap(keymod.TableKey, []const u8).init(a);
+        var tnames = std.AutoHashMap(TableKey, []const u8).init(a);
         var nit = self.namespaces.iterator();
         while (nit.next()) |kv| {
             var tit = kv.value_ptr.tables.iterator();
@@ -396,7 +397,7 @@ pub const ForestState = struct {
             // the leftmost child), so a heavily-split table doesn't copy
             // its name into every TreeChange.
             if (tree.left.primary.len == 0) {
-                if (tnames.get(.{ .namespace = tk.namespace, .table_id = keymod.treeTableId(tk.tree_id) })) |n|
+                if (tnames.get(.{ .namespace = tk.namespace, .table_id = treeTableId(tk.tree_id) })) |n|
                     change.name = @constCast(n);
             }
             try tree_changes.append(a, change);
@@ -464,7 +465,7 @@ pub const ForestState = struct {
             // serialize stamps table names onto tree changes (only user
             // tables carry one; empty is a no-op).
             if (tc.op() == .create)
-                try self.registerTableName(tc.namespaceId(), keymod.treeTableId(tc.treeId()), tc.name());
+                try self.registerTableName(tc.namespaceId(), treeTableId(tc.treeId()), tc.name());
         }
 
         const tbl_len = reader.sstableChangesLen();

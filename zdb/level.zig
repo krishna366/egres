@@ -1,5 +1,5 @@
 const std = @import("std");
-const Key = @import("key.zig").Key;
+const Key = @import("kv.zig").Key;
 const table = @import("table.zig");
 const vfs = @import("vfs");
 const utils = @import("utils");
@@ -252,6 +252,15 @@ pub const Level = struct {
     /// overlappingTables returns a heap-allocated slice of TableEntry whose key
     /// range overlaps kr. The caller must free the slice when done.
     /// L0: always all tables; L≥1: binary search on both ends.
+    ///
+    /// Bounds compare on the PRIMARY only (orderWithoutTs). A full Key.order
+    /// would be wrong here: it sorts timestamps descending, so a table whose
+    /// smallest key is an older version of kr.right's primary compares as
+    /// "starts after kr.right" and gets excluded — even though it holds that
+    /// very primary. Callers use this to answer "which tables could hold keys
+    /// in this primary range", and every one of them (compaction src/dest
+    /// selection, openMerge) needs every version of a boundary primary, not
+    /// the subset that happens to sort inside a versioned bound.
     pub fn overlappingTables(self: *Level, allocator: std.mem.Allocator, kr: KeyRange) ![]TableEntry {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
@@ -265,7 +274,7 @@ pub const Level = struct {
             // First table where kr.left <= biggest (could overlap on the left).
             const left = utils.search(TableEntry, items, kr.left, struct {
                 fn f(kl: Key, e: TableEntry) bool {
-                    return kl.order(e.table.biggest) != .gt;
+                    return kl.orderWithoutTs(e.table.biggest) != .gt;
                 }
             }.f);
             // First table where kr.right < smallest (no longer overlapping).
@@ -278,7 +287,7 @@ pub const Level = struct {
             else
                 utils.search(TableEntry, items, kr.right, struct {
                     fn f(right_key: Key, e: TableEntry) bool {
-                        return right_key.order(e.table.smallest) == .lt;
+                        return right_key.orderWithoutTs(e.table.smallest) == .lt;
                     }
                 }.f);
             break :blk items[left..right];

@@ -603,3 +603,17 @@ test "frame Frame.read rejects corrupt payload" {
     dest[zbuf.Frame.hdr_size + 5] ^= 0x01;
     try std.testing.expectError(zbuf.Error.Invalid, zbuf.Frame.read(dest));
 }
+
+// zbuf/README.md documents these header sizes and the byte offsets derived
+// from them. Nothing else pins them, which is how the README drifted out of
+// date before: the schema below gained fields and the docs kept the old
+// numbers. If this fails because you changed the test schema, that's working
+// as intended — update the "Example (Table) with Concrete Fields" section to
+// match, then update these.
+test "README: documented header sizes still hold" {
+    try std.testing.expectEqual(@as(u16, 15), gen.CellReader.SIZE_BYTES);
+    try std.testing.expectEqual(@as(u16, 55), gen.RowReader.SIZE_BYTES);
+    try std.testing.expectEqual(@as(u16, 26), gen.TableReader.SIZE_BYTES);
+    try std.testing.expectEqual(@as(u16, 4), zbuf.message_tail_size);
+    try std.testing.expectEqual(@as(u16, 0x425A), zbuf.message_magic);
+}

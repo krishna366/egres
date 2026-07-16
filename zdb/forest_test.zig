@@ -3,7 +3,7 @@ const utils = @import("utils");
 const zdb = @import("zdb");
 const vfs = zdb.vfs;
 
-const Key = zdb.key.Key;
+const Key = zdb.kv.Key;
 const table_mod = zdb.table;
 const Builder = table_mod.builder.Builder;
 const Table = table_mod.Table;
@@ -849,12 +849,523 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
     const k5 = beKey(5);
     const k3 = beKey(3);
     try f.put(&.{
-        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k1, .timestamp = 1 }, .value = "a" },
-        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k5, .timestamp = 1 }, .value = "b" },
-        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k3, .timestamp = 1 }, .value = "c" },
+        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k1, .timestamp = 1 }, .value = "a", .meta = .{} },
+        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k5, .timestamp = 1 }, .value = "b", .meta = .{} },
+        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k3, .timestamp = 1 }, .value = "c", .meta = .{} },
     });
 
     const mk = (try f.maxKey(alloc, ns, tid)).?;
     defer mk.free(alloc);
     try std.testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, mk.primary[0..8], .big));
+}
+
+// ---------------------------------------------------------------------------
+// Meta byte: survives the whole write path
+// ---------------------------------------------------------------------------
+
+test "forest: meta survives put, flush to L0, compaction, and get" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    _ = try f.createTree(1, 0, .{ .inf = true });
+
+    // buildFlush allocates an SST id, which needs a durable-lease callback.
+    // Nothing here restarts, so persisting the ceiling is a no-op.
+    const Lease = struct {
+        fn call(_: *anyopaque, _: u64) anyerror!void {}
+    };
+    var lease_ctx: u8 = 0;
+    f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
+
+    // Forest.open leaves an id-0 placeholder memtable, and swapCurrentOut
+    // releases rather than freezes that one — writes into it would be dropped
+    // instead of flushed. Swap in a real memtable before writing.
+    try f.newMemtable(1, 1);
+
+    const cases = [_]struct { primary: []const u8, meta: zdb.kv.Meta }{
+        .{ .primary = "a", .meta = .{ .kind = .deleted } },
+        .{ .primary = "b", .meta = .{ .encoding = .roaring } },
+        .{ .primary = "c", .meta = .{ .kind = .deleted, .encoding = .roaring } },
+        .{ .primary = "d", .meta = .{} },
+    };
+
+    var items: [cases.len]zdb.kv.Item = undefined;
+    for (cases, 0..) |c, i| {
+        items[i] = .{
+            .key = .{ .namespace = 1, .table_id = 0, .primary = c.primary, .timestamp = 1 },
+            .value = "v",
+            .meta = c.meta,
+        };
+    }
+    try f.put(&items);
+
+    // getRaw, not get: this asserts meta survives the round trip, and
+    // Forest.get deliberately reports a tombstoned key as absent (covered
+    // separately by the tombstone tests below).
+    for (cases) |c| {
+        const got = try f.getRaw(alloc, .{
+            .namespace = 1,
+            .table_id = 0,
+            .primary = c.primary,
+            .timestamp = std.math.maxInt(u64),
+        }, .p0) orelse return error.TestExpectedItem;
+        defer got.free(alloc);
+        try std.testing.expectEqual(c.meta, got.meta);
+    }
+
+    // Freeze and flush to an L0 SST, so the next reads decode meta back out of
+    // the on-disk entry encoding rather than the skiplist node.
+    try f.newMemtable(2, 2);
+    var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush.changes.deinit(alloc);
+    try f.applyFlush(flush.changes.items, flush.memtable_id);
+
+    for (cases) |c| {
+        const got = try f.getRaw(alloc, .{
+            .namespace = 1,
+            .table_id = 0,
+            .primary = c.primary,
+            .timestamp = std.math.maxInt(u64),
+        }, .p0) orelse return error.TestExpectedItem;
+        defer got.free(alloc);
+        try std.testing.expectEqual(c.meta, got.meta);
+        try std.testing.expectEqualStrings("v", got.value);
+    }
+
+    // Compact L0 → L1. Compaction rewrites every entry through a fresh
+    // Builder, so meta has to survive the merge iterator and the re-encode.
+    const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    var comp = try tree.buildCompaction(0, &f.file_ids, 0);
+    defer comp.deinit(alloc);
+    // Guard against the compaction being a silent no-op, which would make the
+    // assertions below vacuous.
+    try std.testing.expect(comp.items.len > 0);
+    try tree.applyCompaction(comp.items);
+
+    // Every row is still here: compaction preserves meta but never acts on it,
+    // so `delete` must NOT have dropped anything (keys_in == keys_out).
+    for (cases) |c| {
+        const got = try f.getRaw(alloc, .{
+            .namespace = 1,
+            .table_id = 0,
+            .primary = c.primary,
+            .timestamp = std.math.maxInt(u64),
+        }, .p0) orelse return error.TestExpectedItem;
+        defer got.free(alloc);
+        try std.testing.expectEqual(c.meta, got.meta);
+        try std.testing.expectEqualStrings("v", got.value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tombstones + the read horizon
+// ---------------------------------------------------------------------------
+
+test "forest: a tombstone reads as absent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    try f.newMemtable(1, 1);
+
+    // Write a value, then delete it at a later timestamp.
+    try f.put(&[_]zdb.kv.Item{.{
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k", .timestamp = 10 },
+        .value = "v",
+        .meta = .{},
+    }});
+    const live = try f.get(alloc, .{
+        .namespace = 1,
+        .table_id = 0,
+        .primary = "k",
+        .timestamp = std.math.maxInt(u64),
+    }, .p0) orelse return error.TestExpectedItem;
+    live.free(alloc);
+
+    try f.put(&[_]zdb.kv.Item{.{
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k", .timestamp = 20 },
+        .value = "",
+        .meta = .{ .kind = .deleted },
+    }});
+
+    // Deleted as of now.
+    try std.testing.expect((try f.get(alloc, .{
+        .namespace = 1,
+        .table_id = 0,
+        .primary = "k",
+        .timestamp = std.math.maxInt(u64),
+    }, .p0)) == null);
+
+    // The tombstone is still real data underneath — get just refuses to
+    // surface it.
+    const raw = try f.getRaw(alloc, .{
+        .namespace = 1,
+        .table_id = 0,
+        .primary = "k",
+        .timestamp = std.math.maxInt(u64),
+    }, .p0) orelse return error.TestExpectedItem;
+    defer raw.free(alloc);
+    try std.testing.expect(raw.meta.isDeleted());
+
+    // Reading before the delete still sees the value: the tombstone shadows
+    // older versions, it doesn't erase them.
+    const before = try f.get(alloc, .{
+        .namespace = 1,
+        .table_id = 0,
+        .primary = "k",
+        .timestamp = 15,
+    }, .p0) orelse return error.TestExpectedItem;
+    defer before.free(alloc);
+    try std.testing.expectEqualStrings("v", before.value);
+}
+
+test "forest: globalMinRead rejects older reads and only moves forward" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    try f.newMemtable(1, 1);
+
+    // Default 0 means nothing is rejected and nothing is droppable.
+    try std.testing.expectEqual(@as(u64, 0), f.globalMinRead());
+    try std.testing.expect((try f.get(alloc, .{
+        .namespace = 1,
+        .table_id = 0,
+        .primary = "k",
+        .timestamp = 1,
+    }, .p0)) == null);
+
+    try std.testing.expectEqual(@as(u64, 100), f.setGlobalMinRead(100));
+
+    // Below the horizon: the versions may already be compacted away, so the
+    // read is refused rather than answered wrongly.
+    try std.testing.expectError(error.ReadBelowMinRead, f.get(alloc, .{
+        .namespace = 1,
+        .table_id = 0,
+        .primary = "k",
+        .timestamp = 99,
+    }, .p0));
+
+    // At the horizon is allowed.
+    try std.testing.expect((try f.get(alloc, .{
+        .namespace = 1,
+        .table_id = 0,
+        .primary = "k",
+        .timestamp = 100,
+    }, .p0)) == null);
+
+    // Monotonic: a stale caller can't walk it back and un-discard data that
+    // a compaction already dropped.
+    try std.testing.expectEqual(@as(u64, 100), f.setGlobalMinRead(50));
+    try std.testing.expectEqual(@as(u64, 100), f.globalMinRead());
+    try std.testing.expectEqual(@as(u64, 150), f.setGlobalMinRead(150));
+}
+
+// ---------------------------------------------------------------------------
+// Scan: version selection + tombstone visibility
+// ---------------------------------------------------------------------------
+
+/// Collects what a scan emits. Dupes each item: the callback's Item borrows
+/// the merge iterator's buffers, which the next step overwrites.
+const ScanCollector = struct {
+    alloc: std.mem.Allocator,
+    got: std.ArrayList(zdb.kv.Item) = .empty,
+
+    fn emit(ctx: *anyopaque, item: zdb.kv.Item) anyerror!bool {
+        const self: *ScanCollector = @ptrCast(@alignCast(ctx));
+        try self.got.append(self.alloc, try item.dupe(self.alloc));
+        return true;
+    }
+
+    fn deinit(self: *ScanCollector) void {
+        for (self.got.items) |it| it.free(self.alloc);
+        self.got.deinit(self.alloc);
+    }
+};
+
+/// A forest holding, in namespace 1:
+///   a@20="a2", a@10="a1"          (two live versions)
+///   b@20=tombstone, b@10="b1"     (deleted, one version behind it)
+///   c@10="c1"                     (one live version)
+fn seedVersionedForest(f: *Forest) !void {
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    try f.newMemtable(1, 1);
+
+    const rows = [_]struct { p: []const u8, ts: u64, v: []const u8, m: zdb.kv.Meta }{
+        .{ .p = "a", .ts = 10, .v = "a1", .m = .{} },
+        .{ .p = "a", .ts = 20, .v = "a2", .m = .{} },
+        .{ .p = "b", .ts = 10, .v = "b1", .m = .{} },
+        .{ .p = "b", .ts = 20, .v = "", .m = .{ .kind = .deleted } },
+        .{ .p = "c", .ts = 10, .v = "c1", .m = .{} },
+    };
+    for (rows) |r| {
+        try f.put(&[_]zdb.kv.Item{.{
+            .key = .{ .namespace = 1, .table_id = 0, .primary = r.p, .timestamp = r.ts },
+            .value = r.v,
+            .meta = r.m,
+        }});
+    }
+}
+
+fn runScan(
+    alloc: std.mem.Allocator,
+    f: *Forest,
+    opts: Forest.ScanOptions,
+    col: *ScanCollector,
+) !u64 {
+    const open = Key{ .namespace = 1, .table_id = 0, .primary = "", .timestamp = std.math.maxInt(u64) };
+    return f.scan(alloc, .{ .left = open, .right = open }, opts, @ptrCast(col), &ScanCollector.emit);
+}
+
+test "scan: by default emits one version per key and hides deleted keys" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    const n = try runScan(alloc, f, .{}, &col);
+
+    // a's newest, c's only. b is deleted and vanishes entirely — its
+    // tombstone is not emitted, and neither is b@10 behind it.
+    try std.testing.expectEqual(@as(u64, 2), n);
+    try std.testing.expectEqualStrings("a", col.got.items[0].key.primary);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
+    try std.testing.expectEqualStrings("c", col.got.items[1].key.primary);
+    try std.testing.expectEqualStrings("c1", col.got.items[1].value);
+}
+
+test "scan: num_versions returns extra versions but still stops at a tombstone" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    const n = try runScan(alloc, f, .{ .num_versions = 10 }, &col);
+
+    // a@20, a@10, c@10. b is still hidden: without include_deleted, a
+    // tombstone ends the primary regardless of how many versions were asked
+    // for.
+    try std.testing.expectEqual(@as(u64, 3), n);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
+    try std.testing.expectEqual(@as(u64, 20), col.got.items[0].key.timestamp);
+    try std.testing.expectEqualStrings("a1", col.got.items[1].value);
+    try std.testing.expectEqual(@as(u64, 10), col.got.items[1].key.timestamp);
+    try std.testing.expectEqualStrings("c1", col.got.items[2].value);
+}
+
+test "scan: include_deleted surfaces tombstones and the versions behind them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    const n = try runScan(alloc, f, .{ .num_versions = 10, .include_deleted = true }, &col);
+
+    // Everything: a@20, a@10, b@20 (tombstone), b@10, c@10.
+    try std.testing.expectEqual(@as(u64, 5), n);
+    try std.testing.expectEqualStrings("b", col.got.items[2].key.primary);
+    try std.testing.expect(col.got.items[2].meta.isDeleted());
+    try std.testing.expectEqual(@as(u64, 20), col.got.items[2].key.timestamp);
+    try std.testing.expectEqualStrings("b1", col.got.items[3].value);
+    try std.testing.expectEqualStrings("c1", col.got.items[4].value);
+}
+
+test "scan: num_versions caps deleted runs too" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    const n = try runScan(alloc, f, .{ .num_versions = 1, .include_deleted = true }, &col);
+
+    // One version each: a@20, b@20 (the tombstone), c@10. b@10 is cut by the
+    // version cap, not by the tombstone rule.
+    try std.testing.expectEqual(@as(u64, 3), n);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
+    try std.testing.expect(col.got.items[1].meta.isDeleted());
+    try std.testing.expectEqualStrings("c1", col.got.items[2].value);
+}
+
+test "scan: num_versions 0 behaves as 1 rather than returning nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    const n = try runScan(alloc, f, .{ .num_versions = 0 }, &col);
+    try std.testing.expectEqual(@as(u64, 2), n);
+}
+
+test "scan: max_rows bounds emitted items, not versions walked" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    // Default opts skip a@10, both b versions. max_rows=2 must still yield
+    // the 2 keys a scan would emit, not get consumed by the skipped rows.
+    const n = try runScan(alloc, f, .{ .max_rows = 2 }, &col);
+    try std.testing.expectEqual(@as(u64, 2), n);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
+    try std.testing.expectEqualStrings("c1", col.got.items[1].value);
+}
+
+test "scan: read_ts reports the world as of that timestamp" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    // At ts=15 only the @10 writes have happened.
+    const n = try runScan(alloc, f, .{ .read_ts = 15 }, &col);
+
+    // a@20 hasn't been written yet, so a reads as "a1".
+    //
+    // And b: its tombstone is at @20, which is ALSO in the future here — so
+    // b is not deleted as of 15 and must come back live. This is the case
+    // that breaks if the tombstone rule runs before the read_ts filter.
+    try std.testing.expectEqual(@as(u64, 3), n);
+    try std.testing.expectEqualStrings("a1", col.got.items[0].value);
+    try std.testing.expectEqualStrings("b", col.got.items[1].key.primary);
+    try std.testing.expectEqualStrings("b1", col.got.items[1].value);
+    try std.testing.expect(!col.got.items[1].meta.isDeleted());
+    try std.testing.expectEqualStrings("c1", col.got.items[2].value);
+
+    // The same key at the same instant via get must agree.
+    const g = try f.get(alloc, .{
+        .namespace = 1,
+        .table_id = 0,
+        .primary = "b",
+        .timestamp = 15,
+    }, .p0) orelse return error.TestExpectedItem;
+    defer g.free(alloc);
+    try std.testing.expectEqualStrings("b1", g.value);
+}
+
+test "scan: versions above read_ts do not consume num_versions" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    // a@20 is invisible at ts=15. With num_versions=1, the one version we
+    // return must be a@10 — the invisible a@20 must not have spent the quota.
+    const n = try runScan(alloc, f, .{ .num_versions = 1, .read_ts = 15 }, &col);
+    try std.testing.expectEqual(@as(u64, 3), n);
+    try std.testing.expectEqualStrings("a1", col.got.items[0].value);
+    try std.testing.expectEqual(@as(u64, 10), col.got.items[0].key.timestamp);
+}
+
+test "scan: read_ts at the delete sees the key as gone" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    // At ts=20 the tombstone IS visible, so b disappears again.
+    const n = try runScan(alloc, f, .{ .read_ts = 20 }, &col);
+    try std.testing.expectEqual(@as(u64, 2), n);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
+    try std.testing.expectEqualStrings("c1", col.got.items[1].value);
+}
+
+test "scan: rejects a read_ts below globalMinRead" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    _ = f.setGlobalMinRead(100);
+
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    try std.testing.expectError(error.ReadBelowMinRead, runScan(alloc, f, .{ .read_ts = 99 }, &col));
+
+    // At the horizon is fine, and the default (latest) is always fine.
+    _ = try runScan(alloc, f, .{ .read_ts = 100 }, &col);
+    _ = try runScan(alloc, f, .{}, &col);
 }

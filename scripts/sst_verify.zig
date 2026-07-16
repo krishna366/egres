@@ -4,7 +4,7 @@ const utils = @import("utils");
 const vfs = zdb.vfs;
 const Table = zdb.table.Table;
 const TableIterator = zdb.table.TableIterator;
-const Key = zdb.key.Key;
+const Key = zdb.kv.Key;
 
 /// Returns true on success, false on any failure. Prints the result line
 /// directly so we don't need to retain pointers into the table after it's

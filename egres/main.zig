@@ -109,7 +109,7 @@ fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
     var tc = [_]zdb.manifest.TreeChange{
         zdb.manifest.createTreeChange(0, zdb.manifest.first_namespace, "", ""),
         zdb.manifest.createTreeChange(
-            zdb.key.makeTreeId(zdb.manifest.catalog_table_id, 0),
+            zdb.kv.makeTreeId(zdb.manifest.catalog_table_id, 0),
             zdb.manifest.first_namespace,
             "",
             "",

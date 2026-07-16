@@ -1,7 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
 const skiplist = @import("zdb").skl;
-const Key = @import("zdb").key.Key;
+const Key = @import("zdb").kv.Key;
+const Meta = @import("zdb").kv.Meta;
 const u = @import("utils");
 
 fn writeKey(buf: []u8, idx: usize) ![]const u8 {
@@ -228,4 +229,79 @@ test "skiplist grows beyond 64 MiB up to 256 MiB and validates full iteration" {
         "[zdb.skl] verification complete keys={d} verify_elapsed_ms={d}\n",
         .{ inserted, @divTrunc(verify_elapsed_ns, std.time.ns_per_ms) },
     );
+}
+
+test "skiplist: meta survives put and get" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+
+    const meta: Meta = .{ .kind = .deleted, .encoding = .roaring };
+    try sl.putItem(.{
+        .key = .{ .primary = "key1", .timestamp = 1 },
+        .value = "val1",
+        .meta = meta,
+    });
+
+    const got = sl.get(.{ .primary = "key1", .timestamp = 1 }) orelse
+        return error.TestExpectedItem;
+    try testing.expectEqual(meta, got.meta);
+    try testing.expectEqualStrings("val1", got.value);
+
+    // The plain put() wrapper must still mean "raw, no flags".
+    try sl.put(.{ .primary = "key2", .timestamp = 1 }, "val2");
+    const plain = sl.get(.{ .primary = "key2", .timestamp = 1 }) orelse
+        return error.TestExpectedItem;
+    try testing.expectEqual(Meta.raw, plain.meta);
+}
+
+test "skiplist: overwrite in place updates meta, not just value" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+
+    // Same key AND same timestamp takes the overwrite-in-place branch, where
+    // it'd be easy to swap the value and forget meta.
+    try sl.putItem(.{
+        .key = .{ .primary = "key1", .timestamp = 5 },
+        .value = "first",
+        .meta = .{ .encoding = .roaring },
+    });
+    try sl.putItem(.{
+        .key = .{ .primary = "key1", .timestamp = 5 },
+        .value = "second",
+        .meta = .{ .kind = .deleted, .encoding = .raw },
+    });
+
+    const got = sl.get(.{ .primary = "key1", .timestamp = 5 }) orelse
+        return error.TestExpectedItem;
+    try testing.expectEqualStrings("second", got.value);
+    try testing.expectEqual(Meta{ .kind = .deleted, .encoding = .raw }, got.meta);
+}
+
+test "skiplist: meta reaches the iterator" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+
+    try sl.putItem(.{
+        .key = .{ .primary = "a", .timestamp = 1 },
+        .value = "va",
+        .meta = .{ .encoding = .roaring },
+    });
+    try sl.putItem(.{
+        .key = .{ .primary = "b", .timestamp = 1 },
+        .value = "vb",
+        .meta = .{ .kind = .deleted },
+    });
+
+    var it = sl.iterator();
+    defer it.deinit();
+    try it.seekRange(.{}, .{});
+
+    const first = it.itemRef() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("a", first.key.primary);
+    try testing.expectEqual(Meta{ .encoding = .roaring }, first.meta);
+
+    try it.next();
+    const second = it.itemRef() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("b", second.key.primary);
+    try testing.expectEqual(Meta{ .kind = .deleted }, second.meta);
 }

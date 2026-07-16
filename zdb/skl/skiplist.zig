@@ -2,9 +2,9 @@ const std = @import("std");
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 const utils = @import("utils");
-const key_mod = @import("../key.zig");
-const Key = key_mod.Key;
-const Item = key_mod.Item;
+const Key = @import("../kv.zig").Key;
+const Item = @import("../kv.zig").Item;
+const Meta = @import("../kv.zig").Meta;
 
 pub const Error = error{
     OutOfMemory,
@@ -20,6 +20,9 @@ pub const SkipList = struct {
     pub const Node = struct {
         key: []const u8,
         value: []const u8,
+        // Not swapped atomically with `value` on overwrite — see `put`. The
+        // key is immutable for a node's lifetime; only these two change.
+        meta: Meta,
         next: []Atomic(?*Node),
     };
 
@@ -58,7 +61,12 @@ pub const SkipList = struct {
         const next_arr = try arena.allocator().alloc(Atomic(?*Node), max_height);
         for (next_arr) |*p| p.* = Atomic(?*Node).init(null);
         const head = try arena.allocator().create(Node);
-        head.* = .{ .key = &[_]u8{}, .value = &[_]u8{}, .next = next_arr };
+        head.* = .{
+            .key = &[_]u8{},
+            .value = &[_]u8{},
+            .meta = .{},
+            .next = next_arr,
+        };
 
         const self = try allocator.create(Self);
         self.* = .{
@@ -149,10 +157,18 @@ pub const SkipList = struct {
         if (!found.equalPrimary(key)) return null;
         if (found.timestamp > key.timestamp) return null;
 
-        return .{ .key = found, .value = node.value };
+        return .{ .key = found, .value = node.value, .meta = node.meta };
     }
 
+    /// Convenience for callers with nothing to say about the row: raw
+    /// encoding, no flags. The write path uses putItem.
     pub fn put(self: *Self, key: Key, value: []const u8) Error!void {
+        return self.putItem(.{ .key = key, .value = value, .meta = .{} });
+    }
+
+    pub fn putItem(self: *Self, item: Item) Error!void {
+        const key = item.key;
+        const value = item.value;
         const alloc = self.arena.allocator();
 
         // Build full key for the findNode lookup. This key is allocated on arena.
@@ -166,6 +182,14 @@ pub const SkipList = struct {
             // The previous value can't really be deallocated in arena allocator.
             // So, don't worry about it. Allocate a new one and move on.
             existing.value = alloc.dupe(u8, value) catch return Error.ArenaFull;
+            // value and meta are two separate non-atomic stores, so a
+            // concurrent reader can see the new value with the old meta. Same
+            // exposure the value store already had on its own (it's a fat
+            // pointer), and it only arises on an exact overwrite: same key AND
+            // same timestamp, i.e. twice within one raft batch. Fixing it
+            // properly means one atomic pointer to an immutable {value, meta}
+            // record, which costs an indirection on every read.
+            existing.meta = item.meta;
             // Old value stays resident in the arena, so memory grows by the
             // new value's bytes even on overwrite.
             _ = self.used_bytes.fetchAdd(value.len, .monotonic);
@@ -176,7 +200,12 @@ pub const SkipList = struct {
         const next_arr = try alloc.alloc(Atomic(?*Node), height);
         for (next_arr) |*p| p.* = Atomic(?*Node).init(null);
         const new_node = try alloc.create(Node);
-        new_node.* = .{ .key = keyWithTs, .value = valOwn, .next = next_arr };
+        new_node.* = .{
+            .key = keyWithTs,
+            .value = valOwn,
+            .meta = item.meta,
+            .next = next_arr,
+        };
 
         // We expect multiple readers, but only expect one writer.
         // So, we can just do a load and store, without worrying about the value changing
@@ -267,7 +296,11 @@ pub const Iterator = struct {
 
     pub fn itemRef(self: *const Iterator) ?Item {
         const node = self.current orelse return null;
-        return .{ .key = Key.init(node.key), .value = node.value };
+        return .{
+            .key = Key.init(node.key),
+            .value = node.value,
+            .meta = node.meta,
+        };
     }
 
     pub fn next(self: *Iterator) !void {

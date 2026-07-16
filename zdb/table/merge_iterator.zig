@@ -1,6 +1,6 @@
 const std = @import("std");
 const table = @import("table.zig");
-const Key = @import("../key.zig").Key;
+const Key = @import("../kv.zig").Key;
 const skl = @import("../skl/skiplist.zig");
 const utils = @import("utils");
 

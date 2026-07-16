@@ -1,5 +1,7 @@
 const std = @import("std");
-const Key = @import("../key.zig").Key;
+const Key = @import("../kv.zig").Key;
+const Item = @import("../kv.zig").Item;
+const idx = @import("index.zig");
 const buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
 const compress = utils.compression;
@@ -15,9 +17,10 @@ const log = std.log.scoped(.table_builder);
 // [Block 1]
 // ...
 // [Block N]
+// [zero padding, so the file length is a multiple of vfs.page_size]
 // [TableIndex bytes]
 // [u32 index_len]
-// [u32 index_crc32]
+// [u64 index_hash]
 //
 // Block layout is set as:
 // | ------------------------------------------------------------------------|
@@ -31,7 +34,7 @@ const log = std.log.scoped(.table_builder);
 // Each entry is stored as such:
 // | ----------------------------------------------------------------------|
 // | -- u16 key overlap with base -- | -- u16 key diff length from base -- |
-// | -- key diff bytes -- | -- value bytes ------------------------------- |
+// | -- u8 meta -- | -- key diff bytes -- | -- value bytes --------------- |
 // | ----------------------------------------------------------------------|
 //
 // Notes:
@@ -39,12 +42,21 @@ const log = std.log.scoped(.table_builder);
 //   not against the previous key. This is useful because it allows us random
 //   access to any idx on the block entry, and derive its key.
 //
+// - meta (kv.zig:Meta) lives in the 5-byte fixed header, NOT as a prefix on
+//   the value bytes. The value's length is implicit — it runs to the next
+//   entry's offset — so a byte inside the value region would have no length
+//   guaranteeing it's there, and an empty value would stop being a zero-byte
+//   region. In the header it's covered by the reader's single `off + 5` bounds
+//   check, before any value math.
+//
 // - entry_off_* values point to entry starts within the block.
-// - CRCs are CRC32 over the uncompressed block bytes prior to the checksum field.
-//   Blocks are then optionally compressed; the stored CRC remains over uncompressed data.
+// - Checksums are xxhash3 u64 (zbuf.hash) over the uncompressed block bytes
+//   prior to the checksum field. Blocks are then optionally compressed; the
+//   stored checksum remains over the uncompressed data.
 // - TableIndex (zbuf) contains block offsets, max_version, key_count, sizes,
-//   and currently an empty bloom filter.
-// - All integer fields are little-endian.
+//   format_version, and a binary fuse filter over the keys' primaries.
+// - All integer fields are little-endian. (Keys marshal big-endian — see
+//   kv.zig — so they order correctly bytewise; that's a separate concern.)
 
 pub const Error = error{
     KeyOrderViolation,
@@ -96,6 +108,13 @@ pub const Builder = struct {
     max_version: u64,
     uncompressed_size: u32,
     compressed_size: u32,
+    /// Estimated bytes of shadowed (dead-or-dying) data written into this
+    /// table: versions that sit below their primary's newest terminal (a newer
+    /// full `state` or a `deleted`), so no read past the horizon needs them —
+    /// reclaimable once global_min_read rises past them. Fed by `addStaleBytes`
+    /// from compaction, snapshotted into the table index at `finish()`.
+    /// A user-data estimate (key.primary + value), so it under-approximates
+    /// on-disk footprint — fine as a signal.
     stale_data_size: u32,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Builder {
@@ -157,7 +176,25 @@ pub const Builder = struct {
         return Key.init(self.last_key.items);
     }
 
+    /// Record `n` bytes of shadowed data in the table being built. Saturates
+    /// rather than overflowing: max_table_size caps a real table well under
+    /// u32, so this only guards against a pathological input.
+    pub inline fn addStaleBytes(self: *Builder, n: usize) void {
+        const clamped: u32 = @intCast(@min(n, std.math.maxInt(u32)));
+        self.stale_data_size +|= clamped;
+    }
+
+    /// Convenience for callers with nothing to say about the row: raw
+    /// encoding, no flags. Production writers use addItem, so meta travels
+    /// with the row it describes.
     pub fn add(self: *Builder, key: Key, value: []const u8) Error!void {
+        return self.addItem(.{ .key = key, .value = value, .meta = .{} });
+    }
+
+    pub fn addItem(self: *Builder, item: Item) Error!void {
+        const key = item.key;
+        const value = item.value;
+
         if (key.len() > std.math.maxInt(u16)) return error.KeyTooLarge;
         if (value.len > std.math.maxInt(u32)) return error.ValueTooLarge;
 
@@ -185,8 +222,8 @@ pub const Builder = struct {
         const diff_len = entry_key.len - overlap;
 
         // Estimate the encoded size for this entry:
-        // 2 bytes overlap + 2 bytes diff_len + key diff + value.
-        const entry_sz = @as(usize, 4) + diff_len + value.len;
+        // 2 bytes overlap + 2 bytes diff_len + 1 byte meta + key diff + value.
+        const entry_sz = @as(usize, 5) + diff_len + value.len;
         if (self.shouldFinishBlock(entry_sz)) {
             try self.finishBlock();
         }
@@ -202,10 +239,14 @@ pub const Builder = struct {
 
         // cur_offsets stores the start offset of each entry in cur_block.
         try self.cur_offsets.append(self.allocator, @intCast(self.cur_block.items.len));
-        // Per-entry encoding: [u16 overlap][u16 diff_len][diff bytes][value bytes]
-        // Value boundary is derived from the next entry offset (or end of entries region).
+        // Per-entry encoding:
+        //   [u16 overlap][u16 diff_len][u8 meta][diff bytes][value bytes]
+        // Value boundary is derived from the next entry offset (or end of
+        // entries region), which is why meta sits in the fixed header rather
+        // than in front of the value. See the layout notes at the top.
         try appendU16(&self.cur_block, self.allocator, @intCast(overlap2));
         try appendU16(&self.cur_block, self.allocator, @intCast(diff.len));
+        try self.cur_block.append(self.allocator, item.meta.toByte());
         try self.cur_block.appendSlice(self.allocator, diff);
         try self.cur_block.appendSlice(self.allocator, value);
 
@@ -325,6 +366,7 @@ pub const Builder = struct {
             .uncompressed_size = self.uncompressed_size,
             .compressed_size = self.compressed_size,
             .stale_data_size = self.stale_data_size,
+            .format_version = idx.format_version,
         });
         try index_writer.setCompression(@enumFromInt(@intFromEnum(self.cfg.codec)));
         if (binary_fuse_off) |off| {

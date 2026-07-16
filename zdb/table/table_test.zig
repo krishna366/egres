@@ -1,7 +1,8 @@
 const std = @import("std");
 const utils = @import("utils");
 const zdb = @import("zdb");
-const Key = zdb.key.Key;
+const zbuf = @import("zbuf").zbuf;
+const Key = zdb.kv.Key;
 const vfs = zdb.vfs;
 
 const Builder = zdb.table.builder.Builder;
@@ -721,4 +722,133 @@ test "seekRange: ConcatIterator across multiple tables" {
         try concat.next();
     }
     try std.testing.expectEqual(@as(usize, 300), count);
+}
+
+// ---------------------------------------------------------------------------
+// Meta byte: survives the SST entry encoding
+// ---------------------------------------------------------------------------
+
+/// Distinct-but-deterministic meta for entry i, mixing both nibbles so a
+/// mix-up between kind and encoding shows up as a mismatch.
+fn metaFor(i: usize) zdb.kv.Meta {
+    return .{
+        .kind = switch (i % 3) {
+            0 => .deleted,
+            1 => .delta,
+            else => .state,
+        },
+        .encoding = if ((i % 2) == 1) .roaring else .raw,
+    };
+}
+
+test "table: meta round-trips through builder and iterator" {
+    const alloc = std.testing.allocator;
+    // Small blocks so the table spans many blocks: meta has to survive each
+    // block re-anchoring on a new base key.
+    var b = Builder.init(alloc, .{ .target_block_size = 4096 });
+    defer b.deinit();
+
+    const n = 500;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key_str = try std.fmt.bufPrint(&key_buf, "k:{d:0>4}", .{i});
+        var val_buf: [20]u8 = undefined;
+        // Every third entry has an EMPTY value with a non-zero meta. This is
+        // the case that would break if meta were a value prefix instead of a
+        // header field: the value region's length is implicit, so an empty
+        // value must stay a zero-byte region.
+        const val = if (i % 3 == 0)
+            ""
+        else
+            try std.fmt.bufPrint(&val_buf, "v{d}", .{i});
+
+        try b.addItem(.{
+            .key = .{ .primary = key_str, .timestamp = 1 },
+            .value = val,
+            .meta = metaFor(i),
+        });
+    }
+
+    var tb = try b.finish();
+    defer tb.deinit();
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(tbl);
+
+    var it = TableIterator.init(alloc, tbl, .p0);
+    defer it.deinit();
+    try it.seekRange(.{}, .{});
+
+    var count: usize = 0;
+    while (it.itemRef()) |item| {
+        try std.testing.expectEqual(metaFor(count), item.meta);
+        if (count % 3 == 0) try std.testing.expectEqual(@as(usize, 0), item.value.len);
+        count += 1;
+        try it.next();
+    }
+    try std.testing.expectEqual(@as(usize, n), count);
+}
+
+test "table: meta survives random access via seekGe" {
+    const alloc = std.testing.allocator;
+    var b = Builder.init(alloc, .{ .target_block_size = 4096 });
+    defer b.deinit();
+
+    const n = 500;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key_str = try std.fmt.bufPrint(&key_buf, "k:{d:0>4}", .{i});
+        try b.addItem(.{
+            .key = .{ .primary = key_str, .timestamp = 1 },
+            .value = "x",
+            .meta = metaFor(i),
+        });
+    }
+
+    var tb = try b.finish();
+    defer tb.deinit();
+    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(tbl);
+
+    // setIdx is reached by binary search too, not just forward scans, so seek
+    // straight into the middle of blocks rather than walking there.
+    for ([_]usize{ 0, 1, 7, 128, 199, 256, 499 }) |target| {
+        var key_buf: [32]u8 = undefined;
+        const key_str = try std.fmt.bufPrint(&key_buf, "k:{d:0>4}", .{target});
+
+        var it = TableIterator.init(alloc, tbl, .p0);
+        defer it.deinit();
+        try it.seekRange(.{ .primary = key_str, .timestamp = 1 }, .{});
+
+        const item = it.itemRef() orelse return error.TestExpectedItem;
+        try std.testing.expectEqualStrings(key_str, item.key.primary);
+        try std.testing.expectEqual(metaFor(target), item.meta);
+    }
+}
+
+test "table: SST written before format_version is rejected" {
+    const alloc = std.testing.allocator;
+    var tb = try buildTestTable(alloc, "foo", 10, 4096);
+    defer tb.deinit();
+
+    // Rewind the index to look like one written before field id 10 existed:
+    // shrink its size_bytes so formatVersion() reads back 0 from a slot past
+    // the header. Then repair the index checksum, because the whole point is
+    // that checksums do NOT catch a stale entry format — only this gate does.
+    const bytes = tb.bytes;
+    const trailer_at = bytes.len - 12;
+    const index_len = std.mem.readInt(u32, bytes[trailer_at..][0..4], .little);
+    const index_at = trailer_at - index_len;
+    const index_bytes = bytes[index_at..trailer_at];
+
+    const cur_size = std.mem.readInt(u16, index_bytes[0..2], .little);
+    try std.testing.expectEqual(@as(u16, 51), cur_size);
+    std.mem.writeInt(u16, index_bytes[0..2], 47, .little);
+    std.mem.writeInt(u64, bytes[trailer_at + 4 ..][0..8], zbuf.hash(index_bytes), .little);
+
+    try std.testing.expectError(
+        error.UnsupportedTableFormat,
+        Table.openHandle(alloc, try fromBuf(alloc, bytes), .p0),
+    );
 }

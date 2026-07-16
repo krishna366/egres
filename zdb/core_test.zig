@@ -1,6 +1,6 @@
 const std = @import("std");
 const zdb = @import("zdb");
-const Key = zdb.key.Key;
+const Key = zdb.kv.Key;
 
 test "config validate rejects single compactor and in-memory dir" {
     const bad_compactors = zdb.config.Config{
@@ -40,19 +40,4 @@ test "keyWithTs parseTs parseKey and compareWithTs match badger ordering" {
 
     // User key still sorts before timestamp suffix.
     try std.testing.expectEqual(std.math.Order.lt, Key.init(a_v7).order(Key.init(b_v1)));
-}
-
-test "entry flags and estimate size" {
-    const e = zdb.types.Entry
-        .init("hello", "world")
-        .withVersion(7)
-        .withUserMeta(3)
-        .withDelete()
-        .withDiscardEarlierVersions();
-
-    try std.testing.expectEqual(@as(usize, 12), e.estimateSize());
-    try std.testing.expect(e.isDelete());
-    try std.testing.expect(e.discardEarlierVersions());
-    try std.testing.expectEqual(@as(u64, 7), e.version);
-    try std.testing.expectEqual(@as(u8, 3), e.user_meta);
 }
