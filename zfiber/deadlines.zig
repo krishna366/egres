@@ -1,10 +1,18 @@
-//! Per-worker timeout machinery: a flat array of pending deadlines plus one
-//! `xev.Timer` re-armed dynamically to the earliest deadline.
+//! Per-worker timeout machinery: a flat array of pending deadlines plus a
+//! growable pool of `xev.Timer` completions, one always armed for the earliest
+//! deadline.
+//!
+//! To fire earlier we NEVER `timer.reset` the in-flight completion (that path —
+//! cancel + re-arm the SAME completion via `op.reset` — had a race that could
+//! strand the timer). Instead `armForHead` always runs a FRESH node from the
+//! pool for the new head and cancels the superseded one. The pool grows on
+//! demand, so the head is always armed even when many ever-earlier deadlines
+//! register before a single loop tick.
 //!
 //! Each `Worker` owns one `Deadlines` instance. Timeouts registered on worker N
-//! live in worker N's array, and the xev `timer` is only ever armed/reset on
+//! live in worker N's array, and the xev timers are only ever armed/canceled on
 //! worker N's thread — libxev per-loop state is not thread-safe, so
-//! `register`/`drainExpired`/`onTimer`/`armForHead` stay owner-thread-only.
+//! `register`/`drainExpired`/`onTimerNode`/`armForHead` stay owner-thread-only.
 //!
 //! `cancel`, however, IS safe to call from any worker: a fiber that registered a
 //! timeout here can migrate and complete on a different worker, then cancel from
@@ -41,6 +49,20 @@ pub const min_timeout_ms: u64 = 1;
 /// `on_fire(on_fire_ctx)` exactly once (gated by `_done`).
 pub const Timeout = fb.Timeout;
 
+/// One reusable timer SQE. `completion` must stay put (io_uring holds its
+/// address until the CQE), so nodes are heap-allocated and never moved. A node
+/// is either in flight (armed for a deadline) or cached in `free_nodes`.
+const TimerNode = struct {
+    completion: xev.Completion = .{},
+    parent: *Deadlines = undefined,
+    deadline_ms: i64 = 0,
+};
+
+/// Cap on cached idle nodes. A burst can allocate more than this transiently;
+/// as those timers fire, the pool caches up to this many for reuse and frees
+/// the rest — so a spike doesn't inflate memory forever.
+const max_free_nodes = 16;
+
 pub const Deadlines = struct {
     loop: *xev.Loop,
     timer: xev.Timer,
@@ -48,17 +70,21 @@ pub const Deadlines = struct {
     /// Captured at init (the runtime's allocator) so callers never pass one and
     /// can't mismatch grow vs. free.
     allocator: Allocator,
-    /// SQE backing the in-flight timer expiration.
-    completion: xev.Completion = undefined,
-    /// SQE backing the cancellation half of an `xev.Timer.reset` call.
-    /// Required by `reset` because the old SQE has to be canceled
-    /// independently of the new SQE being submitted.
-    cancel_completion: xev.Completion = undefined,
-    /// True while a timer SQE is in flight (between `arm`/`reset` and
-    /// the matching callback returning `.disarm`). Decides whether
-    /// `armForHead` should call `timer.run` (fresh) or `timer.reset`
-    /// (cancel-then-re-arm on the same completion).
-    armed: bool = false,
+    /// The node armed for the current earliest deadline (the head), or null.
+    /// Superseded by `armForHead` when an earlier deadline arrives.
+    active: ?*TimerNode = null,
+    /// Cache of idle timer completions for reuse, capped at `max_free_nodes`.
+    /// To fire earlier we NEVER reset the in-flight timer (that reset —
+    /// cancel-then-re-arm the SAME completion via `op.reset` — had a race that
+    /// could strand it). Instead we always `timer.run` a fresh node and
+    /// `cancel` the superseded one so it recycles here fast. A burst of
+    /// ever-earlier deadlines allocates beyond the cap transiently; the excess
+    /// is freed as it recycles, so memory doesn't stay inflated.
+    free_nodes: std.ArrayList(*TimerNode) = .empty,
+    /// SQE for the `timer.cancel` of a superseded node — one in flight at a
+    /// time. When busy, the superseded node just lingers to its own deadline
+    /// (still correct; the fresh node covers the head), then recycles.
+    cancel_completion: xev.Completion = .{},
     /// Pending timeouts as a flat array of pointers — NOT the `MinHeap`. We scan
     /// it (O(N), N tiny) for the min deadline and for removal. Removal matches by
     /// pointer identity.
@@ -70,14 +96,26 @@ pub const Deadlines = struct {
     sl: Spinlock = .{},
 
     pub fn init(loop: *xev.Loop, allocator: Allocator) !Deadlines {
-        return .{
+        var self: Deadlines = .{
             .loop = loop,
             .timer = try xev.Timer.init(),
             .allocator = allocator,
         };
+        // Preallocate the cap so `recycleNode` never has to grow (or fail).
+        try self.free_nodes.ensureTotalCapacity(allocator, max_free_nodes);
+        return self;
     }
 
     pub fn deinit(self: *Deadlines) void {
+        // Frees the cached (idle) nodes only. A node still armed at deinit is
+        // NOT freed here — it's abandoned. That is safe (no UAF): the run loop
+        // has stopped, so nobody reaps its completion, and the kernel writes
+        // CQEs to its own ring, never into this memory. The cost is a bounded
+        // one-time leak (~the current head timer) at teardown — acceptable for
+        // process shutdown; revisit with an owning node list if a leak-checked
+        // runtime tears down with live timers.
+        for (self.free_nodes.items) |n| self.allocator.destroy(n);
+        self.free_nodes.deinit(self.allocator);
         self.timeouts.deinit(self.allocator);
         self.timer.deinit();
     }
@@ -98,7 +136,7 @@ pub const Deadlines = struct {
     /// CLOCK_MONOTONIC, no caching. Using `loop.now()` would hand us
     /// libxev's cached value, which can be arbitrarily stale between
     /// `loop.run` iterations under heavy worker load; that stale
-    /// baseline could let `onTimer`'s drainExpired see both a short and
+    /// baseline could let a fire.s drainExpired see both a short and
     /// a long deadline "expired" in one sweep when only the short fired.
     ///
     /// Re-arms the xev timer iff this entry becomes the new earliest
@@ -137,7 +175,7 @@ pub const Deadlines = struct {
         // Arm outside the lock — `register` only ever runs on the owner
         // thread, so the timer SQE op is safe; keeping it off `sl` avoids
         // pinning a cross-thread `cancel` behind a libxev call.
-        if (becomes_head) self.resetTimer(current_ms);
+        if (becomes_head) self.armForHead(current_ms);
     }
 
     /// O(N) removal by POINTER IDENTITY. Safe even when `t` isn't enqueued
@@ -203,13 +241,42 @@ pub const Deadlines = struct {
         }
     }
 
-    /// Reset the timer for the earliest pending deadline. Owner-thread
-    /// only (touches the xev timer). No-op when there are no timeouts.
-    fn resetTimer(self: *Deadlines, current_ms: i64) void {
+    /// Take a cached idle node, or allocate a fresh one.
+    fn acquireNode(self: *Deadlines) !*TimerNode {
+        if (self.free_nodes.pop()) |n| return n;
+        const n = try self.allocator.create(TimerNode);
+        n.* = .{ .parent = self };
+        return n;
+    }
+
+    /// Return a fired/canceled node. Cache it for reuse (its completion is
+    /// done, so reset it), or free it if the cache is already full — so a
+    /// burst that allocated many nodes doesn't retain them all.
+    fn recycleNode(self: *Deadlines, node: *TimerNode) void {
+        if (self.free_nodes.items.len < max_free_nodes) {
+            node.completion = .{};
+            self.free_nodes.appendAssumeCapacity(node);
+        } else {
+            self.allocator.destroy(node);
+        }
+    }
+
+    /// Ensure a timer fires at or before the earliest pending deadline.
+    /// Owner-thread only. Always `timer.run`s a fresh node for the head (never
+    /// `reset`) and cancels the superseded one so it recycles promptly. The
+    /// growable pool guarantees a node is always available, so the head is
+    /// never left uncovered. No-op when the active node already covers the
+    /// head, or when there are no timeouts.
+    fn armForHead(self: *Deadlines, current_ms: i64) void {
         self.sl.lock();
         const head = self.minDeadlineLocked();
         self.sl.unlock();
         const deadline = head orelse return;
+
+        // Active node already fires at or before the head → nothing to do.
+        if (self.active) |a| {
+            if (a.deadline_ms <= deadline) return;
+        }
 
         const delta = deadline - current_ms;
         const next_ms: u64 = if (delta < @as(i64, @intCast(min_timeout_ms)))
@@ -217,60 +284,54 @@ pub const Deadlines = struct {
         else
             @intCast(delta);
 
-        if (self.armed) {
-            // reset cancels the in-flight SQE (callback fires with
-            // error.Canceled) and queues a new one for `next_ms`.
-            self.timer.reset(
-                self.loop,
-                &self.completion,
-                &self.cancel_completion,
-                next_ms,
-                Deadlines,
-                self,
-                onTimer,
-            );
-        } else {
-            self.timer.run(
-                self.loop,
-                &self.completion,
-                next_ms,
-                Deadlines,
-                self,
-                onTimer,
-            );
-            self.armed = true;
+        const node = self.acquireNode() catch {
+            std.log.err("deadlines: OOM arming timer; head deferred", .{});
+            return;
+        };
+        node.deadline_ms = deadline;
+        self.timer.run(self.loop, &node.completion, next_ms, TimerNode, node, onTimerNode);
+
+        // Cancel the superseded node so it recycles now instead of lingering to
+        // its own (later) deadline. Clean timer_remove — no `op.reset`, so no
+        // re-arm race; its own callback fires Canceled and recycles it. Skipped
+        // if a cancel is already in flight: that node just lingers (harmless —
+        // the fresh node covers the head) and recycles on its natural fire.
+        const superseded = self.active;
+        self.active = node;
+        if (superseded) |o| {
+            if (self.cancel_completion.state() != .active) {
+                self.timer.cancel(self.loop, &o.completion, &self.cancel_completion, Deadlines, self, onCancel);
+            }
         }
     }
 };
 
-fn onTimer(
-    ud: ?*Deadlines,
+fn onCancel(_: ?*Deadlines, _: *xev.Loop, _: *xev.Completion, _: xev.CancelError!void) xev.CallbackAction {
+    // The removed node's OWN callback (onTimerNode) recycles it; the remove
+    // result itself is irrelevant (NOENT if the node already fired).
+    return .disarm;
+}
+
+fn onTimerNode(
+    ud: ?*TimerNode,
     _: *xev.Loop,
     _: *xev.Completion,
     result: xev.Timer.RunError!void,
 ) xev.CallbackAction {
-    const self = ud.?;
-    _ = result catch |err| switch (err) {
-        // A `reset` fires the old SQE with Canceled. The reset has
-        // already queued a fresh run on `self.completion`; just bow
-        // out and let that one call us back later.
-        error.Canceled => return .disarm,
-        // Unexpected: nothing to do, drop the tick. The next register
-        // will re-arm.
-        error.Unexpected => {
-            self.armed = false;
-            return .disarm;
-        },
-    };
+    const node = ud.?;
+    const self = node.parent;
+    if (self.active == node) self.active = null;
+    self.recycleNode(node);
 
-    // Normal expiration: drain everything whose deadline has passed,
-    // then re-arm for the next entry if any remain. Same monotonic
-    // source as `register` — see its comment.
+    // Canceled (superseded, cancelled to recycle early) or Unexpected: nothing
+    // expired here, and the head is covered by the node that superseded us (or
+    // a future register re-arms). Don't drain / re-arm.
+    _ = result catch return .disarm;
+
     const now = coarse.clockMsUseRarely(.monotonic);
     self.drainExpired(now);
-    self.armed = false;
-    // armForHead re-locks the heap and no-ops if it's empty.
-    self.resetTimer(now);
+    // Re-arm for whatever remains (this node fired, so the head lost its timer).
+    self.armForHead(now);
     return .disarm;
 }
 

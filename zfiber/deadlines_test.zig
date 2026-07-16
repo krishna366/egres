@@ -108,6 +108,37 @@ test "Deadlines: re-arm to earlier deadline registered after a later one" {
     try std.testing.expect(long_elapsed < 250);
 }
 
+test "Deadlines: many ever-earlier deadlines before a loop tick all fire on time" {
+    // Register N deadlines, each SHORTER than the last, back-to-back with no
+    // park in between — so no loop tick separates them. Every one is a new
+    // head, so `armForHead` runs a fresh pooled node for each. The growable
+    // pool guarantees a node is always available, so the SHORTEST is not
+    // stretched behind a longer armed timer (the hole a fixed node count has).
+    const w = fiber.currentWorker();
+    const now = nowMs();
+
+    const N = 20;
+    var fired: [N]Fired = undefined;
+    for (&fired) |*f| f.* = .{};
+    var t: [N]fiber.Timeout = undefined;
+    // Deadlines 60,58,...,22 ms — strictly decreasing, so each becomes head.
+    for (0..N) |i| {
+        t[i] = .{ .on_fire = &Fired.cb, .on_fire_ctx = &fired[i] };
+        try w.deadlines.register(&t[i], @intCast(60 - i * 2));
+    }
+    defer for (0..N) |i| w.deadlines.cancel(&t[i]);
+
+    // Poll until the last-registered (shortest, ~22 ms) has fired.
+    while (!fired[N - 1].fired()) fiber.sleepMs(1);
+
+    // The shortest deadline (22 ms) fires near its own time — NOT stretched to
+    // the longest (60 ms). A generous ceiling tolerates scheduler load.
+    const shortest = fired[N - 1].at() - now;
+    std.log.debug("shortest of {d} fired at {d} ms (deadline 22)", .{ N, shortest });
+    try std.testing.expect(shortest >= 20);
+    try std.testing.expect(shortest < 50);
+}
+
 // ── sleepMs (the fiber-facing consumer of Deadlines) ────────────────
 
 test "sleepMs: 100 fibers sleeping 10ms in parallel finish under 50ms" {
