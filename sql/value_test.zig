@@ -1,7 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const pgwire = @import("pgwire");
 const Type = sql.Type;
+const value = sql.value;
+const rowkey = sql.rowkey;
 
 test "sql.value: fixedWidth and isVarlen per type" {
     try testing.expectEqual(@as(?u8, 1), Type.bool_.fixedWidth());
@@ -51,4 +54,57 @@ test "sql.value: Type.fromName resolves DDL type names" {
     try testing.expect(Type.fromName("serial") == null);
     try testing.expect(Type.fromName("numeric") == null);
     try testing.expect(Type.fromName("") == null);
+}
+
+test "sql.value: parseValue coerces literals and rejects unsupported types" {
+    try testing.expectEqual(@as(i32, -7), (try value.parseValue(.int4, "-7")).int4);
+    try testing.expectEqual(@as(u64, 42), (try value.parseValue(.uint8, "42")).uint8);
+    try testing.expectEqual(true, (try value.parseValue(.bool_, "t")).bool_);
+    try testing.expectEqual(false, (try value.parseValue(.bool_, "FALSE")).bool_);
+    try testing.expectEqual(@as(f64, 1.5), (try value.parseValue(.float8, "1.5")).float8);
+    try testing.expectEqualStrings("hi", (try value.parseValue(.text, "hi")).text);
+    // Bad numeric / bool → error (executor maps to 22P02).
+    try testing.expectError(error.InvalidCharacter, value.parseValue(.int4, "nope"));
+    try testing.expectError(error.InvalidBool, value.parseValue(.bool_, "maybe"));
+    // Types this slice can't parse.
+    try testing.expectError(error.UnsupportedType, value.parseValue(.date, "2026-01-01"));
+    try testing.expectError(error.UnsupportedType, value.parseValue(.uuid, "x"));
+}
+
+test "sql.value: formatValue renders text-format output" {
+    var buf: [64]u8 = undefined;
+    const cases = [_]struct { v: value.Value, want: []const u8 }{
+        .{ .v = .{ .int4 = -7 }, .want = "-7" },
+        .{ .v = .{ .uint8 = 42 }, .want = "42" },
+        .{ .v = .{ .bool_ = true }, .want = "t" },
+        .{ .v = .{ .bool_ = false }, .want = "f" },
+        .{ .v = .{ .text = "hello" }, .want = "hello" },
+    };
+    for (cases) |c| {
+        var w = std.Io.Writer.fixed(&buf);
+        try value.formatValue(&w, c.v);
+        try testing.expectEqualStrings(c.want, w.buffered());
+    }
+}
+
+test "sql.value: pgTypeOid widens unsigned ints" {
+    try testing.expectEqual(pgwire.oid.bool_, value.pgTypeOid(.bool_));
+    try testing.expectEqual(pgwire.oid.int4, value.pgTypeOid(.int4));
+    try testing.expectEqual(pgwire.oid.int4, value.pgTypeOid(.uint2)); // widen
+    try testing.expectEqual(pgwire.oid.int8, value.pgTypeOid(.uint4)); // widen
+    try testing.expectEqual(pgwire.oid.numeric, value.pgTypeOid(.uint8)); // widen
+    try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.text));
+    try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.date)); // no dedicated oid yet
+}
+
+test "sql.rowkey: egid encodes big-endian and round-trips in key order" {
+    const a = rowkey.encodeEgid(1);
+    const b = rowkey.encodeEgid(256);
+    // Big-endian ⇒ byte order matches numeric order.
+    try testing.expect(std.mem.order(u8, &a, &b) == .lt);
+    try testing.expectEqual(@as(?u64, 1), rowkey.decodeEgid(&a));
+    try testing.expectEqual(@as(?u64, 256), rowkey.decodeEgid(&b));
+    // Non-8-byte primaries aren't egid-shaped.
+    try testing.expectEqual(@as(?u64, null), rowkey.decodeEgid("abc"));
+    try testing.expectEqual(@as(?u64, null), rowkey.decodeEgid(""));
 }

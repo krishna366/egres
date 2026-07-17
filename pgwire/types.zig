@@ -54,8 +54,11 @@ pub const sqlstate = struct {
     pub const syntax_error: [5]u8 = .{ '4', '2', '6', '0', '1' };
     pub const duplicate_table: [5]u8 = .{ '4', '2', 'P', '0', '7' };
     pub const undefined_table: [5]u8 = .{ '4', '2', 'P', '0', '1' };
+    pub const undefined_column: [5]u8 = .{ '4', '2', '7', '0', '3' };
     pub const invalid_catalog_name: [5]u8 = .{ '3', 'D', '0', '0', '0' };
     pub const feature_not_supported: [5]u8 = .{ '0', 'A', '0', '0', '0' };
+    pub const invalid_text_representation: [5]u8 = .{ '2', '2', 'P', '0', '2' };
+    pub const unique_violation: [5]u8 = .{ '2', '3', '5', '0', '5' };
 };
 
 /// Severity strings used in ErrorResponse 'S' / 'V' fields.

@@ -38,6 +38,7 @@ pub const Engine = engine.Engine;
 pub const StorageImpl = engine.StorageImpl;
 pub const SnapshotCfg = engine.SnapshotCfg;
 pub const InFlight = engine.InFlight;
+pub const ApplyObserver = engine.ApplyObserver;
 
 /// The admin protocol front-end: a line-protocol listener over an Engine.
 pub const AdminServer = admin.AdminServer;

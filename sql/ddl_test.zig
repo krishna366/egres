@@ -18,9 +18,10 @@ test "sql.ddl: CREATE/DROP DATABASE parse to typed statements" {
 test "sql.ddl: everything else is unsupported; bad SQL is a syntax error" {
     const alloc = testing.allocator;
 
-    var sel = try ddl.parseDdl(alloc, "SELECT 1;");
-    defer sel.deinit(alloc);
-    try testing.expect(sel == .unsupported);
+    // A statement kind we don't handle at all (UPDATE) is unsupported.
+    var upd = try ddl.parseDdl(alloc, "UPDATE t SET x = 1;");
+    defer upd.deinit(alloc);
+    try testing.expect(upd == .unsupported);
 
     try testing.expectError(error.SyntaxError, ddl.parseDdl(alloc, "CREATE DATABASE;"));
 }
@@ -90,4 +91,90 @@ test "sql.ddl: DROP TABLE variants" {
     var di = try ddl.parseDdl(alloc, "DROP INDEX i;");
     defer di.deinit(alloc);
     try testing.expect(di == .unsupported);
+}
+
+test "sql.ddl: CREATE TABLE reserves the egid column name" {
+    const alloc = testing.allocator;
+    var stmt = try ddl.parseDdl(alloc, "CREATE TABLE t (egid int8, name text);");
+    defer stmt.deinit(alloc);
+    try testing.expect(stmt == .invalid);
+    try testing.expect(std.mem.indexOf(u8, stmt.invalid, "egid") != null);
+}
+
+test "sql.ddl: INSERT ... VALUES parses rows, columns, and literals" {
+    const alloc = testing.allocator;
+
+    // Positional, multi-row.
+    var pos = try ddl.parseDdl(alloc, "INSERT INTO t VALUES (1, 'a'), (2, 'b');");
+    defer pos.deinit(alloc);
+    try testing.expectEqualStrings("t", pos.insert.table);
+    try testing.expect(pos.insert.columns == null);
+    try testing.expectEqual(@as(usize, 2), pos.insert.rows.len);
+    try testing.expectEqual(@as(i64, 1), pos.insert.rows[0][0].int);
+    try testing.expectEqualStrings("a", pos.insert.rows[0][1].str);
+    try testing.expectEqual(@as(i64, 2), pos.insert.rows[1][0].int);
+
+    // Explicit column list + null + bool literals.
+    var cols = try ddl.parseDdl(alloc, "INSERT INTO t (id, flag, note) VALUES (0, true, NULL);");
+    defer cols.deinit(alloc);
+    try testing.expect(cols.insert.columns != null);
+    try testing.expectEqual(@as(usize, 3), cols.insert.columns.?.len);
+    try testing.expectEqualStrings("id", cols.insert.columns.?[0]);
+    try testing.expectEqual(@as(i64, 0), cols.insert.rows[0][0].int); // zero-valued ival
+    try testing.expectEqual(true, cols.insert.rows[0][1].bool_);
+    try testing.expect(cols.insert.rows[0][2] == .null_value);
+}
+
+test "sql.ddl: INSERT rejections carry a reason" {
+    const alloc = testing.allocator;
+    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+        .{ .sql = "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING;", .needle = "ON CONFLICT" },
+        .{ .sql = "INSERT INTO t VALUES (1) RETURNING id;", .needle = "RETURNING" },
+        .{ .sql = "INSERT INTO t SELECT * FROM u;", .needle = "VALUES" },
+    };
+    for (cases) |case| {
+        var stmt = try ddl.parseDdl(alloc, case.sql);
+        defer stmt.deinit(alloc);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
+    }
+}
+
+test "sql.ddl: SELECT parses projection, table, and an equality filter" {
+    const alloc = testing.allocator;
+
+    // Star, no filter.
+    var s1 = try ddl.parseDdl(alloc, "SELECT * FROM t;");
+    defer s1.deinit(alloc);
+    try testing.expectEqualStrings("t", s1.select.table);
+    try testing.expect(s1.select.projection == .star);
+    try testing.expect(s1.select.filter == null);
+
+    // Named columns incl. the egid pseudo-column + a WHERE filter.
+    var s2 = try ddl.parseDdl(alloc, "SELECT egid, name FROM t WHERE id = 5;");
+    defer s2.deinit(alloc);
+    try testing.expect(s2.select.projection == .columns);
+    try testing.expectEqual(@as(usize, 2), s2.select.projection.columns.len);
+    try testing.expectEqualStrings("egid", s2.select.projection.columns[0]);
+    try testing.expectEqualStrings("name", s2.select.projection.columns[1]);
+    const f = s2.select.filter.?;
+    try testing.expectEqualStrings("id", f.column);
+    try testing.expectEqual(@as(i64, 5), f.literal.int);
+}
+
+test "sql.ddl: SELECT rejections carry a reason" {
+    const alloc = testing.allocator;
+    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+        .{ .sql = "SELECT * FROM t ORDER BY a;", .needle = "ORDER BY" },
+        .{ .sql = "SELECT * FROM t LIMIT 3;", .needle = "LIMIT" },
+        .{ .sql = "SELECT * FROM a, b;", .needle = "one table" },
+        .{ .sql = "SELECT count(*) FROM t;", .needle = "column references" },
+        .{ .sql = "SELECT * FROM t WHERE a > 5;", .needle = "column = value" },
+    };
+    for (cases) |case| {
+        var stmt = try ddl.parseDdl(alloc, case.sql);
+        defer stmt.deinit(alloc);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
+    }
 }

@@ -187,10 +187,12 @@ fn makeModules(
     // libpg_query binding (the C archive itself is linked per-executable via
     // addLibpgQuerySources); the server (pgwire front-end) drives the
     // engine — the sanctioned direction is sql → engine → zdb/raft, and
-    // engine never imports sql.
+    // engine never imports sql. sql also references zdb key types directly
+    // (Key/KeyRange/Item) to build catalog + data scans against the forest.
     const sql = makeModule(b, target, optimize, "sql.zig");
     sql.addImport("pgwire", pgwire);
     sql.addImport("engine", engine);
+    sql.addImport("zdb", zdb);
     sql.addImport("zfiber", fiber);
 
     return .{

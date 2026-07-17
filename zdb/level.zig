@@ -15,10 +15,30 @@ pub const Error = table.table.Error;
 // KeyRange
 // ---------------------------------------------------------------------------
 
+// Low sentinel for a table's start: an EMPTY primary reads as fully-open, so
+// table-scoped bounds use this non-empty minimum instead. Static so
+// `limitToTable` can hand out slices into it.
+const table_lo = [_]u8{0};
+
 pub const KeyRange = struct {
     left: Key = .{},
     right: Key = .{},
     inf: bool = false,
+
+    /// This range CLAMPED to one table's key window `[table_start, table_end)`
+    /// (table_end = the next table_id's start, exclusive) — i.e. intersect with
+    /// the table range. A left below the table (a lower namespace/table, or
+    /// empty) is raised to table_start; a right at/above the end (or empty =
+    /// open) is lowered to table_end; a left/right genuinely inside the table is
+    /// kept. So a scan over the namespace-wide memtable stays within the table
+    /// instead of grafting one key's primary onto another.
+    pub fn limitToTable(self: KeyRange, ns: u64, table_id: u32) KeyRange {
+        const mt = std.math.maxInt(u64);
+        return self.intersect(.{
+            .left = .{ .namespace = ns, .table_id = table_id, .primary = &table_lo, .timestamp = mt },
+            .right = .{ .namespace = ns, .table_id = table_id +| 1, .primary = &table_lo, .timestamp = mt },
+        });
+    }
 
     pub fn isEmpty(self: KeyRange) bool {
         return self.left.primary.len == 0 and self.right.primary.len == 0 and !self.inf;

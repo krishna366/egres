@@ -877,11 +877,13 @@ pub const AdminServer = struct {
             .primary = req.end_key,
             .timestamp = std.math.maxInt(u64),
         };
-        const scan_range = zdb.level.KeyRange{
+        // Admin scans the raw-KV table (table_id 0); limitToTable confines it
+        // to (req.ns, 0) across the namespace-wide memtable.
+        const scan_range = (zdb.level.KeyRange{
             .left = scan_start,
             .right = scan_end,
             .inf = req.start_key.len == 0 and req.end_key.len == 0,
-        };
+        }).limitToTable(req.ns, 0);
 
         // 4 KiB buffered writer — 1-2 items fit per drain at the bench's
         // 4 KiB value size; smaller modes pack many items per drain.
@@ -913,7 +915,6 @@ pub const AdminServer = struct {
 
         const emitted = self.engine.forest.scan(
             self.engine.allocator,
-            req.ns,
             scan_range,
             req.max_count,
             .p0,
@@ -1169,7 +1170,7 @@ pub const AdminServer = struct {
             try proto.writeErr(stream, @errorName(err));
             return;
         };
-        self.engine.proposeAndApplyMC(mc) catch |err| {
+        self.engine.proposeMC(mc, .apply) catch |err| {
             log.err("ns create failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;

@@ -552,6 +552,48 @@ pub fn encodeDataRow(
     };
 }
 
+/// Streaming DataRow encoder: format columns one at a time directly into
+/// `scratch` (rather than buffering each cell, then copying again), then
+/// `finish` writes the whole frame in one go. Each column reserves a 4-byte
+/// length placeholder that `endColumn` backpatches once the value's bytes are
+/// written. Column count is fixed up front.
+pub const DataRowWriter = struct {
+    scratch: *std.Io.Writer.Allocating,
+    out: *std.Io.Writer,
+    col_at: usize = 0, // placeholder offset of the column in progress
+
+    /// Reset the scratch and write the column count.
+    pub fn begin(scratch: *std.Io.Writer.Allocating, out: *std.Io.Writer, field_count: u16) !DataRowWriter {
+        resetScratch(scratch);
+        try scratch.writer.writeInt(i16, @intCast(field_count), .big);
+        return .{ .scratch = scratch, .out = out };
+    }
+
+    /// A NULL column (length -1, no bytes).
+    pub fn writeNull(self: *DataRowWriter) !void {
+        try self.scratch.writer.writeInt(i32, -1, .big);
+    }
+
+    /// Begin a non-null column: reserve its length and return the writer to
+    /// format the value into. Pair with `endColumn`.
+    pub fn beginColumn(self: *DataRowWriter) !*std.Io.Writer {
+        self.col_at = self.scratch.writer.end;
+        try self.scratch.writer.writeInt(i32, 0, .big); // placeholder, backpatched below
+        return &self.scratch.writer;
+    }
+
+    /// Finish a non-null column: backpatch its byte length.
+    pub fn endColumn(self: *DataRowWriter) void {
+        const len: i32 = @intCast(self.scratch.writer.end - self.col_at - 4);
+        std.mem.writeInt(i32, self.scratch.writer.buffered()[self.col_at..][0..4], len, .big);
+    }
+
+    /// Emit the finished DataRow as one frame.
+    pub fn finish(self: *DataRowWriter) !void {
+        try writeFrame(self.out, .data_row, self.scratch.writer.buffered());
+    }
+};
+
 /// CommandComplete body (tag 'C'): one C string ("SELECT 1",
 /// "INSERT 0 5", etc.).
 pub fn encodeCommandComplete(

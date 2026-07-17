@@ -358,6 +358,11 @@ fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *sql.Se
         runJoin(args, eng.allocator);
     }
 
+    // Feed the commit stream to the SQL server's per-table caches (egid
+    // counters). Register before start so no applied entry is missed; the
+    // apply loop stops (eng.wait) before sql_srv is torn down.
+    eng.setApplyObserver(sql_srv.applyObserver());
+
     // The engine owns recovery + applyCommits + the raft/compaction/snapshot
     // loops; register the admin front-end into its loop group.
     eng.start() catch |err| {

@@ -811,6 +811,13 @@ pub const ConnState = struct {
         try proto.writeFrame(self.out, .data_row, self.scratch_out.writer.buffered());
     }
 
+    /// Streaming DataRow: format each column directly into the output scratch,
+    /// then `finish`. See proto.DataRowWriter — one format pass, one frame
+    /// write (no per-cell buffering).
+    pub fn beginDataRow(self: *ConnState, field_count: u16) StateError!proto.DataRowWriter {
+        return proto.DataRowWriter.begin(&self.scratch_out, self.out, field_count);
+    }
+
     pub fn sendCommandComplete(self: *ConnState, tag: []const u8) StateError!void {
         try proto.encodeCommandComplete(&self.scratch_out, tag);
         try proto.writeFrame(self.out, .command_complete, self.scratch_out.writer.buffered());

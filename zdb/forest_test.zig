@@ -814,3 +814,47 @@ test "forest: routes to correct tree" {
         try std.testing.expect(f.tables.contains(.{ .namespace = 2, .table_id = 0 }));
     }
 }
+
+// ---------------------------------------------------------------------------
+// maxKey — largest row id in a table (drives SQL egid allocation)
+// ---------------------------------------------------------------------------
+
+fn beKey(egid: u64) [8]u8 {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, egid, .big);
+    return b;
+}
+
+test "forest: maxKey finds the largest row id (memtable), or null when empty" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    const ns: u64 = 16;
+    const tid: u32 = 16;
+    _ = try f.createTree(ns, tid, .{ .inf = true });
+
+    // No keys yet → null (tree exists but is empty).
+    try std.testing.expect((try f.maxKey(alloc, ns, tid)) == null);
+    // A table with no tree at all → null.
+    try std.testing.expect((try f.maxKey(alloc, ns, 17)) == null);
+
+    // Insert egids out of order; the max (big-endian key order == numeric) is 5.
+    const k1 = beKey(1);
+    const k5 = beKey(5);
+    const k3 = beKey(3);
+    try f.put(&.{
+        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k1, .timestamp = 1 }, .value = "a" },
+        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k5, .timestamp = 1 }, .value = "b" },
+        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k3, .timestamp = 1 }, .value = "c" },
+    });
+
+    const mk = (try f.maxKey(alloc, ns, tid)).?;
+    defer mk.free(alloc);
+    try std.testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, mk.primary[0..8], .big));
+}

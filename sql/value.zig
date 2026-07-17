@@ -7,6 +7,7 @@
 //! representing SQL NULL in band so a decoded `Row` is self-contained.
 
 const std = @import("std");
+const pgwire = @import("pgwire");
 
 /// SQL column types this codec stores. Fixed-width types live in the row's
 /// fixed region at constant offsets; varlen types live in the trailing data
@@ -137,6 +138,94 @@ pub const Row = struct {
         self.cells.deinit(alloc);
     }
 };
+
+// -----------------------------------------------------------------------------
+// Text ↔ Value + wire type mapping (INSERT literals, SELECT output).
+// -----------------------------------------------------------------------------
+
+/// Parse a SQL literal into a typed cell of column type `ty`. The returned
+/// `text`/`bytea` Value BORROWS `text` (the caller keeps it alive until the row
+/// is marshaled). NULL is handled by the caller, not here. Numeric/bool parse
+/// failures surface as errors (the executor maps them to 22P02); types this
+/// slice can't parse (temporal, uuid, interval) return `error.UnsupportedType`
+/// (→ 0A000).
+pub fn parseValue(ty: Type, text: []const u8) !Value {
+    return switch (ty) {
+        .bool_ => .{ .bool_ = try parseBool(text) },
+        .int2 => .{ .int2 = try std.fmt.parseInt(i16, text, 10) },
+        .int4 => .{ .int4 = try std.fmt.parseInt(i32, text, 10) },
+        .int8 => .{ .int8 = try std.fmt.parseInt(i64, text, 10) },
+        .uint2 => .{ .uint2 = try std.fmt.parseInt(u16, text, 10) },
+        .uint4 => .{ .uint4 = try std.fmt.parseInt(u32, text, 10) },
+        .uint8 => .{ .uint8 = try std.fmt.parseInt(u64, text, 10) },
+        .float4 => .{ .float4 = try std.fmt.parseFloat(f32, text) },
+        .float8 => .{ .float8 = try std.fmt.parseFloat(f64, text) },
+        .text => .{ .text = text },
+        .bytea => .{ .bytea = text },
+        .date, .time, .timestamp, .timestamptz, .interval, .uuid => error.UnsupportedType,
+    };
+}
+
+fn parseBool(text: []const u8) !bool {
+    // Postgres accepts several spellings; cover the common ones.
+    if (eqlAny(text, &.{ "t", "true", "1", "yes", "on" })) return true;
+    if (eqlAny(text, &.{ "f", "false", "0", "no", "off" })) return false;
+    return error.InvalidBool;
+}
+
+fn eqlAny(text: []const u8, options: []const []const u8) bool {
+    for (options) |o| if (std.ascii.eqlIgnoreCase(text, o)) return true;
+    return false;
+}
+
+/// Render a non-null cell as its text-format wire representation. The caller
+/// emits SQL NULL as `proto.DataValue.null_value` and never passes it here.
+pub fn formatValue(w: *std.Io.Writer, v: Value) !void {
+    switch (v) {
+        .null_value => {}, // caller handles null out-of-band
+        .bool_ => |b| try w.writeAll(if (b) "t" else "f"),
+        .text, .bytea => |s| try w.writeAll(s),
+        // Every numeric + temporal payload renders via {d}; `inline` binds the
+        // capture to each tag's concrete type. Temporal/uuid can't be inserted
+        // this slice, so a live value never actually reaches those tags — they
+        // degrade to the raw fields rather than crash. TODO: proper Postgres
+        // date/time text formats.
+        inline .int2, .int4, .int8, .uint2, .uint4, .uint8, .float4, .float8, .date, .time, .timestamp, .timestamptz => |x| try w.print("{d}", .{x}),
+        .interval => |iv| try w.print("{d}mon {d}d {d}us", .{ iv.months, iv.days, iv.micros }),
+        .uuid => |u| try w.print("{x}", .{u}),
+    }
+}
+
+/// Equality of two cells (same type expected — the caller coerces the filter
+/// literal to the column's type first). NULL equals only NULL.
+pub fn valuesEqual(x: Value, y: Value) bool {
+    if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+    return switch (x) {
+        .null_value => true,
+        .text => std.mem.eql(u8, x.text, y.text),
+        .bytea => std.mem.eql(u8, x.bytea, y.bytea),
+        .uuid => std.mem.eql(u8, &x.uuid, &y.uuid),
+        .interval => std.meta.eql(x.interval, y.interval),
+        inline else => |v, tag| v == @field(y, @tagName(tag)),
+    };
+}
+
+/// The Postgres OID advertised for a column of this type. Unsigned integers
+/// widen to the smallest signed pg type that holds them (uint2→int4,
+/// uint4→int8, uint8→numeric); types without a dedicated OID here are sent as
+/// text (formatValue renders them).
+pub fn pgTypeOid(ty: Type) pgwire.Oid {
+    return switch (ty) {
+        .bool_ => pgwire.oid.bool_,
+        .int2 => pgwire.oid.int2,
+        .int4, .uint2 => pgwire.oid.int4,
+        .int8, .uint4 => pgwire.oid.int8,
+        .uint8 => pgwire.oid.numeric,
+        .float4 => pgwire.oid.float4,
+        .float8 => pgwire.oid.float8,
+        .text, .bytea, .date, .time, .timestamp, .timestamptz, .interval, .uuid => pgwire.oid.text,
+    };
+}
 
 test {
     std.testing.refAllDecls(@This());

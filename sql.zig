@@ -18,6 +18,8 @@ pub const value = @import("sql/value.zig");
 pub const schema = @import("sql/schema.zig");
 pub const row = @import("sql/row.zig");
 pub const catalog = @import("sql/catalog.zig");
+pub const table = @import("sql/table.zig");
+pub const rowkey = @import("sql/rowkey.zig");
 pub const ddl = @import("sql/ddl.zig");
 pub const server = @import("sql/server.zig");
 

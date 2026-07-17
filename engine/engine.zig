@@ -33,10 +33,25 @@ const vfs = zdb.vfs;
 const metrics = zdb.metrics;
 const log = std.log.scoped(.engine);
 
+/// A front-end's hook into the commit stream. `onData` fires on the apply
+/// fiber right after a committed Mutations entry is written to the forest,
+/// with the (namespace, table_id) it targeted and the rows written — so a
+/// front-end (SQL) can maintain caches (e.g. a per-table max row id) from the
+/// commit stream on EVERY node, and a node that becomes leader inherits them
+/// without re-scanning. MUST NOT block, propose, or re-enter the engine.
+pub const ApplyObserver = struct {
+    ctx: *anyopaque,
+    onData: *const fn (ctx: *anyopaque, namespace: u64, table_id: u32, items: []const zdb.key.Item) void,
+};
+
 pub const StorageImpl = struct {
     forest: *Forest,
     allocator: std.mem.Allocator,
     node: *raft.Node,
+    /// Optional commit-stream hook (see ApplyObserver). Set once at startup
+    /// via Engine.setApplyObserver, before the apply loop runs; the loop stops
+    /// (eng.wait) before the observer's owner is torn down, so no unregister.
+    apply_observer: ?ApplyObserver = null,
     /// Gate the apply path until recovery finishes. Until then trees, route
     /// tables, and SST files referenced by the snapshot may not be in
     /// place, and apply would error-retry-spin. Flipped (along with
@@ -134,6 +149,11 @@ pub const StorageImpl = struct {
 
                 // Write this to Forest.
                 try self.forest.put(items.items);
+
+                // Feed the committed rows to any front-end cache (SQL's
+                // per-table max row id) — on every node, so a new leader
+                // inherits it without a re-scan.
+                if (self.apply_observer) |obs| obs.onData(obs.ctx, ns, tid, items.items);
 
                 try metrics.g().bytes_written.incrBy(.{
                     .source = "user",
@@ -268,6 +288,27 @@ pub const InFlight = struct {
     cid: u64 = 0,
     started_at_ms: i64,
 };
+
+/// How far a propose blocks: `commit` = replicated to a quorum (durable +
+/// ordered); `apply` = also applied to this node's state (locally readable).
+pub const Wait = enum { commit, apply };
+
+/// Blocks a `.commit` propose until the commit callback fires. Single waiter
+/// (the proposer) + single notifier (the callback), and `Notify` handles the
+/// notify-before-park race via its `pending` flag — no counter/init like a
+/// WaitGroup. The proposer only parks after a successful propose, and raft
+/// resolves every accepted proposal (commit or step-down), so it always wakes.
+const CommitWait = struct {
+    done: fiber.Notify = .{},
+    status: raft.CommitStatus,
+};
+
+fn onCommitWait(ctx_raw: *anyopaque, entry: raft.Entry, status: raft.CommitStatus) void {
+    _ = entry;
+    const ctx: *CommitWait = @ptrCast(@alignCast(ctx_raw));
+    ctx.status = status;
+    ctx.done.notify();
+}
 
 /// The glue binding `zdb` (the forest) and `raft` (the node) into one
 /// replicated storage unit: writes flow through raft and apply into the forest,
@@ -1098,33 +1139,49 @@ pub const Engine = struct {
         self.catchup_term.store(term, .release);
     }
 
-    /// Replicate a forest manifest change (ns/tree create or drop, …) through
-    /// Raft, blocking until it is applied on this node. Pairs with the forest
-    /// `build*` constructors: the caller builds the change (leader side), this
-    /// makes it real everywhere. Control-plane rule: manifest proposals wait
-    /// for APPLY, not just commit.
-    pub fn proposeAndApplyMC(self: *Engine, mc: manifest.ManifestChange) !void {
-        const payload = try encodeManifestChange(
-            self.allocator,
-            mc.cmd,
-            mc.sstable_changes,
-            mc.tree_changes,
-            mc.memtable_id,
-        );
-        defer self.allocator.free(payload);
-        try self.node.proposeAndWaitForApply(payload, .manifest);
+    /// Register a front-end's commit-stream hook (see ApplyObserver). Call once
+    /// at startup, before eng.start(), so no applied entry is missed.
+    pub fn setApplyObserver(self: *Engine, obs: ApplyObserver) void {
+        self.storage_impl.apply_observer = obs;
     }
 
-    /// Replicate key-value writes to (namespace, table_id) through Raft,
-    /// blocking until they are applied on this node. Same control-plane rule
-    /// as proposeAndApplyMC — DDL metadata (catalog rows) must be locally
-    /// readable the moment the client sees CommandComplete, so commit-wait
-    /// (the admin `set` path) is not enough. Not for user-data writes; those
-    /// get a commit-wait path when the time comes.
-    pub fn proposeAndApplyKVs(self: *Engine, namespace: u64, table_id: u32, kvs: anytype) !void {
+    /// Propose an already-encoded payload through Raft and block for `wait`
+    /// (commit = quorum; apply = also applied here). The one propose+wait path
+    /// the encode helpers below funnel through.
+    pub fn proposeAndWait(self: *Engine, payload: []const u8, proposal_type: raft.Node.ProposalType, wait_for: Wait) !void {
+        switch (wait_for) {
+            .apply => try self.node.proposeAndWaitForApply(payload, proposal_type),
+            .commit => {
+                var ctx = CommitWait{ .status = .committed };
+                try self.node.proposeWithCallback(payload, &onCommitWait, @ptrCast(&ctx), proposal_type);
+                ctx.done.wait();
+                switch (ctx.status) {
+                    .committed => {},
+                    .not_leader => return error.NotLeader,
+                    else => return error.NotCommitted,
+                }
+            },
+        }
+    }
+
+    /// Encode a forest manifest change (ns/tree create or drop, …) and propose
+    /// it. Pairs with the forest `build*` constructors: the caller builds the
+    /// change (leader side), this makes it real everywhere. Control plane uses
+    /// `.apply` — the change must be locally visible when the caller returns.
+    pub fn proposeMC(self: *Engine, mc: manifest.ManifestChange, wait_for: Wait) !void {
+        const payload = try encodeManifestChange(self.allocator, mc.cmd, mc.sstable_changes, mc.tree_changes, mc.memtable_id);
+        defer self.allocator.free(payload);
+        try self.proposeAndWait(payload, .manifest, wait_for);
+    }
+
+    /// Encode key-value writes to (namespace, table_id) and propose them.
+    /// Catalog rows use `.apply` (locally readable at CommandComplete); user
+    /// data (INSERT) uses `.commit` (durable + ordered is enough — the egid
+    /// counter is advanced at hand-out).
+    pub fn proposeKVs(self: *Engine, namespace: u64, table_id: u32, kvs: anytype, wait_for: Wait) !void {
         const payload = try encodeMutations(self.allocator, namespace, table_id, kvs);
         defer self.allocator.free(payload);
-        try self.node.proposeAndWaitForApply(payload, .data);
+        try self.proposeAndWait(payload, .data, wait_for);
     }
 
     /// Encode key-value writes as one `Mutations` payload for a .data

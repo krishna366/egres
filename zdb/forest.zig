@@ -596,21 +596,21 @@ pub const Forest = struct {
 
     pub const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
 
-    /// Forward scan over `[scan_range.left, scan_range.right)` within
-    /// namespace `ns`, spanning every tree that overlaps the request.
+    /// Forward scan over a table-limited `scan_range` — a KeyRange run through
+    /// `KeyRange.limitToTable`, so its bounds are full keys confined to one
+    /// `(namespace, table_id)` (which ride the `left` bound). That confinement
+    /// keeps the scan from spilling across the namespace-wide memtable into an
+    /// adjacent table.
     ///
-    /// One tree at a time: look up the tree owning `current_left`,
-    /// snapshot its range, open a cursor (with a fresh memtable iter
-    /// snapshot), drain to the cursor's end (or max_count), then
-    /// advance `current_left` past the snapshotted right boundary and
-    /// re-look-up. Re-looking-up after each tree means the scan is
-    /// safe against splits firing mid-scan: we always pick whichever
-    /// tree currently covers the next key. Per-cursor memtable
-    /// snapshots also pick up any newly-flushed data.
+    /// One tree at a time: look up the tree owning `current_left`, snapshot its
+    /// range, open a cursor (with a fresh memtable iter snapshot), drain to the
+    /// cursor's end (or max_count), then advance past the snapshotted right
+    /// boundary and re-look-up. Re-looking-up per hop keeps the scan safe
+    /// against splits firing mid-scan. Per-cursor memtable snapshots also pick
+    /// up newly-flushed data.
     pub fn scan(
         self: *Forest,
         allocator: std.mem.Allocator,
-        ns: u64,
         scan_range: KeyRange,
         max_count: u64,
         priority: vfs.Priority,
@@ -626,6 +626,10 @@ pub const Forest = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
+        // The range is already table-limited; ns + table_id ride its left bound.
+        const ns = scan_range.left.namespace;
+        const table_id = scan_range.left.table_id;
+
         var emitted: u64 = 0;
         var current_left = scan_range.left;
 
@@ -640,17 +644,8 @@ pub const Forest = struct {
             {
                 self.mu.lockShared(@src());
                 defer self.mu.unlockShared();
-                // A scan stays within a single table_id table; current_left
-                // carries that table_id (== scan_range.left.table_id throughout).
-                const trees = self.treesFor(ns, current_left.table_id) orelse return emitted;
-                const found: ?*Tree = blk: {
-                    if (current_left.primary.len == 0) {
-                        if (trees.entries.items.len == 0) break :blk null;
-                        break :blk trees.entries.items[0];
-                    }
-                    break :blk trees.lookup(current_left);
-                };
-                tree = found orelse return emitted;
+                const trees = self.treesFor(ns, table_id) orelse return emitted;
+                tree = trees.lookup(current_left) orelse return emitted;
                 tree_range = try tree.key_range.dupe(a);
             }
 
@@ -689,6 +684,77 @@ pub const Forest = struct {
             current_left = tree_range.right;
         }
         return emitted;
+    }
+
+    /// The largest stored key for (namespace, table_id), or null if the table
+    /// has no keys. Assumes a monotonically-increasing row id (SQL's egid), so
+    /// the max lives in the rightmost tree and, within it, the rightmost SST of
+    /// each level: last-by-id in L0 (newest flush = highest ids) or last-by-
+    /// smallest in L≥1 (highest range). Step 1 takes the max of those SSTs'
+    /// in-memory `biggest` keys — O(#levels), no I/O. Step 2 scans from that
+    /// floor and keeps the highest key: the SSTs top out at floor, so anything
+    /// beyond it is an unflushed memtable row. If the scan surfaces nothing
+    /// higher, the floor stands. The returned Key's `primary` is owned by
+    /// `allocator` (free it). Callers derive a table's next id from it without
+    /// persisting a counter.
+    pub fn maxKey(self: *Forest, allocator: std.mem.Allocator, ns: u64, table_id: u32) !?Key {
+        // Step 1: floor = max `biggest` over the rightmost SST of each level in
+        // the rightmost tree. Owned by `allocator`, or null if no SSTs.
+        var floor: ?Key = null;
+        errdefer if (floor) |f| f.free(allocator);
+        {
+            self.mu.lockShared(@src());
+            defer self.mu.unlockShared();
+
+            const trees = self.treesFor(ns, table_id) orelse return null;
+            if (trees.entries.items.len == 0) return null;
+
+            const tree = trees.entries.items[trees.entries.items.len - 1]; // rightmost
+            var best_sst: Key = .{};
+            for (tree.levels) |*lv| {
+                lv.mu.lockShared(@src());
+                defer lv.mu.unlockShared();
+                if (lv.tables.items.len == 0) continue;
+
+                const b = lv.tables.items[lv.tables.items.len - 1].table.biggest; // rightmost
+                if (b.primary.len == 0) continue;
+
+                if (best_sst.primary.len == 0 or b.orderWithoutTs(best_sst) == .gt) best_sst = b;
+            }
+            // Dupe out from under the tables — they may close once locks drop.
+            if (best_sst.primary.len > 0) floor = try best_sst.dupe(allocator);
+        }
+
+        // Step 2: scan from floor (or the table start if there's no floor) and
+        // keep the highest key. `best` is a single reused buffer holding the
+        // latest (thus, at end, the largest) key's marshaled bytes — no
+        // per-row alloc churn. `floor` backs the left bound, so it outlives the
+        // scan.
+        const Ctx = struct {
+            allocator: std.mem.Allocator,
+            best: std.ArrayList(u8) = .empty,
+            fn emit(raw: *anyopaque, item: Item) anyerror!bool {
+                const c: *@This() = @ptrCast(@alignCast(raw));
+                c.best.clearRetainingCapacity();
+                _ = try item.key.marshalTo(c.allocator, &c.best);
+                return true;
+            }
+        };
+        var ctx = Ctx{ .allocator = allocator };
+        defer ctx.best.deinit(allocator);
+        // [floor, table end): floor (if any) is an in-table key we keep; no
+        // floor limits to the table start. limitToTable confines the memtable.
+        const scan_range = (KeyRange{ .left = floor orelse Key{} }).limitToTable(ns, table_id);
+        _ = try self.scan(allocator, scan_range, std.math.maxInt(u64), .p0, &ctx, Ctx.emit);
+
+        // A memtable row above floor wins; otherwise floor stands (or null if
+        // the table had no SSTs and no rows).
+        if (ctx.best.items.len > 0) {
+            const k = try Key.initAlloc(allocator, ctx.best.items);
+            if (floor) |f| f.free(allocator);
+            return k;
+        }
+        return floor;
     }
 
     /// installTree opens the in-memory Tree for the given id and adds it to its
