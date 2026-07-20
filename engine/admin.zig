@@ -1246,7 +1246,7 @@ fn formatEntry(alloc: std.mem.Allocator, w: *std.Io.Writer, stored: raft.StoredE
                         mcs.deinit(alloc);
                         alloc.destroy(mcs);
                     }
-                    try w.print(" detail=ManifestChange cmd={d} memtable_id={d} sstable_changes={d} tree_changes={d}", .{
+                    try w.print(" detail=ManifestChange cmd={t} memtable_id={d} sstable_changes={d} tree_changes={d}", .{
                         mcs.cmd, mcs.memtable_id, mcs.sstable_changes.len, mcs.tree_changes.len,
                     });
                     try w.writeByte('\n');

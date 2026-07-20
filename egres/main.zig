@@ -117,7 +117,7 @@ fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
     };
     tc[0].name = @constCast(default_database);
     const payload = try zdb.buffers.marshalRoot(allocator, zdb.manifest.ManifestChange{
-        .cmd = 5, // ns_create
+        .cmd = .create_ns,
         .tree_changes = &tc,
         .sstable_changes = &.{},
         .memtable_id = 0,

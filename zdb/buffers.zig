@@ -91,11 +91,26 @@ pub const Namespace = schema.Table(.{
     .{ .id = 3, .name = "name", .ty = schema.Bytes },
 });
 
+// Which kind of change a ManifestChange carries. `none` (0) is the zero value
+// left by the snapshot path (ForestState.serialize sets only the state fields);
+// it is never dispatched. DDL commands are verb-first and grouped as
+// consecutive create/drop pairs by object.
+pub const Command = schema.EnumDef(.{
+    .{ .name = "none", .tag = 0 },
+    .{ .name = "new_memtable", .tag = 1 },
+    .{ .name = "flush", .tag = 2 },
+    .{ .name = "compaction", .tag = 3 },
+    .{ .name = "tree_split", .tag = 4 },
+    .{ .name = "create_ns", .tag = 5 },
+    .{ .name = "drop_ns", .tag = 6 },
+    .{ .name = "create_tree", .tag = 7 },
+    .{ .name = "drop_tree", .tag = 8 },
+});
+
 pub const ManifestChange = schema.Table(.{
     .{ .id = 1, .name = "tree_changes", .ty = schema.Array(TreeChange) },
     .{ .id = 2, .name = "sstable_changes", .ty = schema.Array(SSTableChange) },
-    // TODO: cmd needs to switch to enum.
-    .{ .id = 3, .name = "cmd", .ty = schema.U32 }, // 1=new_memtable, 2=flush, 3=compaction, 4=tree_split, 5=ns_create, 6=create_tree, 7=drop_tree
+    .{ .id = 3, .name = "cmd", .ty = schema.Enum(Command) },
     .{ .id = 4, .name = "memtable_id", .ty = schema.U64 }, // for flush: which memtable was flushed
     .{ .id = 5, .name = "namespaces", .ty = schema.Array(Namespace) }, // snapshot only
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 }, // snapshot only: global namespace counter

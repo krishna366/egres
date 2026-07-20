@@ -863,7 +863,7 @@ pub const Forest = struct {
         return .{
             .tree_changes = tree_changes,
             .sstable_changes = &.{},
-            .cmd = 5, // ns_create
+            .cmd = .create_ns,
             .memtable_id = 0,
         };
     }
@@ -905,7 +905,7 @@ pub const Forest = struct {
     /// installs the in-memory Tree + namespace route, records the namespace's
     /// name, and advances the global namespace counter (idempotent — keeps a
     /// re-elected leader current). Called on all nodes after Raft commit
-    /// (cmd=5).
+    /// (create_ns).
     ///
     /// Skips any TreeChange whose tree already exists (re-apply).
     pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
@@ -934,7 +934,7 @@ pub const Forest = struct {
     /// table starts at split 0, so tree_id = (table_id << 32). The tree is
     /// infinite-range *within* its table — routing isolates by
     /// (namespace, table_id), so no key-range bound is needed. No state mutates,
-    /// so a failed propose costs nothing. cmd=6. Caller owns the returned slice.
+    /// so a failed propose costs nothing. create_tree. Caller owns the returned slice.
     pub fn buildCreateTree(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_id: u32) !manifest.ManifestChange {
         const tree_id = blk: {
             self.mu.lockShared(@src());
@@ -946,7 +946,7 @@ pub const Forest = struct {
         return .{
             .tree_changes = tree_changes,
             .sstable_changes = &.{},
-            .cmd = 6, // create_tree
+            .cmd = .create_tree,
             .memtable_id = 0,
         };
     }
@@ -984,7 +984,7 @@ pub const Forest = struct {
     /// namespace/table if absent. Also advances the namespace's table_id
     /// counter past the created table (idempotent; this is what keeps a
     /// re-elected leader's allocator current). Idempotent on (namespace,
-    /// tree_id). Called on all nodes after Raft commit (cmd=6).
+    /// tree_id). Called on all nodes after Raft commit (create_tree).
     pub fn applyCreateTree(self: *Forest, mc: manifest.ManifestChange) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
@@ -1005,7 +1005,7 @@ pub const Forest = struct {
     /// buildDropTable is Phase A of DROP TABLE: emit a delete change for every
     /// tree of the table — a table can span >1 tree after
     /// splits. The table_id counter is NOT rewound (ids are never reused, since
-    /// a dropped SST may still be clone-shared). cmd=7. Returns an empty change
+    /// a dropped SST may still be clone-shared). drop_tree. Returns an empty change
     /// set if the table has no trees. Caller owns the returned slice.
     ///
     /// The dropped table's schema rows in the namespace's CATALOG tree are NOT
@@ -1030,7 +1030,7 @@ pub const Forest = struct {
         return .{
             .tree_changes = tree_changes,
             .sstable_changes = &.{},
-            .cmd = 7, // drop_tree
+            .cmd = .drop_tree,
             .memtable_id = 0,
         };
     }
@@ -1039,7 +1039,7 @@ pub const Forest = struct {
     /// entry (dropping the table once empty), tear down the in-memory tree
     /// (Tree.close releases its level refs on its SSTs — SSTs shared with another
     /// tree survive via refcount), and remove the tree from the manifest.
-    /// Idempotent. cmd=7.
+    /// Idempotent. drop_tree.
     ///
     /// NOTE: dropped SST *files* are not eagerly unlinked from disk (Tree.close
     /// detaches, and the table cache holds its own ref). The data is immediately
@@ -1050,7 +1050,7 @@ pub const Forest = struct {
         defer self.mu.unlock();
         try self.applyTreeDeletesLocked(mc);
         // Forget each dropped table's name (first delete of a multi-tree
-        // table removes it; the rest are no-ops). drop_ns (cmd 8) doesn't
+        // table removes it; the rest are no-ops). drop_ns doesn't
         // come here — dropNamespace frees the whole map.
         for (mc.tree_changes) |tc| {
             if (tc.op != .delete) continue;
@@ -1087,7 +1087,7 @@ pub const Forest = struct {
 
     /// buildDropNamespace is Phase A of DROP DATABASE: emit a delete change for
     /// every tree in every table of the namespace — the default table, system
-    /// tables (catalog etc.), and user tables alike. cmd=8. Namespace ids are
+    /// tables (catalog etc.), and user tables alike. drop_ns. Namespace ids are
     /// never reused, so no counter rewind is needed; applyDropNamespace forgets
     /// the counter entirely. Returns an empty change set for an unknown
     /// namespace (idempotent). Caller owns the returned slice.
@@ -1108,7 +1108,7 @@ pub const Forest = struct {
         return .{
             .tree_changes = try changes.toOwnedSlice(alloc),
             .sstable_changes = &.{},
-            .cmd = 8, // drop_ns
+            .cmd = .drop_ns,
             .memtable_id = 0,
         };
     }
@@ -1118,7 +1118,7 @@ pub const Forest = struct {
     /// refcount survive; physical reclaim is snapshot GC's job), then forget the
     /// namespace's manifest state (table_id counter + name, freeing the name
     /// for re-CREATE). Leftover memtable entries for the namespace are dropped
-    /// at flush (buildFlush skips items with no route). Idempotent. cmd=8.
+    /// at flush (buildFlush skips items with no route). Idempotent. drop_ns.
     pub fn applyDropNamespace(self: *Forest, mc: manifest.ManifestChange) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
@@ -1615,7 +1615,7 @@ pub const Forest = struct {
         return .{
             .sstable_changes = try table_changes.toOwnedSlice(alloc),
             .tree_changes = tree_changes,
-            .cmd = 4, // tree_split
+            .cmd = .tree_split,
         };
     }
 

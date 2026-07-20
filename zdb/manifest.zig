@@ -515,6 +515,7 @@ pub const ForestState = struct {
 pub const SSTableChange = zen.SSTableChangeStruct;
 pub const TreeChange = zen.TreeChangeStruct;
 pub const ManifestChange = zen.ManifestChangeStruct;
+pub const Command = zen.CommandEnum;
 
 pub fn createSSTableChange(sst_id: u64, namespace_id: u64, tree_id: u64, level: u32) SSTableChange {
     return .{ .op = .create, .sst_id = sst_id, .namespace_id = namespace_id, .tree_id = tree_id, .level = level };

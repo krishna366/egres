@@ -21,6 +21,19 @@ pub const OpEnum = enum(u8) {
     _,
 };
 
+pub const CommandEnum = enum(u8) {
+    none = 0,
+    new_memtable = 1,
+    flush = 2,
+    compaction = 3,
+    tree_split = 4,
+    create_ns = 5,
+    drop_ns = 6,
+    create_tree = 7,
+    drop_tree = 8,
+    _,
+};
+
 pub fn addTail(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, offset: u32) Error!void {
     try zbuf.appendMessageTail(buf, alloc, T.TABLE_ID, offset);
 }
@@ -1754,7 +1767,7 @@ pub const ManifestChangeStruct = struct {
     pub const TABLE_ID: u16 = 46598;
     tree_changes: []TreeChangeStruct = &.{},
     sstable_changes: []SSTableChangeStruct = &.{},
-    cmd: u32 = 0,
+    cmd: CommandEnum = @enumFromInt(0),
     memtable_id: u64 = 0,
     namespaces: []NamespaceStruct = &.{},
     next_ns_id: u64 = 0,
@@ -1854,7 +1867,7 @@ pub const ManifestChangeReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 46;
+    pub const SIZE_BYTES: u16 = 43;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -1918,26 +1931,27 @@ pub const ManifestChangeReader = struct {
         return SSTableChangeReader.init(self.buf, child_off);
     }
 
-    pub fn cmd(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 22;
+    pub fn cmd(self: Self) CommandEnum {
+        const slot_end = @as(u32, self.base) + 19;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 18)) catch 0;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 18)) catch 0;
+        return @enumFromInt(v);
     }
 
     pub fn memtableId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 30;
+        const slot_end = @as(u32, self.base) + 27;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 22)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 19)) catch 0;
     }
 
     fn namespacesSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 38;
+        const slot_end = @as(u32, self.base) + 35;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 30)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 34)) catch return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 27)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch return &.{};
         if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
         if (end > self.buf.len) return &.{};
@@ -1957,10 +1971,10 @@ pub const ManifestChangeReader = struct {
     }
 
     pub fn nextNsId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 46;
+        const slot_end = @as(u32, self.base) + 43;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 38)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 35)) catch 0;
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -2038,10 +2052,10 @@ pub const ManifestChangeReader = struct {
             const child_view = try self.sstableChangesAt(i_sstableChanges);
             try child_view.verify();
         }
-        const slot_end_arr_30 = @as(u32, self.base) + 38;
-        if (slot_end_arr_30 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 30));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 34));
+        const slot_end_arr_27 = @as(u32, self.base) + 35;
+        if (slot_end_arr_27 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 27));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 31));
             if (elem_count > 0) {
                 const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
@@ -2133,7 +2147,7 @@ pub const ManifestChangeWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 46;
+    pub const SIZE_BYTES: u16 = 43;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -2180,32 +2194,32 @@ pub const ManifestChangeWriter = struct {
         try zbuf.patchU32(out.items, self.base + 14, @as(u32, @intCast(values.len)));
     }
 
-    pub fn setCmd(self: *Self, v: u32) Error!void {
+    pub fn setCmd(self: *Self, v: CommandEnum) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 18, v);
+        try zbuf.patchU8(out.items, self.base + 18, @intFromEnum(v));
     }
 
     pub fn setMemtableId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 22, v);
+        try zbuf.patchU64(out.items, self.base + 19, v);
     }
 
     pub fn setNamespaces(self: *Self, values: []const u32) Error!void {
         const out = self.bufMut();
         if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 30, 0);
-            try zbuf.patchU32(out.items, self.base + 34, 0);
+            try zbuf.patchU32(out.items, self.base + 27, 0);
+            try zbuf.patchU32(out.items, self.base + 31, 0);
             return;
         }
         const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
         const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 30, index_off);
-        try zbuf.patchU32(out.items, self.base + 34, @as(u32, @intCast(values.len)));
+        try zbuf.patchU32(out.items, self.base + 27, index_off);
+        try zbuf.patchU32(out.items, self.base + 31, @as(u32, @intCast(values.len)));
     }
 
     pub fn setNextNsId(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 38, v);
+        try zbuf.patchU64(out.items, self.base + 35, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {

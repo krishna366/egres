@@ -178,15 +178,15 @@ pub const StorageImpl = struct {
 
         // TRACE: pinpoints which entry / cmd hangs the apply path. Last
         // "enter" without a matching "exit" is the wedge.
-        log.info("applyManifestChange enter idx={d} cmd={d} mt={d} tcs={d}", .{
+        log.info("applyManifestChange enter idx={d} cmd={t} mt={d} tcs={d}", .{
             index, mcs.cmd, mcs.memtable_id, mcs.sstable_changes.len,
         });
-        defer log.info("applyManifestChange exit  idx={d} cmd={d}", .{ index, mcs.cmd });
+        defer log.info("applyManifestChange exit  idx={d} cmd={t}", .{ index, mcs.cmd });
 
         switch (mcs.cmd) {
-            1 => try self.forest.newMemtable(mcs.memtable_id, index),
-            2 => try self.forest.applyFlush(mcs.sstable_changes, mcs.memtable_id),
-            3 => {
+            .new_memtable => try self.forest.newMemtable(mcs.memtable_id, index),
+            .flush => try self.forest.applyFlush(mcs.sstable_changes, mcs.memtable_id),
+            .compaction => {
                 if (mcs.sstable_changes.len > 0) {
                     const sc = mcs.sstable_changes[0];
                     if (self.forest.getTree(sc.namespace_id, sc.tree_id)) |tree| {
@@ -194,12 +194,12 @@ pub const StorageImpl = struct {
                     }
                 }
             },
-            4 => try self.forest.applySplit(mcs.*),
-            5 => try self.forest.applyNamespaceCreate(mcs.*),
-            6 => try self.forest.applyCreateTree(mcs.*),
-            7 => try self.forest.applyDropTree(mcs.*),
-            8 => try self.forest.applyDropNamespace(mcs.*),
-            else => log.err("unknown ManifestChange cmd={d}", .{mcs.cmd}),
+            .tree_split => try self.forest.applySplit(mcs.*),
+            .create_ns => try self.forest.applyNamespaceCreate(mcs.*),
+            .create_tree => try self.forest.applyCreateTree(mcs.*),
+            .drop_tree => try self.forest.applyDropTree(mcs.*),
+            .drop_ns => try self.forest.applyDropNamespace(mcs.*),
+            else => log.err("unknown ManifestChange cmd={d}", .{@intFromEnum(mcs.cmd)}),
         }
     }
 
@@ -928,7 +928,7 @@ pub const Engine = struct {
         self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_ms = fiber.coarseMs() });
         defer self.removeInFlight(.new_memtable, 0, 0);
         const new_id = try self.forest.file_ids.allocate();
-        const payload = try zdb_bufs.marshalRoot(self.allocator, manifest.ManifestChange{ .cmd = 1, .memtable_id = new_id });
+        const payload = try zdb_bufs.marshalRoot(self.allocator, manifest.ManifestChange{ .cmd = .new_memtable, .memtable_id = new_id });
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
     }
@@ -952,7 +952,7 @@ pub const Engine = struct {
 
         try self.distributeNewFiles(changes.items);
 
-        const payload = try encodeManifestChange(self.allocator, 2, changes.items, &.{}, result.memtable_id);
+        const payload = try encodeManifestChange(self.allocator, .flush, changes.items, &.{}, result.memtable_id);
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
     }
@@ -995,7 +995,7 @@ pub const Engine = struct {
         const t2 = fiber.coarseMs();
         log.info("compact cid={d} distribute_done distribute_ms={d}", .{ cid, t2 - t1 });
 
-        const payload = try encodeManifestChange(self.allocator, 3, changes.items, &.{}, 0);
+        const payload = try encodeManifestChange(self.allocator, .compaction, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
         const t3 = fiber.coarseMs();
@@ -1013,7 +1013,7 @@ pub const Engine = struct {
         // encodeManifestChange copies the bytes into a self-owned payload,
         // so the arena can be torn down right after encode. No new SST
         // files are produced (split just remaps existing tables between
-        // trees), so distributeNewFiles is unnecessary here. cmd=4 routes
+        // trees), so distributeNewFiles is unnecessary here. tree_split routes
         // through applyManifestChange to applySplit on every node.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -1213,7 +1213,7 @@ pub const Engine = struct {
 /// Encode a ManifestChange into a zbuf-serialized payload for proposeDataChange.
 fn encodeManifestChange(
     allocator: std.mem.Allocator,
-    cmd: u32,
+    cmd: manifest.Command,
     sstable_changes: []manifest.SSTableChange,
     tree_changes: []manifest.TreeChange,
     memtable_id: u64,

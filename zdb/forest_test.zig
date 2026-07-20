@@ -381,7 +381,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const dc = try f.buildDropNamespace(alloc, 7);
     defer alloc.free(dc.tree_changes);
     try std.testing.expectEqual(@as(usize, 4), dc.tree_changes.len);
-    try std.testing.expectEqual(@as(u32, 8), dc.cmd);
+    try std.testing.expectEqual(manifest.Command.drop_ns, dc.cmd);
     try f.applyDropNamespace(dc);
 
     try std.testing.expect(!f.hasNamespace(7));
