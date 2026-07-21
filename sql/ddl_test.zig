@@ -178,3 +178,58 @@ test "sql.ddl: SELECT rejections carry a reason" {
         try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
     }
 }
+
+test "sql.ddl: DELETE parses table and the optional equality filter" {
+    const alloc = testing.allocator;
+
+    // No WHERE: delete every row.
+    var d1 = try ddl.parseDdl(alloc, "DELETE FROM t;");
+    defer d1.deinit(alloc);
+    try testing.expectEqualStrings("t", d1.delete.table);
+    try testing.expect(d1.delete.filter == null);
+
+    // WHERE on a payload column.
+    var d2 = try ddl.parseDdl(alloc, "DELETE FROM t WHERE id = 5;");
+    defer d2.deinit(alloc);
+    const f2 = d2.delete.filter.?;
+    try testing.expectEqualStrings("id", f2.column);
+    try testing.expectEqual(@as(i64, 5), f2.literal.int);
+
+    // WHERE on the egid pseudo-column parses as a plain column filter.
+    var d3 = try ddl.parseDdl(alloc, "DELETE FROM t WHERE egid = 3;");
+    defer d3.deinit(alloc);
+    const f3 = d3.delete.filter.?;
+    try testing.expectEqualStrings("egid", f3.column);
+    try testing.expectEqual(@as(i64, 3), f3.literal.int);
+
+    // Qualified name keeps the last part; string literal.
+    var d4 = try ddl.parseDdl(alloc, "DELETE FROM public.t WHERE name = 'x';");
+    defer d4.deinit(alloc);
+    try testing.expectEqualStrings("t", d4.delete.table);
+    const f4 = d4.delete.filter.?;
+    try testing.expectEqualStrings("name", f4.column);
+    try testing.expectEqualStrings("x", f4.literal.str);
+}
+
+test "sql.ddl: DELETE rejections carry a reason" {
+    const alloc = testing.allocator;
+    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+        .{ .sql = "DELETE FROM t USING u WHERE t.a = u.a;", .needle = "USING" },
+        .{ .sql = "DELETE FROM t RETURNING id;", .needle = "RETURNING" },
+        .{ .sql = "WITH x AS (SELECT 1) DELETE FROM t;", .needle = "WITH" },
+        .{ .sql = "DELETE FROM t WHERE a > 5;", .needle = "column = value" },
+        .{ .sql = "DELETE FROM t WHERE a = 1 AND b = 2;", .needle = "WHERE" },
+        .{
+            .sql = "DELETE FROM t WHERE id IN (SELECT id FROM u);",
+            .needle = "WHERE",
+        },
+        .{ .sql = "DELETE FROM t WHERE a = b;", .needle = "literal" },
+    };
+    for (cases) |case| {
+        var stmt = try ddl.parseDdl(alloc, case.sql);
+        defer stmt.deinit(alloc);
+        try testing.expect(stmt == .invalid);
+        const found = std.mem.indexOf(u8, stmt.invalid, case.needle);
+        try testing.expect(found != null);
+    }
+}

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for SQL INSERT/SELECT over the pgwire endpoint. Builds,
-# starts a fresh single-node egres, drives psql through insert/select/filter,
-# egid visibility, a restart-persistence + monotonic-egid leg, and greps the
-# server log. Wipes /data/egres — that dir is throw-away by convention.
+# End-to-end smoke test for SQL INSERT/SELECT/DELETE over the pgwire endpoint.
+# Builds, starts a fresh single-node egres, drives psql through
+# insert/select/filter, egid visibility, delete (point + scan + full-table), a
+# restart-persistence + monotonic-egid leg (incl. no-reuse of a deleted max),
+# and greps the server log. Wipes /data/egres — that dir is throw-away.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -82,6 +83,36 @@ start_server
 expect "rows survive restart" "(3 rows)" q "SELECT * FROM t;"
 expect "INSERT post-restart" "INSERT 0 1" q "INSERT INTO t (name) VALUES ('d');"
 expect "egid 4 post-restart" "d" v "SELECT name FROM t WHERE egid = 4;"
+# State here: egids 1=a, 2=b, 3=c, 4=d, all live.
+
+# --- delete by egid (point path) -------------------------------------------
+expect "DELETE by egid" "DELETE 1" q "DELETE FROM t WHERE egid = 2;"
+expect "deleted row invisible" "(0 rows)" q "SELECT * FROM t WHERE egid = 2;"
+expect "DELETE same egid again is 0" "DELETE 0" q "DELETE FROM t WHERE egid = 2;"
+
+# --- delete by payload column (scan path) ----------------------------------
+expect "DELETE by column" "DELETE 1" q "DELETE FROM t WHERE name = 'c';"
+expect "DELETE no match is 0" "DELETE 0" q "DELETE FROM t WHERE name = 'zzz';"
+expect "survivors intact" "(2 rows)" q "SELECT * FROM t;" # a (egid 1), d (egid 4)
+
+# --- delete rejections / errors --------------------------------------------
+expect "DELETE USING rejected" "not supported" q "DELETE FROM t USING u WHERE t.id = u.id;"
+expect "DELETE unknown table" "does not exist" q "DELETE FROM nope;"
+
+# --- delete the current max, then restart: egid must NOT be reused ----------
+# Deletes egid 4 (the highest stored key). maxKey must count the tombstone and
+# seed next_egid past it, else the next INSERT resurrects egid 4.
+expect "DELETE current max" "DELETE 1" q "DELETE FROM t WHERE egid = 4;"
+stop_server
+start_server
+expect "deletes survive restart" "(1 row)" q "SELECT * FROM t;" # just a (egid 1)
+expect "INSERT after delete+restart" "INSERT 0 1" q "INSERT INTO t (name) VALUES ('e');"
+expect "egid 4 not reused (lands on 5)" "e" v "SELECT name FROM t WHERE egid = 5;"
+
+# --- delete every row (no WHERE) -------------------------------------------
+expect "DELETE all" "DELETE 2" q "DELETE FROM t;" # a (egid 1), e (egid 5)
+expect "table empty" "(0 rows)" q "SELECT * FROM t;"
+expect "DELETE on empty is 0" "DELETE 0" q "DELETE FROM t;"
 
 # --- no unexpected server-side errors --------------------------------------
 if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi

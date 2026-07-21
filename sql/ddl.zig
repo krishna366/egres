@@ -66,6 +66,11 @@ pub const Select = struct {
     filter: ?Filter,
 };
 
+pub const Delete = struct {
+    table: []const u8, // owned
+    filter: ?Filter, // null = delete every row
+};
+
 pub const DdlStmt = union(enum) {
     create_database: []const u8, // database name (owned)
     drop_database: []const u8, // database name (owned)
@@ -73,6 +78,7 @@ pub const DdlStmt = union(enum) {
     drop_table: DropTable,
     insert: Insert,
     select: Select,
+    delete: Delete,
     invalid: []const u8, // recognized but rejected; reason (owned)
     unsupported,
 
@@ -106,10 +112,11 @@ pub const DdlStmt = union(enum) {
                         alloc.free(cols);
                     },
                 }
-                if (sel.filter) |f| {
-                    alloc.free(f.column);
-                    freeLit(alloc, f.literal);
-                }
+                freeFilter(alloc, sel.filter);
+            },
+            .delete => |del| {
+                alloc.free(del.table);
+                freeFilter(alloc, del.filter);
             },
             .unsupported => {},
         }
@@ -120,6 +127,13 @@ fn freeLit(alloc: std.mem.Allocator, lit: Literal) void {
     switch (lit) {
         .str, .float => |s| alloc.free(s),
         else => {},
+    }
+}
+
+fn freeFilter(alloc: std.mem.Allocator, filter: ?Filter) void {
+    if (filter) |f| {
+        alloc.free(f.column);
+        freeLit(alloc, f.literal);
     }
 }
 
@@ -152,6 +166,7 @@ pub fn parseDdl(alloc: std.mem.Allocator, sql: []const u8) parser.ParseError!Ddl
     if (std.mem.eql(u8, kind, "DropStmt")) return parseDropTable(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "InsertStmt")) return parseInsert(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "SelectStmt")) return parseSelect(alloc, entry.value_ptr.*);
+    if (std.mem.eql(u8, kind, "DeleteStmt")) return parseDelete(alloc, entry.value_ptr.*);
     return .unsupported;
 }
 
@@ -260,6 +275,16 @@ const SelectStmtJson = struct {
             rexpr: struct { A_Const: InsertStmtJson.AConst = .{} } = .{},
         };
     };
+};
+
+/// DELETE FROM t [WHERE col = const]. `relation` is inline (a RangeVar body,
+/// like INSERT); the last three clauses are decoded only to reject them.
+const DeleteStmtJson = struct {
+    relation: struct { relname: []const u8 = "" } = .{},
+    whereClause: ?SelectStmtJson.WhereNode = null,
+    usingClause: []const std.json.Value = &.{}, // DELETE ... USING
+    returningList: []const std.json.Value = &.{}, // RETURNING
+    withClause: ?std.json.Value = null, // WITH ... DELETE
 };
 
 /// Decode one statement body into its typed mirror. A shape we don't
@@ -430,6 +455,50 @@ fn freeLits(alloc: std.mem.Allocator, lits: []const Literal) void {
     };
 }
 
+/// A parsed WHERE: a `col = literal` filter or a rejection reason (owned).
+const ParsedWhere = union(enum) {
+    filter: Filter,
+    invalid: []const u8,
+
+    fn reject(alloc: std.mem.Allocator, msg: []const u8) !ParsedWhere {
+        return .{ .invalid = try alloc.dupe(u8, msg) };
+    }
+};
+
+/// Parse the one WHERE shape this slice supports — `column = literal` —
+/// shared by SELECT and DELETE. Anything else (non-equality op, AND/OR,
+/// subquery, column-vs-column) yields a clean `.invalid` reason; only OOM
+/// propagates.
+fn parseWhere(
+    alloc: std.mem.Allocator,
+    w: SelectStmtJson.WhereNode,
+) parser.ParseError!ParsedWhere {
+    const ae = w.A_Expr orelse
+        return ParsedWhere.reject(alloc, "unsupported WHERE clause");
+    if (!std.mem.eql(u8, ae.kind, "AEXPR_OP") or ae.name.len == 0 or
+        !std.mem.eql(u8, ae.name[ae.name.len - 1].String.sval, "="))
+        return ParsedWhere.reject(
+            alloc,
+            "only `column = value` is supported in WHERE",
+        );
+
+    const lcol = ae.lexpr.ColumnRef orelse
+        return ParsedWhere.reject(alloc, "WHERE left side must be a column");
+    const lfields = lcol.fields;
+    if (lfields.len == 0 or lfields[lfields.len - 1].String == null)
+        return ParsedWhere.reject(alloc, "WHERE left side must be a column");
+
+    const lit = try literalFrom(alloc, ae.rexpr.A_Const);
+    if (lit == .unsupported)
+        return ParsedWhere.reject(alloc, "WHERE right side must be a literal");
+    const sval = lfields[lfields.len - 1].String.?.sval;
+    const wcol = alloc.dupe(u8, sval) catch |e| {
+        freeLit(alloc, lit);
+        return e;
+    };
+    return .{ .filter = .{ .column = wcol, .literal = lit } };
+}
+
 /// SELECT [cols|*] FROM one_table [WHERE col = literal]. Joins, subqueries,
 /// ORDER BY / GROUP BY / LIMIT / DISTINCT and expression targets are rejected.
 fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
@@ -472,26 +541,15 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
     }
 
     var filter: ?Filter = null;
-    errdefer if (filter) |f| {
-        alloc.free(f.column);
-        freeLit(alloc, f.literal);
+    errdefer freeFilter(alloc, filter);
+    if (ss.whereClause) |w| switch (try parseWhere(alloc, w)) {
+        .filter => |f| filter = f,
+        .invalid => |msg| {
+            for (cols.items) |c| alloc.free(c);
+            cols.deinit(alloc);
+            return .{ .invalid = msg };
+        },
     };
-    if (ss.whereClause) |w| {
-        const ae = w.A_Expr orelse return invalidSel(alloc, &cols, "unsupported WHERE clause", .{});
-        if (!std.mem.eql(u8, ae.kind, "AEXPR_OP") or ae.name.len == 0 or
-            !std.mem.eql(u8, ae.name[ae.name.len - 1].String.sval, "="))
-            return invalidSel(alloc, &cols, "only `column = value` is supported in WHERE", .{});
-        const lfields = (ae.lexpr.ColumnRef orelse return invalidSel(alloc, &cols, "WHERE left side must be a column", .{})).fields;
-        if (lfields.len == 0 or lfields[lfields.len - 1].String == null)
-            return invalidSel(alloc, &cols, "WHERE left side must be a column", .{});
-        const lit = try literalFrom(alloc, ae.rexpr.A_Const);
-        if (lit == .unsupported) return invalidSel(alloc, &cols, "WHERE right side must be a literal", .{});
-        const wcol = alloc.dupe(u8, lfields[lfields.len - 1].String.?.sval) catch |e| {
-            freeLit(alloc, lit);
-            return e;
-        };
-        filter = .{ .column = wcol, .literal = lit };
-    }
 
     const table = try alloc.dupe(u8, rv.relname);
     errdefer alloc.free(table);
@@ -500,6 +558,42 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         .projection = if (star) .star else .{ .columns = try cols.toOwnedSlice(alloc) },
         .filter = filter,
     } };
+}
+
+/// Reject a recognized statement with an owned client-facing reason.
+fn invalid(alloc: std.mem.Allocator, msg: []const u8) !DdlStmt {
+    return .{ .invalid = try alloc.dupe(u8, msg) };
+}
+
+/// DELETE FROM one_table [WHERE col = literal]. USING, RETURNING, WITH, and
+/// any non-equality WHERE are rejected with a reason. `WHERE egid = N` parses
+/// as an ordinary column filter — egid resolution stays server-side.
+fn parseDelete(
+    alloc: std.mem.Allocator,
+    body: std.json.Value,
+) parser.ParseError!DdlStmt {
+    const parsed = try fromValue(DeleteStmtJson, alloc, body) orelse
+        return .unsupported;
+    defer parsed.deinit();
+    const ds = parsed.value;
+
+    if (ds.usingClause.len > 0)
+        return invalid(alloc, "DELETE ... USING is not supported");
+    if (ds.returningList.len > 0)
+        return invalid(alloc, "RETURNING is not supported");
+    if (ds.withClause != null)
+        return invalid(alloc, "WITH is not supported");
+
+    var filter: ?Filter = null;
+    errdefer freeFilter(alloc, filter);
+    if (ds.whereClause) |w| switch (try parseWhere(alloc, w)) {
+        .filter => |f| filter = f,
+        .invalid => |msg| return .{ .invalid = msg },
+    };
+
+    const table = try alloc.dupe(u8, ds.relation.relname);
+    errdefer alloc.free(table);
+    return .{ .delete = .{ .table = table, .filter = filter } };
 }
 
 /// Reject a recognized SELECT, freeing the columns accumulated so far. Message

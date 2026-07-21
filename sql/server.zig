@@ -204,9 +204,10 @@ const Handler = struct {
         return null;
     }
 
-    /// DDL preamble (caller holds ddl_mu): this node must be a CAUGHT-UP
-    /// leader before the read-then-propose sequence reads any applied state
-    /// (see Engine.catchUp). Replies and returns false otherwise.
+    /// Catch-up barrier before a read-then-propose sequence reads applied
+    /// state: this node must be a CAUGHT-UP leader (see Engine.catchUp), else
+    /// it replies and returns false. DDL callers hold ddl_mu across it; DML
+    /// (DELETE) calls it bare — the barrier itself takes no lock.
     fn ddlReady(self: *Handler, state: *pgwire.ConnState) !bool {
         self.srv.engine.catchUp() catch |err| {
             switch (err) {
@@ -243,6 +244,7 @@ const Handler = struct {
             .drop_table => |dt| try self.dropTable(state, dt),
             .insert => |ins| try self.insert(state, ins),
             .select => |sel| try self.select(state, sel),
+            .delete => |del| try self.delete(state, del),
             .invalid => |msg| try replyErrorCode(state, pgwire.sqlstate.feature_not_supported, msg),
             .unsupported => try replyError(state, "unsupported statement"),
         }
@@ -511,20 +513,10 @@ const Handler = struct {
         var egid_filter: ?u64 = null;
         var cell_filter: ?CellFilter = null;
         if (sel.filter) |f| {
-            if (std.ascii.eqlIgnoreCase(f.column, "egid")) {
-                egid_filter = switch (f.literal) {
-                    .int => |n| if (n >= 0) @intCast(n) else return replyErrorCode(state, pgwire.sqlstate.invalid_text_representation, "egid must be a non-negative integer"),
-                    else => return replyErrorCode(state, pgwire.sqlstate.invalid_text_representation, "egid must be an integer"),
-                };
-            } else {
-                const fc = t.column(f.column) orelse return replyErrorCode(state, pgwire.sqlstate.undefined_column, "column does not exist");
-                cell_filter = .{
-                    .idx = psIndex(&t.ps, fc.column_id),
-                    .val = litToValue(a, f.literal, fc.ty) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => return replyErrorCode(state, pgwire.sqlstate.invalid_text_representation, "invalid value in WHERE"),
-                    },
-                };
+            const rf = try resolveFilter(state, a, t, f) orelse return;
+            switch (rf) {
+                .egid => |e| egid_filter = e,
+                .cell => |c| cell_filter = c,
             }
         }
 
@@ -557,6 +549,101 @@ const Handler = struct {
         }
 
         try state.sendCommandComplete(try std.fmt.allocPrint(a, "SELECT {d}", .{emitter.count}));
+    }
+
+    fn delete(self: *Handler, state: *pgwire.ConnState, del: ddl.Delete) !void {
+        const eng = self.srv.engine;
+        // Read-then-propose against applied state: catch up first so the scan
+        // sees the committed tail and the reported count is honest (INSERT
+        // gets the same barrier through allocEgid).
+        if (!try self.ddlReady(state)) return;
+
+        const ns = try self.sessionNamespace(state) orelse return;
+        const table_id = eng.forest.lookupTable(ns, del.table) orelse
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.undefined_table,
+                "table does not exist",
+            );
+        const t = self.srv.openTable(ns, table_id) catch |err| {
+            logDeleteErr(del.table, "load schema", err);
+            return replyError(state, "failed to load table schema");
+        };
+
+        var arena = std.heap.ArenaAllocator.init(eng.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Resolve WHERE: `egid = N` → one-hop point delete; a payload column
+        // → scan + decode; no WHERE → tombstone every live row.
+        var cell_filter: ?CellFilter = null;
+        var point_egid: ?u64 = null;
+        if (del.filter) |f| {
+            const rf = try resolveFilter(state, a, t, f) orelse return;
+            switch (rf) {
+                .egid => |e| point_egid = e,
+                .cell => |c| cell_filter = c,
+            }
+        }
+
+        if (point_egid) |e| {
+            // get reads tombstones as absent, so a missing/already-deleted
+            // egid honestly reports DELETE 0 and proposes nothing.
+            const k = rowkey.encodeEgid(e);
+            const search = zdb.kv.Key{
+                .namespace = ns,
+                .table_id = table_id,
+                .primary = &k,
+                .timestamp = std.math.maxInt(u64),
+            };
+            var n: u64 = 0;
+            if (try eng.forest.get(eng.allocator, search, .p0)) |item| {
+                item.free(eng.allocator);
+                const kvs = [_]TombstoneKV{.{ .key = &k }};
+                eng.proposeKVs(ns, table_id, &kvs, .commit) catch |err| {
+                    logDeleteErr(del.table, "propose", err);
+                    return replyError(state, "delete failed");
+                };
+                n = 1;
+            }
+            const tag = try std.fmt.allocPrint(a, "DELETE {d}", .{n});
+            return state.sendCommandComplete(tag);
+        }
+
+        // Scan path: collect the egid keys of every matching live row, then
+        // tombstone them in one Mutations entry (one implicit transaction).
+        var col = DeleteCollector{
+            .a = a,
+            .ps = &t.ps,
+            .cell_filter = cell_filter,
+        };
+        const scan_range = (zdb.level.KeyRange{}).limitToTable(ns, table_id);
+        _ = eng.forest.scan(
+            eng.allocator,
+            scan_range,
+            .{},
+            &col,
+            DeleteCollector.scanCb,
+        ) catch |err| {
+            logDeleteErr(del.table, "scan", err);
+            return replyError(state, "scan failed");
+        };
+        if (col.err) |err| {
+            logDeleteErr(del.table, "collect", err);
+            return replyError(state, "delete failed");
+        }
+
+        const n = col.keys.items.len;
+        if (n > 0) {
+            const kvs = try a.alloc(TombstoneKV, n);
+            for (col.keys.items, kvs) |key, *kv| kv.* = .{ .key = key };
+            eng.proposeKVs(ns, table_id, kvs, .commit) catch |err| {
+                logDeleteErr(del.table, "propose", err);
+                return replyError(state, "delete failed");
+            };
+        }
+        const tag = try std.fmt.allocPrint(a, "DELETE {d}", .{n});
+        try state.sendCommandComplete(tag);
     }
 };
 
@@ -595,6 +682,74 @@ fn psIndex(ps: *const schema.PhysicalSchema, column_id: u32) usize {
     unreachable;
 }
 
+/// A tombstone write for one row key. Engine.encodeMutations probes for the
+/// `meta` field, so this lands as a delete on the wire: empty value, meta
+/// kind deleted.
+const TombstoneKV = struct {
+    key: []const u8,
+    value: []const u8 = "",
+    meta: zdb.kv.Meta = .{ .kind = .deleted },
+};
+
+fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {
+    log.err(
+        "delete from '{s}': {s}: {s}",
+        .{ table_name, what, @errorName(err) },
+    );
+}
+
+/// A resolved WHERE `col = value`: the `egid` pseudo-column becomes a point id;
+/// any payload column becomes a per-row cell compare. Shared by SELECT and
+/// DELETE.
+const ResolvedFilter = union(enum) { egid: u64, cell: CellFilter };
+
+/// Resolve a parsed `col = literal` filter against `t`. `a` (the statement
+/// arena) backs the coerced compare value. On an unknown column, a bad egid,
+/// or an uncoercible literal the SQL error is already sent and null returned
+/// — the statement is over. Only OOM propagates as an error.
+fn resolveFilter(
+    state: *pgwire.ConnState,
+    a: std.mem.Allocator,
+    t: *const table.Table,
+    f: ddl.Filter,
+) !?ResolvedFilter {
+    const bad_value = pgwire.sqlstate.invalid_text_representation;
+    if (std.ascii.eqlIgnoreCase(f.column, "egid")) {
+        const n = switch (f.literal) {
+            .int => |v| v,
+            else => {
+                try replyErrorCode(state, bad_value, "egid must be an integer");
+                return null;
+            },
+        };
+        if (n < 0) {
+            try replyErrorCode(
+                state,
+                bad_value,
+                "egid must be a non-negative integer",
+            );
+            return null;
+        }
+        return .{ .egid = @intCast(n) };
+    }
+    const fc = t.column(f.column) orelse {
+        try replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_column,
+            "column does not exist",
+        );
+        return null;
+    };
+    const val = litToValue(a, f.literal, fc.ty) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try replyErrorCode(state, bad_value, "invalid value in WHERE");
+            return null;
+        },
+    };
+    return .{ .cell = .{ .idx = psIndex(&t.ps, fc.column_id), .val = val } };
+}
+
 /// Turns each scanned/fetched row into a projected, filtered DataRow on the
 /// wire. Holds the projection + filter so per-row work is one method call —
 /// used directly for a point get and via `scanCb` for a scan. Columns format
@@ -616,6 +771,8 @@ const RowEmitter = struct {
 
     /// Filter, project, and send one row (true if sent, false if filtered out).
     fn emit(self: *RowEmitter, item: zdb.kv.Item) !bool {
+        // TODO: We should only decode the cell_filter col first. And only later
+        // decode the whole row.
         try row.unmarshalRow(self.stmt_alloc, self.ps, item.value, &.{}, &self.decoded);
         if (self.cell_filter) |cf| {
             if (!value.valuesEqual(self.decoded.at(cf.idx), cf.val)) return false;
@@ -642,6 +799,39 @@ const RowEmitter = struct {
     fn scanCb(raw: *anyopaque, item: zdb.kv.Item) anyerror!bool {
         const self: *RowEmitter = @ptrCast(@alignCast(raw));
         _ = self.emit(item) catch |e| {
+            self.err = e;
+            return false;
+        };
+        return true;
+    }
+};
+
+/// Collects the egid keys of the rows a DELETE matches. With a cell filter each
+/// row is decoded and compared (same recipe as RowEmitter.emit); without one
+/// the key alone suffices — no decode. Keys are duped into the statement
+/// arena because scan Items don't outlive the callback. Default ScanOptions
+/// skip tombstones, so only live rows are collected — re-running reports 0.
+const DeleteCollector = struct {
+    a: std.mem.Allocator, // statement arena — backs keys + decoded
+    ps: *const schema.PhysicalSchema,
+    cell_filter: ?CellFilter,
+    decoded: value.Row = .{},
+    keys: std.ArrayList([]const u8) = .empty,
+    err: ?anyerror = null,
+
+    fn collect(self: *DeleteCollector, item: zdb.kv.Item) !void {
+        if (self.cell_filter) |cf| {
+            const dec = &self.decoded;
+            try row.unmarshalRow(self.a, self.ps, item.value, &.{}, dec);
+            if (!value.valuesEqual(dec.at(cf.idx), cf.val)) return;
+        }
+        try self.keys.append(self.a, try self.a.dupe(u8, item.key.primary));
+    }
+
+    /// forest.scan callback: collect, capturing any error so the scan stops.
+    fn scanCb(raw: *anyopaque, item: zdb.kv.Item) anyerror!bool {
+        const self: *DeleteCollector = @ptrCast(@alignCast(raw));
+        self.collect(item) catch |e| {
             self.err = e;
             return false;
         };

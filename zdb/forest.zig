@@ -867,7 +867,10 @@ pub const Forest = struct {
     /// beyond it is an unflushed memtable row. If the scan surfaces nothing
     /// higher, the floor stands. The returned Key's `primary` is owned by
     /// `allocator` (free it). Callers derive a table's next id from it without
-    /// persisting a counter.
+    /// persisting a counter — so the max is the largest STORED key, deleted
+    /// or not: the memtable scan counts tombstones (include_deleted) and step
+    /// 1's SST `biggest` is physical, so a deleted current-max still seeds the
+    /// next id past itself and an id is never re-minted onto a tombstoned row.
     pub fn maxKey(self: *Forest, allocator: std.mem.Allocator, ns: u64, table_id: u32) !?Key {
         // Step 1: floor = max `biggest` over the rightmost SST of each level in
         // the rightmost tree. Owned by `allocator`, or null if no SSTs.
@@ -915,8 +918,16 @@ pub const Forest = struct {
         defer ctx.best.deinit(allocator);
         // [floor, table end): floor (if any) is an in-table key we keep; no
         // floor limits to the table start. limitToTable confines the memtable.
+        // include_deleted: a tombstoned max is still a stored key, so it must
+        // count — else its id gets re-minted onto a deleted row (see doc).
         const scan_range = (KeyRange{ .left = floor orelse Key{} }).limitToTable(ns, table_id);
-        _ = try self.scan(allocator, scan_range, .{}, &ctx, Ctx.emit);
+        _ = try self.scan(
+            allocator,
+            scan_range,
+            .{ .include_deleted = true },
+            &ctx,
+            Ctx.emit,
+        );
 
         // A memtable row above floor wins; otherwise floor stands (or null if
         // the table had no SSTs and no rows).

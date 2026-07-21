@@ -54,10 +54,21 @@ which won't be manifest state either.
   One counter, on `sql.Server`'s cached `table.Table`. See sql.Server.allocEgid.
 - Allocated at INSERT time, not commit. Aborted/uncommitted ids burn; gaps
   are fine (Postgres sequences are non-transactional for the same reason).
-- Deletes deferred: with DELETE + compaction the current-max row could be
-  physically erased and the derived max under-read. Can't happen pre-DELETE;
-  revisit alongside the versioning/GC model (likely MVCC retention prevents
-  physical loss, or a lazily-persisted high-water added then).
+- Deletes (IMPLEMENTED as SQL tombstones, `Meta.deleted`): `maxKey` counts
+  tombstoned keys (`include_deleted`, consistent with step 1's physical
+  `biggest`), so a deleted current-max still seeds `next_egid` past itself in
+  the common case. If the horizon later advances and a deleted max is fully
+  compacted away, `maxKey` under-reads and an egid can be reused — and that is
+  fine. Under-read and stale-leftover are mutually exclusive: the key is missed
+  only once every version incl. the tombstone is erased, so there is nothing
+  left to resurrect, and a reused egid is always rewritten with a fresh (newest)
+  timestamp. This is SQLite-rowid / Postgres-ctid semantics: reuse is a
+  client-facing id-stability tradeoff, not a correctness property.
+- The real invariant for when reuse matters: once secondary indexes exist,
+  DELETE must remove index postings in the SAME Mutations entry as the row
+  tombstone. With that atomicity there is no posting that outlives the row, so a
+  reused egid can never surface an old index hit. A persisted egid high-water
+  (no-reuse guarantee for external references) is then purely optional.
 
 ## Why pessimistic
 

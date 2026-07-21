@@ -35,7 +35,6 @@ const TableTrees = forest_mod.TableTrees;
 
 const config = zdb.config;
 
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -857,6 +856,53 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
     const mk = (try f.maxKey(alloc, ns, tid)).?;
     defer mk.free(alloc);
     try std.testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, mk.primary[0..8], .big));
+}
+
+test "forest: maxKey counts a tombstoned max key" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    const ns: u64 = 16;
+    const tid: u32 = 16;
+    _ = try f.createTree(ns, tid, .{ .inf = true });
+
+    // Seed egids 1/3/5, then tombstone the max (5) at a higher timestamp — as
+    // a DELETE would. maxKey must still report 5: seeding next_egid from a
+    // lower key would re-mint id 5 onto the deleted row.
+    const k1 = beKey(1);
+    const k3 = beKey(3);
+    const k5 = beKey(5);
+    const key = struct {
+        fn at(n: u64, t: u32, p: []const u8, ts: u64) zdb.kv.Key {
+            return .{
+                .namespace = n,
+                .table_id = t,
+                .primary = p,
+                .timestamp = ts,
+            };
+        }
+    };
+    try f.put(&.{
+        .{ .key = key.at(ns, tid, &k1, 1), .value = "a", .meta = .{} },
+        .{ .key = key.at(ns, tid, &k3, 1), .value = "b", .meta = .{} },
+        .{ .key = key.at(ns, tid, &k5, 1), .value = "c", .meta = .{} },
+    });
+    try f.put(&.{.{
+        .key = key.at(ns, tid, &k5, 2),
+        .value = "",
+        .meta = .{ .kind = .deleted },
+    }});
+
+    const mk = (try f.maxKey(alloc, ns, tid)).?;
+    defer mk.free(alloc);
+    const got = std.mem.readInt(u64, mk.primary[0..8], .big);
+    try std.testing.expectEqual(@as(u64, 5), got);
 }
 
 // ---------------------------------------------------------------------------
