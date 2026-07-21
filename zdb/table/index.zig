@@ -10,10 +10,19 @@ const std = @import("std");
 /// readers return 0 for slots past size_bytes), and that's exactly the case we
 /// need to reject.
 ///
-/// 1: [u16 key_overlap][u16 key_diff_len][u8 meta][key diff][value]
+/// 1: [u64 crc][u32 entry_count][u32 entry_off × n][entries region]
+///    entries region contains entries in this format:
+///    [u16 key_overlap][u16 key_diff_len][u8 meta][key diff][value]
+///
 pub const format_version: u32 = 1;
 
-pub const trailer_len: usize = 12;
+/// Size of the SST file trailer: [u32 index_len][u64 index_hash], the last
+/// bytes of the file. It is what locates the TableIndex, whose offset isn't
+/// known until every block has been written — which is why this one header
+/// trails rather than leading like a block's does. Both the writer
+/// (builder.zig finish) and the reader (table.zig initFromHandle) size the
+/// trailer from here; nothing may hardcode 12.
+pub const trailer_len: usize = 4 + 8;
 
 pub const Error = error{
     CorruptTable,

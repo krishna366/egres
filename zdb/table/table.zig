@@ -30,8 +30,13 @@ pub const Error = idx.Error || buffers.Error || compress.Error ||
 const log = std.log.scoped(.table);
 
 // TODO: Consider using zbuf to store this.
+/// Where each part of a block starts, all absolute from block[0]. See the
+/// layout diagram at the top of builder.zig.
 pub const BlockLayout = struct {
+    /// Entry offsets array (u32 × entry_count).
     offsets_off: usize,
+    /// Entries region — also where the header ends.
+    entries_off: usize,
     entry_count: usize,
 };
 
@@ -112,7 +117,10 @@ pub const Table = struct {
 
         const index_reader = try buffers.TableIndexReader.init(index_bytes, 0);
         var table_index = try index_reader.toStruct(allocator);
-        errdefer table_index.deinit(allocator);
+        // destroy, not deinit: toStruct hands back a created pointer, and
+        // deinit frees only what the struct points at. Same call Table.deinit
+        // makes on the success path.
+        errdefer table_index.destroy(allocator);
 
         // Refuse any SST whose entry encoding we don't speak. The block
         // checksums can't catch this: a stale table's blocks are internally
@@ -266,13 +274,12 @@ pub const Table = struct {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.allocator);
         const sz = try compress.decompress(self.allocator, self.codec, result.data, &out);
-        // Block must contain at least the trailing u64 hash (see zbuf.hash).
+        // Block must contain at least the leading u64 hash (see zbuf.hash).
         if (sz < 8) return error.CorruptTable;
         std.debug.assert(out.items.len == sz);
 
-        const checksum_off = sz - 8;
-        const stored_checksum = try idx.readU64LE(out.items, checksum_off);
-        const got_checksum = zbuf.hash(out.items[0..checksum_off]);
+        const stored_checksum = try idx.readU64LE(out.items, 0);
+        const got_checksum = zbuf.hash(out.items[8..]);
         if (stored_checksum != got_checksum) return error.ChecksumMismatch;
 
         // Create ref-counted Value with owned copy
@@ -298,6 +305,8 @@ pub const BlockIterator = struct {
     alloc: std.mem.Allocator,
     key_buf: std.ArrayList(u8),
     block: []const u8,
+    /// The entries region, sliced once at init. Entry offsets stored in
+    /// the block are relative to this, not to the block.
     entries_region: []const u8,
     layout: BlockLayout,
     base_key: []const u8,
@@ -311,23 +320,24 @@ pub const BlockIterator = struct {
     }
 
     fn parseBlockLayout(block: []const u8) Error!BlockLayout {
-        // Trailer is [u32 entry_count][u64 block_hash] (see builder.zig
-        // finishBlock); parseBlockLayout never validates the hash itself —
-        // that's already done in readBlockUncached's decompress step.
+        // Header is [u64 block_hash][u32 entry_count] then the entry
+        // offsets (see builder.zig finishBlock). parseBlockLayout never
+        // validates the hash itself — that's already done in readBlock's
+        // decompress step.
         if (block.len < 12) return error.CorruptTable;
 
-        // TODO: We should be running block checksums.
-        const checksum_off = block.len - 8;
-        const count_off = checksum_off - 4;
-        const entry_count_u32 = try idx.readU32LE(block, count_off);
-        const entry_count: usize = @intCast(entry_count_u32);
+        const entry_count: usize = @intCast(try idx.readU32LE(block, 8));
         if (entry_count == 0) return error.CorruptTable;
 
-        const offsets_bytes = entry_count * 4;
-        if (count_off < offsets_bytes) return error.CorruptTable;
-        const offsets_off = count_off - offsets_bytes;
+        const offsets_off: usize = 12;
+        const entries_off = offsets_off + entry_count * 4;
+        if (entries_off > block.len) return error.CorruptTable;
 
-        return .{ .offsets_off = offsets_off, .entry_count = entry_count };
+        return .{
+            .offsets_off = offsets_off,
+            .entries_off = entries_off,
+            .entry_count = entry_count,
+        };
     }
 
     pub fn init(
@@ -340,8 +350,9 @@ pub const BlockIterator = struct {
         //
         // Block layout is set as:
         // | ------------------------------------------------------------------------||
-        // | --- entries_region --- | --- offsets to entries, each offset is u32 --- |
-        // | --  entry count u32 -- | -- block crc u32 -- |
+        // | -- block crc u64 -- | -- entry count u32 -- |
+        // | --- offsets to entries, u32 each, entry_count of them --- |
+        // | --- entries region --- |
         // | ------------------------------------------------------------------------||
         //
         // Note that we only store the start offset of each entry i, not the end, because
@@ -350,7 +361,7 @@ pub const BlockIterator = struct {
         // Each entry is stored as such:
         // | ----------------------------------------------------------------------||
         // | -- u16 key overlap with base -- | -- u16 key diff length from base -- |
-        // | -- u8 meta -- | -- key diff bytes -- | -- value bytes --------------- |
+        // | -- u8 meta -- | -- key diff bytes -- | -- value bytes ----------- |
         // | ----------------------------------------------------------------------||
         const layout = try parseBlockLayout(block);
 
@@ -359,7 +370,7 @@ pub const BlockIterator = struct {
             .key_buf = .empty,
             .block = block,
             .layout = layout,
-            .entries_region = block[0..layout.offsets_off],
+            .entries_region = block[layout.entries_off..],
             .base_key = base_key,
             .entry_idx = 0,
             .val = &[_]u8{},
@@ -384,20 +395,119 @@ pub const BlockIterator = struct {
         try self.setIdx(self.entry_idx + 1);
     }
 
-    /// Binary search for the first entry with key >= target.
-    pub fn seekGe(self: *BlockIterator, target: Key) Error!void {
+    /// A stored key, read in place: base_key[0..overlap] ++ diff, without
+    /// pasting the two together. Lets a search compare an entry without
+    /// materializing it — the whole point of seeking this way.
+    const StoredKey = struct {
+        base: []const u8,
+        diff: []const u8,
+
+        fn len(self: StoredKey) usize {
+            return self.base.len + self.diff.len;
+        }
+
+        fn at(self: StoredKey, i: usize) u8 {
+            if (i < self.base.len) return self.base[i];
+            return self.diff[i - self.base.len];
+        }
+
+        /// The trailing 8 bytes, big-endian. They can straddle the
+        /// base/diff seam — entry 0 of a block has no diff at all, and a
+        /// version chain's diff is often just part of the timestamp.
+        fn timestamp(self: StoredKey) u64 {
+            var ts: u64 = 0;
+            var i = self.len() - 8;
+            while (i < self.len()) : (i += 1) {
+                ts = (ts << 8) | self.at(i);
+            }
+            return ts;
+        }
+    };
+
+    /// Read entry i's key without copying it.
+    fn storedKeyAt(self: *BlockIterator, i: usize) Error!StoredKey {
+        const er = self.entries_region;
+        const off = try self.getOffset(i);
+        if (off + 5 > er.len) return error.CorruptTable;
+
+        const overlap: usize = @intCast(try idx.readU16LE(er, off));
+        const dlen: usize = @intCast(try idx.readU16LE(er, off + 2));
+        if (overlap > self.base_key.len) return error.CorruptTable;
+        // 12-byte ns/tid prefix, >=1 primary byte, 8-byte timestamp.
+        if (overlap + dlen < 21) return error.CorruptTable;
+
+        const start = off + 5;
+        const end = start + dlen;
+        if (end > er.len) return error.CorruptTable;
+
+        return .{
+            .base = self.base_key[0..overlap],
+            .diff = er[start..end],
+        };
+    }
+
+    /// Order entry i against a marshaled target, per Key.order: the
+    /// [ns|tid|primary] prefix bytewise (ns and tid are fixed-width
+    /// big-endian, so bytewise IS field order, and only primary can
+    /// differ in length, where shorter-is-less is what we want), then the
+    /// trailing timestamp REVERSED. Comparing whole keys with one memcmp
+    /// would be wrong twice: unequal primary lengths misalign the
+    /// timestamp, and its order is inverted.
+    ///
+    /// `shared` is how many leading bytes the TARGET shares with
+    /// base_key. Bytes below it that the entry also takes from base_key
+    /// are equal on both sides and need no comparing — hence the start at
+    /// min(shared, overlap): past `overlap` the entry leaves the base key
+    /// and may differ there, so skipping further would miss it. Keys in a
+    /// block share a long prefix, so the loop normally runs a byte or two.
+    fn cmpStoredKey(
+        self: *BlockIterator,
+        i: usize,
+        target_key: []const u8,
+        shared_w_base: usize,
+    ) Error!std.math.Order {
+        const sk = try self.storedKeyAt(i);
+        const slen = sk.len() - 8; // prefix, i.e. key minus timestamp
+        const tlen = target_key.len - 8;
+
+        var at = @min(shared_w_base, sk.base.len);
+        const end = @min(slen, tlen);
+        while (at < end) : (at += 1) {
+            // byte by byte comparison
+            const a = sk.at(at);
+            const b = target_key[at];
+            if (a != b) return if (a < b) .lt else .gt;
+        }
+        if (slen != tlen) return if (slen < tlen) .lt else .gt;
+
+        const ets = sk.timestamp();
+        const tts = std.mem.readInt(u64, target_key[tlen..][0..8], .big);
+        if (ets == tts) return .eq;
+        return if (ets > tts) .lt else .gt; // newest sorts first
+    }
+
+    /// Binary search for the first entry with key >= target. `traw` is
+    /// `target` marshaled (Key.marshalTo): the caller marshals once per
+    /// seek, then probes compare raw bytes and only the landing entry is
+    /// materialized.
+    pub fn seekGe(self: *BlockIterator, target_key: []const u8) Error!void {
         // This binary search is only possible because we're diffing keys
         // against the base key and not against the previous key.
+        if (target_key.len == 0) return self.setIdx(0);
+        if (target_key.len < 21) return error.CorruptTable;
+
+        // Bytes the target shares with the base key, computed once for
+        // the whole search; cmpEntry decides per entry how much of that
+        // it can actually skip.
+        const shared = std.mem.findDiff(u8, target_key, self.base_key) orelse
+            @min(target_key.len, self.base_key.len);
+
         var lo: usize = 0;
         var hi: usize = self.layout.entry_count;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            try self.setIdx(mid);
-            if (!self.is_valid) {
-                hi = mid;
-                continue;
-            }
-            if (Key.init(self.key_buf.items).order(target) == .lt) {
+            const ord = try self.cmpStoredKey(mid, target_key, shared);
+            if (ord == .lt) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -412,6 +522,10 @@ pub const BlockIterator = struct {
 
     pub fn itemRef(self: *const BlockIterator) ?Item {
         if (!self.is_valid) return null;
+        // Parsed per call rather than cached in setIdx: Key.init is three
+        // loads off a hot key_buf, where caching costs a 40-byte store plus
+        // a reload, and every caller reads it about once per position.
+        // Measured: caching made a key walk ~20% SLOWER.
         return .{
             .key = Key.init(self.key_buf.items),
             .value = self.val,
@@ -419,9 +533,10 @@ pub const BlockIterator = struct {
         };
     }
 
+    /// Start of entry i within entries_region.
     inline fn getOffset(self: *BlockIterator, i: usize) Error!usize {
-        const offset = try idx.readU32LE(self.block, self.layout.offsets_off + (i * 4));
-        return @intCast(offset);
+        const at = self.layout.offsets_off + (i * 4);
+        return @intCast(try idx.readU32LE(self.block, at));
     }
 
     fn setIdx(self: *BlockIterator, i: usize) Error!void {
@@ -430,31 +545,38 @@ pub const BlockIterator = struct {
             return;
         }
 
+        const er = self.entries_region;
         const off = try self.getOffset(i);
         // 5-byte fixed header: [u16 overlap][u16 diff_len][u8 meta].
-        if (off + 5 > self.entries_region.len) return error.CorruptTable;
+        if (off + 5 > er.len) return error.CorruptTable;
 
-        const key_overlap: usize = @intCast(try idx.readU16LE(self.entries_region, off));
-        const key_diff_len: usize = @intCast(try idx.readU16LE(self.entries_region, off + 2));
+        const key_overlap: usize = @intCast(try idx.readU16LE(er, off));
+        const key_diff_len: usize = @intCast(try idx.readU16LE(er, off + 2));
         if (key_overlap > self.base_key.len) return error.CorruptTable;
-        const meta = Meta.fromByte(self.entries_region[off + 4]);
+        const meta = Meta.fromByte(er[off + 4]);
 
         const diff_start = off + 5;
         const diff_end = diff_start + key_diff_len;
-        if (diff_end > self.entries_region.len) return error.CorruptTable;
-        const diff = self.entries_region[diff_start..diff_end];
+        if (diff_end > er.len) return error.CorruptTable;
+        const diff = er[diff_start..diff_end];
 
         // Reconstruct full key into reusable buffer: base[0..overlap] ++ diff.
         self.key_buf.clearRetainingCapacity();
         try self.key_buf.appendSlice(self.alloc, self.base_key[0..key_overlap]);
         try self.key_buf.appendSlice(self.alloc, diff);
 
-        // Value boundary: next entry's offset, or end of entries_region for the last entry.
+        // Value boundary: next entry's offset, or end of the entries
+        // region for the last entry.
         const value_start = diff_end;
-        const value_end = if (i + 1 < self.layout.entry_count) try self.getOffset(i + 1) else self.entries_region.len;
-        if (value_end < value_start or value_end > self.entries_region.len) return error.CorruptTable;
+        const value_end = if (i + 1 < self.layout.entry_count)
+            try self.getOffset(i + 1)
+        else
+            er.len;
+        if (value_end < value_start or value_end > er.len) {
+            return error.CorruptTable;
+        }
 
-        self.val = self.entries_region[value_start..value_end];
+        self.val = er[value_start..value_end];
         self.meta = meta;
         self.entry_idx = i;
         self.is_valid = true;
@@ -472,6 +594,10 @@ pub const TableIterator = struct {
     priority: vfs.Priority,
     end_key: ?Key = null, // exclusive upper bound; owned (duped)
     end_bpos: usize = 0, // block index where end_key lives
+    /// Reusable scratch for the marshaled seek target — BlockIterator's
+    /// binary search compares against raw bytes, so we build them once
+    /// per seek rather than once per probe.
+    seek_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, table: *Table, priority: vfs.Priority) TableIterator {
         table.incrRef();
@@ -488,6 +614,7 @@ pub const TableIterator = struct {
 
     pub fn deinit(self: *TableIterator) void {
         if (self.end_key) |ek| ek.free(self.allocator);
+        self.seek_buf.deinit(self.allocator);
         self.table.decrRef();
         if (self.bi) |*bi| bi.deinit();
         if (self.current_block) |b| b.decrRef();
@@ -555,8 +682,12 @@ pub const TableIterator = struct {
         // or 0 if all base keys are > target.
         const lo = if (bi_idx > 0) bi_idx - 1 else 0;
 
+        // Marshal once; the in-block search compares against these bytes.
+        self.seek_buf.clearRetainingCapacity();
+        const traw = try target.marshalTo(self.allocator, &self.seek_buf);
+
         try self.setBlock(lo);
-        try self.bi.?.seekGe(target);
+        try self.bi.?.seekGe(traw);
         if (self.bi.?.is_valid) {
             self.valid = true;
             return;

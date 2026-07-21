@@ -137,6 +137,66 @@ test "table builder/reader roundtrip and seek" {
     try std.testing.expectEqualStrings("vb3", it.itemRef().?.value);
 }
 
+// seekGe compares stored keys in place, against the base key plus a diff,
+// never materializing them. Two rules are easy to get wrong that way and
+// unexercised by the fixed-width keys the other tests use: a primary that
+// is a strict PREFIX of another sorts first (a < ab < abc < b), and among
+// versions of one primary the NEWEST sorts first.
+test "seekGe: prefix-length and version ordering" {
+    const alloc = std.testing.allocator;
+
+    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    defer b.deinit();
+    try b.add(.{ .primary = "a", .timestamp = 5 }, "a5");
+    try b.add(.{ .primary = "ab", .timestamp = 9 }, "ab9");
+    try b.add(.{ .primary = "ab", .timestamp = 3 }, "ab3");
+    try b.add(.{ .primary = "abc", .timestamp = 1 }, "abc1");
+    try b.add(.{ .primary = "b", .timestamp = 7 }, "b7");
+
+    var tb = try b.finish();
+    defer tb.deinit();
+    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(t);
+
+    // One block, so every seek exercises the in-block search.
+    try std.testing.expectEqual(@as(usize, 1), t.blockCount());
+
+    var it = TableIterator.init(alloc, t, .p0);
+    defer it.deinit();
+
+    // Stored order is the seek order.
+    const want = [_][]const u8{ "a5", "ab9", "ab3", "abc1", "b7" };
+    try it.seekRange(.{}, .{});
+    for (want) |v| {
+        try std.testing.expectEqualStrings(v, it.itemRef().?.value);
+        try it.next();
+    }
+    try std.testing.expect(it.itemRef() == null);
+
+    const max_ts = std.math.maxInt(u64);
+    const cases = [_]struct { k: Key, want: []const u8 }{
+        // Newest version of a primary comes first.
+        .{ .k = .{ .primary = "ab", .timestamp = max_ts }, .want = "ab9" },
+        // A read below the newest lands on the next version down.
+        .{ .k = .{ .primary = "ab", .timestamp = 5 }, .want = "ab3" },
+        .{ .k = .{ .primary = "ab", .timestamp = 3 }, .want = "ab3" },
+        // Shorter primary sorts before its own extensions.
+        .{ .k = .{ .primary = "a", .timestamp = max_ts }, .want = "a5" },
+        .{ .k = .{ .primary = "abc", .timestamp = max_ts }, .want = "abc1" },
+        // Absent keys land on the next one that exists.
+        .{ .k = .{ .primary = "aa", .timestamp = max_ts }, .want = "ab9" },
+        .{ .k = .{ .primary = "az", .timestamp = max_ts }, .want = "b7" },
+    };
+    for (cases) |c| {
+        try it.seekRange(c.k, .{});
+        try std.testing.expectEqualStrings(c.want, it.itemRef().?.value);
+    }
+
+    // Past every key: nothing left.
+    try it.seekRange(.{ .primary = "c", .timestamp = max_ts }, .{});
+    try std.testing.expect(it.itemRef() == null);
+}
+
 test "table binary fuse contains keys" {
     const alloc = std.testing.allocator;
 

@@ -24,8 +24,9 @@ const log = std.log.scoped(.table_builder);
 //
 // Block layout is set as:
 // | ------------------------------------------------------------------------|
-// | --- entries_region --- | --- offsets to entries, each offset is u32 --- |
-// | --  entry count u32 -- | -- block crc u64 -- |
+// | -- block crc u64 -- | -- entry count u32 -- |
+// | --- offsets to entries, each offset is u32, entry_count of them --- |
+// | --- entries region --- |
 // | ------------------------------------------------------------------------|
 //
 // Note that we only store the start offset of each entry i, not the end, because
@@ -34,10 +35,30 @@ const log = std.log.scoped(.table_builder);
 // Each entry is stored as such:
 // | ----------------------------------------------------------------------|
 // | -- u16 key overlap with base -- | -- u16 key diff length from base -- |
-// | -- u8 meta -- | -- key diff bytes -- | -- value bytes --------------- |
+// | -- u8 meta -- | -- key diff bytes -- | -- value bytes -------------- |
 // | ----------------------------------------------------------------------|
 //
 // Notes:
+// - Everything needed to locate anything sits at the FRONT, in a header of
+//   known shape: the crc, the entry count, then the offsets. The reader
+//   walks it forward at fixed strides instead of unwinding a chain of
+//   subtractions from the block's end. The crc covers every byte after it,
+//   so it is written last, backpatched into the 8 bytes reserved for it at
+//   offset 0.
+//
+// - Entry offsets are relative to the entries region, so they need no
+//   rewriting once the header's size (which follows from the entry count)
+//   is known.
+//
+// - Keys and values are interleaved per entry rather than split into
+//   separate regions. Splitting them was tried and reverted: it cost 4
+//   bytes per entry for a parallel value-offset array (~9% fewer keys per
+//   block) and measured no gain, because reading a block already streams
+//   every one of its bytes through cache — decompress, checksum, then copy
+//   into the block cache — so a key walk finds the value bytes resident
+//   whatever the layout. Separation only pays where it lets you avoid
+//   LOADING bytes, which within one block it never does.
+//
 // - Keys are prefix-compressed against the block base key (first key in block),
 //   not against the previous key. This is useful because it allows us random
 //   access to any idx on the block entry, and derive its key.
@@ -49,7 +70,7 @@ const log = std.log.scoped(.table_builder);
 //   region. In the header it's covered by the reader's single `off + 5` bounds
 //   check, before any value math.
 //
-// - entry_off_* values point to entry starts within the block.
+// - entry_off_* values point to entry starts within the entries region.
 // - Checksums are xxhash3 u64 (zbuf.hash) over the uncompressed block bytes
 //   prior to the checksum field. Blocks are then optionally compressed; the
 //   stored checksum remains over the uncompressed data.
@@ -98,7 +119,11 @@ pub const Builder = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     table_bytes: std.ArrayList(u8),
-    cur_block: std.ArrayList(u8),
+    /// Where finishBlock assembles a block: header, then the entries the
+    /// two cur_* buffers below accumulated. Kept separate from them
+    /// because the header's size isn't known until the block is complete.
+    block_buf: std.ArrayList(u8),
+    cur_entries: std.ArrayList(u8),
     cur_offsets: std.ArrayList(u32),
     cur_base_key: std.ArrayList(u8),
     block_infos: std.ArrayList(BlockInfo),
@@ -118,12 +143,13 @@ pub const Builder = struct {
     stale_data_size: u32,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Builder {
-        // TODO: Choose sane defaults for table_bytes and cur_block.
+        // TODO: Choose sane defaults for table_bytes and cur_entries.
         return .{
             .allocator = allocator,
             .cfg = cfg,
             .table_bytes = .empty,
-            .cur_block = .empty,
+            .block_buf = .empty,
+            .cur_entries = .empty,
             .cur_offsets = .empty,
             .cur_base_key = .empty,
             .block_infos = .empty,
@@ -146,7 +172,8 @@ pub const Builder = struct {
         self.bf_hashes.deinit(self.allocator);
         self.cur_base_key.deinit(self.allocator);
         self.cur_offsets.deinit(self.allocator);
-        self.cur_block.deinit(self.allocator);
+        self.cur_entries.deinit(self.allocator);
+        self.block_buf.deinit(self.allocator);
         self.table_bytes.deinit(self.allocator);
     }
 
@@ -162,7 +189,8 @@ pub const Builder = struct {
         self.bf_hashes.clearRetainingCapacity();
         self.cur_base_key.clearRetainingCapacity();
         self.cur_offsets.clearRetainingCapacity();
-        self.cur_block.clearRetainingCapacity();
+        self.cur_entries.clearRetainingCapacity();
+        self.block_buf.clearRetainingCapacity();
         self.table_bytes.clearRetainingCapacity();
         self.key_count = 0;
         self.max_version = 0;
@@ -195,6 +223,11 @@ pub const Builder = struct {
         const key = item.key;
         const value = item.value;
 
+        // A real row, never a bound sentinel: an empty primary marshals to
+        // zero bytes (Key.marshalTo), which would leave last_key empty and
+        // quietly disarm both the ordering check below and the base-key
+        // comparison further down.
+        std.debug.assert(key.len() > 0);
         if (key.len() > std.math.maxInt(u16)) return error.KeyTooLarge;
         if (value.len > std.math.maxInt(u32)) return error.ValueTooLarge;
 
@@ -215,40 +248,54 @@ pub const Builder = struct {
         _ = try key.marshalTo(self.allocator, &self.last_key);
         const entry_key = self.last_key.items;
 
-        const overlap = if (self.cur_base_key.items.len == 0)
-            0
-        else
-            commonPrefixLen(self.cur_base_key.items, entry_key);
-        const diff_len = entry_key.len - overlap;
+        // Overlap against the base key currently in force. Only used to
+        // size this entry for the fits-in-the-open-block question below.
+        // findDiff yields null only for wholly equal slices: entries are
+        // strictly ascending, so none repeats its block's base key, and a
+        // fresh block's empty base differs in length from any real key.
+        const base = self.cur_base_key.items;
+        const fit_overlap =
+            std.mem.findDiff(u8, base, entry_key) orelse unreachable;
 
         // Estimate the encoded size for this entry:
         // 2 bytes overlap + 2 bytes diff_len + 1 byte meta + key diff + value.
-        const entry_sz = @as(usize, 5) + diff_len + value.len;
+        const entry_sz = @as(usize, 5) + (entry_key.len - fit_overlap) +
+            value.len;
         if (self.shouldFinishBlock(entry_sz)) {
             try self.finishBlock();
         }
 
-        if (self.cur_base_key.items.len == 0) {
+        // finishBlock clears the base key, so a block that just rolled over
+        // — like the very first one — adopts THIS key as its base: the
+        // overlap is then the whole key and the stored diff is empty. With
+        // no rollover the overlap measured above still stands, which is why
+        // it isn't recomputed.
+        const overlap = if (self.cur_base_key.items.len == 0) blk: {
             try self.cur_base_key.appendSlice(self.allocator, entry_key);
-        }
+            break :blk entry_key.len;
+        } else fit_overlap;
 
-        const overlap2 = commonPrefixLen(self.cur_base_key.items, entry_key);
-        if (overlap2 > std.math.maxInt(u16)) return error.KeyTooLarge;
-        const diff = entry_key[overlap2..];
+        if (overlap > std.math.maxInt(u16)) return error.KeyTooLarge;
+        const diff = entry_key[overlap..];
         if (diff.len > std.math.maxInt(u16)) return error.KeyTooLarge;
 
-        // cur_offsets stores the start offset of each entry in cur_block.
-        try self.cur_offsets.append(self.allocator, @intCast(self.cur_block.items.len));
+        // cur_offsets stores the start offset of each entry in cur_entries,
+        // recorded before the append so it names where this entry begins.
+        try self.cur_offsets.append(
+            self.allocator,
+            @intCast(self.cur_entries.items.len),
+        );
+
         // Per-entry encoding:
         //   [u16 overlap][u16 diff_len][u8 meta][diff bytes][value bytes]
         // Value boundary is derived from the next entry offset (or end of
         // entries region), which is why meta sits in the fixed header rather
         // than in front of the value. See the layout notes at the top.
-        try appendU16(&self.cur_block, self.allocator, @intCast(overlap2));
-        try appendU16(&self.cur_block, self.allocator, @intCast(diff.len));
-        try self.cur_block.append(self.allocator, item.meta.toByte());
-        try self.cur_block.appendSlice(self.allocator, diff);
-        try self.cur_block.appendSlice(self.allocator, value);
+        try appendU16(&self.cur_entries, self.allocator, @intCast(overlap));
+        try appendU16(&self.cur_entries, self.allocator, @intCast(diff.len));
+        try self.cur_entries.append(self.allocator, item.meta.toByte());
+        try self.cur_entries.appendSlice(self.allocator, diff);
+        try self.cur_entries.appendSlice(self.allocator, value);
 
         if (self.key_count == std.math.maxInt(u32)) return error.IntegerOverflow;
         self.key_count += 1;
@@ -385,16 +432,20 @@ pub const Builder = struct {
         // Page-aligned files dodge any O_DIRECT / iomap edge case where an
         // unaligned-tail write could be silently dropped on some kernels;
         // the cost is at most page_size-1 zero bytes per SST.
-        const trailer_size: usize = 4 + 8;
-        const tail_size = index_bytes.items.len + trailer_size;
+        const tail_size = index_bytes.items.len + idx.trailer_len;
         const total_unpadded = self.table_bytes.items.len + tail_size;
         const remainder = total_unpadded % vfs.page_size;
         const pad_bytes = if (remainder == 0) 0 else vfs.page_size - remainder;
         if (pad_bytes > 0) try self.table_bytes.appendNTimes(self.allocator, 0, pad_bytes);
 
         try self.table_bytes.appendSlice(self.allocator, index_bytes.items);
+        const trailer_at = self.table_bytes.items.len;
         try appendU32(&self.table_bytes, self.allocator, index_len);
         try appendU64(&self.table_bytes, self.allocator, index_checksum);
+        // The reader seeks by idx.trailer_len, so what we wrote has to be
+        // exactly that wide — the padding above was sized on it too.
+        std.debug.assert(self.table_bytes.items.len - trailer_at ==
+            idx.trailer_len);
 
         std.debug.assert(self.table_bytes.items.len % vfs.page_size == 0);
 
@@ -411,13 +462,14 @@ pub const Builder = struct {
     fn shouldFinishBlock(self: *Builder, new_entry_est: usize) bool {
         if (self.cur_offsets.items.len == 0) return false;
 
-        // Block tail layout:
-        // (entry_count + 1) offsets * 4 bytes each
+        // Block header layout, counting the entry we're about to add:
+        // 8 bytes checksum (xxhash3, see zbuf.hash)
         // + 4 bytes entry_count
-        // + 8 bytes checksum (xxhash3, see zbuf.hash)
-        const tail_est =
-            (self.cur_offsets.items.len + 1) * 4 + 12;
-        const estimated = self.cur_block.items.len + new_entry_est + tail_est;
+        // + (entry_count + 1) offsets * 4 bytes each
+        const n = self.cur_offsets.items.len;
+        const header_est = 8 + 4 + (n + 1) * 4;
+        const estimated = self.cur_entries.items.len +
+            new_entry_est + header_est;
         return estimated > self.cfg.target_block_size;
     }
 
@@ -429,25 +481,43 @@ pub const Builder = struct {
         const base_key = try self.allocator.dupe(u8, self.cur_base_key.items);
         errdefer self.allocator.free(base_key);
 
-        // Block tail: [u32 entry_off_0 ...][u32 entry_count][u64 block_hash]
-        for (self.cur_offsets.items) |off| {
-            try appendU32(&self.cur_block, self.allocator, off);
-        }
-        try appendU32(&self.cur_block, self.allocator, @intCast(self.cur_offsets.items.len));
+        // Header first: [u64 crc][u32 entry_count][u32 entry_off × n].
+        // Its size follows from the entry count, so the region-relative
+        // offsets recorded while adding entries stay valid — the crc is
+        // the only field needing a second pass, and we reserve it here.
+        const n = self.cur_offsets.items.len;
+        const header_len = 8 + 4 + n * 4;
 
-        const checksum = zbuf.hash(self.cur_block.items);
-        try appendU64(&self.cur_block, self.allocator, checksum);
+        const out = &self.block_buf;
+        out.clearRetainingCapacity();
+
+        try appendU64(out, self.allocator, 0); // crc, backpatched below
+        try appendU32(out, self.allocator, @intCast(n));
+        for (self.cur_offsets.items) |off| {
+            try appendU32(out, self.allocator, off);
+        }
+        std.debug.assert(out.items.len == header_len);
+
+        try out.appendSlice(self.allocator, self.cur_entries.items);
+
+        const checksum = zbuf.hash(out.items[8..]);
+        std.mem.writeInt(u64, out.items[0..8], checksum, .little);
 
         // Track pre-compression size; CRC was computed over the uncompressed bytes.
-        const raw_len: u32 = @intCast(self.cur_block.items.len);
+        const raw_len: u32 = @intCast(out.items.len);
         std.debug.assert(self.uncompressed_size <= std.math.maxInt(u32) - raw_len);
         self.uncompressed_size += raw_len;
 
         const block_off: u32 = @intCast(self.table_bytes.items.len);
         if (self.cfg.codec == .none) {
-            try self.table_bytes.appendSlice(self.allocator, self.cur_block.items);
+            try self.table_bytes.appendSlice(self.allocator, out.items);
         } else {
-            const clen: u32 = @intCast(try compress.compress(self.allocator, self.cfg.codec, self.cur_block.items, &self.table_bytes));
+            const clen: u32 = @intCast(try compress.compress(
+                self.allocator,
+                self.cfg.codec,
+                out.items,
+                &self.table_bytes,
+            ));
             std.debug.assert(self.compressed_size <= std.math.maxInt(u32) - clen);
             self.compressed_size += clen;
         }
@@ -460,18 +530,11 @@ pub const Builder = struct {
         });
 
         // Reuse capacity for the next block to avoid re-allocating every time.
-        self.cur_block.clearRetainingCapacity();
+        self.cur_entries.clearRetainingCapacity();
         self.cur_offsets.clearRetainingCapacity();
         self.cur_base_key.clearRetainingCapacity();
     }
 };
-
-fn commonPrefixLen(a: []const u8, b: []const u8) usize {
-    const n = @min(a.len, b.len);
-    var i: usize = 0;
-    while (i < n and a[i] == b[i]) : (i += 1) {}
-    return i;
-}
 
 fn appendU16(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u16) !void {
     var tmp: [2]u8 = undefined;

@@ -10,9 +10,11 @@
 // LocalQueue, or do we need a lock-free deque?" — the question that motivated
 // the Chase-Lev work-stealing experiment.
 //
-// `push` never dereferences the `*Fiber` it stores (it only asserts the
-// pointer is ≥ 0x1000), so we feed it synthetic `@ptrFromInt` addresses and
-// keep the hot loop measuring ring + lock cost alone — no allocation noise.
+// `push`/`pop` flip `Fiber.qstate` via assertEnQ/assertDQ wherever runtime
+// safety is on, so the fibers we feed the ring have to be real memory. They
+// need not be real FIBERS though — nothing else in the struct is touched —
+// so we hand out pointers into one zeroed slab and the hot loop still
+// measures ring + lock cost alone, with no allocation inside it.
 //
 // Run via `zig build -Drelease bench` for accurate numbers (Debug bounds
 // checks dominate the loop at this scale). Filter with
@@ -27,12 +29,16 @@ const Bench = bench.Bench;
 const Fiber = fiber.Fiber;
 const cap = 16; // bench ring depth; seeded as the ring's initial capacity
 
-// A pool of distinct, never-dereferenced dummy `*Fiber` pointers. Distinct
-// values (rather than one repeated pointer) keep the stored slots varying so
-// the compiler can't fold the ring into a constant.
-fn dummies() [cap]*Fiber {
-    var ds: [cap]*Fiber = undefined;
-    for (&ds, 0..) |*d, i| d.* = @ptrFromInt(0x1000 + i * 64);
+// A slab of distinct dummy fibers, zeroed so `qstate` starts at 0 and the
+// push/pop assertions see the 0→1→0 cycle they expect. Distinct pointers
+// (rather than one repeated) keep the stored slots varying so the compiler
+// can't fold the ring into a constant. Synthetic @ptrFromInt addresses were
+// used here once; they segfault the moment runtime safety turns those
+// assertions on, i.e. in every build except the ReleaseFast one `zig build
+// bench` produces.
+fn dummies(alloc: std.mem.Allocator) ![]Fiber {
+    const ds = try alloc.alloc(Fiber, cap);
+    @memset(std.mem.sliceAsBytes(ds), 0);
     return ds;
 }
 
@@ -43,13 +49,14 @@ fn dummies() [cap]*Fiber {
 fn benchPushPop(b: *Bench, comptime mode: fiber.QueueLockMode) !void {
     var q = try fiber.LocalQueue(mode).init(std.heap.page_allocator, cap);
     defer q.deinit();
-    const ds = dummies();
+    const ds = try dummies(std.heap.page_allocator);
+    defer std.heap.page_allocator.free(ds);
     b.resetTimer();
 
     var sink: usize = 0;
     var i: u64 = 0;
     while (i < b.n) : (i += 1) {
-        try q.push(ds[i & (cap - 1)]);
+        try q.push(&ds[i & (cap - 1)]);
         sink +%= @intFromPtr(q.pop().?);
     }
     std.mem.doNotOptimizeAway(sink);
@@ -64,14 +71,15 @@ fn benchFillDrain(b: *Bench, comptime mode: fiber.QueueLockMode) !void {
     // measuring steady-state push/pop + lock cost, not the realloc path.
     var q = try fiber.LocalQueue(mode).init(std.heap.page_allocator, cap);
     defer q.deinit();
-    const ds = dummies();
+    const ds = try dummies(std.heap.page_allocator);
+    defer std.heap.page_allocator.free(ds);
     b.resetTimer();
 
     var sink: usize = 0;
     var i: u64 = 0;
     while (i < b.n) : (i += 1) {
         var j: usize = 0;
-        while (j < cap - 1) : (j += 1) try q.push(ds[j]);
+        while (j < cap - 1) : (j += 1) try q.push(&ds[j]);
         while (q.pop()) |f| sink +%= @intFromPtr(f);
     }
     std.mem.doNotOptimizeAway(sink);

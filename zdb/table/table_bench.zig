@@ -1,0 +1,323 @@
+//! Micro-benchmarks for the SST read path.
+//!
+//! Four angles, each isolating one cost so an optimization's effect is
+//! attributable:
+//!
+//!   merge scan  — MergeIterator arbitration across 8 interleaved tables.
+//!                 Keys are striped so the winner changes every step, the
+//!                 worst case for the heap.
+//!   point seeks — TableIterator.seekRange to a random key. Includes the
+//!                 per-seek readBlock (openHandle tables have file_id 0,
+//!                 the block-cache skip sentinel), so it moves less than
+//!                 `block seekGe` does.
+//!   block seekGe— the in-block binary search alone: one cached block,
+//!                 repeated seeks to keys inside it. The purest signal
+//!                 for the key-compare path.
+//!   full scan   — sequential setIdx/next over every entry of one table.
+//!   key walks    — keys only, never a value byte, at two value sizes:
+//!                 what version skipping and compaction's discard
+//!                 decisions do.
+//!
+//! Run with `zig build bench` (ReleaseFast).
+
+const std = @import("std");
+const utils = @import("utils");
+const zdb = @import("zdb");
+const bench = utils.bench;
+const Bench = bench.Bench;
+const Key = zdb.kv.Key;
+const vfs = zdb.vfs;
+
+const Builder = zdb.table.builder.Builder;
+const Table = zdb.table.Table;
+const TableIterator = zdb.table.TableIterator;
+const BlockIterator = zdb.table.BlockIterator;
+const merge = zdb.table.merge_iterator;
+
+// ── Helpers (mirrors of the table_test.zig ones; test files aren't
+// importable from each other) ────────────────────────────────────────────
+
+fn destroyTable(t: *Table) void {
+    const allocator = t.allocator;
+    t.decrRef();
+    allocator.destroy(t);
+}
+
+fn fromBuf(alloc: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
+    const owned = try alloc.dupe(u8, buf);
+    return .{
+        .file_size = @intCast(owned.len),
+        .owned_buf = owned,
+        .buf_allocator = alloc,
+        .vfs = vfs.g(),
+    };
+}
+
+fn keyAt(buf: []u8, i: usize) ![]const u8 {
+    return std.fmt.bufPrint(buf, "k{d:0>7}", .{i});
+}
+
+/// Build a table over the arithmetic progression `stripe, stripe+stride,
+/// …` of length `n`. `stride` tables built with distinct stripes hold
+/// disjoint, perfectly interleaved key streams.
+fn buildStriped(
+    alloc: std.mem.Allocator,
+    stripe: usize,
+    stride: usize,
+    n: usize,
+    block_size: u32,
+    val_len: usize,
+) !zdb.table.builder.TableBuffer {
+    var b = Builder.init(alloc, .{ .target_block_size = block_size });
+    defer b.deinit();
+
+    const val = try alloc.alloc(u8, val_len);
+    defer alloc.free(val);
+    @memset(val, 'v');
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kb: [16]u8 = undefined;
+        const p = try keyAt(&kb, stripe + i * stride);
+        try b.add(.{ .primary = p, .timestamp = 1 }, val);
+    }
+    return b.finish();
+}
+
+/// Build + open one striped table. Caller destroys via destroyTable.
+fn openStriped(
+    alloc: std.mem.Allocator,
+    stripe: usize,
+    stride: usize,
+    n: usize,
+    block_size: u32,
+    val_len: usize,
+) !*Table {
+    var tb = try buildStriped(alloc, stripe, stride, n, block_size, val_len);
+    defer tb.deinit();
+    return Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+}
+
+const value_len: usize = 16;
+const num_tables: usize = 8;
+const keys_per_table: usize = 8 * 1024;
+const single_keys: usize = 64 * 1024;
+
+/// Not `b.alloc` (page_allocator): readBlock allocates per block, and an
+/// mmap/munmap pair per 4 KiB block buries the iterator work we're here
+/// to measure. smp_allocator is what production-shaped allocation costs.
+const gpa = std.heap.smp_allocator;
+
+// ── Benchmarks ───────────────────────────────────────────────────────────
+
+fn benchMergeScan(b: *Bench) !void {
+    const a = gpa;
+    var tables: [num_tables]*Table = undefined;
+    var opened: usize = 0;
+    defer for (tables[0..opened]) |t| destroyTable(t);
+    while (opened < num_tables) : (opened += 1) {
+        tables[opened] = try openStriped(
+            a,
+            opened,
+            num_tables,
+            keys_per_table,
+            4096,
+            value_len,
+        );
+    }
+
+    b.resetTimer();
+    var i: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        var iters: [num_tables]merge.Iterator = undefined;
+        for (tables, 0..) |t, j| {
+            iters[j] = .{ .table = TableIterator.init(a, t, .p0) };
+        }
+        var m = merge.MergeIterator.init(a, iters[0..]);
+        defer m.deinit();
+
+        try m.seekRange(.{}, .{});
+        var count: usize = 0;
+        while (m.itemRef()) |item| : (count += 1) {
+            b.addBytes(item.key.primary.len + item.value.len);
+            try m.next();
+        }
+        if (count != num_tables * keys_per_table) return error.ShortScan;
+    }
+}
+
+fn benchPointSeeks(b: *Bench) !void {
+    const a = gpa;
+    const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
+    defer destroyTable(t);
+
+    var it = TableIterator.init(a, t, .p0);
+    defer it.deinit();
+
+    b.resetTimer();
+    var i: u64 = 0;
+    var j: usize = 0;
+    var hits: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        // Coprime stride: visits every key, defeats block locality.
+        j = (j + 40503) % single_keys;
+        var kb: [16]u8 = undefined;
+        const p = try keyAt(&kb, j);
+        try it.seekRange(.{ .primary = p, .timestamp = 1 }, .{});
+        if (it.itemRef() != null) hits += 1;
+    }
+    std.mem.doNotOptimizeAway(hits);
+}
+
+fn benchBlockSeekGe(b: *Bench) !void {
+    const a = gpa;
+    // 16 KiB blocks hold ~300 entries here, so the binary search runs
+    // ~8-9 probes — deep enough for the per-probe cost to dominate.
+    const t = try openStriped(a, 0, 1, single_keys, 16 * 1024, value_len);
+    defer destroyTable(t);
+
+    const bpos = t.blockCount() / 2;
+    const block = try t.readBlock(bpos, .p0);
+    defer block.decrRef();
+    const base_raw = try t.blockBaseKey(bpos);
+
+    var bi = try BlockIterator.init(a, block.data, base_raw);
+    defer bi.deinit();
+
+    // Spread targets over the block: entry 0's key is the base key, and
+    // keys here are dense, so index = first + offset.
+    const first = try std.fmt.parseInt(
+        usize,
+        Key.init(base_raw).primary[1..],
+        10,
+    );
+    const num_targets: usize = 64;
+    const step = @max(1, bi.layout.entry_count / num_targets);
+
+    // seekGe compares against marshaled bytes, so pre-build them —
+    // production marshals once per seek, not once per probe.
+    var targets: [num_targets][]const u8 = undefined;
+    for (&targets, 0..) |*raw, k| {
+        var kb: [16]u8 = undefined;
+        const p = try keyAt(&kb, first + k * step);
+        const key = Key{ .primary = p, .timestamp = 1 };
+        raw.* = try key.marshal(a);
+    }
+    defer for (targets) |raw| a.free(raw);
+
+    b.resetTimer();
+    var i: u64 = 0;
+    var hits: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        try bi.seekGe(targets[i % num_targets]);
+        if (bi.itemRef() != null) hits += 1;
+    }
+    std.mem.doNotOptimizeAway(hits);
+}
+
+/// Walk the keys of ONE already-resident block, never touching a value.
+/// Keys and values are interleaved, so the stride per key grows with the
+/// value size — this pair of numbers is what a keys/values split would
+/// have to beat. It was tried and reverted (see builder.zig): the split
+/// cost 4 bytes per entry and won nothing, because loading a block
+/// already streams every byte through cache (decompress + checksum +
+/// copy), leaving values resident whatever the layout.
+fn benchBlockKeyWalk(b: *Bench, val_len: usize) !void {
+    const a = gpa;
+    const t = try openStriped(a, 0, 1, single_keys, 64 * 1024, val_len);
+    defer destroyTable(t);
+
+    const bpos = t.blockCount() / 2;
+    const block = try t.readBlock(bpos, .p0);
+    defer block.decrRef();
+    const base_raw = try t.blockBaseKey(bpos);
+
+    var bi = try BlockIterator.init(a, block.data, base_raw);
+    defer bi.deinit();
+    const n = bi.layout.entry_count;
+
+    b.resetTimer();
+    var i: u64 = 0;
+    var bytes: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        try bi.seekToFirst();
+        var count: usize = 0;
+        while (bi.itemRef()) |item| : (count += 1) {
+            bytes += item.key.primary.len;
+            try bi.next();
+        }
+        if (count != n) return error.ShortScan;
+    }
+    // Per-key cost is what matters here; report keys walked, not bytes.
+    std.mem.doNotOptimizeAway(bytes);
+}
+
+/// Full-table key-only scan. Dominated by per-block load cost, so it
+/// mostly measures blocks-per-scan — which is why it grows with value
+/// size even though it reads no value bytes.
+fn benchKeyScan(b: *Bench, val_len: usize) !void {
+    const a = gpa;
+    const t = try openStriped(a, 0, 1, single_keys, 64 * 1024, val_len);
+    defer destroyTable(t);
+
+    var it = TableIterator.init(a, t, .p0);
+    defer it.deinit();
+
+    b.resetTimer();
+    var i: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        try it.seekRange(.{}, .{});
+        var count: usize = 0;
+        while (it.itemRef()) |item| : (count += 1) {
+            b.addBytes(item.key.primary.len);
+            try it.next();
+        }
+        if (count != single_keys) return error.ShortScan;
+    }
+}
+
+fn benchFullScan(b: *Bench) !void {
+    const a = gpa;
+    const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
+    defer destroyTable(t);
+
+    var it = TableIterator.init(a, t, .p0);
+    defer it.deinit();
+
+    b.resetTimer();
+    var i: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        try it.seekRange(.{}, .{});
+        var count: usize = 0;
+        while (it.itemRef()) |item| : (count += 1) {
+            b.addBytes(item.key.primary.len + item.value.len);
+            try it.next();
+        }
+        if (count != single_keys) return error.ShortScan;
+    }
+}
+
+test "BENCH: merge scan 8 tables" {
+    try benchMergeScan(bench.current());
+}
+test "BENCH: table point seeks" {
+    try benchPointSeeks(bench.current());
+}
+test "BENCH: block seekGe" {
+    try benchBlockSeekGe(bench.current());
+}
+test "BENCH: table full scan" {
+    try benchFullScan(bench.current());
+}
+test "BENCH: key-only scan 16B values" {
+    try benchKeyScan(bench.current(), 16);
+}
+test "BENCH: key-only scan 256B values" {
+    try benchKeyScan(bench.current(), 256);
+}
+test "BENCH: in-block key walk 16B values" {
+    try benchBlockKeyWalk(bench.current(), 16);
+}
+test "BENCH: in-block key walk 256B values" {
+    try benchBlockKeyWalk(bench.current(), 256);
+}

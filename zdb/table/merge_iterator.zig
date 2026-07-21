@@ -40,47 +40,118 @@ pub const Iterator = union(enum) {
     }
 };
 
-fn iterOrder(iters: []const Iterator, a: usize, b: usize) std.math.Order {
-    const item_a = iters[a].itemRef().?;
-    const item_b = iters[b].itemRef().?;
-    return item_a.key.order(item_b.key);
-}
+/// Heap slot: a source index. A merge has one source per memtable plus
+/// one per overlapping L0 table plus one per deeper level, so u16 is
+/// three orders of magnitude of headroom; seekRange asserts the bound.
+const Src = u16;
 
 pub const MergeIterator = struct {
     allocator: std.mem.Allocator,
     iters: []Iterator, // caller-owned slice
-    heap: std.PriorityQueue(usize, []const Iterator, iterOrder),
+    /// Each source's current item, indexed BY SOURCE and refreshed once
+    /// per advance. Comparisons read keys from here instead of
+    /// dispatching through the Iterator union and re-parsing the bytes
+    /// every time. An item stays valid exactly until its own source
+    /// advances (its key points into that source's key_buf or arena, its
+    /// value into a block the source holds a ref on) — which is when we
+    /// overwrite it.
+    items: []table.Item = &.{},
+    /// Min-heap (by winsOver) of the sources that still hold an item.
+    /// Source indices rather than the items themselves: sift swaps stay
+    /// 2 bytes wide and the live heap sits in a single cache line.
+    heap: []Src = &.{},
+    heap_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, iters: []Iterator) MergeIterator {
-        return .{
-            .allocator = allocator,
-            .iters = iters,
-            .heap = std.PriorityQueue(usize, []const Iterator, iterOrder).initContext(iters),
-        };
+        return .{ .allocator = allocator, .iters = iters };
     }
 
     pub fn deinit(self: *MergeIterator) void {
-        self.heap.deinit(self.allocator);
+        if (self.items.len > 0) self.allocator.free(self.items);
+        if (self.heap.len > 0) self.allocator.free(self.heap);
         for (self.iters) |*it| it.deinit();
     }
 
+    /// True when source `a` should reach the caller before source `b`.
+    ///
+    /// Every source in one merge shares a single (namespace, table_id):
+    /// scans run on table-limited ranges (KeyRange.limitToTable) and a
+    /// compaction merge never leaves its tree. Those fields are equal by
+    /// construction, so orderPrimary skips them; the asserts catch a
+    /// future caller that breaks the assumption.
+    ///
+    /// Equal full keys fall back to source index for a deterministic
+    /// order; they are NOT collapsed. A key present in two sources
+    /// surfaces once per source — compaction's keys_in accounting reads
+    /// a missing one as iterator loss.
+    fn winsOver(self: *const MergeIterator, a: Src, b: Src) bool {
+        const ka = self.items[a].key;
+        const kb = self.items[b].key;
+        std.debug.assert(ka.namespace == kb.namespace);
+        std.debug.assert(ka.table_id == kb.table_id);
+        return switch (ka.orderPrimary(kb)) {
+            .lt => true,
+            .gt => false,
+            .eq => a < b,
+        };
+    }
+
     pub fn seekRange(self: *MergeIterator, start: Key, end: Key) !void {
-        while (self.heap.pop() != null) {}
-        for (self.iters) |*it| try it.seekRange(start, end);
+        std.debug.assert(self.iters.len <= std.math.maxInt(Src));
+        if (self.heap.len == 0 and self.iters.len > 0) {
+            self.items = try self.allocator.alloc(table.Item, self.iters.len);
+            self.heap = try self.allocator.alloc(Src, self.iters.len);
+        }
+        self.heap_len = 0;
         for (self.iters, 0..) |*it, i| {
-            if (it.itemRef() != null) try self.heap.push(self.allocator, i);
+            try it.seekRange(start, end);
+            self.items[i] = it.itemRef() orelse continue;
+            self.heap[self.heap_len] = @intCast(i);
+            self.heap_len += 1;
+        }
+        // Floyd heapify: O(n), against O(n log n) for n separate pushes.
+        var i = self.heap_len / 2;
+        while (i > 0) {
+            i -= 1;
+            self.siftDown(i);
         }
     }
 
     pub fn itemRef(self: *MergeIterator) ?table.Item {
-        const i = self.heap.peek() orelse return null;
-        return self.iters[i].itemRef();
+        if (self.heap_len == 0) return null;
+        return self.items[self.heap[0]];
     }
 
     pub fn next(self: *MergeIterator) Error!void {
-        const i = self.heap.pop() orelse return;
-        try self.iters[i].next();
-        if (self.iters[i].itemRef() != null) try self.heap.push(self.allocator, i);
+        if (self.heap_len == 0) return;
+        const src = self.heap[0];
+        try self.iters[src].next();
+        if (self.iters[src].itemRef()) |item| {
+            // Replace-top rather than pop + push: the source that just
+            // advanced often still wins (runs from one source are the
+            // common case), so one sift replaces two.
+            self.items[src] = item;
+        } else {
+            self.heap_len -= 1;
+            if (self.heap_len == 0) return;
+            self.heap[0] = self.heap[self.heap_len];
+        }
+        self.siftDown(0);
+    }
+
+    fn siftDown(self: *MergeIterator, start: usize) void {
+        var i = start;
+        while (true) {
+            const l = 2 * i + 1;
+            if (l >= self.heap_len) return; // also the single-source exit
+            var c = l;
+            const r = l + 1;
+            if (r < self.heap_len and
+                self.winsOver(self.heap[r], self.heap[l])) c = r;
+            if (!self.winsOver(self.heap[c], self.heap[i])) return;
+            std.mem.swap(Src, &self.heap[c], &self.heap[i]);
+            i = c;
+        }
     }
 };
 

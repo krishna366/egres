@@ -222,7 +222,21 @@ pub const Key = struct {
     }
 
     pub fn order(self: Key, other: Key) std.math.Order {
-        const cmp = self.orderWithoutTs(other);
+        const ns_ord = std.math.order(self.namespace, other.namespace);
+        if (ns_ord != .eq) return ns_ord;
+        const tid_ord = std.math.order(self.table_id, other.table_id);
+        if (tid_ord != .eq) return tid_ord;
+        return self.orderPrimary(other);
+    }
+
+    /// Order within one table: primary ascending, then timestamp
+    /// DESCENDING so a key's newest version comes first. Callers that
+    /// already know both keys share a (namespace, table_id) — a merge
+    /// over one table's sources, say — skip those fields and call this.
+    /// The sole definition of the reversed-timestamp rule; `order` is
+    /// this plus the namespace/table_id prefix.
+    pub fn orderPrimary(self: Key, other: Key) std.math.Order {
+        const cmp = std.mem.order(u8, self.primary, other.primary);
         if (cmp != .eq) return cmp;
 
         if (self.timestamp == other.timestamp) return .eq;
