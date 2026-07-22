@@ -53,8 +53,8 @@ test "Channel: bounded blocking handoff with capacity 1" {
     var g: fiber.Group(void) = .init(std.testing.allocator);
     defer g.deinit();
     // Pin both to worker 0 — `total` is a plain u32, not atomic.
-    try g.spawn(.{ }, Producer.run, .{&ch});
-    try g.spawn(.{ }, Consumer.run, .{ &ch, &total });
+    try g.spawn(.{}, Producer.run, .{&ch});
+    try g.spawn(.{}, Consumer.run, .{ &ch, &total });
     g.wait();
 
     try std.testing.expectEqual(@as(u32, 100 * 101 / 2), total);

@@ -51,4 +51,3 @@ test "RWMutex(.tracked): only the first reader of a shared session records" {
     try std.testing.expect(std.mem.indexOf(u8, text, "held_by=") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "lock_registry_test.zig") != null);
 }
-

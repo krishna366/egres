@@ -96,6 +96,8 @@ pub const Shutdown = @import("shutdown.zig").Shutdown;
 // `utils.context` for existing callers). `coarse_clock` reads `context.g().io`.
 pub const context = @import("context.zig");
 
+pub const SemaphoreMap = @import("semaphore_map.zig").SemaphoreMap;
+
 // `sleepMs` lives in deadlines.zig — it parks on the per-worker Deadlines array
 // and PANICS on a spurious wake (resumed before its own deadline fired).
 pub const sleepMs = @import("deadlines.zig").sleepMs;
@@ -112,4 +114,3 @@ pub const fsops = @import("fsops.zig");
 // From net.zig — TCP networking with zio.net-compatible Stream/Server/
 // IpAddress and the std.Io.Reader/Writer socket adapters.
 pub const net = @import("net.zig");
-
