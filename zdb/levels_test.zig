@@ -25,7 +25,6 @@ const TableCache = zdb.tree.TableCache;
 
 const config = zdb.config;
 
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -895,6 +894,7 @@ test "compaction: a tombstone above the horizon is retained with the state it sh
         .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
         .p0,
     ) orelse return error.TestExpectedItem;
+    defer got.free(alloc);
     try std.testing.expect(got.meta.isDeleted());
     try std.testing.expectEqual(@as(u64, 100), got.key.timestamp);
 
@@ -903,6 +903,7 @@ test "compaction: a tombstone above the horizon is retained with the state it sh
     // is exactly what a correct MVCC read returns — and thus must survive GC.
     const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 60 }, .p0) orelse
         return error.TestExpectedItem;
+    defer mid.free(alloc);
     try std.testing.expectEqualStrings("old", mid.value);
 }
 
@@ -930,6 +931,7 @@ test "compaction: a non-bottom level never drops tombstones" {
         .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
         .p0,
     ) orelse return error.TestExpectedItem;
+    defer got.free(alloc);
     try std.testing.expect(got.meta.isDeleted());
 }
 
@@ -956,6 +958,7 @@ test "compaction: a put above the horizon survives a lower tombstone's drop" {
         .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
         .p0,
     ) orelse return error.TestExpectedItem;
+    defer got.free(alloc);
     try std.testing.expectEqualStrings("new", got.value);
     try std.testing.expect(!got.meta.isDeleted());
 
@@ -990,9 +993,11 @@ test "compaction: dropping one primary does not disturb its neighbours" {
 
     const j = try fx.tree.get(.{ .primary = "j", .timestamp = std.math.maxInt(u64) }, .p0) orelse
         return error.TestExpectedItem;
+    defer j.free(alloc);
     try std.testing.expectEqualStrings("jv", j.value);
     const m = try fx.tree.get(.{ .primary = "m", .timestamp = std.math.maxInt(u64) }, .p0) orelse
         return error.TestExpectedItem;
+    defer m.free(alloc);
     try std.testing.expectEqualStrings("mv", m.value);
     try std.testing.expect((try fx.tree.get(
         .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
@@ -1026,6 +1031,7 @@ test "compaction: bottom level drops shadowed versions once they reach the horiz
 
     const got = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
         return error.TestExpectedItem;
+    defer got.free(alloc);
     try std.testing.expectEqualStrings("v500", got.value);
     // A read that would have landed on k@300 finds nothing — it's collected.
     try std.testing.expect((try fx.tree.get(.{ .primary = "k", .timestamp = 400 }, .p0)) == null);
@@ -1054,9 +1060,11 @@ test "compaction: bottom level keeps a shadowed version above the horizon and co
 
     const newest = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
         return error.TestExpectedItem;
+    defer newest.free(alloc);
     try std.testing.expectEqualStrings("v500", newest.value);
     const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 350 }, .p0) orelse
         return error.TestExpectedItem;
+    defer mid.free(alloc);
     try std.testing.expectEqualStrings("v300", mid.value);
     // k@300 is shadowed by the newer full row k@500 → counted stale: primary
     // "k" (1) + value "v300" (4). Reclaimed once the horizon rises past 500.
@@ -1085,9 +1093,11 @@ test "compaction: a non-bottom level keeps everything but still counts stale" {
     // Both versions survive — a non-bottom compaction never drops.
     const newest = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
         return error.TestExpectedItem;
+    defer newest.free(alloc);
     try std.testing.expectEqualStrings("v500", newest.value);
     const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 350 }, .p0) orelse
         return error.TestExpectedItem;
+    defer mid.free(alloc);
     try std.testing.expectEqualStrings("v300", mid.value);
     // The shadowed k@300 is counted stale even though nothing was dropped.
     try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
@@ -1118,13 +1128,14 @@ test "compaction: a delta above the newest state is live, not stale" {
     // All three survive (a non-bottom compaction drops nothing).
     const top = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
         return error.TestExpectedItem;
+    defer top.free(alloc);
     try std.testing.expect(top.meta.isDelta());
     const base = try fx.tree.get(.{ .primary = "k", .timestamp = 250 }, .p0) orelse
         return error.TestExpectedItem;
+    defer base.free(alloc);
     try std.testing.expectEqualStrings("s200", base.value);
 
     // Only k@100 sits below the newest terminal (state@200) → stale: "k" (1) +
     // "s100" (4). The delta and its base state are NOT counted.
     try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
 }
-

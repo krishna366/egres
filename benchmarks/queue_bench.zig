@@ -87,8 +87,16 @@ fn benchFillDrain(b: *Bench, comptime mode: fiber.QueueLockMode) !void {
 
 // ── Benchmarks ───────────────────────────────────────────────────────────
 
-test "BENCH: localqueue nolock   push+pop" { try benchPushPop(bench.current(), .none); }
-test "BENCH: localqueue withlock push+pop" { try benchPushPop(bench.current(), .withlock); }
+test "BENCH: localqueue nolock   push+pop" {
+    try benchPushPop(bench.current(), .none);
+}
+test "BENCH: localqueue withlock push+pop" {
+    try benchPushPop(bench.current(), .withlock);
+}
 
-test "BENCH: localqueue nolock   fill+drain" { try benchFillDrain(bench.current(), .none); }
-test "BENCH: localqueue withlock fill+drain" { try benchFillDrain(bench.current(), .withlock); }
+test "BENCH: localqueue nolock   fill+drain" {
+    try benchFillDrain(bench.current(), .none);
+}
+test "BENCH: localqueue withlock fill+drain" {
+    try benchFillDrain(bench.current(), .withlock);
+}

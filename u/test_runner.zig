@@ -1290,7 +1290,25 @@ pub fn main(init: std.process.Init) !void {
         writeColored(out, tty, .bright_red, "\n{d} tracked lock(s) never deinit'd", .{leaked_locks});
         out.writeAll(" — missing `mu.deinit()`; would dangle the lock registry\n") catch {};
     }
+
+    // Testing-allocator leak check. One global `allocator_instance` serves
+    // every test, so this can only run once, here, after all test fibers
+    // (and their defers) are done — anything still allocated was leaked by
+    // some test. Attribution comes from the per-leak "allocated at:" trace
+    // (recorded because `allow_stack_tracing` is on above), which
+    // detectLeaks prints via log.err straight to stderr — flush `out`
+    // first so traces don't interleave with the buffered summary.
+    out.flush() catch {};
+    const leaked_allocs = std.testing.allocator_instance.detectLeaks();
+    if (leaked_allocs > 0) {
+        writeColored(out, tty, .bright_red, "\n{d} allocation(s) leaked", .{
+            leaked_allocs,
+        });
+        out.writeAll(" from std.testing.allocator — " ++
+            "see \"allocated at:\" traces above\n") catch {};
+    }
     out.flush() catch {};
 
-    if (eff_failed > 0 or leaked_locks > 0) std.process.exit(1);
+    if (eff_failed > 0 or leaked_locks > 0 or leaked_allocs > 0)
+        std.process.exit(1);
 }
