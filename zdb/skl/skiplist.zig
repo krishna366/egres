@@ -52,11 +52,19 @@ pub const SkipList = struct {
     used_bytes: Atomic(usize),
 
     pub fn init(allocator: Allocator) !*Self {
+        return initCapacity(allocator, max_arena_size);
+    }
+
+    /// `init` with a caller-chosen starting arena capacity. Pass 0 to
+    /// skip the preheat and grow on demand — right for small private
+    /// skiplists like a transaction's pending writes.
+    pub fn initCapacity(allocator: Allocator, capacity: usize) !*Self {
         var arena = std.heap.ArenaAllocator.init(allocator);
-        // Preheat first chunk so we start near the old 64 MiB capacity behavior.
-        const warmup = try arena.allocator().alloc(u8, max_arena_size);
-        _ = warmup;
-        _ = arena.reset(.{ .retain_with_limit = max_arena_size });
+        if (capacity > 0) {
+            // Preheat the first chunk to `capacity` bytes.
+            _ = try arena.allocator().alloc(u8, capacity);
+            _ = arena.reset(.retain_capacity);
+        }
 
         const next_arr = try arena.allocator().alloc(Atomic(?*Node), max_height);
         for (next_arr) |*p| p.* = Atomic(?*Node).init(null);

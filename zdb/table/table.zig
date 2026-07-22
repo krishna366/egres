@@ -227,7 +227,7 @@ pub const Table = struct {
 
     pub fn containsKey(self: *const Table, key: Key) bool {
         if (self.binary_fuse) |bf| {
-            const h = key.hash();
+            const h = key.bloomHash();
             return bf.contain(h);
         }
         return true;

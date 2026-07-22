@@ -771,7 +771,7 @@ pub const AdminServer = struct {
                 },
                 .scan => |req| {
                     log.debug("SCAN ns={d} start_key={s} max={d} mode={s} versions={d} deleted={}", .{
-                        req.ns,           req.start_key,      req.max_count,
+                        req.ns,             req.start_key,    req.max_count,
                         @tagName(req.mode), req.num_versions, req.include_deleted,
                     });
                     self.handleScan(stream, req) catch return;
@@ -846,13 +846,16 @@ pub const AdminServer = struct {
         // Encode as a single-item Mutations batch — the wire format is the
         // same regardless of batch size, so the apply path doesn't need to
         // know whether this write came from a `set` or a `set_batch`.
-        const proposal_bytes = try Engine.encodeMutations(
-            self.engine.allocator,
-            ns,
-            0,
-            &[_]proto.KV{kv},
-        );
-        defer self.engine.allocator.free(proposal_bytes);
+        // Wire keys are full marshaled keys; admin writes land in the
+        // raw-KV table (table_id 0).
+        const alloc = self.engine.allocator;
+        const wire_key = try (Key{ .namespace = ns, .primary = kv.key }).marshal(alloc);
+        defer alloc.free(wire_key);
+        var kvs = [_]zdb_bufs.KeyValueStruct{
+            .{ .key = wire_key, .value = kv.value, .meta = kv.meta.toByte() },
+        };
+        const proposal_bytes = try Engine.encodeMutations(alloc, ns, &kvs);
+        defer alloc.free(proposal_bytes);
 
         // TODO: Fire callback at commit time (quorum achieved) instead of after apply.
         // Currently the client blocks until both commit + apply are done. To fix:
@@ -906,12 +909,18 @@ pub const AdminServer = struct {
             return;
         }
         self.engine.applyWriteBackpressure(batch.ns);
-        const proposal_bytes = try Engine.encodeMutations(
-            self.engine.allocator,
-            batch.ns,
-            0,
-            batch.kvs,
-        );
+        // Wire keys are full marshaled keys (raw-KV table_id 0); the
+        // arena owns them until the payload is encoded.
+        var arena = std.heap.ArenaAllocator.init(self.engine.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const kvs = try aa.alloc(zdb_bufs.KeyValueStruct, batch.kvs.len);
+        for (batch.kvs, kvs) |src, *dst| dst.* = .{
+            .key = try (Key{ .namespace = batch.ns, .primary = src.key }).marshal(aa),
+            .value = src.value,
+            .meta = src.meta.toByte(),
+        };
+        const proposal_bytes = try Engine.encodeMutations(self.engine.allocator, batch.ns, kvs);
         defer self.engine.allocator.free(proposal_bytes);
 
         var ctx = CommitCtx{ .status = .committed };
@@ -1013,8 +1022,7 @@ pub const AdminServer = struct {
             mode: proto.ScanCmd.Mode,
             ns: u32,
 
-            fn emit(ctx_raw: *anyopaque, item: zdb.kv.Item) anyerror!bool {
-                const c: *@This() = @ptrCast(@alignCast(ctx_raw));
+            fn emit(c: *@This(), item: zdb.kv.Item) anyerror!bool {
                 // Memtables are forest-wide; an item with a different
                 // namespace means we've walked off the end of ours.
                 if (item.key.namespace != c.ns) return false;
@@ -1039,8 +1047,8 @@ pub const AdminServer = struct {
                 .include_deleted = req.include_deleted,
                 .read_ts = read_ts,
             },
-            @ptrCast(&cctx),
-            &Ctx.emit,
+            &cctx,
+            Ctx.emit,
         ) catch |err| {
             log.err("forest.scan failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, "scan failed");

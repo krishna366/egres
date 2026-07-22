@@ -9,6 +9,10 @@
 //!         database's table schemas, plus its own binary-compiled
 //!         bootstrap schema.
 //! ddl:    parseDdl — SQL text → typed DDL statements via libpg_query.
+//! txn:    Txn — the transaction context DML statements run inside
+//!         (read_ts snapshot + pending-write skiplist).
+//! oracle: Oracle — recent commit timestamps by key identity hash,
+//!         for write-conflict detection (see docs/txn_conflicts.md).
 //! server: Server — the pgwire front-end over the engine (listener,
 //!         per-connection handler, DDL execution).
 
@@ -21,6 +25,8 @@ pub const catalog = @import("sql/catalog.zig");
 pub const table = @import("sql/table.zig");
 pub const rowkey = @import("sql/rowkey.zig");
 pub const ddl = @import("sql/ddl.zig");
+pub const txn = @import("sql/txn.zig");
+pub const oracle = @import("sql/oracle.zig");
 pub const server = @import("sql/server.zig");
 
 pub const Server = server.Server;

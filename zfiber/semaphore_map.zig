@@ -182,8 +182,8 @@ pub const SemaphoreMap = struct {
         for (e.holders.items) |hold| {
             if (hold.owner_id != owner_id) continue;
             if (hold.mode == .exclusive or mode == .shared) {
-                // We want shared lock, but are holding an exclusive lock. So,
-                // we're good.
+                // If we're already holding an exclusive lock, OR we just want a
+                // shared lock, we're good.
                 self.mu.unlock();
                 return false;
             }
@@ -222,7 +222,7 @@ pub const SemaphoreMap = struct {
             .entry = e,
             .mode = mode,
         }) catch {
-            removeOwner(&e.waiters, owner_id);
+            _ = removeOwner(&e.waiters, owner_id);
             self.mu.unlock();
             return error.OutOfMemory;
         };
@@ -362,7 +362,7 @@ pub const SemaphoreMap = struct {
     /// waiter list and its entry in the `waiting` graph. Caller holds
     /// `mu`.
     fn deregisterWaiter(self: *SemaphoreMap, e: *Entry, owner_id: u64) void {
-        removeOwner(&e.waiters, owner_id);
+        _ = removeOwner(&e.waiters, owner_id);
         _ = self.waiting.remove(owner_id);
     }
 

@@ -107,6 +107,23 @@ pub const Item = struct {
         };
     }
 
+    /// `dupe` without the value bytes (the copy keeps `value = ""`).
+    /// For callers that only need the key — e.g. DELETE's match
+    /// collection, which locks and tombstones by primary and never
+    /// reads the row back.
+    pub fn dupeNoValue(self: Item, allocator: std.mem.Allocator) !Item {
+        return .{
+            .key = .{
+                .namespace = self.key.namespace,
+                .table_id = self.key.table_id,
+                .primary = try allocator.dupe(u8, self.key.primary),
+                .timestamp = self.key.timestamp,
+            },
+            .value = "",
+            .meta = self.meta,
+        };
+    }
+
     pub fn free(self: Item, allocator: std.mem.Allocator) void {
         allocator.free(self.key.primary);
         allocator.free(self.value);
@@ -131,7 +148,23 @@ pub const TreeKey = packed struct(u128) {
 pub const TableKey = packed struct(u96) {
     namespace: u64,
     table_id: u32,
+
+    /// Identity hash for lock-table (and future conflict-oracle)
+    /// keys. Seed 1 keeps table keys disjoint from row identities
+    /// (Key.identityHash, seed 0), so a table's lock can never collide
+    /// with a row's.
+    pub fn identityHash(self: TableKey) u64 {
+        const v: u128 = @as(u96, @bitCast(self));
+        return std.hash.XxHash3.hash(1, std.mem.asBytes(&v));
+    }
 };
+
+/// Identity hash of a whole namespace — the database-level intent-lock
+/// key. Seed 2 keeps it disjoint from row identities (Key.identityHash,
+/// seed 0) and table identities (TableKey.identityHash, seed 1).
+pub fn namespaceHash(namespace: u64) u64 {
+    return std.hash.XxHash3.hash(2, std.mem.asBytes(&namespace));
+}
 
 /// Compose a namespace-local tree_id from its table (high 32 bits) and
 /// split index (low 32 bits). split_id 0 is the table's first/only tree; it
@@ -210,6 +243,19 @@ pub const Key = struct {
         return buf;
     }
 
+    /// Identity hash over (namespace, table_id, primary) — the
+    /// timestamp is deliberately excluded: all versions of a row share
+    /// one identity. Row-lock key for fiber.SemaphoreMap (and the
+    /// future conflict oracle). Seed 0; TableKey.identityHash uses
+    /// seed 1 so the two key shapes can never collide.
+    pub fn identityHash(self: Key) u64 {
+        var h = std.hash.XxHash3.init(0);
+        h.update(std.mem.asBytes(&self.namespace));
+        h.update(std.mem.asBytes(&self.table_id));
+        h.update(self.primary);
+        return h.final();
+    }
+
     // We're no longer storing timestamp with negate op. When comparing keys, we are already
     // parsing timestamp separately, otherwise our variable length primary key could spill over
     // into comparison, making it wrong. As such, we can just do a basic u64 comparison, instead
@@ -259,8 +305,10 @@ pub const Key = struct {
         return 12 + self.primary.len + 8;
     }
 
-    /// Hash primary key only (for bloom filter).
-    pub fn hash(self: Key) u64 {
+    /// Hash of the primary key only — the per-table SST bloom-filter
+    /// hash (namespace/table are implied by the table). NOT a row
+    /// identity: use identityHash for locks and conflict tracking.
+    pub fn bloomHash(self: Key) u64 {
         return std.hash.Wyhash.hash(0, self.primary);
     }
 

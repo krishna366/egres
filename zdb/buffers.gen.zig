@@ -2561,7 +2561,6 @@ pub const KeyValueWriter = struct {
 pub const MutationsStruct = struct {
     pub const TABLE_ID: u16 = 46600;
     namespace: u64 = 0,
-    table_id: u32 = 0,
     kvs: []KeyValueStruct = &.{},
     pub fn deinit(self: *MutationsStruct, alloc: std.mem.Allocator) void {
         for (self.kvs) |*_b| _b.deinit(alloc);
@@ -2577,7 +2576,6 @@ pub const MutationsStruct = struct {
     fn cloneValue(self: MutationsStruct, alloc: std.mem.Allocator) Error!MutationsStruct {
         var s = MutationsStruct{
             .namespace = self.namespace,
-            .table_id = self.table_id,
         };
         errdefer s.deinit(alloc);
         {
@@ -2600,7 +2598,6 @@ pub const MutationsStruct = struct {
     pub fn marshalTo(self: MutationsStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try MutationsWriter.initWithBuf(alloc, out);
         try writer.setNamespace(self.namespace);
-        try writer.setTableId(self.table_id);
         if (self.kvs.len > 0) {
             const offsets = try alloc.alloc(u32, self.kvs.len);
             defer alloc.free(offsets);
@@ -2621,7 +2618,7 @@ pub const MutationsReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46600;
-    pub const SIZE_BYTES: u16 = 22;
+    pub const SIZE_BYTES: u16 = 18;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -2644,19 +2641,12 @@ pub const MutationsReader = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
     }
 
-    pub fn tableId(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 14;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch 0;
-    }
-
     fn kvsSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 22;
+        const slot_end = @as(u32, self.base) + 18;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 18)) catch return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch return &.{};
         if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
         if (end > self.buf.len) return &.{};
@@ -2678,7 +2668,6 @@ pub const MutationsReader = struct {
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try MutationsWriter.initWithBuf(alloc, out);
         try writer.setNamespace(self.namespace());
-        try writer.setTableId(self.tableId());
         const count_kvs: u32 = self.kvsLen();
         if (count_kvs != 0) {
             var child_offsets_kvs = try alloc.alloc(u32, @intCast(count_kvs));
@@ -2697,10 +2686,10 @@ pub const MutationsReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_arr_14 = @as(u32, self.base) + 22;
-        if (slot_end_arr_14 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 18));
+        const slot_end_arr_10 = @as(u32, self.base) + 18;
+        if (slot_end_arr_10 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
             if (elem_count > 0) {
                 const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
@@ -2716,7 +2705,6 @@ pub const MutationsReader = struct {
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!MutationsStruct {
         var s = MutationsStruct{
             .namespace = self.namespace(),
-            .table_id = self.tableId(),
         };
         errdefer s.deinit(alloc);
         {
@@ -2773,7 +2761,7 @@ pub const MutationsWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46600;
-    pub const SIZE_BYTES: u16 = 22;
+    pub const SIZE_BYTES: u16 = 18;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -2799,22 +2787,17 @@ pub const MutationsWriter = struct {
         try zbuf.patchU64(out.items, self.base + 2, v);
     }
 
-    pub fn setTableId(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 10, v);
-    }
-
     pub fn setKvs(self: *Self, values: []const u32) Error!void {
         const out = self.bufMut();
         if (values.len == 0) {
+            try zbuf.patchU32(out.items, self.base + 10, 0);
             try zbuf.patchU32(out.items, self.base + 14, 0);
-            try zbuf.patchU32(out.items, self.base + 18, 0);
             return;
         }
         const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
         const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 14, index_off);
-        try zbuf.patchU32(out.items, self.base + 18, @as(u32, @intCast(values.len)));
+        try zbuf.patchU32(out.items, self.base + 10, index_off);
+        try zbuf.patchU32(out.items, self.base + 14, @as(u32, @intCast(values.len)));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -2823,7 +2806,6 @@ pub const MutationsWriter = struct {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
         if (@hasField(Values, "namespace")) try self.setNamespace(@field(values, "namespace"));
-        if (@hasField(Values, "table_id")) try self.setTableId(@field(values, "table_id"));
         if (@hasField(Values, "kvs")) try self.setKvs(@field(values, "kvs"));
     }
 

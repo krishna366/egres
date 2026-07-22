@@ -107,6 +107,18 @@ pub fn unmarshalRow(
     }
 }
 
+/// Decode ONE column — by its index into `ps.columns` — without touching
+/// the rest of the row: a null-bit test plus one fixed-offset read or
+/// varlen-directory slice, O(1) either way. Filters use this to reject a
+/// row before paying for the full unmarshalRow.
+pub fn readCell(
+    ps: *const PhysicalSchema,
+    buffer: []const u8,
+    idx: usize,
+) Value {
+    return decodeColumn(ps, buffer, ps.columns[idx]);
+}
+
 // --- internals --------------------------------------------------------------
 
 inline fn isNull(buffer: []const u8, col: ColumnLayout) bool {

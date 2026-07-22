@@ -119,8 +119,8 @@ test "sql.row: round-trip every type" {
     defer ps.deinit(alloc);
 
     const vals = [_]Value{
-        .{ .bool_ = true },   .{ .int2 = -7 },  .{ .int4 = 123456 }, .{ .int8 = -9_000_000_000 },
-        .{ .float4 = 3.5 },   .{ .float8 = 2.5 }, .{ .date = 9000 }, .{ .timestamp = 1_700_000_000_000_000 },
+        .{ .bool_ = true },   .{ .int2 = -7 },                                .{ .int4 = 123456 }, .{ .int8 = -9_000_000_000 },
+        .{ .float4 = 3.5 },   .{ .float8 = 2.5 },                             .{ .date = 9000 },   .{ .timestamp = 1_700_000_000_000_000 },
         .{ .text = "hello" }, .{ .bytea = &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF } },
     };
 

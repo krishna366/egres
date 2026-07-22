@@ -5,13 +5,19 @@
 //! `.invalid` carrying the client-facing reason — parse succeeded, this is
 //! a semantic rejection. Syntax errors propagate as ParseError so the
 //! endpoint can answer with a 42601.
+//!
+//! `parseDdl` takes an arena and returns a `DdlStmt` whose every string
+//! and slice BORROWS from it — parse allocates the libpg_query tree into
+//! the arena and the statement points straight into it; nothing is duped
+//! or individually freed. The statement is valid only while the arena
+//! lives, and the caller drops the arena when the statement is done.
 
 const std = @import("std");
 const pgwire = @import("pgwire");
 const parser = pgwire.parser_mod;
 const value = @import("value.zig");
 
-/// One parsed `name type [PRIMARY KEY]` column. `name` is owned.
+/// One parsed `name type [PRIMARY KEY]` column. `name` is borrowed.
 pub const ColumnDef = struct {
     name: []const u8,
     ty: value.Type,
@@ -19,36 +25,36 @@ pub const ColumnDef = struct {
 };
 
 pub const CreateTable = struct {
-    name: []const u8, // table name (owned)
+    name: []const u8, // table name (borrowed)
     if_not_exists: bool = false,
-    columns: []ColumnDef, // owned (and each column name)
+    columns: []ColumnDef, // borrowed (and each column name)
 };
 
 pub const DropTable = struct {
-    name: []const u8, // table name (owned)
+    name: []const u8, // table name (borrowed)
     missing_ok: bool = false, // IF EXISTS
 };
 
 /// One VALUES cell, still untyped: coerced to its column's Type at execute
-/// (value.parseValue). `str`/`float` own their bytes. `unsupported` is a
+/// (value.parseValue). `str`/`float` borrow their bytes. `unsupported` is a
 /// non-literal item (DEFAULT, an expression) the executor rejects.
 pub const Literal = union(enum) {
     int: i64,
-    float: []const u8, // owned; libpg_query keeps floats as text
-    str: []const u8, // owned
+    float: []const u8, // borrowed; libpg_query keeps floats as text
+    str: []const u8, // borrowed
     bool_: bool,
     null_value,
     unsupported,
 };
 
 pub const Insert = struct {
-    table: []const u8, // owned
-    columns: ?[][]const u8, // owned target columns; null = positional (all columns)
-    rows: [][]Literal, // owned rows of literals
+    table: []const u8, // borrowed
+    columns: ?[][]const u8, // borrowed target columns; null = positional (all columns)
+    rows: [][]Literal, // borrowed rows of literals
 };
 
 /// What a SELECT projects: `*` (all live columns) or a named list (which may
-/// include the `egid` pseudo-column). Names are owned.
+/// include the `egid` pseudo-column). Names are borrowed.
 pub const Projection = union(enum) {
     star,
     columns: [][]const u8,
@@ -56,90 +62,54 @@ pub const Projection = union(enum) {
 
 /// A single `column = literal` filter (the only WHERE this slice supports).
 pub const Filter = struct {
-    column: []const u8, // owned
+    column: []const u8, // borrowed
     literal: Literal,
 };
 
 pub const Select = struct {
-    table: []const u8, // owned
+    table: []const u8, // borrowed
     projection: Projection,
     filter: ?Filter,
 };
 
 pub const Delete = struct {
-    table: []const u8, // owned
+    table: []const u8, // borrowed
     filter: ?Filter, // null = delete every row
 };
 
+/// One SET assignment: `column = literal`.
+pub const SetClause = struct {
+    column: []const u8, // borrowed
+    literal: Literal,
+};
+
+pub const Update = struct {
+    table: []const u8, // borrowed
+    sets: []SetClause, // borrowed
+    filter: ?Filter, // null = update every row
+};
+
 pub const DdlStmt = union(enum) {
-    create_database: []const u8, // database name (owned)
-    drop_database: []const u8, // database name (owned)
+    create_database: []const u8, // database name (borrowed)
+    drop_database: []const u8, // database name (borrowed)
     create_table: CreateTable,
     drop_table: DropTable,
     insert: Insert,
     select: Select,
     delete: Delete,
-    invalid: []const u8, // recognized but rejected; reason (owned)
+    update: Update,
+    begin_txn,
+    commit_txn,
+    rollback_txn,
+    invalid: []const u8, // recognized but rejected; reason
     unsupported,
-
-    pub fn deinit(self: *DdlStmt, alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create_database, .drop_database, .invalid => |n| alloc.free(n),
-            .create_table => |ct| {
-                for (ct.columns) |c| alloc.free(c.name);
-                alloc.free(ct.columns);
-                alloc.free(ct.name);
-            },
-            .drop_table => |dt| alloc.free(dt.name),
-            .insert => |ins| {
-                alloc.free(ins.table);
-                if (ins.columns) |cols| {
-                    for (cols) |c| alloc.free(c);
-                    alloc.free(cols);
-                }
-                for (ins.rows) |r| {
-                    for (r) |lit| freeLit(alloc, lit);
-                    alloc.free(r);
-                }
-                alloc.free(ins.rows);
-            },
-            .select => |sel| {
-                alloc.free(sel.table);
-                switch (sel.projection) {
-                    .star => {},
-                    .columns => |cols| {
-                        for (cols) |c| alloc.free(c);
-                        alloc.free(cols);
-                    },
-                }
-                freeFilter(alloc, sel.filter);
-            },
-            .delete => |del| {
-                alloc.free(del.table);
-                freeFilter(alloc, del.filter);
-            },
-            .unsupported => {},
-        }
-    }
 };
 
-fn freeLit(alloc: std.mem.Allocator, lit: Literal) void {
-    switch (lit) {
-        .str, .float => |s| alloc.free(s),
-        else => {},
-    }
-}
-
-fn freeFilter(alloc: std.mem.Allocator, filter: ?Filter) void {
-    if (filter) |f| {
-        alloc.free(f.column);
-        freeLit(alloc, f.literal);
-    }
-}
-
 pub fn parseDdl(alloc: std.mem.Allocator, sql: []const u8) parser.ParseError!DdlStmt {
-    var tree = try parser.parse(alloc, sql, null);
-    defer tree.deinit(alloc);
+    // `alloc` must be an arena: parse allocates the whole libpg_query JSON
+    // tree into it, and the returned DdlStmt borrows strings straight out
+    // of that tree. Nothing is freed here — the caller drops the arena.
+    const tree = try parser.parse(alloc, sql, null);
 
     const stmts = tree.statements() orelse return .unsupported;
     if (stmts.len == 0) return .unsupported;
@@ -156,17 +126,18 @@ pub fn parseDdl(alloc: std.mem.Allocator, sql: []const u8) parser.ParseError!Ddl
 
     if (std.mem.eql(u8, kind, "CreatedbStmt") or std.mem.eql(u8, kind, "DropdbStmt")) {
         const name = asString(body.get("dbname") orelse return .unsupported) orelse return .unsupported;
-        const owned = try alloc.dupe(u8, name);
         return if (kind[0] == 'C')
-            .{ .create_database = owned }
+            .{ .create_database = name }
         else
-            .{ .drop_database = owned };
+            .{ .drop_database = name };
     }
     if (std.mem.eql(u8, kind, "CreateStmt")) return parseCreateTable(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "DropStmt")) return parseDropTable(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "InsertStmt")) return parseInsert(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "SelectStmt")) return parseSelect(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "DeleteStmt")) return parseDelete(alloc, entry.value_ptr.*);
+    if (std.mem.eql(u8, kind, "UpdateStmt")) return parseUpdate(alloc, entry.value_ptr.*);
+    if (std.mem.eql(u8, kind, "TransactionStmt")) return parseTransaction(alloc, entry.value_ptr.*);
     return .unsupported;
 }
 
@@ -287,11 +258,30 @@ const DeleteStmtJson = struct {
     withClause: ?std.json.Value = null, // WITH ... DELETE
 };
 
+/// UPDATE t SET col = const [, ...] [WHERE col = const]. Each targetList
+/// entry is one SET assignment; a non-literal value (expression, DEFAULT,
+/// sub-select, multi-assign) leaves `A_Const` null → rejected. The last
+/// three clauses are decoded only to reject them.
+const UpdateStmtJson = struct {
+    relation: struct { relname: []const u8 = "" } = .{},
+    targetList: []const ResTargetNode = &.{},
+    whereClause: ?SelectStmtJson.WhereNode = null,
+    fromClause: []const std.json.Value = &.{}, // UPDATE ... FROM
+    returningList: []const std.json.Value = &.{}, // RETURNING
+    withClause: ?std.json.Value = null, // WITH ... UPDATE
+
+    const ResTargetNode = struct { ResTarget: ResTarget = .{} };
+    const ResTarget = struct {
+        name: []const u8 = "",
+        val: struct { A_Const: ?InsertStmtJson.AConst = null } = .{},
+    };
+};
+
 /// Decode one statement body into its typed mirror. A shape we don't
 /// recognize (unknown node kind, wrong field type) is null → .unsupported;
 /// only OOM propagates.
-fn fromValue(comptime T: type, alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!?std.json.Parsed(T) {
-    return std.json.parseFromValue(T, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+fn fromValue(comptime T: type, alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!?T {
+    return std.json.parseFromValueLeaky(T, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
@@ -301,56 +291,45 @@ fn fromValue(comptime T: type, alloc: std.mem.Allocator, body: std.json.Value) p
 /// single-column PRIMARY KEY parse; any other constraint (NOT NULL, UNIQUE,
 /// FK, DEFAULT, table-level) is a clean `.invalid`.
 fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const parsed = try fromValue(CreateStmtJson, alloc, body) orelse return .unsupported;
-    defer parsed.deinit();
-    const cs = parsed.value;
+    const cs = try fromValue(CreateStmtJson, alloc, body) orelse return .unsupported;
 
     var columns: std.ArrayList(ColumnDef) = .empty;
-    errdefer {
-        for (columns.items) |c| alloc.free(c.name);
-        columns.deinit(alloc);
-    }
-
     var pkey_seen = false;
     for (cs.tableElts) |elt| {
         const cd = switch (elt) {
             .ColumnDef => |col| col,
-            .Constraint => return invalidMsg(alloc, &columns, "table-level constraints are not supported", .{}),
+            .Constraint => return invalid("table-level constraints are not supported"),
         };
         if (std.ascii.eqlIgnoreCase(cd.colname, "egid"))
-            return invalidMsg(alloc, &columns, "column name \"egid\" is reserved", .{});
+            return invalid("column name \"egid\" is reserved");
         for (columns.items) |c| {
             if (std.mem.eql(u8, c.name, cd.colname))
-                return invalidMsg(alloc, &columns, "duplicate column \"{s}\"", .{cd.colname});
+                return invalidFmt(alloc, "duplicate column \"{s}\"", .{cd.colname});
         }
 
         const names = cd.typeName.names;
         if (names.len == 0) return .unsupported;
         const tyname = names[names.len - 1].String.sval;
         const ty = value.Type.fromName(tyname) orelse
-            return invalidMsg(alloc, &columns, "unsupported type \"{s}\"", .{tyname});
+            return invalidFmt(alloc, "unsupported type \"{s}\"", .{tyname});
 
         var pkey = false;
         for (cd.constraints) |con| {
             if (!std.mem.eql(u8, con.Constraint.contype, "CONSTR_PRIMARY"))
-                return invalidMsg(alloc, &columns, "only PRIMARY KEY column constraints are supported", .{});
+                return invalid("only PRIMARY KEY column constraints are supported");
             pkey = true;
         }
         if (pkey) {
             if (pkey_seen)
-                return invalidMsg(alloc, &columns, "multiple PRIMARY KEY columns are not supported", .{});
+                return invalid("multiple PRIMARY KEY columns are not supported");
             pkey_seen = true;
         }
 
-        const owned = try alloc.dupe(u8, cd.colname);
-        errdefer alloc.free(owned);
-        try columns.append(alloc, .{ .name = owned, .ty = ty, .pkey = pkey });
+        try columns.append(alloc, .{ .name = cd.colname, .ty = ty, .pkey = pkey });
     }
 
-    const owned_name = try alloc.dupe(u8, cs.relation.relname);
-    errdefer alloc.free(owned_name);
     return .{ .create_table = .{
-        .name = owned_name,
+        .name = cs.relation.relname,
         .if_not_exists = cs.if_not_exists,
         .columns = try columns.toOwnedSlice(alloc),
     } };
@@ -359,18 +338,16 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
 /// DROP TABLE. Non-table DROPs (INDEX, VIEW, …) are `.unsupported`;
 /// multi-table DROPs are rejected.
 fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const parsed = try fromValue(DropStmtJson, alloc, body) orelse return .unsupported;
-    defer parsed.deinit();
-    const ds = parsed.value;
+    const ds = try fromValue(DropStmtJson, alloc, body) orelse return .unsupported;
 
     if (!std.mem.eql(u8, ds.removeType, "OBJECT_TABLE")) return .unsupported;
     if (ds.objects.len != 1)
-        return .{ .invalid = try alloc.dupe(u8, "DROP TABLE with multiple tables is not supported") };
+        return invalid("DROP TABLE with multiple tables is not supported");
     const items = ds.objects[0].List.items;
     if (items.len == 0) return .unsupported;
 
     return .{ .drop_table = .{
-        .name = try alloc.dupe(u8, items[items.len - 1].String.sval),
+        .name = items[items.len - 1].String.sval,
         .missing_ok = ds.missing_ok,
     } };
 }
@@ -379,89 +356,51 @@ fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseEr
 /// (before any allocation, so no cleanup); arity, unknown columns, and literal
 /// coercion are the executor's job. The `errdefer`s only cover OOM.
 fn parseInsert(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const parsed = try fromValue(InsertStmtJson, alloc, body) orelse return .unsupported;
-    defer parsed.deinit();
-    const is = parsed.value;
+    const is = try fromValue(InsertStmtJson, alloc, body) orelse return .unsupported;
 
-    if (is.onConflictClause != null) return .{ .invalid = try alloc.dupe(u8, "ON CONFLICT is not supported") };
-    if (is.returningList.len > 0) return .{ .invalid = try alloc.dupe(u8, "RETURNING is not supported") };
-    const sel = is.selectStmt orelse return .{ .invalid = try alloc.dupe(u8, "INSERT requires VALUES") };
+    if (is.onConflictClause != null) return invalid("ON CONFLICT is not supported");
+    if (is.returningList.len > 0) return invalid("RETURNING is not supported");
+    const sel = is.selectStmt orelse return invalid("INSERT requires VALUES");
     if (sel.SelectStmt.valuesLists.len == 0)
-        return .{ .invalid = try alloc.dupe(u8, "only INSERT ... VALUES is supported") };
+        return invalid("only INSERT ... VALUES is supported");
 
     var columns: ?[][]const u8 = null;
-    errdefer if (columns) |cols| {
-        for (cols) |c| alloc.free(c);
-        alloc.free(cols);
-    };
     if (is.cols.len > 0) {
         const cols = try alloc.alloc([]const u8, is.cols.len);
-        var filled: usize = 0;
-        errdefer {
-            for (cols[0..filled]) |c| alloc.free(c);
-            alloc.free(cols);
-        }
-        for (is.cols, cols) |ct, *dst| {
-            dst.* = try alloc.dupe(u8, ct.ResTarget.name);
-            filled += 1;
-        }
+        for (is.cols, cols) |ct, *dst| dst.* = ct.ResTarget.name;
         columns = cols;
     }
 
     var rows: std.ArrayList([]Literal) = .empty;
-    errdefer {
-        for (rows.items) |r| {
-            freeLits(alloc, r);
-            alloc.free(r);
-        }
-        rows.deinit(alloc);
-    }
     for (sel.SelectStmt.valuesLists) |ln| {
         const lits = try alloc.alloc(Literal, ln.List.items.len);
-        var filled: usize = 0;
-        errdefer {
-            freeLits(alloc, lits[0..filled]);
-            alloc.free(lits);
-        }
-        for (ln.List.items, lits) |ac, *lit| {
-            lit.* = try literalFrom(alloc, ac.A_Const);
-            filled += 1;
-        }
+        for (ln.List.items, lits) |ac, *lit| lit.* = literalFrom(ac.A_Const);
         try rows.append(alloc, lits);
     }
 
-    const table = try alloc.dupe(u8, is.relation.relname);
-    errdefer alloc.free(table);
     return .{ .insert = .{
-        .table = table,
+        .table = is.relation.relname,
         .columns = columns,
         .rows = try rows.toOwnedSlice(alloc),
     } };
 }
 
-fn literalFrom(alloc: std.mem.Allocator, ac: InsertStmtJson.AConst) parser.ParseError!Literal {
+fn literalFrom(ac: InsertStmtJson.AConst) Literal {
     if (ac.isnull) return .null_value;
     if (ac.ival) |iv| return .{ .int = iv.ival };
-    if (ac.fval) |fv| return .{ .float = try alloc.dupe(u8, fv.fval) };
-    if (ac.sval) |sv| return .{ .str = try alloc.dupe(u8, sv.sval) };
+    if (ac.fval) |fv| return .{ .float = fv.fval };
+    if (ac.sval) |sv| return .{ .str = sv.sval };
     if (ac.boolval) |bv| return .{ .bool_ = bv.boolval };
     return .unsupported;
 }
 
-fn freeLits(alloc: std.mem.Allocator, lits: []const Literal) void {
-    for (lits) |lit| switch (lit) {
-        .str, .float => |s| alloc.free(s),
-        else => {},
-    };
-}
-
-/// A parsed WHERE: a `col = literal` filter or a rejection reason (owned).
+/// A parsed WHERE: a `col = literal` filter or a rejection reason (borrowed).
 const ParsedWhere = union(enum) {
     filter: Filter,
     invalid: []const u8,
 
-    fn reject(alloc: std.mem.Allocator, msg: []const u8) !ParsedWhere {
-        return .{ .invalid = try alloc.dupe(u8, msg) };
+    fn reject(msg: []const u8) ParsedWhere {
+        return .{ .invalid = msg };
     }
 };
 
@@ -469,100 +408,114 @@ const ParsedWhere = union(enum) {
 /// shared by SELECT and DELETE. Anything else (non-equality op, AND/OR,
 /// subquery, column-vs-column) yields a clean `.invalid` reason; only OOM
 /// propagates.
-fn parseWhere(
-    alloc: std.mem.Allocator,
-    w: SelectStmtJson.WhereNode,
-) parser.ParseError!ParsedWhere {
+fn parseWhere(w: SelectStmtJson.WhereNode) ParsedWhere {
     const ae = w.A_Expr orelse
-        return ParsedWhere.reject(alloc, "unsupported WHERE clause");
+        return ParsedWhere.reject("unsupported WHERE clause");
     if (!std.mem.eql(u8, ae.kind, "AEXPR_OP") or ae.name.len == 0 or
         !std.mem.eql(u8, ae.name[ae.name.len - 1].String.sval, "="))
         return ParsedWhere.reject(
-            alloc,
             "only `column = value` is supported in WHERE",
         );
 
     const lcol = ae.lexpr.ColumnRef orelse
-        return ParsedWhere.reject(alloc, "WHERE left side must be a column");
+        return ParsedWhere.reject("WHERE left side must be a column");
     const lfields = lcol.fields;
     if (lfields.len == 0 or lfields[lfields.len - 1].String == null)
-        return ParsedWhere.reject(alloc, "WHERE left side must be a column");
+        return ParsedWhere.reject("WHERE left side must be a column");
 
-    const lit = try literalFrom(alloc, ae.rexpr.A_Const);
+    const lit = literalFrom(ae.rexpr.A_Const);
     if (lit == .unsupported)
-        return ParsedWhere.reject(alloc, "WHERE right side must be a literal");
-    const sval = lfields[lfields.len - 1].String.?.sval;
-    const wcol = alloc.dupe(u8, sval) catch |e| {
-        freeLit(alloc, lit);
-        return e;
-    };
-    return .{ .filter = .{ .column = wcol, .literal = lit } };
+        return ParsedWhere.reject("WHERE right side must be a literal");
+    return .{ .filter = .{
+        .column = lfields[lfields.len - 1].String.?.sval,
+        .literal = lit,
+    } };
 }
 
 /// SELECT [cols|*] FROM one_table [WHERE col = literal]. Joins, subqueries,
 /// ORDER BY / GROUP BY / LIMIT / DISTINCT and expression targets are rejected.
 fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const parsed = try fromValue(SelectStmtJson, alloc, body) orelse return .unsupported;
-    defer parsed.deinit();
-    const ss = parsed.value;
+    const ss = try fromValue(SelectStmtJson, alloc, body) orelse return .unsupported;
 
     if (ss.sortClause.len > 0 or ss.groupClause.len > 0 or ss.distinctClause.len > 0 or
         ss.havingClause != null or ss.limitCount != null or ss.limitOffset != null)
-        return .{ .invalid = try alloc.dupe(u8, "ORDER BY / GROUP BY / LIMIT / DISTINCT are not supported") };
+        return invalid("ORDER BY / GROUP BY / LIMIT / DISTINCT are not supported");
 
     if (ss.fromClause.len != 1)
-        return .{ .invalid = try alloc.dupe(u8, "SELECT must read exactly one table") };
+        return invalid("SELECT must read exactly one table");
     const rv = ss.fromClause[0].RangeVar orelse
-        return .{ .invalid = try alloc.dupe(u8, "only table sources are supported") };
+        return invalid("only table sources are supported");
 
     // Every target must be a column reference; a `*` anywhere makes it a
     // star projection.
     var star = false;
     for (ss.targetList) |tn| {
         const cr = tn.ResTarget.val.ColumnRef orelse
-            return .{ .invalid = try alloc.dupe(u8, "only column references are supported in SELECT") };
+            return invalid("only column references are supported in SELECT");
         for (cr.fields) |f| {
             if (f.A_Star != null) star = true;
         }
     }
 
     var cols: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (cols.items) |c| alloc.free(c);
-        cols.deinit(alloc);
-    }
     if (!star) {
         for (ss.targetList) |tn| {
             const fields = tn.ResTarget.val.ColumnRef.?.fields;
             if (fields.len == 0 or fields[fields.len - 1].String == null)
-                return invalidSel(alloc, &cols, "unsupported column reference", .{});
-            try cols.append(alloc, try alloc.dupe(u8, fields[fields.len - 1].String.?.sval));
+                return invalid("unsupported column reference");
+            try cols.append(alloc, fields[fields.len - 1].String.?.sval);
         }
     }
 
     var filter: ?Filter = null;
-    errdefer freeFilter(alloc, filter);
-    if (ss.whereClause) |w| switch (try parseWhere(alloc, w)) {
+    if (ss.whereClause) |w| switch (parseWhere(w)) {
         .filter => |f| filter = f,
-        .invalid => |msg| {
-            for (cols.items) |c| alloc.free(c);
-            cols.deinit(alloc);
-            return .{ .invalid = msg };
-        },
+        .invalid => |msg| return .{ .invalid = msg },
     };
 
-    const table = try alloc.dupe(u8, rv.relname);
-    errdefer alloc.free(table);
     return .{ .select = .{
-        .table = table,
+        .table = rv.relname,
         .projection = if (star) .star else .{ .columns = try cols.toOwnedSlice(alloc) },
         .filter = filter,
     } };
 }
 
-/// Reject a recognized statement with an owned client-facing reason.
-fn invalid(alloc: std.mem.Allocator, msg: []const u8) !DdlStmt {
-    return .{ .invalid = try alloc.dupe(u8, msg) };
+/// Reject a recognized statement with a static client-facing reason —
+/// borrowed straight from .rodata, so no allocation.
+fn invalid(msg: []const u8) DdlStmt {
+    return .{ .invalid = msg };
+}
+
+/// Reject with a formatted reason, allocated into the parse arena.
+fn invalidFmt(
+    alloc: std.mem.Allocator,
+    comptime fmt: []const u8,
+    args: anytype,
+) parser.ParseError!DdlStmt {
+    return .{ .invalid = try std.fmt.allocPrint(alloc, fmt, args) };
+}
+
+/// BEGIN / START TRANSACTION / COMMIT / ROLLBACK. GOTCHA: TRANS_STMT_BEGIN
+/// is protobuf tag 0, so libpg_query OMITS `kind` for a plain BEGIN — the
+/// default must be begin. Transaction modes (ISOLATION LEVEL …) are
+/// ignored; savepoints and two-phase commit are rejected with a reason.
+const TransactionStmtJson = struct {
+    kind: []const u8 = "TRANS_STMT_BEGIN",
+};
+
+fn parseTransaction(
+    alloc: std.mem.Allocator,
+    body: std.json.Value,
+) parser.ParseError!DdlStmt {
+    const ts = try fromValue(TransactionStmtJson, alloc, body) orelse
+        return .unsupported;
+    const k = ts.kind;
+    if (std.mem.eql(u8, k, "TRANS_STMT_BEGIN") or
+        std.mem.eql(u8, k, "TRANS_STMT_START"))
+        return .begin_txn;
+    if (std.mem.eql(u8, k, "TRANS_STMT_COMMIT")) return .commit_txn;
+    if (std.mem.eql(u8, k, "TRANS_STMT_ROLLBACK")) return .rollback_txn;
+    return invalid("unsupported transaction statement");
 }
 
 /// DELETE FROM one_table [WHERE col = literal]. USING, RETURNING, WITH, and
@@ -572,47 +525,70 @@ fn parseDelete(
     alloc: std.mem.Allocator,
     body: std.json.Value,
 ) parser.ParseError!DdlStmt {
-    const parsed = try fromValue(DeleteStmtJson, alloc, body) orelse
+    const ds = try fromValue(DeleteStmtJson, alloc, body) orelse
         return .unsupported;
-    defer parsed.deinit();
-    const ds = parsed.value;
 
     if (ds.usingClause.len > 0)
-        return invalid(alloc, "DELETE ... USING is not supported");
+        return invalid("DELETE ... USING is not supported");
     if (ds.returningList.len > 0)
-        return invalid(alloc, "RETURNING is not supported");
+        return invalid("RETURNING is not supported");
     if (ds.withClause != null)
-        return invalid(alloc, "WITH is not supported");
+        return invalid("WITH is not supported");
 
     var filter: ?Filter = null;
-    errdefer freeFilter(alloc, filter);
-    if (ds.whereClause) |w| switch (try parseWhere(alloc, w)) {
+    if (ds.whereClause) |w| switch (parseWhere(w)) {
         .filter => |f| filter = f,
         .invalid => |msg| return .{ .invalid = msg },
     };
 
-    const table = try alloc.dupe(u8, ds.relation.relname);
-    errdefer alloc.free(table);
-    return .{ .delete = .{ .table = table, .filter = filter } };
+    return .{ .delete = .{ .table = ds.relation.relname, .filter = filter } };
 }
 
-/// Reject a recognized SELECT, freeing the columns accumulated so far. Message
-/// first — on OOM the caller's errdefer owns the cleanup.
-fn invalidSel(alloc: std.mem.Allocator, cols: *std.ArrayList([]const u8), comptime fmt: []const u8, args: anytype) parser.ParseError!DdlStmt {
-    const msg = try std.fmt.allocPrint(alloc, fmt, args);
-    for (cols.items) |c| alloc.free(c);
-    cols.deinit(alloc);
-    return .{ .invalid = msg };
-}
+/// UPDATE one_table SET col = literal [, ...] [WHERE col = literal].
+/// FROM, RETURNING, WITH, non-literal SET values, and duplicate SET
+/// columns are rejected with a reason.
+fn parseUpdate(
+    alloc: std.mem.Allocator,
+    body: std.json.Value,
+) parser.ParseError!DdlStmt {
+    const us = try fromValue(UpdateStmtJson, alloc, body) orelse
+        return .unsupported;
 
-/// Reject a recognized statement: build the owned `.invalid` reason, then
-/// release the columns accumulated so far. Message first — on OOM the
-/// caller's errdefer still owns the cleanup.
-fn invalidMsg(alloc: std.mem.Allocator, columns: *std.ArrayList(ColumnDef), comptime fmt: []const u8, args: anytype) parser.ParseError!DdlStmt {
-    const msg = try std.fmt.allocPrint(alloc, fmt, args);
-    for (columns.items) |c| alloc.free(c.name);
-    columns.deinit(alloc);
-    return .{ .invalid = msg };
+    if (us.fromClause.len > 0)
+        return invalid("UPDATE ... FROM is not supported");
+    if (us.returningList.len > 0)
+        return invalid("RETURNING is not supported");
+    if (us.withClause != null)
+        return invalid("WITH is not supported");
+    if (us.targetList.len == 0) return .unsupported;
+
+    var filter: ?Filter = null;
+    if (us.whereClause) |w| switch (parseWhere(w)) {
+        .filter => |f| filter = f,
+        .invalid => |msg| return .{ .invalid = msg },
+    };
+
+    var sets: std.ArrayList(SetClause) = .empty;
+    for (us.targetList) |tn| {
+        const rt = tn.ResTarget;
+        if (rt.name.len == 0) return .unsupported;
+        const ac = rt.val.A_Const orelse
+            return invalid("SET value must be a literal");
+        for (sets.items) |s| {
+            if (std.mem.eql(u8, s.column, rt.name))
+                return invalid("duplicate column in SET");
+        }
+        const lit = literalFrom(ac);
+        if (lit == .unsupported)
+            return invalid("SET value must be a literal");
+        try sets.append(alloc, .{ .column = rt.name, .literal = lit });
+    }
+
+    return .{ .update = .{
+        .table = us.relation.relname,
+        .sets = try sets.toOwnedSlice(alloc),
+        .filter = filter,
+    } };
 }
 
 fn asObject(v: std.json.Value) ?std.json.ObjectMap {

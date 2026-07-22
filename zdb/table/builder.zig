@@ -237,10 +237,10 @@ pub const Builder = struct {
                 return error.KeyOrderViolation;
             }
             if (!key.equalPrimary(last)) {
-                try self.bf_hashes.append(self.allocator, key.hash());
+                try self.bf_hashes.append(self.allocator, key.bloomHash());
             }
         } else {
-            try self.bf_hashes.append(self.allocator, key.hash());
+            try self.bf_hashes.append(self.allocator, key.bloomHash());
         }
 
         // Marshal into last_key scratch buffer for prefix compression.

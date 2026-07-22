@@ -377,6 +377,10 @@ fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *sql.Se
         log.err("appMain: spawn sql server failed: {s}", .{@errorName(err)});
         return;
     };
+    eng.spawnListener(sql.Server.runOracleRotation, .{sql_srv}) catch |err| {
+        log.err("appMain: spawn oracle rotation failed: {s}", .{@errorName(err)});
+        return;
+    };
 
     node.shutdown.install() catch |err| {
         log.err("appMain: installing signal handlers failed: {s}", .{@errorName(err)});

@@ -119,25 +119,28 @@ pub const ManifestChange = schema.Table(.{
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 }, // snapshot only: global namespace counter
 });
 
-/// A single key-value tuple. Carried inside `Mutations` which groups them
-/// by namespace — so the per-tuple envelope only holds the bytes themselves.
-/// `meta` is zdb.Meta packed into a byte (see zdb/kv.zig); 0 is Meta.raw, so
-/// a writer that never sets it produces a plain put.
+/// A single key-value write. `key` is a FULL marshaled zdb key
+/// [ns:u64 BE][table_id:u32 BE][primary][ts:u64 BE] — self-describing, so
+/// one Mutations entry can span tables. The timestamp on the wire is
+/// whatever the writer held (a transaction's read_ts); apply always
+/// rewrites it to the enclosing `LogEntry.timestamp`, the commit HLC
+/// shared by the whole batch. `meta` is zdb.Meta packed into a byte (see
+/// zdb/kv.zig); 0 is Meta.raw, so a writer that never sets it produces a
+/// plain put.
 pub const KeyValue = schema.Table(.{
     .{ .id = 1, .name = "key", .ty = schema.Bytes },
     .{ .id = 2, .name = "value", .ty = schema.Bytes },
     .{ .id = 3, .name = "meta", .ty = schema.U8 },
 });
 
-/// One or more key-value writes proposed through raft as a single entry. The
-/// enclosing `LogEntry.timestamp` is the commit HLC for the whole batch (all kvs
-/// share it). `namespace` + `table_id` sit at the Mutations level so every kv
-/// lands in the same (namespace, table_id) table — keeps routing + apply
-/// simple. table_id 0 is the raw-KV / default table.
+/// A committed write set proposed through raft as a single .data entry —
+/// one entry, one commit HLC, atomic across every key/table it touches.
+/// An entry never spans namespaces (a session is bound to one database),
+/// so `namespace` sits at the top level as the authority; apply validates
+/// each key's own namespace bytes against it.
 pub const Mutations = schema.Table(.{
     .{ .id = 1, .name = "namespace", .ty = schema.U64 },
-    .{ .id = 2, .name = "table_id", .ty = schema.U32 },
-    .{ .id = 3, .name = "kvs", .ty = schema.Array(KeyValue) },
+    .{ .id = 2, .name = "kvs", .ty = schema.Array(KeyValue) },
 });
 
 // zbuf tail stores table_id as u16, so use a module namespace in high bits and

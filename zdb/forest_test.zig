@@ -755,7 +755,7 @@ test "forest: getIterators outlives a concurrent flush+pop" {
 
     // Snapshot under the lock — each skl.Iterator.init bumps
     // refcount before getIterators returns.
-    const iters = try mts.getIterators(alloc);
+    const iters = try mts.getIterators(alloc, null);
 
     // Simulate flush completion: drop M_5 from immutables (release fires
     // inside popOldestIfMatches). M_5's refcount goes from 2 → 1
@@ -1133,8 +1133,7 @@ const ScanCollector = struct {
     alloc: std.mem.Allocator,
     got: std.ArrayList(zdb.kv.Item) = .empty,
 
-    fn emit(ctx: *anyopaque, item: zdb.kv.Item) anyerror!bool {
-        const self: *ScanCollector = @ptrCast(@alignCast(ctx));
+    fn emit(self: *ScanCollector, item: zdb.kv.Item) anyerror!bool {
         try self.got.append(self.alloc, try item.dupe(self.alloc));
         return true;
     }
@@ -1176,7 +1175,7 @@ fn runScan(
     col: *ScanCollector,
 ) !u64 {
     const open = Key{ .namespace = 1, .table_id = 0, .primary = "", .timestamp = std.math.maxInt(u64) };
-    return f.scan(alloc, .{ .left = open, .right = open }, opts, @ptrCast(col), &ScanCollector.emit);
+    return f.scan(alloc, .{ .left = open, .right = open }, opts, col, ScanCollector.emit);
 }
 
 test "scan: by default emits one version per key and hides deleted keys" {

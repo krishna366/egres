@@ -36,13 +36,19 @@ const log = std.log.scoped(.engine);
 
 /// A front-end's hook into the commit stream. `onData` fires on the apply
 /// fiber right after a committed Mutations entry is written to the forest,
-/// with the (namespace, table_id) it targeted and the rows written — so a
-/// front-end (SQL) can maintain caches (e.g. a per-table max row id) from the
-/// commit stream on EVERY node, and a node that becomes leader inherits them
-/// without re-scanning. MUST NOT block, propose, or re-enter the engine.
+/// with the entry's namespace and the rows written — a Mutations entry is
+/// single-namespace (apply skips any key disagreeing with it), so `ns`
+/// names every item's home. Lets a front-end (SQL) maintain caches (e.g.
+/// a per-table max row id) from the commit stream on EVERY node, and a
+/// node that becomes leader inherits them without re-scanning. MUST NOT
+/// block, propose, or re-enter the engine.
 pub const ApplyObserver = struct {
     ctx: *anyopaque,
-    onData: *const fn (ctx: *anyopaque, namespace: u64, table_id: u32, items: []const zdb.kv.Item) void,
+    onData: *const fn (
+        ctx: *anyopaque,
+        ns: u64,
+        items: []const zdb.kv.Item,
+    ) void,
 };
 
 pub const StorageImpl = struct {
@@ -122,9 +128,6 @@ pub const StorageImpl = struct {
                 if (entry.index < self.oldest_memtable_index) return;
 
                 const ns = ms.namespace();
-                // Routes the batch to its table; 0 (the wire default)
-                // is the raw-KV table, so legacy admin writes are unchanged.
-                const tid = ms.tableId();
                 const count = ms.kvsLen();
 
                 var items: std.ArrayList(Item) = .empty;
@@ -134,19 +137,30 @@ pub const StorageImpl = struct {
                 var total_bytes: u64 = 0;
                 for (0..count) |i| {
                     const kv = try ms.kvsAt(@intCast(i));
-                    const val = kv.value();
+                    // Wire keys are full marshaled keys (self-describing
+                    // ns/tid). Minimum: 12-byte prefix + 1 primary byte +
+                    // 8-byte ts. A short key — or a key whose namespace
+                    // disagrees with the entry's — means an encoder bug;
+                    // skipping keeps apply deterministic across nodes
+                    // without wedging the loop on a poison entry.
+                    if (kv.key().len < 21) {
+                        log.err("on_apply: short wire key at index={d} kv={d} len={d}", .{ entry.index, i, kv.key().len });
+                        continue;
+                    }
+                    var key = Key.init(kv.key());
+                    if (key.namespace != ns) {
+                        log.err("on_apply: key ns={d} != entry ns={d} at index={d} kv={d}", .{ key.namespace, ns, entry.index, i });
+                        continue;
+                    }
+                    // The wire carries the writer's timestamp (a txn's
+                    // read_ts); the commit timestamp is the entry's HLC.
+                    key.timestamp = entry.timestamp;
                     items.appendAssumeCapacity(.{
-                        .key = .{
-                            .namespace = ns,
-                            .table_id = tid,
-                            .primary = kv.key(),
-                            // Timestamp comes from the raft Entry (one per batch).
-                            .timestamp = entry.timestamp,
-                        },
-                        .value = val,
+                        .key = key,
+                        .value = kv.value(),
                         .meta = Meta.fromByte(kv.meta()),
                     });
-                    total_bytes += val.len;
+                    total_bytes += kv.value().len;
                 }
 
                 // Write this to Forest.
@@ -155,7 +169,8 @@ pub const StorageImpl = struct {
                 // Feed the committed rows to any front-end cache (SQL's
                 // per-table max row id) — on every node, so a new leader
                 // inherits it without a re-scan.
-                if (self.apply_observer) |obs| obs.onData(obs.ctx, ns, tid, items.items);
+                if (self.apply_observer) |obs|
+                    obs.onData(obs.ctx, ns, items.items);
 
                 try metrics.g().bytes_written.incrBy(.{
                     .source = "user",
@@ -1180,44 +1195,27 @@ pub const Engine = struct {
         try self.proposeAndWait(payload, .manifest, wait_for);
     }
 
-    /// Encode key-value writes to (namespace, table_id) and propose them.
-    /// Catalog rows use `.apply` (locally readable at CommandComplete); user
-    /// data (INSERT) uses `.commit` (durable + ordered is enough — the egid
-    /// counter is advanced at hand-out).
-    pub fn proposeKVs(self: *Engine, namespace: u64, table_id: u32, kvs: anytype, wait_for: Wait) !void {
-        const payload = try encodeMutations(self.allocator, namespace, table_id, kvs);
+    /// Encode key-value writes and propose them as one .data entry — one
+    /// raft entry, one commit HLC, atomic across every key/table the keys
+    /// touch. Each kv's key is a FULL marshaled zdb key (Key.marshal);
+    /// its wire timestamp is ignored and rewritten to the commit HLC at
+    /// apply, and its namespace must match `namespace` (the batch
+    /// authority apply validates against). Callers pick `wait_for`:
+    /// `.apply` when the writes must be locally readable on return
+    /// (catalog rows), `.commit` when durable + ordered is enough.
+    pub fn proposeWrites(self: *Engine, namespace: u64, kvs: []zdb_bufs.KeyValueStruct, wait_for: Wait) !void {
+        const payload = try encodeMutations(self.allocator, namespace, kvs);
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload, .data, wait_for);
     }
 
     /// Encode key-value writes as one `Mutations` payload for a .data
-    /// proposal. All kvs in a batch share (namespace, table_id) — one
-    /// table, one Raft entry, one commit HLC. `kvs` is any slice whose
-    /// elements carry `.key`/`.value` byte slices (admin proto.KV, sql rows);
-    /// table_id 0 is the raw-KV default table.
-    pub fn encodeMutations(allocator: std.mem.Allocator, namespace: u64, table_id: u32, kvs: anytype) ![]u8 {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(allocator);
-
-        var mw = try zdb_bufs.MutationsWriter.initWithBuf(allocator, &buf);
-
-        const offsets = try allocator.alloc(u32, kvs.len);
-        defer allocator.free(offsets);
-        for (kvs, 0..) |kv, i| {
-            var kvw = try zdb_bufs.KeyValueWriter.initWithBuf(allocator, &buf);
-            try kvw.set(.{ .key = kv.key, .value = kv.value });
-            // Callers whose element type carries meta (future tombstone /
-            // roaring writers) put it on the wire; everyone else leaves the
-            // slot at its zeroed default, which decodes as Meta.raw — exactly
-            // a plain put. Mirrors the generated set()'s own @hasField probe.
-            if (@hasField(@TypeOf(kv), "meta")) try kvw.setMeta(kv.meta.toByte());
-            offsets[i] = (try kvw.finish()).offset;
-        }
-        try mw.setNamespace(namespace);
-        try mw.setTableId(table_id);
-        try mw.setKvs(offsets);
-        _ = try mw.finishWithTail();
-        return buf.toOwnedSlice(allocator);
+    /// proposal. `kvs` is borrowed — marshalRoot copies the bytes out.
+    pub fn encodeMutations(allocator: std.mem.Allocator, namespace: u64, kvs: []zdb_bufs.KeyValueStruct) ![]u8 {
+        return zdb_bufs.marshalRoot(allocator, zdb_bufs.MutationsStruct{
+            .namespace = namespace,
+            .kvs = kvs,
+        });
     }
 };
 

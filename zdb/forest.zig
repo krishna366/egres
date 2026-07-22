@@ -136,22 +136,31 @@ pub const Memtables = struct {
         return self.current.memoryUsage();
     }
 
-    /// Get iterators across the active memtable + every immutable
-    /// for use in a scan merge. Each `skl.Iterator.init` acquires the
-    /// underlying skiplist — release happens via `deinit` on the
-    /// returned iterator (transitively from `MergeIterator.deinit`).
-    /// Doing the acquires under our shared lock guarantees that even if
-    /// a concurrent flush + `popOldestIfMatches` releases the original
-    /// ref a moment later, the skiplist stays alive until the iterator
-    /// drops its ref. Caller frees the slice itself.
-    pub fn getIterators(self: *Memtables, allocator: std.mem.Allocator) ![]merge_iterator.Iterator {
+    /// Get iterators for a scan merge: `pending` (a txn's private
+    /// write skiplist, when non-null) FIRST — src 0, the merge's
+    /// equal-key tie-break, so the txn sees its own writes — then the
+    /// active memtable, then every immutable. Each `skl.Iterator.init`
+    /// acquires the underlying skiplist — release happens via `deinit`
+    /// on the returned iterator (transitively from
+    /// `MergeIterator.deinit`). Doing the acquires under our shared
+    /// lock guarantees that even if a concurrent flush +
+    /// `popOldestIfMatches` releases the original ref a moment later,
+    /// the skiplist stays alive until the iterator drops its ref.
+    /// Caller frees the slice itself.
+    pub fn getIterators(
+        self: *Memtables,
+        allocator: std.mem.Allocator,
+        pending: ?*skl.SkipList,
+    ) ![]merge_iterator.Iterator {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        const total = self.immutables.items.len + 1;
+        const extra: usize = @intFromBool(pending != null);
+        const total = extra + 1 + self.immutables.items.len;
         const out = try allocator.alloc(merge_iterator.Iterator, total);
-        out[0] = .{ .skiplist = skl.Iterator.init(self.current) };
+        if (pending) |p| out[0] = .{ .skiplist = skl.Iterator.init(p) };
+        out[extra] = .{ .skiplist = skl.Iterator.init(self.current) };
         for (self.immutables.items, 0..) |imm, i| {
-            out[i + 1] = .{ .skiplist = skl.Iterator.init(imm) };
+            out[extra + 1 + i] = .{ .skiplist = skl.Iterator.init(imm) };
         }
         return out;
     }
@@ -656,7 +665,7 @@ pub const Forest = struct {
         return tree.get(search_key, priority);
     }
 
-    pub const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
+    const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
 
     /// How much of a key's version history a scan should surface.
     ///
@@ -700,6 +709,12 @@ pub const Forest = struct {
         /// background sweeps should pick a lower one so they queue behind
         /// user-facing reads.
         priority: vfs.Priority = .p0,
+        /// A transaction's private pending-write skiplist, merged in as
+        /// the highest-priority source (src 0) so the txn sees its own
+        /// uncommitted writes. Its entries carry ts = read_ts, which the
+        /// visibility filter admits and which wins equal-key ties against
+        /// committed versions (lower src wins in the merge). null = none.
+        pending: ?*skl.SkipList = null,
     };
 
     /// Forward scan over a table-limited `scan_range` — a KeyRange run through
@@ -723,6 +738,27 @@ pub const Forest = struct {
     /// against splits firing mid-scan. Per-cursor memtable snapshots also pick
     /// up newly-flushed data.
     pub fn scan(
+        self: *Forest,
+        allocator: std.mem.Allocator,
+        scan_range: KeyRange,
+        opts: ScanOptions,
+        ctx: anytype,
+        comptime cb: fn (@TypeOf(ctx), Item) anyerror!bool,
+    ) !u64 {
+        // The one type-erasing shim: the cast target is generated from
+        // the same @TypeOf(ctx) that produced the pointer, so a caller
+        // cannot pair the wrong context with the wrong callback. One
+        // scanRaw instantiation serves every ctx type.
+        const shim = struct {
+            fn call(raw: *anyopaque, item: Item) anyerror!bool {
+                return cb(@ptrCast(@alignCast(raw)), item);
+            }
+        };
+        return self.scanRaw(allocator, scan_range, opts, ctx, shim.call);
+    }
+
+    /// Type-erased core of `scan` — see the doc above.
+    fn scanRaw(
         self: *Forest,
         allocator: std.mem.Allocator,
         scan_range: KeyRange,
@@ -793,9 +829,10 @@ pub const Forest = struct {
             // Allocate memtable iters from the per-call arena so they
             // live exactly as long as the merge. (Memtables.getIterators
             // returns a fresh slice; freeing it through the arena at
-            // end-of-scope is fine.)
-            const mem_iters = try self.memtables.getIterators(a);
-            var merge = try tree.openMerge(a, visit_range, opts.priority, mem_iters);
+            // end-of-scope is fine.) The txn's pending skiplist rides
+            // in as src 0 — the merge's equal-key tie-break.
+            const srcs = try self.memtables.getIterators(a, opts.pending);
+            var merge = try tree.openMerge(a, visit_range, opts.priority, srcs);
 
             // Drain (or hit max_rows). Use a labeled block so merge.deinit
             // fires on every exit path before we either return or hop to
@@ -907,8 +944,7 @@ pub const Forest = struct {
         const Ctx = struct {
             allocator: std.mem.Allocator,
             best: std.ArrayList(u8) = .empty,
-            fn emit(raw: *anyopaque, item: Item) anyerror!bool {
-                const c: *@This() = @ptrCast(@alignCast(raw));
+            fn emit(c: *@This(), item: Item) anyerror!bool {
                 c.best.clearRetainingCapacity();
                 _ = try item.key.marshalTo(c.allocator, &c.best);
                 return true;

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for SQL INSERT/SELECT/DELETE over the pgwire endpoint.
-# Builds, starts a fresh single-node egres, drives psql through
-# insert/select/filter, egid visibility, delete (point + scan + full-table), a
-# restart-persistence + monotonic-egid leg (incl. no-reuse of a deleted max),
-# and greps the server log. Wipes /data/egres — that dir is throw-away.
+# End-to-end smoke test for SQL INSERT/SELECT/UPDATE/DELETE over the pgwire
+# endpoint. Builds, starts a fresh single-node egres, drives psql through
+# insert/select/filter, egid visibility, update (point + multi-SET + scan +
+# full-table), delete (point + scan + full-table), a restart-persistence +
+# monotonic-egid leg (incl. no-reuse of a deleted max), and greps the server
+# log. Wipes /data/egres — that dir is throw-away.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -83,7 +84,24 @@ start_server
 expect "rows survive restart" "(3 rows)" q "SELECT * FROM t;"
 expect "INSERT post-restart" "INSERT 0 1" q "INSERT INTO t (name) VALUES ('d');"
 expect "egid 4 post-restart" "d" v "SELECT name FROM t WHERE egid = 4;"
-# State here: egids 1=a, 2=b, 3=c, 4=d, all live.
+# State here: egids 1=a, 2=b, 3=c, 4=d, all live; ids 1, 2, NULL, NULL.
+
+# --- update: point, multi-SET, scan, full-table ----------------------------
+expect "UPDATE by egid" "UPDATE 1" q "UPDATE t SET name = 'b2' WHERE egid = 2;"
+expect "updated value visible" "b2" v "SELECT name FROM t WHERE egid = 2;"
+expect "multi-SET" "UPDATE 1" q "UPDATE t SET id = 20, name = 'b3' WHERE egid = 2;"
+expect "multi-SET visible" "b3" v "SELECT name FROM t WHERE id = 20;"
+expect "UPDATE by column" "UPDATE 1" q "UPDATE t SET id = 30 WHERE name = 'c';"
+expect "scan-update visible" "c" v "SELECT name FROM t WHERE id = 30;"
+expect "UPDATE no match is 0" "UPDATE 0" q "UPDATE t SET id = 7 WHERE name = 'zzz';"
+expect "UPDATE all rows" "UPDATE 4" q "UPDATE t SET id = 99;"
+expect "all rows updated" "(4 rows)" q "SELECT * FROM t WHERE id = 99;"
+
+# --- update rejections / errors --------------------------------------------
+expect "UPDATE expression rejected" "literal" q "UPDATE t SET id = id + 1;"
+expect "UPDATE egid rejected" "egid" q "UPDATE t SET egid = 9 WHERE egid = 1;"
+expect "UPDATE unknown table" "does not exist" q "UPDATE nope SET id = 1;"
+expect "UPDATE unknown column" "does not exist" q "UPDATE t SET bogus = 1;"
 
 # --- delete by egid (point path) -------------------------------------------
 expect "DELETE by egid" "DELETE 1" q "DELETE FROM t WHERE egid = 2;"
@@ -106,6 +124,7 @@ expect "DELETE current max" "DELETE 1" q "DELETE FROM t WHERE egid = 4;"
 stop_server
 start_server
 expect "deletes survive restart" "(1 row)" q "SELECT * FROM t;" # just a (egid 1)
+expect "update survives restart" "99" v "SELECT id FROM t WHERE egid = 1;"
 expect "INSERT after delete+restart" "INSERT 0 1" q "INSERT INTO t (name) VALUES ('e');"
 expect "egid 4 not reused (lands on 5)" "e" v "SELECT name FROM t WHERE egid = 5;"
 

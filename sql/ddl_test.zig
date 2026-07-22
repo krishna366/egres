@@ -4,33 +4,38 @@ const sql = @import("sql");
 const ddl = sql.ddl;
 
 test "sql.ddl: CREATE/DROP DATABASE parse to typed statements" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
-    var create = try ddl.parseDdl(alloc, "CREATE DATABASE app;");
-    defer create.deinit(alloc);
+    const create = try ddl.parseDdl(alloc, "CREATE DATABASE app;");
     try testing.expectEqualStrings("app", create.create_database);
 
-    var drop = try ddl.parseDdl(alloc, "drop database app");
-    defer drop.deinit(alloc);
+    const drop = try ddl.parseDdl(alloc, "drop database app");
     try testing.expectEqualStrings("app", drop.drop_database);
 }
 
 test "sql.ddl: everything else is unsupported; bad SQL is a syntax error" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
-    // A statement kind we don't handle at all (UPDATE) is unsupported.
-    var upd = try ddl.parseDdl(alloc, "UPDATE t SET x = 1;");
-    defer upd.deinit(alloc);
-    try testing.expect(upd == .unsupported);
+    // A statement kind we don't handle at all (TRUNCATE) is unsupported.
+    const trunc = try ddl.parseDdl(alloc, "TRUNCATE t;");
+    try testing.expect(trunc == .unsupported);
 
     try testing.expectError(error.SyntaxError, ddl.parseDdl(alloc, "CREATE DATABASE;"));
 }
 
 test "sql.ddl: CREATE TABLE parses columns, types, and the primary key" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
-    var ct = try ddl.parseDdl(alloc, "CREATE TABLE t (id int PRIMARY KEY, name text);");
-    defer ct.deinit(alloc);
+    const ct = try ddl.parseDdl(alloc, "CREATE TABLE t (id int PRIMARY KEY, name text);");
     try testing.expectEqualStrings("t", ct.create_table.name);
     try testing.expect(!ct.create_table.if_not_exists);
     const cols = ct.create_table.columns;
@@ -43,20 +48,21 @@ test "sql.ddl: CREATE TABLE parses columns, types, and the primary key" {
     try testing.expect(!cols[1].pkey);
 
     // IF NOT EXISTS + schema-qualified name + our unsigned custom type.
-    var ine = try ddl.parseDdl(alloc, "CREATE TABLE IF NOT EXISTS public.u (a uint4);");
-    defer ine.deinit(alloc);
+    const ine = try ddl.parseDdl(alloc, "CREATE TABLE IF NOT EXISTS public.u (a uint4);");
     try testing.expectEqualStrings("u", ine.create_table.name);
     try testing.expect(ine.create_table.if_not_exists);
     try testing.expectEqual(sql.Type.uint4, ine.create_table.columns[0].ty);
 
     // Zero columns is legal Postgres.
-    var empty = try ddl.parseDdl(alloc, "CREATE TABLE nothing ();");
-    defer empty.deinit(alloc);
+    const empty = try ddl.parseDdl(alloc, "CREATE TABLE nothing ();");
     try testing.expectEqual(@as(usize, 0), empty.create_table.columns.len);
 }
 
 test "sql.ddl: CREATE TABLE semantic rejections carry a reason" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     const cases = [_]struct { sql: []const u8, needle: []const u8 }{
         .{ .sql = "CREATE TABLE t (a int NOT NULL);", .needle = "PRIMARY KEY" },
         .{ .sql = "CREATE TABLE t (a serial);", .needle = "serial" },
@@ -66,47 +72,50 @@ test "sql.ddl: CREATE TABLE semantic rejections carry a reason" {
         .{ .sql = "DROP TABLE a, b;", .needle = "multiple tables" },
     };
     for (cases) |case| {
-        var stmt = try ddl.parseDdl(alloc, case.sql);
-        defer stmt.deinit(alloc);
+        const stmt = try ddl.parseDdl(alloc, case.sql);
         try testing.expect(stmt == .invalid);
         try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
     }
 }
 
 test "sql.ddl: DROP TABLE variants" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
-    var dt = try ddl.parseDdl(alloc, "DROP TABLE t;");
-    defer dt.deinit(alloc);
+    const dt = try ddl.parseDdl(alloc, "DROP TABLE t;");
     try testing.expectEqualStrings("t", dt.drop_table.name);
     try testing.expect(!dt.drop_table.missing_ok);
 
     // IF EXISTS + schema-qualified: the last name part is the table.
-    var ie = try ddl.parseDdl(alloc, "DROP TABLE IF EXISTS public.t;");
-    defer ie.deinit(alloc);
+    const ie = try ddl.parseDdl(alloc, "DROP TABLE IF EXISTS public.t;");
     try testing.expectEqualStrings("t", ie.drop_table.name);
     try testing.expect(ie.drop_table.missing_ok);
 
     // Non-table DROPs are a different feature, not a rejection.
-    var di = try ddl.parseDdl(alloc, "DROP INDEX i;");
-    defer di.deinit(alloc);
+    const di = try ddl.parseDdl(alloc, "DROP INDEX i;");
     try testing.expect(di == .unsupported);
 }
 
 test "sql.ddl: CREATE TABLE reserves the egid column name" {
-    const alloc = testing.allocator;
-    var stmt = try ddl.parseDdl(alloc, "CREATE TABLE t (egid int8, name text);");
-    defer stmt.deinit(alloc);
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const stmt = try ddl.parseDdl(alloc, "CREATE TABLE t (egid int8, name text);");
     try testing.expect(stmt == .invalid);
     try testing.expect(std.mem.indexOf(u8, stmt.invalid, "egid") != null);
 }
 
 test "sql.ddl: INSERT ... VALUES parses rows, columns, and literals" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     // Positional, multi-row.
-    var pos = try ddl.parseDdl(alloc, "INSERT INTO t VALUES (1, 'a'), (2, 'b');");
-    defer pos.deinit(alloc);
+    const pos = try ddl.parseDdl(alloc, "INSERT INTO t VALUES (1, 'a'), (2, 'b');");
     try testing.expectEqualStrings("t", pos.insert.table);
     try testing.expect(pos.insert.columns == null);
     try testing.expectEqual(@as(usize, 2), pos.insert.rows.len);
@@ -115,8 +124,7 @@ test "sql.ddl: INSERT ... VALUES parses rows, columns, and literals" {
     try testing.expectEqual(@as(i64, 2), pos.insert.rows[1][0].int);
 
     // Explicit column list + null + bool literals.
-    var cols = try ddl.parseDdl(alloc, "INSERT INTO t (id, flag, note) VALUES (0, true, NULL);");
-    defer cols.deinit(alloc);
+    const cols = try ddl.parseDdl(alloc, "INSERT INTO t (id, flag, note) VALUES (0, true, NULL);");
     try testing.expect(cols.insert.columns != null);
     try testing.expectEqual(@as(usize, 3), cols.insert.columns.?.len);
     try testing.expectEqualStrings("id", cols.insert.columns.?[0]);
@@ -126,33 +134,36 @@ test "sql.ddl: INSERT ... VALUES parses rows, columns, and literals" {
 }
 
 test "sql.ddl: INSERT rejections carry a reason" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     const cases = [_]struct { sql: []const u8, needle: []const u8 }{
         .{ .sql = "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING;", .needle = "ON CONFLICT" },
         .{ .sql = "INSERT INTO t VALUES (1) RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "INSERT INTO t SELECT * FROM u;", .needle = "VALUES" },
     };
     for (cases) |case| {
-        var stmt = try ddl.parseDdl(alloc, case.sql);
-        defer stmt.deinit(alloc);
+        const stmt = try ddl.parseDdl(alloc, case.sql);
         try testing.expect(stmt == .invalid);
         try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
     }
 }
 
 test "sql.ddl: SELECT parses projection, table, and an equality filter" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     // Star, no filter.
-    var s1 = try ddl.parseDdl(alloc, "SELECT * FROM t;");
-    defer s1.deinit(alloc);
+    const s1 = try ddl.parseDdl(alloc, "SELECT * FROM t;");
     try testing.expectEqualStrings("t", s1.select.table);
     try testing.expect(s1.select.projection == .star);
     try testing.expect(s1.select.filter == null);
 
     // Named columns incl. the egid pseudo-column + a WHERE filter.
-    var s2 = try ddl.parseDdl(alloc, "SELECT egid, name FROM t WHERE id = 5;");
-    defer s2.deinit(alloc);
+    const s2 = try ddl.parseDdl(alloc, "SELECT egid, name FROM t WHERE id = 5;");
     try testing.expect(s2.select.projection == .columns);
     try testing.expectEqual(@as(usize, 2), s2.select.projection.columns.len);
     try testing.expectEqualStrings("egid", s2.select.projection.columns[0]);
@@ -163,7 +174,10 @@ test "sql.ddl: SELECT parses projection, table, and an equality filter" {
 }
 
 test "sql.ddl: SELECT rejections carry a reason" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     const cases = [_]struct { sql: []const u8, needle: []const u8 }{
         .{ .sql = "SELECT * FROM t ORDER BY a;", .needle = "ORDER BY" },
         .{ .sql = "SELECT * FROM t LIMIT 3;", .needle = "LIMIT" },
@@ -172,39 +186,37 @@ test "sql.ddl: SELECT rejections carry a reason" {
         .{ .sql = "SELECT * FROM t WHERE a > 5;", .needle = "column = value" },
     };
     for (cases) |case| {
-        var stmt = try ddl.parseDdl(alloc, case.sql);
-        defer stmt.deinit(alloc);
+        const stmt = try ddl.parseDdl(alloc, case.sql);
         try testing.expect(stmt == .invalid);
         try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
     }
 }
 
 test "sql.ddl: DELETE parses table and the optional equality filter" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     // No WHERE: delete every row.
-    var d1 = try ddl.parseDdl(alloc, "DELETE FROM t;");
-    defer d1.deinit(alloc);
+    const d1 = try ddl.parseDdl(alloc, "DELETE FROM t;");
     try testing.expectEqualStrings("t", d1.delete.table);
     try testing.expect(d1.delete.filter == null);
 
     // WHERE on a payload column.
-    var d2 = try ddl.parseDdl(alloc, "DELETE FROM t WHERE id = 5;");
-    defer d2.deinit(alloc);
+    const d2 = try ddl.parseDdl(alloc, "DELETE FROM t WHERE id = 5;");
     const f2 = d2.delete.filter.?;
     try testing.expectEqualStrings("id", f2.column);
     try testing.expectEqual(@as(i64, 5), f2.literal.int);
 
     // WHERE on the egid pseudo-column parses as a plain column filter.
-    var d3 = try ddl.parseDdl(alloc, "DELETE FROM t WHERE egid = 3;");
-    defer d3.deinit(alloc);
+    const d3 = try ddl.parseDdl(alloc, "DELETE FROM t WHERE egid = 3;");
     const f3 = d3.delete.filter.?;
     try testing.expectEqualStrings("egid", f3.column);
     try testing.expectEqual(@as(i64, 3), f3.literal.int);
 
     // Qualified name keeps the last part; string literal.
-    var d4 = try ddl.parseDdl(alloc, "DELETE FROM public.t WHERE name = 'x';");
-    defer d4.deinit(alloc);
+    const d4 = try ddl.parseDdl(alloc, "DELETE FROM public.t WHERE name = 'x';");
     try testing.expectEqualStrings("t", d4.delete.table);
     const f4 = d4.delete.filter.?;
     try testing.expectEqualStrings("name", f4.column);
@@ -212,7 +224,10 @@ test "sql.ddl: DELETE parses table and the optional equality filter" {
 }
 
 test "sql.ddl: DELETE rejections carry a reason" {
-    const alloc = testing.allocator;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     const cases = [_]struct { sql: []const u8, needle: []const u8 }{
         .{ .sql = "DELETE FROM t USING u WHERE t.a = u.a;", .needle = "USING" },
         .{ .sql = "DELETE FROM t RETURNING id;", .needle = "RETURNING" },
@@ -226,8 +241,87 @@ test "sql.ddl: DELETE rejections carry a reason" {
         .{ .sql = "DELETE FROM t WHERE a = b;", .needle = "literal" },
     };
     for (cases) |case| {
-        var stmt = try ddl.parseDdl(alloc, case.sql);
-        defer stmt.deinit(alloc);
+        const stmt = try ddl.parseDdl(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        const found = std.mem.indexOf(u8, stmt.invalid, case.needle);
+        try testing.expect(found != null);
+    }
+}
+
+test "sql.ddl: UPDATE parses table, SET list, and the optional filter" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // No WHERE: update every row. Multiple SETs, mixed literal kinds.
+    const up1 = try ddl.parseDdl(
+        alloc,
+        "UPDATE t SET a = 5, b = 'x', c = NULL;",
+    );
+    try testing.expectEqualStrings("t", up1.update.table);
+    try testing.expect(up1.update.filter == null);
+    try testing.expectEqual(3, up1.update.sets.len);
+    try testing.expectEqualStrings("a", up1.update.sets[0].column);
+    try testing.expectEqual(@as(i64, 5), up1.update.sets[0].literal.int);
+    try testing.expectEqualStrings("b", up1.update.sets[1].column);
+    try testing.expectEqualStrings("x", up1.update.sets[1].literal.str);
+    try testing.expectEqualStrings("c", up1.update.sets[2].column);
+    try testing.expect(up1.update.sets[2].literal == .null_value);
+
+    // WHERE on a payload column; SET int 0 exercises libpg_query's
+    // omitted-zero encoding ("ival":{} still means 0).
+    const up2 = try ddl.parseDdl(alloc, "UPDATE t SET a = 0 WHERE id = 7;");
+    try testing.expectEqual(@as(i64, 0), up2.update.sets[0].literal.int);
+    const f2 = up2.update.filter.?;
+    try testing.expectEqualStrings("id", f2.column);
+    try testing.expectEqual(@as(i64, 7), f2.literal.int);
+
+    // WHERE on the egid pseudo-column parses as a plain column filter.
+    const up3 = try ddl.parseDdl(alloc, "UPDATE t SET a = 1 WHERE egid = 3;");
+    try testing.expectEqualStrings("egid", up3.update.filter.?.column);
+}
+
+test "sql.ddl: transaction statements parse; savepoints are rejected" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Plain BEGIN: libpg_query omits `kind` (protobuf tag 0).
+    const b = try ddl.parseDdl(alloc, "BEGIN;");
+    try testing.expect(b == .begin_txn);
+
+    const st = try ddl.parseDdl(alloc, "START TRANSACTION;");
+    try testing.expect(st == .begin_txn);
+
+    const c = try ddl.parseDdl(alloc, "COMMIT;");
+    try testing.expect(c == .commit_txn);
+
+    const r = try ddl.parseDdl(alloc, "ROLLBACK;");
+    try testing.expect(r == .rollback_txn);
+
+    const sp = try ddl.parseDdl(alloc, "SAVEPOINT s1;");
+    try testing.expect(sp == .invalid);
+}
+
+test "sql.ddl: UPDATE rejections carry a reason" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+        .{ .sql = "UPDATE t SET a = 1 FROM u;", .needle = "FROM" },
+        .{ .sql = "UPDATE t SET a = 1 RETURNING id;", .needle = "RETURNING" },
+        .{ .sql = "WITH x AS (SELECT 1) UPDATE t SET a = 1;", .needle = "WITH" },
+        .{ .sql = "UPDATE t SET a = b;", .needle = "literal" },
+        .{ .sql = "UPDATE t SET a = a + 1;", .needle = "literal" },
+        .{ .sql = "UPDATE t SET a = DEFAULT;", .needle = "literal" },
+        .{ .sql = "UPDATE t SET a = 1, a = 2;", .needle = "duplicate" },
+        .{ .sql = "UPDATE t SET a = 1 WHERE b > 5;", .needle = "column = value" },
+    };
+    for (cases) |case| {
+        const stmt = try ddl.parseDdl(alloc, case.sql);
         try testing.expect(stmt == .invalid);
         const found = std.mem.indexOf(u8, stmt.invalid, case.needle);
         try testing.expect(found != null);

@@ -70,8 +70,7 @@ const LoadCtx = struct {
     scratch: value.Row = .{}, // reused across catalog rows
     err: ?anyerror = null,
 
-    fn emit(ctx_raw: *anyopaque, item: Item) anyerror!bool {
-        const c: *LoadCtx = @ptrCast(@alignCast(ctx_raw));
+    fn emit(c: *LoadCtx, item: Item) anyerror!bool {
         // Decode all seven catalog cells (column_id order = SELECT *).
         // TODO: How do we know the version of the row, and whether the physical
         // schema corresponds to that version?

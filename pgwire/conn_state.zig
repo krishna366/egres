@@ -182,9 +182,14 @@ pub const ConnState = struct {
     /// bodies before writeFrame ships them to `out`.
     scratch_out: std.Io.Writer.Allocating,
     alloc: std.mem.Allocator,
-    /// Sticky transaction status. Always .idle today; the field exists
-    /// so a future executor can flip it on BEGIN/COMMIT.
+    /// Transaction status byte for ReadyForQuery; the SQL handler flips
+    /// it on BEGIN/COMMIT/ROLLBACK and statement failure.
     tx_status: types.TxStatus = .idle,
+    /// True once `sendError` fired. The SQL handler clears it per
+    /// statement and reads it afterwards — "did this statement error?" —
+    /// to drive failed-transaction state without threading a result
+    /// through every reply site.
+    error_sent: bool = false,
 
     /// Registry of prepared statements by name. Empty string is the
     /// "unnamed" slot, overwritten on each Parse with name "".
@@ -828,6 +833,7 @@ pub const ConnState = struct {
     }
 
     pub fn sendError(self: *ConnState, f: proto.ErrorField) StateError!void {
+        self.error_sent = true;
         try self.writeError(f);
     }
 

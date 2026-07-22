@@ -116,4 +116,3 @@ pub fn isBinarySupported(oid: types.Oid) bool {
         else => false,
     };
 }
-
