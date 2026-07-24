@@ -6,7 +6,9 @@
 # edge-closer), failed-txn state (25P02, COMMIT→ROLLBACK), DDL-in-txn
 # rejection (25001), table intent locks (DROP TABLE queues behind open
 # DML txns), read_ts bumps (blocked writer restarts and applies with no
-# abort; a stale prior read aborts 40001), and disconnect rollback +
+# abort; a stale prior read aborts 40001), SELECT FOR UPDATE (blocks
+# writers not readers, deadlocks 40P01, a cell-filter scan locks exactly
+# the matches, FOR SHARE / NOWAIT reject), and disconnect rollback +
 # lock release. Wipes /data/egres.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -239,6 +241,88 @@ sync_session 2
 if [ "$(v "SELECT name FROM t2 WHERE egid = 1;")" = "x1" ]; then
     ok "aborted txn left the concurrent commit in place"
 else bad "unexpected value after abort: $(v "SELECT name FROM t2 WHERE egid = 1;")"; fi
+
+# --- SELECT FOR UPDATE: blocks writers, not readers --------------------------
+send 1 "BEGIN;"
+send 1 "SELECT name FROM t2 WHERE egid = 1 FOR UPDATE;"
+sync_session 1
+if grep -q "x1" "$D/out1"; then
+    ok "FOR UPDATE returns the locked row"
+else bad "FOR UPDATE returned nothing"; fi
+NU=$(grep -c "UPDATE 1" "$D/out2" || true)
+send 2 "UPDATE t2 SET name = 'w2' WHERE egid = 1;" # parks on S1's row lock
+sleep 0.3
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$NU" ]; then
+    ok "writer blocks behind FOR UPDATE"
+else bad "writer was not blocked by FOR UPDATE"; fi
+if [ "$(v "SELECT name FROM t2 WHERE egid = 1;")" = "x1" ]; then
+    ok "plain read passes FOR UPDATE without blocking"
+else bad "reader blocked or saw uncommitted data"; fi
+send 1 "COMMIT;"
+sync_session 2
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$((NU + 1))" ] &&
+    [ "$(v "SELECT name FROM t2 WHERE egid = 1;")" = "w2" ]; then
+    ok "blocked writer lands after FOR UPDATE holder commits"
+else bad "blocked writer never landed after commit"; fi
+
+# --- FOR UPDATE deadlock: closing edge refused with 40P01 --------------------
+q "INSERT INTO t2 VALUES (2, 'row2');" >/dev/null # egid 2
+send 1 "BEGIN;"
+send 1 "SELECT name FROM t2 WHERE egid = 1 FOR UPDATE;"
+sync_session 1
+send 2 "BEGIN;"
+send 2 "SELECT name FROM t2 WHERE egid = 2 FOR UPDATE;"
+sync_session 2
+N40=$(grep -c "40P01" "$D/out2" || true)
+send 1 "SELECT name FROM t2 WHERE egid = 2 FOR UPDATE;" # parks behind S2
+sleep 0.3 # S1 is parked mid-statement and cannot answer a sync marker
+send 2 "SELECT name FROM t2 WHERE egid = 1 FOR UPDATE;" # closes the cycle
+sync_session 2
+if [ "$(grep -c "40P01" "$D/out2" || true)" = "$((N40 + 1))" ]; then
+    ok "FOR UPDATE deadlock refused at the closing edge with 40P01"
+else bad "no 40P01 for the FOR UPDATE deadlock closer"; fi
+send 2 "COMMIT;" # of a failed txn -> rolls back; releases row 2
+sync_session 2
+sync_session 1 # S1's parked FOR UPDATE completes
+if grep -q "row2" "$D/out1"; then
+    ok "victim's abort unblocked the parked FOR UPDATE"
+else bad "parked FOR UPDATE never completed"; fi
+send 1 "ROLLBACK;"
+sync_session 1
+
+# --- FOR UPDATE scan: the cell filter locks the matches, nothing else --------
+send 1 "BEGIN;"
+send 1 "SELECT name FROM t2 WHERE name = 'row2' FOR UPDATE;" # locks egid 2
+sync_session 1
+NU=$(grep -c "UPDATE 1" "$D/out2" || true)
+send 2 "UPDATE t2 SET name = 'nb1' WHERE egid = 1;" # unmatched row: no lock
+sync_session 2
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$((NU + 1))" ]; then
+    ok "unmatched row stays unlocked under FOR UPDATE scan"
+else bad "FOR UPDATE scan locked an unmatched row"; fi
+send 2 "UPDATE t2 SET name = 'z2' WHERE egid = 2;" # matched row: parks
+sleep 0.3
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$((NU + 1))" ]; then
+    ok "matched row is locked by FOR UPDATE scan"
+else bad "matched row was not locked"; fi
+send 1 "COMMIT;"
+sync_session 2
+if [ "$(v "SELECT name FROM t2 WHERE egid = 2;")" = "z2" ]; then
+    ok "blocked writer lands after scan FOR UPDATE commits"
+else bad "blocked writer lost after scan FOR UPDATE"; fi
+
+# --- FOR UPDATE variants: implicit txn works, the rest reject cleanly --------
+if q "SELECT name FROM t2 WHERE egid = 1 FOR UPDATE;" | grep -q "nb1"; then
+    ok "implicit-txn FOR UPDATE works"
+else bad "implicit-txn FOR UPDATE failed"; fi
+if { q "SELECT name FROM t2 FOR SHARE;" 2>&1 || true; } |
+    grep -q "only FOR UPDATE"; then
+    ok "FOR SHARE rejected"
+else bad "FOR SHARE not rejected"; fi
+if { q "SELECT name FROM t2 FOR UPDATE NOWAIT;" 2>&1 || true; } |
+    grep -q "not supported"; then
+    ok "NOWAIT rejected"
+else bad "NOWAIT not rejected"; fi
 
 # --- disconnect mid-txn: rollback + lock release (t is dropped; use t2) ------
 send 1 "BEGIN;"

@@ -70,6 +70,8 @@ pub const Select = struct {
     table: []const u8, // borrowed
     projection: Projection,
     filter: ?Filter,
+    /// FOR UPDATE: lock every matched row exclusively (held to txn end).
+    for_update: bool = false,
 };
 
 pub const Delete = struct {
@@ -219,6 +221,7 @@ const SelectStmtJson = struct {
     targetList: []const ResTargetNode = &.{},
     fromClause: []const FromNode = &.{},
     whereClause: ?WhereNode = null,
+    lockingClause: []const LockingNode = &.{},
     // Clauses this slice doesn't support — presence ⇒ rejection.
     sortClause: []const std.json.Value = &.{},
     groupClause: []const std.json.Value = &.{},
@@ -226,6 +229,17 @@ const SelectStmtJson = struct {
     havingClause: ?std.json.Value = null,
     limitCount: ?std.json.Value = null,
     limitOffset: ?std.json.Value = null,
+
+    // FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED. Unlike zero-valued
+    // ints (omitted), enum strings are always emitted: plain FOR UPDATE
+    // arrives as strength="LCS_FORUPDATE", waitPolicy="LockWaitBlock".
+    const LockingNode = struct {
+        LockingClause: ?struct {
+            strength: []const u8 = "",
+            waitPolicy: []const u8 = "",
+            lockedRels: []const std.json.Value = &.{},
+        } = null,
+    };
 
     const ResTargetNode = struct { ResTarget: struct { val: ColumnRefWrap = .{} } = .{} };
     // A target / WHERE operand must be a column reference; anything else
@@ -473,10 +487,26 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         .invalid => |msg| return .{ .invalid = msg },
     };
 
+    var for_update = false;
+    if (ss.lockingClause.len > 0) {
+        if (ss.lockingClause.len > 1)
+            return invalid("only a single FOR UPDATE clause is supported");
+        const lc = ss.lockingClause[0].LockingClause orelse
+            return invalid("unsupported locking clause");
+        if (!std.mem.eql(u8, lc.strength, "LCS_FORUPDATE"))
+            return invalid("only FOR UPDATE is supported");
+        if (!std.mem.eql(u8, lc.waitPolicy, "LockWaitBlock"))
+            return invalid("NOWAIT / SKIP LOCKED are not supported");
+        if (lc.lockedRels.len > 0)
+            return invalid("FOR UPDATE OF is not supported");
+        for_update = true;
+    }
+
     return .{ .select = .{
         .table = rv.relname,
         .projection = if (star) .star else .{ .columns = try cols.toOwnedSlice(alloc) },
         .filter = filter,
+        .for_update = for_update,
     } };
 }
 

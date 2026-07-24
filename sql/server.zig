@@ -452,10 +452,15 @@ const Handler = struct {
     fn runDml(self: *Handler, state: *pgwire.ConnState, stmt: ddl.DdlStmt) !void {
         // A write can only commit on the leader — reject it up front
         // rather than scanning, locking, and failing at propose. Reads
-        // run on any node (newTxn sets read_ts best-effort). Re-routing a
-        // write to the leader is future work.
+        // run on any node (newTxn sets read_ts best-effort), but FOR
+        // UPDATE takes row locks and bumps against the oracle — leader-
+        // local state — so it is gated like a write. Re-routing to the
+        // leader is future work.
         switch (stmt) {
             .insert, .delete, .update => if (!self.srv.engine.node.isLeader())
+                return replyError(state, "not the leader"),
+            .select => |sel| if (sel.for_update and
+                !self.srv.engine.node.isLeader())
                 return replyError(state, "not the leader"),
             else => {},
         }
@@ -972,46 +977,56 @@ const Handler = struct {
 
         const fields = try a.alloc(pgwire.FieldDescription, outs.items.len);
         for (outs.items, fields) |o, *fd| fd.* = .{ .name = o.name, .type_oid = value.pgTypeOid(o.ty), .format_code = 0 };
-        try state.sendRowDescription(fields);
-
-        // Filter: `egid` → one-hop point get; a payload column → per-row compare.
-        var egid_filter: ?u64 = null;
-        var cell_filter: ?CellFilter = null;
-        if (sel.filter) |f| {
-            const rf = try resolveFilter(state, a, t, f) orelse return;
-            switch (rf) {
-                .egid => |e| egid_filter = e,
-                .cell => |c| cell_filter = c,
-            }
-        }
+        // FOR UPDATE sends NOTHING until every lock is held: lockRow may
+        // Restart the statement, and bytes already on the wire (the row
+        // description, emitted rows) would repeat on the re-run.
+        if (!sel.for_update) try state.sendRowDescription(fields);
 
         var emitter = RowEmitter{
             .state = state,
             .ps = &t.ps,
             .outs = outs.items,
-            .cell_filter = cell_filter,
             .stmt_alloc = a,
         };
         defer emitter.deinit();
 
-        if (egid_filter) |e| {
-            // One-hop point get at the txn snapshot (pending write
-            // first — read-your-own-writes).
-            const k = rowkey.encodeEgid(e);
-            if (try tx.lookup(.{ .namespace = ns, .table_id = table_id, .primary = &k, .timestamp = tx.read_ts })) |found| {
-                defer found.release();
-                _ = try emitter.emit(found.item);
+        // Plain SELECT streams matches to the wire as run() visits
+        // them; FOR UPDATE captures them (values included) to lock
+        // every one BEFORE the first byte is sent — the UPDATE/DELETE
+        // lock-all shape with "act" = emission.
+        var sc = Scanner{
+            .a = a,
+            .ps = &t.ps,
+            .mode = if (sel.for_update)
+                .copy_value
+            else
+                .{ .emit_value = &emitter },
+            .lock = sel.for_update,
+        };
+        if (sel.filter) |f| {
+            switch ((try resolveFilter(state, a, t, f)) orelse return) {
+                .egids => |es| sc.source = .{ .egids = es },
+                .cell => |c| sc.cell_filter = c,
             }
-        } else {
-            tx.recordScan();
-            // Full-table scan in egid order (limitToTable confines it to this
-            // table across the namespace-wide memtable).
-            const scan_range = (zdb.level.KeyRange{}).limitToTable(ns, table_id);
-            _ = eng.forest.scan(eng.allocator, scan_range, .{ .read_ts = tx.read_ts, .pending = tx.writes }, &emitter, RowEmitter.scanCb) catch |err| {
-                log.err("select from '{s}': scan: {s}", .{ sel.table, @errorName(err) });
-                return replyError(state, "scan failed");
-            };
-            if (emitter.err) |err| return err; // a send error mid-scan — the serve loop handles it
+        }
+        sc.run(eng, ns, table_id, tx) catch |err|
+            return replyRunErr(state, "select from", sel.table, err);
+        if (sc.err) |err| {
+            // Streaming: an emit error is a wire error — surface it
+            // to the serve loop. Capture: arena OOM — reply.
+            if (!sel.for_update) return err;
+            log.err("select from '{s}': collect: {s}", .{
+                sel.table, @errorName(err),
+            });
+            return replyError(state, "select failed");
+        }
+        if (sel.for_update) {
+            // run() returned with every match locked: none committed
+            // above read_ts (that lockRow would have bumped →
+            // restarted), so the captured values are the newest
+            // versions, frozen by our locks — emit them now.
+            try state.sendRowDescription(fields);
+            for (sc.items.items) |item| try emitter.emit(item);
         }
 
         try state.sendCommandComplete(try std.fmt.allocPrint(a, "SELECT {d}", .{emitter.count}));
@@ -1038,82 +1053,35 @@ const Handler = struct {
 
         const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
-        // Resolve WHERE: `egid = N` → one-hop point delete; a payload column
-        // → scan + decode; no WHERE → tombstone every live row.
-        var cell_filter: ?CellFilter = null;
-        var point_egid: ?u64 = null;
-        if (del.filter) |f| {
-            const rf = try resolveFilter(state, a, t, f) orelse return;
-            switch (rf) {
-                .egid => |e| point_egid = e,
-                .cell => |c| cell_filter = c,
-            }
-        }
-
-        if (point_egid) |e| {
-            // Lock, then read at read_ts: the lock's bump check already
-            // advanced read_ts past the row's newest committed version
-            // (the previous holder committed with apply-wait before
-            // releasing, so the oracle had it) — the lost-update guard
-            // without a latest-read. The txn's own pending write is
-            // newer still, so it is consulted first. Tombstones read as
-            // absent → honest DELETE 0.
-            const k = rowkey.encodeEgid(e);
-            tx.lockRow(table_id, &k) catch |err| return replyLockErr(state, err);
-            var n: u64 = 0;
-            if (try tx.lookup(.{ .namespace = ns, .table_id = table_id, .primary = &k, .timestamp = tx.read_ts })) |found| {
-                found.release();
-                n = 1;
-            }
-            if (n == 1) {
-                try tx.put(table_id, &k, "", .{ .kind = .deleted });
-                if (tx.implicit) {
-                    if (!try self.commitOrReply(state, a, tx, "delete", del.table)) return;
-                }
-            }
-            const tag = try std.fmt.allocPrint(a, "DELETE {d}", .{n});
-            return state.sendCommandComplete(tag);
-        }
-
-        // Scan path: the snapshot scan captures matching rows; every one
-        // is locked first (in key order — the scan's order, so concurrent
-        // statements can't cycle), then tombstoned from the capture.
-        tx.recordScan();
-        var col = MatchCollector{
+        // Resolve WHERE: `egid = N` → a point lookup; a payload column
+        // → scan + compare; no WHERE → tombstone every live row. Either
+        // way run() captures the matches; every one is locked, then
+        // tombstoned from the capture.
+        var sc = Scanner{
             .a = a,
             .ps = &t.ps,
-            .cell_filter = cell_filter,
-            .sets = null, // DELETE: tombstoned by key; row bytes unused
+            .mode = .no_value,
+            .lock = true,
         };
-        const scan_range = (zdb.level.KeyRange{}).limitToTable(ns, table_id);
-        _ = eng.forest.scan(
-            eng.allocator,
-            scan_range,
-            .{ .read_ts = tx.read_ts, .pending = tx.writes },
-            &col,
-            MatchCollector.scanCb,
-        ) catch |err| {
-            logDeleteErr(del.table, "scan", err);
-            return replyError(state, "scan failed");
-        };
-        if (col.err) |err| {
+        if (del.filter) |f| {
+            switch ((try resolveFilter(state, a, t, f)) orelse return) {
+                .egids => |es| sc.source = .{ .egids = es },
+                .cell => |c| sc.cell_filter = c,
+            }
+        }
+        sc.run(eng, ns, table_id, tx) catch |err|
+            return replyRunErr(state, "delete from", del.table, err);
+        if (sc.err) |err| {
             logDeleteErr(del.table, "collect", err);
             return replyError(state, "delete failed");
         }
 
-        // Lock every candidate before the first tombstone: lockRow may
-        // raise Restart (read_ts bump), and a restart must find no
-        // half-buffered writes from this statement. Getting past the
-        // locks means NO candidate committed above read_ts — the scan's
-        // captured rows are still the newest versions, now frozen by our
-        // locks, so they are tombstoned directly with no re-read.
-        for (col.items.items) |item|
-            tx.lockRow(table_id, item.key.primary) catch |err|
-                return replyLockErr(state, err);
-
-        for (col.items.items) |item|
+        // Past run()'s locks no candidate committed above read_ts — the
+        // captured rows are the newest versions, frozen by our locks, so
+        // they are tombstoned directly with no re-read.
+        for (sc.items.items) |item|
             try tx.put(table_id, item.key.primary, "", .{ .kind = .deleted });
-        const n = col.items.items.len;
+        const n = sc.items.items.len;
         if (n > 0 and tx.implicit) {
             if (!try self.commitOrReply(state, a, tx, "delete", del.table)) return;
         }
@@ -1159,77 +1127,34 @@ const Handler = struct {
             sv.* = .{ .idx = psIndex(&t.ps, c.column_id), .val = v };
         }
 
-        // Resolve WHERE: `egid = N` → one-hop point update; a payload
-        // column → scan + decode; no WHERE → rewrite every live row.
-        var cell_filter: ?CellFilter = null;
-        var point_egid: ?u64 = null;
+        // Resolve WHERE: `egid = N` → a point lookup; a payload column
+        // → scan + compare; no WHERE → rewrite every live row. Either
+        // way run() captures each match as its REWRITTEN row (see
+        // Scanner.Mode.update_value).
+        var sc = Scanner{
+            .a = a,
+            .ps = &t.ps,
+            .mode = .{ .update_value = sets },
+            .lock = true,
+        };
         if (up.filter) |f| {
-            const rf = try resolveFilter(state, a, t, f) orelse return;
-            switch (rf) {
-                .egid => |e| point_egid = e,
-                .cell => |c| cell_filter = c,
+            switch ((try resolveFilter(state, a, t, f)) orelse return) {
+                .egids => |es| sc.source = .{ .egids = es },
+                .cell => |c| sc.cell_filter = c,
             }
         }
-
-        var n: u64 = 0;
-        if (point_egid) |e| {
-            // Lock, then read at read_ts: the lock's bump check already
-            // advanced read_ts past the row's newest committed version,
-            // so this snapshot read IS the latest state — the
-            // lost-update guard without a latest-read. Tombstones read
-            // as absent → UPDATE 0.
-            const k = rowkey.encodeEgid(e);
-            tx.lockRow(table_id, &k) catch |err| return replyLockErr(state, err);
-            if (try tx.lookup(.{ .namespace = ns, .table_id = table_id, .primary = &k, .timestamp = tx.read_ts })) |found| {
-                defer found.release();
-                var dec = value.Row{};
-                var buf: std.ArrayList(u8) = .empty; // arena-backed
-                const bytes = rewriteRowBytes(a, &t.ps, sets, &dec, found.item.value, &buf) catch |err| {
-                    log.err("update '{s}': rewrite: {s}", .{ up.table, @errorName(err) });
-                    return replyError(state, "update failed");
-                };
-                try tx.put(table_id, &k, bytes, .{});
-                n = 1;
-            }
-        } else {
-            // Snapshot scan captures each match as its REWRITTEN row
-            // (see MatchCollector.sets); lock each in key order, then
-            // buffer the precomputed rows.
-            tx.recordScan();
-            var col = MatchCollector{
-                .a = a,
-                .ps = &t.ps,
-                .cell_filter = cell_filter,
-                .sets = sets,
-            };
-            const scan_range = (zdb.level.KeyRange{}).limitToTable(ns, table_id);
-            _ = eng.forest.scan(
-                eng.allocator,
-                scan_range,
-                .{ .read_ts = tx.read_ts, .pending = tx.writes },
-                &col,
-                MatchCollector.scanCb,
-            ) catch |err| {
-                log.err("update '{s}': scan: {s}", .{ up.table, @errorName(err) });
-                return replyError(state, "scan failed");
-            };
-            if (col.err) |err| {
-                log.err("update '{s}': collect: {s}", .{ up.table, @errorName(err) });
-                return replyError(state, "update failed");
-            }
-            // Lock EVERY candidate before buffering the first write:
-            // lockRow may raise Restart (read_ts bump), and a restart
-            // must find no half-buffered writes from this statement.
-            // Getting past the locks means NO candidate committed above
-            // read_ts — the rows the captures were rewritten from were
-            // the newest versions, now frozen by our locks.
-            for (col.items.items) |item|
-                tx.lockRow(table_id, item.key.primary) catch |err|
-                    return replyLockErr(state, err);
-            for (col.items.items) |item|
-                try tx.put(table_id, item.key.primary, item.value, .{});
-            n = col.items.items.len;
+        sc.run(eng, ns, table_id, tx) catch |err|
+            return replyRunErr(state, "update", up.table, err);
+        if (sc.err) |err| {
+            log.err("update '{s}': collect: {s}", .{ up.table, @errorName(err) });
+            return replyError(state, "update failed");
         }
+        // Past run()'s locks no candidate committed above read_ts — the
+        // rows the captures were rewritten from were the newest
+        // versions, frozen by our locks; buffer them directly.
+        for (sc.items.items) |item|
+            try tx.put(table_id, item.key.primary, item.value, .{});
+        const n = sc.items.items.len;
 
         if (tx.implicit) {
             if (!try self.commitOrReply(state, a, tx, "update", up.table)) return;
@@ -1280,10 +1205,10 @@ fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {
     );
 }
 
-/// A resolved WHERE `col = value`: the `egid` pseudo-column becomes a point id;
-/// any payload column becomes a per-row cell compare. Shared by SELECT and
-/// DELETE.
-const ResolvedFilter = union(enum) { egid: u64, cell: CellFilter };
+/// A resolved WHERE `col = value`: the `egid` pseudo-column becomes a
+/// point-id list (one entry today; IN-lists later); any payload column
+/// becomes a per-row cell compare. Feeds Scanner's source / cell_filter.
+const ResolvedFilter = union(enum) { egids: []const u64, cell: CellFilter };
 
 /// Resolve a parsed `col = literal` filter against `t`. `a` (the statement
 /// arena) backs the coerced compare value. On an unknown column, a bad egid,
@@ -1312,7 +1237,7 @@ fn resolveFilter(
             );
             return null;
         }
-        return .{ .egid = @intCast(n) };
+        return .{ .egids = try a.dupe(u64, &.{@intCast(n)}) };
     }
     const fc = t.column(f.column) orelse {
         try replyErrorCode(
@@ -1332,33 +1257,25 @@ fn resolveFilter(
     return .{ .cell = .{ .idx = psIndex(&t.ps, fc.column_id), .val = val } };
 }
 
-/// Turns each scanned/fetched row into a projected, filtered DataRow on the
-/// wire. Holds the projection + filter so per-row work is one method call —
-/// used directly for a point get and via `scanCb` for a scan. Columns format
-/// straight into the frame (pgwire DataRowWriter), which the connection's
-/// buffered writer batches to the socket.
+/// Turns each row into a projected DataRow on the wire — Scanner's
+/// emitter for streaming (emit_value), and driven directly to emit a
+/// FOR UPDATE capture post-lock (filtering is Scanner's job either
+/// way). Columns format straight into the frame (pgwire DataRowWriter),
+/// which the connection's buffered writer batches to the socket.
 const RowEmitter = struct {
     state: *pgwire.ConnState,
     ps: *const schema.PhysicalSchema,
     outs: []const SelectOut,
-    cell_filter: ?CellFilter,
     stmt_alloc: std.mem.Allocator, // backs the reused `decoded` row
     decoded: value.Row = .{},
     count: u64 = 0,
-    err: ?anyerror = null,
 
     fn deinit(self: *RowEmitter) void {
         self.decoded.deinit(self.stmt_alloc);
     }
 
-    /// Filter, project, and send one row (true if sent, false if filtered out).
-    fn emit(self: *RowEmitter, item: zdb.kv.Item) !bool {
-        // Filter on the one cell it names first; only survivors pay the
-        // full decode for projection.
-        if (self.cell_filter) |cf| {
-            if (!value.valuesEqual(row.readCell(self.ps, item.value, cf.idx), cf.val))
-                return false;
-        }
+    /// Project and send one row.
+    fn emit(self: *RowEmitter, item: zdb.kv.Item) !void {
         try row.unmarshalRow(self.stmt_alloc, self.ps, item.value, &.{}, &self.decoded);
 
         var dw = try self.state.beginDataRow(@intCast(self.outs.len));
@@ -1376,36 +1293,34 @@ const RowEmitter = struct {
         }
         try dw.finish();
         self.count += 1;
-        return true;
-    }
-
-    /// forest.scan callback: emit, capturing any error so the scan stops.
-    fn scanCb(self: *RowEmitter, item: zdb.kv.Item) anyerror!bool {
-        _ = self.emit(item) catch |e| {
-            self.err = e;
-            return false;
-        };
-        return true;
     }
 };
 
-/// Collects the egid keys of the rows a DELETE matches. With a cell filter each
-/// row is decoded and compared (same recipe as RowEmitter.emit); without one
-/// the key alone suffices — no decode. Keys are duped into the statement
-/// arena because scan Items don't outlive the callback. Default ScanOptions
-/// skip tombstones, so only live rows are collected — re-running reports 0.
-const MatchCollector = struct {
+/// The statement scanner — the one forest.scan callback for DML. Filters
+/// each row on the single cell the WHERE names (no full-row decode),
+/// then handles the match per `mode` — streamed to the wire, or captured
+/// into `items` for a post-lock pass (duped into the statement arena;
+/// scan Items don't outlive the callback). Default ScanOptions skip
+/// tombstones, so only live rows are seen — re-running a DELETE reports 0.
+const Scanner = struct {
     a: std.mem.Allocator, // statement arena — backs items
     ps: *const schema.PhysicalSchema,
-    cell_filter: ?CellFilter,
-    /// UPDATE's SET overlay — non-null makes each match's capture the
-    /// REWRITTEN row (built here, while the scan's source bytes are
-    /// alive), so the old value is never copied and the post-lock pass
-    /// just buffers `items` verbatim. Null (DELETE): key-only capture.
-    sets: ?[]const SetVal,
+    cell_filter: ?CellFilter = null,
+    source: Source = .table,
+    mode: Mode,
+    /// Lock every matched row (exclusive, held to txn end) before run()
+    /// returns: point keys BEFORE their read (the lock's bump makes the
+    /// read the newest version — the lost-update guard without a
+    /// latest-read), scan captures after the scan, in key order so
+    /// concurrent statements can't cycle. lockRow may raise Restart
+    /// mid-run — safe exactly because run() has buffered no writes and
+    /// sent no wire bytes; the re-run finds the locks still held
+    /// (re-entrant) and takes a fresh capture. Streaming (emit_value)
+    /// must NOT lock: its rows are already on the wire and a Restart
+    /// would resend them.
+    lock: bool = false,
     decoded: value.Row = .{}, // rewrite decode scratch, arena-backed
-    /// Matches duped into the statement arena — value empty (DELETE) or
-    /// the rewritten row (UPDATE). The post-lock pass tombstones/puts
+    /// Captured matches. The post-lock pass tombstones/puts/emits
     /// straight from these: reaching it means no candidate committed
     /// above read_ts (that lockRow would have bumped → restarted →
     /// re-scanned), so the scan-time source IS the newest version and
@@ -1413,39 +1328,152 @@ const MatchCollector = struct {
     items: std.ArrayList(zdb.kv.Item) = .empty,
     err: ?anyerror = null,
 
-    fn collect(self: *MatchCollector, item: zdb.kv.Item) !void {
+    /// Where the statement's rows come from.
+    const Source = union(enum) {
+        /// Snapshot scan of the whole table; cell_filter prunes rows.
+        table,
+        /// Point lookups by row id — `WHERE egid = N` today (one
+        /// entry), IN-lists later. With `lock` set, each key is locked
+        /// BEFORE its read: the lock's bump has already advanced
+        /// read_ts, so the value read is the newest. An absent row
+        /// still leaves its key locked — harmless today, and the
+        /// phantom-insert guard once explicit row ids exist.
+        egids: []const u64,
+    };
+
+    /// What each match's value gets used for.
+    const Mode = union(enum) {
+        /// DELETE: key-only capture — tombstoned by key, bytes unused.
+        no_value,
+        /// SELECT FOR UPDATE: capture the row verbatim; the post-lock
+        /// pass emits it.
+        copy_value,
+        /// Plain SELECT: straight to the wire; nothing is captured.
+        emit_value: *RowEmitter,
+        /// UPDATE: capture the REWRITTEN row (built here, while the
+        /// scan's source bytes are alive), so the old value is never
+        /// copied and the post-lock pass just buffers it verbatim.
+        update_value: []const SetVal,
+    };
+
+    fn collect(self: *Scanner, item: zdb.kv.Item) !void {
         // Filter on the ONE cell it names — no full-row decode here.
         if (self.cell_filter) |cf| {
             if (!value.valuesEqual(row.readCell(self.ps, item.value, cf.idx), cf.val))
                 return;
         }
-        var captured = try item.dupeNoValue(self.a);
-        if (self.sets) |sets| {
-            // Rewrite now, borrowing the scan's transient row bytes:
-            // pure computation into the arena — no txn state touched, so
-            // a later Restart just discards it with the statement arena.
-            var buf: std.ArrayList(u8) = .empty; // arena; bytes persist
-            captured.value = try rewriteRowBytes(
-                self.a,
-                self.ps,
-                sets,
-                &self.decoded,
-                item.value,
-                &buf,
-            );
-        }
+        const captured: zdb.kv.Item = switch (self.mode) {
+            .emit_value => |em| return em.emit(item),
+            .no_value => try item.dupeNoValue(self.a),
+            .copy_value => try item.dupe(self.a),
+            .update_value => |sets| rewritten: {
+                var cap = try item.dupeNoValue(self.a);
+                // Rewrite now, borrowing the scan's transient row
+                // bytes: pure computation into the arena — no txn state
+                // touched, so a later Restart just discards it with the
+                // statement arena.
+                var buf: std.ArrayList(u8) = .empty; // arena; persists
+                cap.value = try rewriteRowBytes(
+                    self.a,
+                    self.ps,
+                    sets,
+                    &self.decoded,
+                    item.value,
+                    &buf,
+                );
+                break :rewritten cap;
+            },
+        };
         try self.items.append(self.a, captured);
     }
 
     /// forest.scan callback: collect, capturing any error so the scan stops.
-    fn scanCb(self: *MatchCollector, item: zdb.kv.Item) anyerror!bool {
+    fn scanCb(self: *Scanner, item: zdb.kv.Item) anyerror!bool {
         self.collect(item) catch |e| {
             self.err = e;
             return false;
         };
         return true;
     }
+
+    /// Feed the statement's rows through `collect`, per `source` — and
+    /// when `lock` is set, return only once every match is locked.
+    /// Point lookups read at the txn's read_ts (pending write first —
+    /// read-your-own-writes; tombstones read as absent). The table scan
+    /// is recorded on the txn first (SI: prior-scan revalidation on a
+    /// later bump); limitToTable confines it across the namespace-wide
+    /// memtable. Collect errors land in `err`; lock errors propagate —
+    /// callers map them via replyRunErr.
+    fn run(
+        self: *Scanner,
+        eng: *engine.Engine,
+        ns: u64,
+        table_id: u32,
+        tx: *txn.Txn,
+    ) !void {
+        std.debug.assert(!(self.lock and self.mode == .emit_value));
+        switch (self.source) {
+            .egids => |egids| for (egids) |egid| {
+                const k = rowkey.encodeEgid(egid);
+                if (self.lock) try tx.lockRow(table_id, &k);
+
+                const found = (try tx.lookup(.{
+                    .namespace = ns,
+                    .table_id = table_id,
+                    .primary = &k,
+                    .timestamp = tx.read_ts,
+                })) orelse continue;
+                defer found.release();
+
+                self.collect(found.item) catch |e| {
+                    self.err = e;
+                    return;
+                };
+            },
+            .table => {
+                tx.recordScan();
+                _ = try eng.forest.scan(
+                    eng.allocator,
+                    (zdb.level.KeyRange{}).limitToTable(ns, table_id),
+                    .{ .read_ts = tx.read_ts, .pending = tx.writes },
+                    self,
+                    Scanner.scanCb,
+                );
+                // A failed collect ends the statement — don't bother
+                // locking a partial capture.
+                if (self.lock and self.err == null)
+                    for (self.items.items) |item|
+                        try tx.lockRow(table_id, item.key.primary);
+            },
+        }
+    }
 };
+
+/// Map a Scanner.run failure onto the wire: row-lock errors (run locks
+/// the matches when Scanner.lock is set) ride replyLockErr — Restart
+/// propagates to the statement driver — and anything else is an
+/// internal scan failure.
+fn replyRunErr(
+    state: *pgwire.ConnState,
+    comptime verb: []const u8,
+    table_name: []const u8,
+    err: anyerror,
+) !void {
+    return switch (err) {
+        error.Restart,
+        error.Conflict,
+        error.Deadlock,
+        error.Upgrade,
+        => replyLockErr(state, err),
+        else => {
+            log.err(
+                verb ++ " '{s}': scan: {s}",
+                .{ table_name, @errorName(err) },
+            );
+            return replyError(state, "scan failed");
+        },
+    };
+}
 
 /// Map a lock failure onto the wire. Deadlock: this statement's wait
 /// would have closed a cycle — it is the victim; 40P01, the client
