@@ -8,8 +8,11 @@
 # DML txns), read_ts bumps (blocked writer restarts and applies with no
 # abort; a stale prior read aborts 40001), SELECT FOR UPDATE (blocks
 # writers not readers, deadlocks 40P01, a cell-filter scan locks exactly
-# the matches, FOR SHARE / NOWAIT reject), and disconnect rollback +
-# lock release. Wipes /data/egres.
+# the matches, FOR SHARE / NOWAIT reject), PRIMARY KEY enforcement (unique
+# index: 23505 duplicates in-statement + sequential + concurrent, 23502 NULL
+# keys, DELETE frees the key, UPDATE-of-PK 0A000, and the index-key lock
+# serializing racing inserters), and disconnect rollback + lock release.
+# Wipes /data/egres.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -323,6 +326,90 @@ if { q "SELECT name FROM t2 FOR UPDATE NOWAIT;" 2>&1 || true; } |
     grep -q "not supported"; then
     ok "NOWAIT rejected"
 else bad "NOWAIT not rejected"; fi
+
+# --- PRIMARY KEY: unique-index enforcement + concurrency --------------------
+# A real PK table (the suites above are egid-only). Enforcement is a unique
+# index: duplicates 23505, NULL keys 23502, and the index entry is locked so
+# concurrent inserters of one key serialize.
+q "CREATE TABLE pk (id int4 PRIMARY KEY, name text);" >/dev/null
+q "INSERT INTO pk VALUES (1, 'a'), (3, 'c');" >/dev/null
+# q() runs a non-verbose psql, so these grep the error message text (the
+# SQLSTATE only prints under \set VERBOSITY verbose, which the sessions set).
+if { q "INSERT INTO pk VALUES (1, 'dup');" 2>&1 || true; } | grep -q "duplicate key"; then
+    ok "sequential duplicate PK rejected"
+else bad "sequential duplicate PK not rejected"; fi
+if { q "INSERT INTO pk VALUES (8, 'x'), (8, 'y');" 2>&1 || true; } | grep -q "duplicate key"; then
+    ok "in-statement duplicate PK rejected"
+else bad "in-statement duplicate PK not rejected"; fi
+if { q "INSERT INTO pk (name) VALUES ('z');" 2>&1 || true; } | grep -q "not-null constraint"; then
+    ok "NULL primary key rejected"
+else bad "NULL primary key not rejected"; fi
+if q "INSERT INTO pk VALUES (4, 'd'), (5, 'e');" | grep -q "INSERT 0 2"; then
+    ok "distinct multi-row INSERT succeeds"
+else bad "distinct multi-row INSERT failed"; fi
+# DELETE clears the index entry, so the same PK re-inserts (index maintained).
+q "DELETE FROM pk WHERE id = 1;" >/dev/null
+if q "INSERT INTO pk VALUES (1, 'a2');" | grep -q "INSERT 0 1"; then
+    ok "re-INSERT of a deleted PK succeeds"
+else bad "re-INSERT after delete rejected — stale index entry"; fi
+if { q "UPDATE pk SET id = 99 WHERE id = 3;" 2>&1 || true; } | grep -q "cannot be updated"; then
+    ok "UPDATE of the PK column rejected"
+else bad "UPDATE of the PK column not rejected"; fi
+
+# Concurrent insert of one key: the loser parks on the index-key lock, then
+# 23505 once the winner commits.
+DUP0=$(grep -c "23505" "$D/out2" || true)
+INS0=$(grep -c "INSERT 0 1" "$D/out2" || true)
+send 1 "BEGIN;"
+send 1 "INSERT INTO pk VALUES (20, 's1');"
+sync_session 1
+send 2 "INSERT INTO pk VALUES (20, 's2');" # parks on the index-key lock
+sleep 0.3
+if [ "$(grep -c "INSERT 0 1" "$D/out2")" = "$INS0" ] &&
+    [ "$(grep -c "23505" "$D/out2")" = "$DUP0" ]; then
+    ok "concurrent same-PK insert blocks on the index lock"
+else bad "second inserter was not blocked"; fi
+send 1 "COMMIT;"
+sync_session 2
+if [ "$(grep -c "23505" "$D/out2")" -gt "$DUP0" ]; then
+    ok "loser gets 23505 once the winner commits"
+else bad "loser did not get 23505 after winner committed"; fi
+
+# Same race, but the holder ROLLBACKs → the key is free, the waiter lands.
+INS1=$(grep -c "INSERT 0 1" "$D/out2" || true)
+send 1 "BEGIN;"
+send 1 "INSERT INTO pk VALUES (21, 'r1');"
+sync_session 1
+send 2 "INSERT INTO pk VALUES (21, 'r2');" # parks on the index-key lock
+sleep 0.3
+send 1 "ROLLBACK;"
+sync_session 2
+if [ "$(grep -c "INSERT 0 1" "$D/out2")" -gt "$INS1" ]; then
+    ok "waiter's insert lands after the holder rolls back"
+else bad "waiter blocked or rejected after rollback"; fi
+
+# WHERE <pk> = v routes through the unique index (point lookup, not a scan).
+if [ "$(v "SELECT name FROM pk WHERE id = 4;")" = "d" ]; then
+    ok "SELECT WHERE pk routes through the index and returns the row"
+else bad "index point SELECT wrong: $(v "SELECT name FROM pk WHERE id = 4;")"; fi
+
+# Phantom-insert guard: FOR UPDATE on an ABSENT key locks that index key, so a
+# concurrent INSERT of it blocks until the guard's txn ends. A cell scan of an
+# absent row would lock nothing — this works only via the index.
+GI0=$(grep -c "INSERT 0 1" "$D/out2" || true)
+send 1 "BEGIN;"
+send 1 "SELECT name FROM pk WHERE id = 50 FOR UPDATE;" # 0 rows, locks index[50]
+sync_session 1
+send 2 "INSERT INTO pk VALUES (50, 'ghost');" # parks on the absent-key lock
+sleep 0.3
+if [ "$(grep -c "INSERT 0 1" "$D/out2")" = "$GI0" ]; then
+    ok "FOR UPDATE on an absent PK blocks a concurrent insert (phantom guard)"
+else bad "phantom insert was not blocked"; fi
+send 1 "COMMIT;"
+sync_session 2
+if [ "$(grep -c "INSERT 0 1" "$D/out2")" -gt "$GI0" ]; then
+    ok "the insert proceeds once the guard's txn ends"
+else bad "insert never proceeded after the guard released"; fi
 
 # --- disconnect mid-txn: rollback + lock release (t is dropped; use t2) ------
 send 1 "BEGIN;"

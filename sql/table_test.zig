@@ -31,10 +31,14 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
 
     const ns: u64 = 16;
     const user_table_id: u32 = 16;
+    const pkey_index_id: u32 = 17;
     _ = try f.createTree(ns, catalog.table_id, .{ .inf = true });
+    _ = try f.createTree(ns, catalog.index_table_id, .{ .inf = true });
 
     var catalog_ps = try schema.compile(alloc, catalog.logical_schema, catalog.logical_schema.current_version);
     defer catalog_ps.deinit(alloc);
+    var index_ps = try schema.compile(alloc, catalog.index_logical_schema, catalog.index_logical_schema.current_version);
+    defer index_ps.deinit(alloc);
 
     // Synthetic table: (id int4 PRIMARY KEY, name text).
     const cols = [_]schema.LogicalColumn{
@@ -65,13 +69,44 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
             .meta = .{},
         });
     }
+
+    // One index row: a unique PK index on column 1, in its own tree.
+    {
+        const def = catalog.IndexDef{
+            .base_table_id = user_table_id,
+            .index_table_id = pkey_index_id,
+            .column_id = 1,
+            .unique = true,
+        };
+        const cells = catalog.encodeIndex(def);
+        const bytes = try row.marshalRow(alloc, &index_ps, &cells, &buf);
+        const ikey = catalog.encodeIndexKey(user_table_id, pkey_index_id);
+        try items.append(alloc, .{
+            .key = .{
+                .namespace = ns,
+                .table_id = catalog.index_table_id,
+                .primary = try a.dupe(u8, &ikey),
+                .timestamp = 1,
+            },
+            .value = try a.dupe(u8, bytes),
+            .meta = .{},
+        });
+    }
     try f.put(items.items);
 
-    var t = try sql.table.loadTableSchema(alloc, f, &catalog_ps, ns, user_table_id);
+    var t = try sql.table.loadTableSchema(alloc, f, &catalog_ps, &index_ps, ns, user_table_id);
     defer t.deinit();
 
     try testing.expectEqual(@as(usize, 2), t.columns.len);
     try testing.expectEqual(@as(u16, 1), t.version);
+
+    // The PK index loads, and the pkey summary points at column 1's index.
+    try testing.expectEqual(@as(usize, 1), t.indexes.len);
+    try testing.expectEqual(pkey_index_id, t.indexes[0].index_table_id);
+    try testing.expect(t.indexes[0].unique);
+    try testing.expect(t.pkey != null);
+    try testing.expectEqual(@as(usize, 0), t.pkey.?.column_index);
+    try testing.expectEqual(pkey_index_id, t.pkey.?.index_table_id);
 
     try testing.expectEqualStrings("id", t.columns[0].name);
     try testing.expectEqual(Type.int4, t.columns[0].ty);
@@ -105,6 +140,8 @@ test "sql.table: load returns UndefinedTable when no catalog rows exist" {
 
     var catalog_ps = try schema.compile(alloc, catalog.logical_schema, catalog.logical_schema.current_version);
     defer catalog_ps.deinit(alloc);
+    var index_ps = try schema.compile(alloc, catalog.index_logical_schema, catalog.index_logical_schema.current_version);
+    defer index_ps.deinit(alloc);
 
-    try testing.expectError(error.UndefinedTable, sql.table.loadTableSchema(alloc, f, &catalog_ps, ns, 999));
+    try testing.expectError(error.UndefinedTable, sql.table.loadTableSchema(alloc, f, &catalog_ps, &index_ps, ns, 999));
 }

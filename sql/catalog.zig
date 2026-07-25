@@ -18,10 +18,16 @@
 //! Out of scope here: table-name ↔ table_id and database metadata (a separate
 //! registry, pg_class's job). On disk the `type` column is the Type enum
 //! ordinal, so reordering Type is a catalog-format change.
+//!
+//! Table 2 is a second system catalog: the INDEX registry (pg_index's job).
+//! One row per index, keyed (base_table_id, index_table_id) big-endian, so a
+//! base_table_id prefix scan walks a table's indexes — what DROP TABLE and
+//! schema load consume. Its own compiled-in schema, same as table 1's.
 
 const std = @import("std");
 const value = @import("value.zig");
 const schema = @import("schema.zig");
+const key = @import("key.zig");
 
 const Type = value.Type;
 const Value = value.Value;
@@ -29,9 +35,12 @@ const Row = value.Row;
 const LogicalColumn = schema.LogicalColumn;
 const LogicalSchema = schema.LogicalSchema;
 
-/// Every namespace reserves table_id 1 for its catalog (0 is the raw-KV
-/// default table; user tables start at zdb's first_table_id, 16).
+/// Every namespace reserves table_id 1 for its column catalog and table_id 2
+/// for its index catalog (0 is the raw-KV default table; tids 3–15 stay
+/// reserved for future system tables; user tables start at zdb's
+/// first_table_id, 16).
 pub const table_id: u32 = 1;
+pub const index_table_id: u32 = 2;
 
 /// The catalog's own columns, by stable column_id. Their ascending order is
 /// also the cell order encodeColumn/decodeColumn use. (`type` is a Zig
@@ -148,23 +157,95 @@ pub fn reconstruct(columns: []const LogicalColumn) LogicalSchema {
 /// order matches numeric order — a prefix scan over a table_id walks its
 /// columns in ascending column_id.
 pub fn encodeKey(owner_table_id: u32, column_id: u32) [8]u8 {
-    var k: [8]u8 = undefined;
-    std.mem.writeInt(u32, k[0..4], owner_table_id, .big);
-    std.mem.writeInt(u32, k[4..8], column_id, .big);
-    return k;
-}
-
-/// The 4-byte key prefix selecting every column of one table.
-pub fn tablePrefix(owner_table_id: u32) [4]u8 {
-    var p: [4]u8 = undefined;
-    std.mem.writeInt(u32, &p, owner_table_id, .big);
-    return p;
+    return (key.U64{ .upper = owner_table_id, .lower = column_id }).encode();
 }
 
 pub fn decodeKey(k: []const u8) Error!Key {
-    if (k.len != 8) return error.CorruptCatalogRow;
+    const p = key.U64.decode(k) orelse return error.CorruptCatalogRow;
+    return .{ .table_id = p.upper, .column_id = p.lower };
+}
+
+// -----------------------------------------------------------------------------
+// Index catalog (table 2): one row per index. Value = the index descriptor
+// (which base table, which column, unique?); key = (base_table_id,
+// index_table_id) big-endian.
+// -----------------------------------------------------------------------------
+
+/// The index catalog's columns, by stable column_id — also the cell order
+/// encodeIndex/decodeIndex use.
+pub const IndexField = enum(u32) {
+    base_table_id = 1,
+    index_table_id = 2,
+    column_id = 3,
+    unique = 4,
+};
+
+/// The fixed schema of the index catalog, compiled into the binary. ids are
+/// uint4, `unique` is a bool. Single-column today; a composite index will
+/// widen `column_id` into an ordered list cell.
+pub const index_logical_schema: LogicalSchema = .{
+    .current_version = 1,
+    .columns = &.{
+        .{ .column_id = @intFromEnum(IndexField.base_table_id), .name = "base_table_id", .ty = .uint4 },
+        .{ .column_id = @intFromEnum(IndexField.index_table_id), .name = "index_table_id", .ty = .uint4 },
+        .{ .column_id = @intFromEnum(IndexField.column_id), .name = "column_id", .ty = .uint4 },
+        .{ .column_id = @intFromEnum(IndexField.unique), .name = "unique", .ty = .bool_ },
+    },
+};
+
+/// A decoded index catalog row: one index of `base_table_id`, stored in its
+/// own tree (`index_table_id`), keyed on `column_id`'s value.
+pub const IndexDef = struct {
+    base_table_id: u32,
+    index_table_id: u32,
+    column_id: u32,
+    unique: bool,
+};
+
+/// Build the index catalog row cells (column_id order) for `def`. Pass
+/// `&result` to marshalRow with the index catalog's compiled PhysicalSchema.
+pub fn encodeIndex(def: IndexDef) [4]Value {
     return .{
-        .table_id = std.mem.readInt(u32, k[0..4], .big),
-        .column_id = std.mem.readInt(u32, k[4..8], .big),
+        .{ .uint4 = def.base_table_id },
+        .{ .uint4 = def.index_table_id },
+        .{ .uint4 = def.column_id },
+        .{ .bool_ = def.unique },
+    };
+}
+
+/// Decode a fully-read index catalog row (four cells, column_id order).
+pub fn decodeIndex(r: *const Row) Error!IndexDef {
+    if (r.len() != 4) return error.CorruptCatalogRow;
+    if (r.at(0) != .uint4 or r.at(1) != .uint4 or
+        r.at(2) != .uint4 or r.at(3) != .bool_)
+        return error.CorruptCatalogRow;
+    return .{
+        .base_table_id = r.at(0).uint4,
+        .index_table_id = r.at(1).uint4,
+        .column_id = r.at(2).uint4,
+        .unique = r.at(3).bool_,
+    };
+}
+
+/// Index catalog row key: (base_table_id, index_table_id) big-endian, so a
+/// base_table_id prefix scan walks a table's indexes in index_table_id order.
+/// Same (u32, u32) BE shape as the column catalog's key — delegated to
+/// encodeKey so the byte layout has one owner.
+/// (Distinct from key.encodeIndexKey, which encodes an index ENTRY's value.)
+pub fn encodeIndexKey(base_table_id: u32, index_tid: u32) [8]u8 {
+    return encodeKey(base_table_id, index_tid);
+}
+
+/// The IndexDef an index catalog row KEY alone determines: base_table_id
+/// and index_table_id. The value-borne fields (column_id, unique) are
+/// zeroed — decodeIndex reads those. Null if `primary` isn't index-key
+/// shaped (8 bytes).
+pub fn decodeIndexKey(primary: []const u8) ?IndexDef {
+    const k = decodeKey(primary) catch return null;
+    return .{
+        .base_table_id = k.table_id,
+        .index_table_id = k.column_id,
+        .column_id = 0,
+        .unique = false,
     };
 }

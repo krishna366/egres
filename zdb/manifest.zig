@@ -42,6 +42,16 @@ pub const first_table_id: u32 = 16;
 /// is created with the namespace itself (see forest.buildNamespaceCreate).
 pub const catalog_table_id: u32 = 1;
 
+/// The namespace's SQL index catalog (one row per index). Like the catalog,
+/// its tree is born with the namespace.
+pub const index_catalog_table_id: u32 = 2;
+
+/// Every tree a namespace is born with, by table_id: the default raw-KV
+/// table plus the SQL catalogs. forest.buildNamespaceCreate and the genesis
+/// seeder both loop over this — extend the list to add a system tree.
+pub const namespace_system_table_ids =
+    [_]u32{ 0, catalog_table_id, index_catalog_table_id };
+
 /// namespaces 1–15 are reserved for future engine use. User databases start
 /// here. nextNamespace floors next_ns_id at this value.
 pub const first_namespace: u64 = 16;

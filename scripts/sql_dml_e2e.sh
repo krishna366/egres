@@ -53,7 +53,10 @@ start_server
 trap stop_server EXIT
 
 # --- create + insert -------------------------------------------------------
-expect "CREATE TABLE" "CREATE TABLE" q "CREATE TABLE t (id int4 PRIMARY KEY, name text);"
+# No PRIMARY KEY: this suite exercises egid-as-identity + data mechanics (rows
+# are looked up by egid/name, and several inserts omit `id`). PK enforcement
+# and its concurrency live in sql_txn_e2e.sh.
+expect "CREATE TABLE" "CREATE TABLE" q "CREATE TABLE t (id int4, name text);"
 expect "INSERT two rows" "INSERT 0 2" q "INSERT INTO t VALUES (1, 'a'), (2, 'b');"
 
 # --- select back -----------------------------------------------------------

@@ -4,7 +4,6 @@ const sql = @import("sql");
 const pgwire = @import("pgwire");
 const Type = sql.Type;
 const value = sql.value;
-const rowkey = sql.rowkey;
 
 test "sql.value: fixedWidth and isVarlen per type" {
     try testing.expectEqual(@as(?u8, 1), Type.bool_.fixedWidth());
@@ -95,16 +94,4 @@ test "sql.value: pgTypeOid widens unsigned ints" {
     try testing.expectEqual(pgwire.oid.numeric, value.pgTypeOid(.uint8)); // widen
     try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.text));
     try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.date)); // no dedicated oid yet
-}
-
-test "sql.rowkey: egid encodes big-endian and round-trips in key order" {
-    const a = rowkey.encodeEgid(1);
-    const b = rowkey.encodeEgid(256);
-    // Big-endian ⇒ byte order matches numeric order.
-    try testing.expect(std.mem.order(u8, &a, &b) == .lt);
-    try testing.expectEqual(@as(?u64, 1), rowkey.decodeEgid(&a));
-    try testing.expectEqual(@as(?u64, 256), rowkey.decodeEgid(&b));
-    // Non-8-byte primaries aren't egid-shaped.
-    try testing.expectEqual(@as(?u64, null), rowkey.decodeEgid("abc"));
-    try testing.expectEqual(@as(?u64, null), rowkey.decodeEgid(""));
 }

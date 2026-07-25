@@ -98,6 +98,54 @@ test "sql.catalog: current_version derives from the highest add/drop" {
     try testing.expectEqual(@as(u16, 5), catalog.deriveCurrentVersion(&cols));
 }
 
+test "sql.catalog: an index descriptor round-trips through an index row" {
+    const alloc = testing.allocator;
+
+    var ips = try sql.compile(alloc, catalog.index_logical_schema, 1);
+    defer ips.deinit(alloc);
+    try testing.expectEqual(@as(usize, 4), ips.columns.len);
+    try testing.expectEqual(@as(u16, 0), ips.n_varlen); // all fixed-width
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var r: sql.Row = .{};
+    defer r.deinit(alloc);
+
+    const def = catalog.IndexDef{
+        .base_table_id = 16,
+        .index_table_id = 17,
+        .column_id = 1,
+        .unique = true,
+    };
+    const vals = catalog.encodeIndex(def);
+    const bytes = try sql.marshalRow(alloc, &ips, &vals, &buf);
+    try sql.unmarshalRow(alloc, &ips, bytes, &[_]u32{}, &r);
+
+    const got = try catalog.decodeIndex(&r);
+    try testing.expectEqual(def, got);
+}
+
+test "sql.catalog: index row keys sort by (base, index) and share a prefix" {
+    const k_16_17 = catalog.encodeIndexKey(16, 17);
+    const k_16_20 = catalog.encodeIndexKey(16, 20);
+    const k_17_1 = catalog.encodeIndexKey(17, 1);
+
+    try testing.expect(std.mem.order(u8, &k_16_17, &k_16_20) == .lt);
+    try testing.expect(std.mem.order(u8, &k_16_20, &k_17_1) == .lt);
+
+    // Same base ⇒ same 4-byte prefix; different base ⇒ different prefix.
+    try testing.expectEqualSlices(u8, k_16_17[0..4], k_16_20[0..4]);
+    try testing.expect(!std.mem.eql(u8, k_16_17[0..4], k_17_1[0..4]));
+
+    // Key-only decode recovers both halves; value-borne fields stay zeroed.
+    const kd = catalog.decodeIndexKey(&k_16_17).?;
+    try testing.expectEqual(@as(u32, 16), kd.base_table_id);
+    try testing.expectEqual(@as(u32, 17), kd.index_table_id);
+    try testing.expectEqual(@as(u32, 0), kd.column_id);
+    try testing.expect(!kd.unique);
+    try testing.expectEqual(null, catalog.decodeIndexKey(k_16_17[0..7]));
+}
+
 test "sql.catalog: row keys sort by (table_id, column_id) and share a table prefix" {
     const k_7_2 = catalog.encodeKey(7, 2);
     const k_7_10 = catalog.encodeKey(7, 10);
@@ -108,11 +156,9 @@ test "sql.catalog: row keys sort by (table_id, column_id) and share a table pref
     try testing.expect(std.mem.order(u8, &k_7_2, &k_7_10) == .lt);
     try testing.expect(std.mem.order(u8, &k_7_10, &k_8_1) == .lt);
 
-    // A table prefix selects exactly that table's rows.
-    const p7 = catalog.tablePrefix(7);
-    try testing.expect(std.mem.startsWith(u8, &k_7_2, &p7));
-    try testing.expect(std.mem.startsWith(u8, &k_7_10, &p7));
-    try testing.expect(!std.mem.startsWith(u8, &k_8_1, &p7));
+    // Same table ⇒ same 4-byte prefix; different table ⇒ different prefix.
+    try testing.expectEqualSlices(u8, k_7_2[0..4], k_7_10[0..4]);
+    try testing.expect(!std.mem.eql(u8, k_7_2[0..4], k_8_1[0..4]));
 
     // Keys decode back to their components.
     const d = try catalog.decodeKey(&k_7_10);

@@ -63,7 +63,8 @@ expect "DROP TABLE" "DROP TABLE" psql "$E" -X -c "DROP TABLE t;"
 expect "second DROP errors" "does not exist" psql "$E" -X -c "DROP TABLE t;"
 expect "IF EXISTS is quiet" "DROP TABLE" psql "$E" -X -c "DROP TABLE IF EXISTS t;"
 expect "re-CREATE after drop" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE t (id int8 PRIMARY KEY);"
-grep -q "created table 't' -> ns=16 table_id=17" "$LOG" && ok "dropped id 16 not reused (got 17)" || bad "table_id reuse"
+# First 't' consumed 16 (table) + 17 (its _pkey index); re-CREATE gets 18.
+grep -q "created table 't' -> ns=16 table_id=18" "$LOG" && ok "dropped ids not reused (got 18)" || bad "table_id reuse"
 
 # --- unknown database fails per query ---------------------------------------
 expect "unknown dbname errors" "database does not exist" \
@@ -74,7 +75,19 @@ stop_server
 start_server
 expect "'t' survives restart" "already exists" psql "$E" -X -c "CREATE TABLE t (id int);"
 expect "post-restart CREATE" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE post_restart (a int4 PRIMARY KEY);"
-grep -q "created table 'post_restart' -> ns=16 table_id=18" "$LOG" && ok "id counter survived restart (18)" || bad "id counter reset"
+# Ids so far in ns16: t=16,17 then re-t=18,19 → next table is 20.
+grep -q "created table 'post_restart' -> ns=16 table_id=20" "$LOG" && ok "id counter survived restart (20)" || bad "id counter reset"
+
+# --- PK auto-index: names share the table namespace, DROP TABLE rejects it --
+# post_restart has a PK, so its 'post_restart_pkey' index tree + name exist.
+expect "index name reserved in table namespace" "already exists" \
+    psql "$E" -X -c "CREATE TABLE post_restart_pkey (a int);"
+expect "DROP TABLE on an index is rejected" "cannot DROP TABLE an index" \
+    psql "$E" -X -c "DROP TABLE post_restart_pkey;"
+# A table named <x>_pkey blocks a later 'x' whose PK index wants that name.
+expect "CREATE TABLE mine_pkey" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE mine_pkey (a int);"
+expect "PK index name collision fails CREATE" "already exists" \
+    psql "$E" -X -c "CREATE TABLE mine (id int PRIMARY KEY);"
 
 # --- per-database name scoping + drop cascades ------------------------------
 expect "CREATE DATABASE app" "CREATE DATABASE" psql "$E" -X -c "CREATE DATABASE app;"
