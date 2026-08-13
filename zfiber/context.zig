@@ -28,17 +28,20 @@ var inited: bool = false;
 
 /// Call exactly once at the top of `main(init: std.process.Init)`.
 ///
-/// TODO(perf): benchmark `std.heap.c_allocator` vs `std.heap.smp_allocator`
-/// under our workloads (memtable churn in zdb, allocator-bound paths in
-/// raft, pgwire request handling). On ReleaseFast with libc linked,
-/// `init.gpa` resolves to `c_allocator` (glibc ptmalloc on Linux). The
-/// 0.16-new `smp_allocator` is lock-free and may win on multi-core
-/// allocation-heavy paths; we'd select it here before populating `global`.
-/// Decision artifact: a /tmp/zdb/bench.log run comparing both under load.
 pub fn initGlobal(init: std.process.Init) void {
+    initGlobalWithAllocator(init, init.gpa);
+}
+
+/// Production can replace `init.gpa` while tests and tools retain Zig's
+/// normal process allocator. The initialization arena is intentionally kept:
+/// it owns only process-lifetime arguments and other startup state.
+pub fn initGlobalWithAllocator(
+    init: std.process.Init,
+    gpa: Allocator,
+) void {
     std.debug.assert(!inited);
     global = .{
-        .gpa = init.gpa,
+        .gpa = gpa,
         .arena = init.arena.allocator(),
         .io = init.io,
         .args = init.minimal.args,

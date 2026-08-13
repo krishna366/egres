@@ -5,6 +5,9 @@
 .zig-cache/
 zig-out/
 
+# Native dependencies built by pinned bootstrap scripts.
+.deps/
+
 # Claude Code's per-project settings and session state.
 .claude/
 

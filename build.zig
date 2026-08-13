@@ -38,6 +38,10 @@ const Modules = struct {
     sql: *std.Build.Module, // sql.zig (row codec + catalog/registry + store)
 };
 
+const jemalloc_version = "5.3.1";
+const jemalloc_sha256 =
+    "3826bc80232f22ed5c4662f3034f799ca316e819103bdc7bb99018a421706f92";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // `-Drelease` is a shortcut for `-Doptimize=ReleaseFast`. Tests + the
@@ -51,12 +55,30 @@ pub fn build(b: *std.Build) void {
         .ReleaseFast
     else
         b.standardOptimizeOption(.{});
+    const jemalloc_library = b.fmt(
+        ".deps/jemalloc/install/{s}/lib/libjemalloc.a",
+        .{jemalloc_version},
+    );
 
     const mods = makeModules(b, target, optimize);
     const regen_buffers_step = addRegenAllBuffers(b, target, optimize, mods);
+    const bootstrap_jemalloc = b.addSystemCommand(&.{
+        "bash",
+        "scripts/bootstrap-jemalloc.sh",
+        jemalloc_version,
+        jemalloc_sha256,
+    });
 
     addZbufCli(b, target, optimize, mods);
-    addEgres(b, target, optimize, mods, regen_buffers_step);
+    addEgres(
+        b,
+        target,
+        optimize,
+        mods,
+        regen_buffers_step,
+        &bootstrap_jemalloc.step,
+        jemalloc_library,
+    );
     addZdbBench(b, target, optimize, mods);
     addZioBench(b, target, optimize, mods);
     addStress(b, target, optimize, mods);
@@ -66,7 +88,15 @@ pub fn build(b: *std.Build) void {
     // `zig build test` — one binary, auto-discovered from `*_test.zig` /
     // `test.zig` files. Replaces the previous test-zdb / test-zbuf /
     // test-utils / test-raft / test-net per-file plumbing.
-    _ = addAllTests(b, target, optimize, mods, regen_buffers_step);
+    _ = addAllTests(
+        b,
+        target,
+        optimize,
+        mods,
+        regen_buffers_step,
+        &bootstrap_jemalloc.step,
+        jemalloc_library,
+    );
     // TODO: rewrite multiproc harness to use egres
     // Deferred for Zig 0.16 migration: builds an executable that pulls in
     // std.process.Child paths in raft/testing.
@@ -403,6 +433,8 @@ fn addAllTests(
     optimize: std.builtin.OptimizeMode,
     mods: Modules,
     regen_buffers_step: *std.Build.Step,
+    bootstrap_jemalloc: *std.Build.Step,
+    jemalloc_library: []const u8,
 ) *std.Build.Step {
     const test_files = collectTestFiles(b);
 
@@ -454,6 +486,10 @@ fn addAllTests(
         .optimize = optimize,
     });
     addImports(root_mod, mods, test_imports);
+    root_mod.link_libc = true;
+    root_mod.addObjectFile(
+        b.path(jemalloc_library),
+    );
 
     // Name the binary by optimize mode so the Debug and ReleaseFast test
     // binaries install SIDE BY SIDE (zig-out/bin/test-Debug vs
@@ -471,6 +507,7 @@ fn addAllTests(
     });
     addVendoredCompressionSources(b, all_tests);
     addLibpgQuerySources(b, all_tests);
+    all_tests.step.dependOn(bootstrap_jemalloc);
     all_tests.step.dependOn(regen_buffers_step);
 
     // Install the test binary to zig-out/bin/<test_bin_name> so it sits at a
@@ -505,6 +542,10 @@ fn addAllTests(
         .optimize = .ReleaseFast,
     });
     addImports(bench_root_mod, mods, test_imports);
+    bench_root_mod.link_libc = true;
+    bench_root_mod.addObjectFile(
+        b.path(jemalloc_library),
+    );
 
     const all_bench = b.addTest(.{
         .root_module = bench_root_mod,
@@ -515,6 +556,7 @@ fn addAllTests(
     });
     addVendoredCompressionSources(b, all_bench);
     addLibpgQuerySources(b, all_bench);
+    all_bench.step.dependOn(bootstrap_jemalloc);
 
     const run_bench = b.addRunArtifact(all_bench);
     run_bench.step.dependOn(regen_buffers_step);
@@ -564,7 +606,20 @@ fn addEgres(
     optimize: std.builtin.OptimizeMode,
     mods: Modules,
     regen_buffers_step: *std.Build.Step,
+    bootstrap_jemalloc: *std.Build.Step,
+    jemalloc_library: []const u8,
 ) void {
+    const jemalloc = makeModule(
+        b,
+        target,
+        optimize,
+        "jemalloc/root.zig",
+    );
+    jemalloc.link_libc = true;
+    jemalloc.addObjectFile(
+        b.path(jemalloc_library),
+    );
+
     const exe = b.addExecutable(.{
         .name = "egres",
         .root_module = makeModule(b, target, optimize, "egres/main.zig"),
@@ -573,7 +628,12 @@ fn addEgres(
     exe.root_module.omit_frame_pointer = false;
     addVendoredCompressionSources(b, exe); // zdb compression (via engine)
     addLibpgQuerySources(b, exe); // pgwire's libpg_query
-    addImports(exe.root_module, mods, .{ "raft", "zdb", "zfiber", "metrics", "flags", "utils", "pgwire", "engine", "sql" });
+    addImports(exe.root_module, mods, .{
+        "raft",   "zdb",    "zfiber", "metrics", "flags", "utils",
+        "pgwire", "engine", "sql",
+    });
+    exe.root_module.addImport("jemalloc", jemalloc);
+    exe.step.dependOn(bootstrap_jemalloc);
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);
 

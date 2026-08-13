@@ -7,6 +7,7 @@ const engine = @import("engine");
 const sql = @import("sql");
 const flags = @import("flags");
 const utils = @import("utils");
+const jemalloc = @import("jemalloc");
 
 pub const std_options = std.Options{
     .log_level = .debug,
@@ -168,8 +169,13 @@ const Args = struct {
 
 pub fn main(init: std.process.Init) !void {
     defer log.info("shutdown complete", .{});
-    utils.context.initGlobal(init);
+    utils.context.initGlobalWithAllocator(init, jemalloc.allocator());
     const allocator = utils.context.g().gpa;
+    // Fail fast if the gpa above ever stops routing to jemalloc: the
+    // embedded MALLOC_CONF policy, memory accounting, and collect() all
+    // assume it.
+    try jemalloc.verifyInUse(allocator);
+    log.info("jemalloc in use: OK", .{});
     const argv = try utils.context.g().argv();
 
     // The in-tree fiber runtime. One worker per core; worker id 0 is the
