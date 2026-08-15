@@ -42,6 +42,23 @@ const jemalloc_version = "5.3.1";
 const jemalloc_sha256 =
     "3826bc80232f22ed5c4662f3034f799ca316e819103bdc7bb99018a421706f92";
 
+const mimalloc_version = "3.4.5";
+const mimalloc_sha256 =
+    "19a43af0645c57d348e729d5b31e23e912582911bb1047f795790834d3416221";
+
+/// One vendored allocator: the bootstrap step that builds it and the
+/// static archive to link. Every binary links exactly one, chosen by
+/// `-Dallocator` — both archives define libc malloc/free (jemalloc via
+/// its non-prefixed build, mimalloc via MI_OVERRIDE), so linking two
+/// would clash, and one owner means C-library allocations route through
+/// the selected backend too.
+const AllocatorDep = struct {
+    bootstrap: *std.Build.Step,
+    library: []const u8,
+};
+
+const AllocatorBackend = enum { mimalloc, jemalloc };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // `-Drelease` is a shortcut for `-Doptimize=ReleaseFast`. Tests + the
@@ -51,6 +68,13 @@ pub fn build(b: *std.Build) void {
     // step (in addAllTests) hardcodes `.ReleaseFast` for its own root
     // module and is unaffected.
     const release_mode = b.option(bool, "release", "Shortcut for -Doptimize=ReleaseFast") orelse false;
+    // Compile-time allocator selection: the chosen backend becomes the
+    // exe's "galloc" module and the only allocator archive it links.
+    const allocator_backend = b.option(
+        AllocatorBackend,
+        "allocator",
+        "Allocator backing the process gpa (default: mimalloc)",
+    ) orelse .mimalloc;
     const optimize: std.builtin.OptimizeMode = if (release_mode)
         .ReleaseFast
     else
@@ -58,6 +82,10 @@ pub fn build(b: *std.Build) void {
     const jemalloc_library = b.fmt(
         ".deps/jemalloc/install/{s}/lib/libjemalloc.a",
         .{jemalloc_version},
+    );
+    const mimalloc_library = b.fmt(
+        ".deps/mimalloc/install/{s}/lib/libmimalloc.a",
+        .{mimalloc_version},
     );
 
     const mods = makeModules(b, target, optimize);
@@ -68,6 +96,33 @@ pub fn build(b: *std.Build) void {
         jemalloc_version,
         jemalloc_sha256,
     });
+    const bootstrap_mimalloc = b.addSystemCommand(&.{
+        "bash",
+        "scripts/bootstrap-mimalloc.sh",
+        mimalloc_version,
+        mimalloc_sha256,
+    });
+    const allocator_dep: AllocatorDep = switch (allocator_backend) {
+        .jemalloc => .{
+            .bootstrap = &bootstrap_jemalloc.step,
+            .library = jemalloc_library,
+        },
+        .mimalloc => .{
+            .bootstrap = &bootstrap_mimalloc.step,
+            .library = mimalloc_library,
+        },
+    };
+    // The selected backend's adapter becomes the "galloc" module — the
+    // one allocator import production code and the generic allocator
+    // tests use — and its archive rides along to every consumer.
+    // Consumers read `galloc.kind` at comptime for the pieces that
+    // differ per backend (main's maintenance fiber, the startup log).
+    const galloc = makeModule(b, target, optimize, switch (allocator_backend) {
+        .jemalloc => "jemalloc/root.zig",
+        .mimalloc => "mimalloc/root.zig",
+    });
+    galloc.link_libc = true;
+    galloc.addObjectFile(b.path(allocator_dep.library));
 
     addZbufCli(b, target, optimize, mods);
     addEgres(
@@ -76,8 +131,8 @@ pub fn build(b: *std.Build) void {
         optimize,
         mods,
         regen_buffers_step,
-        &bootstrap_jemalloc.step,
-        jemalloc_library,
+        galloc,
+        allocator_dep,
     );
     addZdbBench(b, target, optimize, mods);
     addZioBench(b, target, optimize, mods);
@@ -94,8 +149,8 @@ pub fn build(b: *std.Build) void {
         optimize,
         mods,
         regen_buffers_step,
-        &bootstrap_jemalloc.step,
-        jemalloc_library,
+        galloc,
+        allocator_dep,
     );
     // TODO: rewrite multiproc harness to use egres
     // Deferred for Zig 0.16 migration: builds an executable that pulls in
@@ -433,8 +488,8 @@ fn addAllTests(
     optimize: std.builtin.OptimizeMode,
     mods: Modules,
     regen_buffers_step: *std.Build.Step,
-    bootstrap_jemalloc: *std.Build.Step,
-    jemalloc_library: []const u8,
+    galloc: *std.Build.Module,
+    allocator_dep: AllocatorDep,
 ) *std.Build.Step {
     const test_files = collectTestFiles(b);
 
@@ -486,10 +541,11 @@ fn addAllTests(
         .optimize = optimize,
     });
     addImports(root_mod, mods, test_imports);
+    // The build-selected allocator: the generic allocator tests
+    // (egres/galloc_test.zig) exercise whichever backend `-Dallocator`
+    // picked; its archive arrives via the galloc module.
+    root_mod.addImport("galloc", galloc);
     root_mod.link_libc = true;
-    root_mod.addObjectFile(
-        b.path(jemalloc_library),
-    );
 
     // Name the binary by optimize mode so the Debug and ReleaseFast test
     // binaries install SIDE BY SIDE (zig-out/bin/test-Debug vs
@@ -507,7 +563,7 @@ fn addAllTests(
     });
     addVendoredCompressionSources(b, all_tests);
     addLibpgQuerySources(b, all_tests);
-    all_tests.step.dependOn(bootstrap_jemalloc);
+    all_tests.step.dependOn(allocator_dep.bootstrap);
     all_tests.step.dependOn(regen_buffers_step);
 
     // Install the test binary to zig-out/bin/<test_bin_name> so it sits at a
@@ -542,10 +598,8 @@ fn addAllTests(
         .optimize = .ReleaseFast,
     });
     addImports(bench_root_mod, mods, test_imports);
+    bench_root_mod.addImport("galloc", galloc);
     bench_root_mod.link_libc = true;
-    bench_root_mod.addObjectFile(
-        b.path(jemalloc_library),
-    );
 
     const all_bench = b.addTest(.{
         .root_module = bench_root_mod,
@@ -556,7 +610,7 @@ fn addAllTests(
     });
     addVendoredCompressionSources(b, all_bench);
     addLibpgQuerySources(b, all_bench);
-    all_bench.step.dependOn(bootstrap_jemalloc);
+    all_bench.step.dependOn(allocator_dep.bootstrap);
 
     const run_bench = b.addRunArtifact(all_bench);
     run_bench.step.dependOn(regen_buffers_step);
@@ -606,20 +660,9 @@ fn addEgres(
     optimize: std.builtin.OptimizeMode,
     mods: Modules,
     regen_buffers_step: *std.Build.Step,
-    bootstrap_jemalloc: *std.Build.Step,
-    jemalloc_library: []const u8,
+    galloc: *std.Build.Module,
+    allocator_dep: AllocatorDep,
 ) void {
-    const jemalloc = makeModule(
-        b,
-        target,
-        optimize,
-        "jemalloc/root.zig",
-    );
-    jemalloc.link_libc = true;
-    jemalloc.addObjectFile(
-        b.path(jemalloc_library),
-    );
-
     const exe = b.addExecutable(.{
         .name = "egres",
         .root_module = makeModule(b, target, optimize, "egres/main.zig"),
@@ -632,8 +675,8 @@ fn addEgres(
         "raft",   "zdb",    "zfiber", "metrics", "flags", "utils",
         "pgwire", "engine", "sql",
     });
-    exe.root_module.addImport("jemalloc", jemalloc);
-    exe.step.dependOn(bootstrap_jemalloc);
+    exe.root_module.addImport("galloc", galloc);
+    exe.step.dependOn(allocator_dep.bootstrap);
     exe.step.dependOn(regen_buffers_step);
     b.installArtifact(exe);
 

@@ -14,12 +14,17 @@ The bootstrap stores each release independently:
 └── install/<version>/lib/libjemalloc.a
 ```
 
+jemalloc is the non-default backend: `-Dallocator=jemalloc` selects it
+at build time (mimalloc otherwise), making its archive the only
+allocator in the binary — it owns libc malloc/free, so C-library
+allocations route through it too.
+
 To upgrade, replace both constants in `build.zig`, then run:
 
 ```bash
-zig build egres -Drelease
-zig build test -- --filter jemalloc
-zig build test
+zig build egres -Drelease -Dallocator=jemalloc
+zig build test -Dallocator=jemalloc -- --filter galloc
+zig build test -Dallocator=jemalloc
 ```
 
 No cache deletion is required. Builds select the archive named by

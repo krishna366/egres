@@ -7,7 +7,10 @@ const engine = @import("engine");
 const sql = @import("sql");
 const flags = @import("flags");
 const utils = @import("utils");
-const jemalloc = @import("jemalloc");
+// The build-selected allocator backend (see `-Dallocator` in
+// build.zig): jemalloc or mimalloc behind one adapter API, exactly one
+// linked per binary. `galloc.kind` names it at comptime.
+const galloc = @import("galloc");
 
 pub const std_options = std.Options{
     .log_level = .debug,
@@ -169,13 +172,13 @@ const Args = struct {
 
 pub fn main(init: std.process.Init) !void {
     defer log.info("shutdown complete", .{});
-    utils.context.initGlobalWithAllocator(init, jemalloc.allocator());
+    utils.context.initGlobalWithAllocator(init, galloc.allocator());
     const allocator = utils.context.g().gpa;
-    // Fail fast if the gpa above ever stops routing to jemalloc: the
-    // embedded MALLOC_CONF policy, memory accounting, and collect() all
-    // assume it.
-    try jemalloc.verifyInUse(allocator);
-    log.info("jemalloc in use: OK", .{});
+    // Fail fast if the gpa above ever stops routing to the build-selected
+    // allocator: the embedded allocator policy, memory accounting, and
+    // reclamation model all assume it.
+    try galloc.verifyInUse(allocator);
+    log.info("{s} in use: OK", .{galloc.kind});
     const argv = try utils.context.g().argv();
 
     // The in-tree fiber runtime. One worker per core; worker id 0 is the
@@ -191,8 +194,30 @@ pub fn main(init: std.process.Init) !void {
     defer fiber_rt.deinit();
     log.info("runtime initialized: {d} workers", .{fiber_rt.workers.len});
 
-    _ = try fiber.spawn(.{}, bootstrapAndStop, .{ allocator, argv });
+    // mimalloc has no background threads: freed memory returns to the OS
+    // only when something enters the allocator after the 1 s purge
+    // deadline passes. This fiber is that something. jemalloc needs no
+    // fiber — its two background threads (malloc_conf in jemalloc/
+    // root.zig) own reclamation — so the fiber isn't even compiled in.
+    if (comptime std.mem.eql(u8, galloc.kind, "mimalloc")) {
+        try fiber.spawnDetached(.{}, mimallocMaintenance, .{});
+    }
+
+    try fiber.spawnDetached(.{}, bootstrapAndStop, .{ allocator, argv });
     fiber_rt.run();
+}
+
+/// Detached and never joined: parked in sleepMs at shutdown, freed by
+/// Runtime.deinit like any other leftover fiber. The gentle tick costs
+/// ~5 µs under load (zmem measurement) and returns a freed burst to the
+/// OS within a couple of ticks.
+fn mimallocMaintenance() void {
+    while (true) {
+        fiber.sleepMs(1000);
+        // Infallible for mimalloc; the error union exists only so both
+        // backends share one collect() signature.
+        galloc.collect() catch {};
+    }
 }
 
 /// Spawned on the default lane to drive process bootstrap. Stops the
