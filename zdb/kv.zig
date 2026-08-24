@@ -40,8 +40,10 @@ pub const Kind = enum(u2) {
 /// `kind` is interpreted: `deleted` makes a key read as absent (Forest.get) and
 /// lets bottom-level compaction forget it, while `state`/`delta` decide how much
 /// version history that compaction must retain (Tree.buildCompaction). The
-/// `encoding` nibble is still mechanism-only — `roaring` has no implementation
-/// behind it yet.
+/// `encoding` nibble selects the value's format: `roaring` marks posting
+/// values (zdb/validate.zig) — a zroar bitmap when kind=state, a RoaringDelta
+/// message when kind=delta — folded at read (Forest.getBitmap) and rolled up
+/// into synthetic states by compaction (Tree.zig Emitter).
 ///
 /// Meta belongs to a row (an Item), never to a Key. A Key doubles as a bare
 /// position in keyspace — tree boundaries, iterator bounds, block base keys —
@@ -70,6 +72,10 @@ pub const Meta = packed struct(u8) {
 
     pub inline fn isDeleted(self: Meta) bool {
         return self.kind == .deleted;
+    }
+
+    pub inline fn isRoaring(self: Meta) bool {
+        return self.encoding == .roaring;
     }
 
     pub inline fn toByte(self: Meta) u8 {

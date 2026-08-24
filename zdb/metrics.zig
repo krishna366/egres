@@ -41,6 +41,9 @@ pub const Metrics = struct {
     flushes: m.CounterVec(u64, FlushLabels),
     /// Per-tree-per-level compactions — incr once per completed compaction run.
     compactions: m.CounterVec(u64, CompactionLabels),
+    /// Roaring delta chains folded into a synthetic state during
+    /// compaction (leader-only; incremented at build time).
+    rollups: m.CounterVec(u64, CompactionLabels),
     /// Bytes written, sliced by source + tree coordinates.
     bytes_written: m.CounterVec(u64, BytesWrittenLabels),
 
@@ -61,6 +64,13 @@ pub const Metrics = struct {
                 .{},
                 .{},
             ),
+            .rollups = try m.CounterVec(u64, CompactionLabels).init(
+                allocator,
+                io,
+                "zdb_rollups_total",
+                .{},
+                .{},
+            ),
             .bytes_written = try m.CounterVec(u64, BytesWrittenLabels).init(
                 allocator,
                 io,
@@ -74,6 +84,7 @@ pub const Metrics = struct {
     pub fn deinit(self: *Metrics) void {
         self.flushes.deinit();
         self.compactions.deinit();
+        self.rollups.deinit();
         self.bytes_written.deinit();
     }
 

@@ -64,6 +64,35 @@ pub const Config = struct {
     // in one multi-GiB compaction that blocks the loop for minutes.
     l0_compaction_max_bytes: u64 = 1 << 30, // 1 GiB
 
+    // Roaring posting rollup (zdb/tree.zig's VersionTracker).
+    // Compaction folds a
+    // version run whose newest item is a roaring delta into one full
+    // bitmap state, so reads stop at their first hit instead of
+    // walking a delta chain.
+    //
+    // A chain whose base state is among the compaction's own inputs
+    // rolls up for free (the merge already streams every input byte
+    // through a rebuild), gated only by `rollup_min_deltas` — a short
+    // chain isn't worth rewriting a large bitmap for; reads fold it
+    // on the fly.
+    //
+    // A chain WITHOUT its base must fetch it from the levels below
+    // the destination — the one rollup path that costs extra read
+    // I/O. Two triggers allow it, either one suffices:
+    //   dest >= rollup_at_level   compacting into this level or
+    //     deeper always regenerates, so the deep levels converge on
+    //     one state per posting (default 2: L0→L1 stays free-only,
+    //     L1→L2 and below regenerate).
+    //   chain >= rollup_max_deltas   a chain this long regenerates at
+    //     ANY level, bounding read-path fold depth and amortizing the
+    //     deep seek to one per max_deltas writes to that index key.
+    // Chain length is also what bounds rollup buffering — no
+    // separate byte caps.
+    rollup_enabled: bool = true,
+    rollup_min_deltas: u32 = 1,
+    rollup_at_level: u8 = 2,
+    rollup_max_deltas: u32 = 32,
+
     pub fn validate(self: Config) Error!void {
         // Badger semantics: exactly one compactor causes pathological level behavior.
         if (self.num_compactors == 1) return error.InvalidNumCompactors;

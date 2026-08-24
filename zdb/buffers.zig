@@ -133,6 +133,15 @@ pub const KeyValue = schema.Table(.{
     .{ .id = 3, .name = "meta", .ty = schema.U8 },
 });
 
+/// The value layout for Meta{ .kind = .delta, .encoding = .roaring }:
+/// egids to add to / remove from the posting bitmap, layered on the
+/// versions below it (zdb/tree.zig's VersionTracker owns the fold,
+/// zdb/validate.zig the write-side gate).
+pub const RoaringDelta = schema.Table(.{
+    .{ .id = 1, .name = "adds", .ty = schema.Array(schema.U64) },
+    .{ .id = 2, .name = "removes", .ty = schema.Array(schema.U64) },
+});
+
 /// A committed write set proposed through raft as a single .data entry —
 /// one entry, one commit HLC, atomic across every key/table it touches.
 /// An entry never spans namespaces (a session is bound to one database),
@@ -162,4 +171,5 @@ pub const tables = .{
     .{ .name = "KeyValue", .ty = KeyValue, .id = tableId(7) },
     .{ .name = "Mutations", .ty = Mutations, .id = tableId(8) },
     .{ .name = "Namespace", .ty = Namespace, .id = tableId(9) },
+    .{ .name = "RoaringDelta", .ty = RoaringDelta, .id = tableId(10) },
 };

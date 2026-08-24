@@ -677,7 +677,7 @@ test "forest: snapshot manifest round-trip" {
 // Helper that builds a Memtables with a chain of immutables of the given ids.
 // The current memtable is the placeholder (id=0); each `swapCurrentOut(id_i)`
 // freezes the prior current and makes a new current with id_i. After N swaps,
-// immutables = [id_1, id_2, ..., id_{N-1}], current = id_N.
+// immutables = [id_{N-1}, ..., id_2, id_1] (newest first), current = id_N.
 
 fn buildMemtables(alloc: std.mem.Allocator, ids: []const u64) !forest_mod.Memtables {
     const initial = try zdb.skl.SkipList.init(alloc);
@@ -726,8 +726,8 @@ test "forest: popOldestIfMatches phantom" {
 
 test "forest: popOldestIfMatches multi phantom then match" {
     const alloc = std.testing.allocator;
-    // immutables=[2, 4, 7], current=10. Flush proposal expects 7.
-    // Loop drops M_2 and M_4 as phantoms, then pops M_7.
+    // immutables=[7, 4, 2] (newest first), current=10. Flush proposal
+    // expects 7. Loop drops M_2 and M_4 as phantoms, then pops M_7.
     var mts = try buildMemtables(alloc, &.{ 2, 4, 7, 10 });
     defer mts.deinit();
     mts.popOldestIfMatches(7);
@@ -737,8 +737,9 @@ test "forest: popOldestIfMatches multi phantom then match" {
 
 test "forest: popOldestIfMatches multi phantom no match" {
     const alloc = std.testing.allocator;
-    // immutables=[2, 4], current=10. Flush proposal expects 7. Both phantoms;
-    // no match — immutables drained, current untouched.
+    // immutables=[4, 2] (newest first), current=10. Flush proposal
+    // expects 7. Both phantoms; no match — immutables drained, current
+    // untouched.
     var mts = try buildMemtables(alloc, &.{ 2, 4, 10 });
     defer mts.deinit();
     mts.popOldestIfMatches(7);
@@ -1423,4 +1424,267 @@ test "scan: rejects a read_ts below globalMinRead" {
     // At the horizon is fine, and the default (latest) is always fine.
     _ = try runScan(alloc, f, .{ .read_ts = 100 }, &col);
     _ = try runScan(alloc, f, .{}, &col);
+}
+
+// ---------------------------------------------------------------------------
+// getBitmap (roaring postings)
+// ---------------------------------------------------------------------------
+
+const zroar = zdb.zroar;
+
+/// Helpers for the roaring-posting tests. Writers emit RoaringDelta
+/// messages exactly the way the future index write path will: with the
+/// generated writer, tail-less, meta = {.delta, .roaring}.
+const roar = struct {
+    const delta_meta: zdb.kv.Meta = .{ .kind = .delta, .encoding = .roaring };
+    const state_meta: zdb.kv.Meta = .{ .kind = .state, .encoding = .roaring };
+
+    fn key(primary: []const u8, ts: u64) Key {
+        return .{
+            .namespace = 1,
+            .table_id = 0,
+            .primary = primary,
+            .timestamp = ts,
+        };
+    }
+
+    fn putDelta(
+        f: *Forest,
+        alloc: std.mem.Allocator,
+        primary: []const u8,
+        ts: u64,
+        adds: []const u64,
+        rems: []const u64,
+    ) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(alloc);
+        var w = try zdb.buffers.RoaringDeltaWriter.initWithBuf(alloc, &list);
+        if (adds.len > 0) try w.setAdds(adds);
+        if (rems.len > 0) try w.setRemoves(rems);
+        _ = try w.finish();
+        const items = [_]zdb.kv.Item{.{
+            .key = key(primary, ts),
+            .value = list.items,
+            .meta = delta_meta,
+        }};
+        try f.put(&items);
+    }
+
+    fn putState(
+        f: *Forest,
+        alloc: std.mem.Allocator,
+        primary: []const u8,
+        ts: u64,
+        vals: []const u64,
+    ) !void {
+        var bm = try zroar.Bitmap.fromSortedList(alloc, vals);
+        defer bm.deinit();
+        const items = [_]zdb.kv.Item{.{
+            .key = key(primary, ts),
+            .value = bm.toBuffer(),
+            .meta = state_meta,
+        }};
+        try f.put(&items);
+    }
+
+    fn expectBitmap(
+        f: *Forest,
+        alloc: std.mem.Allocator,
+        primary: []const u8,
+        read_ts: u64,
+        expected: []const u64,
+    ) !void {
+        var bm = try f.getBitmap(alloc, key(primary, read_ts), .p0);
+        defer bm.deinit();
+        try std.testing.expectEqual(expected.len, bm.getCardinality());
+        for (expected) |v| try std.testing.expect(bm.contains(v));
+    }
+
+    /// Freeze the current memtable and flush it to an L0 SST.
+    fn flush(f: *Forest, alloc: std.mem.Allocator, next_id: u64) !void {
+        try f.newMemtable(next_id, next_id);
+        var fl = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+        defer fl.changes.deinit(alloc);
+        try f.applyFlush(fl.changes.items, fl.memtable_id);
+    }
+};
+
+test "forest: getBitmap folds deltas from memtable, L0, and history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    const Lease = struct {
+        fn call(_: *anyopaque, _: u64) anyerror!void {}
+    };
+    var lease_ctx: u8 = 0;
+    f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
+    try f.newMemtable(1, 1);
+
+    // History of posting "p": base state at t10, then deltas layering
+    // adds and removes on top at t20/t30.
+    try roar.putState(f, alloc, "p", 10, &.{ 1, 2, 3 });
+    try roar.putDelta(f, alloc, "p", 20, &.{ 40, 50 }, &.{2});
+    try roar.putDelta(f, alloc, "p", 30, &.{2}, &.{ 1, 40 });
+
+    // Whole chain still in the memtable.
+    try roar.expectBitmap(f, alloc, "p", std.math.maxInt(u64), &.{ 2, 3, 50 });
+
+    // Historical reads reconstruct each point in time.
+    try roar.expectBitmap(f, alloc, "p", 25, &.{ 1, 3, 40, 50 });
+    try roar.expectBitmap(f, alloc, "p", 10, &.{ 1, 2, 3 });
+    // Before the base existed: empty.
+    try roar.expectBitmap(f, alloc, "p", 5, &.{});
+
+    // Flush chain to L0; answers must not change.
+    try roar.flush(f, alloc, 2);
+    try roar.expectBitmap(f, alloc, "p", std.math.maxInt(u64), &.{ 2, 3, 50 });
+    try roar.expectBitmap(f, alloc, "p", 25, &.{ 1, 3, 40, 50 });
+
+    // New deltas in the fresh memtable fold onto the flushed history.
+    try roar.putDelta(f, alloc, "p", 40, &.{100}, &.{3});
+    try roar.expectBitmap(f, alloc, "p", std.math.maxInt(u64), &.{ 2, 50, 100 });
+}
+
+test "forest: getBitmap tombstone resets, absent key is empty" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    try f.newMemtable(1, 1);
+
+    // State, then a tombstone (the index key was cleared), then a new
+    // delta. The tombstone terminates the fold: only t30 survives.
+    try roar.putState(f, alloc, "p", 10, &.{ 1, 2, 3 });
+    const del = [_]zdb.kv.Item{.{
+        .key = roar.key("p", 20),
+        .value = "",
+        .meta = .{ .kind = .deleted },
+    }};
+    try f.put(&del);
+    try roar.putDelta(f, alloc, "p", 30, &.{7}, &.{});
+
+    try roar.expectBitmap(f, alloc, "p", std.math.maxInt(u64), &.{7});
+    // As of the tombstone: empty. Before it: the old state.
+    try roar.expectBitmap(f, alloc, "p", 25, &.{});
+    try roar.expectBitmap(f, alloc, "p", 15, &.{ 1, 2, 3 });
+
+    // A key never written reads as an empty posting, not an error.
+    try roar.expectBitmap(f, alloc, "absent", std.math.maxInt(u64), &.{});
+}
+
+test "forest: rollup is read-invariant across flush and compactions" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    const Lease = struct {
+        fn call(_: *anyopaque, _: u64) anyerror!void {}
+    };
+    var lease_ctx: u8 = 0;
+    f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
+    try f.newMemtable(1, 1);
+
+    // "p" has a full chain (base in inputs → rolls up at L0→L1);
+    // "q" is a baseless delta (stays verbatim until read-below lands).
+    try roar.putState(f, alloc, "p", 10, &.{ 1, 2 });
+    try roar.putDelta(f, alloc, "p", 20, &.{40}, &.{2});
+    try roar.putDelta(f, alloc, "p", 30, &.{2}, &.{1});
+    try roar.putDelta(f, alloc, "q", 15, &.{7}, &.{});
+
+    // The oracle: every (key, read_ts) answer, captured while the
+    // whole history is still in the memtable. Rollup may reshape the
+    // physical chain at will; these answers must never change.
+    const Case = struct { key: []const u8, ts: u64, want: []const u64 };
+    const cases = [_]Case{
+        .{ .key = "p", .ts = 5, .want = &.{} },
+        .{ .key = "p", .ts = 10, .want = &.{ 1, 2 } },
+        .{ .key = "p", .ts = 25, .want = &.{ 1, 40 } },
+        .{ .key = "p", .ts = 35, .want = &.{ 2, 40 } },
+        .{ .key = "p", .ts = std.math.maxInt(u64), .want = &.{ 2, 40 } },
+        .{ .key = "q", .ts = 5, .want = &.{} },
+        .{ .key = "q", .ts = std.math.maxInt(u64), .want = &.{7} },
+    };
+    for (cases) |c| try roar.expectBitmap(f, alloc, c.key, c.ts, c.want);
+
+    // Flush to L0, then push the data down two levels; re-check the
+    // oracle after every reshape.
+    try roar.flush(f, alloc, 2);
+    for (cases) |c| try roar.expectBitmap(f, alloc, c.key, c.ts, c.want);
+
+    const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    for ([_]u8{ 0, 1 }) |src| {
+        var comp = try tree.buildCompaction(src, &f.file_ids, 0);
+        defer comp.deinit(alloc);
+        try std.testing.expect(comp.items.len > 0);
+        try tree.applyCompaction(comp.items);
+        for (cases) |c| try roar.expectBitmap(f, alloc, c.key, c.ts, c.want);
+    }
+
+    // Sanity that the rollup actually happened (this test must not
+    // pass vacuously): "p"'s newest version is now a synthetic state.
+    const top = try f.getRaw(alloc, roar.key("p", std.math.maxInt(u64)), .p0) orelse
+        return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isState());
+    try std.testing.expect(top.meta.isRoaring());
+    try std.testing.expectEqual(@as(u64, 30), top.key.timestamp);
+}
+
+test "forest: getBitmap rejects non-roaring chains and old reads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    try f.newMemtable(1, 1);
+
+    const raw = [_]zdb.kv.Item{.{
+        .key = roar.key("r", 10),
+        .value = "plain",
+        .meta = .{},
+    }};
+    try f.put(&raw);
+    try std.testing.expectError(
+        error.NotRoaring,
+        f.getBitmap(alloc, roar.key("r", std.math.maxInt(u64)), .p0),
+    );
+
+    // Undecodable delta bytes (only structure is checked on reads —
+    // content is validated at write time) surface as corruption.
+    const junk = [_]zdb.kv.Item{.{
+        .key = roar.key("c", 10),
+        .value = "junk",
+        .meta = roar.delta_meta,
+    }};
+    try f.put(&junk);
+    try std.testing.expectError(
+        error.CorruptPosting,
+        f.getBitmap(alloc, roar.key("c", std.math.maxInt(u64)), .p0),
+    );
+
+    _ = f.setGlobalMinRead(100);
+    try std.testing.expectError(
+        error.ReadBelowMinRead,
+        f.getBitmap(alloc, roar.key("r", 99), .p0),
+    );
 }

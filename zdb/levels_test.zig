@@ -243,7 +243,7 @@ test "levels: overlapping tables L1" {
     defer alloc.free(gk);
 
     const result = try level.overlappingTables(alloc, .{ .left = Key.init(ck), .right = Key.init(gk) });
-    defer alloc.free(result);
+    defer Level.releaseTables(alloc, result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
 }
 
@@ -279,7 +279,7 @@ test "levels: overlapping tables L0" {
 
     // L0 always returns all tables regardless of the query.
     const result = try level.overlappingTables(alloc, .{ .left = Key.init(ck), .right = Key.init(ck) });
-    defer alloc.free(result);
+    defer Level.releaseTables(alloc, result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
 }
 
@@ -794,7 +794,7 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
         .left = Key.init(left),
         .right = Key.init(right),
     });
-    defer alloc.free(result);
+    defer Level.releaseTables(alloc, result);
 
     // The dest table holds "k" and MUST participate: otherwise the compaction
     // writes k@100/k@90 into dest while k@50 stays in a separate dest table,
@@ -1138,4 +1138,646 @@ test "compaction: a delta above the newest state is live, not stale" {
     // Only k@100 sits below the newest terminal (state@200) → stale: "k" (1) +
     // "s100" (4). The delta and its base state are NOT counted.
     try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
+}
+
+// ---------------------------------------------------------------------------
+// Roaring rollup in compaction
+// ---------------------------------------------------------------------------
+
+const zroar = zdb.zroar;
+
+const roaring_delta: zdb.kv.Meta = .{ .kind = .delta, .encoding = .roaring };
+const roaring_state: zdb.kv.Meta = .{ .kind = .state, .encoding = .roaring };
+
+/// setupTombstoneTree with a caller-supplied Config (dir is filled in
+/// here). Rollup tests need to vary the rollup knobs.
+fn setupTreeWithCfg(
+    alloc: std.mem.Allocator,
+    fx: *TombstoneFixture,
+    dir_path: []const u8,
+    cfg: config.Config,
+    entries: []const MetaEntry,
+) !void {
+    const tree_id: u64 = 1;
+    fx.ms = manifest.ForestState.init(alloc);
+    errdefer fx.ms.deinit();
+    try fx.ms.commit(&.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+
+    var tb = try buildTableMeta(alloc, entries);
+    defer tb.deinit();
+    try installTable(alloc, &fx.ms, dir_path, &tb, 1, tree_id, 0);
+
+    var opts = cfg;
+    opts.dir = dir_path;
+    fx.cache = TableCache.init(alloc, opts.dir);
+    errdefer fx.cache.deinit();
+    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.ms, &fx.cache);
+    fx.file_ids = .{};
+    fx.file_ids.bind(1, 100, @ptrCast(&fx.file_ids), noopPersist);
+}
+
+fn encodeDelta(
+    alloc: std.mem.Allocator,
+    adds: []const u64,
+    rems: []const u64,
+) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(alloc);
+    var w = try zdb.buffers.RoaringDeltaWriter.initWithBuf(alloc, &list);
+    if (adds.len > 0) try w.setAdds(adds);
+    if (rems.len > 0) try w.setRemoves(rems);
+    _ = try w.finish();
+    return list.toOwnedSlice(alloc);
+}
+
+// The aligned return type matters: toBufferCopy allocates align(8),
+// and freeing through a plain []u8 trips the DebugAllocator's
+// alignment bookkeeping.
+fn encodeState(
+    alloc: std.mem.Allocator,
+    vals: []const u64,
+) ![]align(8) u8 {
+    var bm = try zroar.Bitmap.fromSortedList(alloc, vals);
+    defer bm.deinit();
+    return bm.toBufferCopy(alloc);
+}
+
+fn expectBitmapBytes(
+    alloc: std.mem.Allocator,
+    bytes: []const u8,
+    expected: []const u64,
+) !void {
+    var bm = try zroar.Bitmap.fromBufferCopy(alloc, bytes);
+    defer bm.deinit();
+    try std.testing.expectEqual(expected.len, bm.getCardinality());
+    for (expected) |v| try std.testing.expect(bm.contains(v));
+}
+
+/// The posting visible at `read_ts`, via the real read walk
+/// (Tree.rollupBitmap): after a rollup, an old-snapshot reader must
+/// land on the retained chain below the too-new synthetic state and
+/// fold to the same answer it got before the compaction.
+fn foldAt(
+    alloc: std.mem.Allocator,
+    tree: *Tree,
+    primary: []const u8,
+    read_ts: u64,
+) !zroar.Bitmap {
+    const bm = try tree.rollupBitmap(
+        alloc,
+        .{ .primary = primary, .timestamp = read_ts },
+        .p0,
+        null,
+        0,
+    );
+    return bm orelse zroar.Bitmap.init(alloc);
+}
+
+test "compaction: rollup folds a delta chain onto its in-inputs state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d300 = try encodeDelta(alloc, &.{40}, &.{2});
+    defer alloc.free(d300);
+    const d200 = try encodeDelta(alloc, &.{ 2, 3 }, &.{});
+    defer alloc.free(d200);
+    const s100 = try encodeState(alloc, &.{ 1, 2 });
+    defer alloc.free(s100);
+
+    // Non-bottom (4 levels): the retained chain must survive.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+        .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
+        .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 0);
+
+    // Newest version is now a synthetic state at the newest delta's
+    // timestamp: {1,2} +{2,3} → {1,2,3}, then +{40}-{2} → {1,3,40}.
+    const top = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isState());
+    try std.testing.expect(top.meta.isRoaring());
+    try std.testing.expectEqual(@as(u64, 300), top.key.timestamp);
+    try expectBitmapBytes(alloc, top.value, &.{ 1, 3, 40 });
+
+    // The replaced delta is gone; the older chain is retained verbatim
+    // beneath the synthetic state.
+    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 250 }, .p0) orelse
+        return error.TestExpectedItem;
+    defer mid.free(alloc);
+    try std.testing.expect(mid.meta.isDelta());
+    try std.testing.expectEqual(@as(u64, 200), mid.key.timestamp);
+
+    // MVCC: an old-snapshot reader folding the retained chain gets the
+    // historical bitmaps, unchanged by the rollup.
+    var at250 = try foldAt(alloc, &fx.tree, "k", 250);
+    defer at250.deinit();
+    try std.testing.expectEqual(@as(u64, 3), at250.getCardinality());
+    for ([_]u64{ 1, 2, 3 }) |v| try std.testing.expect(at250.contains(v));
+
+    var at150 = try foldAt(alloc, &fx.tree, "k", 150);
+    defer at150.deinit();
+    try std.testing.expectEqual(@as(u64, 2), at150.getCardinality());
+}
+
+test "compaction: rollup leaves lone states and baseless chains alone" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const s100 = try encodeState(alloc, &.{ 7, 8 });
+    defer alloc.free(s100);
+    const d200 = try encodeDelta(alloc, &.{5}, &.{});
+    defer alloc.free(d200);
+
+    // "a": already rolled (lone state). "b": delta with no base among
+    // the inputs — read-below isn't wired yet, so it stays a delta.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        .{ .key = "a", .ts = 100, .val = s100, .meta = roaring_state },
+        .{ .key = "b", .ts = 200, .val = d200, .meta = roaring_delta },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 0);
+
+    const a = try fx.tree.get(
+        .{ .primary = "a", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer a.free(alloc);
+    try std.testing.expect(a.meta.isState());
+    try std.testing.expectEqualSlices(u8, s100, a.value);
+
+    const b = try fx.tree.get(
+        .{ .primary = "b", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer b.free(alloc);
+    try std.testing.expect(b.meta.isDelta());
+    try std.testing.expectEqualSlices(u8, d200, b.value);
+}
+
+test "compaction: a mixed chain aborts the rollup and stays verbatim" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d300 = try encodeDelta(alloc, &.{5}, &.{});
+    defer alloc.free(d300);
+
+    // A raw state under a roaring delta: not ours to fold. Both
+    // versions must come out byte-identical.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+        .{ .key = "k", .ts = 200, .val = "raw-state", .meta = .{} },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 0);
+
+    const top = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isDelta());
+    try std.testing.expectEqualSlices(u8, d300, top.value);
+
+    const under = try fx.tree.get(.{ .primary = "k", .timestamp = 250 }, .p0) orelse
+        return error.TestExpectedItem;
+    defer under.free(alloc);
+    try std.testing.expectEqualStrings("raw-state", under.value);
+}
+
+test "compaction: an empty fold emits a roaring tombstone" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d200 = try encodeDelta(alloc, &.{}, &.{1});
+    defer alloc.free(d200);
+    const s100 = try encodeState(alloc, &.{1});
+    defer alloc.free(s100);
+
+    var fx: TombstoneFixture = undefined;
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
+        .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 0);
+
+    const top = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isDeleted());
+    try std.testing.expectEqual(@as(usize, 0), top.value.len);
+    try std.testing.expectEqual(@as(u64, 200), top.key.timestamp);
+
+    // Retained history below: the old state is still readable.
+    const old = try fx.tree.get(.{ .primary = "k", .timestamp = 150 }, .p0) orelse
+        return error.TestExpectedItem;
+    defer old.free(alloc);
+    try std.testing.expect(old.meta.isState());
+}
+
+test "compaction: bottom level collapses a rolled chain below the horizon" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d200 = try encodeDelta(alloc, &.{5}, &.{});
+    defer alloc.free(d200);
+    const s100 = try encodeState(alloc, &.{1});
+    defer alloc.free(s100);
+
+    // max_levels=2 → dest L1 IS the bottom; horizon above the whole
+    // chain lets the synthetic state's discard boundary drop the rest.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 2 }, &.{
+        .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
+        .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 300);
+
+    const top = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isState());
+    try expectBitmapBytes(alloc, top.value, &.{ 1, 5 });
+
+    // The chain beneath the synthetic state settled below the horizon
+    // and is gone: nothing older than the state remains.
+    try std.testing.expect(
+        (try fx.tree.get(.{ .primary = "k", .timestamp = 150 }, .p0)) == null,
+    );
+}
+
+test "compaction: rollup gates — min_deltas and rollup_enabled" {
+    const alloc = std.testing.allocator;
+
+    const d200 = try encodeDelta(alloc, &.{5}, &.{});
+    defer alloc.free(d200);
+    const s100 = try encodeState(alloc, &.{1});
+    defer alloc.free(s100);
+    const entries = [_]MetaEntry{
+        .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
+        .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
+    };
+
+    // min_deltas=2 with a 1-delta chain: not worth the rewrite.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir_path = try tmpPath(alloc, &tmp);
+        defer alloc.free(dir_path);
+        var fx: TombstoneFixture = undefined;
+        try setupTreeWithCfg(
+            alloc,
+            &fx,
+            dir_path,
+            .{ .max_levels = 4, .rollup_min_deltas = 2 },
+            &entries,
+        );
+        defer fx.deinit();
+        try fx.tree.doCompact(0, &fx.file_ids, 0);
+        const top = try fx.tree.get(
+            .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+            .p0,
+        ) orelse return error.TestExpectedItem;
+        defer top.free(alloc);
+        try std.testing.expect(top.meta.isDelta());
+    }
+
+    // rollup_enabled=false: today's behavior, everything verbatim.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir_path = try tmpPath(alloc, &tmp);
+        defer alloc.free(dir_path);
+        var fx: TombstoneFixture = undefined;
+        try setupTreeWithCfg(
+            alloc,
+            &fx,
+            dir_path,
+            .{ .max_levels = 4, .rollup_enabled = false },
+            &entries,
+        );
+        defer fx.deinit();
+        try fx.tree.doCompact(0, &fx.file_ids, 0);
+        const top = try fx.tree.get(
+            .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+            .p0,
+        ) orelse return error.TestExpectedItem;
+        defer top.free(alloc);
+        try std.testing.expect(top.meta.isDelta());
+        try std.testing.expectEqualSlices(u8, d200, top.value);
+    }
+}
+
+/// One SST per (level, entries) pair, ids assigned 1..n. For the
+/// read-below tests, which need history spread across levels.
+const LevelTable = struct { level: u32, entries: []const MetaEntry };
+
+fn setupTreeMulti(
+    alloc: std.mem.Allocator,
+    fx: *TombstoneFixture,
+    dir_path: []const u8,
+    cfg: config.Config,
+    tables: []const LevelTable,
+) !void {
+    const tree_id: u64 = 1;
+    fx.ms = manifest.ForestState.init(alloc);
+    errdefer fx.ms.deinit();
+    try fx.ms.commit(&.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+
+    for (tables, 1..) |t, id| {
+        var tb = try buildTableMeta(alloc, t.entries);
+        defer tb.deinit();
+        try installTable(alloc, &fx.ms, dir_path, &tb, id, tree_id, t.level);
+    }
+
+    var opts = cfg;
+    opts.dir = dir_path;
+    fx.cache = TableCache.init(alloc, opts.dir);
+    errdefer fx.cache.deinit();
+    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.ms, &fx.cache);
+    fx.file_ids = .{};
+    fx.file_ids.bind(1, 100, @ptrCast(&fx.file_ids), noopPersist);
+}
+
+test "compaction: shadowed delta chains are never re-rolled" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const s400 = try encodeState(alloc, &.{ 1, 5 });
+    defer alloc.free(s400);
+    const d300 = try encodeDelta(alloc, &.{5}, &.{});
+    defer alloc.free(d300);
+    const s100 = try encodeState(alloc, &.{1});
+    defer alloc.free(s100);
+
+    // The shape a chain has right after a rollup: synthetic state on
+    // top, retained delta + old base beneath it. A later compaction
+    // must NOT regenerate a synthetic state for the shadowed delta —
+    // that would repeat the fold + write amp on every compaction
+    // until GC collapses the chain.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        .{ .key = "k", .ts = 400, .val = s400, .meta = roaring_state },
+        .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+        .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 0);
+
+    // The shadowed delta came through verbatim, not as a state.
+    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 350 }, .p0) orelse
+        return error.TestExpectedItem;
+    defer mid.free(alloc);
+    try std.testing.expect(mid.meta.isDelta());
+    try std.testing.expectEqualSlices(u8, d300, mid.value);
+}
+
+test "compaction: read-below rolls a baseless chain onto a deep state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d300 = try encodeDelta(alloc, &.{5}, &.{1});
+    defer alloc.free(d300);
+    const s100 = try encodeState(alloc, &.{ 1, 2 });
+    defer alloc.free(s100);
+
+    // Delta at L1, its base two levels down at L3. Compacting L1→L2
+    // (dest=2 >= rollup_at_level=2) peeks below and regenerates.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeMulti(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        .{ .level = 1, .entries = &.{
+            .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+        } },
+        .{ .level = 3, .entries = &.{
+            .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
+        } },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(1, &fx.file_ids, 0);
+
+    const top = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isState());
+    try std.testing.expectEqual(@as(u64, 300), top.key.timestamp);
+    try expectBitmapBytes(alloc, top.value, &.{ 2, 5 });
+}
+
+test "compaction: max_deltas forces read-below even at L1" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d300 = try encodeDelta(alloc, &.{5}, &.{});
+    defer alloc.free(d300);
+    const d200 = try encodeDelta(alloc, &.{3}, &.{});
+    defer alloc.free(d200);
+    const s100 = try encodeState(alloc, &.{1});
+    defer alloc.free(s100);
+
+    // Level trigger disabled (rollup_at_level way above max_levels);
+    // the 2-delta chain hits rollup_max_deltas=2 and forces the peek
+    // from an L0→L1 compaction.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeMulti(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .rollup_at_level = 200,
+        .rollup_max_deltas = 2,
+    }, &.{
+        .{ .level = 0, .entries = &.{
+            .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+            .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
+        } },
+        .{ .level = 2, .entries = &.{
+            .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
+        } },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 0);
+
+    const top = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isState());
+    try std.testing.expectEqual(@as(u64, 300), top.key.timestamp);
+    try expectBitmapBytes(alloc, top.value, &.{ 1, 3, 5 });
+}
+
+test "compaction: read-below with no state anywhere folds from empty" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d300 = try encodeDelta(alloc, &.{5}, &.{});
+    defer alloc.free(d300);
+    const d100 = try encodeDelta(alloc, &.{3}, &.{});
+    defer alloc.free(d100);
+
+    var fx: TombstoneFixture = undefined;
+    try setupTreeMulti(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        .{ .level = 1, .entries = &.{
+            .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+        } },
+        .{ .level = 3, .entries = &.{
+            .{ .key = "k", .ts = 100, .val = d100, .meta = roaring_delta },
+        } },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(1, &fx.file_ids, 0);
+
+    const top = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isState());
+    try expectBitmapBytes(alloc, top.value, &.{ 3, 5 });
+}
+
+test "compaction: read-below declined by triggers or mixed chains" {
+    const alloc = std.testing.allocator;
+
+    const d300 = try encodeDelta(alloc, &.{5}, &.{});
+    defer alloc.free(d300);
+    const s100 = try encodeState(alloc, &.{1});
+    defer alloc.free(s100);
+
+    // Neither trigger fires: the chain stays a delta.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir_path = try tmpPath(alloc, &tmp);
+        defer alloc.free(dir_path);
+        var fx: TombstoneFixture = undefined;
+        try setupTreeMulti(alloc, &fx, dir_path, .{
+            .max_levels = 4,
+            .rollup_at_level = 200,
+            .rollup_max_deltas = 200,
+        }, &.{
+            .{ .level = 1, .entries = &.{
+                .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+            } },
+            .{ .level = 3, .entries = &.{
+                .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
+            } },
+        });
+        defer fx.deinit();
+        try fx.tree.doCompact(1, &fx.file_ids, 0);
+        const top = try fx.tree.get(
+            .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+            .p0,
+        ) orelse return error.TestExpectedItem;
+        defer top.free(alloc);
+        try std.testing.expect(top.meta.isDelta());
+        try std.testing.expectEqualSlices(u8, d300, top.value);
+    }
+
+    // A raw (non-roaring) version below: the peek reports the chain
+    // unfoldable and the run stays verbatim.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir_path = try tmpPath(alloc, &tmp);
+        defer alloc.free(dir_path);
+        var fx: TombstoneFixture = undefined;
+        try setupTreeMulti(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+            .{ .level = 1, .entries = &.{
+                .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+            } },
+            .{ .level = 3, .entries = &.{
+                .{ .key = "k", .ts = 100, .val = "raw", .meta = .{} },
+            } },
+        });
+        defer fx.deinit();
+        try fx.tree.doCompact(1, &fx.file_ids, 0);
+        const top = try fx.tree.get(
+            .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+            .p0,
+        ) orelse return error.TestExpectedItem;
+        defer top.free(alloc);
+        try std.testing.expect(top.meta.isDelta());
+        try std.testing.expectEqualSlices(u8, d300, top.value);
+    }
+}
+
+test "compaction: rollup folds a chain terminated by a tombstone" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d300 = try encodeDelta(alloc, &.{9}, &.{});
+    defer alloc.free(d300);
+
+    // A raw tombstone terminates a roaring chain (the index key was
+    // cleared, then a new delta arrived): fold = {} + {9}.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
+        .{ .key = "k", .ts = 200, .val = "", .meta = .{ .kind = .deleted } },
+    });
+    defer fx.deinit();
+
+    try fx.tree.doCompact(0, &fx.file_ids, 0);
+
+    const top = try fx.tree.get(
+        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    ) orelse return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.meta.isState());
+    try expectBitmapBytes(alloc, top.value, &.{9});
 }

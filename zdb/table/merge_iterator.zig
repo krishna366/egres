@@ -1,10 +1,45 @@
 const std = @import("std");
 const table = @import("table.zig");
+const cache_mod = @import("../cache.zig");
 const Key = @import("../kv.zig").Key;
 const skl = @import("../skl/skiplist.zig");
 const utils = @import("utils");
 
 pub const Error = table.Error;
+
+/// A refcounted hold on the storage backing an iterator item's value:
+/// a decompressed block (SST sources) or a memtable's skiplist arena.
+/// Every positioned source is pinnable — `Iterator.currentPin` /
+/// `MergeIterator.currentPin` return null only when there is no item.
+/// `hold` takes the ref and returns the pin for append-style use;
+/// `release` drops it (the skiplist arena outlives its Memtables slot
+/// while held; a block outlives cache eviction while held).
+///
+/// A held slice is stable AND immutable, even against the active
+/// memtable: skiplist arenas are append-only — an overwrite dupes new
+/// bytes and swaps the node pointer, never touching old bytes (see
+/// SkipList.putItem) — and blocks are immutable by construction. So
+/// borrowing until a fold completes carries exactly the guarantees
+/// copying at capture time had.
+pub const Pin = union(enum) {
+    block: *cache_mod.Value,
+    skiplist: *skl.SkipList,
+
+    pub fn acquire(self: Pin) Pin {
+        switch (self) {
+            .block => |b| _ = b.incrRef(),
+            .skiplist => |sl| sl.acquire(),
+        }
+        return self;
+    }
+
+    pub fn release(self: Pin) void {
+        switch (self) {
+            .block => |b| b.decrRef(),
+            .skiplist => |sl| sl.release(),
+        }
+    }
+};
 
 /// Iterator is a tagged union that lets MergeIterator accept a TableIterator
 /// (single SST), ConcatIterator (multiple non-overlapping SSTs), or a
@@ -18,6 +53,25 @@ pub const Iterator = union(enum) {
     pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
         switch (self.*) {
             inline else => |*it| try it.seekRange(start, end),
+        }
+    }
+
+    /// The pinnable storage backing itemRef()'s value; null only when
+    /// the source holds no item.
+    pub fn currentPin(self: *const Iterator) ?Pin {
+        switch (self.*) {
+            .table => |*t| {
+                const b = t.currentBlock() orelse return null;
+                return .{ .block = b };
+            },
+            .concat => |*c| {
+                const b = c.currentBlock() orelse return null;
+                return .{ .block = b };
+            },
+            .skiplist => |*s| {
+                if (s.current == null) return null;
+                return .{ .skiplist = s.skiplist };
+            },
         }
     }
 
@@ -117,6 +171,13 @@ pub const MergeIterator = struct {
         }
     }
 
+    /// The pinnable storage backing itemRef()'s value; null only when
+    /// the merge is exhausted.
+    pub fn currentPin(self: *const MergeIterator) ?Pin {
+        if (self.heap_len == 0) return null;
+        return self.iters[self.heap[0]].currentPin();
+    }
+
     pub fn itemRef(self: *MergeIterator) ?table.Item {
         if (self.heap_len == 0) return null;
         return self.items[self.heap[0]];
@@ -124,8 +185,10 @@ pub const MergeIterator = struct {
 
     pub fn next(self: *MergeIterator) Error!void {
         if (self.heap_len == 0) return;
+
         const src = self.heap[0];
         try self.iters[src].next();
+
         if (self.iters[src].itemRef()) |item| {
             // Replace-top rather than pop + push: the source that just
             // advanced often still wins (runs from one source are the
@@ -193,6 +256,11 @@ pub const ConcatIterator = struct {
     pub fn itemRef(self: *const ConcatIterator) ?table.Item {
         if (self.current >= self.iters.len) return null;
         return self.iters[self.current].itemRef();
+    }
+
+    pub fn currentBlock(self: *const ConcatIterator) ?*cache_mod.Value {
+        if (self.current >= self.iters.len) return null;
+        return self.iters[self.current].currentBlock();
     }
 
     pub fn next(self: *ConcatIterator) Error!void {

@@ -64,6 +64,7 @@ pub fn parseMessageWithTail(buf: []const u8) Error!MessageReader {
         KeyValueReader.TABLE_ID => .{ .KeyValue = try KeyValueReader.init(payload_buf, 0) },
         MutationsReader.TABLE_ID => .{ .Mutations = try MutationsReader.init(payload_buf, 0) },
         NamespaceReader.TABLE_ID => .{ .Namespace = try NamespaceReader.init(payload_buf, 0) },
+        RoaringDeltaReader.TABLE_ID => .{ .RoaringDelta = try RoaringDeltaReader.init(payload_buf, 0) },
         else => zbuf.Error.Invalid,
     };
 }
@@ -78,6 +79,7 @@ pub const MessageReader = union(enum) {
     KeyValue: KeyValueReader,
     Mutations: MutationsReader,
     Namespace: NamespaceReader,
+    RoaringDelta: RoaringDeltaReader,
 };
 
 pub const BlockIndexStruct = struct {
@@ -3073,6 +3075,311 @@ pub const NamespaceWriter = struct {
     /// Root must be at payload offset 0. Initialize the root writer first
     /// on an empty buffer; children built later land at higher offsets.
     pub fn finishWithTail(self: *Self) Error!NamespaceBuffer {
+        if (self.base != 0) return zbuf.Error.Invalid;
+        const out = self.bufMut();
+        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
+        var result = try self.finish();
+        result.has_tail = true;
+        return result;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return;
+            owned.deinit(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            self.base = 0;
+            self.owns_buf = false;
+        }
+    }
+};
+
+pub const RoaringDeltaStruct = struct {
+    pub const TABLE_ID: u16 = 46602;
+    adds: []u64 = &.{},
+    removes: []u64 = &.{},
+    pub fn deinit(self: *RoaringDeltaStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.adds);
+        self.adds = &.{};
+        alloc.free(self.removes);
+        self.removes = &.{};
+    }
+
+    pub fn destroy(self: *RoaringDeltaStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: RoaringDeltaStruct, alloc: std.mem.Allocator) Error!RoaringDeltaStruct {
+        var s = RoaringDeltaStruct{};
+        errdefer s.deinit(alloc);
+        s.adds = try alloc.dupe(u64, self.adds);
+        s.removes = try alloc.dupe(u64, self.removes);
+        return s;
+    }
+
+    pub fn clone(self: RoaringDeltaStruct, alloc: std.mem.Allocator) Error!*RoaringDeltaStruct {
+        const ptr = try alloc.create(RoaringDeltaStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: RoaringDeltaStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try RoaringDeltaWriter.initWithBuf(alloc, out);
+        if (self.adds.len > 0) try writer.setAdds(self.adds);
+        if (self.removes.len > 0) try writer.setRemoves(self.removes);
+        const result = try writer.finish();
+        return result.offset;
+    }
+};
+
+pub const RoaringDeltaReader = struct {
+    const Self = @This();
+    buf: []const u8,
+    base: u32,
+    size_bytes: u16,
+
+    pub const TABLE_ID: u16 = 46602;
+    pub const SIZE_BYTES: u16 = 18;
+
+    pub fn parseRoot(buf: []const u8) Error!Self {
+        const tail = try zbuf.readMessageTail(buf);
+        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
+        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
+        return init(payload_buf, 0);
+    }
+
+    pub fn init(buf: []const u8, base: u32) Error!Self {
+        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
+        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
+        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
+        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+    }
+
+    fn addsSlice(self: Self) []const u8 {
+        const slot_end = @as(u32, self.base) + 10;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch return &.{};
+        if (elem_count == 0) return &.{};
+        const end = @as(usize, index_off) + @as(usize, elem_count) * 8;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn addsLen(self: Self) u32 {
+        return @intCast(self.addsSlice().len / 8);
+    }
+
+    pub fn addsAt(self: Self, i: u32) Error!u64 {
+        const s = self.addsSlice();
+        const off = @as(usize, i) * 8;
+        if (off + 8 > s.len) return zbuf.Error.OutOfBounds;
+        return zbuf.readU64(s, off) catch unreachable;
+    }
+
+    pub fn addsToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u64 {
+        const raw = self.addsSlice();
+        const count = raw.len / 8;
+        const out = try alloc.alloc(u64, count);
+        errdefer alloc.free(out);
+        for (out, 0..) |*v, i| {
+            v.* = zbuf.readU64(raw, i * 8) catch unreachable;
+        }
+        return out;
+    }
+
+    fn removesSlice(self: Self) []const u8 {
+        const slot_end = @as(u32, self.base) + 18;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch return &.{};
+        if (elem_count == 0) return &.{};
+        const end = @as(usize, index_off) + @as(usize, elem_count) * 8;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn removesLen(self: Self) u32 {
+        return @intCast(self.removesSlice().len / 8);
+    }
+
+    pub fn removesAt(self: Self, i: u32) Error!u64 {
+        const s = self.removesSlice();
+        const off = @as(usize, i) * 8;
+        if (off + 8 > s.len) return zbuf.Error.OutOfBounds;
+        return zbuf.readU64(s, off) catch unreachable;
+    }
+
+    pub fn removesToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u64 {
+        const raw = self.removesSlice();
+        const count = raw.len / 8;
+        const out = try alloc.alloc(u64, count);
+        errdefer alloc.free(out);
+        for (out, 0..) |*v, i| {
+            v.* = zbuf.readU64(raw, i * 8) catch unreachable;
+        }
+        return out;
+    }
+
+    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try RoaringDeltaWriter.initWithBuf(alloc, out);
+        const values_adds = try self.addsToSliceAlloc(alloc);
+        defer alloc.free(values_adds);
+        if (values_adds.len > 0) try writer.setAdds(values_adds);
+        const values_removes = try self.removesToSliceAlloc(alloc);
+        defer alloc.free(values_removes);
+        if (values_removes.len > 0) try writer.setRemoves(values_removes);
+        const result = try writer.finish();
+        return result.offset;
+    }
+
+    pub fn verify(self: Self) Error!void {
+        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        const slot_end_arr_2 = @as(u32, self.base) + 10;
+        if (slot_end_arr_2 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 2));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
+            if (elem_count > 0) {
+                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 8;
+                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
+            }
+        }
+        const slot_end_arr_10 = @as(u32, self.base) + 18;
+        if (slot_end_arr_10 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
+            if (elem_count > 0) {
+                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 8;
+                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
+            }
+        }
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!RoaringDeltaStruct {
+        var s = RoaringDeltaStruct{};
+        errdefer s.deinit(alloc);
+        s.adds = try self.addsToSliceAlloc(alloc);
+        s.removes = try self.removesToSliceAlloc(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*RoaringDeltaStruct {
+        const ptr = try alloc.create(RoaringDeltaStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const RoaringDeltaBuffer = struct {
+    alloc: std.mem.Allocator,
+    offset: u32,
+    bytes: ?[]u8,
+    ownership: Ownership,
+    has_tail: bool,
+    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
+        const tail = try zbuf.readMessageTail(bytes);
+        if (tail.table_id != RoaringDeltaReader.TABLE_ID) return zbuf.Error.Invalid;
+        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
+    }
+    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
+        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
+    }
+    pub fn initReader(self: @This()) Error!RoaringDeltaReader {
+        const payload = self.bytes orelse return zbuf.Error.Invalid;
+        return RoaringDeltaReader.init(payload, self.offset);
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| {
+            if (self.ownership == .owned) self.alloc.free(bytes);
+            self.bytes = null;
+            self.ownership = .borrowed;
+        }
+    }
+};
+
+pub const RoaringDeltaWriter = struct {
+    const Self = @This();
+    buf: ?*std.ArrayList(u8),
+    owns_buf: bool,
+    alloc: std.mem.Allocator,
+    base: u32,
+
+    pub const TABLE_ID: u16 = 46602;
+    pub const SIZE_BYTES: u16 = 18;
+
+    fn bufMut(self: *Self) *std.ArrayList(u8) {
+        return self.buf orelse @panic("zbuf writer missing buffer");
+    }
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
+        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
+        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
+        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+    }
+
+    pub fn init(alloc: std.mem.Allocator) Error!Self {
+        const owned = try alloc.create(std.ArrayList(u8));
+        owned.* = .empty;
+        errdefer alloc.destroy(owned);
+        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
+        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
+        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+    }
+
+    pub fn setAdds(self: *Self, values: []const u64) Error!void {
+        const out = self.bufMut();
+        if (values.len == 0) {
+            try zbuf.patchU32(out.items, self.base + 2, 0);
+            try zbuf.patchU32(out.items, self.base + 6, 0);
+            return;
+        }
+        const abs_index_off = try zbuf.appendU64Slice(out, self.alloc, values);
+        const index_off = abs_index_off;
+        try zbuf.patchU32(out.items, self.base + 2, index_off);
+        try zbuf.patchU32(out.items, self.base + 6, @as(u32, @intCast(values.len)));
+    }
+
+    pub fn setRemoves(self: *Self, values: []const u64) Error!void {
+        const out = self.bufMut();
+        if (values.len == 0) {
+            try zbuf.patchU32(out.items, self.base + 10, 0);
+            try zbuf.patchU32(out.items, self.base + 14, 0);
+            return;
+        }
+        const abs_index_off = try zbuf.appendU64Slice(out, self.alloc, values);
+        const index_off = abs_index_off;
+        try zbuf.patchU32(out.items, self.base + 10, index_off);
+        try zbuf.patchU32(out.items, self.base + 14, @as(u32, @intCast(values.len)));
+    }
+
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "adds")) try self.setAdds(@field(values, "adds"));
+        if (@hasField(Values, "removes")) try self.setRemoves(@field(values, "removes"));
+    }
+
+    pub fn finish(self: *Self) Error!RoaringDeltaBuffer {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return zbuf.Error.Invalid;
+            const bytes = try owned.toOwnedSlice(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
+        }
+        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+    }
+
+    /// Root must be at payload offset 0. Initialize the root writer first
+    /// on an empty buffer; children built later land at higher offsets.
+    pub fn finishWithTail(self: *Self) Error!RoaringDeltaBuffer {
         if (self.base != 0) return zbuf.Error.Invalid;
         const out = self.bufMut();
         try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);

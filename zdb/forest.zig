@@ -11,6 +11,7 @@ const tree_mod = @import("tree.zig");
 const skl = @import("skl/skiplist.zig");
 const metrics = @import("metrics.zig");
 const fi = @import("file_ids.zig");
+const zroar = @import("zroar");
 
 const Key = @import("kv.zig").Key;
 const TreeKey = @import("kv.zig").TreeKey;
@@ -107,7 +108,10 @@ pub const Memtables = struct {
     allocator: std.mem.Allocator,
     mu: fiber.RWMutex(.untracked),
     current: *SkipList,
-    immutables: std.ArrayList(*SkipList), // oldest at index 0
+    /// Newest at index 0, oldest last — the order every reader wants
+    /// (getIterators hands sources out newest-first as-is), and the
+    /// flush path pops the oldest off the END for free.
+    immutables: std.ArrayList(*SkipList),
 
     pub fn init(allocator: std.mem.Allocator, current: *SkipList) Memtables {
         return .{
@@ -139,7 +143,8 @@ pub const Memtables = struct {
     /// Get iterators for a scan merge: `pending` (a txn's private
     /// write skiplist, when non-null) FIRST — src 0, the merge's
     /// equal-key tie-break, so the txn sees its own writes — then the
-    /// active memtable, then every immutable. Each `skl.Iterator.init`
+    /// active memtable, then the immutables newest-first (their
+    /// storage order). Each `skl.Iterator.init`
     /// acquires the underlying skiplist — release happens via `deinit`
     /// on the returned iterator (transitively from
     /// `MergeIterator.deinit`). Doing the acquires under our shared
@@ -204,11 +209,9 @@ pub const Memtables = struct {
         if (self.current.get(search_key)) |item| {
             return try item.dupe(allocator);
         }
-        // Newest first (highest index).
-        var i: usize = self.immutables.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.immutables.items[i].get(search_key)) |item| {
+        // Immutables are stored newest-first.
+        for (self.immutables.items) |imm| {
+            if (imm.get(search_key)) |item| {
                 return try item.dupe(allocator);
             }
         }
@@ -230,7 +233,8 @@ pub const Memtables = struct {
         if (self.current.id == 0) {
             self.current.release();
         } else {
-            try self.immutables.append(self.allocator, self.current);
+            // Newest-first: the just-frozen memtable goes in front.
+            try self.immutables.insert(self.allocator, 0, self.current);
         }
         const new_mt = try SkipList.init(self.allocator);
         new_mt.id = new_id;
@@ -244,7 +248,8 @@ pub const Memtables = struct {
     pub fn oldestInMemoryLogIndex(self: *Memtables) u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        if (self.immutables.items.len > 0) return self.immutables.items[0].created_at_log_index;
+        const imms = self.immutables.items;
+        if (imms.len > 0) return imms[imms.len - 1].created_at_log_index;
         return self.current.created_at_log_index;
     }
 
@@ -269,8 +274,12 @@ pub const Memtables = struct {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        while (self.immutables.items.len > 0 and self.immutables.items[0].id < expected_id) {
-            const phantom = self.immutables.orderedRemove(0);
+        // Newest-first storage: the oldest sits at the END, so both
+        // the phantom sweep and the pop are cheap tail removals.
+        while (self.immutables.items.len > 0 and
+            self.immutables.items[self.immutables.items.len - 1].id < expected_id)
+        {
+            const phantom = self.immutables.pop().?;
             log.info(
                 "popOldestIfMatches: releasing phantom immutable id={d} (expected_id={d})",
                 .{ phantom.id, expected_id },
@@ -282,7 +291,7 @@ pub const Memtables = struct {
             log.info("popOldestIfMatches: skipping pop, immutables empty (expected_id={d})", .{expected_id});
             return;
         }
-        const oldest_id = self.immutables.items[0].id;
+        const oldest_id = self.immutables.items[self.immutables.items.len - 1].id;
         if (oldest_id != expected_id) {
             log.info(
                 "popOldestIfMatches: skipping pop, oldest.id={d} > expected_id={d} (recovery: pre-snap flush, memtable not re-created locally)",
@@ -290,7 +299,7 @@ pub const Memtables = struct {
             );
             return;
         }
-        const imm = self.immutables.orderedRemove(0);
+        const imm = self.immutables.pop().?;
         imm.release();
     }
 
@@ -300,7 +309,7 @@ pub const Memtables = struct {
         defer self.mu.unlockShared();
 
         if (self.immutables.items.len == 0) return null;
-        return self.immutables.items[0];
+        return self.immutables.items[self.immutables.items.len - 1];
     }
 };
 
@@ -663,6 +672,69 @@ pub const Forest = struct {
         const trees = self.treesFor(search_key.namespace, search_key.table_id) orelse return null;
         const tree = trees.lookup(search_key) orelse return null;
         return tree.get(search_key, priority);
+    }
+
+    /// The posting bitmap for `search_key`'s primary as of
+    /// `search_key.timestamp` (the read_ts — same convention as `get`).
+    /// A lazy top-down walk via Tree.rollupBitmap: one merge over the
+    /// memtable sources, then the owning tree's levels, stopping at
+    /// the first terminal (a state or a tombstone). After compaction
+    /// rollup the newest version is usually already a state, so the
+    /// walk rarely descends past the level that holds it.
+    ///
+    /// An absent key, a tombstoned key, and an empty posting all return
+    /// an EMPTY bitmap — an index reader cannot distinguish them and
+    /// should not try. The bitmap is owned by `allocator`; deinit it.
+    ///
+    /// Fails with CorruptPosting on undecodable delta bytes and
+    /// NotRoaring if the chain contains a non-roaring version —
+    /// getBitmap is only meaningful on keys written as roaring postings.
+    pub fn getBitmap(
+        self: *Forest,
+        allocator: std.mem.Allocator,
+        search_key: Key,
+        priority: vfs.Priority,
+    ) !zroar.Bitmap {
+        if (search_key.timestamp < self.globalMinRead()) {
+            return error.ReadBelowMinRead;
+        }
+
+        // Memtable sources BEFORE the tree lookup: data flushed in
+        // between is then visible in both our held snapshot and L0,
+        // and rollupBitmap's descending bound skips the L0 duplicate.
+        // The reverse order could miss it in both. getIterators
+        // acquires refs, so the arenas outlive a concurrent flush.
+        // One sorted merge over them (rather than sequential drains):
+        // memtable seeks cost no I/O, and the merge is indifferent to
+        // source order and cross-memtable ordering subtleties.
+        const srcs = try self.memtables.getIterators(allocator, null);
+        var mems_itr = merge_iterator.MergeIterator.init(allocator, srcs);
+        defer {
+            mems_itr.deinit(); // releases each source's skiplist ref
+            allocator.free(srcs);
+        }
+
+        // Tree pointer resolved under the forest lock, used after —
+        // the same lifetime contract scanRaw relies on between hops.
+        const tree: ?*Tree = blk: {
+            self.mu.lockShared(@src());
+            defer self.mu.unlockShared();
+            const trees = self.treesFor(
+                search_key.namespace,
+                search_key.table_id,
+            ) orelse break :blk null;
+            break :blk trees.lookup(search_key);
+        };
+        const t = tree orelse return zroar.Bitmap.init(allocator);
+
+        const bm = try t.rollupBitmap(
+            allocator,
+            search_key,
+            priority,
+            &mems_itr,
+            0,
+        );
+        return bm orelse zroar.Bitmap.init(allocator);
     }
 
     const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;

@@ -10,5 +10,9 @@ pub const forest = @import("zdb/forest.zig");
 pub const cache = @import("zdb/cache.zig");
 pub const file_ids = @import("zdb/file_ids.zig");
 pub const metrics = @import("zdb/metrics.zig");
+pub const validate = @import("zdb/validate.zig");
 pub const vfs = @import("vfs");
+// Re-exported so consumers of `getBitmap` (the future SQL index reader)
+// get the Bitmap type from zdb itself, without their own zroar edge.
+pub const zroar = @import("zroar");
 pub const bandwidth = vfs.bandwidth;

@@ -44,6 +44,25 @@ pub const KeyRange = struct {
         return self.left.primary.len == 0 and self.right.primary.len == 0 and !self.inf;
     }
 
+    /// The range spanning one key's versions at or below its timestamp.
+    /// Left keeps `key.timestamp` — ts sorts descending, so a seek
+    /// lands directly on the newest version visible at that ts, never
+    /// touching newer ones (pass maxInt for every version). Right sits
+    /// at ts=0: exclusive, and unreachable in practice (no version
+    /// commits at HLC 0), which closes the range without allocating a
+    /// successor primary. Borrows `key.primary`.
+    pub fn versionsAt(key: Key) KeyRange {
+        return .{
+            .left = key,
+            .right = .{
+                .namespace = key.namespace,
+                .table_id = key.table_id,
+                .primary = key.primary,
+                .timestamp = 0,
+            },
+        };
+    }
+
     /// Deep copy: dupes the underlying primary bytes for both bounds
     /// using `allocator`. The original Keys may borrow from
     /// short-lived storage (e.g. manifest entries protected by a
@@ -293,7 +312,25 @@ pub const Level = struct {
             break :blk items[left..right];
         };
 
-        return allocator.dupe(TableEntry, slice);
+        // Pin every returned table while the lock is still held. The
+        // caller's *Table pointers must survive a concurrent
+        // applyCompaction deleting these entries (decrRef at zero
+        // frees the Table; the file stays). Callers release with
+        // `releaseTables` once done — TableIterator.init takes its
+        // own ref, so iterators outlive the release.
+        const out = try allocator.dupe(TableEntry, slice);
+        for (out) |e| e.table.incrRef();
+        return out;
+    }
+
+    /// Release a slice returned by `overlappingTables`: drop the pins
+    /// and free the slice.
+    pub fn releaseTables(
+        allocator: std.mem.Allocator,
+        entries: []TableEntry,
+    ) void {
+        for (entries) |e| e.table.decrRef();
+        allocator.free(entries);
     }
 
     pub fn getTotalSize(self: *Level) i64 {

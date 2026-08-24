@@ -140,9 +140,14 @@ removed when the queue drains.
   the inserter never reads the posting, so the pending write is a
   **delta** (`add egid E to K`, `remove` for deletes), not a full value.
   Deltas merge at apply — already serialized by raft's single apply
-  loop. v1: read-merge-write into the memtable at apply. Endgame:
-  LSM-native delta records rolled into the base bitmap at read +
-  compaction (the Dgraph posting-list/rollup design).
+  loop. IMPLEMENTED (LSM-native, the Dgraph posting-list/rollup
+  design): delta records are zbuf `RoaringDelta` messages tagged
+  `Meta{.delta, .roaring}` (zdb/buffers.zig); `zdb/validate.zig` is
+  the write-side gate; reads materialize a zroar bitmap via
+  `Forest.getBitmap`; compaction folds chains into a synthetic
+  full-bitmap state (`VersionTracker` in zdb/tree.zig owns the fold,
+  triggers in config.zig `rollup_*`). The SQL layer only needs to emit deltas and
+  call getBitmap when CREATE INDEX lands.
   Soundness invariant: everything about a single row is serialized by
   that row's locks; cross-row index deltas only ever commute (add/remove
   of the SAME egid cannot race because the row lock orders them).

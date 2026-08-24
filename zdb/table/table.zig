@@ -648,12 +648,15 @@ pub const TableIterator = struct {
             }
         }
 
-        // Seek.
+        // Seek. The landing item can be past `end` (start beyond the
+        // last in-range key lands on whatever follows), so the bound
+        // applies here just as it does after every next().
         if (start.len() == 0) {
             try self.seekToFirst();
         } else {
             try self.seekForward(start);
         }
+        self.checkEndKey();
     }
 
     fn seekToFirst(self: *TableIterator) Error!void {
@@ -747,6 +750,16 @@ pub const TableIterator = struct {
     pub fn itemRef(self: *const TableIterator) ?Item {
         if (!self.valid) return null;
         return self.bi.?.itemRef();
+    }
+
+    /// The refcounted block backing the current item's value, or null
+    /// when not positioned. A caller that keeps item.value past next()
+    /// incrRefs this pin (and decrRefs when done) instead of copying
+    /// the bytes — the block stays alive even after the iterator
+    /// advances or dies.
+    pub fn currentBlock(self: *const TableIterator) ?*cache_mod.Value {
+        if (!self.valid) return null;
+        return self.current_block;
     }
 
     fn setBlock(self: *TableIterator, bpos: usize) Error!void {

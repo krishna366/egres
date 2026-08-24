@@ -14,6 +14,7 @@ const Modules = struct {
     // External deps
     zio: *std.Build.Module,
     metrics: *std.Build.Module,
+    zroar: *std.Build.Module,
 
     // Schema / codegen
     schema: *std.Build.Module, // zbuf/schema.zig (used by zbuf gen tool)
@@ -182,6 +183,7 @@ fn makeModules(
     // same artifact, but pulling once keeps the dependency surface explicit.
     const zio = b.dependency("zio", .{ .target = target, .optimize = optimize }).module("zio");
     const metrics = b.dependency("metrics", .{ .target = target, .optimize = optimize }).module("metrics");
+    const zroar = b.dependency("zroar", .{ .target = target, .optimize = optimize }).module("zroar");
 
     // Schema / codegen
     const schema = makeModule(b, target, optimize, "zbuf/schema.zig");
@@ -251,6 +253,7 @@ fn makeModules(
     zdb.addImport("zfiber", fiber);
     zdb.addImport("vfs", vfs);
     zdb.addImport("metrics", metrics);
+    zdb.addImport("zroar", zroar);
 
     const pgwire = makeModule(b, target, optimize, "pgwire.zig");
     pgwire.addImport("zfiber", fiber);
@@ -283,6 +286,7 @@ fn makeModules(
     return .{
         .zio = zio,
         .metrics = metrics,
+        .zroar = zroar,
         .schema = schema,
         .buffers_gen = buffers_gen,
         .flags = flags,
@@ -405,6 +409,9 @@ fn isSkippedPath(path: []const u8) bool {
         std.mem.startsWith(u8, path, "zig-out/") or
         std.mem.startsWith(u8, path, "node_modules/") or
         std.mem.startsWith(u8, path, "third_party/") or
+        // Zig-package deps unpacked by `zig build` (see build.zig.zon);
+        // their tests run in their own repos, not in ours.
+        std.mem.startsWith(u8, path, "zig-pkg/") or
         // Graveyard for code no longer wired into the build (e.g. the old
         // Mux multiplexer + its tests). Excluded wholesale from discovery.
         std.mem.startsWith(u8, path, "unused/");
@@ -532,7 +539,7 @@ fn addAllTests(
     const test_imports = .{
         "zbuf",    "zdb",         "raft",      "utils",  "zio",    "vfs",
         "metrics", "buffers_gen", "transport", "serial", "pgwire", "zfiber",
-        "sql",     "engine",      "flags",
+        "sql",     "engine",      "flags",     "zroar",
     };
 
     const root_mod = b.createModule(.{
