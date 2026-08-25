@@ -13,17 +13,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Installs the pinned compiler and caches the global Zig cache
       # (fetched build.zig.zon packages land there) between runs.
+      # Still declares the node20 runtime as of v2.2.1 (runs fine on
+      # the runner's node24, but emits a deprecation notice) — drop
+      # this note once upstream migrates.
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
       # Native deps (mimalloc/jemalloc) build once into .deps/ from
       # tarballs pinned in build.zig; cache them on those pins.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .deps
           key: deps-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/bootstrap-*.sh') }}
