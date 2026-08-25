@@ -1,0 +1,32 @@
+# Every push to main runs the same gate as a local push:
+# scripts/prepush.sh — exe builds (default + jemalloc allocator) and
+# the full test suite including big tests (`zig build test -- --bigtest`).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the pinned compiler and caches the global Zig cache
+      # (fetched build.zig.zon packages land there) between runs.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Native deps (mimalloc/jemalloc) build once into .deps/ from
+      # tarballs pinned in build.zig; cache them on those pins.
+      - uses: actions/cache@v4
+        with:
+          path: .deps
+          key: deps-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/bootstrap-*.sh') }}
+
+      - name: prepush (builds + full test suite incl. big tests)
+        run: ./scripts/prepush.sh
