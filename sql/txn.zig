@@ -108,8 +108,9 @@ pub const Txn = struct {
     /// The in-flight statement's reads: discarded and re-run on a
     /// restart, merged into `prev` when the statement finishes.
     cur: ReadSet = .{},
-    /// Pending puts and tombstones, created by the first `put` — a
-    /// read-only statement never allocates it. Same-key re-put replaces
+    /// Pending puts and tombstones, plus secondary-index posting ops
+    /// (`putPosting`), created by the first write — a read-only
+    /// statement never allocates it. Same-key re-put replaces
     /// value+meta in place (putItem's exact-match path) — last write
     /// wins within the txn. Owns its arena; released in deinit.
     writes: ?*zdb.skl.SkipList = null,
@@ -275,13 +276,7 @@ pub const Txn = struct {
         val: []const u8,
         meta: Meta,
     ) !void {
-        const w = self.writes orelse blk: {
-            // Capacity 0: unlike the memtable, a txn's write set is
-            // usually tiny — let the arena grow on demand.
-            const w = try zdb.skl.SkipList.initCapacity(self.allocator, 0);
-            self.writes = w;
-            break :blk w;
-        };
+        const w = try self.pendingWrites();
         try w.putItem(.{
             .key = .{
                 .namespace = self.ns,
@@ -292,6 +287,112 @@ pub const Txn = struct {
             .value = val,
             .meta = meta,
         });
+    }
+
+    fn pendingWrites(self: *Txn) !*zdb.skl.SkipList {
+        if (self.writes) |w| return w;
+        // Capacity 0: unlike the memtable, a txn's write set is
+        // usually tiny — let the arena grow on demand.
+        const w = try zdb.skl.SkipList.initCapacity(self.allocator, 0);
+        self.writes = w;
+        return w;
+    }
+
+    /// A pending secondary-index posting op: add/remove this row's
+    /// egid under an index key. Rides the writes skiplist as
+    /// key = {ns, index table, primary = index_key, TIMESTAMP = EGID}
+    /// — the one place a pending key's ts is not a timestamp — so one
+    /// index key's ops form a contiguous run (egids descending, ts
+    /// sorts DESC) and the same (index_key, egid) always lands on the
+    /// same node. The op is the 1-byte value; `noop` marks an
+    /// annihilated pair and never reaches the wire.
+    pub const PostingOp = enum(u8) { add, remove, noop };
+
+    /// Meta for pending posting entries: the discriminator wireKvs
+    /// uses to tell posting runs from row versions (row writes are
+    /// never roaring).
+    const posting_meta: Meta = .{ .kind = .delta, .encoding = .roaring };
+
+    /// Record `op` for (index key, egid) — no locks: posting deltas
+    /// commute, and the ROW's lock already serializes add/remove of
+    /// one egid (docs/transactions.md, lock classes).
+    ///
+    /// Annihilation, not last-write-wins: ops for one (index_key,
+    /// egid) strictly alternate within a txn — a remove is only
+    /// emitted when the pending-aware row currently maps to this
+    /// index key, an add only when it doesn't, and egids are never
+    /// reused after a delete. An opposite pending op therefore
+    /// cancels to `noop` (the pair nets to "no change vs committed
+    /// state"), and a later op re-opens the slot. This keeps the wire
+    /// delta the EXACT diff: UPDATE 3→5→3 emits nothing at all — no
+    /// spurious record, and no spurious oracle bump for concurrent
+    /// readers of an index key this txn net-changed nothing on.
+    pub fn putPosting(
+        self: *Txn,
+        table_id: u32,
+        index_key: []const u8,
+        egid: u64,
+        op: PostingOp,
+    ) !void {
+        // egid 0 never exists (allocation starts at 1), so a run walk
+        // bounded by exclusive ts=0 can't lose an entry.
+        std.debug.assert(egid != 0);
+        std.debug.assert(op != .noop);
+        const key = Key{
+            .namespace = self.ns,
+            .table_id = table_id,
+            .primary = index_key,
+            .timestamp = egid,
+        };
+        const w = try self.pendingWrites();
+        var next = op;
+        // get() is MVCC-style (newest version <= ts), so require the
+        // exact node before treating it as this egid's slot.
+        if (w.get(key)) |item| {
+            if (item.key.timestamp == egid) {
+                const cur: PostingOp = @enumFromInt(item.value[0]);
+                std.debug.assert(cur != op); // alternation, see above
+                // Same op stays itself (idempotent — must not
+                // annihilate even though the assert says it can't
+                // happen); noop re-opens; opposite ops cancel.
+                next = if (cur == op or cur == .noop) op else .noop;
+            }
+        }
+        try w.putItem(.{
+            .key = key,
+            .value = &.{@intFromEnum(next)},
+            .meta = posting_meta,
+        });
+    }
+
+    /// Read-your-own-writes for index reads: apply this txn's pending
+    /// posting ops for one index key onto a bitmap of committed egids
+    /// (which the caller owns — getBitmap results are).
+    pub fn overlayPostings(
+        self: *Txn,
+        table_id: u32,
+        index_key: []const u8,
+        bm: *zdb.zroar.Bitmap,
+    ) !void {
+        const w = self.writes orelse return;
+        var it = w.iterator();
+        defer it.deinit();
+        var probe = Key{
+            .namespace = self.ns,
+            .table_id = table_id,
+            .primary = index_key,
+            .timestamp = std.math.maxInt(u64),
+        };
+        const start = probe;
+        probe.timestamp = 0; // exclusive right edge; egid 0 never exists
+        try it.seekRange(start, probe);
+        while (it.itemRef()) |item| : (try it.next()) {
+            switch (@as(PostingOp, @enumFromInt(item.value[0]))) {
+                .add => _ = try bm.set(item.key.timestamp),
+                .remove => _ = bm.remove(item.key.timestamp),
+                .noop => {},
+            }
+        }
     }
 
     /// A found row and how to let it go: committed rows are owned
@@ -340,29 +441,91 @@ pub const Txn = struct {
     }
 
     /// The pending write set as wire kvs in key order — the commit
-    /// payload. Key/value slices point into the txn arena (valid until
-    /// deinit); the array itself comes from `a`. A key re-put across a
-    /// read_ts bump leaves versions at both stamps in the skiplist;
-    /// within one key the iteration order is ts-DESCENDING, so keeping
-    /// only the first version per (table_id, primary) emits exactly the
-    /// txn's final state.
+    /// payload. Row keys/values point into the txn arena (valid until
+    /// deinit); posting deltas and the array itself come from `a`. A
+    /// key re-put across a read_ts bump leaves versions at both
+    /// stamps in the skiplist; within one key the iteration order is
+    /// ts-DESCENDING, so keeping only the first version per
+    /// (table_id, primary) emits exactly the txn's final state.
+    /// Posting runs (meta roaring) are the exception: their versions
+    /// are one op per egid, folded into a single RoaringDelta kv.
     pub fn wireKvs(self: *Txn, a: std.mem.Allocator) ![]zen.KeyValueStruct {
         var kvs: std.ArrayList(zen.KeyValueStruct) = .empty;
         const w = self.writes orelse return kvs.toOwnedSlice(a);
         var it = w.iterator();
         defer it.deinit();
         var last: ?Key = null;
-        while (it.itemRef()) |item| : (try it.next()) {
-            if (last) |lk| {
-                if (item.key.orderWithoutTs(lk) == .eq) continue;
+        while (it.itemRef()) |item| {
+            if (item.meta.isRoaring()) {
+                // Consumes the whole run and leaves `it` past it. Row
+                // and posting keys never share a primary (disjoint
+                // table_ids), so `last` needs no reset.
+                try self.flattenPostings(a, &kvs, &it);
+                continue;
             }
-            last = item.key;
-            try kvs.append(a, .{
-                .key = try item.key.marshal(a),
-                .value = item.value,
-                .meta = item.meta.toByte(),
-            });
+            const dup = if (last) |lk|
+                item.key.orderWithoutTs(lk) == .eq
+            else
+                false;
+            if (!dup) {
+                last = item.key;
+                try kvs.append(a, .{
+                    .key = try item.key.marshal(a),
+                    .value = item.value,
+                    .meta = item.meta.toByte(),
+                });
+            }
+            try it.next();
         }
         return kvs.toOwnedSlice(a);
+    }
+
+    /// Fold one index key's pending posting run (one op per egid,
+    /// egids descending) into a single RoaringDelta wire kv at
+    /// read_ts — or nothing, when every op annihilated to noop.
+    /// Leaves the iterator on the first item past the run.
+    fn flattenPostings(
+        self: *Txn,
+        a: std.mem.Allocator,
+        kvs: *std.ArrayList(zen.KeyValueStruct),
+        it: *zdb.skl.Iterator,
+    ) !void {
+        const run_key = it.itemRef().?.key;
+        var adds: std.ArrayList(u64) = .empty;
+        var removes: std.ArrayList(u64) = .empty;
+        while (it.itemRef()) |item| : (try it.next()) {
+            if (item.key.orderWithoutTs(run_key) != .eq) break;
+
+            // key.timestamp is being used as a proxy for egid.
+            switch (@as(PostingOp, @enumFromInt(item.value[0]))) {
+                .add => try adds.append(a, item.key.timestamp),
+                .remove => try removes.append(a, item.key.timestamp),
+                .noop => {},
+            }
+        }
+        const delta = zen.RoaringDeltaStruct{
+            .adds = adds.items,
+            .removes = removes.items,
+        };
+        if (delta.adds.len == 0 and delta.removes.len == 0) return;
+
+        // The run yields egids descending; the delta wants ascending.
+        std.mem.reverse(u64, delta.adds);
+        std.mem.reverse(u64, delta.removes);
+
+        var buf: std.ArrayList(u8) = .empty;
+        _ = try delta.marshalTo(a, &buf);
+        // The write-side gate. One op slot per (key, egid) makes the
+        // lists disjoint by construction; a failure here is a bug,
+        // and erroring the commit beats proposing a corrupt posting.
+        try zdb.validate.validateDelta(buf.items);
+
+        var wire = run_key;
+        wire.timestamp = self.read_ts;
+        try kvs.append(a, .{
+            .key = try wire.marshal(a),
+            .value = buf.items,
+            .meta = posting_meta.toByte(),
+        });
     }
 };

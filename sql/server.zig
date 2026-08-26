@@ -24,6 +24,10 @@ const Oracle = @import("oracle.zig").Oracle;
 
 const log = std.log.scoped(.sql);
 
+/// Readability alias — a borrowed byte string (row bytes, encoded
+/// keys). Same type as []const u8, purely a shorter spelling.
+const String = []const u8;
+
 /// The default database, present from a node's very first boot — created
 /// by the WAL's genesis entry (see egres seedGenesis), never at runtime.
 /// Sessions that name no database land here (psql defaults dbname to the
@@ -997,36 +1001,40 @@ const Handler = struct {
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(eng.allocator);
-        var kbuf: std.ArrayList(u8) = .empty; // reused PK-key scratch
-        defer kbuf.deinit(eng.allocator);
 
-        // Phase 0: parse + marshal every row, and encode its PK index key,
-        // BEFORE any lock or write — a Restart re-runs the whole statement,
-        // so nothing may be buffered until every PK lock is held (§Phase 1).
+        // One VALUES row, fully derived in Phase 0 — parse + marshal +
+        // encode every key BEFORE any lock or write: a Restart re-runs
+        // the whole statement, so nothing may be buffered until every
+        // PK lock is held (§Phase 1). `values` is reused per row, so
+        // anything derived from a row's cells is captured here.
+        const PendingRow = struct {
+            bytes: String = "", // marshaled row value
+            pkey: String = "", // PK index key, when t.pkey != null
+            /// Per idx_cols entry (same order): the index key this
+            /// row lands under. Always present — NULL cells key on
+            /// the NULL tag byte, and unencodable column types
+            /// (interval) never carry an index (rejected at CREATE
+            /// INDEX).
+            postings: []String = &.{},
+
+            fn lessByPkey(rows: []@This(), x: usize, y: usize) bool {
+                return std.mem.lessThan(u8, rows[x].pkey, rows[y].pkey);
+            }
+        };
         const num_rows = ins.rows.len;
-        const row_bytes = try arloc.alloc([]const u8, num_rows);
-        const index_keys: [][]const u8 =
-            if (t.pkey != null) try arloc.alloc([]const u8, num_rows) else &.{};
-        for (ins.rows, 0..) |row_lits, i| {
+        const idx_cols = try indexCols(arloc, t);
+        const pending = try arloc.alloc(PendingRow, num_rows);
+        for (ins.rows, pending) |row_lits, *pr| {
+            pr.* = .{};
             if (row_lits.len != targets.len)
                 return replyErrorCode(state, pgwire.sqlstate.syntax_error, "INSERT has the wrong number of values");
 
             for (values) |*v| v.* = .null_value; // reset all to null
 
             for (row_lits, targets) |lit, target| {
-                target.dst.* = litToValue(arloc, lit, target.col.ty) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    error.UnsupportedLiteral, error.UnsupportedType => return replyErrorCode(
-                        state,
-                        pgwire.sqlstate.feature_not_supported,
-                        "unsupported value or column type",
-                    ),
-                    else => return replyErrorCode(
-                        state,
-                        pgwire.sqlstate.invalid_text_representation,
-                        "invalid value for column type",
-                    ),
-                };
+                target.dst.* =
+                    (try coerceLiteral(state, arloc, lit, target.col.ty)) orelse
+                    return;
             }
 
             if (t.pkey) |pk| {
@@ -1037,21 +1045,32 @@ const Handler = struct {
                         pgwire.sqlstate.not_null_violation,
                         "null value in primary key column violates not-null constraint",
                     );
-                kbuf.clearRetainingCapacity();
-
-                key.encodeIndexKey(eng.allocator, pkv, &kbuf) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    error.Unencodable => return replyErrorCode(
-                        state,
-                        pgwire.sqlstate.feature_not_supported,
-                        "PRIMARY KEY on this column type is not supported",
-                    ),
-                };
-                index_keys[i] = try arloc.dupe(u8, kbuf.items);
+                pr.pkey = key.encodeIndexKey(arloc, pkv, null) catch |err|
+                    switch (err) {
+                        error.OutOfMemory => return err,
+                        error.Unencodable => return replyErrorCode(
+                            state,
+                            pgwire.sqlstate.feature_not_supported,
+                            "PRIMARY KEY on this column type is not supported",
+                        ),
+                    };
+            }
+            if (idx_cols.count() > 0) {
+                pr.postings = try arloc.alloc(String, idx_cols.count());
+                for (idx_cols.keys(), pr.postings) |col_idx, *posting_key| {
+                    posting_key.* = key.encodeIndexKey(
+                        arloc,
+                        values[col_idx],
+                        null,
+                    ) catch |err| switch (err) {
+                        error.Unencodable => unreachable,
+                        else => return err,
+                    };
+                }
             }
             // marshalRow reuses `buf`; dupe out before the next row clobbers it.
             const bytes = try row.marshalRow(eng.allocator, &t.ps, values, &buf);
-            row_bytes[i] = try arloc.dupe(u8, bytes);
+            pr.bytes = try arloc.dupe(u8, bytes);
         }
 
         // Phase 1 (PK tables): reject duplicates, then lock every PK index
@@ -1062,13 +1081,13 @@ const Handler = struct {
         if (t.pkey) |pk| {
             const order = try arloc.alloc(usize, num_rows);
             for (order, 0..) |*o, j| o.* = j;
-            std.mem.sort(usize, order, index_keys, lessByIndexKey);
+            std.mem.sort(usize, order, pending, PendingRow.lessByPkey);
 
             for (1..num_rows) |j| {
-                if (std.mem.eql(u8, index_keys[order[j - 1]], index_keys[order[j]]))
+                if (std.mem.eql(u8, pending[order[j - 1]].pkey, pending[order[j]].pkey))
                     return replyErrorCode(state, pgwire.sqlstate.unique_violation, "duplicate key value violates unique constraint");
             }
-            for (order) |j| tx.lockRow(pk.index_table_id, index_keys[j]) catch |err|
+            for (order) |j| tx.lockRow(pk.index_table_id, pending[j].pkey) catch |err|
                 return replyLockErr(state, err);
             // Post-lock, read_ts covers the key's newest commit: a live
             // index entry means the PK value already exists.
@@ -1076,7 +1095,7 @@ const Handler = struct {
                 const found = tx.lookup(.{
                     .namespace = ns,
                     .table_id = pk.index_table_id,
-                    .primary = index_keys[j],
+                    .primary = pending[j].pkey,
                     .timestamp = tx.read_ts,
                 }) catch |err| {
                     log.err("insert into '{s}': pk probe: {s}", .{ ins.table, @errorName(err) });
@@ -1090,11 +1109,11 @@ const Handler = struct {
         }
 
         // Phase 2: every lock is held — allocate egids and buffer each row
-        // and its index entry (PK value → egid). No Restart can occur here
-        // (puts don't bump). The whole VALUES list commits atomically as one
-        // .data entry; an implicit txn waits for apply so an immediate SELECT
+        // and its index entries. No Restart can occur here (puts don't
+        // bump). The whole VALUES list commits atomically as one .data
+        // entry; an implicit txn waits for apply so an immediate SELECT
         // on this session sees the rows.
-        for (0..num_rows) |i| {
+        for (pending) |pr| {
             const egid = self.srv.allocEgid(ns, table_id) catch |err| switch (err) {
                 error.NotLeader => return replyError(state, "not the leader"),
                 else => {
@@ -1103,10 +1122,15 @@ const Handler = struct {
                 },
             };
             const ekey = key.encodeEgid(egid);
-            try tx.put(table_id, &ekey, row_bytes[i], .{});
+            try tx.put(table_id, &ekey, pr.bytes, .{});
             // The index entry's value is the row key: the same 8 BE bytes.
             if (t.pkey) |pk|
-                try tx.put(pk.index_table_id, index_keys[i], &ekey, .{});
+                try tx.put(pk.index_table_id, pr.pkey, &ekey, .{});
+            // Non-unique indexes: commuting posting deltas, NO locks —
+            // the row lock (here, a fresh egid) serializes add/remove
+            // of one egid (docs/transactions.md, lock classes).
+            for (idx_cols.values(), pr.postings) |index_tid, posting_key|
+                try tx.putPosting(index_tid, posting_key, egid, .add);
         }
 
         if (tx.implicit) {
@@ -1216,14 +1240,14 @@ const Handler = struct {
                 pgwire.sqlstate.undefined_table,
                 "table does not exist",
             );
-        const t = self.srv.openTable(ns, table_id) catch |err| {
+        const tbl = self.srv.openTable(ns, table_id) catch |err| {
             logDeleteErr(del.table, "load schema", err);
             return replyError(state, "failed to load table schema");
         };
 
         var arena = std.heap.ArenaAllocator.init(eng.allocator);
         defer arena.deinit();
-        const a = arena.allocator();
+        const arloc = arena.allocator();
 
         const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
@@ -1231,16 +1255,21 @@ const Handler = struct {
         // → scan + compare; no WHERE → tombstone every live row. Either
         // way run() captures the matches; every one is locked, then
         // tombstoned from the capture.
+        const idx_cols = try indexCols(arloc, tbl);
         var scanner = Scanner{
-            .a = a,
-            .ps = &t.ps,
-            // PK tables keep the old bytes so the index entry (PK value →
-            // egid) can be tombstoned alongside the row.
-            .mode = if (t.pkey != null) .copy_value else .no_value,
+            .a = arloc,
+            .ps = &tbl.ps,
+            // Indexed tables keep the old bytes so every index entry —
+            // the PK's (PK value → egid) and each posting's remove —
+            // can be derived from the row being tombstoned.
+            .mode = if (tbl.pkey != null or idx_cols.count() > 0)
+                .copy_value
+            else
+                .no_value,
             .lock = true,
         };
         if (del.filter) |f| {
-            switch ((try resolveFilter(state, a, t, f)) orelse return) {
+            switch ((try resolveFilter(state, arloc, tbl, f)) orelse return) {
                 .egids => |es| scanner.source = .{ .egids = es },
                 .index_eq => |ix| scanner.source = .{ .index_eq = ix },
                 .cell => |c| scanner.cell_filter = c,
@@ -1257,25 +1286,20 @@ const Handler = struct {
         // row tombstones: the index-key lock serializes against a concurrent
         // re-insert of the same key (whose fresh entry a late tombstone would
         // otherwise shadow). Locking may Restart — safe, nothing buffered yet.
-        if (t.pkey) |pk| {
+        if (tbl.pkey) |pk| {
             const items = scanner.items.items;
-            const index_keys = try a.alloc([]const u8, items.len);
-
-            var kbuf: std.ArrayList(u8) = .empty;
-            defer kbuf.deinit(eng.allocator);
+            const index_keys = try arloc.alloc([]const u8, items.len);
 
             for (items, index_keys) |item, *ik| {
-                kbuf.clearRetainingCapacity();
-
-                const pkv = row.readCell(&t.ps, item.value, pk.column_index);
-                key.encodeIndexKey(eng.allocator, pkv, &kbuf) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    error.Unencodable => {
-                        logDeleteErr(del.table, "encode pk", err);
-                        return replyError(state, "delete failed");
-                    },
-                };
-                ik.* = try a.dupe(u8, kbuf.items);
+                const pkv = row.readCell(&tbl.ps, item.value, pk.column_index);
+                ik.* = key.encodeIndexKey(arloc, pkv, null) catch |err|
+                    switch (err) {
+                        error.OutOfMemory => return err,
+                        error.Unencodable => {
+                            logDeleteErr(del.table, "encode pk", err);
+                            return replyError(state, "delete failed");
+                        },
+                    };
             }
             // The item↔key pairing is not needed past this point, so sort the
             // keys themselves (lock order = the deadlock-avoidance order).
@@ -1288,6 +1312,23 @@ const Handler = struct {
                 try tx.put(pk.index_table_id, ik, "", .{ .kind = .deleted });
         }
 
+        // Non-unique indexes: remove each row's egid from its postings
+        // — commuting deltas, NO locks (docs/transactions.md, lock
+        // classes). All locking is done (run()'s row locks, the PK
+        // block above), so no Restart can strand these.
+        for (scanner.items.items) |item| {
+            const egid = key.decodeEgid(item.key.primary).?;
+            for (idx_cols.keys(), idx_cols.values()) |col_idx, index_tid| {
+                const cell = row.readCell(&tbl.ps, item.value, col_idx);
+                const old_key = key.encodeIndexKey(arloc, cell, null) catch |err|
+                    switch (err) {
+                        error.Unencodable => unreachable,
+                        else => return err,
+                    };
+                try tx.putPosting(index_tid, old_key, egid, .remove);
+            }
+        }
+
         // Past run()'s locks no candidate committed above read_ts — the
         // captured rows are the newest versions, frozen by our locks, so
         // they are tombstoned directly with no re-read.
@@ -1295,9 +1336,9 @@ const Handler = struct {
             try tx.put(table_id, item.key.primary, "", .{ .kind = .deleted });
         const n = scanner.items.items.len;
         if (n > 0 and tx.implicit) {
-            if (!try self.commitOrReply(state, a, tx, "delete", del.table)) return;
+            if (!try self.commitOrReply(state, arloc, tx, "delete", del.table)) return;
         }
-        const tag = try std.fmt.allocPrint(a, "DELETE {d}", .{n});
+        const tag = try std.fmt.allocPrint(arloc, "DELETE {d}", .{n});
         try state.sendCommandComplete(tag);
     }
 
@@ -1318,21 +1359,35 @@ const Handler = struct {
 
         var arena = std.heap.ArenaAllocator.init(eng.allocator);
         defer arena.deinit();
-        const a = arena.allocator();
+        const arloc = arena.allocator();
 
+        const idx_cols = try indexCols(arloc, t);
         const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
-        // Resolve SET columns once: cell index in decode order + the
-        // typed replacement value.
-        const sets = try a.alloc(SetVal, up.sets.len);
-        for (up.sets, sets) |s, *sv| {
-            if (std.ascii.eqlIgnoreCase(s.column, "egid"))
+        // A SET on an indexed column moves each matched row's egid
+        // from its old posting to a statement-constant new one (the
+        // SET value is one literal for every row): the encoded new
+        // key plus where the old one comes from (col_idx into the
+        // pre-image). Parse rejects duplicate SET columns, so one
+        // entry per column.
+        const MovedCol = struct {
+            table_id: u32,
+            col_idx: usize,
+            new_key: String,
+        };
+        var moved_cols: std.ArrayList(MovedCol) = .empty;
+
+        // sets is used to create the updated row. It tells us which cols have
+        // been updated and what their new value is.
+        const set_cols = try arloc.alloc(SetVal, up.sets.len);
+        for (up.sets, set_cols) |clause, *sv| {
+            if (std.ascii.eqlIgnoreCase(clause.column, "egid"))
                 return replyErrorCode(
                     state,
                     pgwire.sqlstate.feature_not_supported,
                     "egid cannot be updated",
                 );
-            const ci = columnIndex(t, s.column) orelse
+            const col_idx = columnIndex(t, clause.column) orelse
                 return replyErrorCode(
                     state,
                     pgwire.sqlstate.undefined_column,
@@ -1340,41 +1395,47 @@ const Handler = struct {
                 );
             // A changed PK would move the row's index entry; not supported
             // this arc (the index stays valid only while the key is fixed).
-            if (t.columns[ci].pkey_position != null)
+            if (t.columns[col_idx].pkey_position != null)
                 return replyErrorCode(
                     state,
                     pgwire.sqlstate.feature_not_supported,
                     "PRIMARY KEY column cannot be updated",
                 );
-            const c = t.columns[ci];
-            const v = litToValue(a, s.literal, c.ty) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                error.UnsupportedLiteral, error.UnsupportedType => return replyErrorCode(
-                    state,
-                    pgwire.sqlstate.feature_not_supported,
-                    "unsupported value or column type",
-                ),
-                else => return replyErrorCode(
-                    state,
-                    pgwire.sqlstate.invalid_text_representation,
-                    "invalid value for column type",
-                ),
+            const col = t.columns[col_idx];
+            const val =
+                (try coerceLiteral(state, arloc, clause.literal, col.ty)) orelse
+                return;
+            sv.* = .{
+                .idx = psIndex(&t.ps, col.column_id),
+                .val = val,
             };
-            sv.* = .{ .idx = psIndex(&t.ps, c.column_id), .val = v };
+
+            if (idx_cols.get(sv.idx)) |index_tid| {
+                try moved_cols.append(arloc, .{
+                    .table_id = index_tid,
+                    .col_idx = sv.idx,
+                    .new_key = key.encodeIndexKey(arloc, sv.val, null) catch |err|
+                        switch (err) {
+                            error.Unencodable => unreachable,
+                            else => return err,
+                        },
+                });
+            }
         }
 
         // Resolve WHERE: `egid = N` → a point lookup; a payload column
-        // → scan + compare; no WHERE → rewrite every live row. Either
-        // way run() captures each match as its REWRITTEN row (see
-        // Scanner.Mode.update_value).
+        // → scan + compare; no WHERE → rewrite every live row. run()
+        // captures each match's PRE-image; the rewrite (and any
+        // posting moves, whose old keys come from that pre-image)
+        // happens post-lock.
         var sc = Scanner{
-            .a = a,
+            .a = arloc,
             .ps = &t.ps,
-            .mode = .{ .update_value = sets },
+            .mode = .copy_value,
             .lock = true,
         };
         if (up.filter) |f| {
-            switch ((try resolveFilter(state, a, t, f)) orelse return) {
+            switch ((try resolveFilter(state, arloc, t, f)) orelse return) {
                 .egids => |es| sc.source = .{ .egids = es },
                 .index_eq => |ix| sc.source = .{ .index_eq = ix },
                 .cell => |c| sc.cell_filter = c,
@@ -1387,18 +1448,79 @@ const Handler = struct {
             return replyError(state, "update failed");
         }
         // Past run()'s locks no candidate committed above read_ts — the
-        // rows the captures were rewritten from were the newest
-        // versions, frozen by our locks; buffer them directly.
-        for (sc.items.items) |item|
-            try tx.put(table_id, item.key.primary, item.value, .{});
+        // captured pre-images are the newest versions, frozen by our
+        // locks. Move each row's egid between postings when an indexed
+        // column changed (equal keys move nothing — commuting deltas,
+        // NO locks per docs/transactions.md; all locking is done, so
+        // no Restart can strand these), then rewrite and buffer the
+        // row.
+        var dec: value.Row = .{};
+        // Reused across items: marshalRow resets it, and tx.put
+        // copies the bytes into the txn arena before returning.
+        var rbuf: std.ArrayList(u8) = .empty;
+        for (sc.items.items) |item| {
+            const egid = key.decodeEgid(item.key.primary).?;
+            for (moved_cols.items) |mv| {
+                const cell = row.readCell(&t.ps, item.value, mv.col_idx);
+                const old_key = key.encodeIndexKey(arloc, cell, null) catch |err|
+                    switch (err) {
+                        error.Unencodable => unreachable,
+                        else => return err,
+                    };
+                // If old_key and new_key match, there's no change. Skip.
+                if (std.mem.eql(u8, old_key, mv.new_key)) continue;
+
+                try tx.putPosting(mv.table_id, old_key, egid, .remove);
+                try tx.putPosting(mv.table_id, mv.new_key, egid, .add);
+            }
+            const rewritten = try rewriteRowBytes(
+                arloc,
+                &t.ps,
+                set_cols,
+                &dec,
+                item.value,
+                &rbuf,
+            );
+            try tx.put(table_id, item.key.primary, rewritten, .{});
+        }
         const n = sc.items.items.len;
 
         if (tx.implicit) {
-            if (!try self.commitOrReply(state, a, tx, "update", up.table)) return;
+            if (!try self.commitOrReply(state, arloc, tx, "update", up.table)) return;
         }
-        try state.sendCommandComplete(try std.fmt.allocPrint(a, "UPDATE {d}", .{n}));
+        try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "UPDATE {d}", .{n}));
     }
 };
+
+/// litToValue plus the client-facing error mapping shared by INSERT
+/// and UPDATE. null = the error reply was already sent (the
+/// resolveFilter convention).
+fn coerceLiteral(
+    state: *pgwire.ConnState,
+    a: std.mem.Allocator,
+    lit: ddl.Literal,
+    ty: value.Type,
+) !?value.Value {
+    return litToValue(a, lit, ty) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.UnsupportedLiteral, error.UnsupportedType => {
+            try replyErrorCode(
+                state,
+                pgwire.sqlstate.feature_not_supported,
+                "unsupported value or column type",
+            );
+            return null;
+        },
+        else => {
+            try replyErrorCode(
+                state,
+                pgwire.sqlstate.invalid_text_representation,
+                "invalid value for column type",
+            );
+            return null;
+        },
+    };
+}
 
 /// Index of a table's live column by name (exact match — libpg_query lowercases
 /// unquoted identifiers, matching how names are stored), or null.
@@ -1425,10 +1547,6 @@ fn litToValue(a: std.mem.Allocator, lit: ddl.Literal, ty: value.Type) !value.Val
 /// Order row indices by their encoded PK index key (memcomparable, so byte
 /// order is value order) — used to lock a multi-row INSERT deadlock-free and
 /// to spot an in-statement duplicate as an adjacent pair.
-fn lessByIndexKey(keys: []const []const u8, x: usize, y: usize) bool {
-    return std.mem.lessThan(u8, keys[x], keys[y]);
-}
-
 fn lessThanBytes(_: void, x: []const u8, y: []const u8) bool {
     return std.mem.lessThan(u8, x, y);
 }
@@ -1446,6 +1564,29 @@ const IndexLookup = struct { index_table_id: u32, key: []const u8 };
 fn psIndex(ps: *const schema.PhysicalSchema, column_id: u32) usize {
     for (ps.columns, 0..) |c, i| if (c.column_id == column_id) return i;
     unreachable;
+}
+
+/// The table's non-unique indexes as col_idx → index table_id (the
+/// key indexes t.columns, t.ps and a row's values alike — same
+/// order): O(1) "is this column indexed?", and — ArrayHashMap —
+/// stable order, so callers can zip keys()/values() against parallel
+/// slices. At most one non-unique index per column (CREATE INDEX
+/// rejects seconds; the assert enforces it here). These indexes carry
+/// roaring postings maintained as commuting deltas (Txn.putPosting);
+/// unique indexes (the pkey) keep their single-egid lock-then-check
+/// path.
+fn indexCols(
+    a: std.mem.Allocator,
+    t: *const table.Table,
+) !std.AutoArrayHashMapUnmanaged(usize, u32) {
+    var map: std.AutoArrayHashMapUnmanaged(usize, u32) = .empty;
+    for (t.indexes) |idx| {
+        if (idx.unique) continue;
+        const gop = try map.getOrPut(a, psIndex(&t.ps, idx.column_id));
+        std.debug.assert(!gop.found_existing);
+        gop.value_ptr.* = idx.index_table_id;
+    }
+    return map;
 }
 
 fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {
@@ -1511,18 +1652,20 @@ fn resolveFilter(
     };
     // An index on this column turns the filter into a point lookup. Matching
     // against the index list (not just the PK) means CREATE INDEX later needs
-    // no routing change. An unencodable value (NULL / interval) falls back to
-    // a cell compare, preserving today's semantics.
+    // no routing change. An unencodable value (interval) falls back to a cell
+    // compare, preserving today's semantics. NULL encodes (its own tag-byte
+    // key), and `= NULL` matching NULL rows is deliberately consistent with
+    // the cell path's valuesEqual(null, null) — Postgres-strict IS NULL
+    // semantics are one future decision covering both paths.
     index: for (t.indexes) |idx| {
         if (idx.column_id != fc.column_id) continue;
-        var kb: std.ArrayList(u8) = .empty;
-        key.encodeIndexKey(a, val, &kb) catch |err| {
+        const ik = key.encodeIndexKey(a, val, null) catch |err| {
             if (err == error.OutOfMemory) return err;
             break :index;
         };
         return .{ .index_eq = .{
             .index_table_id = idx.index_table_id,
-            .key = kb.items,
+            .key = ik,
         } };
     }
     return .{ .cell = .{ .idx = psIndex(&t.ps, fc.column_id), .val = val } };
@@ -1627,9 +1770,12 @@ const Scanner = struct {
         copy_value,
         /// Plain SELECT: straight to the wire; nothing is captured.
         emit_value: *RowEmitter,
-        /// UPDATE: capture the REWRITTEN row (built here, while the
-        /// scan's source bytes are alive), so the old value is never
-        /// copied and the post-lock pass just buffers it verbatim.
+        /// Capture the REWRITTEN row (built here, while the scan's
+        /// source bytes are alive), so the old value is never copied
+        /// and the post-lock pass just buffers it verbatim.
+        /// TODO: currently unused — UPDATE always captures the
+        /// pre-image (.copy_value) since index maintenance needs the
+        /// old cell values; revisit as the no-index fast path.
         update_value: []const SetVal,
     };
 
@@ -1644,13 +1790,13 @@ const Scanner = struct {
             .no_value => try item.dupeNoValue(self.a),
             .copy_value => try item.dupe(self.a),
             .update_value => |sets| rewritten: {
-                var cap = try item.dupeNoValue(self.a);
+                var dup = try item.dupeNoValue(self.a);
                 // Rewrite now, borrowing the scan's transient row
                 // bytes: pure computation into the arena — no txn state
                 // touched, so a later Restart just discards it with the
                 // statement arena.
                 var buf: std.ArrayList(u8) = .empty; // arena; persists
-                cap.value = try rewriteRowBytes(
+                dup.value = try rewriteRowBytes(
                     self.a,
                     self.ps,
                     sets,
@@ -1658,7 +1804,7 @@ const Scanner = struct {
                     item.value,
                     &buf,
                 );
-                break :rewritten cap;
+                break :rewritten dup;
             },
         };
         try self.items.append(self.a, captured);

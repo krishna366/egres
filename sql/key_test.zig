@@ -19,10 +19,7 @@ test "sql.key: egid encodes big-endian and round-trips in key order" {
 
 // Encode one value into an owned buffer.
 fn enc(v: Value) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(testing.allocator);
-    try key.encodeIndexKey(testing.allocator, v, &buf);
-    return buf.toOwnedSlice(testing.allocator);
+    return key.encodeIndexKey(testing.allocator, v, null);
 }
 
 // Assert each value encodes strictly above its predecessor.
@@ -133,15 +130,37 @@ test "sql.key: text and bool sort in value order" {
     try expectAscending(&.{ .{ .bool_ = false }, .{ .bool_ = true } });
 }
 
-test "sql.key: NULL and interval are unencodable" {
+test "sql.key: NULL keys on its tag byte, after every real value" {
+    // NULL has its own address — distinct even from '' (which is a
+    // real, zero-byte value under the value tag) — and sorts last,
+    // Postgres's NULLS LAST.
+    try expectAscending(&.{
+        .{ .text = "" },
+        .{ .text = "zzz" },
+        .null_value,
+    });
+    try expectAscending(&.{
+        .{ .int8 = std.math.maxInt(i64) },
+        .null_value,
+    });
+    const nk = try enc(.null_value);
+    defer testing.allocator.free(nk);
+    try testing.expectEqual(1, nk.len);
+}
+
+test "sql.key: interval is unencodable and leaves the buffer clean" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    try testing.expectError(
-        error.Unencodable,
-        key.encodeIndexKey(testing.allocator, .null_value, &buf),
-    );
+    try buf.append(testing.allocator, 'x');
     try testing.expectError(
         error.Unencodable,
         key.encodeIndexKey(testing.allocator, .{ .interval = .{} }, &buf),
     );
+    // No stray tag byte on the error path — callers reuse buffers.
+    try testing.expectEqualSlices(u8, "x", buf.items);
+
+    // The buffered form returns a view of what it appended.
+    const k = try key.encodeIndexKey(testing.allocator, .{ .int8 = 5 }, &buf);
+    try testing.expectEqual(9, k.len); // tag + widened i64
+    try testing.expectEqualSlices(u8, buf.items[1..], k);
 }

@@ -9,13 +9,16 @@
 //! Index keys: an index entry keys on the indexed cell's VALUE,
 //! encoded memcomparable — `std.mem.order` over the bytes matches SQL
 //! order over the values. Row cells are native-LE (row.zig) and not
-//! order-preserving, so index keys get their own codec. Keys are
-//! single-column: raw text/bytea bytes need no terminator or escaping
-//! — memcmp IS the collation. (Composite keys will switch to
-//! per-component framing wholesale; this raw format is its degenerate
-//! case.) Integers and floats widen to 64-bit before encoding:
-//! widening is lossless and order-preserving, and an index's column
-//! type is fixed so key widths never mix.
+//! order-preserving, so index keys get their own codec. Every key
+//! leads with a tag byte (see `tag_value`/`tag_null`): it gives NULL
+//! its own address — a posting distinct from every real value,
+//! including '' — and sorts it after all real values (Postgres's
+//! NULLS LAST). Keys are single-column: raw text/bytea bytes need no
+//! terminator or escaping — memcmp IS the collation. (Composite keys
+//! will switch to per-component framing wholesale; this raw format is
+//! its degenerate case.) Integers and floats widen to 64-bit before
+//! encoding: widening is lossless and order-preserving, and an
+//! index's column type is fixed so key widths never mix.
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -58,32 +61,54 @@ pub const U64 = packed struct(u64) {
     }
 };
 
-/// Append the memcomparable index-key encoding of `v` to `buf`. Not
-/// encodable: NULL (index writers reject it earlier — 23502) and
-/// interval (months vs days have no calendar-free order). Temporal
-/// types are signed day/µs counts (value.zig), so they encode as
-/// signed integers.
+/// Tag byte leading every index key. Comparison hits it first: all
+/// real values share `tag_value` and order on their encoding exactly
+/// as before, while NULL's lone `tag_null` byte sorts after every
+/// real value — NULLS LAST.
+const tag_value: u8 = 0x00;
+const tag_null: u8 = 0x01;
+
+/// The memcomparable index-key encoding of `v`: [tag_value] ++ value
+/// encoding, or the single [tag_null] byte for NULL. With `buf` the
+/// key is appended there and the return borrows from it; with null
+/// the key comes back as its own exactly-sized `a` allocation. Not
+/// encodable: interval (months vs days have no calendar-free order) —
+/// `buf` is left untouched. Temporal types are signed day/µs counts
+/// (value.zig), so they encode as signed integers.
 pub fn encodeIndexKey(
     a: std.mem.Allocator,
     v: value.Value,
-    buf: *std.ArrayList(u8),
-) !void {
+    buf: ?*std.ArrayList(u8),
+) ![]u8 {
+    var own: std.ArrayList(u8) = .empty;
+    errdefer own.deinit(a);
+    const out = buf orelse &own;
+    const start = out.items.len;
     switch (v) {
-        .null_value, .interval => return error.Unencodable,
-        .bool_ => |b| try buf.append(a, @intFromBool(b)),
-        inline .int2,
-        .int4,
-        .int8,
-        .date,
-        .time,
-        .timestamp,
-        .timestamptz,
-        => |x| try appendSigned(a, x, buf),
-        inline .uint2, .uint4, .uint8 => |x| try appendUnsigned(a, x, buf),
-        inline .float4, .float8 => |x| try appendFloat(a, x, buf),
-        .uuid => |u| try buf.appendSlice(a, &u),
-        .text, .bytea => |s| try buf.appendSlice(a, s),
+        .null_value => try out.append(a, tag_null),
+        .interval => return error.Unencodable,
+        else => {
+            try out.append(a, tag_value);
+            switch (v) {
+                .null_value, .interval => unreachable,
+                .bool_ => |b| try out.append(a, @intFromBool(b)),
+                inline .int2,
+                .int4,
+                .int8,
+                .date,
+                .time,
+                .timestamp,
+                .timestamptz,
+                => |x| try appendSigned(a, x, out),
+                inline .uint2, .uint4, .uint8 => |x| try appendUnsigned(a, x, out),
+                inline .float4, .float8 => |x| try appendFloat(a, x, out),
+                .uuid => |u| try out.appendSlice(a, &u),
+                .text, .bytea => |s| try out.appendSlice(a, s),
+            }
+        },
     }
+    if (buf != null) return out.items[start..];
+    return own.toOwnedSlice(a);
 }
 
 const sign_bit: u64 = 1 << 63;

@@ -305,6 +305,187 @@ test "txn: lockTable coexists with row locks and is re-entrant" {
     try testing.expectEqual(0, fx.sm.entries.count());
 }
 
+const itid: u32 = 17; // a secondary index's table id in these tests
+
+/// wireKvs into an arena: posting deltas allocate from `a`, so tests
+/// route through one arena instead of freeing piecemeal.
+fn wireKvsArena(
+    arena: *std.heap.ArenaAllocator,
+    tx: *Txn,
+) ![]zdb.buffers.KeyValueStruct {
+    return tx.wireKvs(arena.allocator());
+}
+
+test "txn: posting ops flatten to one ascending delta per index key" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Two index keys, ops arriving out of egid order, plus a row put
+    // — the row is untouched by the posting machinery.
+    try tx.put(tid, "row", "v", .{});
+    try tx.putPosting(itid, "blue", 9, .add);
+    try tx.putPosting(itid, "blue", 3, .add);
+    try tx.putPosting(itid, "blue", 5, .remove);
+    try tx.putPosting(itid, "red", 7, .add);
+
+    const kvs = try wireKvsArena(&arena, &tx);
+    try testing.expectEqual(3, kvs.len);
+
+    // Key order: (tid "row") < (itid "blue") < (itid "red").
+    try testing.expectEqualSlices(u8, "v", kvs[0].value);
+
+    const blue = Key.init(kvs[1].key);
+    try testing.expectEqualSlices(u8, "blue", blue.primary);
+    try testing.expectEqual(read_ts, blue.timestamp);
+    const bm = Meta.fromByte(kvs[1].meta);
+    try testing.expect(bm.isRoaring() and bm.isDelta());
+    try zdb.validate.validateDelta(kvs[1].value);
+    const br = try zdb.buffers.RoaringDeltaReader.init(kvs[1].value, 0);
+    try testing.expectEqual(2, br.addsLen());
+    try testing.expectEqual(3, try br.addsAt(0));
+    try testing.expectEqual(9, try br.addsAt(1));
+    try testing.expectEqual(1, br.removesLen());
+    try testing.expectEqual(5, try br.removesAt(0));
+
+    const rr = try zdb.buffers.RoaringDeltaReader.init(kvs[2].value, 0);
+    try testing.expectEqual(1, rr.addsLen());
+    try testing.expectEqual(0, rr.removesLen());
+}
+
+test "txn: opposite posting ops annihilate; a later op re-opens" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // add→remove cancels (insert-then-delete of a fresh row);
+    // remove→add cancels (UPDATE 3→5→3's home key); an all-noop run
+    // emits NOTHING on the wire — no spurious record, no oracle
+    // touch for concurrent readers of that index key.
+    try tx.putPosting(itid, "k", 1, .add);
+    try tx.putPosting(itid, "k", 1, .remove);
+    try tx.putPosting(itid, "j", 2, .remove);
+    try tx.putPosting(itid, "j", 2, .add);
+    try testing.expectEqual(0, (try wireKvsArena(&arena, &tx)).len);
+
+    // add→remove→add nets a single add: the slot re-opens.
+    try tx.putPosting(itid, "k", 1, .add);
+    const kvs = try wireKvsArena(&arena, &tx);
+    try testing.expectEqual(1, kvs.len);
+    const r = try zdb.buffers.RoaringDeltaReader.init(kvs[0].value, 0);
+    try testing.expectEqual(1, r.addsLen());
+    try testing.expectEqual(1, try r.addsAt(0));
+    try testing.expectEqual(0, r.removesLen());
+}
+
+test "txn: flattened postings fold through the forest into a bitmap" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+    _ = try fx.forest.createTree(ns, itid, .{ .inf = true });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Commit txn 1: adds {2, 4, 6} under "blue".
+    {
+        var tx = fx.txn();
+        defer tx.deinit();
+        for ([_]u64{ 2, 4, 6 }) |egid|
+            try tx.putPosting(itid, "blue", egid, .add);
+        try putWire(&arena, &fx, &tx, 600);
+    }
+    // Commit txn 2: removes 4, adds 8.
+    {
+        var tx = fx.txn();
+        defer tx.deinit();
+        try tx.putPosting(itid, "blue", 4, .remove);
+        try tx.putPosting(itid, "blue", 8, .add);
+        try putWire(&arena, &fx, &tx, 700);
+    }
+
+    var bm = try fx.forest.getBitmap(testing.allocator, .{
+        .namespace = ns,
+        .table_id = itid,
+        .primary = "blue",
+        .timestamp = 800,
+    }, .p0);
+    defer bm.deinit();
+    try testing.expectEqual(3, bm.getCardinality());
+    for ([_]u64{ 2, 6, 8 }) |egid| try testing.expect(bm.contains(egid));
+    try testing.expect(!bm.contains(4));
+}
+
+/// Commit a txn's wire kvs into the forest the way apply does:
+/// rewrite every key's ts to the commit HLC, then forest.put.
+fn putWire(
+    arena: *std.heap.ArenaAllocator,
+    fx: *Fixture,
+    tx: *Txn,
+    commit_ts: u64,
+) !void {
+    const a = arena.allocator();
+    const kvs = try tx.wireKvs(a);
+    var items: std.ArrayList(zdb.kv.Item) = .empty;
+    for (kvs) |kv| {
+        var k = Key.init(kv.key);
+        k.timestamp = commit_ts;
+        try items.append(a, .{
+            .key = k,
+            .value = kv.value,
+            .meta = Meta.fromByte(kv.meta),
+        });
+    }
+    try fx.forest.put(items.items);
+}
+
+test "txn: overlayPostings applies pending ops onto a committed bitmap" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+    _ = try fx.forest.createTree(ns, itid, .{ .inf = true });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Committed posting under "blue": {2, 4}.
+    {
+        var tx = fx.txn();
+        defer tx.deinit();
+        try tx.putPosting(itid, "blue", 2, .add);
+        try tx.putPosting(itid, "blue", 4, .add);
+        try putWire(&arena, &fx, &tx, 400);
+    }
+
+    var tx = fx.txn();
+    defer tx.deinit();
+    // Pending: add 9, remove 4, and an annihilated pair on 7 (noop —
+    // must stay invisible). "red" ops must not bleed into "blue".
+    try tx.putPosting(itid, "blue", 9, .add);
+    try tx.putPosting(itid, "blue", 4, .remove);
+    try tx.putPosting(itid, "blue", 7, .add);
+    try tx.putPosting(itid, "blue", 7, .remove);
+    try tx.putPosting(itid, "red", 5, .add);
+
+    var bm = try fx.forest.getBitmap(testing.allocator, .{
+        .namespace = ns,
+        .table_id = itid,
+        .primary = "blue",
+        .timestamp = read_ts,
+    }, .p0);
+    defer bm.deinit();
+    try tx.overlayPostings(itid, "blue", &bm);
+
+    try testing.expectEqual(2, bm.getCardinality());
+    try testing.expect(bm.contains(2));
+    try testing.expect(bm.contains(9));
+    try testing.expect(!bm.contains(4));
+    try testing.expect(!bm.contains(7));
+    try testing.expect(!bm.contains(5));
+}
+
 test "txn: wireKvs emits key order regardless of insert order" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();
