@@ -24,9 +24,7 @@ const Oracle = @import("oracle.zig").Oracle;
 
 const log = std.log.scoped(.sql);
 
-/// Readability alias — a borrowed byte string (row bytes, encoded
-/// keys). Same type as []const u8, purely a shorter spelling.
-const String = []const u8;
+const String = value.String;
 
 /// The default database, present from a node's very first boot — created
 /// by the WAL's genesis entry (see egres seedGenesis), never at runtime.
@@ -254,6 +252,44 @@ pub const Server = struct {
         return self.openTableLocked(db, table_id);
     }
 
+    /// Swap the cached Table for a freshly loaded one — DDL that
+    /// changed the schema (CREATE/DROP INDEX) calls this while
+    /// holding the table intent lock EXCLUSIVELY, which is what makes
+    /// destroying the old entry safe: DML holds its Table only under
+    /// the shared intent lock (taken before openTable), and
+    /// applyCommitted touches cached tables only under tables_mu.
+    /// `next_egid` is runtime state, not catalog state — carry the
+    /// larger of the old counter and the fresh seed across the swap.
+    pub fn reloadTable(self: *Server, ns: u64, table_id: u32) !void {
+        const db = try self.database(ns);
+        db.tables_mu.lock(@src());
+        defer db.tables_mu.unlock();
+        const old = db.tables.fetchRemove(table_id) orelse {
+            // Nothing cached: the next openTable loads fresh anyway.
+            return;
+        };
+        errdefer {
+            old.value.deinit();
+            self.engine.allocator.destroy(old.value);
+        }
+        const t = try self.openTableLocked(db, table_id);
+        t.next_egid = @max(t.next_egid, old.value.next_egid);
+        old.value.deinit();
+        self.engine.allocator.destroy(old.value);
+    }
+
+    /// Drop a table's cache entry outright (DROP TABLE) — same
+    /// exclusive-intent-lock safety argument as reloadTable.
+    pub fn forgetTable(self: *Server, ns: u64, table_id: u32) !void {
+        const db = try self.database(ns);
+        db.tables_mu.lock(@src());
+        defer db.tables_mu.unlock();
+        if (db.tables.fetchRemove(table_id)) |old| {
+            old.value.deinit();
+            self.engine.allocator.destroy(old.value);
+        }
+    }
+
     /// Reserve the next egid for a table (leader path). newTxn already ran
     /// the catch-up barrier, so `next_egid` reflects the applied committed
     /// tail (onDataApplied only advances it) — the id handed out is past
@@ -431,7 +467,13 @@ const Handler = struct {
             // DDL mixes manifest state with the data plane; keep it out
             // of transaction blocks.
             switch (stmt) {
-                .create_database, .drop_database, .create_table, .drop_table => return replyErrorCode(state, pgwire.sqlstate.active_sql_transaction, "DDL inside a transaction block is not supported"),
+                .create_database,
+                .drop_database,
+                .create_table,
+                .drop_table,
+                .create_index,
+                .drop_index,
+                => return replyErrorCode(state, pgwire.sqlstate.active_sql_transaction, "DDL inside a transaction block is not supported"),
                 else => {},
             }
         }
@@ -441,6 +483,8 @@ const Handler = struct {
             .drop_database => |name| try self.dropDatabase(state, name),
             .create_table => |ct| try self.createTable(state, ct),
             .drop_table => |dt| try self.dropTable(state, dt),
+            .create_index => |ci| try self.createIndex(state, ci),
+            .drop_index => |di| try self.dropIndex(state, di),
             .insert, .select, .delete, .update => try self.runDml(state, stmt),
             .begin_txn => try self.beginTxn(state),
             .commit_txn => try self.endTxn(state, true),
@@ -777,9 +821,440 @@ const Handler = struct {
             log.err("drop table '{s}': propose: {s}", .{ dt.name, @errorName(err) });
             return replyError(state, "drop table proposal failed");
         };
+        // Evict the cached Table (safe: we hold the exclusive table
+        // intent, and DML holds its Table only under the shared one).
+        // Index table_ids are never cached — they have no columns.
+        try self.srv.forgetTable(ns, table_id);
 
         log.info("dropped table '{s}' (ns={d} table_id={d} indexes={d})", .{ dt.name, ns, table_id, scan.table_ids.items.len - 1 });
         try state.sendCommandComplete("DROP TABLE");
+    }
+
+    /// CREATE INDEX — the online-backfill protocol. Blocks the
+    /// issuing session until the index is built and valid (the reply
+    /// is a truthful completion signal, as in Postgres), but OTHER
+    /// sessions' writes flow throughout — CONCURRENTLY's semantics.
+    /// In order:
+    ///  1. create the index tree (raft, applied);
+    ///  2. reserve the tree against compactions for the whole build —
+    ///     keeps its bottom level empty, the install condition;
+    ///  3. take the exclusive table intent as a BARRIER only: drains
+    ///     statements still holding a pre-index Table (openTable runs
+    ///     after dmlTxn, so post-barrier statements load the reload);
+    ///  4. under it: catalog row (valid=false) + reloadTable — every
+    ///     future writer maintains the index; snap = that row's own
+    ///     commit HLC, read back from the row. Durable and
+    ///     self-describing: any node could re-run this backfill from
+    ///     the catalog row alone;
+    ///  5. release the barrier — writes flow for the entire build,
+    ///     every posting delta landing at commit HLC > snap;
+    ///  6. scan the base table at snap, fold per-key roaring states,
+    ///     install them as BOTTOM-level SSTs at ts = snap: the oldest
+    ///     data this tree will ever hold, which is exactly what the
+    ///     bottom level means — level-ordering holds against all the
+    ///     deltas above;
+    ///  7. flip valid=true + reloadTable — reads may now use it.
+    /// Crash/failure windows: before 4 → an invisible orphan tree;
+    /// after 4 → an INVALID index accumulating deltas, never
+    /// consulted (DROP INDEX cleans it up; a re-run backfill could
+    /// finish it).
+    fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: ddl.CreateIndex) !void {
+        const eng = self.srv.engine;
+        self.srv.ddl_mu.lock(@src());
+        defer self.srv.ddl_mu.unlock();
+        if (!try self.ddlReady(state)) return;
+
+        const ns = try self.sessionNamespace(state) orelse return;
+        const base_tid = eng.forest.lookupTable(ns, ci.table) orelse
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.undefined_table,
+                "table does not exist",
+            );
+        const t = self.srv.openTable(ns, base_tid) catch |err| {
+            logCreateIndexErr(ci.table, "load schema", err);
+            return replyError(state, "failed to load table schema");
+        };
+        const col_pos = columnIndex(t, ci.column) orelse
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.undefined_column,
+                "column does not exist",
+            );
+        const col = t.columns[col_pos];
+        if (col.ty == .interval)
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.feature_not_supported,
+                "indexes on interval columns are not supported",
+            );
+        // One non-unique index per column — indexCols' invariant.
+        for (t.indexes) |idx| {
+            if (!idx.unique and idx.column_id == col.column_id)
+                return replyErrorCode(
+                    state,
+                    pgwire.sqlstate.feature_not_supported,
+                    "column is already indexed",
+                );
+        }
+        // `t` dangles past reloadTable below; keep what's needed.
+        const column_id = col.column_id;
+
+        var arena = std.heap.ArenaAllocator.init(eng.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const name = ci.name orelse
+            try std.fmt.allocPrint(a, "{s}_{s}_idx", .{ ci.table, ci.column });
+        if (eng.forest.lookupTable(ns, name) != null) {
+            if (ci.if_not_exists)
+                return state.sendCommandComplete("CREATE INDEX");
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.duplicate_table,
+                "index already exists",
+            );
+        }
+
+        const created = eng.forest.buildCreateTables(
+            a,
+            ns,
+            &.{name},
+        ) catch |err| switch (err) {
+            error.NameExists => return replyErrorCode(
+                state,
+                pgwire.sqlstate.duplicate_table,
+                "index already exists",
+            ),
+            else => {
+                logCreateIndexErr(name, "create tree", err);
+                return replyError(state, "create index failed");
+            },
+        };
+        eng.proposeMC(created.change, .apply) catch |err| {
+            logCreateIndexErr(name, "propose tree", err);
+            return replyError(state, "create index failed");
+        };
+        const index_tid = created.table_ids[0];
+
+        const tree_key = zdb.kv.TreeKey{
+            .namespace = ns,
+            .tree_id = zdb.kv.makeTreeId(index_tid, 0),
+        };
+        try eng.reserveTree(tree_key);
+        defer eng.releaseTree(tree_key);
+
+        const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
+        const db = try self.srv.database(ns);
+        const nskey = zdb.kv.namespaceHash(ns);
+
+        _ = db.locks.acquire(nskey, owner, .shared) catch |err|
+            return replyLockErr(state, err);
+        defer db.locks.release(nskey, owner);
+
+        const tkey = (zdb.kv.TableKey{
+            .namespace = ns,
+            .table_id = base_tid,
+        }).identityHash();
+        _ = db.locks.acquire(tkey, owner, .exclusive) catch |err|
+            return replyLockErr(state, err);
+
+        var barrier_held = true;
+        defer if (barrier_held) db.locks.release(tkey, owner);
+
+        const def = catalog.IndexDef{
+            .base_table_id = base_tid,
+            .index_table_id = index_tid,
+            .column_id = column_id,
+            .unique = false,
+            .valid = false,
+        };
+        self.writeCatalogRows(a, ns, base_tid, &.{}, &.{def}) catch |err| {
+            logCreateIndexErr(name, "catalog row", err);
+            return replyError(state, "create index failed");
+        };
+        self.srv.reloadTable(ns, base_tid) catch |err| {
+            logCreateIndexErr(name, "reload table", err);
+            return replyError(state, "create index failed");
+        };
+        const snap = blk: {
+            const ck = catalog.encodeIndexKey(base_tid, index_tid);
+            const found = eng.forest.get(eng.allocator, .{
+                .namespace = ns,
+                .table_id = catalog.index_table_id,
+                .primary = &ck,
+                .timestamp = std.math.maxInt(u64),
+            }, .p0) catch |err| {
+                logCreateIndexErr(name, "read snap", err);
+                return replyError(state, "create index failed");
+            } orelse {
+                logCreateIndexErr(name, "read snap", error.RowMissing);
+                return replyError(state, "create index failed");
+            };
+            defer found.free(eng.allocator);
+            break :blk found.key.timestamp;
+        };
+
+        db.locks.release(tkey, owner);
+        barrier_held = false;
+        log.info("create index '{s}': backfill starting (ns={d} base={d} index={d} snap={d})", .{ name, ns, base_tid, index_tid, snap });
+
+        const t2 = self.srv.openTable(ns, base_tid) catch |err| {
+            logCreateIndexErr(name, "reopen schema", err);
+            return replyError(state, "create index failed");
+        };
+        const n_keys = self.backfillIndex(
+            a,
+            ns,
+            base_tid,
+            index_tid,
+            &t2.ps,
+            col_pos,
+            snap,
+        ) catch |err| {
+            logCreateIndexErr(name, "backfill", err);
+            return replyError(state, "create index failed");
+        };
+        if (n_keys > 0) {
+            // applyBackfill skips (deterministically, on every node)
+            // when the bottom level was not empty; surface that as a
+            // hard failure instead of flipping a hollow index valid.
+            const installed = eng.forest.bottomTableCount(ns, index_tid) catch 0;
+            if (installed == 0) {
+                logCreateIndexErr(name, "install", error.BackfillSkipped);
+                return replyError(state, "create index failed");
+            }
+        }
+
+        var vdef = def;
+        vdef.valid = true;
+        self.writeCatalogRows(a, ns, base_tid, &.{}, &.{vdef}) catch |err| {
+            logCreateIndexErr(name, "valid flip", err);
+            return replyError(state, "create index failed");
+        };
+        self.srv.reloadTable(ns, base_tid) catch |err| {
+            logCreateIndexErr(name, "reload table", err);
+            return replyError(state, "create index failed");
+        };
+
+        log.info("created index '{s}' (ns={d} base={d} index={d} keys={d} snap={d})", .{ name, ns, base_tid, index_tid, n_keys, snap });
+        try state.sendCommandComplete("CREATE INDEX");
+    }
+
+    /// Step 6 of the protocol: scan the base table at read_ts =
+    /// `snap`, fold each row's indexed cell into a per-key roaring
+    /// bitmap, and install the result as bottom-level SSTs of
+    /// {.roaring, .state} values at ts = snap (cmd .index_backfill).
+    /// NULL cells are indexed (the tag_null key); interval never gets
+    /// here (rejected at CREATE INDEX). Memory ∝ table — distinct
+    /// keys + bitmaps — accepted for v1. Returns the number of
+    /// posting keys written; 0 = empty table, nothing installed.
+    fn backfillIndex(
+        self: *Handler,
+        a: std.mem.Allocator,
+        ns: u64,
+        base_tid: u32,
+        index_tid: u32,
+        ps: *const schema.PhysicalSchema,
+        col_pos: usize,
+        snap: u64,
+    ) !usize {
+        const eng = self.srv.engine;
+        const Fold = struct {
+            a: std.mem.Allocator,
+            ps: *const schema.PhysicalSchema,
+            col_pos: usize,
+            rows: usize = 0,
+            map: std.StringArrayHashMapUnmanaged(zdb.zroar.Bitmap) = .empty,
+
+            fn emit(ctx: *@This(), item: zdb.kv.Item) anyerror!bool {
+                const egid = key.decodeEgid(item.key.primary) orelse
+                    return true; // not row-shaped: nothing to index
+                ctx.rows += 1;
+                const cell = row.readCell(ctx.ps, item.value, ctx.col_pos);
+                const ik = key.encodeIndexKey(ctx.a, cell, null) catch |err|
+                    switch (err) {
+                        error.Unencodable => unreachable,
+                        else => return err,
+                    };
+                const gop = try ctx.map.getOrPut(ctx.a, ik);
+                if (!gop.found_existing)
+                    gop.value_ptr.* = try zdb.zroar.Bitmap.init(ctx.a);
+                _ = try gop.value_ptr.set(egid);
+                return true;
+            }
+        };
+        var fold = Fold{ .a = a, .ps = ps, .col_pos = col_pos };
+        _ = try eng.forest.scan(
+            a,
+            (zdb.level.KeyRange{}).limitToTable(ns, base_tid),
+            .{ .read_ts = snap, .priority = .p2 },
+            &fold,
+            Fold.emit,
+        );
+        log.info("backfill index={d}: scanned rows={d} keys={d}", .{ index_tid, fold.rows, fold.map.count() });
+        if (fold.map.count() == 0) return 0;
+
+        // The map collected in first-seen order; the Builder wants
+        // key order.
+        const SortCtx = struct {
+            keys: []const String,
+            pub fn lessThan(c: @This(), x: usize, y: usize) bool {
+                return std.mem.lessThan(u8, c.keys[x], c.keys[y]);
+            }
+        };
+        fold.map.sortUnstable(SortCtx{ .keys = fold.map.keys() });
+
+        var items: std.ArrayList(zdb.kv.Item) = .empty;
+        for (fold.map.keys(), fold.map.values()) |ik, *bm| {
+            // Canonical minimal buffer for persistence.
+            try bm.compact();
+            try items.append(a, .{
+                .key = .{
+                    .namespace = ns,
+                    .table_id = index_tid,
+                    .primary = ik,
+                    .timestamp = snap,
+                },
+                .value = bm.toBuffer(),
+                .meta = .{ .kind = .state, .encoding = .roaring },
+            });
+        }
+        var changes =
+            try eng.forest.buildBottomTable(a, ns, index_tid, items.items);
+        defer changes.deinit(a);
+        try eng.proposeMC(.{
+            .cmd = .index_backfill,
+            .sstable_changes = changes.items,
+            .tree_changes = &.{},
+            .memtable_id = 0,
+        }, .apply);
+        log.info("backfill index={d}: installed tables={d}", .{ index_tid, changes.items.len });
+        return fold.map.count();
+    }
+
+    /// DROP INDEX. Order matters: tombstone the catalog row FIRST,
+    /// then drop the tree — the reverse would leave a live IndexDef
+    /// pointing at a dead tree (reads would see silently-empty
+    /// results), and unlike dropTable's tolerated catalog garbage, a
+    /// live IndexDef row would resurrect the index on the next schema
+    /// load. The tombstone is mandatory.
+    fn dropIndex(self: *Handler, state: *pgwire.ConnState, di: ddl.DropIndex) !void {
+        const eng = self.srv.engine;
+        self.srv.ddl_mu.lock(@src());
+        defer self.srv.ddl_mu.unlock();
+        if (!try self.ddlReady(state)) return;
+
+        const ns = try self.sessionNamespace(state) orelse return;
+        const index_tid = eng.forest.lookupTable(ns, di.name) orelse {
+            if (di.missing_ok) return state.sendCommandComplete("DROP INDEX");
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.undefined_object,
+                "index does not exist",
+            );
+        };
+
+        var arena = std.heap.ArenaAllocator.init(eng.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var scan = table.scanIndexKeys(
+            a,
+            eng.forest,
+            ns,
+            index_tid,
+        ) catch |err| {
+            logDropIndexErr(di.name, "scan catalog", err);
+            return replyError(state, "drop index failed");
+        };
+        defer scan.table_ids.deinit(a);
+        if (!scan.is_index)
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.wrong_object_type,
+                "not an index; use DROP TABLE",
+            );
+        const base_tid = scan.base_table_id.?;
+
+        const defs = table.loadIndexes(
+            a,
+            eng.forest,
+            &self.srv.index_catalog_ps,
+            ns,
+            base_tid,
+        ) catch |err| {
+            logDropIndexErr(di.name, "load defs", err);
+            return replyError(state, "drop index failed");
+        };
+        const def = for (defs) |d| {
+            if (d.index_table_id == index_tid) break d;
+        } else {
+            logDropIndexErr(di.name, "find def", error.RowMissing);
+            return replyError(state, "drop index failed");
+        };
+        // The pkey index is structural — it lives and dies with its
+        // table.
+        if (def.unique)
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.feature_not_supported,
+                "cannot drop a PRIMARY KEY index",
+            );
+
+        // Locks: same shape as dropTable, on the BASE table — the
+        // reload below swaps its cached schema.
+        const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
+        const db = try self.srv.database(ns);
+        const nskey = zdb.kv.namespaceHash(ns);
+        _ = db.locks.acquire(nskey, owner, .shared) catch |err|
+            return replyLockErr(state, err);
+        defer db.locks.release(nskey, owner);
+
+        const tkey = (zdb.kv.TableKey{
+            .namespace = ns,
+            .table_id = base_tid,
+        }).identityHash();
+        _ = db.locks.acquire(tkey, owner, .exclusive) catch |err|
+            return replyLockErr(state, err);
+        defer db.locks.release(tkey, owner);
+
+        const ck = catalog.encodeIndexKey(base_tid, index_tid);
+        const wire_key = (zdb.kv.Key{
+            .namespace = ns,
+            .table_id = catalog.index_table_id,
+            .primary = &ck,
+            .timestamp = 0,
+        }).marshal(a) catch |err| {
+            logDropIndexErr(di.name, "marshal key", err);
+            return replyError(state, "drop index failed");
+        };
+
+        var kvs = [_]zen.KeyValueStruct{.{
+            .key = wire_key,
+            .value = "",
+            .meta = (zdb.kv.Meta{ .kind = .deleted }).toByte(),
+        }};
+        eng.proposeWrites(ns, &kvs, .apply) catch |err| {
+            logDropIndexErr(di.name, "tombstone", err);
+            return replyError(state, "drop index failed");
+        };
+
+        const mc = eng.forest.buildDropTables(a, ns, &.{index_tid}) catch |err| {
+            logDropIndexErr(di.name, "drop tree", err);
+            return replyError(state, "drop index failed");
+        };
+        eng.proposeMC(mc, .apply) catch |err| {
+            logDropIndexErr(di.name, "propose drop", err);
+            return replyError(state, "drop index failed");
+        };
+        self.srv.reloadTable(ns, base_tid) catch |err| {
+            logDropIndexErr(di.name, "reload table", err);
+            return replyError(state, "drop index failed");
+        };
+
+        log.info("dropped index '{s}' (ns={d} base={d} index={d})", .{ di.name, ns, base_tid, index_tid });
+        try state.sendCommandComplete("DROP INDEX");
     }
 
     /// Allocate and initialize a fresh txn (caller owns the pointer —
@@ -957,16 +1432,19 @@ const Handler = struct {
         const table_id = eng.forest.lookupTable(ns, ins.table) orelse
             return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
 
-        const t = self.srv.openTable(ns, table_id) catch |err| {
-            log.err("insert into '{s}': load schema: {s}", .{ ins.table, @errorName(err) });
-            return replyError(state, "failed to load table schema");
-        };
-
         var arena = std.heap.ArenaAllocator.init(eng.allocator);
         defer arena.deinit();
         const arloc = arena.allocator();
 
         const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
+
+        // Open AFTER the intent locks: a statement that parked behind
+        // DDL holding the table lock exclusively (CREATE/DROP INDEX)
+        // must see the reloaded schema, not a stale cached Table.
+        const t = self.srv.openTable(ns, table_id) catch |err| {
+            log.err("insert into '{s}': load schema: {s}", .{ ins.table, @errorName(err) });
+            return replyError(state, "failed to load table schema");
+        };
 
         // Map each VALUES position → the column it writes: `col` carries the
         // name and coercion type, `slot` is that column's cell in `values`
@@ -1145,16 +1623,17 @@ const Handler = struct {
         const ns = try self.sessionNamespace(state) orelse return;
         const table_id = eng.forest.lookupTable(ns, sel.table) orelse
             return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
-        const t = self.srv.openTable(ns, table_id) catch |err| {
-            log.err("select from '{s}': load schema: {s}", .{ sel.table, @errorName(err) });
-            return replyError(state, "failed to load table schema");
-        };
-
         var arena = std.heap.ArenaAllocator.init(eng.allocator);
         defer arena.deinit();
         const a = arena.allocator();
 
         const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
+
+        // Open AFTER the intent locks — see insert's comment.
+        const t = self.srv.openTable(ns, table_id) catch |err| {
+            log.err("select from '{s}': load schema: {s}", .{ sel.table, @errorName(err) });
+            return replyError(state, "failed to load table schema");
+        };
 
         // Resolve outputs: `egid` (from the key) or a payload column (its index
         // into ps.columns == the empty-projection decode order).
@@ -1240,16 +1719,17 @@ const Handler = struct {
                 pgwire.sqlstate.undefined_table,
                 "table does not exist",
             );
-        const tbl = self.srv.openTable(ns, table_id) catch |err| {
-            logDeleteErr(del.table, "load schema", err);
-            return replyError(state, "failed to load table schema");
-        };
-
         var arena = std.heap.ArenaAllocator.init(eng.allocator);
         defer arena.deinit();
         const arloc = arena.allocator();
 
         const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
+
+        // Open AFTER the intent locks — see insert's comment.
+        const tbl = self.srv.openTable(ns, table_id) catch |err| {
+            logDeleteErr(del.table, "load schema", err);
+            return replyError(state, "failed to load table schema");
+        };
 
         // Resolve WHERE: `egid = N` → a point lookup; a payload column
         // → scan + compare; no WHERE → tombstone every live row. Either
@@ -1352,17 +1832,18 @@ const Handler = struct {
                 pgwire.sqlstate.undefined_table,
                 "table does not exist",
             );
-        const t = self.srv.openTable(ns, table_id) catch |err| {
-            log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
-            return replyError(state, "failed to load table schema");
-        };
-
         var arena = std.heap.ArenaAllocator.init(eng.allocator);
         defer arena.deinit();
         const arloc = arena.allocator();
 
-        const idx_cols = try indexCols(arloc, t);
         const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
+
+        // Open AFTER the intent locks — see insert's comment.
+        const t = self.srv.openTable(ns, table_id) catch |err| {
+            log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
+            return replyError(state, "failed to load table schema");
+        };
+        const idx_cols = try indexCols(arloc, t);
 
         // A SET on an indexed column moves each matched row's egid
         // from its old posting to a statement-constant new one (the
@@ -1589,6 +2070,20 @@ fn indexCols(
     return map;
 }
 
+fn logCreateIndexErr(name: []const u8, what: []const u8, err: anyerror) void {
+    log.err(
+        "create index '{s}': {s}: {s}",
+        .{ name, what, @errorName(err) },
+    );
+}
+
+fn logDropIndexErr(name: []const u8, what: []const u8, err: anyerror) void {
+    log.err(
+        "drop index '{s}': {s}: {s}",
+        .{ name, what, @errorName(err) },
+    );
+}
+
 fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {
     log.err(
         "delete from '{s}': {s}: {s}",
@@ -1659,6 +2154,13 @@ fn resolveFilter(
     // semantics are one future decision covering both paths.
     index: for (t.indexes) |idx| {
         if (idx.column_id != fc.column_id) continue;
+        // TODO(stage 4): route non-unique indexes to a bitmap source
+        // (getBitmap + overlayPostings). Until then they must NOT
+        // take .index_eq — its value is a single egid, a posting is
+        // a RoaringDelta chain — so equality falls back to the cell
+        // scan. Invalid (mid-backfill) indexes stay unroutable then
+        // too.
+        if (!idx.unique) continue;
         const ik = key.encodeIndexKey(a, val, null) catch |err| {
             if (err == error.OutOfMemory) return err;
             break :index;

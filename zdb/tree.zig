@@ -31,12 +31,12 @@ const log = std.log.scoped(.zdb_tree);
 // Internal types
 // ---------------------------------------------------------------------------
 
-const Targets = struct {
+pub const Targets = struct {
     allocator: std.mem.Allocator,
     target_sz: []i64,
     file_sz: []i64,
 
-    fn deinit(self: *Targets) void {
+    pub fn deinit(self: *Targets) void {
         self.allocator.free(self.target_sz);
         self.allocator.free(self.file_sz);
     }
@@ -929,7 +929,7 @@ pub const Tree = struct {
     // Level sizing
     // -----------------------------------------------------------------------
 
-    fn levelTargets(self: *Tree) !Targets {
+    pub fn levelTargets(self: *Tree) !Targets {
         const n = self.opts.max_levels;
         const target_sz = try self.allocator.alloc(i64, n);
         errdefer self.allocator.free(target_sz);
@@ -1683,6 +1683,34 @@ pub const Tree = struct {
         }
 
         try self.updateCompactCandidate();
+    }
+
+    /// Install a CREATE INDEX backfill: bottom-level CREATEs only
+    /// (Forest.buildBottomTable). Valid solely while the bottom level
+    /// is still EMPTY — the backfill states are older than every
+    /// delta, so anything already at the bottom (a compaction that
+    /// raced past the engine's tree reservation) would sit ABOVE them
+    /// in version order while sharing the level, breaking the sorted
+    /// run — and a rolled-up terminal there would already be missing
+    /// the backfilled rows. The check reads applied state, so every
+    /// node skips (or installs) identically; the DDL session verifies
+    /// via Forest.bottomTableCount after the apply and fails CREATE
+    /// INDEX loudly on a skip.
+    pub fn applyBackfill(self: *Tree, changes: []const manifest.SSTableChange) !void {
+        if (changes.len == 0) return;
+        const bottom: u32 = @intCast(self.opts.max_levels - 1);
+        for (changes) |c| {
+            std.debug.assert(c.op == .create);
+            std.debug.assert(c.level == bottom);
+        }
+        if (self.levels[bottom].tableCount() > 0) {
+            log.err(
+                "backfill install skipped: bottom level not empty tree={d}",
+                .{self.tree_id},
+            );
+            return;
+        }
+        try self.applyCompaction(changes);
     }
 
     const FlushResult = struct { file_id: u64 };

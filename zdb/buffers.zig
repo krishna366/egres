@@ -108,6 +108,9 @@ pub const Command = schema.EnumDef(.{
     .{ .name = "drop_ns", .tag = 6 },
     .{ .name = "create_tree", .tag = 7 },
     .{ .name = "drop_tree", .tag = 8 },
+    // CREATE INDEX backfill install: CREATEs into the bottom level,
+    // valid only while that level is empty (Tree.applyBackfill).
+    .{ .name = "index_backfill", .tag = 9 },
 });
 
 pub const ManifestChange = schema.Table(.{

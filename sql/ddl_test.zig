@@ -93,9 +93,88 @@ test "sql.ddl: DROP TABLE variants" {
     try testing.expectEqualStrings("t", ie.drop_table.name);
     try testing.expect(ie.drop_table.missing_ok);
 
-    // Non-table DROPs are a different feature, not a rejection.
+    // Non-table, non-index DROPs are a different feature, not a
+    // rejection.
+    const dv = try ddl.parseDdl(alloc, "DROP VIEW v;");
+    try testing.expect(dv == .unsupported);
+}
+
+test "sql.ddl: CREATE INDEX variants" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ci = try ddl.parseDdl(alloc, "CREATE INDEX idx_color ON t (color);");
+    try testing.expectEqualStrings("idx_color", ci.create_index.name.?);
+    try testing.expectEqualStrings("t", ci.create_index.table);
+    try testing.expectEqualStrings("color", ci.create_index.column);
+    try testing.expect(!ci.create_index.if_not_exists);
+
+    // Unnamed: the executor derives "{table}_{column}_idx".
+    const anon = try ddl.parseDdl(alloc, "CREATE INDEX ON t (color);");
+    try testing.expect(anon.create_index.name == null);
+
+    // IF NOT EXISTS + schema-qualified table.
+    const ine = try ddl.parseDdl(
+        alloc,
+        "CREATE INDEX IF NOT EXISTS i ON public.t (color);",
+    );
+    try testing.expect(ine.create_index.if_not_exists);
+    try testing.expectEqualStrings("t", ine.create_index.table);
+
+    // ASC / NULLS LAST are our semantics already — accepted.
+    const ord = try ddl.parseDdl(
+        alloc,
+        "CREATE INDEX i ON t (color ASC NULLS LAST);",
+    );
+    try testing.expectEqualStrings("color", ord.create_index.column);
+}
+
+test "sql.ddl: CREATE INDEX rejections carry a reason" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+        .{ .sql = "CREATE UNIQUE INDEX i ON t (a);", .needle = "UNIQUE" },
+        .{
+            .sql = "CREATE INDEX CONCURRENTLY i ON t (a);",
+            .needle = "CONCURRENTLY",
+        },
+        .{ .sql = "CREATE INDEX i ON t (a, b);", .needle = "single-column" },
+        .{ .sql = "CREATE INDEX i ON t ((a + 1));", .needle = "expression" },
+        .{ .sql = "CREATE INDEX i ON t (a) WHERE a > 1;", .needle = "partial" },
+        .{ .sql = "CREATE INDEX i ON t USING hash (a);", .needle = "hash" },
+        .{ .sql = "CREATE INDEX i ON t (a DESC);", .needle = "DESC" },
+        .{
+            .sql = "CREATE INDEX i ON t (a NULLS FIRST);",
+            .needle = "NULLS FIRST",
+        },
+        .{ .sql = "CREATE INDEX i ON t (a) INCLUDE (b);", .needle = "INCLUDE" },
+        .{ .sql = "DROP INDEX a, b;", .needle = "multiple" },
+        .{ .sql = "DROP INDEX CONCURRENTLY i;", .needle = "CONCURRENTLY" },
+    };
+    for (cases) |case| {
+        const stmt = try ddl.parseDdl(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
+    }
+}
+
+test "sql.ddl: DROP INDEX variants" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
     const di = try ddl.parseDdl(alloc, "DROP INDEX i;");
-    try testing.expect(di == .unsupported);
+    try testing.expectEqualStrings("i", di.drop_index.name);
+    try testing.expect(!di.drop_index.missing_ok);
+
+    const ie = try ddl.parseDdl(alloc, "DROP INDEX IF EXISTS public.i;");
+    try testing.expectEqualStrings("i", ie.drop_index.name);
+    try testing.expect(ie.drop_index.missing_ok);
 }
 
 test "sql.ddl: CREATE TABLE reserves the egid column name" {

@@ -9,6 +9,10 @@
 const std = @import("std");
 const pgwire = @import("pgwire");
 
+/// Readability alias for the sql layer — a borrowed byte string (names,
+/// row bytes, encoded keys). Same type as []const u8, just shorter.
+pub const String = []const u8;
+
 /// SQL column types this codec stores. Fixed-width types live in the row's
 /// fixed region at constant offsets; varlen types live in the trailing data
 /// region, sliced via the row's offset directory.

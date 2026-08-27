@@ -31,6 +31,7 @@ pub const CommandEnum = enum(u8) {
     drop_ns = 6,
     create_tree = 7,
     drop_tree = 8,
+    index_backfill = 9,
     _,
 };
 

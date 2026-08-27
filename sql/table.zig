@@ -279,6 +279,7 @@ const IndexKeyCtx = struct {
     a: std.mem.Allocator,
     target: u32,
     is_index: bool = false,
+    base_table_id: ?u32 = null,
     table_ids: std.ArrayList(u32) = .empty,
     err: ?anyerror = null,
 
@@ -289,6 +290,7 @@ const IndexKeyCtx = struct {
         };
         if (def.index_table_id == c.target) {
             c.is_index = true;
+            c.base_table_id = def.base_table_id;
             return false; // an index has no indexes; nothing more to learn
         }
         if (def.base_table_id == c.target)
@@ -301,13 +303,16 @@ const IndexKeyCtx = struct {
 };
 
 /// What one key-only pass over the index catalog says about a table_id:
-/// it is itself an index (`tids` is then meaningless — the scan stops
-/// early), or it is a base table with these index table_ids (empty if
-/// none). DROP TABLE rejects the former (dropping an index tree out from
-/// under its base would strand the base's PK; Postgres says use DROP
-/// INDEX), then appends the base to `tids` and drops the lot together.
+/// it is itself an index (`base_table_id` then names its base and
+/// `table_ids` is meaningless — the scan stops early), or it is a base
+/// table with these index table_ids (empty if none). DROP TABLE rejects
+/// the former (dropping an index tree out from under its base would
+/// strand the base's PK; Postgres says use DROP INDEX), then appends
+/// the base to `tids` and drops the lot together; DROP INDEX requires
+/// it and uses `base_table_id` to find the IndexDef.
 pub const IndexScan = struct {
     is_index: bool,
+    base_table_id: ?u32,
     table_ids: std.ArrayList(u32),
 };
 
@@ -326,7 +331,11 @@ pub fn scanIndexKeys(
 
     _ = try forest.scan(alloc, range, .{}, &ctx, IndexKeyCtx.emit);
     if (ctx.err) |e| return e;
-    return .{ .is_index = ctx.is_index, .table_ids = ctx.table_ids };
+    return .{
+        .is_index = ctx.is_index,
+        .base_table_id = ctx.base_table_id,
+        .table_ids = ctx.table_ids,
+    };
 }
 
 fn lessByColumnId(_: void, x: schema.LogicalColumn, y: schema.LogicalColumn) bool {

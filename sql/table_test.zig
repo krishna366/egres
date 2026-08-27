@@ -104,6 +104,19 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     try testing.expectEqual(@as(usize, 1), t.indexes.len);
     try testing.expectEqual(pkey_index_id, t.indexes[0].index_table_id);
     try testing.expect(t.indexes[0].unique);
+
+    // scanIndexKeys classifies both directions: the index knows its
+    // base; the base lists its index.
+    var as_index = try sql.table.scanIndexKeys(alloc, f, ns, pkey_index_id);
+    defer as_index.table_ids.deinit(alloc);
+    try testing.expect(as_index.is_index);
+    try testing.expectEqual(user_table_id, as_index.base_table_id.?);
+    var as_base = try sql.table.scanIndexKeys(alloc, f, ns, user_table_id);
+    defer as_base.table_ids.deinit(alloc);
+    try testing.expect(!as_base.is_index);
+    try testing.expectEqual(null, as_base.base_table_id);
+    try testing.expectEqual(1, as_base.table_ids.items.len);
+    try testing.expectEqual(pkey_index_id, as_base.table_ids.items[0]);
     try testing.expect(t.pkey != null);
     try testing.expectEqual(@as(usize, 0), t.pkey.?.column_index);
     try testing.expectEqual(pkey_index_id, t.pkey.?.index_table_id);

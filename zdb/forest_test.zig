@@ -1688,3 +1688,67 @@ test "forest: getBitmap rejects non-roaring chains and old reads" {
         f.getBitmap(alloc, roar.key("r", 99), .p0),
     );
 }
+
+test "forest: index backfill installs bottom states below live deltas" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    const Lease = struct {
+        fn call(_: *anyopaque, _: u64) anyerror!void {}
+    };
+    var lease_ctx: u8 = 0;
+    f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
+    try f.newMemtable(1, 1);
+
+    // The backfill product: one roaring STATE per index key at the
+    // snapshot ts, installed straight into the bottom level — the
+    // oldest data the tree will ever hold.
+    const snap: u64 = 500;
+    var blue = try zroar.Bitmap.fromSortedList(alloc, &.{ 1, 3 });
+    defer blue.deinit();
+    var red = try zroar.Bitmap.fromSortedList(alloc, &.{2});
+    defer red.deinit();
+    const items = [_]zdb.kv.Item{
+        .{
+            .key = roar.key("blue", snap),
+            .value = blue.toBuffer(),
+            .meta = roar.state_meta,
+        },
+        .{
+            .key = roar.key("red", snap),
+            .value = red.toBuffer(),
+            .meta = roar.state_meta,
+        },
+    };
+    var changes = try f.buildBottomTable(alloc, 1, 0, &items);
+    defer changes.deinit(alloc);
+    try std.testing.expectEqual(1, changes.items.len);
+    const tree = f.getTree(1, zdb.kv.makeTreeId(0, 0)).?;
+    try tree.applyBackfill(changes.items);
+    try std.testing.expectEqual(1, try f.bottomTableCount(1, 0));
+
+    // Post-snapshot DML: a delta strictly above the states.
+    try roar.putDelta(f, alloc, "blue", 600, &.{5}, &.{});
+
+    // At/above the delta the fold layers it over the bottom state;
+    // between snap and the delta the state answers alone; other keys
+    // are untouched.
+    try roar.expectBitmap(f, alloc, "blue", 700, &.{ 1, 3, 5 });
+    try roar.expectBitmap(f, alloc, "blue", 550, &.{ 1, 3 });
+    try roar.expectBitmap(f, alloc, "red", 700, &.{2});
+
+    // A second install must skip, deterministically: the bottom level
+    // is no longer empty, so the sorted run (and any rolled-up
+    // terminal) cannot be undercut.
+    var again = try f.buildBottomTable(alloc, 1, 0, &items);
+    defer again.deinit(alloc);
+    try tree.applyBackfill(again.items);
+    try std.testing.expectEqual(1, try f.bottomTableCount(1, 0));
+    try roar.expectBitmap(f, alloc, "blue", 700, &.{ 1, 3, 5 });
+}

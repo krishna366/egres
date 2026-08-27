@@ -176,6 +176,13 @@ pub const Level = struct {
         self.mu.deinit();
     }
 
+    /// Number of tables currently in this level.
+    pub fn tableCount(self: *Level) usize {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        return self.tables.items.len;
+    }
+
     /// initEntries bulk-sets entries, sorts them, and recomputes total_size.
     pub fn initEntries(self: *Level, new_entries: []const TableEntry) !void {
         self.mu.lock(@src());

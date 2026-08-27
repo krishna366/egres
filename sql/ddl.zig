@@ -17,6 +17,8 @@ const pgwire = @import("pgwire");
 const parser = pgwire.parser_mod;
 const value = @import("value.zig");
 
+const String = value.String;
+
 /// One parsed `name type [PRIMARY KEY]` column. `name` is borrowed.
 pub const ColumnDef = struct {
     name: []const u8,
@@ -32,6 +34,18 @@ pub const CreateTable = struct {
 
 pub const DropTable = struct {
     name: []const u8, // table name (borrowed)
+    missing_ok: bool = false, // IF EXISTS
+};
+
+pub const CreateIndex = struct {
+    name: ?String, // borrowed; null = derive "{table}_{column}_idx"
+    table: String, // borrowed
+    column: String, // borrowed
+    if_not_exists: bool = false,
+};
+
+pub const DropIndex = struct {
+    name: String, // index name (borrowed)
     missing_ok: bool = false, // IF EXISTS
 };
 
@@ -96,6 +110,8 @@ pub const DdlStmt = union(enum) {
     drop_database: []const u8, // database name (borrowed)
     create_table: CreateTable,
     drop_table: DropTable,
+    create_index: CreateIndex,
+    drop_index: DropIndex,
     insert: Insert,
     select: Select,
     delete: Delete,
@@ -135,6 +151,7 @@ pub fn parseDdl(alloc: std.mem.Allocator, sql: []const u8) parser.ParseError!Ddl
     }
     if (std.mem.eql(u8, kind, "CreateStmt")) return parseCreateTable(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "DropStmt")) return parseDropTable(alloc, entry.value_ptr.*);
+    if (std.mem.eql(u8, kind, "IndexStmt")) return parseCreateIndex(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "InsertStmt")) return parseInsert(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "SelectStmt")) return parseSelect(alloc, entry.value_ptr.*);
     if (std.mem.eql(u8, kind, "DeleteStmt")) return parseDelete(alloc, entry.value_ptr.*);
@@ -180,13 +197,36 @@ const CreateStmtJson = struct {
     };
 };
 
-/// DROP TABLE IF EXISTS public.t
+/// DROP TABLE IF EXISTS public.t / DROP INDEX IF EXISTS i
 const DropStmtJson = struct {
-    removeType: []const u8 = "", // OBJECT_TABLE (vs INDEX, VIEW, …)
+    removeType: String = "", // OBJECT_TABLE / OBJECT_INDEX (vs VIEW, …)
     missing_ok: bool = false, // IF EXISTS
-    objects: []const Obj = &.{}, // one per dropped table
+    concurrent: bool = false, // DROP INDEX CONCURRENTLY — rejected
+    objects: []const Obj = &.{}, // one per dropped object
 
     const Obj = struct { List: struct { items: []const NameNode = &.{} } = .{} };
+};
+
+/// CREATE INDEX i ON t (col)
+const IndexStmtJson = struct {
+    idxname: String = "", // empty = unnamed (executor derives one)
+    relation: struct { relname: String = "" } = .{},
+    accessMethod: String = "", // the parser fills "btree" by default
+    tableSpace: String = "",
+    indexParams: []const IndexElemNode = &.{},
+    indexIncludingParams: []const std.json.Value = &.{},
+    whereClause: ?std.json.Value = null, // presence ⇒ partial index
+    unique: bool = false,
+    concurrent: bool = false,
+    if_not_exists: bool = false,
+
+    const IndexElemNode = struct {
+        IndexElem: struct {
+            name: String = "", // empty ⇒ expression element
+            ordering: String = "", // SORTBY_* ; "" = default (ASC)
+            nulls_ordering: String = "", // SORTBY_NULLS_* ; "" = LAST
+        } = .{},
+    };
 };
 
 /// INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')
@@ -349,20 +389,77 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
     } };
 }
 
-/// DROP TABLE. Non-table DROPs (INDEX, VIEW, …) are `.unsupported`;
-/// multi-table DROPs are rejected.
+/// DROP TABLE / DROP INDEX (libpg_query reuses DropStmt for both,
+/// discriminated by removeType). Other object kinds (VIEW, …) are
+/// `.unsupported`; multi-object DROPs are rejected.
 fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
     const ds = try fromValue(DropStmtJson, alloc, body) orelse return .unsupported;
 
-    if (!std.mem.eql(u8, ds.removeType, "OBJECT_TABLE")) return .unsupported;
-    if (ds.objects.len != 1)
-        return invalid("DROP TABLE with multiple tables is not supported");
+    const is_index = std.mem.eql(u8, ds.removeType, "OBJECT_INDEX");
+    if (!is_index and !std.mem.eql(u8, ds.removeType, "OBJECT_TABLE"))
+        return .unsupported;
+    if (ds.objects.len != 1) {
+        return if (is_index)
+            invalid("DROP INDEX with multiple indexes is not supported")
+        else
+            invalid("DROP TABLE with multiple tables is not supported");
+    }
+    if (is_index and ds.concurrent)
+        return invalid("DROP INDEX CONCURRENTLY is not supported");
     const items = ds.objects[0].List.items;
     if (items.len == 0) return .unsupported;
+    const name = items[items.len - 1].String.sval;
 
+    if (is_index) {
+        return .{ .drop_index = .{
+            .name = name,
+            .missing_ok = ds.missing_ok,
+        } };
+    }
     return .{ .drop_table = .{
-        .name = items[items.len - 1].String.sval,
+        .name = name,
         .missing_ok = ds.missing_ok,
+    } };
+}
+
+/// CREATE INDEX. v1: a single plain column, non-unique, whole-table,
+/// default btree — every narrowing (UNIQUE, CONCURRENTLY, partial,
+/// multi-column, expression, INCLUDE, TABLESPACE, other access
+/// methods, DESC / NULLS FIRST ordering) is a clean `.invalid`.
+/// ASC / NULLS LAST are accepted: they are this index's semantics
+/// already (the NULL tag byte sorts last).
+fn parseCreateIndex(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
+    const is = try fromValue(IndexStmtJson, alloc, body) orelse return .unsupported;
+
+    if (is.unique) return invalid("UNIQUE indexes are not supported");
+    if (is.concurrent)
+        return invalid("CREATE INDEX CONCURRENTLY is not supported");
+    if (is.whereClause != null)
+        return invalid("partial indexes are not supported");
+    if (is.indexIncludingParams.len > 0)
+        return invalid("INCLUDE columns are not supported");
+    if (is.tableSpace.len > 0) return invalid("TABLESPACE is not supported");
+    if (is.accessMethod.len > 0 and !std.mem.eql(u8, is.accessMethod, "btree"))
+        return invalidFmt(
+            alloc,
+            "access method \"{s}\" is not supported",
+            .{is.accessMethod},
+        );
+    if (is.indexParams.len != 1)
+        return invalid("only single-column indexes are supported");
+    const elem = is.indexParams[0].IndexElem;
+    if (elem.name.len == 0)
+        return invalid("expression indexes are not supported");
+    if (std.mem.eql(u8, elem.ordering, "SORTBY_DESC"))
+        return invalid("DESC index ordering is not supported");
+    if (std.mem.eql(u8, elem.nulls_ordering, "SORTBY_NULLS_FIRST"))
+        return invalid("NULLS FIRST index ordering is not supported");
+
+    return .{ .create_index = .{
+        .name = if (is.idxname.len > 0) is.idxname else null,
+        .table = is.relation.relname,
+        .column = elem.name,
+        .if_not_exists = is.if_not_exists,
     } };
 }
 

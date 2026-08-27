@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for SQL DDL (CREATE/DROP DATABASE + TABLE) over the
+# End-to-end smoke test for SQL DDL (CREATE/DROP DATABASE + TABLE + INDEX)
 # pgwire endpoint. Builds, starts a fresh single-node egres, drives psql
 # through the DDL matrix (including a restart-persistence leg), and greps
 # the server log. Wipes /data/egres — that dir is throw-away by convention.
@@ -94,6 +94,44 @@ expect "CREATE DATABASE app" "CREATE DATABASE" psql "$E" -X -c "CREATE DATABASE 
 expect "same table name in app" "CREATE TABLE" psql "$A" -X -c "CREATE TABLE t (x uint8);"
 expect "DROP DATABASE with tables" "DROP DATABASE" psql "$E" -X -c "DROP DATABASE app;"
 expect "dropped-db session fails" "database does not exist" psql "$A" -X -c "CREATE TABLE y (a int);"
+
+# --- secondary indexes: create / backfill / DML / drop ----------------------
+expect "CREATE TABLE items" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE items (id int PRIMARY KEY, color text);"
+expect "INSERT pre-index rows" "INSERT 0 3" psql "$E" -X -c "INSERT INTO items VALUES (1,'blue'),(2,'red'),(3,'blue');"
+# Blocking online build: the reply means built + valid (backfill done).
+expect "CREATE INDEX backfills" "CREATE INDEX" psql "$E" -X -c "CREATE INDEX items_color ON items (color);"
+expect "duplicate index name" "already exists" psql "$E" -X -c "CREATE INDEX items_color ON items (color);"
+expect "IF NOT EXISTS is quiet (index)" "CREATE INDEX" psql "$E" -X -c "CREATE INDEX IF NOT EXISTS items_color ON items (color);"
+expect "second index on the column" "already indexed" psql "$E" -X -c "CREATE INDEX another ON items (color);"
+expect "UNIQUE index rejected" "UNIQUE" psql "$E" -X -c "CREATE UNIQUE INDEX u ON items (color);"
+expect "index on missing column" "column does not exist" psql "$E" -X -c "CREATE INDEX i2 ON items (nope);"
+expect "index on missing table" "table does not exist" psql "$E" -X -c "CREATE INDEX i3 ON nope (a);"
+
+# DML maintains postings; equality reads stay correct via the cell-scan
+# fallback (the bitmap read path is the next stage).
+expect "SELECT backfilled matches" "(2 rows)" psql "$E" -X -c "SELECT id FROM items WHERE color = 'blue';"
+expect "INSERT with index live" "INSERT 0 1" psql "$E" -X -c "INSERT INTO items VALUES (4,'green');"
+expect "UPDATE moves the index key" "UPDATE 1" psql "$E" -X -c "UPDATE items SET color = 'blue' WHERE id = 4;"
+expect "DELETE with index live" "DELETE 1" psql "$E" -X -c "DELETE FROM items WHERE id = 2;"
+expect "SELECT after churn" "(3 rows)" psql "$E" -X -c "SELECT id FROM items WHERE color = 'blue';"
+
+# DROP INDEX and its rejections.
+expect "DROP TABLE of an index name" "use DROP INDEX" psql "$E" -X -c "DROP TABLE items_color;"
+expect "DROP INDEX of a base table" "not an index" psql "$E" -X -c "DROP INDEX items;"
+expect "cannot drop the pkey index" "PRIMARY KEY index" psql "$E" -X -c "DROP INDEX items_pkey;"
+expect "DROP INDEX" "DROP INDEX" psql "$E" -X -c "DROP INDEX items_color;"
+expect "DROP INDEX missing errors" "does not exist" psql "$E" -X -c "DROP INDEX items_color;"
+expect "DROP INDEX IF EXISTS quiet" "DROP INDEX" psql "$E" -X -c "DROP INDEX IF EXISTS items_color;"
+expect "SELECT after drop still answers" "(3 rows)" psql "$E" -X -c "SELECT id FROM items WHERE color = 'blue';"
+expect "re-CREATE freed index name" "CREATE INDEX" psql "$E" -X -c "CREATE INDEX items_color ON items (color);"
+
+# Restart: index tree, catalog row, and backfilled SSTs survive replay.
+stop_server
+start_server
+expect "index survives restart" "already exists" psql "$E" -X -c "CREATE INDEX items_color ON items (color);"
+expect "indexed write after restart" "INSERT 0 1" psql "$E" -X -c "INSERT INTO items VALUES (5,'red');"
+expect "DROP TABLE cascades the index" "DROP TABLE" psql "$E" -X -c "DROP TABLE items;"
+expect "cascaded index name freed" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE items_color (a int);"
 
 # --- no unexpected server-side errors ---------------------------------------
 if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi

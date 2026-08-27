@@ -55,6 +55,7 @@ pub const sqlstate = struct {
     pub const duplicate_table: [5]u8 = .{ '4', '2', 'P', '0', '7' };
     pub const undefined_table: [5]u8 = .{ '4', '2', 'P', '0', '1' };
     pub const wrong_object_type: [5]u8 = .{ '4', '2', '8', '0', '9' };
+    pub const undefined_object: [5]u8 = .{ '4', '2', '7', '0', '4' };
     pub const undefined_column: [5]u8 = .{ '4', '2', '7', '0', '3' };
     pub const invalid_catalog_name: [5]u8 = .{ '3', 'D', '0', '0', '0' };
     pub const feature_not_supported: [5]u8 = .{ '0', 'A', '0', '0', '0' };

@@ -178,11 +178,12 @@ pub const IndexField = enum(u32) {
     index_table_id = 2,
     column_id = 3,
     unique = 4,
+    valid = 5,
 };
 
 /// The fixed schema of the index catalog, compiled into the binary. ids are
-/// uint4, `unique` is a bool. Single-column today; a composite index will
-/// widen `column_id` into an ordered list cell.
+/// uint4, `unique`/`valid` are bools. Single-column today; a composite
+/// index will widen `column_id` into an ordered list cell.
 pub const index_logical_schema: LogicalSchema = .{
     .current_version = 1,
     .columns = &.{
@@ -190,40 +191,46 @@ pub const index_logical_schema: LogicalSchema = .{
         .{ .column_id = @intFromEnum(IndexField.index_table_id), .name = "index_table_id", .ty = .uint4 },
         .{ .column_id = @intFromEnum(IndexField.column_id), .name = "column_id", .ty = .uint4 },
         .{ .column_id = @intFromEnum(IndexField.unique), .name = "unique", .ty = .bool_ },
+        .{ .column_id = @intFromEnum(IndexField.valid), .name = "valid", .ty = .bool_ },
     },
 };
 
 /// A decoded index catalog row: one index of `base_table_id`, stored in its
-/// own tree (`index_table_id`), keyed on `column_id`'s value.
+/// own tree (`index_table_id`), keyed on `column_id`'s value. `valid` is
+/// Postgres's indisvalid: false while CREATE INDEX's online backfill runs —
+/// DML maintains the index, reads skip it. Flipped true at install.
 pub const IndexDef = struct {
     base_table_id: u32,
     index_table_id: u32,
     column_id: u32,
     unique: bool,
+    valid: bool = true,
 };
 
 /// Build the index catalog row cells (column_id order) for `def`. Pass
 /// `&result` to marshalRow with the index catalog's compiled PhysicalSchema.
-pub fn encodeIndex(def: IndexDef) [4]Value {
+pub fn encodeIndex(def: IndexDef) [5]Value {
     return .{
         .{ .uint4 = def.base_table_id },
         .{ .uint4 = def.index_table_id },
         .{ .uint4 = def.column_id },
         .{ .bool_ = def.unique },
+        .{ .bool_ = def.valid },
     };
 }
 
-/// Decode a fully-read index catalog row (four cells, column_id order).
+/// Decode a fully-read index catalog row (five cells, column_id order).
 pub fn decodeIndex(r: *const Row) Error!IndexDef {
-    if (r.len() != 4) return error.CorruptCatalogRow;
+    if (r.len() != 5) return error.CorruptCatalogRow;
     if (r.at(0) != .uint4 or r.at(1) != .uint4 or
-        r.at(2) != .uint4 or r.at(3) != .bool_)
+        r.at(2) != .uint4 or r.at(3) != .bool_ or r.at(4) != .bool_)
         return error.CorruptCatalogRow;
     return .{
         .base_table_id = r.at(0).uint4,
         .index_table_id = r.at(1).uint4,
         .column_id = r.at(2).uint4,
         .unique = r.at(3).bool_,
+        .valid = r.at(4).bool_,
     };
 }
 

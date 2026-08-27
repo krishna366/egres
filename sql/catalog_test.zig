@@ -103,7 +103,7 @@ test "sql.catalog: an index descriptor round-trips through an index row" {
 
     var ips = try sql.compile(alloc, catalog.index_logical_schema, 1);
     defer ips.deinit(alloc);
-    try testing.expectEqual(@as(usize, 4), ips.columns.len);
+    try testing.expectEqual(@as(usize, 5), ips.columns.len);
     try testing.expectEqual(@as(u16, 0), ips.n_varlen); // all fixed-width
 
     var buf: std.ArrayList(u8) = .empty;
@@ -116,6 +116,7 @@ test "sql.catalog: an index descriptor round-trips through an index row" {
         .index_table_id = 17,
         .column_id = 1,
         .unique = true,
+        .valid = false, // exercise the non-default half of the flag
     };
     const vals = catalog.encodeIndex(def);
     const bytes = try sql.marshalRow(alloc, &ips, &vals, &buf);

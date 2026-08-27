@@ -211,6 +211,14 @@ pub const StorageImpl = struct {
                     }
                 }
             },
+            .index_backfill => {
+                if (mcs.sstable_changes.len > 0) {
+                    const sc = mcs.sstable_changes[0];
+                    if (self.forest.getTree(sc.namespace_id, sc.tree_id)) |tree| {
+                        try tree.applyBackfill(mcs.sstable_changes);
+                    }
+                }
+            },
             .tree_split => try self.forest.applySplit(mcs.*),
             .create_ns => try self.forest.applyNamespaceCreate(mcs.*),
             .create_tree => try self.forest.applyCreateTree(mcs.*),
@@ -532,6 +540,22 @@ pub const Engine = struct {
         self.compacting_mu.lock(@src());
         defer self.compacting_mu.unlock();
         _ = self.compacting_trees.remove(key);
+    }
+
+    /// Reserve a tree against compaction/split for a long-running
+    /// external build (CREATE INDEX's backfill): occupies the same
+    /// slot the compaction loop claims, so the picker skips the tree
+    /// until releaseTree. Keeps the index tree's bottom level empty
+    /// while the backfill runs — the condition its install depends on
+    /// (Tree.applyBackfill).
+    pub fn reserveTree(self: *Engine, key: TreeKey) !void {
+        self.compacting_mu.lock(@src());
+        defer self.compacting_mu.unlock();
+        try self.compacting_trees.put(key, {});
+    }
+
+    pub fn releaseTree(self: *Engine, key: TreeKey) void {
+        self.releaseCompactingTree(key);
     }
 
     /// Add an in-flight record. Returns the slice index for `removeInFlight`.

@@ -522,7 +522,7 @@ pub const Forest = struct {
             const path = try fi.sstPath(self.allocator, self.opts.dir, file_id);
 
             try g.spawn(.{}, writeAndSyncTable, .{
-                self.allocator, tb, path, file_id, tk, &flush_err,
+                self.allocator, tb, path, file_id, tk, 0, &flush_err,
             });
         }
 
@@ -545,13 +545,14 @@ pub const Forest = struct {
     }
 
     /// Writes table bytes to a new SST file, syncs, and closes.
-    /// Returns a manifest.SSTableChange (CREATE at level 0) on success.
+    /// Returns a manifest.SSTableChange (CREATE at `level`) on success.
     fn writeAndSyncTable(
         allocator: std.mem.Allocator,
         tb: table_mod.builder.TableBuffer,
         path: []const u8,
         file_id: u64,
         tk: TreeKey,
+        lvl: u32,
         err_out: *utils.ThreadSafeError,
     ) ?manifest.SSTableChange {
         defer allocator.free(path);
@@ -571,7 +572,134 @@ pub const Forest = struct {
             return null;
         };
         wh.close();
-        return manifest.createSSTableChange(file_id, tk.namespace, tk.tree_id, 0);
+        return manifest.createSSTableChange(file_id, tk.namespace, tk.tree_id, lvl);
+    }
+
+    /// Build BOTTOM-level SSTs for (`ns`, `table_id`) from
+    /// caller-supplied items — sorted ascending, one version per key —
+    /// write + sync them, and return the manifest changes to propose
+    /// (CREATEs, cmd .index_backfill). CREATE INDEX's online backfill
+    /// pours its per-key roaring states through here: those states
+    /// are by construction the OLDEST data the tree will ever hold
+    /// (every posting delta commits after the backfill snapshot), so
+    /// the bottom level is the one placement that keeps the
+    /// level-ordering invariant against everything above.
+    /// Tree.applyBackfill enforces the matching sorted-run condition
+    /// (the bottom level must still be empty at install).
+    ///
+    /// Output splits at the bottom level's target size, so a huge
+    /// backfill lands as several legit tables rather than one giant
+    /// one; items are single-version keys, so any split point is
+    /// safe, and the files are disjoint + sorted — a valid sorted
+    /// run. Writes+syncs run in a fiber group, one per output file,
+    /// like buildFlush; files reach followers exactly like
+    /// flush/compaction outputs (preAppend fetches missing sst ids
+    /// before apply). The caller guarantees the table is un-split —
+    /// one tree — which holds for a freshly created index table
+    /// under ddl_mu (splits never touch an empty tree). `changes` is
+    /// allocated from `allocator` and caller-owned.
+    pub fn buildBottomTable(
+        self: *Forest,
+        allocator: std.mem.Allocator,
+        ns: u64,
+        table_id: u32,
+        items: []const Item,
+    ) !std.ArrayList(manifest.SSTableChange) {
+        var changes: std.ArrayList(manifest.SSTableChange) = .empty;
+        errdefer changes.deinit(allocator);
+        if (items.len == 0) return changes;
+
+        const bottom: u32 = @intCast(self.opts.max_levels - 1);
+        const tk, const max_bytes = blk: {
+            self.mu.lockShared(@src());
+            defer self.mu.unlockShared();
+            const tree = try self.singleTreeLocked(ns, table_id);
+            var targets = try tree.levelTargets();
+            defer targets.deinit();
+            break :blk .{
+                TreeKey{ .namespace = ns, .tree_id = tree.tree_id },
+                @as(usize, @intCast(targets.file_sz[bottom])),
+            };
+        };
+
+        var build_err: utils.ThreadSafeError = .{};
+        var g = fiber.Group(?manifest.SSTableChange).init(self.allocator);
+        defer {
+            _ = g.wait();
+            g.deinit();
+        }
+
+        var bld = Builder.init(self.allocator, .{
+            .target_block_size = self.opts.block_size,
+            .codec = self.opts.compression,
+            .priority = .p2,
+        });
+        defer bld.deinit();
+        for (items) |item| {
+            if (bld.table_bytes.items.len >= max_bytes) {
+                try self.spawnTableWrite(&g, &bld, tk, bottom, &build_err);
+                bld.reset();
+            }
+            try bld.addItem(item);
+        }
+        try self.spawnTableWrite(&g, &bld, tk, bottom, &build_err);
+
+        const tcs = g.wait();
+        for (tcs) |tc_opt| {
+            const tc = tc_opt orelse continue;
+            try changes.append(allocator, tc);
+        }
+        if (build_err.get()) |err| return err;
+
+        if (self.opts.dir.len > 0) {
+            var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.opts.dir});
+            defer dir_sync.join();
+        }
+        return changes;
+    }
+
+    /// One buildBottomTable output file: finish the builder and hand
+    /// the write+sync to the fiber group. Empty builders spawn
+    /// nothing.
+    fn spawnTableWrite(
+        self: *Forest,
+        g: *fiber.Group(?manifest.SSTableChange),
+        bld: *Builder,
+        tk: TreeKey,
+        lvl: u32,
+        err_out: *utils.ThreadSafeError,
+    ) !void {
+        var tb = try bld.finish();
+        if (tb.bytes.len == 0) {
+            tb.deinit();
+            return;
+        }
+        const file_id = try self.file_ids.allocate();
+        const path = try fi.sstPath(self.allocator, self.opts.dir, file_id);
+        try g.spawn(.{}, writeAndSyncTable, .{
+            self.allocator, tb, path, file_id, tk, lvl, err_out,
+        });
+    }
+
+    /// Number of tables in `table_id`'s bottom level — CREATE INDEX's
+    /// post-install verification (applyBackfill skips, deterministically
+    /// on every node, when the bottom level was not empty).
+    pub fn bottomTableCount(self: *Forest, ns: u64, table_id: u32) !usize {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        const tree = try self.singleTreeLocked(ns, table_id);
+        return tree.levels[tree.levels.len - 1].tableCount();
+    }
+
+    /// The ONE tree of an un-split table — backfill's addressing mode:
+    /// a freshly created index table cannot have split (splits never
+    /// touch an empty tree, and ddl_mu serializes DDL against drops).
+    /// Caller holds self.mu.
+    fn singleTreeLocked(self: *Forest, ns: u64, table_id: u32) !*Tree {
+        const trees = self.treesFor(ns, table_id) orelse
+            return error.TreeNotFound;
+        std.debug.assert(trees.entries.items.len == 1);
+        return trees.entries.items[0];
     }
 
     /// applyFlush is Phase B: commits the manifest changes from a memtable flush
