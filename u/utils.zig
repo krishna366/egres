@@ -96,14 +96,14 @@ pub fn search(
 
 /// Lock-free, first-error-wins container. Safe to call set() from many threads;
 /// only the first error is retained.
-pub const ThreadSafeError = struct {
+pub const SafeError = struct {
     raw: std.atomic.Value(u16) = std.atomic.Value(u16).init(0),
 
-    pub fn set(self: *ThreadSafeError, e: anyerror) void {
+    pub fn set(self: *SafeError, e: anyerror) void {
         _ = self.raw.cmpxchgStrong(0, @intFromError(e), .acq_rel, .monotonic);
     }
 
-    pub fn get(self: *const ThreadSafeError) ?anyerror {
+    pub fn get(self: *const SafeError) ?anyerror {
         const v = self.raw.load(.acquire);
         if (v == 0) return null;
         return @errorFromInt(v);
@@ -190,10 +190,40 @@ pub fn SafeHashMap(comptime K: type, comptime V: type) type {
             return self.map.contains(key);
         }
 
+        /// Insert `value` under `key` if absent; return the stored value —
+        /// the existing one when the key was already present (the caller
+        /// disposes of its unused `value` then). One atomic step, unlike
+        /// contains-then-put. (Not fetchPut: that REPLACES the stored
+        /// value, which would hand two racers two different values.)
+        pub fn getOrPut(self: *Self, key: K, value: V) !V {
+            self.mu.lock(@src());
+            defer self.mu.unlock();
+            const gop = try self.map.getOrPut(key);
+            if (!gop.found_existing) gop.value_ptr.* = value;
+            return gop.value_ptr.*;
+        }
+
+        /// Unlocked iteration for teardown — caller must guarantee no
+        /// concurrent access.
+        pub fn valueIterator(self: *Self) HashMap.ValueIterator {
+            return self.map.valueIterator();
+        }
+
         pub fn count(self: *Self) u32 {
             self.mu.lock(@src());
             defer self.mu.unlock();
             return self.map.count();
+        }
+
+        pub fn countValue(self: *Self, value: V) u32 {
+            self.mu.lock(@src());
+            defer self.mu.unlock();
+            var n: u32 = 0;
+            var it = self.map.valueIterator();
+            while (it.next()) |v| {
+                if (std.meta.eql(v.*, value)) n += 1;
+            }
+            return n;
         }
 
         pub fn deinit(self: *Self) void {

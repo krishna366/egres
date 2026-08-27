@@ -192,6 +192,33 @@ pub const JoinResponse = schema.Table(.{
     .{ .id = 4, .name = "leader_addr", .ty = schema.Bytes },
 });
 
+// File-distribution control plane: after uploading a batch of new SSTs to
+// the shared object store, the creator announces the file ids; each peer
+// downloads what its local disk lacks FROM THE STORE, then replies with one
+// batch AnnounceFilesResp. A prefetch optimization — apply-time store fetch
+// is the backstop — so raft relays ids, never file bytes.
+
+pub const AnnounceFiles = schema.Table(.{
+    .{ .id = 1, .name = "announce_id", .ty = schema.U64 },
+    // sender_id in case the files are available on a non-leader peer.
+    .{ .id = 2, .name = "sender_id", .ty = schema.U64 },
+    .{ .id = 3, .name = "file_ids", .ty = schema.Array(schema.U64) },
+});
+
+// tag 0 reserved — a freshly-zeroed byte never decodes as a real status.
+pub const AnnounceStatus = schema.EnumDef(.{
+    .{ .name = "unknown", .tag = 0 },
+    .{ .name = "ok", .tag = 1 },
+    .{ .name = "fail", .tag = 2 },
+});
+
+pub const AnnounceFilesResp = schema.Table(.{
+    .{ .id = 1, .name = "announce_id", .ty = schema.U64 },
+    .{ .id = 2, .name = "node_id", .ty = schema.U64 },
+    .{ .id = 3, .name = "status", .ty = schema.Enum(AnnounceStatus) },
+    .{ .id = 4, .name = "fail_error", .ty = schema.Bytes },
+});
+
 // zbuf tail currently stores table_id as u16, so we reserve high bits in u16
 // for module-level namespacing and OR local ids into the low bits.
 const RAFT_TABLE_NS: u16 = 0xA500;
@@ -216,4 +243,6 @@ pub const tables = .{
     .{ .name = "Snapshot", .ty = Snapshot, .id = tableId(13) },
     .{ .name = "WalSlot", .ty = WalSlot, .id = tableId(14) },
     .{ .name = "WalHeader", .ty = WalHeader, .id = tableId(15) },
+    .{ .name = "AnnounceFiles", .ty = AnnounceFiles, .id = tableId(16) },
+    .{ .name = "AnnounceFilesResp", .ty = AnnounceFilesResp, .id = tableId(17) },
 };

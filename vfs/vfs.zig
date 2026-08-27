@@ -4,6 +4,10 @@ const posix = std.posix;
 const fiber = @import("zfiber");
 const utils = @import("utils");
 pub const bandwidth = @import("bandwidth.zig");
+pub const filestore = @import("filestore.zig");
+pub const FileStore = filestore.FileStore;
+pub const sigv4 = @import("sigv4.zig");
+pub const s3 = @import("s3.zig");
 
 inline fn fdToFile(fd: posix.fd_t) std.Io.File {
     return .{ .handle = fd, .flags = .{ .nonblocking = false } };
@@ -66,7 +70,6 @@ pub const ReadResult = struct {
         if (self.buf) |b| self.allocator.free(b);
     }
 };
-
 
 pub const FileHandle = struct {
     file: ?fiber.File = null,
@@ -404,8 +407,25 @@ pub const VFS = struct {
             .direct = builtin.os.tag == .linux and opts.mode == .direct,
         };
     }
-
 };
+
+/// Create `path`, write `data` through the accounted FileHandle path,
+/// fsync, and close — the durable whole-file write behind SST flushes
+/// and dir-store puts. Callers whose buffers are page-aligned pass
+/// `.direct` (the SST builders pad + align their output); arbitrary
+/// heap buffers must use `.default` — direct-mode writes assert
+/// alignment rather than bounce.
+pub fn writeAndSync(
+    path: []const u8,
+    data: []const u8,
+    opts: FileOptions,
+    priority: Priority,
+) !void {
+    const wh = try g().createFile(path, opts);
+    defer wh.close();
+    try wh.write(data, 0, priority);
+    try wh.sync();
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Module-level metadata ops

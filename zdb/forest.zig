@@ -500,7 +500,7 @@ pub const Forest = struct {
         // Flush all builders to SST files. writeAndSyncTable handles the full
         // write path (finish → create file → write → sync → close) and returns
         // the manifest SSTableChange directly.
-        var flush_err: utils.ThreadSafeError = .{};
+        var flush_err: utils.SafeError = .{};
         var g = fiber.Group(?manifest.SSTableChange).init(self.allocator);
         defer {
             _ = g.wait();
@@ -553,25 +553,16 @@ pub const Forest = struct {
         file_id: u64,
         tk: TreeKey,
         lvl: u32,
-        err_out: *utils.ThreadSafeError,
+        err_out: *utils.SafeError,
     ) ?manifest.SSTableChange {
         defer allocator.free(path);
         var mtb = tb;
         defer mtb.deinit();
 
-        const wh = vfs.g().createFile(path, .{ .mode = .direct }) catch |err| {
+        vfs.writeAndSync(path, mtb.bytes, .{ .mode = .direct }, .p0) catch |err| {
             err_out.set(err);
             return null;
         };
-        wh.write(mtb.bytes, 0, .p0) catch |err| {
-            err_out.set(err);
-            return null;
-        };
-        wh.sync() catch |err| {
-            err_out.set(err);
-            return null;
-        };
-        wh.close();
         return manifest.createSSTableChange(file_id, tk.namespace, tk.tree_id, lvl);
     }
 
@@ -593,8 +584,9 @@ pub const Forest = struct {
     /// safe, and the files are disjoint + sorted — a valid sorted
     /// run. Writes+syncs run in a fiber group, one per output file,
     /// like buildFlush; files reach followers exactly like
-    /// flush/compaction outputs (preAppend fetches missing sst ids
-    /// before apply). The caller guarantees the table is un-split —
+    /// flush/compaction outputs (uploaded to the shared file store
+    /// before propose; apply downloads what's missing). The caller
+    /// guarantees the table is un-split —
     /// one tree — which holds for a freshly created index table
     /// under ddl_mu (splits never touch an empty tree). `changes` is
     /// allocated from `allocator` and caller-owned.
@@ -622,7 +614,7 @@ pub const Forest = struct {
             };
         };
 
-        var build_err: utils.ThreadSafeError = .{};
+        var build_err: utils.SafeError = .{};
         var g = fiber.Group(?manifest.SSTableChange).init(self.allocator);
         defer {
             _ = g.wait();
@@ -667,7 +659,7 @@ pub const Forest = struct {
         bld: *Builder,
         tk: TreeKey,
         lvl: u32,
-        err_out: *utils.ThreadSafeError,
+        err_out: *utils.SafeError,
     ) !void {
         var tb = try bld.finish();
         if (tb.bytes.len == 0) {

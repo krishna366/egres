@@ -11,9 +11,8 @@ pub const msg_type_raft: u16 = 1;
 pub const msg_type_join_request: u16 = 2;
 pub const msg_type_ping: u16 = 3;
 pub const msg_type_pong: u16 = 4;
-pub const msg_type_file_push: u16 = 5; // [8B file_id][4B crc32][file data...]
-pub const msg_type_file_ack: u16 = 6; // [8B file_id][8B node_id]
-pub const msg_type_file_request: u16 = 7; // [N * 8B file_ids]
+pub const msg_type_announce: u16 = 5; // zbuf AnnounceFiles
+pub const msg_type_announce_resp: u16 = 6; // zbuf AnnounceFilesResp
 
 pub const OutboundMsg = struct {
     message_type: u16,
@@ -100,6 +99,9 @@ pub const Serial = struct {
         var buf_writer = self.tcp_stream.writer(self.write_buf);
         const writer = &buf_writer.interface;
 
+        // TODO: Should we add checksum here itself. So, every message sent or
+        // received automatically gets a checksum. We don't have to check it
+        // again?
         var hdr: [header_size]u8 = undefined;
         std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len), .little);
         std.mem.writeInt(u16, hdr[4..6], message_type, .little);

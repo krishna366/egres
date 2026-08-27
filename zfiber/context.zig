@@ -11,6 +11,7 @@ pub const Context = struct {
     arena: Allocator,
     io: Io,
     args: std.process.Args,
+    environ_map: *std.process.Environ.Map,
 
     /// argv as `[]const []const u8`, allocated in arena (no caller free).
     /// Callers that want sentinel-terminated strings can use `args.toSlice`
@@ -20,6 +21,11 @@ pub const Context = struct {
         var it = self.args.iterate();
         while (it.next()) |a| try list.append(self.arena, a);
         return list.toOwnedSlice(self.arena);
+    }
+
+    /// Environment variable lookup (process-lifetime memory, no free).
+    pub fn env(self: *const Context, key: []const u8) ?[]const u8 {
+        return self.environ_map.get(key);
     }
 };
 
@@ -45,6 +51,7 @@ pub fn initGlobalWithAllocator(
         .arena = init.arena.allocator(),
         .io = init.io,
         .args = init.minimal.args,
+        .environ_map = init.environ_map,
     };
     inited = true;
 }

@@ -61,11 +61,38 @@ const RaftCfg = struct {
 const DataCfg = struct {
     dir: []const u8 = "",
     wal_dir: []const u8 = "",
+    memtable_size: u64 = 0,
 
     pub const docs = .{
         .self = "Storage paths. WAL can live on a faster device than the LSM forest.",
         .dir = "Directory holding the LSM forest. Required.",
         .wal_dir = "Directory holding the raft WAL. Empty = same as `dir`.",
+        .memtable_size = "Memtable size in bytes; 0 = zdb default (64 MiB). Small values force frequent flushes — useful for tests.",
+    };
+};
+
+/// `--store` — the shared object store that distributes SST files across
+/// nodes (upload before propose; download at apply). Required for any
+/// multi-node cluster: a seeded node refuses to start without one, and a
+/// leader without one rejects joins. Single-node runs need none. The
+/// depot directory is write-once blobs only — NEVER a node's live data
+/// dir.
+const StoreCfg = struct {
+    kind: []const u8 = "",
+    path: []const u8 = "",
+    s3_endpoint: []const u8 = "",
+    s3_bucket: []const u8 = "",
+    s3_region: []const u8 = "us-east-1",
+    s3_prefix: []const u8 = "",
+
+    pub const docs = .{
+        .self = "Shared object store for SST distribution (multi-node).",
+        .kind = "Backend: '' (none, single-node only), 'dir' (shared write-once depot directory, e.g. an NFS mount), or 's3' (S3-compatible store; creds via AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).",
+        .path = "Depot directory when kind=dir.",
+        .s3_endpoint = "S3 endpoint as an ip:port literal (plain HTTP), e.g. 127.0.0.1:8333.",
+        .s3_bucket = "Bucket name when kind=s3.",
+        .s3_region = "SigV4 signing region when kind=s3.",
+        .s3_prefix = "Optional key prefix inside the bucket (unreserved URI characters only).",
     };
 };
 
@@ -236,6 +263,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const live_listen = try flags.g().register("listen", ListenCfg);
     const live_raft = try flags.g().register("raft", RaftCfg);
     const live_data = try flags.g().register("data", DataCfg);
+    const live_store = try flags.g().register("store", StoreCfg);
     const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
 
     // --help is terminal; handle after registration so writeHelpAll has
@@ -263,9 +291,34 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const listen = live_listen.snapshot();
     const raft_cfg = live_raft.snapshot();
     const data_cfg = live_data.snapshot();
+    const store_cfg = live_store.snapshot();
     if (raft_cfg.id == 0 or data_cfg.dir.len == 0) {
         std.log.err("--raft requires id (>0); --data requires dir", .{});
         usage(allocator);
+        std.process.exit(1);
+    }
+    // Multi-node needs the shared store: every joiner would fetch its SSTs
+    // from it. The bootstrapping first node is gated at join time instead
+    // (it can't know it will ever have peers).
+    if (raft_cfg.seeds.len > 0 and store_cfg.kind.len == 0) {
+        std.log.err("--store is required when joining a cluster (seeds set): SSTs are distributed via the shared object store", .{});
+        std.process.exit(1);
+    }
+    if (std.mem.eql(u8, store_cfg.kind, "dir") and store_cfg.path.len == 0) {
+        std.log.err("--store kind=dir requires path", .{});
+        std.process.exit(1);
+    }
+    if (std.mem.eql(u8, store_cfg.kind, "s3") and
+        (store_cfg.s3_endpoint.len == 0 or store_cfg.s3_bucket.len == 0))
+    {
+        std.log.err("--store kind=s3 requires s3_endpoint and s3_bucket", .{});
+        std.process.exit(1);
+    }
+    if (store_cfg.kind.len > 0 and
+        !std.mem.eql(u8, store_cfg.kind, "dir") and
+        !std.mem.eql(u8, store_cfg.kind, "s3"))
+    {
+        std.log.err("--store kind must be '', 'dir', or 's3' (got '{s}')", .{store_cfg.kind});
         std.process.exit(1);
     }
 
@@ -301,6 +354,23 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     // Initialize VFS with bandwidth limit.
     zdb.vfs.VFS.initGlobal(.{ .bytes_per_sec = 1024 * 1024 * 1024 });
 
+    // The shared object store (SST distribution). `.none` on single node.
+    var store: zdb.vfs.FileStore = if (std.mem.eql(u8, store_cfg.kind, "dir"))
+        try zdb.vfs.FileStore.initDir(allocator, store_cfg.path)
+    else if (std.mem.eql(u8, store_cfg.kind, "s3"))
+        try zdb.vfs.FileStore.initS3(allocator, .{
+            .endpoint = store_cfg.s3_endpoint,
+            .bucket = store_cfg.s3_bucket,
+            .region = store_cfg.s3_region,
+            .prefix = store_cfg.s3_prefix,
+        })
+    else
+        .none;
+    defer store.deinit();
+    if (store != .none) log.info("file store: kind={s} path={s} s3={s}/{s}", .{
+        store_cfg.kind, store_cfg.path, store_cfg.s3_endpoint, store_cfg.s3_bucket,
+    });
+
     // Initialize global metrics before anything that might increment them.
     // zdb owns storage-layer metrics; raft owns its own propose-phase
     // histograms — they live in separate Metrics structs but both surface
@@ -327,6 +397,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
             .cluster_id = raft_cfg.cluster_id,
             .listen_addr = raft_addr,
             .tick_interval_ms = raft_cfg.tick_ms,
+            .has_file_store = store != .none,
         },
     );
     defer deinitWithLog("node", node);
@@ -335,9 +406,9 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 
     // Open zdb forest.
     log.info("opening forest at {s}", .{data_cfg.dir});
-    var forest = try zdb.forest.Forest.open(allocator, .{
-        .dir = data_cfg.dir,
-    });
+    var forest_opts = zdb.config.Config{ .dir = data_cfg.dir };
+    if (data_cfg.memtable_size > 0) forest_opts.memtable_size = @intCast(data_cfg.memtable_size);
+    var forest = try zdb.forest.Forest.open(allocator, forest_opts);
     defer {
         forest.close();
         log.info("deinit: forest done", .{});
@@ -347,7 +418,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     // The replicated storage engine: builds the apply state machine + raft
     // runtime, installs the SM on the node, and binds the forest's file-id
     // allocator to the node + WAL. Owns all that node/forest wiring.
-    const eng = try engine.Engine.open(allocator, node, forest, &wal, live_snapshot, raft_cfg.id);
+    const eng = try engine.Engine.open(allocator, node, forest, &wal, live_snapshot, raft_cfg.id, &store);
     defer deinitWithLog("engine", eng);
 
     // The admin protocol front-end over the engine.

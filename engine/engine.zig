@@ -25,6 +25,7 @@ pub const SnapshotCfg = struct {
 
 const zdb_bufs = zdb.buffers;
 const manifest = zdb.manifest;
+const fi = zdb.file_ids;
 const Forest = zdb.forest.Forest;
 const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
@@ -55,6 +56,10 @@ pub const StorageImpl = struct {
     forest: *Forest,
     allocator: std.mem.Allocator,
     node: *raft.Node,
+    /// The shared object store (SST distribution): the apply path downloads
+    /// files the manifest references but the local disk lacks. `.none` on
+    /// single node, where the local disk always has them.
+    store: *zdb.vfs.FileStore,
     /// Optional commit-stream hook (see ApplyObserver). Set once at startup
     /// via Engine.setApplyObserver, before the apply loop runs; the loop stops
     /// (eng.wait) before the observer's owner is torn down, so no unregister.
@@ -72,15 +77,23 @@ pub const StorageImpl = struct {
     /// `oldest_memtable_index` field (0 if no snapshot, equivalent to "no
     /// skipping"). Read-only after `recovery_done` flips, so no atomic.
     oldest_memtable_index: u64 = 0,
+    /// Per-file locks around ensureFileLocal: the announce prefetch,
+    /// apply loop, and recovery can chase the SAME file concurrently,
+    /// and two racing forest.writeFile calls trip the table cache's
+    /// double-install assert. Under the file's lock the loser's hasFile
+    /// re-check turns its download into a no-op — it waits for the
+    /// in-flight download instead of duplicating it — while DIFFERENT
+    /// files download in parallel. Mutexes are heap pointers (a by-value
+    /// mutex would move on rehash while parked on) and entries are never
+    /// removed (a parked waiter may hold the pointer): one tiny entry
+    /// per distinct file ever ensured.
+    file_locks: utils.SafeHashMap(u64, *fiber.Mutex(.untracked)),
 
     pub fn asStateMachine(self: *StorageImpl) raft.Node.StateMachine {
         return .{
             .ctx = @ptrCast(self),
             .applyFn = &applyEntry,
-            .writeFileFn = &writeFile,
-            .readFileFn = &readFile,
-            .hasFileFn = &hasFile,
-            .preAppendFn = &preAppend,
+            .ensureFilesFn = &ensureFiles,
             .isReadyFn = &isReady,
         };
     }
@@ -193,6 +206,15 @@ pub const StorageImpl = struct {
             self.allocator.destroy(mcs);
         }
 
+        // Backstop: every SST this change creates must be on local disk
+        // before the forest installs it. Normally the announce prefetch
+        // already pulled them; a store failure here errors out and the
+        // apply loop parks + retries (never loop internally).
+        // TODO: Switch to disk cache, so we can tolerate remote files.
+        for (mcs.sstable_changes) |sc| {
+            if (sc.op == .create) try self.ensureFileLocal(sc.sst_id);
+        }
+
         // TRACE: pinpoints which entry / cmd hangs the apply path. Last
         // "enter" without a matching "exit" is the wedge.
         log.info("applyManifestChange enter idx={d} cmd={t} mt={d} tcs={d}", .{
@@ -228,19 +250,97 @@ pub const StorageImpl = struct {
         }
     }
 
-    fn writeFile(ctx: *anyopaque, file_id: u64, data: []const u8) void {
+    /// StateMachine hook behind the announce prefetch: a peer announced
+    /// these ids are in the store; download whatever the local disk lacks.
+    fn ensureFiles(ctx: *anyopaque, file_ids: []const u64) anyerror!void {
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+        try self.ensureFilesLocal(file_ids);
+    }
+
+    /// Download every listed file, retrying each until it lands —
+    /// error.ShuttingDown is the only exit short of success, so a caller
+    /// that returns cleanly holds every file. A few workers pull ids off
+    /// a shared cursor, so distinct files download in parallel (same-file
+    /// chasers already serialize on file_locks). Behind both the announce
+    /// prefetch and snapshot recovery. A file another fiber fetched
+    /// meanwhile costs a no-op retry (ensureFileLocal re-checks hasFile
+    /// under the file's ensure lock), so a list that staled is harmless.
+    fn ensureFilesLocal(self: *StorageImpl, file_ids: []const u64) !void {
+        const workers = @min(file_ids.len, 3);
+        if (workers == 0) return;
+
+        var next = std.atomic.Value(usize).init(0);
+        var ensure_err: utils.SafeError = .{};
+        var g = fiber.Group(void).init(self.allocator);
+        // wait-in-defer: a failed spawn must still join the workers
+        // already running before `next`/`ensure_err` leave scope.
+        defer {
+            _ = g.wait();
+            g.deinit();
+        }
+        for (0..workers) |_| {
+            try g.spawn(.{}, ensureFileWorker, .{ self, file_ids, &next, &ensure_err });
+        }
+        _ = g.wait();
+        if (ensure_err.get()) |err| return err;
+    }
+
+    /// One ensureFilesLocal worker: pull the next id off the shared
+    /// cursor, ensure it (retrying until it lands), repeat until the
+    /// list drains or shutdown starts. Errors go to `err_out` — the
+    /// fiber.Group + SafeError idiom (see forest.buildFlush).
+    fn ensureFileWorker(
+        self: *StorageImpl,
+        file_ids: []const u64,
+        next: *std.atomic.Value(usize),
+        err_out: *utils.SafeError,
+    ) void {
+        while (true) {
+            const i = next.fetchAdd(1, .monotonic);
+            if (i >= file_ids.len) return;
+
+            var attempt: u64 = 1;
+            while (true) : (attempt += 1) {
+                if (self.node.isShuttingDown()) {
+                    err_out.set(error.ShuttingDown);
+                    return;
+                }
+                self.ensureFileLocal(file_ids[i]) catch |err| {
+                    log.warn("ensureFiles: file_id={d} attempt={d} failed: {s}; retrying", .{
+                        file_ids[i], attempt, @errorName(err),
+                    });
+                    fiber.sleepMs(1000);
+                    continue;
+                };
+                break;
+            }
+        }
+    }
+
+    /// Ensure one SST is on local disk, downloading it from the shared
+    /// object store if missing. Single attempt — callers retry (the apply
+    /// park-loop, ensureFilesLocal's per-file loop).
+    fn ensureFileLocal(self: *StorageImpl, file_id: u64) !void {
+        const fresh = try self.allocator.create(fiber.Mutex(.untracked));
+        fresh.* = .{};
+        const mu = try self.file_locks.getOrPut(file_id, fresh);
+        if (mu != fresh) self.allocator.destroy(fresh);
+        mu.lock(@src());
+        defer mu.unlock();
+
+        if (self.forest.hasFile(file_id)) return;
+
+        const name = try fi.sstPath(self.allocator, "", file_id);
+        defer self.allocator.free(name);
+
+        const data = try self.store.getAll(self.allocator, name);
+        defer self.allocator.free(data);
+
         self.forest.writeFile(file_id, data);
-    }
-
-    fn readFile(ctx: *anyopaque, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-        return self.forest.readFile(allocator, file_id);
-    }
-
-    fn hasFile(ctx: *anyopaque, file_id: u64) bool {
-        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-        return self.forest.hasFile(file_id);
+        std.log.scoped(.file_event).info(
+            "node={d} event=store_get file_id={d} bytes={d}",
+            .{ self.node.id, file_id, data.len },
+        );
     }
 
     /// Publish the result of recovery to the apply path: install the
@@ -252,45 +352,6 @@ pub const StorageImpl = struct {
     pub fn markRecovered(self: *StorageImpl, oldest_memtable_index: u64) void {
         self.oldest_memtable_index = oldest_memtable_index;
         self.recovery_done.store(true, .release);
-    }
-
-    /// Ensure all SST files referenced by ManifestChange entries are on disk
-    /// before the WAL append. Fetches missing files from the leader.
-    fn preAppend(ctx: *anyopaque, node: *raft.Node, entries: []const raft.buffers.LogEntryBuffer) void {
-        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-
-        // Collect missing file IDs across all entries.
-        var missing = std.ArrayList(u64).empty;
-        defer missing.deinit(self.allocator);
-
-        for (entries) |entry| {
-            const reader = entry.initReader() catch continue;
-            if (reader.entryType() != .manifest) continue;
-            const data = reader.data();
-            if (data.len == 0) continue;
-
-            const mc = zdb_bufs.ManifestChangeReader.parseRoot(data) catch continue;
-            const tc_len = mc.sstableChangesLen();
-            for (0..tc_len) |i| {
-                const tc = mc.sstableChangesAt(@intCast(i)) catch continue;
-                if (tc.op() == .create and !self.forest.hasFile(tc.sstId())) {
-                    missing.append(self.allocator, tc.sstId()) catch continue;
-                }
-            }
-        }
-
-        if (missing.items.len == 0) return;
-
-        log.info("preAppend: fetching {d} missing files from leader", .{missing.items.len});
-        while (true) {
-            node.fetchFiles(missing.items) catch |err| {
-                log.err("preAppend: fetchFiles failed: {s}, retrying", .{@errorName(err)});
-                fiber.sleepMs(100);
-                continue;
-            };
-            break;
-        }
-        log.info("preAppend: received {d} files from leader", .{missing.items.len});
     }
 };
 
@@ -343,6 +404,9 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
     forest: *Forest,
     node: *raft.Node,
+    /// The shared object store: new SSTs are uploaded here before their
+    /// manifest change is proposed (see uploadNewFiles).
+    store: *zdb.vfs.FileStore,
     /// The apply state machine (owned). Loops/handlers gate on
     /// `storage_impl.recovery_done` (and, for data mutations, on the forest
     /// also having a real memtable) so the SM is valid before any proposal.
@@ -400,6 +464,7 @@ pub const Engine = struct {
         wal: *raft.DiskWAL,
         snapshot_cfg: *flags.Live(SnapshotCfg),
         raft_node_id: u64,
+        store: *zdb.vfs.FileStore,
     ) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
@@ -407,7 +472,14 @@ pub const Engine = struct {
             .allocator = allocator,
             .forest = forest,
             .node = node,
-            .storage_impl = .{ .forest = forest, .allocator = allocator, .node = node },
+            .store = store,
+            .storage_impl = .{
+                .forest = forest,
+                .allocator = allocator,
+                .node = node,
+                .store = store,
+                .file_locks = utils.SafeHashMap(u64, *fiber.Mutex(.untracked)).init(allocator),
+            },
             .sm = undefined,
             .raft_rt = raft.RaftRuntime.init(allocator, node),
             .snapshot_cfg = snapshot_cfg,
@@ -433,6 +505,12 @@ pub const Engine = struct {
         self.compacting_trees.deinit();
         self.compacting_mu.unlock();
         self.in_flight_mu.deinit();
+        var lock_it = self.storage_impl.file_locks.valueIterator();
+        while (lock_it.next()) |mu| {
+            mu.*.deinit();
+            self.allocator.destroy(mu.*);
+        }
+        self.storage_impl.file_locks.deinit();
         self.compacting_mu.deinit();
         self.flush_split_mu.deinit();
         self.bg.deinit();
@@ -685,19 +763,16 @@ pub const Engine = struct {
         try self.forest.ms.restoreFrom(snap.data);
         oldest_idx = snap.oldest_memtable_index;
 
-        // Fetch any missing SSTs from the leader. Retry until empty or
-        // shutdown — fetchFiles errors when leader_id is unknown, which
-        // resolves once raft elects/learns one.
-        while (!self.node.isShuttingDown()) {
-            const missing = try self.forest.collectMissingFileIds(self.allocator);
-            defer self.allocator.free(missing);
-            if (missing.len == 0) break;
-            log.info("recovery: fetching {d} missing SST files from leader", .{missing.len});
-            self.node.fetchFiles(missing) catch |err| {
-                log.warn("recovery: fetchFiles failed ({s}); retrying in 200 ms", .{@errorName(err)});
-                fiber.sleepMs(200);
-                continue;
-            };
+        // Download every missing SST from the shared object store before
+        // proceeding — opening a partial forest would start a node with
+        // holes in its data. ensureFilesLocal retries each file until it
+        // lands; its only other exit, error.ShuttingDown, propagates and
+        // aborts startup instead of falling through.
+        const missing = try self.forest.collectMissingFileIds(self.allocator);
+        defer self.allocator.free(missing);
+        if (missing.len > 0) {
+            log.info("recovery: fetching {d} missing SST files from the store", .{missing.len});
+            try self.storage_impl.ensureFilesLocal(missing);
         }
 
         try self.forest.openTablesFromManifest();
@@ -1099,15 +1174,41 @@ pub const Engine = struct {
         try self.node.proposeAndWaitForApply(payload, .manifest);
     }
 
-    /// Send new SST files to peers and wait for quorum acks.
-    fn distributeNewFiles(self: *Engine, changes: []const manifest.SSTableChange) !void {
+    /// Distribute new SST files, BEFORE their manifest change is proposed:
+    /// upload each `.create` to the shared object store, then announce the
+    /// ids to all peers and wait until a quorum has downloaded them (batch
+    /// acks). Consensus on the entry then implies the files are fetchable,
+    /// and the announce prefetch means the entry usually lands on followers
+    /// that already hold the files — apply never stalls. Apply-time store
+    /// fetch remains the backstop. No-op without a store (single node:
+    /// joins are rejected without one, so peers imply a store). Pub: SST
+    /// creators outside the engine (sql index backfill) call it too.
+    pub fn distributeNewFiles(self: *Engine, changes: []const manifest.SSTableChange) !void {
+        if (self.store.* == .none) return;
+        const fe = std.log.scoped(.file_event);
         var file_ids = std.ArrayList(u64).empty;
         defer file_ids.deinit(self.allocator);
         for (changes) |c| {
-            if (c.op == .create) try file_ids.append(self.allocator, c.sst_id);
+            if (c.op != .create) continue;
+
+            try file_ids.append(self.allocator, c.sst_id);
+            const name = try fi.sstPath(self.allocator, "", c.sst_id);
+            defer self.allocator.free(name);
+
+            // Retried proposes and splits re-reference already-uploaded ids.
+            if (try self.store.exists(name)) continue;
+
+            const data = self.forest.readFile(self.allocator, c.sst_id) orelse return error.FileNotFound;
+            defer self.allocator.free(data);
+
+            try self.store.put(name, data);
+            fe.info("node={d} event=store_put file_id={d} bytes={d}", .{ self.node.id, c.sst_id, data.len });
         }
         if (file_ids.items.len == 0) return;
-        try self.node.sendAndWaitForFileQuorum(file_ids.items);
+        // One durability barrier for the whole batch (put syncs bytes;
+        // this syncs the names) before peers are told to fetch.
+        try self.store.sync();
+        try self.node.announceAndWaitForFileQuorum(file_ids.items);
     }
 
     /// L0 backpressure: sleep proportional to how many L0 tables the

@@ -1123,6 +1123,9 @@ const Handler = struct {
         var changes =
             try eng.forest.buildBottomTable(a, ns, index_tid, items.items);
         defer changes.deinit(a);
+        // Upload + announce the backfill SSTs before proposing, like every
+        // other SST creator — followers download from the shared store.
+        try eng.distributeNewFiles(changes.items);
         try eng.proposeMC(.{
             .cmd = .index_backfill,
             .sstable_changes = changes.items,

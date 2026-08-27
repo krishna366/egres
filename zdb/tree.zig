@@ -543,7 +543,7 @@ pub const TableCache = struct {
         // Phase 2: open misses concurrently. Each fiber writes to need.table
         // and bumps `completed` on return; the watchdog uses that to log
         // periodic progress if the group hangs.
-        var tse: utils.ThreadSafeError = .{};
+        var tse: utils.SafeError = .{};
         var completed = std.atomic.Value(usize).init(0);
         const total = misses.items.len;
         var g = fiber.Group(void).init(self.allocator);
@@ -579,7 +579,7 @@ pub const TableCache = struct {
     fn openFiber(
         self: *TableCache,
         need: *TableNeed,
-        tse: *utils.ThreadSafeError,
+        tse: *utils.SafeError,
         completed: *std.atomic.Value(usize),
     ) void {
         defer _ = completed.fetchAdd(1, .release);

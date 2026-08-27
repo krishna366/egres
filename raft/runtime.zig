@@ -119,6 +119,12 @@ pub fn joinCluster(
 
             const reason = reader.reasonCode();
             log.info("joinCluster: rejected by {s}, reason={d}", .{ target, reason });
+            // Terminal rejection — the cluster has no shared file store, so
+            // retrying can never succeed until the leader restarts with one.
+            if (reason == node_mod.Node.JoinReason.no_file_store) {
+                log.err("joinCluster: cluster has no file store (--store); cannot join", .{});
+                return error.NoFileStore;
+            }
             if (reason == node_mod.Node.JoinReason.not_leader) {
                 const leader_addr = reader.leaderAddr();
                 if (leader_addr.len > 0) {
