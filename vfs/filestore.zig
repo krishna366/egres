@@ -14,6 +14,7 @@ const std = @import("std");
 const fiber = @import("zfiber");
 const vfs = @import("vfs.zig");
 const s3_mod = @import("s3.zig");
+const lookahead_mod = @import("lookahead.zig");
 
 pub const S3Config = s3_mod.S3Config;
 
@@ -105,6 +106,27 @@ pub const FileStore = union(enum) {
         defer obj.close();
         return obj.read(a, 0, obj.size());
     }
+
+    /// Measure the ideal readahead for this store endpoint (see
+    /// lookahead.calibrate): the size whose transfer time equals the
+    /// per-request fixed cost — a network round trip for s3, syscall +
+    /// device latency for dir.
+    pub fn calibrateLookahead(self: *FileStore, block_size: u64) !u64 {
+        switch (self.*) {
+            .none => return 0,
+            .dir => |*d| return d.calibrateLookahead(block_size),
+            .s3 => |*s| return s.calibrateLookahead(block_size),
+        }
+    }
+
+    /// The calibrated readahead in bytes; 0 = none needed/uncalibrated.
+    pub fn lookahead(self: *const FileStore) u64 {
+        switch (self.*) {
+            .none => return 0,
+            .dir => |*d| return d.lookahead,
+            .s3 => |*s| return s.lookahead,
+        }
+    }
 };
 
 /// A readable object: open once, read many ranges. Mirrors the shape of
@@ -152,6 +174,9 @@ const S3Object = struct {
 pub const DirStore = struct {
     a: std.mem.Allocator,
     depot: []const u8,
+    /// calibrateLookahead at startup. 0 = uncalibrated. Not consumed yet —
+    /// tiered reads will size their readahead from it.
+    lookahead: u64 = 0,
 
     pub fn init(a: std.mem.Allocator, depot: []const u8) !DirStore {
         const tmp_dir = try std.fmt.allocPrint(a, "{s}/tmp", .{depot});
@@ -168,7 +193,7 @@ pub const DirStore = struct {
         return std.fmt.allocPrint(self.a, "{s}/{s}", .{ self.depot, name });
     }
 
-    fn put(self: *DirStore, name: []const u8, data: []const u8) !void {
+    pub fn put(self: *DirStore, name: []const u8, data: []const u8) !void {
         // O_DIRECT requires it, and every legit caller already complies
         // (the SST builder pads + aligns its output; forest.readFile
         // returns page-aligned reads) — reject rather than bounce.
@@ -229,6 +254,76 @@ pub const DirStore = struct {
 
         const sz = (try f.stat()).size;
         return .{ .dir = .{ .f = f, .sz = sz } };
+    }
+
+    /// Object size in bytes; errors if absent.
+    pub fn head(self: *DirStore, name: []const u8) !u64 {
+        const path = try self.objectPath(name);
+        defer self.a.free(path);
+        return vfs.fileSize(path);
+    }
+
+    /// Measure this depot's ideal readahead (policy in vfs/lookahead.zig;
+    /// this store contributes probeRead and the object ops) and record it
+    /// in `lookahead`. Meaningful locally too: the knee is device latency
+    /// × device bandwidth (~100s of KB on NVMe) instead of network round
+    /// trip × link bandwidth (~MBs).
+    pub fn calibrateLookahead(self: *DirStore, block_size: u64) !u64 {
+        self.lookahead = try lookahead_mod.calibrate(self.a, self, block_size);
+        return self.lookahead;
+    }
+
+    /// One timed ranged read of the probe object — the disk analog of
+    /// s3's timed ranged GET, and the measurement primitive behind
+    /// lookahead.calibrate. Same contract as the s3 probe: total_ns =
+    /// end-to-end cost of a production read of this size (one pread, its
+    /// own fixed cost included), ttfb_ns = a sample of the fixed
+    /// per-request cost alone. A positional read has no observable
+    /// "first byte" mid-syscall, so the fixed cost is sampled as its OWN
+    /// single-page pread at an unrelated offset — splitting the main
+    /// read instead would charge every probe two serial device round
+    /// trips that production reads never pay. Opened O_DIRECT so the
+    /// page cache can't serve repeats and turn the numbers into memory
+    /// bandwidth.
+    pub fn probeRead(self: *DirStore, off: u64, len: u64) !lookahead_mod.Probe {
+        const path = try self.objectPath(lookahead_mod.probe_object);
+        defer self.a.free(path);
+        // O_DIRECT needs page-aligned offset/length/buffer; align the
+        // request itself — any aligned window of ~len bytes probes
+        // equally well.
+        const a_off = off & ~@as(u64, vfs.page_size - 1);
+        const a_len: usize = std.mem.alignForward(usize, @intCast(@max(len, vfs.page_size)), vfs.page_size);
+        const buf = try self.a.alignedAlloc(u8, vfs.page_alignment, a_len);
+        defer self.a.free(buf);
+
+        const f = fiber.File.fromFd(try vfs.openDirect(path, .{ .mode = .direct }));
+        defer f.close();
+        const fsize = (try f.stat()).size;
+        if (a_off + a_len > fsize) return error.ShortRead;
+
+        // The fixed-cost page: hashed from the (already random) offset so
+        // repeats can't sit in one device cache slot, dodged out of the
+        // main window so it can't pre-warm the ranged read.
+        const pages = fsize / vfs.page_size;
+        var page_off = ((off *% 0x9E3779B97F4A7C15) % pages) * vfs.page_size;
+        if (page_off >= a_off and page_off < a_off + a_len) {
+            page_off = ((page_off + a_len) / vfs.page_size % pages) * vfs.page_size;
+        }
+        const t0 = lookahead_mod.nowNs();
+        if (try f.read(buf[0..vfs.page_size], page_off) != vfs.page_size) return error.ShortRead;
+        const fixed_ns = lookahead_mod.nowNs() - t0;
+        if (!lookahead_mod.verifyProbeData(page_off, buf[0..vfs.page_size])) return error.BadProbeData;
+
+        const t1 = lookahead_mod.nowNs();
+        var got: usize = 0;
+        while (got < a_len) {
+            const n = try f.read(buf[got..], a_off + got);
+            if (n == 0) return error.ShortRead;
+            got += n;
+        }
+        const total = lookahead_mod.nowNs() - t1;
+        if (!lookahead_mod.verifyProbeData(a_off, buf)) return error.BadProbeData;
+        return .{ .size = a_len, .ttfb_ns = fixed_ns, .total_ns = total };
     }
 };
 

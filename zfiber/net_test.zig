@@ -1,5 +1,6 @@
 const std = @import("std");
 const fiber = @import("zfiber");
+const testing = std.testing;
 
 const loopback: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
 
@@ -400,4 +401,33 @@ test "net.tcp: connect to an unused port fails" {
     var h = try fiber.spawn(.{}, Ctx.run, .{&ctx});
     h.join();
     try std.testing.expect(!connected);
+}
+
+test "net: parseEndpoint splits scheme/host/port" {
+    // Scheme decides TLS and the default port.
+    const b2 = try fiber.net.parseEndpoint("https://s3.us-east-005.backblazeb2.com");
+    try testing.expectEqualStrings("s3.us-east-005.backblazeb2.com", b2.host);
+    try testing.expectEqual(@as(u16, 443), b2.port);
+    try testing.expect(b2.tls);
+
+    const seaweed = try fiber.net.parseEndpoint("http://127.0.0.1:8333");
+    try testing.expectEqualStrings("127.0.0.1", seaweed.host);
+    try testing.expectEqual(@as(u16, 8333), seaweed.port);
+    try testing.expect(!seaweed.tls);
+
+    // Explicit port on https; bracketed IPv6 with and without port.
+    const alt = try fiber.net.parseEndpoint("https://minio.internal:9000");
+    try testing.expectEqual(@as(u16, 9000), alt.port);
+    const v6 = try fiber.net.parseEndpoint("http://[::1]:8333");
+    try testing.expectEqualStrings("::1", v6.host);
+    try testing.expectEqual(@as(u16, 8333), v6.port);
+    const v6d = try fiber.net.parseEndpoint("http://[fe80::1]");
+    try testing.expectEqualStrings("fe80::1", v6d.host);
+    try testing.expectEqual(@as(u16, 80), v6d.port);
+
+    // The scheme is required (it carries the TLS decision); garbage rejects.
+    try testing.expectError(error.BadEndpoint, fiber.net.parseEndpoint("127.0.0.1:8333"));
+    try testing.expectError(error.BadEndpoint, fiber.net.parseEndpoint("https://"));
+    try testing.expectError(error.BadEndpoint, fiber.net.parseEndpoint("http://host:notaport"));
+    try testing.expectError(error.BadEndpoint, fiber.net.parseEndpoint("http://[::1"));
 }

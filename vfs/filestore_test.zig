@@ -60,6 +60,39 @@ test "filestore: dir backend put/get/exists/delete round-trip" {
     try testing.expect(!try store.exists("0001_000000000001.sst"));
 }
 
+test "filestore: dir probeRead times an O_DIRECT ranged read" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpPath(alloc, &tmp);
+    defer alloc.free(root);
+    const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
+    defer alloc.free(depot);
+
+    var store = try vfs.FileStore.initDir(alloc, depot);
+    defer store.deinit();
+
+    // A small probe-patterned object (position-dependent bytes from 0);
+    // page-aligned because put writes O_DIRECT.
+    const data = try alloc.alignedAlloc(u8, vfs.page_alignment, 64 << 10);
+    defer alloc.free(data);
+    for (data, 0..) |*b, i| b.* = vfs.lookahead.probeByte(i);
+    try store.put(vfs.lookahead.probe_object, data);
+
+    // Unaligned request: offset rounds down to a page boundary, the
+    // window keeps its length; both timings are real (the fixed-cost
+    // page and the ranged read are separate preads, so no ordering
+    // between them is guaranteed).
+    const p = try store.dir.probeRead(5000, 8192);
+    try testing.expectEqual(@as(u64, 8192), p.size);
+    try testing.expect(p.ttfb_ns > 0 and p.total_ns > 0);
+
+    // A probe object holding the wrong bytes must fail verification.
+    @memset(data, 0);
+    try store.put(vfs.lookahead.probe_object, data);
+    try testing.expectError(error.BadProbeData, store.dir.probeRead(0, 4096));
+}
+
 test "filestore: none backend refuses every op" {
     var store: vfs.FileStore = .none;
     defer store.deinit();

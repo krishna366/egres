@@ -24,6 +24,9 @@ const xev = @import("xev");
 const fb = @import("fiber.zig");
 const rt = @import("runtime.zig");
 const fsops = @import("fsops.zig");
+const context = @import("context.zig");
+
+const net_log = std.log.scoped(.net);
 
 const Fiber = fb.Fiber;
 const Sionet = std.Io.net;
@@ -74,6 +77,181 @@ fn socketShutdown(fd: Sionet.Socket.Handle, how: ShutdownHow) !void {
 }
 
 // ───────────────────────── IpAddress ─────────────────────────
+
+/// An endpoint URL split into its parts (see `parseEndpoint`).
+pub const Endpoint = struct {
+    host: []const u8,
+    port: u16,
+    tls: bool,
+};
+
+/// Parse `http://host[:port]` / `https://host[:port]`. The scheme is
+/// required — it carries the TLS decision and the default port (80/443).
+/// The host may be a DNS name, an IPv4 literal, or a bracketed IPv6
+/// literal (`http://[::1]:8333`). Slices point into `url`.
+pub fn parseEndpoint(url: []const u8) error{BadEndpoint}!Endpoint {
+    var rest: []const u8 = undefined;
+    var tls: bool = undefined;
+    if (std.mem.startsWith(u8, url, "http://")) {
+        rest = url["http://".len..];
+        tls = false;
+    } else if (std.mem.startsWith(u8, url, "https://")) {
+        rest = url["https://".len..];
+        tls = true;
+    } else return error.BadEndpoint;
+
+    var host = rest;
+    var port: u16 = if (tls) 443 else 80;
+    if (rest.len > 0 and rest[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return error.BadEndpoint;
+        host = rest[1..close];
+
+        const after = rest[close + 1 ..];
+        if (after.len > 0) {
+            if (after[0] != ':') return error.BadEndpoint;
+            port = std.fmt.parseInt(u16, after[1..], 10) catch return error.BadEndpoint;
+        }
+    } else if (std.mem.lastIndexOfScalar(u8, rest, ':')) |colon| {
+        host = rest[0..colon];
+        port = std.fmt.parseInt(u16, rest[colon + 1 ..], 10) catch return error.BadEndpoint;
+    }
+    if (host.len == 0) return error.BadEndpoint;
+    return .{ .host = host, .port = port, .tls = tls };
+}
+
+/// Resolve `host` — an IP literal or a DNS name — to a dialable address.
+/// Parse-first, so hex-y IPv6 literals are never mistaken for names; DNS
+/// otherwise, with the blocking lookup offloaded to the fsops pool — the
+/// calling fiber parks, its worker thread keeps running other fibers.
+pub fn resolveHost(host: []const u8, port: u16) !IpAddress {
+    if (std.Io.net.IpAddress.parse(host, port)) |addr| {
+        return .{ .inner = addr };
+    } else |_| {}
+
+    return fsops.run(lookupHost, .{ host, port });
+}
+
+/// The blocking half of `resolveHost`: runs on a pool thread.
+fn lookupHost(host: []const u8, port: u16) !IpAddress {
+    const io = fsops.io();
+    const name = std.Io.net.HostName.init(host) catch return error.BadHostName;
+    var results: [16]std.Io.net.HostName.LookupResult = undefined;
+    var q = std.Io.Queue(std.Io.net.HostName.LookupResult).init(&results);
+    try name.lookup(io, &q, .{ .port = port });
+    while (q.getOne(io) catch null) |res| switch (res) {
+        .address => |addr| return .{ .inner = addr },
+        .canonical_name => {},
+    };
+    return error.UnknownHostName;
+}
+
+// ──────────────────────── Client connection ────────────────────────
+
+/// One client connection: the TCP stream plus its persistent buffered
+/// reader/writer — and, under TLS, the session state (handshake done
+/// once at connect, reused for the connection's lifetime). Heap-
+/// allocated and never moved: the std.Io reader/writer interfaces are
+/// address-sensitive. All socket I/O — TLS records included — flows
+/// through the fiber Stream (fibers park; worker threads never block).
+pub const Conn = struct {
+    stream: Stream,
+    tls: ?*TlsConn,
+    plain_rbuf: [4096]u8,
+    plain_wbuf: [4096]u8,
+    stream_reader: Stream.Reader,
+    stream_writer: Stream.Writer,
+
+    const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
+
+    const TlsConn = struct {
+        sock_rbuf: [tls_buf_len]u8,
+        sock_wbuf: [tls_buf_len]u8,
+        read_buf: [tls_buf_len]u8,
+        write_buf: [tls_buf_len]u8,
+        // Handshake entropy (240B): a field rather than a fiber-stack
+        // local — this struct is heap anyway, and fiber stacks are kept
+        // for small scratch only.
+        entropy: [std.crypto.tls.Client.Options.entropy_len]u8,
+        stream_reader: Stream.Reader,
+        stream_writer: Stream.Writer,
+        client: std.crypto.tls.Client,
+    };
+
+    /// TLS parameters for `connect`. Trust roots are CALLER-owned: the
+    /// runtime dials and handshakes, but when to load or refresh a CA
+    /// bundle is application policy.
+    pub const TlsOptions = struct {
+        /// Server name — SNI + certificate verification.
+        host: []const u8,
+        ca_bundle: *std.crypto.Certificate.Bundle,
+        ca_lock: *std.Io.RwLock,
+    };
+
+    /// Dial `addr` and, when `tls_opts` is set, complete the TLS
+    /// handshake before returning.
+    pub fn connect(a: std.mem.Allocator, addr: IpAddress, tls_opts: ?TlsOptions) !*Conn {
+        const stream = try addr.connect(.{});
+        errdefer stream.close();
+        const conn = try a.create(Conn);
+        errdefer a.destroy(conn);
+        conn.stream = stream;
+        conn.tls = null;
+        if (tls_opts) |opts| {
+            const t = try a.create(TlsConn);
+            errdefer a.destroy(t);
+            t.stream_reader = stream.reader(&t.sock_rbuf);
+            t.stream_writer = stream.writer(&t.sock_wbuf);
+            const io = context.g().io;
+            io.random(&t.entropy);
+            t.client = std.crypto.tls.Client.init(
+                &t.stream_reader.interface,
+                &t.stream_writer.interface,
+                .{
+                    .host = .{ .explicit = opts.host },
+                    .ca = .{ .bundle = .{
+                        .gpa = a,
+                        .io = io,
+                        .lock = opts.ca_lock,
+                        .bundle = opts.ca_bundle,
+                    } },
+                    .write_buffer = &t.write_buf,
+                    .read_buffer = &t.read_buf,
+                    .entropy = &t.entropy,
+                    .realtime_now = std.Io.Timestamp.now(io, .real),
+                },
+            ) catch |err| {
+                net_log.err("tls handshake with {s} failed: {s}", .{ opts.host, @errorName(err) });
+                return error.TlsHandshakeFailed;
+            };
+            conn.tls = t;
+        } else {
+            conn.stream_reader = stream.reader(&conn.plain_rbuf);
+            conn.stream_writer = stream.writer(&conn.plain_wbuf);
+        }
+        return conn;
+    }
+
+    pub fn rd(self: *Conn) *std.Io.Reader {
+        return if (self.tls) |t| &t.client.reader else &self.stream_reader.interface;
+    }
+
+    pub fn wr(self: *Conn) *std.Io.Writer {
+        return if (self.tls) |t| &t.client.writer else &self.stream_writer.interface;
+    }
+
+    /// Flush through every layer down to the socket (the TLS writer
+    /// drains records into the stream writer, which buffers too).
+    pub fn flushAll(self: *Conn) !void {
+        try self.wr().flush();
+        if (self.tls) |t| try t.stream_writer.interface.flush();
+    }
+
+    pub fn deinit(self: *Conn, a: std.mem.Allocator) void {
+        self.stream.close();
+        if (self.tls) |t| a.destroy(t);
+        a.destroy(self);
+    }
+};
 
 pub const IpAddress = struct {
     inner: std.Io.net.IpAddress,

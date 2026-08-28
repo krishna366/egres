@@ -8,6 +8,7 @@ pub const filestore = @import("filestore.zig");
 pub const FileStore = filestore.FileStore;
 pub const sigv4 = @import("sigv4.zig");
 pub const s3 = @import("s3.zig");
+pub const lookahead = @import("lookahead.zig");
 
 inline fn fdToFile(fd: posix.fd_t) std.Io.File {
     return .{ .handle = fd, .flags = .{ .nonblocking = false } };
@@ -480,7 +481,10 @@ pub fn syncDir(path: []const u8) void {
 // These are convenience wrappers for test setup / small-file scenarios.
 // For SST-style I/O, use `VFS.openFile` / `VFS.createFile` + `FileHandle`.
 
-/// Create (truncating if it exists) and write `data` in one shot.
+/// Create (truncating if it exists), write `data` in one shot, and fsync:
+/// whole-file writers want the bytes durable, not dirty page cache — the
+/// dir store renames these into place as upload targets, and a rename
+/// must never expose a name whose data could still be lost.
 pub fn writeFile(path: []const u8, data: []const u8) !void {
     const f = try fiber.Dir.cwd().createFile(path, .{});
     defer f.close();
@@ -488,6 +492,7 @@ pub fn writeFile(path: []const u8, data: []const u8) !void {
     while (off < data.len) {
         off += try f.write(data[off..], off);
     }
+    try f.sync(.{});
 }
 
 /// Open and read the whole file. Caller owns the returned buffer.
@@ -549,7 +554,9 @@ pub fn iterateDir(path: []const u8) !DirIter {
 ///
 /// Takes `FileOptions` rather than expanding into one parameter per flag
 /// so this function's signature stays stable as new flags are added.
-fn openDirect(path: []const u8, opts: FileOptions) !posix.fd_t {
+/// Pub for the dir store's calibration probe reads, which need O_DIRECT
+/// without a FileHandle's bandwidth accounting.
+pub fn openDirect(path: []const u8, opts: FileOptions) !posix.fd_t {
     const direct_io = opts.mode == .direct;
     const accmode: posix.ACCMODE = if (opts.flags.writable) .RDWR else .RDONLY;
     var flags: posix.O = .{ .ACCMODE = accmode };

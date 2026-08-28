@@ -89,7 +89,7 @@ const StoreCfg = struct {
         .self = "Shared object store for SST distribution (multi-node).",
         .kind = "Backend: '' (none, single-node only), 'dir' (shared write-once depot directory, e.g. an NFS mount), or 's3' (S3-compatible store; creds via AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).",
         .path = "Depot directory when kind=dir.",
-        .s3_endpoint = "S3 endpoint as an ip:port literal (plain HTTP), e.g. 127.0.0.1:8333.",
+        .s3_endpoint = "S3 endpoint URL: http://host[:port] or https://host[:port]. The scheme decides TLS; host may be a DNS name or IP literal. E.g. https://s3.us-east-005.backblazeb2.com or http://127.0.0.1:8333.",
         .s3_bucket = "Bucket name when kind=s3.",
         .s3_region = "SigV4 signing region when kind=s3.",
         .s3_prefix = "Optional key prefix inside the bucket (unreserved URI characters only).",
@@ -370,6 +370,14 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     if (store != .none) log.info("file store: kind={s} path={s} s3={s}/{s}", .{
         store_cfg.kind, store_cfg.path, store_cfg.s3_endpoint, store_cfg.s3_bucket,
     });
+    // Size the future read-lookahead to this endpoint's latency knee.
+    // Non-fatal: a probe hiccup shouldn't block boot; lookahead stays 0.
+    if (store != .none) {
+        const block_size = (zdb.config.Config{}).block_size;
+        _ = store.calibrateLookahead(block_size) catch |err| {
+            log.warn("store lookahead calibration failed: {s}", .{@errorName(err)});
+        };
+    }
 
     // Initialize global metrics before anything that might increment them.
     // zdb owns storage-layer metrics; raft owns its own propose-phase

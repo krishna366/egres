@@ -158,7 +158,7 @@ JSON
     sleep 3
     echo "s3.bucket.create -name egres" | weed shell >/dev/null 2>&1 || true
     export AWS_ACCESS_KEY_ID=egreskey AWS_SECRET_ACCESS_KEY=egressecret
-    run_cluster --store="kind=s3;s3_endpoint=127.0.0.1:8333;s3_bucket=egres"
+    run_cluster --store="kind=s3;s3_endpoint=http://127.0.0.1:8333;s3_bucket=egres"
     kill -TERM "$WEED_PID" 2>/dev/null || true
     wait "$WEED_PID" 2>/dev/null || true
     rm -rf "$SEAWEED_DIR"
