@@ -94,6 +94,16 @@ pub const PhysicalSchema = struct {
         return null;
     }
 
+    /// Index of `column_id` in `columns` — which is also its cell index
+    /// when decoding with an empty projection, the form row.readCell and
+    /// the SQL layer's filters index by. Callers pass ids taken from
+    /// this schema's own table, so absence is a bug, not a miss (`find`
+    /// is the nullable lookup).
+    pub fn index(self: *const PhysicalSchema, column_id: u32) usize {
+        for (self.columns, 0..) |c, i| if (c.column_id == column_id) return i;
+        unreachable;
+    }
+
     pub fn deinit(self: *PhysicalSchema, alloc: std.mem.Allocator) void {
         alloc.free(self.columns);
     }

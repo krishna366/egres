@@ -169,6 +169,16 @@ pub const Txn = struct {
         self.cur.ran_scan = true;
     }
 
+    /// The current statement read `key` outside `lookup` — the
+    /// posting-bitmap path records the INDEX key here: any commit that
+    /// changes the key's membership writes a posting delta under this
+    /// exact key (bumping its oracle floor), so one identity hash
+    /// revalidates the whole result set on a later bump. Phantom-free,
+    /// unlike a scan.
+    pub fn recordRead(self: *Txn, key: Key) !void {
+        try self.cur.reads.append(self.allocator, key.identityHash());
+    }
+
     /// Release every held row lock NOW — the abort path. Idempotent;
     /// deinit calls it too. Failing txns release immediately (a deadlock
     /// victim holding its locks until the client's ROLLBACK would keep
@@ -424,7 +434,7 @@ pub const Txn = struct {
     /// own lock, so revalidation can never falsely abort on them.
     pub fn lookup(self: *Txn, key: Key) !?Found {
         std.debug.assert(key.namespace == self.ns);
-        try self.cur.reads.append(self.allocator, key.identityHash());
+        try self.recordRead(key);
         if (self.writes) |w| {
             if (w.get(key)) |item| {
                 if (item.meta.isDeleted()) return null;

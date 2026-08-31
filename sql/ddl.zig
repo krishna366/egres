@@ -1,733 +1,754 @@
-//! DDL parsing: SQL text → a small typed `DdlStmt`, via libpg_query (reused
-//! from pgwire). Only the statements the store can execute are recognized;
-//! everything else (SELECT/INSERT/…) maps to `.unsupported`. A statement we
-//! recognize but must reject (unsupported type, constraint, …) maps to
-//! `.invalid` carrying the client-facing reason — parse succeeded, this is
-//! a semantic rejection. Syntax errors propagate as ParseError so the
-//! endpoint can answer with a 42601.
+//! DDL execution: CREATE/DROP DATABASE, TABLE and INDEX. Each is a
+//! choreography over the forest's manifest (name reservation, tree
+//! creation, catalog rows) replicated through raft — the data plane
+//! proper lives in dml.zig. CREATE INDEX also runs the online backfill
+//! that fills a fresh index tree from the base table.
 //!
-//! `parseDdl` takes an arena and returns a `DdlStmt` whose every string
-//! and slice BORROWS from it — parse allocates the libpg_query tree into
-//! the arena and the statement points straight into it; nothing is duped
-//! or individually freed. The statement is valid only while the arena
-//! lives, and the caller drops the arena when the statement is done.
+//! These take `*Handler` rather than being its methods: Zig keeps a
+//! struct's methods in one file, and the handler's DDL half is its own
+//! concern from its session/txn half.
 
 const std = @import("std");
+const engine = @import("engine");
 const pgwire = @import("pgwire");
-const parser = pgwire.parser_mod;
+const zdb = @import("zdb");
+const zen = zdb.buffers;
+
+const catalog = @import("catalog.zig");
+const parse = @import("parse.zig");
+const key = @import("key.zig");
+const row = @import("row.zig");
+const schema = @import("schema.zig");
+const table = @import("table.zig");
 const value = @import("value.zig");
+const server = @import("server.zig");
 
+const Handler = server.Handler;
 const String = value.String;
+const log = std.log.scoped(.sql);
+const replyError = server.replyError;
+const replyErrorCode = server.replyErrorCode;
+const replyLockErr = server.replyLockErr;
+const default_database = server.default_database;
 
-/// One parsed `name type [PRIMARY KEY]` column. `name` is borrowed.
-pub const ColumnDef = struct {
-    name: []const u8,
-    ty: value.Type,
-    pkey: bool = false,
-};
+pub fn createDatabase(self: *Handler, state: *pgwire.ConnState, name: []const u8) !void {
+    const eng = self.srv.engine;
+    self.srv.ddl_mu.lock(@src());
+    defer self.srv.ddl_mu.unlock();
+    if (!try self.ddlReady(state)) return;
 
-pub const CreateTable = struct {
-    name: []const u8, // table name (borrowed)
-    if_not_exists: bool = false,
-    columns: []ColumnDef, // borrowed (and each column name)
-};
-
-pub const DropTable = struct {
-    name: []const u8, // table name (borrowed)
-    missing_ok: bool = false, // IF EXISTS
-};
-
-pub const CreateIndex = struct {
-    name: ?String, // borrowed; null = derive "{table}_{column}_idx"
-    table: String, // borrowed
-    column: String, // borrowed
-    if_not_exists: bool = false,
-};
-
-pub const DropIndex = struct {
-    name: String, // index name (borrowed)
-    missing_ok: bool = false, // IF EXISTS
-};
-
-/// One VALUES cell, still untyped: coerced to its column's Type at execute
-/// (value.parseValue). `str`/`float` borrow their bytes. `unsupported` is a
-/// non-literal item (DEFAULT, an expression) the executor rejects.
-pub const Literal = union(enum) {
-    int: i64,
-    float: []const u8, // borrowed; libpg_query keeps floats as text
-    str: []const u8, // borrowed
-    bool_: bool,
-    null_value,
-    unsupported,
-};
-
-pub const Insert = struct {
-    table: []const u8, // borrowed
-    columns: ?[][]const u8, // borrowed target columns; null = positional (all columns)
-    rows: [][]Literal, // borrowed rows of literals
-};
-
-/// What a SELECT projects: `*` (all live columns) or a named list (which may
-/// include the `egid` pseudo-column). Names are borrowed.
-pub const Projection = union(enum) {
-    star,
-    columns: [][]const u8,
-};
-
-/// A single `column = literal` filter (the only WHERE this slice supports).
-pub const Filter = struct {
-    column: []const u8, // borrowed
-    literal: Literal,
-};
-
-pub const Select = struct {
-    table: []const u8, // borrowed
-    projection: Projection,
-    filter: ?Filter,
-    /// FOR UPDATE: lock every matched row exclusively (held to txn end).
-    for_update: bool = false,
-};
-
-pub const Delete = struct {
-    table: []const u8, // borrowed
-    filter: ?Filter, // null = delete every row
-};
-
-/// One SET assignment: `column = literal`.
-pub const SetClause = struct {
-    column: []const u8, // borrowed
-    literal: Literal,
-};
-
-pub const Update = struct {
-    table: []const u8, // borrowed
-    sets: []SetClause, // borrowed
-    filter: ?Filter, // null = update every row
-};
-
-pub const DdlStmt = union(enum) {
-    create_database: []const u8, // database name (borrowed)
-    drop_database: []const u8, // database name (borrowed)
-    create_table: CreateTable,
-    drop_table: DropTable,
-    create_index: CreateIndex,
-    drop_index: DropIndex,
-    insert: Insert,
-    select: Select,
-    delete: Delete,
-    update: Update,
-    begin_txn,
-    commit_txn,
-    rollback_txn,
-    invalid: []const u8, // recognized but rejected; reason
-    unsupported,
-};
-
-pub fn parseDdl(alloc: std.mem.Allocator, sql: []const u8) parser.ParseError!DdlStmt {
-    // `alloc` must be an arena: parse allocates the whole libpg_query JSON
-    // tree into it, and the returned DdlStmt borrows strings straight out
-    // of that tree. Nothing is freed here — the caller drops the arena.
-    const tree = try parser.parse(alloc, sql, null);
-
-    const stmts = tree.statements() orelse return .unsupported;
-    if (stmts.len == 0) return .unsupported;
-    const wrapper = asObject(stmts[0]).?.get("stmt") orelse return .unsupported;
-    const wrapper_obj = asObject(wrapper) orelse return .unsupported;
-
-    // The statement node is a single-entry map keyed by its kind. CREATE and
-    // DROP DATABASE are their own kinds (CreatedbStmt / DropdbStmt), both
-    // carrying the name in `dbname`.
-    var it = wrapper_obj.iterator();
-    const entry = it.next() orelse return .unsupported;
-    const kind = entry.key_ptr.*;
-    const body = asObject(entry.value_ptr.*) orelse return .unsupported;
-
-    if (std.mem.eql(u8, kind, "CreatedbStmt") or std.mem.eql(u8, kind, "DropdbStmt")) {
-        const name = asString(body.get("dbname") orelse return .unsupported) orelse return .unsupported;
-        return if (kind[0] == 'C')
-            .{ .create_database = name }
-        else
-            .{ .drop_database = name };
-    }
-    if (std.mem.eql(u8, kind, "CreateStmt")) return parseCreateTable(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "DropStmt")) return parseDropTable(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "IndexStmt")) return parseCreateIndex(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "InsertStmt")) return parseInsert(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "SelectStmt")) return parseSelect(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "DeleteStmt")) return parseDelete(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "UpdateStmt")) return parseUpdate(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "TransactionStmt")) return parseTransaction(alloc, entry.value_ptr.*);
-    return .unsupported;
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const created = eng.forest.buildCreateNamespace(arena.allocator(), name) catch |err| switch (err) {
+        error.NameExists => return replyError(state, "database already exists"),
+        else => |e| {
+            log.err("create database '{s}': {s}", .{ name, @errorName(e) });
+            return replyError(state, "create database failed");
+        },
+    };
+    eng.proposeMC(created.change, .apply) catch |err| {
+        log.err("create database '{s}': propose: {s}", .{ name, @errorName(err) });
+        return replyError(state, "create database proposal failed");
+    };
+    log.info("created database '{s}' -> ns={d}", .{ name, created.namespace });
+    try state.sendCommandComplete("CREATE DATABASE");
 }
 
-// ---------------------------------------------------------------------------
-// Typed mirrors of the libpg_query JSON we consume, decoded with
-// std.json.parseFromValue. libpg_query encodes every AST node as a
-// single-key object keyed by its kind — {"ColumnDef": {...}} — which is
-// exactly std.json's tagged-union convention, and omits zero-valued/false
-// fields, which land on the struct defaults (absent if_not_exists ⇒ false).
-// ignore_unknown_fields skips the location/typemod/oncommit noise. The
-// declarations double as the shape documentation.
-// ---------------------------------------------------------------------------
+pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: []const u8) !void {
+    const eng = self.srv.engine;
+    self.srv.ddl_mu.lock(@src());
+    defer self.srv.ddl_mu.unlock();
+    if (!try self.ddlReady(state)) return;
 
-/// One part of a (possibly qualified) name: `public.t` arrives as
-/// [{"String": {"sval": "public"}}, {"String": {"sval": "t"}}] — the LAST
-/// part is the object itself.
-const NameNode = struct { String: struct { sval: []const u8 = "" } = .{} };
+    if (std.mem.eql(u8, name, default_database))
+        return replyError(state, "cannot drop the default database");
+    const ns = eng.forest.lookupNamespace(name) orelse
+        return replyError(state, "database does not exist");
 
-/// CREATE TABLE t (id int PRIMARY KEY, name text)
-const CreateStmtJson = struct {
-    relation: struct { relname: []const u8 = "" } = .{},
-    if_not_exists: bool = false,
-    tableElts: []const TableElt = &.{},
+    // Exclusive namespace intent: queue behind every open txn and
+    // in-flight statement (they hold it shared, first lock → txn
+    // end), so the drop never lands mid-transaction; writer
+    // preference parks new DML behind us meanwhile. `dropped` is
+    // set under the exclusive hold — a statement waking from the
+    // key afterwards sees it and answers 3D000 (see dmlTxn). Fresh
+    // owner id — DDL runs outside any txn; parking under ddl_mu is
+    // safe (global order ddl_mu → intent, DML never takes ddl_mu).
+    const db = self.srv.database(ns) catch
+        return replyError(state, "internal error: database state");
+    const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
+    const nskey = zdb.kv.namespaceHash(ns);
+    _ = db.locks.acquire(nskey, owner, .exclusive) catch |err|
+        return replyLockErr(state, err);
+    defer db.locks.release(nskey, owner);
 
-    const TableElt = union(enum) {
-        ColumnDef: ColumnDefJson,
-        /// Table-level constraint (PRIMARY KEY (a, b), CHECK, …) — rejected.
-        Constraint: std.json.Value,
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const mc = eng.forest.buildDropNamespace(arena.allocator(), ns) catch |err| {
+        log.err("drop database '{s}': {s}", .{ name, @errorName(err) });
+        return replyError(state, "drop database failed");
     };
-    const ColumnDefJson = struct {
-        colname: []const u8 = "",
-        /// `int` arrives pg_catalog-qualified: names = [pg_catalog, int4].
-        typeName: struct { names: []const NameNode = &.{} } = .{},
-        constraints: []const ConstraintNode = &.{},
+    eng.proposeMC(mc, .apply) catch |err| {
+        log.err("drop database '{s}': propose: {s}", .{ name, @errorName(err) });
+        return replyError(state, "drop database proposal failed");
     };
-    const ConstraintNode = struct {
-        Constraint: struct { contype: []const u8 = "" } = .{},
-    };
-};
+    db.dropped = true;
+    log.info("dropped database '{s}' (ns={d})", .{ name, ns });
+    try state.sendCommandComplete("DROP DATABASE");
+}
 
-/// DROP TABLE IF EXISTS public.t / DROP INDEX IF EXISTS i
-const DropStmtJson = struct {
-    removeType: String = "", // OBJECT_TABLE / OBJECT_INDEX (vs VIEW, …)
-    missing_ok: bool = false, // IF EXISTS
-    concurrent: bool = false, // DROP INDEX CONCURRENTLY — rejected
-    objects: []const Obj = &.{}, // one per dropped object
+pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: parse.CreateTable) !void {
+    const eng = self.srv.engine;
+    self.srv.ddl_mu.lock(@src());
+    defer self.srv.ddl_mu.unlock();
+    if (!try self.ddlReady(state)) return;
 
-    const Obj = struct { List: struct { items: []const NameNode = &.{} } = .{} };
-};
+    const ns = try self.sessionNamespace(state) orelse return;
+    if (eng.forest.lookupTable(ns, ct.name) != null) {
+        if (ct.if_not_exists) return state.sendCommandComplete("CREATE TABLE");
+        return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table already exists");
+    }
 
-/// CREATE INDEX i ON t (col)
-const IndexStmtJson = struct {
-    idxname: String = "", // empty = unnamed (executor derives one)
-    relation: struct { relname: String = "" } = .{},
-    accessMethod: String = "", // the parser fills "btree" by default
-    tableSpace: String = "",
-    indexParams: []const IndexElemNode = &.{},
-    indexIncludingParams: []const std.json.Value = &.{},
-    whereClause: ?std.json.Value = null, // presence ⇒ partial index
-    unique: bool = false,
-    concurrent: bool = false,
-    if_not_exists: bool = false,
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-    const IndexElemNode = struct {
-        IndexElem: struct {
-            name: String = "", // empty ⇒ expression element
-            ordering: String = "", // SORTBY_* ; "" = default (ASC)
-            nulls_ordering: String = "", // SORTBY_NULLS_* ; "" = LAST
-        } = .{},
-    };
-};
-
-/// INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')
-const InsertStmtJson = struct {
-    relation: struct { relname: []const u8 = "" } = .{},
-    cols: []const ResTargetNode = &.{}, // empty = positional
-    selectStmt: ?SelectWrap = null,
-    onConflictClause: ?std.json.Value = null, // presence ⇒ ON CONFLICT
-    returningList: []const std.json.Value = &.{}, // non-empty ⇒ RETURNING
-
-    const ResTargetNode = struct { ResTarget: struct { name: []const u8 = "" } = .{} };
-    // INSERT ... VALUES nests rows under a SelectStmt with `valuesLists`;
-    // INSERT ... SELECT has a SelectStmt WITHOUT valuesLists (→ rejected).
-    const SelectWrap = struct { SelectStmt: SelectValues = .{} };
-    const SelectValues = struct { valuesLists: []const ListNode = &.{} };
-    const ListNode = struct { List: struct { items: []const AConstNode = &.{} } = .{} };
-    const AConstNode = struct { A_Const: AConst = .{} };
-    // A_Const encodes its value under a type-named key; the key's presence is
-    // the discriminant (libpg_query omits zero inner values, so `ival: {}`
-    // still means integer 0).
-    pub const AConst = struct {
-        ival: ?struct { ival: i64 = 0 } = null,
-        fval: ?struct { fval: []const u8 = "" } = null,
-        sval: ?struct { sval: []const u8 = "" } = null,
-        boolval: ?struct { boolval: bool = false } = null,
-        isnull: bool = false,
-    };
-};
-
-/// SELECT [cols|*] FROM t [WHERE col = const]
-const SelectStmtJson = struct {
-    targetList: []const ResTargetNode = &.{},
-    fromClause: []const FromNode = &.{},
-    whereClause: ?WhereNode = null,
-    lockingClause: []const LockingNode = &.{},
-    // Clauses this slice doesn't support — presence ⇒ rejection.
-    sortClause: []const std.json.Value = &.{},
-    groupClause: []const std.json.Value = &.{},
-    distinctClause: []const std.json.Value = &.{},
-    havingClause: ?std.json.Value = null,
-    limitCount: ?std.json.Value = null,
-    limitOffset: ?std.json.Value = null,
-
-    // FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED. Unlike zero-valued
-    // ints (omitted), enum strings are always emitted: plain FOR UPDATE
-    // arrives as strength="LCS_FORUPDATE", waitPolicy="LockWaitBlock".
-    const LockingNode = struct {
-        LockingClause: ?struct {
-            strength: []const u8 = "",
-            waitPolicy: []const u8 = "",
-            lockedRels: []const std.json.Value = &.{},
-        } = null,
-    };
-
-    const ResTargetNode = struct { ResTarget: struct { val: ColumnRefWrap = .{} } = .{} };
-    // A target / WHERE operand must be a column reference; anything else
-    // (function, arithmetic) leaves ColumnRef null → rejected.
-    const ColumnRefWrap = struct { ColumnRef: ?ColumnRef = null };
-    const ColumnRef = struct { fields: []const FieldNode = &.{} };
-    const FieldNode = struct {
-        String: ?struct { sval: []const u8 = "" } = null,
-        A_Star: ?struct {} = null,
-    };
-    const FromNode = struct { RangeVar: ?struct { relname: []const u8 = "" } = null };
-    const WhereNode = struct {
-        A_Expr: ?AExpr = null,
-        const AExpr = struct {
-            kind: []const u8 = "",
-            name: []const NameNode = &.{},
-            lexpr: ColumnRefWrap = .{},
-            rexpr: struct { A_Const: InsertStmtJson.AConst = .{} } = .{},
+    // Mint the column ids ONCE: 1-based declaration position. Everything
+    // downstream — the PK index descriptor and the catalog rows — reads
+    // ids from this list, never re-derives them from position. The
+    // PRIMARY KEY column (parse allows at most one) gets an auto unique
+    // index on its id.
+    const columns = try a.alloc(schema.LogicalColumn, ct.columns.len);
+    var pkey_col: ?u32 = null;
+    for (ct.columns, columns, 1..) |c, *lc, id| {
+        lc.* = .{
+            .column_id = @intCast(id),
+            .name = c.name,
+            .ty = c.ty,
+            .pkey_position = if (c.pkey) 1 else null,
         };
+        if (c.pkey) pkey_col = lc.column_id;
+    }
+
+    // The table's tree, plus the PK index's own tree named "<table>_pkey"
+    // (Postgres convention) — both created in one atomic change. A name
+    // collision on either fails the CREATE.
+    var names: [2][]const u8 = .{ ct.name, "" };
+    var n_names: usize = 1;
+    if (pkey_col != null) {
+        names[1] = try std.fmt.allocPrint(a, "{s}_pkey", .{ct.name});
+        n_names = 2;
+    }
+
+    const created = eng.forest.buildCreateTables(
+        a,
+        ns,
+        names[0..n_names],
+    ) catch |err| switch (err) {
+        error.NameExists => return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table or index name already exists"),
+        else => |e| {
+            log.err("create table '{s}': {s}", .{ ct.name, @errorName(e) });
+            return replyError(state, "create table failed");
+        },
     };
-};
-
-/// DELETE FROM t [WHERE col = const]. `relation` is inline (a RangeVar body,
-/// like INSERT); the last three clauses are decoded only to reject them.
-const DeleteStmtJson = struct {
-    relation: struct { relname: []const u8 = "" } = .{},
-    whereClause: ?SelectStmtJson.WhereNode = null,
-    usingClause: []const std.json.Value = &.{}, // DELETE ... USING
-    returningList: []const std.json.Value = &.{}, // RETURNING
-    withClause: ?std.json.Value = null, // WITH ... DELETE
-};
-
-/// UPDATE t SET col = const [, ...] [WHERE col = const]. Each targetList
-/// entry is one SET assignment; a non-literal value (expression, DEFAULT,
-/// sub-select, multi-assign) leaves `A_Const` null → rejected. The last
-/// three clauses are decoded only to reject them.
-const UpdateStmtJson = struct {
-    relation: struct { relname: []const u8 = "" } = .{},
-    targetList: []const ResTargetNode = &.{},
-    whereClause: ?SelectStmtJson.WhereNode = null,
-    fromClause: []const std.json.Value = &.{}, // UPDATE ... FROM
-    returningList: []const std.json.Value = &.{}, // RETURNING
-    withClause: ?std.json.Value = null, // WITH ... UPDATE
-
-    const ResTargetNode = struct { ResTarget: ResTarget = .{} };
-    const ResTarget = struct {
-        name: []const u8 = "",
-        val: struct { A_Const: ?InsertStmtJson.AConst = null } = .{},
+    eng.proposeMC(created.change, .apply) catch |err| {
+        log.err("create table '{s}': propose: {s}", .{ ct.name, @errorName(err) });
+        return replyError(state, "create table proposal failed");
     };
-};
-
-/// Decode one statement body into its typed mirror. A shape we don't
-/// recognize (unknown node kind, wrong field type) is null → .unsupported;
-/// only OOM propagates.
-fn fromValue(comptime T: type, alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!?T {
-    return std.json.parseFromValueLeaky(T, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => null,
-    };
-}
-
-/// CREATE TABLE. Only bare `name type` columns with an optional
-/// single-column PRIMARY KEY parse; any other constraint (NOT NULL, UNIQUE,
-/// FK, DEFAULT, table-level) is a clean `.invalid`.
-fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const cs = try fromValue(CreateStmtJson, alloc, body) orelse return .unsupported;
-
-    var columns: std.ArrayList(ColumnDef) = .empty;
-    var pkey_seen = false;
-    for (cs.tableElts) |elt| {
-        const cd = switch (elt) {
-            .ColumnDef => |col| col,
-            .Constraint => return invalid("table-level constraints are not supported"),
+    // Phase 2: the table's column rows (+ the index descriptor row, if
+    // any) into the namespace's catalogs — one proposal, atomic. A crash
+    // between the two proposals leaves a named, column-less table (DROP
+    // TABLE cleans it up) — acceptable pre-production.
+    var indexes: [1]catalog.IndexDef = undefined;
+    var n_indexes: usize = 0;
+    if (pkey_col) |col| {
+        indexes[0] = .{
+            .base_table_id = created.table_ids[0],
+            .index_table_id = created.table_ids[1],
+            .column_id = col,
+            .unique = true,
         };
-        if (std.ascii.eqlIgnoreCase(cd.colname, "egid"))
-            return invalid("column name \"egid\" is reserved");
-        for (columns.items) |c| {
-            if (std.mem.eql(u8, c.name, cd.colname))
-                return invalidFmt(alloc, "duplicate column \"{s}\"", .{cd.colname});
-        }
-
-        const names = cd.typeName.names;
-        if (names.len == 0) return .unsupported;
-        const tyname = names[names.len - 1].String.sval;
-        const ty = value.Type.fromName(tyname) orelse
-            return invalidFmt(alloc, "unsupported type \"{s}\"", .{tyname});
-
-        var pkey = false;
-        for (cd.constraints) |con| {
-            if (!std.mem.eql(u8, con.Constraint.contype, "CONSTR_PRIMARY"))
-                return invalid("only PRIMARY KEY column constraints are supported");
-            pkey = true;
-        }
-        if (pkey) {
-            if (pkey_seen)
-                return invalid("multiple PRIMARY KEY columns are not supported");
-            pkey_seen = true;
-        }
-
-        try columns.append(alloc, .{ .name = cd.colname, .ty = ty, .pkey = pkey });
+        n_indexes = 1;
     }
+    writeCatalogRows(self, a, ns, created.table_ids[0], columns, indexes[0..n_indexes]) catch |err| {
+        log.err("create table '{s}': catalog rows: {s}", .{ ct.name, @errorName(err) });
+        return replyError(state, "create table failed writing catalog rows");
+    };
 
-    return .{ .create_table = .{
-        .name = cs.relation.relname,
-        .if_not_exists = cs.if_not_exists,
-        .columns = try columns.toOwnedSlice(alloc),
-    } };
+    if (n_indexes > 0)
+        log.info("created table '{s}' -> ns={d} table_id={d} columns={d} pkey_index_id={d}", .{ ct.name, ns, created.table_ids[0], ct.columns.len, indexes[0].index_table_id })
+    else
+        log.info("created table '{s}' -> ns={d} table_id={d} columns={d}", .{ ct.name, ns, created.table_ids[0], ct.columns.len });
+    try state.sendCommandComplete("CREATE TABLE");
 }
 
-/// DROP TABLE / DROP INDEX (libpg_query reuses DropStmt for both,
-/// discriminated by removeType). Other object kinds (VIEW, …) are
-/// `.unsupported`; multi-object DROPs are rejected.
-fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const ds = try fromValue(DropStmtJson, alloc, body) orelse return .unsupported;
+/// Marshal one catalog row per column plus one per index descriptor and
+/// replicate the batch into the namespace's catalog trees, waiting for
+/// local apply. Column rows land in table 1, index rows in table 2 —
+/// mixed table_ids in one atomic proposal. `columns` carry their minted
+/// ids (createTable assigns them); nothing is derived here.
+fn writeCatalogRows(
+    self: *Handler,
+    a: std.mem.Allocator,
+    ns: u64,
+    table_id: u32,
+    columns: []const schema.LogicalColumn,
+    indexes: []const catalog.IndexDef,
+) !void {
+    const eng = self.srv.engine;
+    const n = columns.len + indexes.len;
+    if (n == 0) return;
 
-    const is_index = std.mem.eql(u8, ds.removeType, "OBJECT_INDEX");
-    if (!is_index and !std.mem.eql(u8, ds.removeType, "OBJECT_TABLE"))
-        return .unsupported;
-    if (ds.objects.len != 1) {
-        return if (is_index)
-            invalid("DROP INDEX with multiple indexes is not supported")
-        else
-            invalid("DROP TABLE with multiple tables is not supported");
+    const kvs = try a.alloc(zen.KeyValueStruct, n);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(eng.allocator);
+    for (columns, 0..) |lc, i| {
+        const cells = catalog.encodeColumn(table_id, lc);
+        const bytes = try row.marshalRow(eng.allocator, &self.srv.catalog_ps, &cells, &buf);
+        const primary = catalog.encodeKey(table_id, lc.column_id);
+        const k = zdb.kv.Key{
+            .namespace = ns,
+            .table_id = catalog.table_id,
+            .primary = &primary,
+        };
+        // marshalRow reuses `buf` — copy the row out; marshal copies
+        // the key.
+        kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
     }
-    if (is_index and ds.concurrent)
-        return invalid("DROP INDEX CONCURRENTLY is not supported");
-    const items = ds.objects[0].List.items;
-    if (items.len == 0) return .unsupported;
-    const name = items[items.len - 1].String.sval;
-
-    if (is_index) {
-        return .{ .drop_index = .{
-            .name = name,
-            .missing_ok = ds.missing_ok,
-        } };
-    }
-    return .{ .drop_table = .{
-        .name = name,
-        .missing_ok = ds.missing_ok,
-    } };
-}
-
-/// CREATE INDEX. v1: a single plain column, non-unique, whole-table,
-/// default btree — every narrowing (UNIQUE, CONCURRENTLY, partial,
-/// multi-column, expression, INCLUDE, TABLESPACE, other access
-/// methods, DESC / NULLS FIRST ordering) is a clean `.invalid`.
-/// ASC / NULLS LAST are accepted: they are this index's semantics
-/// already (the NULL tag byte sorts last).
-fn parseCreateIndex(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const is = try fromValue(IndexStmtJson, alloc, body) orelse return .unsupported;
-
-    if (is.unique) return invalid("UNIQUE indexes are not supported");
-    if (is.concurrent)
-        return invalid("CREATE INDEX CONCURRENTLY is not supported");
-    if (is.whereClause != null)
-        return invalid("partial indexes are not supported");
-    if (is.indexIncludingParams.len > 0)
-        return invalid("INCLUDE columns are not supported");
-    if (is.tableSpace.len > 0) return invalid("TABLESPACE is not supported");
-    if (is.accessMethod.len > 0 and !std.mem.eql(u8, is.accessMethod, "btree"))
-        return invalidFmt(
-            alloc,
-            "access method \"{s}\" is not supported",
-            .{is.accessMethod},
+    for (indexes, columns.len..) |idx, i| {
+        const cells = catalog.encodeIndex(idx);
+        const bytes = try row.marshalRow(
+            eng.allocator,
+            &self.srv.index_catalog_ps,
+            &cells,
+            &buf,
         );
-    if (is.indexParams.len != 1)
-        return invalid("only single-column indexes are supported");
-    const elem = is.indexParams[0].IndexElem;
-    if (elem.name.len == 0)
-        return invalid("expression indexes are not supported");
-    if (std.mem.eql(u8, elem.ordering, "SORTBY_DESC"))
-        return invalid("DESC index ordering is not supported");
-    if (std.mem.eql(u8, elem.nulls_ordering, "SORTBY_NULLS_FIRST"))
-        return invalid("NULLS FIRST index ordering is not supported");
-
-    return .{ .create_index = .{
-        .name = if (is.idxname.len > 0) is.idxname else null,
-        .table = is.relation.relname,
-        .column = elem.name,
-        .if_not_exists = is.if_not_exists,
-    } };
+        const primary = catalog.encodeIndexKey(idx.base_table_id, idx.index_table_id);
+        const k = zdb.kv.Key{
+            .namespace = ns,
+            .table_id = catalog.index_table_id,
+            .primary = &primary,
+        };
+        kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
+    }
+    try eng.proposeWrites(ns, kvs, .apply);
 }
 
-/// INSERT ... VALUES. ON CONFLICT / RETURNING / INSERT…SELECT are rejected
-/// (before any allocation, so no cleanup); arity, unknown columns, and literal
-/// coercion are the executor's job. The `errdefer`s only cover OOM.
-fn parseInsert(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const is = try fromValue(InsertStmtJson, alloc, body) orelse return .unsupported;
+pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: parse.DropTable) !void {
+    const eng = self.srv.engine;
+    self.srv.ddl_mu.lock(@src());
+    defer self.srv.ddl_mu.unlock();
+    if (!try self.ddlReady(state)) return;
 
-    if (is.onConflictClause != null) return invalid("ON CONFLICT is not supported");
-    if (is.returningList.len > 0) return invalid("RETURNING is not supported");
-    const sel = is.selectStmt orelse return invalid("INSERT requires VALUES");
-    if (sel.SelectStmt.valuesLists.len == 0)
-        return invalid("only INSERT ... VALUES is supported");
+    const ns = try self.sessionNamespace(state) orelse return;
+    const table_id = eng.forest.lookupTable(ns, dt.name) orelse {
+        if (dt.missing_ok) return state.sendCommandComplete("DROP TABLE");
+        return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
+    };
 
-    var columns: ?[][]const u8 = null;
-    if (is.cols.len > 0) {
-        const cols = try alloc.alloc([]const u8, is.cols.len);
-        for (is.cols, cols) |ct, *dst| dst.* = ct.ResTarget.name;
-        columns = cols;
-    }
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-    var rows: std.ArrayList([]Literal) = .empty;
-    for (sel.SelectStmt.valuesLists) |ln| {
-        const lits = try alloc.alloc(Literal, ln.List.items.len);
-        for (ln.List.items, lits) |ac, *lit| lit.* = literalFrom(ac.A_Const);
-        try rows.append(alloc, lits);
-    }
+    // One key-only catalog scan answers both DROP questions: is this
+    // name an index (reject), and which index trees belong to it (drop
+    // with the base below). Safe pre-lock: ddl_mu serializes every
+    // catalog mutation; the intent locks only fence in-flight DML.
+    var scan = table.scanIndexKeys(a, eng.forest, ns, table_id) catch |err| {
+        log.err("drop table '{s}': index scan: {s}", .{ dt.name, @errorName(err) });
+        return replyError(state, "drop table failed");
+    };
+    if (scan.is_index)
+        return replyErrorCode(state, pgwire.sqlstate.wrong_object_type, "cannot DROP TABLE an index; use DROP INDEX");
 
-    return .{ .insert = .{
-        .table = is.relation.relname,
-        .columns = columns,
-        .rows = try rows.toOwnedSlice(alloc),
-    } };
+    // Shared namespace intent + exclusive table intent (ns → table,
+    // the global order): queue behind every open txn's shared table
+    // hold so the drop never lands mid-transaction, while the ns
+    // hold makes a concurrent DROP DATABASE queue behind US. Writer
+    // preference parks new DML behind the pending table key. Fresh
+    // owner id — DDL runs outside any txn. Safe to park while
+    // holding ddl_mu: the global order is ddl_mu → intent lock (DML
+    // never takes ddl_mu), so no cycle can involve both.
+    const db = self.srv.database(ns) catch
+        return replyError(state, "internal error: database state");
+    const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
+    const nskey = zdb.kv.namespaceHash(ns);
+
+    _ = db.locks.acquire(nskey, owner, .shared) catch |err|
+        return replyLockErr(state, err);
+    defer db.locks.release(nskey, owner);
+    const tkey = (zdb.kv.TableKey{
+        .namespace = ns,
+        .table_id = table_id,
+    }).identityHash();
+    _ = db.locks.acquire(tkey, owner, .exclusive) catch |err|
+        return replyLockErr(state, err);
+    defer db.locks.release(tkey, owner);
+
+    // The table and its index tables drop together, in one atomic change
+    // — order is irrelevant. Their rows in the CATALOG trees stay behind
+    // as unreachable garbage (ids are never reused). TODO: issue
+    // tombstones for them.
+    try scan.table_ids.append(a, table_id);
+    const mc = eng.forest.buildDropTables(a, ns, scan.table_ids.items) catch |err| {
+        log.err("drop table '{s}': {s}", .{ dt.name, @errorName(err) });
+        return replyError(state, "drop table failed");
+    };
+    eng.proposeMC(mc, .apply) catch |err| {
+        log.err("drop table '{s}': propose: {s}", .{ dt.name, @errorName(err) });
+        return replyError(state, "drop table proposal failed");
+    };
+    // Evict the cached Table (safe: we hold the exclusive table
+    // intent, and DML holds its Table only under the shared one).
+    // Index table_ids are never cached — they have no columns.
+    try self.srv.forgetTable(ns, table_id);
+
+    log.info("dropped table '{s}' (ns={d} table_id={d} indexes={d})", .{ dt.name, ns, table_id, scan.table_ids.items.len - 1 });
+    try state.sendCommandComplete("DROP TABLE");
 }
 
-fn literalFrom(ac: InsertStmtJson.AConst) Literal {
-    if (ac.isnull) return .null_value;
-    if (ac.ival) |iv| return .{ .int = iv.ival };
-    if (ac.fval) |fv| return .{ .float = fv.fval };
-    if (ac.sval) |sv| return .{ .str = sv.sval };
-    if (ac.boolval) |bv| return .{ .bool_ = bv.boolval };
-    return .unsupported;
+/// CREATE INDEX — the online-backfill protocol. Blocks the
+/// issuing session until the index is built and valid (the reply
+/// is a truthful completion signal, as in Postgres), but OTHER
+/// sessions' writes flow throughout — CONCURRENTLY's semantics.
+/// In order:
+///  1. create the index tree (raft, applied);
+///  2. reserve the tree against compactions for the whole build —
+///     keeps its bottom level empty, the install condition;
+///  3. take the exclusive table intent as a BARRIER only: drains
+///     statements still holding a pre-index Table (openTable runs
+///     after dmlTxn, so post-barrier statements load the reload);
+///  4. under it: catalog row (valid=false) + reloadTable — every
+///     future writer maintains the index; snap = that row's own
+///     commit HLC, read back from the row. Durable and
+///     self-describing: any node could re-run this backfill from
+///     the catalog row alone;
+///  5. release the barrier — writes flow for the entire build,
+///     every posting delta landing at commit HLC > snap;
+///  6. scan the base table at snap, fold per-key roaring states,
+///     install them as BOTTOM-level SSTs at ts = snap: the oldest
+///     data this tree will ever hold, which is exactly what the
+///     bottom level means — level-ordering holds against all the
+///     deltas above;
+///  7. flip valid=true + reloadTable — reads may now use it.
+/// Crash/failure windows: before 4 → an invisible orphan tree;
+/// after 4 → an INVALID index accumulating deltas, never
+/// consulted (DROP INDEX cleans it up; a re-run backfill could
+/// finish it).
+pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: parse.CreateIndex) !void {
+    const eng = self.srv.engine;
+    self.srv.ddl_mu.lock(@src());
+    defer self.srv.ddl_mu.unlock();
+    if (!try self.ddlReady(state)) return;
+
+    const ns = try self.sessionNamespace(state) orelse return;
+    const base_tid = eng.forest.lookupTable(ns, ci.table) orelse
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_table,
+            "table does not exist",
+        );
+    const t = self.srv.openTable(ns, base_tid) catch |err| {
+        logCreateIndexErr(ci.table, "load schema", err);
+        return replyError(state, "failed to load table schema");
+    };
+    const col_pos = t.columnIndex(ci.column) orelse
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_column,
+            "column does not exist",
+        );
+    const col = t.columns[col_pos];
+    if (col.ty == .interval)
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.feature_not_supported,
+            "indexes on interval columns are not supported",
+        );
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Same NAME first — that's this exact index existing, the
+    // IF NOT EXISTS idempotence case — before the one-index-per-
+    // column limit, which is about a SECOND index on the column.
+    const name = ci.name orelse
+        try std.fmt.allocPrint(a, "{s}_{s}_idx", .{ ci.table, ci.column });
+    if (eng.forest.lookupTable(ns, name) != null) {
+        if (ci.if_not_exists)
+            return state.sendCommandComplete("CREATE INDEX");
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.duplicate_table,
+            "index already exists",
+        );
+    }
+    // One non-unique index per column — indexCols' invariant.
+    for (t.indexes) |idx| {
+        if (!idx.unique and idx.column_id == col.column_id)
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.feature_not_supported,
+                "column is already indexed",
+            );
+    }
+    // `t` dangles past reloadTable below; keep what's needed.
+    const column_id = col.column_id;
+
+    const created = eng.forest.buildCreateTables(
+        a,
+        ns,
+        &.{name},
+    ) catch |err| switch (err) {
+        error.NameExists => return replyErrorCode(
+            state,
+            pgwire.sqlstate.duplicate_table,
+            "index already exists",
+        ),
+        else => {
+            logCreateIndexErr(name, "create tree", err);
+            return replyError(state, "create index failed");
+        },
+    };
+    eng.proposeMC(created.change, .apply) catch |err| {
+        logCreateIndexErr(name, "propose tree", err);
+        return replyError(state, "create index failed");
+    };
+    const index_tid = created.table_ids[0];
+
+    const tree_key = zdb.kv.TreeKey{
+        .namespace = ns,
+        .tree_id = zdb.kv.makeTreeId(index_tid, 0),
+    };
+    try eng.reserveTree(tree_key);
+    defer eng.releaseTree(tree_key);
+
+    const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
+    const db = try self.srv.database(ns);
+    const nskey = zdb.kv.namespaceHash(ns);
+
+    _ = db.locks.acquire(nskey, owner, .shared) catch |err|
+        return replyLockErr(state, err);
+    defer db.locks.release(nskey, owner);
+
+    const tkey = (zdb.kv.TableKey{
+        .namespace = ns,
+        .table_id = base_tid,
+    }).identityHash();
+    _ = db.locks.acquire(tkey, owner, .exclusive) catch |err|
+        return replyLockErr(state, err);
+
+    var barrier_held = true;
+    defer if (barrier_held) db.locks.release(tkey, owner);
+
+    const def = catalog.IndexDef{
+        .base_table_id = base_tid,
+        .index_table_id = index_tid,
+        .column_id = column_id,
+        .unique = false,
+        .valid = false,
+    };
+    writeCatalogRows(self, a, ns, base_tid, &.{}, &.{def}) catch |err| {
+        logCreateIndexErr(name, "catalog row", err);
+        return replyError(state, "create index failed");
+    };
+    self.srv.reloadTable(ns, base_tid) catch |err| {
+        logCreateIndexErr(name, "reload table", err);
+        return replyError(state, "create index failed");
+    };
+    const snap = blk: {
+        const ck = catalog.encodeIndexKey(base_tid, index_tid);
+        const found = eng.forest.get(eng.allocator, .{
+            .namespace = ns,
+            .table_id = catalog.index_table_id,
+            .primary = &ck,
+            .timestamp = std.math.maxInt(u64),
+        }, .p0) catch |err| {
+            logCreateIndexErr(name, "read snap", err);
+            return replyError(state, "create index failed");
+        } orelse {
+            logCreateIndexErr(name, "read snap", error.RowMissing);
+            return replyError(state, "create index failed");
+        };
+        defer found.free(eng.allocator);
+        break :blk found.key.timestamp;
+    };
+
+    db.locks.release(tkey, owner);
+    barrier_held = false;
+    log.info("create index '{s}': backfill starting (ns={d} base={d} index={d} snap={d})", .{ name, ns, base_tid, index_tid, snap });
+
+    const t2 = self.srv.openTable(ns, base_tid) catch |err| {
+        logCreateIndexErr(name, "reopen schema", err);
+        return replyError(state, "create index failed");
+    };
+    const n_keys = backfillIndex(
+        self,
+        a,
+        ns,
+        base_tid,
+        index_tid,
+        &t2.ps,
+        col_pos,
+        snap,
+    ) catch |err| {
+        logCreateIndexErr(name, "backfill", err);
+        return replyError(state, "create index failed");
+    };
+    if (n_keys > 0) {
+        // applyBackfill skips (deterministically, on every node)
+        // when the bottom level was not empty; surface that as a
+        // hard failure instead of flipping a hollow index valid.
+        const installed = eng.forest.bottomTableCount(ns, index_tid) catch 0;
+        if (installed == 0) {
+            logCreateIndexErr(name, "install", error.BackfillSkipped);
+            return replyError(state, "create index failed");
+        }
+    }
+
+    var vdef = def;
+    vdef.valid = true;
+    writeCatalogRows(self, a, ns, base_tid, &.{}, &.{vdef}) catch |err| {
+        logCreateIndexErr(name, "valid flip", err);
+        return replyError(state, "create index failed");
+    };
+    self.srv.reloadTable(ns, base_tid) catch |err| {
+        logCreateIndexErr(name, "reload table", err);
+        return replyError(state, "create index failed");
+    };
+
+    log.info("created index '{s}' (ns={d} base={d} index={d} keys={d} snap={d})", .{ name, ns, base_tid, index_tid, n_keys, snap });
+    try state.sendCommandComplete("CREATE INDEX");
 }
 
-/// A parsed WHERE: a `col = literal` filter or a rejection reason (borrowed).
-const ParsedWhere = union(enum) {
-    filter: Filter,
-    invalid: []const u8,
+/// Step 6 of the protocol: scan the base table at read_ts =
+/// `snap`, fold each row's indexed cell into a per-key roaring
+/// bitmap, and install the result as bottom-level SSTs of
+/// {.roaring, .state} values at ts = snap (cmd .index_backfill).
+/// NULL cells are indexed (the tag_null key); interval never gets
+/// here (rejected at CREATE INDEX). Memory ∝ table — distinct
+/// keys + bitmaps — accepted for v1. Returns the number of
+/// posting keys written; 0 = empty table, nothing installed.
+fn backfillIndex(
+    self: *Handler,
+    a: std.mem.Allocator,
+    ns: u64,
+    base_tid: u32,
+    index_tid: u32,
+    ps: *const schema.PhysicalSchema,
+    col_pos: usize,
+    snap: u64,
+) !usize {
+    const eng = self.srv.engine;
+    const Fold = struct {
+        a: std.mem.Allocator,
+        ps: *const schema.PhysicalSchema,
+        col_pos: usize,
+        rows: usize = 0,
+        map: std.StringArrayHashMapUnmanaged(zdb.zroar.Bitmap) = .empty,
 
-    fn reject(msg: []const u8) ParsedWhere {
-        return .{ .invalid = msg };
+        fn emit(ctx: *@This(), item: zdb.kv.Item) anyerror!bool {
+            const egid = key.decodeEgid(item.key.primary) orelse
+                return true; // not row-shaped: nothing to index
+            ctx.rows += 1;
+            const cell = row.readCell(ctx.ps, item.value, ctx.col_pos);
+            const ik = key.encodeIndexKey(ctx.a, cell, null) catch |err|
+                switch (err) {
+                    error.Unencodable => unreachable,
+                    else => return err,
+                };
+            const gop = try ctx.map.getOrPut(ctx.a, ik);
+            if (!gop.found_existing)
+                gop.value_ptr.* = try zdb.zroar.Bitmap.init(ctx.a);
+            _ = try gop.value_ptr.set(egid);
+            return true;
+        }
+    };
+    var fold = Fold{ .a = a, .ps = ps, .col_pos = col_pos };
+    _ = try eng.forest.scan(
+        a,
+        (zdb.level.KeyRange{}).limitToTable(ns, base_tid),
+        .{ .read_ts = snap, .priority = .p2 },
+        &fold,
+        Fold.emit,
+    );
+    log.info("backfill index={d}: scanned rows={d} keys={d}", .{ index_tid, fold.rows, fold.map.count() });
+    if (fold.map.count() == 0) return 0;
+
+    // The map collected in first-seen order; the Builder wants
+    // key order.
+    const SortCtx = struct {
+        keys: []const String,
+        pub fn lessThan(c: @This(), x: usize, y: usize) bool {
+            return std.mem.lessThan(u8, c.keys[x], c.keys[y]);
+        }
+    };
+    fold.map.sortUnstable(SortCtx{ .keys = fold.map.keys() });
+
+    var items: std.ArrayList(zdb.kv.Item) = .empty;
+    for (fold.map.keys(), fold.map.values()) |ik, *bm| {
+        // Canonical minimal buffer for persistence.
+        try bm.compact();
+        try items.append(a, .{
+            .key = .{
+                .namespace = ns,
+                .table_id = index_tid,
+                .primary = ik,
+                .timestamp = snap,
+            },
+            .value = bm.toBuffer(),
+            .meta = .{ .kind = .state, .encoding = .roaring },
+        });
     }
-};
+    var changes =
+        try eng.forest.buildBottomTable(a, ns, index_tid, items.items);
+    defer changes.deinit(a);
+    // Upload + announce the backfill SSTs before proposing, like every
+    // other SST creator — followers download from the shared store.
+    try eng.distributeNewFiles(changes.items);
+    try eng.proposeMC(.{
+        .cmd = .index_backfill,
+        .sstable_changes = changes.items,
+        .tree_changes = &.{},
+        .memtable_id = 0,
+    }, .apply);
+    log.info("backfill index={d}: installed tables={d}", .{ index_tid, changes.items.len });
+    return fold.map.count();
+}
 
-/// Parse the one WHERE shape this slice supports — `column = literal` —
-/// shared by SELECT and DELETE. Anything else (non-equality op, AND/OR,
-/// subquery, column-vs-column) yields a clean `.invalid` reason; only OOM
-/// propagates.
-fn parseWhere(w: SelectStmtJson.WhereNode) ParsedWhere {
-    const ae = w.A_Expr orelse
-        return ParsedWhere.reject("unsupported WHERE clause");
-    if (!std.mem.eql(u8, ae.kind, "AEXPR_OP") or ae.name.len == 0 or
-        !std.mem.eql(u8, ae.name[ae.name.len - 1].String.sval, "="))
-        return ParsedWhere.reject(
-            "only `column = value` is supported in WHERE",
+/// DROP INDEX. Order matters: tombstone the catalog row FIRST,
+/// then drop the tree — the reverse would leave a live IndexDef
+/// pointing at a dead tree (reads would see silently-empty
+/// results), and unlike dropTable's tolerated catalog garbage, a
+/// live IndexDef row would resurrect the index on the next schema
+/// load. The tombstone is mandatory.
+pub fn dropIndex(self: *Handler, state: *pgwire.ConnState, di: parse.DropIndex) !void {
+    const eng = self.srv.engine;
+    self.srv.ddl_mu.lock(@src());
+    defer self.srv.ddl_mu.unlock();
+    if (!try self.ddlReady(state)) return;
+
+    const ns = try self.sessionNamespace(state) orelse return;
+    const index_tid = eng.forest.lookupTable(ns, di.name) orelse {
+        if (di.missing_ok) return state.sendCommandComplete("DROP INDEX");
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_object,
+            "index does not exist",
+        );
+    };
+
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var scan = table.scanIndexKeys(
+        a,
+        eng.forest,
+        ns,
+        index_tid,
+    ) catch |err| {
+        logDropIndexErr(di.name, "scan catalog", err);
+        return replyError(state, "drop index failed");
+    };
+    defer scan.table_ids.deinit(a);
+    if (!scan.is_index)
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.wrong_object_type,
+            "not an index; use DROP TABLE",
+        );
+    const base_tid = scan.base_table_id.?;
+
+    const defs = table.loadIndexes(
+        a,
+        eng.forest,
+        &self.srv.index_catalog_ps,
+        ns,
+        base_tid,
+    ) catch |err| {
+        logDropIndexErr(di.name, "load defs", err);
+        return replyError(state, "drop index failed");
+    };
+    const def = for (defs) |d| {
+        if (d.index_table_id == index_tid) break d;
+    } else {
+        logDropIndexErr(di.name, "find def", error.RowMissing);
+        return replyError(state, "drop index failed");
+    };
+    // The pkey index is structural — it lives and dies with its
+    // table.
+    if (def.unique)
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.feature_not_supported,
+            "cannot drop a PRIMARY KEY index",
         );
 
-    const lcol = ae.lexpr.ColumnRef orelse
-        return ParsedWhere.reject("WHERE left side must be a column");
-    const lfields = lcol.fields;
-    if (lfields.len == 0 or lfields[lfields.len - 1].String == null)
-        return ParsedWhere.reject("WHERE left side must be a column");
+    // Locks: same shape as dropTable, on the BASE table — the
+    // reload below swaps its cached schema.
+    const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
+    const db = try self.srv.database(ns);
+    const nskey = zdb.kv.namespaceHash(ns);
+    _ = db.locks.acquire(nskey, owner, .shared) catch |err|
+        return replyLockErr(state, err);
+    defer db.locks.release(nskey, owner);
 
-    const lit = literalFrom(ae.rexpr.A_Const);
-    if (lit == .unsupported)
-        return ParsedWhere.reject("WHERE right side must be a literal");
-    return .{ .filter = .{
-        .column = lfields[lfields.len - 1].String.?.sval,
-        .literal = lit,
-    } };
-}
+    const tkey = (zdb.kv.TableKey{
+        .namespace = ns,
+        .table_id = base_tid,
+    }).identityHash();
+    _ = db.locks.acquire(tkey, owner, .exclusive) catch |err|
+        return replyLockErr(state, err);
+    defer db.locks.release(tkey, owner);
 
-/// SELECT [cols|*] FROM one_table [WHERE col = literal]. Joins, subqueries,
-/// ORDER BY / GROUP BY / LIMIT / DISTINCT and expression targets are rejected.
-fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!DdlStmt {
-    const ss = try fromValue(SelectStmtJson, alloc, body) orelse return .unsupported;
-
-    if (ss.sortClause.len > 0 or ss.groupClause.len > 0 or ss.distinctClause.len > 0 or
-        ss.havingClause != null or ss.limitCount != null or ss.limitOffset != null)
-        return invalid("ORDER BY / GROUP BY / LIMIT / DISTINCT are not supported");
-
-    if (ss.fromClause.len != 1)
-        return invalid("SELECT must read exactly one table");
-    const rv = ss.fromClause[0].RangeVar orelse
-        return invalid("only table sources are supported");
-
-    // Every target must be a column reference; a `*` anywhere makes it a
-    // star projection.
-    var star = false;
-    for (ss.targetList) |tn| {
-        const cr = tn.ResTarget.val.ColumnRef orelse
-            return invalid("only column references are supported in SELECT");
-        for (cr.fields) |f| {
-            if (f.A_Star != null) star = true;
-        }
-    }
-
-    var cols: std.ArrayList([]const u8) = .empty;
-    if (!star) {
-        for (ss.targetList) |tn| {
-            const fields = tn.ResTarget.val.ColumnRef.?.fields;
-            if (fields.len == 0 or fields[fields.len - 1].String == null)
-                return invalid("unsupported column reference");
-            try cols.append(alloc, fields[fields.len - 1].String.?.sval);
-        }
-    }
-
-    var filter: ?Filter = null;
-    if (ss.whereClause) |w| switch (parseWhere(w)) {
-        .filter => |f| filter = f,
-        .invalid => |msg| return .{ .invalid = msg },
+    const ck = catalog.encodeIndexKey(base_tid, index_tid);
+    const wire_key = (zdb.kv.Key{
+        .namespace = ns,
+        .table_id = catalog.index_table_id,
+        .primary = &ck,
+        .timestamp = 0,
+    }).marshal(a) catch |err| {
+        logDropIndexErr(di.name, "marshal key", err);
+        return replyError(state, "drop index failed");
     };
 
-    var for_update = false;
-    if (ss.lockingClause.len > 0) {
-        if (ss.lockingClause.len > 1)
-            return invalid("only a single FOR UPDATE clause is supported");
-        const lc = ss.lockingClause[0].LockingClause orelse
-            return invalid("unsupported locking clause");
-        if (!std.mem.eql(u8, lc.strength, "LCS_FORUPDATE"))
-            return invalid("only FOR UPDATE is supported");
-        if (!std.mem.eql(u8, lc.waitPolicy, "LockWaitBlock"))
-            return invalid("NOWAIT / SKIP LOCKED are not supported");
-        if (lc.lockedRels.len > 0)
-            return invalid("FOR UPDATE OF is not supported");
-        for_update = true;
-    }
-
-    return .{ .select = .{
-        .table = rv.relname,
-        .projection = if (star) .star else .{ .columns = try cols.toOwnedSlice(alloc) },
-        .filter = filter,
-        .for_update = for_update,
-    } };
-}
-
-/// Reject a recognized statement with a static client-facing reason —
-/// borrowed straight from .rodata, so no allocation.
-fn invalid(msg: []const u8) DdlStmt {
-    return .{ .invalid = msg };
-}
-
-/// Reject with a formatted reason, allocated into the parse arena.
-fn invalidFmt(
-    alloc: std.mem.Allocator,
-    comptime fmt: []const u8,
-    args: anytype,
-) parser.ParseError!DdlStmt {
-    return .{ .invalid = try std.fmt.allocPrint(alloc, fmt, args) };
-}
-
-/// BEGIN / START TRANSACTION / COMMIT / ROLLBACK. GOTCHA: TRANS_STMT_BEGIN
-/// is protobuf tag 0, so libpg_query OMITS `kind` for a plain BEGIN — the
-/// default must be begin. Transaction modes (ISOLATION LEVEL …) are
-/// ignored; savepoints and two-phase commit are rejected with a reason.
-const TransactionStmtJson = struct {
-    kind: []const u8 = "TRANS_STMT_BEGIN",
-};
-
-fn parseTransaction(
-    alloc: std.mem.Allocator,
-    body: std.json.Value,
-) parser.ParseError!DdlStmt {
-    const ts = try fromValue(TransactionStmtJson, alloc, body) orelse
-        return .unsupported;
-    const k = ts.kind;
-    if (std.mem.eql(u8, k, "TRANS_STMT_BEGIN") or
-        std.mem.eql(u8, k, "TRANS_STMT_START"))
-        return .begin_txn;
-    if (std.mem.eql(u8, k, "TRANS_STMT_COMMIT")) return .commit_txn;
-    if (std.mem.eql(u8, k, "TRANS_STMT_ROLLBACK")) return .rollback_txn;
-    return invalid("unsupported transaction statement");
-}
-
-/// DELETE FROM one_table [WHERE col = literal]. USING, RETURNING, WITH, and
-/// any non-equality WHERE are rejected with a reason. `WHERE egid = N` parses
-/// as an ordinary column filter — egid resolution stays server-side.
-fn parseDelete(
-    alloc: std.mem.Allocator,
-    body: std.json.Value,
-) parser.ParseError!DdlStmt {
-    const ds = try fromValue(DeleteStmtJson, alloc, body) orelse
-        return .unsupported;
-
-    if (ds.usingClause.len > 0)
-        return invalid("DELETE ... USING is not supported");
-    if (ds.returningList.len > 0)
-        return invalid("RETURNING is not supported");
-    if (ds.withClause != null)
-        return invalid("WITH is not supported");
-
-    var filter: ?Filter = null;
-    if (ds.whereClause) |w| switch (parseWhere(w)) {
-        .filter => |f| filter = f,
-        .invalid => |msg| return .{ .invalid = msg },
+    var kvs = [_]zen.KeyValueStruct{.{
+        .key = wire_key,
+        .value = "",
+        .meta = (zdb.kv.Meta{ .kind = .deleted }).toByte(),
+    }};
+    eng.proposeWrites(ns, &kvs, .apply) catch |err| {
+        logDropIndexErr(di.name, "tombstone", err);
+        return replyError(state, "drop index failed");
     };
 
-    return .{ .delete = .{ .table = ds.relation.relname, .filter = filter } };
-}
-
-/// UPDATE one_table SET col = literal [, ...] [WHERE col = literal].
-/// FROM, RETURNING, WITH, non-literal SET values, and duplicate SET
-/// columns are rejected with a reason.
-fn parseUpdate(
-    alloc: std.mem.Allocator,
-    body: std.json.Value,
-) parser.ParseError!DdlStmt {
-    const us = try fromValue(UpdateStmtJson, alloc, body) orelse
-        return .unsupported;
-
-    if (us.fromClause.len > 0)
-        return invalid("UPDATE ... FROM is not supported");
-    if (us.returningList.len > 0)
-        return invalid("RETURNING is not supported");
-    if (us.withClause != null)
-        return invalid("WITH is not supported");
-    if (us.targetList.len == 0) return .unsupported;
-
-    var filter: ?Filter = null;
-    if (us.whereClause) |w| switch (parseWhere(w)) {
-        .filter => |f| filter = f,
-        .invalid => |msg| return .{ .invalid = msg },
+    const mc = eng.forest.buildDropTables(a, ns, &.{index_tid}) catch |err| {
+        logDropIndexErr(di.name, "drop tree", err);
+        return replyError(state, "drop index failed");
+    };
+    eng.proposeMC(mc, .apply) catch |err| {
+        logDropIndexErr(di.name, "propose drop", err);
+        return replyError(state, "drop index failed");
+    };
+    self.srv.reloadTable(ns, base_tid) catch |err| {
+        logDropIndexErr(di.name, "reload table", err);
+        return replyError(state, "drop index failed");
     };
 
-    var sets: std.ArrayList(SetClause) = .empty;
-    for (us.targetList) |tn| {
-        const rt = tn.ResTarget;
-        if (rt.name.len == 0) return .unsupported;
-        const ac = rt.val.A_Const orelse
-            return invalid("SET value must be a literal");
-        for (sets.items) |s| {
-            if (std.mem.eql(u8, s.column, rt.name))
-                return invalid("duplicate column in SET");
-        }
-        const lit = literalFrom(ac);
-        if (lit == .unsupported)
-            return invalid("SET value must be a literal");
-        try sets.append(alloc, .{ .column = rt.name, .literal = lit });
-    }
-
-    return .{ .update = .{
-        .table = us.relation.relname,
-        .sets = try sets.toOwnedSlice(alloc),
-        .filter = filter,
-    } };
+    log.info("dropped index '{s}' (ns={d} base={d} index={d})", .{ di.name, ns, base_tid, index_tid });
+    try state.sendCommandComplete("DROP INDEX");
 }
 
-fn asObject(v: std.json.Value) ?std.json.ObjectMap {
-    return switch (v) {
-        .object => |o| o,
-        else => null,
-    };
+fn logCreateIndexErr(name: []const u8, what: []const u8, err: anyerror) void {
+    log.err(
+        "create index '{s}': {s}: {s}",
+        .{ name, what, @errorName(err) },
+    );
 }
 
-fn asString(v: std.json.Value) ?[]const u8 {
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
+fn logDropIndexErr(name: []const u8, what: []const u8, err: anyerror) void {
+    log.err(
+        "drop index '{s}': {s}: {s}",
+        .{ name, what, @errorName(err) },
+    );
 }

@@ -85,6 +85,15 @@ pub const Table = struct {
         }
         return null;
     }
+
+    /// Position of a live column by name in `columns` (exact match —
+    /// libpg_query lowercases unquoted identifiers, matching how names
+    /// are stored), or null. `column` returns the column itself; this
+    /// returns where it sits, for callers indexing parallel slices.
+    pub fn columnIndex(self: *const Table, name: []const u8) ?usize {
+        for (self.columns, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return i;
+        return null;
+    }
 };
 
 /// The scan window selecting every catalog row owned by `owner_id` in

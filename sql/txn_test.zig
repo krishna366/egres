@@ -232,6 +232,48 @@ test "txn: bump with clean prior reads succeeds" {
     try testing.expectEqual(600, tx.read_ts);
 }
 
+test "txn: bump revalidates a recorded posting read by its index key" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+    const blue = Key{
+        .namespace = ns,
+        .table_id = itid,
+        .primary = "blue",
+        .timestamp = read_ts,
+    };
+
+    // Statement 1 read the "blue" posting — the index-bitmap path
+    // records the INDEX key, not a scan. An unrelated row committing
+    // above the snapshot then bumps cleanly (a scan would Conflict).
+    {
+        var tx = fx.txn();
+        defer tx.deinit();
+        try tx.recordRead(blue);
+        try tx.beginStatement();
+
+        try fx.commit("r1", 600);
+        try testing.expectError(error.Restart, tx.lockRow(tid, "r1"));
+        try testing.expectEqual(600, tx.read_ts);
+    }
+    // Same shape, but a posting delta commits under "blue" itself —
+    // the membership statement 1 read is stale at any higher snapshot,
+    // so the bump must Conflict.
+    {
+        var tx = fx.txn();
+        defer tx.deinit();
+        try tx.recordRead(blue);
+        try tx.beginStatement();
+
+        var stale = blue;
+        stale.timestamp = 550;
+        try fx.oracle.updateItems(&.{
+            .{ .key = stale, .value = "", .meta = .{} },
+        });
+        try fx.commit("r1", 600);
+        try testing.expectError(error.Conflict, tx.lockRow(tid, "r1"));
+    }
+}
+
 test "txn: restartStatement rewinds the statement's read tracking" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();

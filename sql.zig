@@ -8,13 +8,21 @@
 //! catalog: table 1 of every namespace — the on-disk store of that
 //!         database's table schemas, plus its own binary-compiled
 //!         bootstrap schema.
-//! ddl:    parseDdl — SQL text → typed DDL statements via libpg_query.
+//! parse:  statement — SQL text → a typed Stmt via libpg_query.
 //! txn:    Txn — the transaction context DML statements run inside
 //!         (read_ts snapshot + pending-write skiplist).
 //! oracle: Oracle — recent commit timestamps by key identity hash,
 //!         for write-conflict detection (see docs/txn_conflicts.md).
-//! server: Server — the pgwire front-end over the engine (listener,
-//!         per-connection handler, DDL execution).
+//! server: Server — the pgwire front-end over the engine: listener,
+//!         per-database txn machinery, and the per-connection Handler
+//!         (session state, statement dispatch, DML restart driver,
+//!         transaction lifetime).
+//! ddl:    CREATE/DROP DATABASE, TABLE, INDEX — manifest and catalog
+//!         choreography, including CREATE INDEX's online backfill.
+//! dml:    INSERT / SELECT / DELETE / UPDATE statement bodies.
+//! scanner: WHERE resolution (the planner) and the row pipeline every
+//!         statement reads through — table scan, egid lookups, unique
+//!         index lookup, posting bitmap.
 
 const std = @import("std");
 
@@ -24,10 +32,13 @@ pub const row = @import("sql/row.zig");
 pub const catalog = @import("sql/catalog.zig");
 pub const table = @import("sql/table.zig");
 pub const key = @import("sql/key.zig");
-pub const ddl = @import("sql/ddl.zig");
+pub const parse = @import("sql/parse.zig");
 pub const txn = @import("sql/txn.zig");
 pub const oracle = @import("sql/oracle.zig");
 pub const server = @import("sql/server.zig");
+pub const ddl = @import("sql/ddl.zig");
+pub const dml = @import("sql/dml.zig");
+pub const scanner = @import("sql/scanner.zig");
 
 pub const Server = server.Server;
 pub const default_database = server.default_database;
