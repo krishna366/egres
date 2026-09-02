@@ -16,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DATA=/data/egres
+DATA="${DATA:-/data/egres}"
 LOG=/tmp/zdb/server.log
 E="host=127.0.0.1 port=3210 dbname=egres sslmode=disable"
 D=$(mktemp -d)

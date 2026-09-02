@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DATA=/data/egres
+DATA="${DATA:-/data/egres}"
 LOG=/tmp/zdb/server.log
 E="host=127.0.0.1 port=3210 dbname=egres sslmode=disable"
 
@@ -63,6 +63,8 @@ expect "INSERT two rows" "INSERT 0 2" q "INSERT INTO t VALUES (1, 'a'), (2, 'b')
 expect "SELECT * returns both" "(2 rows)" q "SELECT * FROM t;"
 expect "egid 1 = first row" "a" v "SELECT name FROM t WHERE egid = 1;"
 expect "egid 2 = second row" "b" v "SELECT name FROM t WHERE egid = 2;"
+expect "egid 0 rejected" "positive integer" q "SELECT name FROM t WHERE egid = 0;"
+expect "negative egid rejected (uint8 parse)" "invalid value" q "SELECT name FROM t WHERE egid = -1;"
 expect "WHERE on payload column" "b" v "SELECT name FROM t WHERE id = 2;"
 expect "SELECT egid, id, name" "(2 rows)" q "SELECT egid, id, name FROM t;"
 

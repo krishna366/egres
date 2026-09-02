@@ -117,9 +117,12 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     try testing.expectEqual(null, as_base.base_table_id);
     try testing.expectEqual(1, as_base.table_ids.items.len);
     try testing.expectEqual(pkey_index_id, as_base.table_ids.items[0]);
-    try testing.expect(t.pkey != null);
-    try testing.expectEqual(@as(usize, 0), t.pkey.?.column_index);
-    try testing.expectEqual(pkey_index_id, t.pkey.?.index_table_id);
+    // The index resolved its column to the live one; pkey is that index.
+    try testing.expectEqual(&t.columns[0], t.indexes[0].column);
+    try testing.expect(t.primary_index != null);
+    try testing.expectEqual(&t.indexes[0], t.primary_index.?);
+    try testing.expectEqual(@as(usize, 0), t.primary_index.?.column.pos);
+    try testing.expectEqual(pkey_index_id, t.primary_index.?.index_table_id);
 
     try testing.expectEqualStrings("id", t.columns[0].name);
     try testing.expectEqual(Type.int4, t.columns[0].ty);
@@ -133,9 +136,14 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     try testing.expectEqual(@as(usize, 2), t.ps.columns.len);
     try testing.expectEqual(@as(u16, 1), t.ps.n_varlen);
 
-    // Name resolution helper.
-    try testing.expect(t.column("id") != null);
+    // Name resolution: a pointer into `columns`, position included; the
+    // egid pseudo-column resolves too but is not among `columns`.
+    try testing.expectEqual(&t.columns[1], t.column("name").?);
+    try testing.expectEqual(@as(usize, 1), t.column("name").?.pos);
     try testing.expect(t.column("missing") == null);
+    try testing.expectEqual(&sql.table.egid_column, t.column("egid").?);
+    try testing.expect(t.column("egid").?.isEgid());
+    for (t.columns) |c| try testing.expect(!c.isEgid());
 }
 
 test "sql.table: load returns UndefinedTable when no catalog rows exist" {

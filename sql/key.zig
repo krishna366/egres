@@ -2,7 +2,8 @@
 //! the SQL layer gives them meaning.
 //!
 //! Row keys: a data table keys each row by its egid — a per-table,
-//! monotonically increasing u64 — stored as an 8-byte big-endian
+//! monotonically increasing u64 starting at 1 (0 is never a row) —
+//! stored as an 8-byte big-endian
 //! primary key, so byte order matches numeric order: scans walk rows
 //! in insertion order and the largest key is the largest egid.
 //!

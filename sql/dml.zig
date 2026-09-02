@@ -24,7 +24,6 @@ const server = @import("server.zig");
 const Handler = server.Handler;
 const RowEmitter = scanner.RowEmitter;
 const Scanner = scanner.Scanner;
-const SelectOut = scanner.SelectOut;
 const SetVal = scanner.SetVal;
 const String = value.String;
 const litToValue = scanner.litToValue;
@@ -50,39 +49,30 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
     // Open AFTER the intent locks: a statement that parked behind
     // DDL holding the table lock exclusively (CREATE/DROP INDEX)
     // must see the reloaded schema, not a stale cached Table.
-    const t = self.srv.openTable(ns, table_id) catch |err| {
+    const tbl = self.srv.openTable(ns, table_id) catch |err| {
         log.err("insert into '{s}': load schema: {s}", .{ ins.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
 
-    // Map each VALUES position → the column it writes: `col` carries the
-    // name and coercion type, `slot` is that column's cell in `values`
-    // (parallel to t.columns, == ps order). Positional insert maps 1:1
-    // to the live columns; an explicit list resolves names. Inserting an
-    // explicit `egid` isn't supported yet.
+    // The column each VALUES position writes (its cell in `values` is
+    // Column.pos). Positional insert is the live columns themselves;
+    // an explicit list resolves names. Inserting an explicit `egid`
+    // isn't supported yet.
     // TODO: allow user-provided egids once unique-index enforcement exists
     // — a below-counter egid needs a data-tree existence check, and
     // concurrent inserts of the same egid need apply-time validation.
-    const values = try arloc.alloc(value.Value, t.columns.len);
-    const Target = struct {
-        col: *const table.Column,
-        dst: *value.Value,
-    };
-    const targets: []Target = blk: {
-        if (ins.columns) |cols| {
-            const list = try arloc.alloc(Target, cols.len);
-            for (cols, list) |name, *target| {
-                if (std.ascii.eqlIgnoreCase(name, "egid"))
-                    return replyErrorCode(state, pgwire.sqlstate.feature_not_supported, "inserting an explicit egid is not supported yet");
-                const ci = t.columnIndex(name) orelse
-                    return replyErrorCode(state, pgwire.sqlstate.undefined_column, "column does not exist");
-                target.* = .{ .col = &t.columns[ci], .dst = &values[ci] };
-            }
-            break :blk list;
+    const values = try arloc.alloc(value.Value, tbl.columns.len);
+    const target_cols: []const table.Column = blk: {
+        const cols = ins.columns orelse break :blk tbl.columns;
+
+        const list = try arloc.alloc(table.Column, cols.len);
+        for (cols, list) |name, *target| {
+            const col = tbl.column(name) orelse
+                return replyErrorCode(state, pgwire.sqlstate.undefined_column, "column does not exist");
+            if (col.isEgid())
+                return replyErrorCode(state, pgwire.sqlstate.feature_not_supported, "inserting an explicit egid is not supported yet");
+            target.* = col.*;
         }
-        const list = try arloc.alloc(Target, t.columns.len);
-        for (list, t.columns, values) |*dst, *col, *slot|
-            dst.* = .{ .col = col, .dst = slot };
         break :blk list;
     };
 
@@ -94,45 +84,45 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
     // the whole statement, so nothing may be buffered until every
     // PK lock is held (§Phase 1). `values` is reused per row, so
     // anything derived from a row's cells is captured here.
-    const PendingRow = struct {
+    const Row = struct {
         bytes: String = "", // marshaled row value
         pkey: String = "", // PK index key, when t.pkey != null
-        /// Per idx_cols entry (same order): the index key this
-        /// row lands under. Always present — NULL cells key on
-        /// the NULL tag byte, and unencodable column types
+        /// Per posting index (same order as `posting_idx`): the
+        /// key this row lands under. Always present — NULL cells
+        /// key on the NULL tag byte, and unencodable column types
         /// (interval) never carry an index (rejected at CREATE
         /// INDEX).
-        postings: []String = &.{},
+        bitmap_keys: []String = &.{},
 
         fn lessByPkey(rows: []@This(), x: usize, y: usize) bool {
             return std.mem.lessThan(u8, rows[x].pkey, rows[y].pkey);
         }
     };
     const num_rows = ins.rows.len;
-    const idx_cols = try indexCols(arloc, t);
-    const pending = try arloc.alloc(PendingRow, num_rows);
-    for (ins.rows, pending) |row_lits, *pr| {
-        pr.* = .{};
-        if (row_lits.len != targets.len)
+    const bitmap_idxs = try bitmapIndexes(arloc, tbl);
+    const rows = try arloc.alloc(Row, num_rows);
+    for (ins.rows, rows) |row_lits, *prow| {
+        prow.* = .{};
+        if (row_lits.len != target_cols.len)
             return replyErrorCode(state, pgwire.sqlstate.syntax_error, "INSERT has the wrong number of values");
 
         for (values) |*v| v.* = .null_value; // reset all to null
 
-        for (row_lits, targets) |lit, target| {
-            target.dst.* =
-                (try coerceLiteral(state, arloc, lit, target.col.ty)) orelse
+        for (row_lits, target_cols) |lit, col| {
+            values[col.pos] =
+                (try coerceLiteral(state, arloc, lit, col.ty)) orelse
                 return;
         }
 
-        if (t.pkey) |pk| {
-            const pkv = values[pk.column_index];
-            if (pkv == .null_value)
+        if (tbl.primary_index) |pk| {
+            const val = values[pk.column.pos];
+            if (val == .null_value)
                 return replyErrorCode(
                     state,
                     pgwire.sqlstate.not_null_violation,
                     "null value in primary key column violates not-null constraint",
                 );
-            pr.pkey = key.encodeIndexKey(arloc, pkv, null) catch |err|
+            prow.pkey = key.encodeIndexKey(arloc, val, null) catch |err|
                 switch (err) {
                     error.OutOfMemory => return err,
                     error.Unencodable => return replyErrorCode(
@@ -142,12 +132,12 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
                     ),
                 };
         }
-        if (idx_cols.count() > 0) {
-            pr.postings = try arloc.alloc(String, idx_cols.count());
-            for (idx_cols.keys(), pr.postings) |col_idx, *posting_key| {
-                posting_key.* = key.encodeIndexKey(
+        if (bitmap_idxs.len > 0) {
+            prow.bitmap_keys = try arloc.alloc(String, bitmap_idxs.len);
+            for (bitmap_idxs, prow.bitmap_keys) |ix, *bm_key| {
+                bm_key.* = key.encodeIndexKey(
                     arloc,
-                    values[col_idx],
+                    values[ix.column.pos],
                     null,
                 ) catch |err| switch (err) {
                     error.Unencodable => unreachable,
@@ -156,8 +146,8 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
             }
         }
         // marshalRow reuses `buf`; dupe out before the next row clobbers it.
-        const bytes = try row.marshalRow(eng.allocator, &t.ps, values, &buf);
-        pr.bytes = try arloc.dupe(u8, bytes);
+        const bytes = try row.marshalRow(eng.allocator, &tbl.ps, values, &buf);
+        prow.bytes = try arloc.dupe(u8, bytes);
     }
 
     // Phase 1 (PK tables): reject duplicates, then lock every PK index
@@ -165,24 +155,24 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
     // multi-row locking AND an adjacency check for an in-statement
     // duplicate. lockRow may Restart (bump) / Conflict / Deadlock; on
     // Restart the driver re-runs from Phase 0 with nothing buffered.
-    if (t.pkey) |pk| {
-        const order = try arloc.alloc(usize, num_rows);
-        for (order, 0..) |*o, j| o.* = j;
-        std.mem.sort(usize, order, pending, PendingRow.lessByPkey);
+    if (tbl.primary_index) |pk| {
+        const row_order = try arloc.alloc(usize, num_rows);
+        for (row_order, 0..) |*o, j| o.* = j;
+        std.mem.sort(usize, row_order, rows, Row.lessByPkey);
 
         for (1..num_rows) |j| {
-            if (std.mem.eql(u8, pending[order[j - 1]].pkey, pending[order[j]].pkey))
+            if (std.mem.eql(u8, rows[row_order[j - 1]].pkey, rows[row_order[j]].pkey))
                 return replyErrorCode(state, pgwire.sqlstate.unique_violation, "duplicate key value violates unique constraint");
         }
-        for (order) |j| tx.lockRow(pk.index_table_id, pending[j].pkey) catch |err|
+        for (row_order) |j| tx.lockRow(pk.index_table_id, rows[j].pkey) catch |err|
             return replyLockErr(state, err);
         // Post-lock, read_ts covers the key's newest commit: a live
         // index entry means the PK value already exists.
-        for (order) |j| {
+        for (row_order) |j| {
             const found = tx.lookup(.{
                 .namespace = ns,
                 .table_id = pk.index_table_id,
-                .primary = pending[j].pkey,
+                .primary = rows[j].pkey,
                 .timestamp = tx.read_ts,
             }) catch |err| {
                 log.err("insert into '{s}': pk probe: {s}", .{ ins.table, @errorName(err) });
@@ -200,7 +190,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
     // bump). The whole VALUES list commits atomically as one .data
     // entry; an implicit txn waits for apply so an immediate SELECT
     // on this session sees the rows.
-    for (pending) |pr| {
+    for (rows) |prow| {
         const egid = self.srv.allocEgid(ns, table_id) catch |err| switch (err) {
             error.NotLeader => return replyError(state, "not the leader"),
             else => {
@@ -209,15 +199,15 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
             },
         };
         const ekey = key.encodeEgid(egid);
-        try tx.put(table_id, &ekey, pr.bytes, .{});
+        try tx.put(table_id, &ekey, prow.bytes, .{});
         // The index entry's value is the row key: the same 8 BE bytes.
-        if (t.pkey) |pk|
-            try tx.put(pk.index_table_id, pr.pkey, &ekey, .{});
+        if (tbl.primary_index) |pk|
+            try tx.put(pk.index_table_id, prow.pkey, &ekey, .{});
         // Non-unique indexes: commuting posting deltas, NO locks —
         // the row lock (here, a fresh egid) serializes add/remove
         // of one egid (docs/transactions.md, lock classes).
-        for (idx_cols.values(), pr.postings) |index_tid, posting_key|
-            try tx.putPosting(index_tid, posting_key, egid, .add);
+        for (bitmap_idxs, prow.bitmap_keys) |ix, posting_key|
+            try tx.putPosting(ix.index_table_id, posting_key, egid, .add);
     }
 
     if (tx.implicit) {
@@ -232,9 +222,10 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void
     const ns = try self.sessionNamespace(state) orelse return;
     const table_id = eng.forest.lookupTable(ns, sel.table) orelse
         return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
+
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arloc = arena.allocator();
 
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
@@ -244,24 +235,28 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void
         return replyError(state, "failed to load table schema");
     };
 
-    // Resolve outputs: `egid` (from the key) or a payload column (its index
-    // into ps.columns == the empty-projection decode order).
-    var outs: std.ArrayList(SelectOut) = .empty;
+    // Resolve outputs: `*` is the user columns; by name, egid resolves
+    // like any other column (Table.column).
+    var cols: std.ArrayList(*const table.Column) = .empty;
     switch (sel.projection) {
-        .star => for (t.columns) |c| {
-            try outs.append(a, .{ .name = c.name, .ty = c.ty, .source = .{ .cell = t.ps.index(c.column_id) } });
-        },
+        .star => for (t.columns) |*c| try cols.append(arloc, c),
         .columns => |names| for (names) |nm| {
-            if (std.ascii.eqlIgnoreCase(nm, "egid")) {
-                try outs.append(a, .{ .name = "egid", .ty = .int8, .source = .egid });
-            } else if (t.column(nm)) |c| {
-                try outs.append(a, .{ .name = c.name, .ty = c.ty, .source = .{ .cell = t.ps.index(c.column_id) } });
-            } else return replyErrorCode(state, pgwire.sqlstate.undefined_column, "column does not exist");
+            const c = t.column(nm) orelse
+                return replyErrorCode(
+                    state,
+                    pgwire.sqlstate.undefined_column,
+                    "column does not exist",
+                );
+            try cols.append(arloc, c);
         },
     }
 
-    const fields = try a.alloc(pgwire.FieldDescription, outs.items.len);
-    for (outs.items, fields) |o, *fd| fd.* = .{ .name = o.name, .type_oid = value.pgTypeOid(o.ty), .format_code = 0 };
+    const fields = try arloc.alloc(pgwire.FieldDescription, cols.items.len);
+    for (cols.items, fields) |c, *fd| fd.* = .{
+        .name = c.name,
+        .type_oid = value.pgTypeOid(c.ty),
+        .format_code = 0,
+    };
     // FOR UPDATE sends NOTHING until every lock is held: lockRow may
     // Restart the statement, and bytes already on the wire (the row
     // description, emitted rows) would repeat on the re-run.
@@ -269,19 +264,17 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void
 
     var emitter = RowEmitter{
         .state = state,
-        .ps = &t.ps,
-        .outs = outs.items,
-        .stmt_alloc = a,
+        .t = t,
+        .outs = cols.items,
     };
-    defer emitter.deinit();
 
     // Plain SELECT streams matches to the wire as run() visits
     // them; FOR UPDATE captures them (values included) to lock
     // every one BEFORE the first byte is sent — the UPDATE/DELETE
     // lock-all shape with "act" = emission.
     var sc = Scanner{
-        .a = a,
-        .ps = &t.ps,
+        .a = arloc,
+        .t = t,
         .mode = if (sel.for_update)
             .copy_value
         else
@@ -289,7 +282,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void
         .lock = sel.for_update,
     };
     if (sel.filter) |f| {
-        switch ((try resolveFilter(state, a, t, f)) orelse return) {
+        switch ((try resolveFilter(state, arloc, t, f)) orelse return) {
             .egids => |es| sc.source = .{ .egids = es },
             .index_eq => |ix| sc.source = .{ .index_eq = ix },
             .index_bitmap => |ix| sc.source = .{ .index_bitmap = ix },
@@ -316,7 +309,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void
         for (sc.items.items) |item| try emitter.emit(item);
     }
 
-    try state.sendCommandComplete(try std.fmt.allocPrint(a, "SELECT {d}", .{emitter.count}));
+    try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "SELECT {d}", .{emitter.count}));
 }
 
 pub fn delete(self: *Handler, state: *pgwire.ConnState, del: parse.Delete) !void {
@@ -345,17 +338,14 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: parse.Delete) !void
     // → scan + compare; no WHERE → tombstone every live row. Either
     // way run() captures the matches; every one is locked, then
     // tombstoned from the capture.
-    const idx_cols = try indexCols(arloc, tbl);
+    const posting_idx = try bitmapIndexes(arloc, tbl);
     var sc = Scanner{
         .a = arloc,
-        .ps = &tbl.ps,
+        .t = tbl,
         // Indexed tables keep the old bytes so every index entry —
         // the PK's (PK value → egid) and each posting's remove —
         // can be derived from the row being tombstoned.
-        .mode = if (tbl.pkey != null or idx_cols.count() > 0)
-            .copy_value
-        else
-            .no_value,
+        .mode = if (tbl.indexes.len > 0) .copy_value else .no_value,
         .lock = true,
     };
     if (del.filter) |f| {
@@ -377,12 +367,12 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: parse.Delete) !void
     // row tombstones: the index-key lock serializes against a concurrent
     // re-insert of the same key (whose fresh entry a late tombstone would
     // otherwise shadow). Locking may Restart — safe, nothing buffered yet.
-    if (tbl.pkey) |pk| {
+    if (tbl.primary_index) |pk| {
         const items = sc.items.items;
         const index_keys = try arloc.alloc([]const u8, items.len);
 
         for (items, index_keys) |item, *ik| {
-            const pkv = row.readCell(&tbl.ps, item.value, pk.column_index);
+            const pkv = tbl.read(item, pk.column);
             ik.* = key.encodeIndexKey(arloc, pkv, null) catch |err|
                 switch (err) {
                     error.OutOfMemory => return err,
@@ -409,14 +399,14 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: parse.Delete) !void
     // block above), so no Restart can strand these.
     for (sc.items.items) |item| {
         const egid = key.decodeEgid(item.key.primary).?;
-        for (idx_cols.keys(), idx_cols.values()) |col_idx, index_tid| {
-            const cell = row.readCell(&tbl.ps, item.value, col_idx);
+        for (posting_idx) |ix| {
+            const cell = tbl.read(item, ix.column);
             const old_key = key.encodeIndexKey(arloc, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
                     else => return err,
                 };
-            try tx.putPosting(index_tid, old_key, egid, .remove);
+            try tx.putPosting(ix.index_table_id, old_key, egid, .remove);
         }
     }
 
@@ -454,17 +444,16 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
         log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
-    const idx_cols = try indexCols(arloc, t);
+    const posting_idx = try bitmapIndexes(arloc, t);
 
     // A SET on an indexed column moves each matched row's egid
     // from its old posting to a statement-constant new one (the
-    // SET value is one literal for every row): the encoded new
-    // key plus where the old one comes from (col_idx into the
-    // pre-image). Parse rejects duplicate SET columns, so one
-    // entry per column.
+    // SET value is one literal for every row): the index (whose
+    // column reads the old key out of the pre-image) plus the
+    // encoded new key. Parse rejects duplicate SET columns, so
+    // one entry per column.
     const MovedCol = struct {
-        table_id: u32,
-        col_idx: usize,
+        index: *const table.Index,
         new_key: String,
     };
     var moved_cols: std.ArrayList(MovedCol) = .empty;
@@ -473,40 +462,36 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
     // been updated and what their new value is.
     const set_cols = try arloc.alloc(SetVal, up.sets.len);
     for (up.sets, set_cols) |clause, *sv| {
-        if (std.ascii.eqlIgnoreCase(clause.column, "egid"))
-            return replyErrorCode(
-                state,
-                pgwire.sqlstate.feature_not_supported,
-                "egid cannot be updated",
-            );
-        const col_idx = t.columnIndex(clause.column) orelse
+        const col = t.column(clause.column) orelse
             return replyErrorCode(
                 state,
                 pgwire.sqlstate.undefined_column,
                 "column does not exist",
             );
+        if (col.isEgid())
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.feature_not_supported,
+                "egid cannot be updated",
+            );
         // A changed PK would move the row's index entry; not supported
         // this arc (the index stays valid only while the key is fixed).
-        if (t.columns[col_idx].pkey_position != null)
+        if (col.pkey_position != null)
             return replyErrorCode(
                 state,
                 pgwire.sqlstate.feature_not_supported,
                 "PRIMARY KEY column cannot be updated",
             );
-        const col = t.columns[col_idx];
         const val =
             (try coerceLiteral(state, arloc, clause.literal, col.ty)) orelse
             return;
-        sv.* = .{
-            .idx = t.ps.index(col.column_id),
-            .val = val,
-        };
+        sv.* = .{ .col = col, .val = val };
 
-        if (idx_cols.get(sv.idx)) |index_tid| {
+        for (posting_idx) |ix| {
+            if (ix.column != col) continue;
             try moved_cols.append(arloc, .{
-                .table_id = index_tid,
-                .col_idx = sv.idx,
-                .new_key = key.encodeIndexKey(arloc, sv.val, null) catch |err|
+                .index = ix,
+                .new_key = key.encodeIndexKey(arloc, val, null) catch |err|
                     switch (err) {
                         error.Unencodable => unreachable,
                         else => return err,
@@ -522,7 +507,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
     // happens post-lock.
     var sc = Scanner{
         .a = arloc,
-        .ps = &t.ps,
+        .t = t,
         .mode = .copy_value,
         .lock = true,
     };
@@ -554,7 +539,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
     for (sc.items.items) |item| {
         const egid = key.decodeEgid(item.key.primary).?;
         for (moved_cols.items) |mv| {
-            const cell = row.readCell(&t.ps, item.value, mv.col_idx);
+            const cell = t.read(item, mv.index.column);
             const old_key = key.encodeIndexKey(arloc, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
@@ -563,8 +548,8 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
             // If old_key and new_key match, there's no change. Skip.
             if (std.mem.eql(u8, old_key, mv.new_key)) continue;
 
-            try tx.putPosting(mv.table_id, old_key, egid, .remove);
-            try tx.putPosting(mv.table_id, mv.new_key, egid, .add);
+            try tx.putPosting(mv.index.index_table_id, old_key, egid, .remove);
+            try tx.putPosting(mv.index.index_table_id, mv.new_key, egid, .add);
         }
         const rewritten = try rewriteRowBytes(
             arloc,
@@ -621,26 +606,21 @@ fn lessThanBytes(_: void, x: []const u8, y: []const u8) bool {
     return std.mem.lessThan(u8, x, y);
 }
 
-/// key indexes t.columns, t.ps and a row's values alike — same
-/// order): O(1) "is this column indexed?", and — ArrayHashMap —
-/// stable order, so callers can zip keys()/values() against parallel
-/// slices. At most one non-unique index per column (CREATE INDEX
-/// rejects seconds; the assert enforces it here). These indexes carry
-/// roaring postings maintained as commuting deltas (Txn.putPosting);
-/// unique indexes (the pkey) keep their single-egid lock-then-check
-/// path.
-fn indexCols(
+/// The indexes maintained as roaring postings — every non-unique index
+/// of `t`, at most one per column (CREATE INDEX rejects seconds). Their
+/// entries are commuting deltas (Txn.putPosting); unique indexes (the
+/// pkey) keep their single-egid lock-then-check path. Pointers into
+/// t.indexes, in a stable order callers zip parallel slices against.
+fn bitmapIndexes(
     a: std.mem.Allocator,
     t: *const table.Table,
-) !std.AutoArrayHashMapUnmanaged(usize, u32) {
-    var map: std.AutoArrayHashMapUnmanaged(usize, u32) = .empty;
-    for (t.indexes) |idx| {
+) ![]const *const table.Index {
+    var list: std.ArrayList(*const table.Index) = .empty;
+    for (t.indexes) |*idx| {
         if (idx.unique) continue;
-        const gop = try map.getOrPut(a, t.ps.index(idx.column_id));
-        std.debug.assert(!gop.found_existing);
-        gop.value_ptr.* = idx.index_table_id;
+        try list.append(a, idx);
     }
-    return map;
+    return list.toOwnedSlice(a);
 }
 
 fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {

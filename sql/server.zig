@@ -305,6 +305,9 @@ pub const Server = struct {
         defer db.tables_mu.unlock();
         const t = try self.openTableLocked(db, table_id);
         const egid = t.next_egid;
+        // egids start at 1 (openTableLocked seeds the counter); 0 is
+        // never a row.
+        std.debug.assert(egid >= 1);
         t.next_egid += 1;
         return egid;
     }

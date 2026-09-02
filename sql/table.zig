@@ -14,6 +14,7 @@ const zdb = @import("zdb");
 const value = @import("value.zig");
 const schema = @import("schema.zig");
 const row = @import("row.zig");
+const key = @import("key.zig");
 const catalog = @import("catalog.zig");
 
 const Forest = zdb.forest.Forest;
@@ -34,36 +35,67 @@ comptime {
 }
 
 /// One live column of a loaded table. `name` is owned by the Table's arena.
-/// Order matches the compiled PhysicalSchema positionally (both ascending by
-/// column_id), so `columns[i]` describes `ps.columns[i]`.
+/// Statements hold a `*const Column` (into `Table.columns`, stable for the
+/// Table's life) and never a bare position or column_id: `column_id` is
+/// the catalog's stable identity, what index rows name; `pos` is where
+/// the column sits at runtime.
 pub const Column = struct {
     column_id: u32,
+    /// Slot in `columns`, in `ps.columns`, in a row decoded with the empty
+    /// projection (row.unmarshalRow / readCell), and in INSERT's values —
+    /// all four are the live columns in column_id order. Minted once, in
+    /// loadTableSchema, where the parallel-arrays invariant is asserted.
+    pos: usize,
     name: []const u8,
     ty: value.Type,
     pkey_position: ?u16,
+
+    /// The row-key pseudo-column (`egid_column`).
+    pub fn isEgid(self: *const Column) bool {
+        return self.column_id == egid_column.column_id;
+    }
 };
 
-/// The PRIMARY KEY's summary, resolved once at load so statements needn't
-/// rescan. `column_index` is the key column's position in `columns` (==
-/// `ps.columns` position, for pulling its value out of a positional row);
-/// `index_table_id` is its unique index's tree.
-pub const Pkey = struct {
-    column_index: usize,
+/// The row-key pseudo-column: column_id 0 marks it (user ids start at
+/// 1). Its value is the row's egid, read from the KEY, not the row
+/// bytes, so it has no position — `pos` is maxInt, so any use as an
+/// index faults instead of silently reading column 0. It is not in
+/// `Table.columns` — SELECT * and positional INSERT never see it — but
+/// `Table.column` resolves it by name, so it can be projected and
+/// filtered on; INSERT and UPDATE refuse it.
+pub const egid_column = Column{
+    .column_id = 0,
+    .pos = std.math.maxInt(usize),
+    .name = "egid",
+    // Egids are u64; uint8 rides the wire as numeric — the one pg type
+    // that holds the full range (value.pgTypeOid).
+    .ty = .uint8,
+    .pkey_position = null,
+};
+
+/// One index of a loaded table, its catalog row's column_id resolved to
+/// the live `Column` it keys on — the one id → column resolution. DML
+/// and the planner compare and read through the pointer.
+pub const Index = struct {
     index_table_id: u32,
+    unique: bool,
+    valid: bool,
+    column: *const Column,
 };
 
 /// A user table as the SQL layer sees it: its live columns (logical schema)
 /// and compiled byte layout (physical schema) for encoding/decoding rows, plus
 /// the next row id to hand out. `loadTableSchema` fills the schema; `next_egid`
 /// is runtime state (0 out of the load). Owns one arena — all of `columns`,
-/// their names, and `ps` live in it, so `deinit` frees everything.
+/// their names, `indexes`, and `ps` live in it, so `deinit` frees everything.
 pub const Table = struct {
+    /// The user columns — what SELECT * and positional INSERT walk.
     columns: []Column,
-    /// Every index of this table (owned by the arena). The PK index, if any,
-    /// is also summarized in `pkey`.
-    indexes: []catalog.IndexDef,
-    /// The PRIMARY KEY index, or null for a table without one.
-    pkey: ?Pkey,
+    /// Every index of this table, columns resolved.
+    indexes: []Index,
+    /// The PRIMARY KEY's index — the one on the column with `pkey_position`
+    /// set — or null for a table without one.
+    primary_index: ?*const Index,
     ps: schema.PhysicalSchema,
     version: u16,
     arena: std.heap.ArenaAllocator,
@@ -78,21 +110,23 @@ pub const Table = struct {
         self.arena.deinit();
     }
 
-    /// The live column with this name, or null. Linear scan (columns is small).
-    pub fn column(self: *const Table, name: []const u8) ?Column {
-        for (self.columns) |c| {
+    /// The live column with this name (exact match — libpg_query
+    /// lowercases unquoted identifiers, matching how names are stored),
+    /// the egid pseudo-column, or null. Linear scan (columns is small).
+    pub fn column(self: *const Table, name: []const u8) ?*const Column {
+        if (std.mem.eql(u8, name, egid_column.name)) return &egid_column;
+        for (self.columns) |*c| {
             if (std.mem.eql(u8, c.name, name)) return c;
         }
         return null;
     }
 
-    /// Position of a live column by name in `columns` (exact match —
-    /// libpg_query lowercases unquoted identifiers, matching how names
-    /// are stored), or null. `column` returns the column itself; this
-    /// returns where it sits, for callers indexing parallel slices.
-    pub fn columnIndex(self: *const Table, name: []const u8) ?usize {
-        for (self.columns, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return i;
-        return null;
+    /// One column's value out of a stored row: the egid from the key,
+    /// any other cell by a null-bit test plus one O(1) read
+    /// (row.readCell) — no full-row decode.
+    pub fn read(self: *const Table, item: Item, col: *const Column) value.Value {
+        if (col.isEgid()) return .{ .uint8 = key.decodeEgid(item.key.primary).? };
+        return row.readCell(&self.ps, item.value, col.pos);
     }
 };
 
@@ -198,12 +232,16 @@ pub fn loadTableSchema(
     const logical = catalog.reconstruct(ctx.all.items);
     const ps = try schema.compile(a, logical, logical.current_version);
 
-    // Expose only the columns live at the current version, in ps order.
+    // Expose only the columns live at the current version, in ps order:
+    // `pos` is the slot in both, asserted here where it is minted.
     var cols: std.ArrayList(Column) = .empty;
     for (ctx.all.items) |lc| {
         if (!lc.liveAt(logical.current_version)) continue;
+        const pos = cols.items.len;
+        std.debug.assert(ps.columns[pos].column_id == lc.column_id);
         try cols.append(a, .{
             .column_id = lc.column_id,
+            .pos = pos,
             .name = lc.name,
             .ty = lc.ty,
             .pkey_position = lc.pkey_position,
@@ -211,25 +249,31 @@ pub fn loadTableSchema(
     }
     const columns = try cols.toOwnedSlice(a);
 
-    // Indexes (table 2), plus the PK summary derived from them: the key
-    // column (pkey_position set) paired with the index on it.
-    const indexes = try loadIndexes(a, forest, index_catalog_ps, ns, table_id);
-    var pkey: ?Pkey = null;
-    for (columns, 0..) |c, i| {
-        if (c.pkey_position == null) continue;
-        for (indexes) |idx| if (idx.column_id == c.column_id) {
-            pkey = .{
-                .column_index = i,
-                .index_table_id = idx.index_table_id,
-            };
+    // Indexes (table 2), each resolved to the live column it keys on —
+    // an index naming a column the table doesn't have is corrupt
+    // catalog state. The pointers target the arena-owned `columns`
+    // slice, so they survive the Table being moved into the cache.
+    const defs = try loadIndexes(a, forest, index_catalog_ps, ns, table_id);
+    const indexes = try a.alloc(Index, defs.len);
+    for (defs, indexes) |def, *idx| {
+        const col = for (columns) |*c| {
+            if (c.column_id == def.column_id) break c;
+        } else return error.CorruptCatalogRow;
+        idx.* = .{
+            .index_table_id = def.index_table_id,
+            .unique = def.unique,
+            .valid = def.valid,
+            .column = col,
         };
-        break; // single-column PK only
     }
+    const pkey: ?*const Index = for (indexes) |*idx| {
+        if (idx.column.pkey_position != null) break idx;
+    } else null;
 
     return .{
         .columns = columns,
         .indexes = indexes,
-        .pkey = pkey,
+        .primary_index = pkey,
         .ps = ps,
         .version = logical.current_version,
         .arena = arena,

@@ -21,11 +21,8 @@ const server = @import("server.zig");
 const log = std.log.scoped(.sql);
 const replyErrorCode = server.replyErrorCode;
 
-/// Where a SELECT output column's value comes from.
-pub const SelectSource = union(enum) { egid, cell: usize };
-pub const SelectOut = struct { name: []const u8, ty: value.Type, source: SelectSource };
-/// A resolved `column = value` filter: the column's decode-cell index + target.
-pub const CellFilter = struct { idx: usize, val: value.Value };
+/// A resolved `column = value` filter: the column + the target value.
+pub const CellFilter = struct { col: *const table.Column, val: value.Value };
 /// A resolved index point lookup: which index tree + the memcomparable key.
 pub const IndexLookup = struct { index_table_id: u32, key: []const u8 };
 
@@ -49,29 +46,11 @@ const ResolvedFilter = union(enum) {
 pub fn resolveFilter(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,
-    t: *const table.Table,
-    f: parse.Filter,
+    tbl: *const table.Table,
+    filter: parse.Filter,
 ) !?ResolvedFilter {
     const bad_value = pgwire.sqlstate.invalid_text_representation;
-    if (std.ascii.eqlIgnoreCase(f.column, "egid")) {
-        const n = switch (f.literal) {
-            .int => |v| v,
-            else => {
-                try replyErrorCode(state, bad_value, "egid must be an integer");
-                return null;
-            },
-        };
-        if (n < 0) {
-            try replyErrorCode(
-                state,
-                bad_value,
-                "egid must be a non-negative integer",
-            );
-            return null;
-        }
-        return .{ .egids = try a.dupe(u64, &.{@intCast(n)}) };
-    }
-    const fc = t.column(f.column) orelse {
+    const fcol = tbl.column(filter.column) orelse {
         try replyErrorCode(
             state,
             pgwire.sqlstate.undefined_column,
@@ -79,21 +58,42 @@ pub fn resolveFilter(
         );
         return null;
     };
-    const val = litToValue(a, f.literal, fc.ty) catch |err| switch (err) {
+    const val = litToValue(a, filter.literal, fcol.ty) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             try replyErrorCode(state, bad_value, "invalid value in WHERE");
             return null;
         },
     };
+    // The egid IS the row key: a point lookup, never a cell compare.
+    // The column is uint8, so a negative literal already failed to
+    // parse above; only zero (never a row) needs rejecting here.
+    if (fcol.isEgid()) {
+        const n = switch (val) {
+            .uint8 => |n| n,
+            else => {
+                try replyErrorCode(state, bad_value, "egid must be an integer");
+                return null;
+            },
+        };
+        if (n == 0) {
+            try replyErrorCode(
+                state,
+                bad_value,
+                "egid must be a positive integer",
+            );
+            return null;
+        }
+        return .{ .egids = try a.dupe(u64, &.{n}) };
+    }
     // An index on this column turns the filter into an index read. An
     // unencodable value (interval) falls back to a cell compare,
     // preserving today's semantics. NULL encodes (its own tag-byte
     // key), and `= NULL` matching NULL rows is deliberately consistent
     // with the cell path's valuesEqual(null, null) — Postgres-strict IS
     // NULL semantics are one future decision covering both paths.
-    index: for (t.indexes) |idx| {
-        if (idx.column_id != fc.column_id) continue;
+    index: for (tbl.indexes) |idx| {
+        if (idx.column != fcol) continue;
         // Mid-backfill: DML maintains the index but reads must not
         // trust it yet (catalog.IndexDef.valid); fall through to the
         // cell scan.
@@ -107,13 +107,13 @@ pub fn resolveFilter(
             .key = ik,
         };
         // Unique: the entry's value IS the one row key. Non-unique:
-        // the entry is a roaring posting — every matching egid.
+        // the entry is a roaring bitmap — every matching egid.
         return if (idx.unique)
             .{ .index_eq = lu }
         else
             .{ .index_bitmap = lu };
     }
-    return .{ .cell = .{ .idx = t.ps.index(fc.column_id), .val = val } };
+    return .{ .cell = .{ .col = fcol, .val = val } };
 }
 
 /// Turns each row into a projected DataRow on the wire — Scanner's
@@ -123,26 +123,17 @@ pub fn resolveFilter(
 /// which the connection's buffered writer batches to the socket.
 pub const RowEmitter = struct {
     state: *pgwire.ConnState,
-    ps: *const schema.PhysicalSchema,
-    outs: []const SelectOut,
-    stmt_alloc: std.mem.Allocator, // backs the reused `decoded` row
-    decoded: value.Row = .{},
+    t: *const table.Table,
+    /// The projection — egid is a column too (table.egid_column).
+    outs: []const *const table.Column,
     count: u64 = 0,
 
-    pub fn deinit(self: *RowEmitter) void {
-        self.decoded.deinit(self.stmt_alloc);
-    }
-
-    /// Project and send one row.
+    /// Project and send one row — each output cell decoded on its own
+    /// (O(1) each, Table.read), no full-row decode.
     pub fn emit(self: *RowEmitter, item: zdb.kv.Item) !void {
-        try row.unmarshalRow(self.stmt_alloc, self.ps, item.value, &.{}, &self.decoded);
-
         var dw = try self.state.beginDataRow(@intCast(self.outs.len));
-        for (self.outs) |o| {
-            const v: value.Value = switch (o.source) {
-                .egid => .{ .int8 = @intCast(key.decodeEgid(item.key.primary) orelse 0) },
-                .cell => |idx| self.decoded.at(idx),
-            };
+        for (self.outs) |col| {
+            const v = self.t.read(item, col);
             if (v == .null_value) {
                 try dw.writeNull();
             } else {
@@ -178,7 +169,7 @@ pub fn litToValue(a: std.mem.Allocator, lit: parse.Literal, ty: value.Type) !val
 /// tombstones, so only live rows are seen — re-running a DELETE reports 0.
 pub const Scanner = struct {
     a: std.mem.Allocator, // statement arena — backs items
-    ps: *const schema.PhysicalSchema,
+    t: *const table.Table,
     cell_filter: ?CellFilter = null,
     source: Source = .table,
     mode: Mode,
@@ -251,7 +242,7 @@ pub const Scanner = struct {
     fn collect(self: *Scanner, item: zdb.kv.Item) !void {
         // Filter on the ONE cell it names — no full-row decode here.
         if (self.cell_filter) |cf| {
-            if (!value.valuesEqual(row.readCell(self.ps, item.value, cf.idx), cf.val))
+            if (!value.valuesEqual(self.t.read(item, cf.col), cf.val))
                 return;
         }
         const captured: zdb.kv.Item = switch (self.mode) {
@@ -267,7 +258,7 @@ pub const Scanner = struct {
                 var buf: std.ArrayList(u8) = .empty; // arena; persists
                 dup.value = try rewriteRowBytes(
                     self.a,
-                    self.ps,
+                    &self.t.ps,
                     sets,
                     &self.decoded,
                     item.value,
@@ -444,9 +435,8 @@ pub const Scanner = struct {
     }
 };
 
-/// One resolved SET assignment: the cell's decode-order index + its typed
-/// replacement value.
-pub const SetVal = struct { idx: usize, val: value.Value };
+/// One resolved SET assignment: the column + its typed replacement value.
+pub const SetVal = struct { col: *const table.Column, val: value.Value };
 
 /// UPDATE's rewrite: decode `src` (its cells borrow from src — the call
 /// must finish while src is alive), overlay the SET values, marshal the
@@ -464,6 +454,6 @@ pub fn rewriteRowBytes(
     try row.unmarshalRow(a, ps, src, &.{}, dec);
     // Overlaying into the codec's backing store is fine: the next
     // unmarshalRow refills every cell.
-    for (sets) |sv| dec.cells.items[sv.idx] = sv.val;
+    for (sets) |sv| dec.cells.items[sv.col.pos] = sv.val;
     return row.marshalRow(a, ps, dec.items(), buf);
 }

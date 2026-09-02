@@ -329,7 +329,11 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: parse.DropTable) 
 ///     data this tree will ever hold, which is exactly what the
 ///     bottom level means — level-ordering holds against all the
 ///     deltas above;
-///  7. flip valid=true + reloadTable — reads may now use it.
+///  7. retake the table intent as a barrier again, and under it flip
+///     valid=true + reloadTable — reads may now use it. The reload
+///     destroys the cached Table, which is only safe while no
+///     statement holds it (DML holds the shared intent from dmlTxn
+///     to txn end); the barrier drains them and parks new ones.
 /// Crash/failure windows: before 4 → an invisible orphan tree;
 /// after 4 → an INVALID index accumulating deltas, never
 /// consulted (DROP INDEX cleans it up; a re-run backfill could
@@ -351,13 +355,12 @@ pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: parse.CreateInd
         logCreateIndexErr(ci.table, "load schema", err);
         return replyError(state, "failed to load table schema");
     };
-    const col_pos = t.columnIndex(ci.column) orelse
+    const col = t.column(ci.column) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.undefined_column,
             "column does not exist",
         );
-    const col = t.columns[col_pos];
     if (col.ty == .interval)
         return replyErrorCode(
             state,
@@ -382,16 +385,17 @@ pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: parse.CreateInd
             "index already exists",
         );
     }
-    // One non-unique index per column — indexCols' invariant.
+    // One non-unique index per column — postingIndexes' invariant.
     for (t.indexes) |idx| {
-        if (!idx.unique and idx.column_id == col.column_id)
+        if (!idx.unique and idx.column == col)
             return replyErrorCode(
                 state,
                 pgwire.sqlstate.feature_not_supported,
                 "column is already indexed",
             );
     }
-    // `t` dangles past reloadTable below; keep what's needed.
+    // `t` (and `col` into it) dangle past reloadTable below; keep
+    // what's needed.
     const column_id = col.column_id;
 
     const created = eng.forest.buildCreateTables(
@@ -481,14 +485,18 @@ pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: parse.CreateInd
         logCreateIndexErr(name, "reopen schema", err);
         return replyError(state, "create index failed");
     };
+    const col2 = t2.column(ci.column) orelse {
+        logCreateIndexErr(name, "reopen schema", error.ColumnMissing);
+        return replyError(state, "create index failed");
+    };
     const n_keys = backfillIndex(
         self,
         a,
         ns,
         base_tid,
         index_tid,
-        &t2.ps,
-        col_pos,
+        t2,
+        col2,
         snap,
     ) catch |err| {
         logCreateIndexErr(name, "backfill", err);
@@ -504,6 +512,12 @@ pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: parse.CreateInd
             return replyError(state, "create index failed");
         }
     }
+
+    // Barrier again for the flip: reloadTable below frees the Table
+    // every in-flight statement on this base holds.
+    _ = db.locks.acquire(tkey, owner, .exclusive) catch |err|
+        return replyLockErr(state, err);
+    barrier_held = true;
 
     var vdef = def;
     vdef.valid = true;
@@ -534,15 +548,15 @@ fn backfillIndex(
     ns: u64,
     base_tid: u32,
     index_tid: u32,
-    ps: *const schema.PhysicalSchema,
-    col_pos: usize,
+    t: *const table.Table,
+    col: *const table.Column,
     snap: u64,
 ) !usize {
     const eng = self.srv.engine;
     const Fold = struct {
         a: std.mem.Allocator,
-        ps: *const schema.PhysicalSchema,
-        col_pos: usize,
+        t: *const table.Table,
+        col: *const table.Column,
         rows: usize = 0,
         map: std.StringArrayHashMapUnmanaged(zdb.zroar.Bitmap) = .empty,
 
@@ -550,7 +564,7 @@ fn backfillIndex(
             const egid = key.decodeEgid(item.key.primary) orelse
                 return true; // not row-shaped: nothing to index
             ctx.rows += 1;
-            const cell = row.readCell(ctx.ps, item.value, ctx.col_pos);
+            const cell = ctx.t.read(item, ctx.col);
             const ik = key.encodeIndexKey(ctx.a, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
@@ -563,7 +577,7 @@ fn backfillIndex(
             return true;
         }
     };
-    var fold = Fold{ .a = a, .ps = ps, .col_pos = col_pos };
+    var fold = Fold{ .a = a, .t = t, .col = col };
     _ = try eng.forest.scan(
         a,
         (zdb.level.KeyRange{}).limitToTable(ns, base_tid),
