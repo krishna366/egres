@@ -1427,6 +1427,274 @@ test "scan: rejects a read_ts below globalMinRead" {
 }
 
 // ---------------------------------------------------------------------------
+// Cursor: the pull form of scan
+// ---------------------------------------------------------------------------
+
+/// The whole of one table, both bounds open.
+fn tableRange(ns: u64, table_id: u32) KeyRange {
+    const open = Key{ .namespace = ns, .table_id = table_id, .primary = "", .timestamp = std.math.maxInt(u64) };
+    return .{ .left = open, .right = open };
+}
+
+/// Drain a cursor the way `scan` does, duping each item at hand-out time.
+fn drainCursor(cur: *Forest.Cursor, col: *ScanCollector) !void {
+    while (try cur.next()) |item| _ = try col.emit(item);
+}
+
+/// `scan` and a cursor over the same table and options must agree item for
+/// item — and on the count both report.
+fn expectCursorMatchesScan(alloc: std.mem.Allocator, f: *Forest, ns: u64, table_id: u32, opts: Forest.ScanOptions) !void {
+    var via_scan = ScanCollector{ .alloc = alloc };
+    defer via_scan.deinit();
+    const n = try f.scan(alloc, tableRange(ns, table_id), opts, &via_scan, ScanCollector.emit);
+
+    var via_cursor = ScanCollector{ .alloc = alloc };
+    defer via_cursor.deinit();
+    var cur = try f.openCursor(alloc, tableRange(ns, table_id), opts);
+    defer cur.deinit();
+    try drainCursor(&cur, &via_cursor);
+
+    try std.testing.expectEqual(n, cur.emitted);
+    try std.testing.expectEqual(via_scan.got.items.len, via_cursor.got.items.len);
+    for (via_scan.got.items, via_cursor.got.items) |a, b| {
+        try std.testing.expectEqualStrings(a.key.primary, b.key.primary);
+        try std.testing.expectEqual(a.key.timestamp, b.key.timestamp);
+        try std.testing.expectEqualStrings(a.value, b.value);
+        try std.testing.expectEqual(a.meta, b.meta);
+    }
+}
+
+test "cursor: agrees with scan under every option" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    // Every combination the scan tests above exercise, plus a few crossings.
+    const variants = [_]Forest.ScanOptions{
+        .{},
+        .{ .num_versions = 10 },
+        .{ .num_versions = 10, .include_deleted = true },
+        .{ .num_versions = 1, .include_deleted = true },
+        .{ .num_versions = 0 },
+        .{ .max_rows = 2 },
+        .{ .max_rows = 1 },
+        .{ .max_rows = 0 },
+        .{ .read_ts = 15 },
+        .{ .read_ts = 20 },
+        .{ .read_ts = 15, .num_versions = 5, .include_deleted = true },
+        .{ .read_ts = 10, .max_rows = 2, .include_deleted = true },
+    };
+    for (variants) |opts| try expectCursorMatchesScan(alloc, f, 1, 0, opts);
+}
+
+test "cursor: null is sticky and emitted counts hand-outs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    // Walked to the end: a's newest, c's only (b is deleted).
+    {
+        var cur = try f.openCursor(alloc, tableRange(1, 0), .{});
+        defer cur.deinit();
+        try std.testing.expectEqualStrings("a2", ((try cur.next()) orelse return error.TestExpectedItem).value);
+        try std.testing.expectEqualStrings("c1", ((try cur.next()) orelse return error.TestExpectedItem).value);
+        try std.testing.expectEqual(null, try cur.next());
+        try std.testing.expectEqual(null, try cur.next());
+        try std.testing.expectEqual(@as(u64, 2), cur.emitted);
+    }
+    // Cut off by max_rows: the cap counts hand-outs, and holds afterwards.
+    {
+        var cur = try f.openCursor(alloc, tableRange(1, 0), .{ .max_rows = 1 });
+        defer cur.deinit();
+        try std.testing.expectEqualStrings("a2", ((try cur.next()) orelse return error.TestExpectedItem).value);
+        try std.testing.expectEqual(null, try cur.next());
+        try std.testing.expectEqual(null, try cur.next());
+        try std.testing.expectEqual(@as(u64, 1), cur.emitted);
+    }
+}
+
+test "cursor: max_rows 0 opens exhausted without the min-read check" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+    _ = f.setGlobalMinRead(100);
+
+    // Below the horizon is refused at open — unless nothing will be read.
+    try std.testing.expectError(error.ReadBelowMinRead, f.openCursor(alloc, tableRange(1, 0), .{ .read_ts = 99 }));
+    {
+        var cur = try f.openCursor(alloc, tableRange(1, 0), .{ .read_ts = 99, .max_rows = 0 });
+        defer cur.deinit();
+        try std.testing.expectEqual(null, try cur.next());
+        try std.testing.expectEqual(@as(u64, 0), cur.emitted);
+    }
+    // At the horizon is fine, and the default (latest) is always fine.
+    {
+        var cur = try f.openCursor(alloc, tableRange(1, 0), .{ .read_ts = 100 });
+        defer cur.deinit();
+        try std.testing.expect((try cur.next()) != null);
+    }
+    {
+        var cur = try f.openCursor(alloc, tableRange(1, 0), .{});
+        defer cur.deinit();
+        try std.testing.expect((try cur.next()) != null);
+    }
+}
+
+test "cursor: deinit mid-walk releases the sources" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedVersionedForest(f);
+
+    // Take one item and walk away. The testing allocator catches a leaked
+    // iterator slice or key buffer; Forest.close catches a memtable or
+    // table ref that was never given back.
+    {
+        var cur = try f.openCursor(alloc, tableRange(1, 0), .{ .num_versions = 10, .include_deleted = true });
+        defer cur.deinit();
+        try std.testing.expectEqualStrings("a2", ((try cur.next()) orelse return error.TestExpectedItem).value);
+    }
+    // And the forest is none the worse for it.
+    try expectCursorMatchesScan(alloc, f, 1, 0, .{});
+}
+
+test "cursor: a flush between two next calls does not disturb the walk" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    const Lease = struct {
+        fn call(_: *anyopaque, _: u64) anyerror!void {}
+    };
+    var lease_ctx: u8 = 0;
+    f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
+    try f.newMemtable(1, 1);
+
+    const primaries = [_][]const u8{ "a", "b", "c", "d", "e" };
+    const values = [_][]const u8{ "va", "vb", "vc", "vd", "ve" };
+    for (primaries, values) |p, v| {
+        try f.put(&[_]zdb.kv.Item{.{
+            .key = .{ .namespace = 1, .table_id = 0, .primary = p, .timestamp = 5 },
+            .value = v,
+            .meta = .{},
+        }});
+    }
+
+    var cur = try f.openCursor(alloc, tableRange(1, 0), .{});
+    defer cur.deinit();
+    const first = (try cur.next()) orelse return error.TestExpectedItem;
+    try std.testing.expectEqualStrings("a", first.key.primary);
+
+    // The memtable the cursor is reading is frozen and flushed to L0 under
+    // it. The cursor holds a ref on that skiplist, so its walk carries on
+    // from the snapshot it opened — nothing skipped, nothing repeated.
+    try roar.flush(f, alloc, 2);
+
+    var rest = ScanCollector{ .alloc = alloc };
+    defer rest.deinit();
+    try drainCursor(&cur, &rest);
+    try std.testing.expectEqual(@as(usize, 4), rest.got.items.len);
+    for (rest.got.items, primaries[1..], values[1..]) |it, p, v| {
+        try std.testing.expectEqualStrings(p, it.key.primary);
+        try std.testing.expectEqualStrings(v, it.value);
+    }
+    try std.testing.expectEqual(@as(u64, 5), cur.emitted);
+
+    // A cursor opened now reads the same rows back from the L0 SST.
+    var again = ScanCollector{ .alloc = alloc };
+    defer again.deinit();
+    var cur2 = try f.openCursor(alloc, tableRange(1, 0), .{});
+    defer cur2.deinit();
+    try drainCursor(&cur2, &again);
+    try std.testing.expectEqual(@as(usize, 5), again.got.items.len);
+    for (again.got.items, primaries, values) |it, p, v| {
+        try std.testing.expectEqualStrings(p, it.key.primary);
+        try std.testing.expectEqualStrings(v, it.value);
+    }
+}
+
+/// Ten one-key L3 SSTs k01..k10 in (namespace 42, table 0), value = the
+/// key, then a split: two trees, the boundary somewhere in the middle.
+fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !void {
+    const tree_id = try f.createTree(42, 0, .{ .inf = true });
+    const keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
+    for (keys, 1..) |k, tbl_id| {
+        const path = try zdb.file_ids.sstPath(alloc, dir_path, tbl_id);
+        defer alloc.free(path);
+        try buildAndWriteTableKV(alloc, path, .{ .namespace = 42, .table_id = 0, .primary = k, .timestamp = 1 }, k);
+    }
+    {
+        const tree_ptr = f.getTree(42, tree_id).?;
+        var changes: [keys.len]manifest.SSTableChange = undefined;
+        for (&changes, 1..) |*c, tbl_id| c.* = manifest.createSSTableChange(@intCast(tbl_id), 42, tree_id, 3); // L3
+        try tree_ptr.applyCompaction(&changes);
+    }
+    {
+        f.mu.lock(@src());
+        defer f.mu.unlock();
+        try f.splitTreeForTests(42, tree_id);
+    }
+    try std.testing.expectEqual(@as(usize, 2), treeCount(f));
+}
+
+test "cursor: hops across a split like scan does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    try seedSplitForest(alloc, f, dir_path);
+
+    try expectCursorMatchesScan(alloc, f, 42, 0, .{});
+    // A cap that lands inside the second tree.
+    try expectCursorMatchesScan(alloc, f, 42, 0, .{ .max_rows = 7 });
+
+    // All ten, in order, across the hop: the first tree holds only the
+    // lower keys, so k10 arriving proves the second tree was visited.
+    var col = ScanCollector{ .alloc = alloc };
+    defer col.deinit();
+    var cur = try f.openCursor(alloc, tableRange(42, 0), .{});
+    defer cur.deinit();
+    try drainCursor(&cur, &col);
+    try std.testing.expectEqual(@as(usize, 10), col.got.items.len);
+    try std.testing.expectEqualStrings("k01", col.got.items[0].key.primary);
+    try std.testing.expectEqualStrings("k10", col.got.items[9].key.primary);
+    for (col.got.items) |it| try std.testing.expectEqualStrings(it.key.primary, it.value);
+    try std.testing.expect(cur.done);
+}
+
+// ---------------------------------------------------------------------------
 // getBitmap (roaring postings)
 // ---------------------------------------------------------------------------
 

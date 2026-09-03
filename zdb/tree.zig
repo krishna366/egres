@@ -739,13 +739,28 @@ pub const Tree = struct {
         return null;
     }
 
-    /// A live merge iterator over one tree's data, plus any extras the
-    /// caller wired in (typically memtable iterators). Owns its arena
-    /// and the underlying merge — caller drives via `itemRef`/`next`,
-    /// frees via `deinit`. The walk loop lives in `Forest.scan`, which
-    /// can compose multiple cursors back-to-back to span trees.
-    /// Build a merge iterator over this tree's L≥1 data restricted to
-    /// `range`, plus the caller-supplied `extras`.
+    /// Build a merge iterator over this tree's data overlapping `range`,
+    /// plus the caller-supplied `extras` (typically memtable iterators).
+    /// The walk loop lives in `Forest.Cursor`, which opens one of these
+    /// per tree it visits.
+    ///
+    /// LOCKED: the caller holds the forest read lock (`Forest.mu` shared)
+    /// across this call, and must have read `key_range` under that same
+    /// hold. A split (`applySplit`, under the write lock) deletes the
+    /// migrated tables from this tree's levels and narrows `key_range` in
+    /// place. If the caller snapshotted the range, dropped the lock, and
+    /// only then selected tables here, a split in that gap would pin just
+    /// the left half — while the caller's hop still jumps past the OLD
+    /// right edge, so the moved keys would never be read. Selected under
+    /// the same hold, the pinned tables always cover the range copied; a
+    /// split after that only moves tables already pinned (a table ref
+    /// keeps it readable whichever tree the manifest now lists it under).
+    ///
+    /// NOT positioned: `range` only picks the tables (and pins them —
+    /// every iterator wired in holds its own table ref). The caller
+    /// seeks with `merge.seekRange(range.left, range.right)` afterwards,
+    /// so the block reads a seek issues happen outside the lock — that
+    /// is the reason the seek is not done here.
     ///
     /// Sources fed into the merge:
     ///   - `extras` — passed through verbatim (typically memtable iters)
@@ -764,7 +779,7 @@ pub const Tree = struct {
     /// heap, plus the iters' own scratch (key_buf etc.) — comes from it.
     /// The caller keeps the arena alive for the merge's lifetime and frees
     /// it at end-of-scope; `merge.deinit()` only releases table refs.
-    pub fn openMerge(
+    pub fn openMergeLocked(
         self: *Tree,
         allocator: std.mem.Allocator,
         range: KeyRange,
@@ -801,12 +816,9 @@ pub const Tree = struct {
             }
         }
 
-        var merge = MergeIterator.init(allocator, iters.items);
-        transferred = true; // merge.deinit now owns iter cleanup
-        errdefer merge.deinit();
-        try merge.seekRange(range.left, range.right);
-
-        return merge;
+        // merge.deinit now owns iter cleanup.
+        transferred = true;
+        return MergeIterator.init(allocator, iters.items);
     }
 
     pub fn totalSize(self: *Tree) i64 {

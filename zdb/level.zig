@@ -285,7 +285,7 @@ pub const Level = struct {
     /// "starts after kr.right" and gets excluded — even though it holds that
     /// very primary. Callers use this to answer "which tables could hold keys
     /// in this primary range", and every one of them (compaction src/dest
-    /// selection, openMerge) needs every version of a boundary primary, not
+    /// selection, openMergeLocked) needs every version of a boundary primary, not
     /// the subset that happens to sort inside a versioned bound.
     pub fn overlappingTables(self: *Level, allocator: std.mem.Allocator, kr: KeyRange) ![]TableEntry {
         self.mu.lockShared(@src());

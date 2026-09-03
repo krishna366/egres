@@ -857,8 +857,6 @@ pub const Forest = struct {
         return bm orelse zroar.Bitmap.init(allocator);
     }
 
-    const ScanCallback = *const fn (ctx: *anyopaque, item: Item) anyerror!bool;
-
     /// How much of a key's version history a scan should surface.
     ///
     /// The merge iterator hands us every version of every primary, newest
@@ -923,12 +921,11 @@ pub const Forest = struct {
     /// `scan_range`'s own timestamps only position the seek — `opts.read_ts`
     /// is what decides visibility.
     ///
-    /// One tree at a time: look up the tree owning `current_left`, snapshot its
-    /// range, open a cursor (with a fresh memtable iter snapshot), drain to the
-    /// cursor's end (or max_rows), then advance past the snapshotted right
-    /// boundary and re-look-up. Re-looking-up per hop keeps the scan safe
-    /// against splits firing mid-scan. Per-cursor memtable snapshots also pick
-    /// up newly-flushed data.
+    /// A loop over a `Cursor`: the callback sees each item the cursor hands
+    /// out, in order, and stops the scan by returning false. Returns how many
+    /// items reached the callback (the one it said false to included). The
+    /// item is a borrow — see `Cursor.next`. Instantiated per ctx type, but
+    /// the walk itself lives in `Cursor` and compiles once.
     pub fn scan(
         self: *Forest,
         allocator: std.mem.Allocator,
@@ -937,154 +934,263 @@ pub const Forest = struct {
         ctx: anytype,
         comptime cb: fn (@TypeOf(ctx), Item) anyerror!bool,
     ) !u64 {
-        // The one type-erasing shim: the cast target is generated from
-        // the same @TypeOf(ctx) that produced the pointer, so a caller
-        // cannot pair the wrong context with the wrong callback. One
-        // scanRaw instantiation serves every ctx type.
-        const shim = struct {
-            fn call(raw: *anyopaque, item: Item) anyerror!bool {
-                return cb(@ptrCast(@alignCast(raw)), item);
-            }
-        };
-        return self.scanRaw(allocator, scan_range, opts, ctx, shim.call);
+        var cur = try self.openCursor(allocator, scan_range, opts);
+        defer cur.deinit();
+        while (try cur.next()) |item| {
+            if (!try cb(ctx, item)) break;
+        }
+        return cur.emitted;
     }
 
-    /// Type-erased core of `scan` — see the doc above.
-    fn scanRaw(
+    /// Open a `Cursor` over `scan_range` — the walk `scan` does, handed out
+    /// one item per `next` so the caller sets the pace. Same arguments and
+    /// guards as `scan`: a `read_ts` below `globalMinRead` is refused here,
+    /// except when `max_rows` is 0, which opens an already-exhausted cursor
+    /// without looking. Nothing is read or pinned until the first `next`.
+    pub fn openCursor(
         self: *Forest,
         allocator: std.mem.Allocator,
         scan_range: KeyRange,
         opts: ScanOptions,
-        ctx: *anyopaque,
-        cb: ScanCallback,
-    ) !u64 {
-        if (opts.max_rows == 0) return 0;
-        if (opts.read_ts < self.globalMinRead()) {
+    ) !Cursor {
+        if (opts.max_rows != 0 and opts.read_ts < self.globalMinRead()) {
             return error.ReadBelowMinRead;
         }
-        const want_versions: u32 = @max(opts.num_versions, 1);
+        return .{
+            .forest = self,
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .key_range = scan_range,
+            .opts = opts,
+            .want_versions = @max(opts.num_versions, 1),
+            // The range is already table-limited; ns + table_id ride its left bound.
+            .ns = scan_range.left.namespace,
+            .table_id = scan_range.left.table_id,
+        };
+    }
 
-        // Per-call arena — used to dupe each visited tree's
-        // right-boundary key so it stays alive across iterations
-        // (we drop the forest read lock between cursor hops).
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
+    /// A scan as a pull handle: `next` returns the next visible item, null
+    /// once the range is exhausted. Same walk, filters, and options as
+    /// `scan` — that function is a loop over one of these. What the cursor
+    /// adds is pacing: a caller can take some items, return to whoever
+    /// called it, and come back later, with the open tree's merge iterator
+    /// and its refs (SST tables, memtable arenas, the pending skiplist)
+    /// held in between. Holding across a wait is safe — the refs keep that
+    /// storage alive even if a flush or compaction has since replaced it in
+    /// the manifest — so the cost is residency, not correctness.
+    ///
+    /// One tree at a time: look up the tree owning `key_range.left`,
+    /// snapshot its range, open a merge over the intersection (with a fresh
+    /// memtable iter snapshot), drain it, then move `key_range.left` past
+    /// the snapshotted right boundary and re-look-up. Re-looking-up per hop
+    /// keeps the scan safe against splits firing mid-scan. Per-hop memtable
+    /// snapshots also pick up newly-flushed data.
+    ///
+    /// One fiber drives a cursor. `deinit` on every path — an abandoned
+    /// cursor pins its tables until then.
+    pub const Cursor = struct {
+        forest: *Forest,
+        allocator: std.mem.Allocator,
+        /// Per-cursor arena: memtable iterator slices and each visited
+        /// tree's duped range live exactly as long as the cursor (the
+        /// forest read lock is released once the hop's merge is open, and
+        /// a split frees the tree's old right bound, so the range cannot
+        /// borrow from the tree).
+        arena: std.heap.ArenaAllocator,
+        /// The window still to visit: the scan's range at open, its left
+        /// bound advanced past each drained tree's snapshotted right edge.
+        key_range: KeyRange,
+        opts: ScanOptions,
+        /// `opts.num_versions` clamped up to 1 (see ScanOptions).
+        want_versions: u32,
+        ns: u64,
+        table_id: u32,
+        /// The open tree's merge; null between trees (a hop is pending)
+        /// and once `done`.
+        merge: ?merge_iterator.MergeIterator = null,
+        /// The open tree's range as snapshotted at its hop (tree.key_range
+        /// stays in sync with the manifest via applySplit).
+        tree_range: KeyRange = .{},
+        /// The merge is parked on an item the caller already has. Advancing
+        /// right after the hand-out would overwrite the key buffer and could
+        /// drop the block the value lives in, so the step past it is owed to
+        /// the following `next`. False only before the first hand-out from a
+        /// freshly opened tree.
+        next_pending: bool = false,
+        /// No tree left to visit.
+        done: bool = false,
+        /// Per-primary emit state. A primary's versions arrive contiguously,
+        /// newest first, so this only ever tracks one run at a time.
+        ///
+        /// The state deliberately spans tree hops rather than resetting per
+        /// tree: a primary can't straddle two trees (findSplitKey pins the
+        /// split above every version of its key), so a hop always lands on
+        /// a new primary anyway — and if that ever stops holding, carrying
+        /// the state is the behaviour that stays correct.
+        ///
+        /// `cur_primary` owns its bytes: item.key.primary points into the
+        /// block iterator's key_buf, which the next merge.next() overwrites.
+        /// Empty doubles as "no run yet" — a stored primary is never empty
+        /// (an empty primary is the open-bound sentinel, and Key.marshalTo
+        /// encodes it as zero bytes), so the first item can never compare
+        /// equal to it.
+        cur_primary: std.ArrayList(u8) = .empty,
+        versions_emitted: u32 = 0,
+        skip_versions: bool = false,
+        /// Items handed out so far — what `scan` returns. Bounded by
+        /// `opts.max_rows`; versions the filters skip are free.
+        emitted: u64 = 0,
 
-        // The range is already table-limited; ns + table_id ride its left bound.
-        const ns = scan_range.left.namespace;
-        const table_id = scan_range.left.table_id;
+        /// Releases the open merge (table + skiplist refs) and the cursor's
+        /// memory. Safe after exhaustion, and after an error from `next`.
+        pub fn deinit(self: *Cursor) void {
+            if (self.merge) |*m| m.deinit();
+            self.merge = null;
+            self.cur_primary.deinit(self.allocator);
+            self.arena.deinit();
+        }
 
-        var emitted: u64 = 0;
-        var current_left = scan_range.left;
+        /// The next item the options admit, or null when the scan is done
+        /// (`max_rows` reached, or the range walked to its end). Null is
+        /// sticky.
+        ///
+        /// The returned Item is a BORROW valid until the following `next`
+        /// or `deinit`: its key points into a source's key buffer, its
+        /// value into a block or arena the source holds a ref on, and the
+        /// advance overwrites the one and may release the other. Copy what
+        /// must outlive the call.
+        pub fn next(self: *Cursor) !?Item {
+            while (self.emitted < self.opts.max_rows) {
+                if (self.merge == null) {
+                    if (self.done) return null;
 
-        // Per-primary emit state. A primary's versions arrive contiguously,
-        // newest first, so this only ever tracks one run at a time.
-        //
-        // The state deliberately spans tree hops rather than resetting per
-        // tree: a primary can't straddle two trees (findSplitKey pins the
-        // split above every version of its key), so a hop always lands on a
-        // new primary anyway — and if that ever stops holding, carrying the
-        // state is the behaviour that stays correct.
-        //
-        // `cur_primary` owns its bytes: item.key.primary points into the block
-        // iterator's key_buf, which the next merge.next() overwrites. Empty
-        // doubles as "no run yet" — a stored primary is never empty (an empty
-        // primary is the open-bound sentinel, and Key.marshalTo encodes it as
-        // zero bytes), so the first item can never compare equal to it.
-        var cur_primary: std.ArrayList(u8) = .empty;
-        defer cur_primary.deinit(allocator);
-        var versions_emitted: u32 = 0;
-        var skip_versions = false;
-
-        while (emitted < opts.max_rows) {
-            // Find the tree owning current_left + snapshot its range
-            // (tree.key_range stays in sync with the manifest via
-            // applySplit). Re-doing the lookup per hop keeps the scan
-            // safe against splits firing between hops — we always
-            // pick whichever tree currently covers the next key.
-            var tree: *Tree = undefined;
-            var tree_range = KeyRange{};
-            {
-                self.mu.lockShared(@src());
-                defer self.mu.unlockShared();
-                const trees = self.treesFor(ns, table_id) orelse return emitted;
-                tree = trees.lookup(current_left) orelse return emitted;
-                tree_range = try tree.key_range.dupe(a);
-            }
-
-            // Restrict to the requested scan window. If the intersection
-            // is empty the scan has run off the end → done.
-            const remaining = KeyRange{ .left = current_left, .right = scan_range.right };
-            const visit_range = remaining.intersect(tree_range);
-
-            // Allocate memtable iters from the per-call arena so they
-            // live exactly as long as the merge. (Memtables.getIterators
-            // returns a fresh slice; freeing it through the arena at
-            // end-of-scope is fine.) The txn's pending skiplist rides
-            // in as src 0 — the merge's equal-key tie-break.
-            const srcs = try self.memtables.getIterators(a, opts.pending);
-            var merge = try tree.openMerge(a, visit_range, opts.priority, srcs);
-
-            // Drain (or hit max_rows). Use a labeled block so merge.deinit
-            // fires on every exit path before we either return or hop to
-            // the next tree.
-            const stop_early = drain: {
-                while (emitted < opts.max_rows) {
-                    const item = merge.itemRef() orelse break :drain false;
-
-                    // Not written yet, as far as this scan is concerned.
-                    // Filtered before everything below on purpose: before the
-                    // tombstone rule, so a delete above read_ts can't hide a
-                    // key that is still live at read_ts; and before the
-                    // version cap, so invisible versions don't consume it.
-                    if (item.key.timestamp > opts.read_ts) {
-                        try merge.next();
-                        continue;
-                    }
-
-                    if (!item.key.equalPrimary(.{ .primary = cur_primary.items })) {
-                        cur_primary.clearRetainingCapacity();
-                        try cur_primary.appendSlice(allocator, item.key.primary);
-                        versions_emitted = 0;
-                        skip_versions = false;
-                    }
-
-                    // Skipped versions don't count against max_rows — that
-                    // bounds what the caller receives, not what we walk past.
-                    if (skip_versions or versions_emitted >= want_versions) {
-                        // TODO: Add a nextKey in underlying iterators.
-                        try merge.next();
-                        continue;
-                    }
-
-                    if (item.meta.isDeleted() and !opts.include_deleted) {
-                        // Deleted as of this version: suppress the tombstone
-                        // and everything older behind it.
-                        skip_versions = true;
-                        try merge.next();
-                        continue;
-                    }
-
-                    const cont = try cb(ctx, item);
-                    emitted += 1;
-                    versions_emitted += 1;
-                    if (!cont) break :drain true;
+                    try self.openNextTree();
+                    if (self.merge == null) return null; // nothing covers key_range.left
+                }
+                const merge = &self.merge.?;
+                if (self.next_pending) {
+                    self.next_pending = false;
                     try merge.next();
                 }
-                break :drain false;
-            };
-            merge.deinit();
-            if (stop_early) return emitted;
+                if (try self.nextVisible(merge)) |item| {
+                    // The merge stays parked on `item` so the borrow holds;
+                    // the step past it is owed to the next call.
+                    self.next_pending = true;
+                    return item;
+                }
 
-            // Advance to next tree by jumping past the snapshotted
-            // right edge. Empty primary = unbounded right (rightmost
-            // tree) → done.
-            if (tree_range.right.primary.len == 0) break;
-            current_left = tree_range.right;
+                // This tree is drained: close it and move the window past
+                // its snapshotted right edge. Empty primary = unbounded
+                // right (rightmost tree) → done.
+                merge.deinit();
+                self.merge = null;
+                if (self.tree_range.right.primary.len == 0) {
+                    self.done = true;
+                    return null;
+                }
+                self.key_range.left = self.tree_range.right;
+            }
+            return null;
         }
-        return emitted;
-    }
+
+        /// Look up the tree owning `key_range.left`, snapshot its range, and
+        /// open a merge over its intersection with the window. Redoing the
+        /// lookup per hop keeps the scan safe against splits firing between
+        /// hops — we always take whichever tree currently covers the next
+        /// key. Leaves `merge` null and sets `done` when no tree does. An
+        /// empty intersection just opens an empty merge; `next` then hops
+        /// or finishes as usual.
+        ///
+        /// Lookup, range snapshot, and table selection (`openMergeLocked`)
+        /// happen under ONE hold of the forest read lock. A split moves a tree's
+        /// right-half tables to a new tree and narrows its range in place;
+        /// were the lock dropped between the snapshot and the selection, a
+        /// split in that gap would leave the merge pinning only the left
+        /// half while the hop still jumps past the snapshotted right edge —
+        /// the moved keys would never be read. Pinned together, the tables
+        /// always cover the range copied, and a later split just moves
+        /// tables we already hold. The seek — the part that reads blocks —
+        /// runs after the lock is released.
+        fn openNextTree(self: *Cursor) !void {
+            const a = self.arena.allocator();
+
+            const visit_range = blk: {
+                self.forest.mu.lockShared(@src());
+                defer self.forest.mu.unlockShared();
+                const trees = self.forest.treesFor(self.ns, self.table_id) orelse {
+                    self.done = true;
+                    return;
+                };
+                const tree = trees.lookup(self.key_range.left) orelse {
+                    self.done = true;
+                    return;
+                };
+                self.tree_range = try tree.key_range.dupe(a);
+                const visit_range = self.key_range.intersect(self.tree_range);
+
+                // Memtable iters come from the cursor arena so they live
+                // exactly as long as the merge. (Memtables.getIterators
+                // returns a fresh slice; freeing it through the arena at
+                // deinit is fine.) The txn's pending skiplist rides in as
+                // src 0 — the merge's equal-key tie-break.
+                const srcs = try self.forest.memtables.getIterators(a, self.opts.pending);
+                self.merge = try tree.openMergeLocked(a, visit_range, self.opts.priority, srcs);
+                break :blk visit_range;
+            };
+
+            // Position the sources. On error the merge stays set, so
+            // `deinit` still releases everything it pinned.
+            try self.merge.?.seekRange(visit_range.left, visit_range.right);
+            // A hop only happens after the previous merge was drained, and
+            // draining begins by paying the owed advance — so none is owed.
+            std.debug.assert(!self.next_pending);
+        }
+
+        /// Walk the open merge to the next item the options admit and
+        /// return it, leaving the merge positioned ON it. Null when this
+        /// tree is drained.
+        fn nextVisible(self: *Cursor, merge: *merge_iterator.MergeIterator) !?Item {
+            while (merge.itemRef()) |item| {
+                // Not written yet, as far as this scan is concerned.
+                // Filtered before everything below on purpose: before the
+                // tombstone rule, so a delete above read_ts can't hide a
+                // key that is still live at read_ts; and before the
+                // version cap, so invisible versions don't consume it.
+                if (item.key.timestamp > self.opts.read_ts) {
+                    try merge.next();
+                    continue;
+                }
+
+                if (!item.key.equalPrimary(.{ .primary = self.cur_primary.items })) {
+                    self.cur_primary.clearRetainingCapacity();
+                    try self.cur_primary.appendSlice(self.allocator, item.key.primary);
+                    self.versions_emitted = 0;
+                    self.skip_versions = false;
+                }
+
+                // Skipped versions don't count against max_rows — that
+                // bounds what the caller receives, not what we walk past.
+                if (self.skip_versions or self.versions_emitted >= self.want_versions) {
+                    // TODO: Add a nextKey in underlying iterators.
+                    try merge.next();
+                    continue;
+                }
+
+                if (item.meta.isDeleted() and !self.opts.include_deleted) {
+                    // Deleted as of this version: suppress the tombstone
+                    // and everything older behind it.
+                    self.skip_versions = true;
+                    try merge.next();
+                    continue;
+                }
+
+                self.emitted += 1;
+                self.versions_emitted += 1;
+                return item;
+            }
+            return null;
+        }
+    };
 
     /// The largest stored key for (namespace, table_id), or null if the table
     /// has no keys. Assumes a monotonically-increasing row id (SQL's egid), so
