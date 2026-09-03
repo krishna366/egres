@@ -148,12 +148,18 @@ test "levels: handler L0 sort" {
     const t2 = try openTableOwned(alloc, &tb2);
     defer destroyTable(t2);
 
-    var level = Level.init(alloc, 0);
+    var lock: zdb.level.Lock = .{};
+
+    var level = Level.init(alloc, 0, &lock);
+
+    const held = lock.hold(.exclusive, @src());
+
+    defer held.release();
     defer level.deinit();
 
-    try level.addEntry(3, t3);
-    try level.addEntry(1, t1);
-    try level.addEntry(2, t2);
+    try level.addEntry(held, 3, t3);
+    try level.addEntry(held, 1, t1);
+    try level.addEntry(held, 2, t2);
 
     // L0 sorts ascending by ID.
     try std.testing.expectEqual(@as(u64, 1), level.tables.items[0].id);
@@ -183,12 +189,18 @@ test "levels: handler L1 sort" {
     const tb = try openTableOwned(alloc, &tbb);
     defer destroyTable(tb);
 
-    var level = Level.init(alloc, 1);
+    var lock: zdb.level.Lock = .{};
+
+    var level = Level.init(alloc, 1, &lock);
+
+    const held = lock.hold(.exclusive, @src());
+
+    defer held.release();
     defer level.deinit();
 
-    try level.addEntry(3, tc); // "c"
-    try level.addEntry(1, ta); // "a"
-    try level.addEntry(2, tb); // "b"
+    try level.addEntry(held, 3, tc); // "c"
+    try level.addEntry(held, 1, ta); // "a"
+    try level.addEntry(held, 2, tb); // "b"
 
     // L1 sorts by smallest key ascending.
     const sk0 = level.tables.items[0].table.smallest.primary;
@@ -230,10 +242,16 @@ test "levels: overlapping tables L1" {
         _ = i;
     };
 
-    var level = Level.init(alloc, 1);
+    var lock: zdb.level.Lock = .{};
+
+    var level = Level.init(alloc, 1, &lock);
+
+    const held = lock.hold(.exclusive, @src());
+
+    defer held.release();
     defer level.deinit();
     for (tables, 0..) |t, i| {
-        try level.addEntry(@intCast(i + 1), t);
+        try level.addEntry(held, @intCast(i + 1), t);
     }
 
     // Query range c-g should overlap tables c-d, e-f, g-h → indices 1..4.
@@ -242,7 +260,7 @@ test "levels: overlapping tables L1" {
     const gk = try (Key{ .primary = "g", .timestamp = 0 }).marshal(alloc);
     defer alloc.free(gk);
 
-    const result = try level.overlappingTables(alloc, .{ .left = Key.init(ck), .right = Key.init(gk) });
+    const result = try level.overlappingTables(held.shared(), alloc, .{ .left = Key.init(ck), .right = Key.init(gk) });
     defer Level.releaseTables(alloc, result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
 }
@@ -268,17 +286,23 @@ test "levels: overlapping tables L0" {
     const t3 = try openTableOwned(alloc, &tb3);
     defer destroyTable(t3);
 
-    var level = Level.init(alloc, 0);
+    var lock: zdb.level.Lock = .{};
+
+    var level = Level.init(alloc, 0, &lock);
+
+    const held = lock.hold(.exclusive, @src());
+
+    defer held.release();
     defer level.deinit();
-    try level.addEntry(1, t1);
-    try level.addEntry(2, t2);
-    try level.addEntry(3, t3);
+    try level.addEntry(held, 1, t1);
+    try level.addEntry(held, 2, t2);
+    try level.addEntry(held, 3, t3);
 
     const ck = try (Key{ .primary = "x", .timestamp = 0 }).marshal(alloc);
     defer alloc.free(ck);
 
     // L0 always returns all tables regardless of the query.
-    const result = try level.overlappingTables(alloc, .{ .left = Key.init(ck), .right = Key.init(ck) });
+    const result = try level.overlappingTables(held.shared(), alloc, .{ .left = Key.init(ck), .right = Key.init(ck) });
     defer Level.releaseTables(alloc, result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
 }
@@ -302,13 +326,19 @@ test "levels: get L0 newest wins" {
     const t2 = try openTableOwned(alloc, &tb2);
     defer destroyTable(t2);
 
-    var level = Level.init(alloc, 0);
+    var lock: zdb.level.Lock = .{};
+
+    var level = Level.init(alloc, 0, &lock);
+
+    const held = lock.hold(.exclusive, @src());
+
+    defer held.release();
     defer level.deinit();
-    try level.addEntry(1, t1);
-    try level.addEntry(2, t2);
+    try level.addEntry(held, 1, t1);
+    try level.addEntry(held, 2, t2);
 
     // Search with max ts to find the newest version.
-    const item = try level.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0);
+    const item = try level.get(held.shared(), .{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0);
     try std.testing.expect(item != null);
     defer {
         alloc.free(item.?.key.primary);
@@ -338,13 +368,19 @@ test "levels: get L1 hit" {
     const tc = try openTableOwned(alloc, &tbc);
     defer destroyTable(tc);
 
-    var level = Level.init(alloc, 1);
-    defer level.deinit();
-    try level.addEntry(1, ta);
-    try level.addEntry(2, tb);
-    try level.addEntry(3, tc);
+    var lock: zdb.level.Lock = .{};
 
-    const item = try level.get(.{ .primary = "b", .timestamp = 0 }, .p0);
+    var level = Level.init(alloc, 1, &lock);
+
+    const held = lock.hold(.exclusive, @src());
+
+    defer held.release();
+    defer level.deinit();
+    try level.addEntry(held, 1, ta);
+    try level.addEntry(held, 2, tb);
+    try level.addEntry(held, 3, tc);
+
+    const item = try level.get(held.shared(), .{ .primary = "b", .timestamp = 0 }, .p0);
     try std.testing.expect(item != null);
     defer {
         alloc.free(item.?.key.primary);
@@ -365,11 +401,17 @@ test "levels: get miss" {
     const ta = try openTableOwned(alloc, &tba);
     defer destroyTable(ta);
 
-    var level = Level.init(alloc, 1);
-    defer level.deinit();
-    try level.addEntry(1, ta);
+    var lock: zdb.level.Lock = .{};
 
-    const item = try level.get(.{ .primary = "z", .timestamp = 0 }, .p0);
+    var level = Level.init(alloc, 1, &lock);
+
+    const held = lock.hold(.exclusive, @src());
+
+    defer held.release();
+    defer level.deinit();
+    try level.addEntry(held, 1, ta);
+
+    const item = try level.get(held.shared(), .{ .primary = "z", .timestamp = 0 }, .p0);
     try std.testing.expect(item == null);
 }
 
@@ -414,14 +456,14 @@ test "levels: open" {
     const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
-    defer tree.close();
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    defer tree.release();
 
-    try std.testing.expectEqual(@as(usize, 1), tree.levels[0].numTables());
-    try std.testing.expectEqual(@as(usize, 1), tree.levels[1].numTables());
+    try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(0));
+    try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
     // All other levels empty.
-    for (tree.levels[2..]) |*h| {
-        try std.testing.expectEqual(@as(usize, 0), h.numTables());
+    for (2..tree.levels.len) |i| {
+        try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(i));
     }
 }
 
@@ -452,8 +494,8 @@ test "levels: pick compact level" {
 
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
-    defer tree.close();
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    defer tree.release();
 
     // Manually plant a large table in L1.
     var tb = try buildTable(alloc, &.{
@@ -462,8 +504,12 @@ test "levels: pick compact level" {
     });
     defer tb.deinit();
     const t = try openTableOwned(alloc, &tb);
-    try cache.own(999, t);
-    try tree.levels[1].addEntry(999, t);
+    _ = try cache.own(999, t);
+    {
+        const h = tree.mu.hold(.exclusive, @src());
+        defer h.release();
+        try tree.levels[1].addEntry(h, 999, t);
+    }
     t.decrRef(); // now levels owns the table.
 
     try tree.updateCompactCandidate();
@@ -512,20 +558,20 @@ test "levels: doCompact L0 L1" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
-    defer tree.close();
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    defer tree.release();
 
     // All three tables should be in L0 before compaction.
-    try std.testing.expectEqual(@as(usize, 3), tree.levels[0].numTables());
-    try std.testing.expectEqual(@as(usize, 0), tree.levels[1].numTables());
+    try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(0));
+    try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
 
     var file_ids: zdb.file_ids.FileIds = .{};
     file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
     try tree.doCompact(0, &file_ids, 0);
 
     // After compaction L0 must be empty and keys must live in L1.
-    try std.testing.expectEqual(@as(usize, 0), tree.levels[0].numTables());
-    try std.testing.expect(tree.levels[1].numTables() > 0);
+    try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(0));
+    try std.testing.expect(tree.numTablesAt(1) > 0);
 
     // All three keys must be retrievable via get.
     for (l0_data) |d| {
@@ -593,19 +639,19 @@ test "levels: doCompact L0 L1 with dest overlap" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
-    defer tree.close();
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    defer tree.release();
 
-    try std.testing.expectEqual(@as(usize, 2), tree.levels[0].numTables());
-    try std.testing.expectEqual(@as(usize, 1), tree.levels[1].numTables());
+    try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(0));
+    try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
 
     var file_ids: zdb.file_ids.FileIds = .{};
     file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
     try tree.doCompact(0, &file_ids, 0);
 
     // L0 must be empty; L1 holds the merged result in a single table.
-    try std.testing.expectEqual(@as(usize, 0), tree.levels[0].numTables());
-    try std.testing.expectEqual(@as(usize, 1), tree.levels[1].numTables());
+    try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(0));
+    try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
 
     // All four keys from both levels must be present after compaction.
     const expected = [_]struct { key: []const u8, val: []const u8 }{
@@ -669,19 +715,19 @@ test "levels: doCompact L1 L2" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 3 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
-    defer tree.close();
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    defer tree.release();
 
-    try std.testing.expectEqual(@as(usize, 1), tree.levels[1].numTables());
-    try std.testing.expectEqual(@as(usize, 1), tree.levels[2].numTables());
+    try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
+    try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(2));
 
     var file_ids: zdb.file_ids.FileIds = .{};
     file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
     try tree.doCompact(1, &file_ids, 0);
 
     // L1 must be empty; L2 holds the original {cc} table plus new {aa, bb}.
-    try std.testing.expectEqual(@as(usize, 0), tree.levels[1].numTables());
-    try std.testing.expectEqual(@as(usize, 2), tree.levels[2].numTables());
+    try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
+    try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(2));
 
     const expected = [_]struct { key: []const u8, val: []const u8 }{
         .{ .key = "aa", .val = "vaa" },
@@ -718,24 +764,32 @@ test "levels: get L0 shadows L1" {
     const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    var tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
-    defer tree.close();
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    defer tree.release();
 
     // Plant in-memory tables directly into the level handlers.
     // L1: foo at ts=1 (old version).
     var tb_l1 = try buildTable(alloc, &.{.{ .key = "foo", .ts = 1, .val = "l1_val" }});
     defer tb_l1.deinit();
     const t_l1 = try openTableOwned(alloc, &tb_l1);
-    try cache.own(1, t_l1);
-    try tree.levels[1].addEntry(1, t_l1);
+    _ = try cache.own(1, t_l1);
+    {
+        const h = tree.mu.hold(.exclusive, @src());
+        defer h.release();
+        try tree.levels[1].addEntry(h, 1, t_l1);
+    }
     t_l1.decrRef();
 
     // L0: foo at ts=5 (newer version; higher ts sorts earlier in byte order).
     var tb_l0 = try buildTable(alloc, &.{.{ .key = "foo", .ts = 5, .val = "l0_val" }});
     defer tb_l0.deinit();
     const t_l0 = try openTableOwned(alloc, &tb_l0);
-    try cache.own(2, t_l0);
-    try tree.levels[0].addEntry(2, t_l0);
+    _ = try cache.own(2, t_l0);
+    {
+        const h = tree.mu.hold(.exclusive, @src());
+        defer h.release();
+        try tree.levels[0].addEntry(h, 2, t_l0);
+    }
     t_l0.decrRef();
 
     // Searching with maxInt ts seeks to the very beginning of "foo" entries;
@@ -777,9 +831,15 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
     const t = try openTableOwned(alloc, &tb);
     defer destroyTable(t);
 
-    var level = Level.init(alloc, 1);
+    var lock: zdb.level.Lock = .{};
+
+    var level = Level.init(alloc, 1, &lock);
+
+    const held = lock.hold(.exclusive, @src());
+
+    defer held.release();
     defer level.deinit();
-    try level.addEntry(1, t);
+    try level.addEntry(held, 1, t);
 
     // A src table {(a,10), (k,100), (k,90)} has smallest=(a,10) and
     // biggest=(k,90) — biggest is the LOWEST-ts version of its largest
@@ -790,7 +850,7 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
     const right = try (Key{ .primary = "k", .timestamp = 90 }).marshal(alloc);
     defer alloc.free(right);
 
-    const result = try level.overlappingTables(alloc, .{
+    const result = try level.overlappingTables(held.shared(), alloc, .{
         .left = Key.init(left),
         .right = Key.init(right),
     });
@@ -811,11 +871,11 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
 const TombstoneFixture = struct {
     ms: manifest.ForestState,
     cache: TableCache,
-    tree: Tree,
+    tree: *Tree,
     file_ids: zdb.file_ids.FileIds,
 
     fn deinit(self: *TombstoneFixture) void {
-        self.tree.close();
+        self.tree.release();
         self.cache.deinit();
         self.ms.deinit();
     }
@@ -1280,12 +1340,12 @@ test "compaction: rollup folds a delta chain onto its in-inputs state" {
 
     // MVCC: an old-snapshot reader folding the retained chain gets the
     // historical bitmaps, unchanged by the rollup.
-    var at250 = try foldAt(alloc, &fx.tree, "k", 250);
+    var at250 = try foldAt(alloc, fx.tree, "k", 250);
     defer at250.deinit();
     try std.testing.expectEqual(@as(u64, 3), at250.getCardinality());
     for ([_]u64{ 1, 2, 3 }) |v| try std.testing.expect(at250.contains(v));
 
-    var at150 = try foldAt(alloc, &fx.tree, "k", 150);
+    var at150 = try foldAt(alloc, fx.tree, "k", 150);
     defer at150.deinit();
     try std.testing.expectEqual(@as(u64, 2), at150.getCardinality());
 }

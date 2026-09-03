@@ -1,12 +1,17 @@
 const std = @import("std");
 const _zen = @import("buffers.gen.zig");
 const Key = @import("kv.zig").Key;
+const KeyRange = @import("level.zig").KeyRange;
 const TreeKey = @import("kv.zig").TreeKey;
 const TableKey = @import("kv.zig").TableKey;
 const treeTableId = @import("kv.zig").treeTableId;
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
 const fiber = @import("zfiber");
+
+/// The manifest lock. Shared for the name lookups on the query path and
+/// the copy-out readers, exclusive for the apply path's commits.
+pub const Lock = fiber.RWMutex(.untracked);
 
 // -------------------------------------------------------------------------
 // Error set
@@ -77,7 +82,7 @@ pub const ForestState = struct {
     /// apply / snapshot-persist discipline as the per-namespace table_id
     /// counter, one level up.
     next_ns_id: u64 = first_namespace,
-    mu: fiber.Mutex(.untracked) = .{},
+    mu: Lock = .{},
 
     pub const Namespace = struct {
         /// Next-free user table_id: the only authoritative source of
@@ -195,8 +200,8 @@ pub const ForestState = struct {
 
     /// Resolve a database name to its namespace.
     pub fn lookupNamespace(self: *ForestState, name: []const u8) ?u64 {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
         return self.names.get(name);
     }
 
@@ -230,8 +235,8 @@ pub const ForestState = struct {
     /// Resolve a table name to its table_id within a namespace (per-query
     /// hot path).
     pub fn lookupTable(self: *ForestState, namespace: u64, name: []const u8) ?u32 {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
         const ns = self.namespaces.getPtr(namespace) orelse return null;
         return ns.tables.get(name);
     }
@@ -269,11 +274,69 @@ pub const ForestState = struct {
         }
     }
 
-    fn freeTree(self: *ForestState, tree: *TreeState) void {
-        for (tree.levels.items) |*lm| lm.tables.deinit();
-        tree.levels.deinit(self.allocator);
-        if (tree.left.primary.len > 0) self.allocator.free(tree.left.primary);
-        if (tree.right.primary.len > 0) self.allocator.free(tree.right.primary);
+    /// A tree's key range, duped into `alloc` under the manifest lock
+    /// (`inf` set as `Tree.open` sets it: both bounds empty). `commit` on
+    /// the apply loop rehashes `trees` and, on a delete or a range update,
+    /// frees the very bytes a stored `TreeState` borrows — so a caller off
+    /// that loop copies under the lock instead of holding a `TreeState`
+    /// across its own work. Null if the tree is not listed.
+    pub fn treeRange(self: *ForestState, alloc: std.mem.Allocator, key: TreeKey) !?KeyRange {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        const tree = self.trees.getPtr(key) orelse return null;
+        const range = KeyRange{
+            .left = tree.left,
+            .right = tree.right,
+            .inf = tree.left.len() == 0 and tree.right.len() == 0,
+        };
+        return try range.dupe(alloc);
+    }
+
+    /// Every listed tree's key — one namespace's when `namespace` is
+    /// given — copied out under the lock. Caller frees the slice.
+    pub fn treeKeys(self: *ForestState, alloc: std.mem.Allocator, namespace: ?u64) ![]TreeKey {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        var out: std.ArrayList(TreeKey) = .empty;
+        errdefer out.deinit(alloc);
+        var it = self.trees.keyIterator();
+        while (it.next()) |tk| {
+            if (namespace) |ns| if (tk.namespace != ns) continue;
+            try out.append(alloc, tk.*);
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// Every SST id any tree lists (a table shared by two trees appears
+    /// twice), copied out under the lock. Caller frees the slice.
+    pub fn listedFileIds(self: *ForestState, alloc: std.mem.Allocator) ![]u64 {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(alloc);
+        var it = self.trees.valueIterator();
+        while (it.next()) |tree| {
+            for (tree.levels.items) |lm| {
+                var tit = lm.tables.keyIterator();
+                while (tit.next()) |fid| try out.append(alloc, fid.*);
+            }
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// A tree's manifest record, borrowed for as long as `held` is: the
+    /// record's key bytes are freed by a delete or range update, so this
+    /// exists only under a caller's hold. Null if the tree is not listed.
+    pub fn treeState(self: *ForestState, held: Lock.Shared, key: TreeKey) ?*const TreeState {
+        self.mu.assertHeld(held);
+        return self.trees.getPtr(key);
+    }
+
+    fn freeTree(self: *ForestState, tree_state: *TreeState) void {
+        for (tree_state.levels.items) |*lm| lm.tables.deinit();
+        tree_state.levels.deinit(self.allocator);
+        if (tree_state.left.primary.len > 0) self.allocator.free(tree_state.left.primary);
+        if (tree_state.right.primary.len > 0) self.allocator.free(tree_state.right.primary);
     }
 
     pub fn deinit(self: *ForestState) void {
@@ -286,8 +349,10 @@ pub const ForestState = struct {
         self.namespaces.deinit();
     }
 
-    /// Applies a single table CREATE or DELETE to the tree's levels.
-    pub fn applySSTableChange(self: *ForestState, tc: SSTableChange) !void {
+    /// Applies a single table CREATE or DELETE to the tree's levels. Caller
+    /// holds the manifest lock exclusively — `held` is the proof.
+    pub fn applySSTableChange(self: *ForestState, held: Lock.Exclusive, tc: SSTableChange) !void {
+        self.mu.assertHeld(held);
         const key = TreeKey{ .namespace = tc.namespace_id, .tree_id = tc.tree_id };
         if (tc.op == .create) {
             const tree = self.trees.getPtr(key) orelse return ManifestError.TreeNotFound;
@@ -309,8 +374,10 @@ pub const ForestState = struct {
 
     /// Applies a tree CREATE, DELETE, or UPDATE.
     /// DELETE automatically removes all tables owned by the tree.
-    /// UPDATE changes the tree's key range.
-    pub fn applyTreeChange(self: *ForestState, tc: TreeChange) !void {
+    /// UPDATE changes the tree's key range. Caller holds the manifest lock
+    /// exclusively — `held` is the proof.
+    pub fn applyTreeChange(self: *ForestState, held: Lock.Exclusive, tc: TreeChange) !void {
+        self.mu.assertHeld(held);
         const key = TreeKey{ .namespace = tc.namespace_id, .tree_id = tc.tree_id };
         if (tc.op == .create) {
             try self.trees.put(key, .{
@@ -344,15 +411,17 @@ pub const ForestState = struct {
     ) !void {
         if (table_changes.len == 0 and tree_changes.len == 0) return;
 
-        self.mu.lock(@src());
-        defer self.mu.unlock();
+        const held = self.mu.hold(.exclusive, @src());
+        defer held.release();
 
-        for (tree_changes) |tc| try self.applyTreeChange(tc);
-        for (table_changes) |tc| try self.applySSTableChange(tc);
+        for (tree_changes) |tc| try self.applyTreeChange(held, tc);
+        for (table_changes) |tc| try self.applySSTableChange(held, tc);
     }
 
     /// Count total table entries across all trees and levels.
     pub fn tableCount(self: *ForestState) u32 {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
         var count: u32 = 0;
         var it = self.trees.iterator();
         while (it.next()) |kv| {
@@ -374,7 +443,9 @@ pub const ForestState = struct {
     /// Wire format reuses the existing `ManifestChange` zbuf shape: a list of
     /// `tree_changes` (CREATE per tree), `sstable_changes` (CREATE per SST), and
     /// `next_table_ids` (one per namespace).
-    pub fn serialize(self: *const ForestState, allocator: std.mem.Allocator) ![]u8 {
+    pub fn serialize(self: *ForestState, allocator: std.mem.Allocator) ![]u8 {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -446,70 +517,87 @@ pub const ForestState = struct {
 
     /// Replace the receiver's tree contents with the deserialized state from
     /// `bytes` (as produced by `serialize`). Failure mid-decode leaves the
-    /// state empty, not partial.
+    /// state empty, not partial. Recovery-time, before the apply barrier
+    /// lifts: nothing else touches the manifest meanwhile. Two phases —
+    /// the map rebuild under an exclusive hold, then the name registry
+    /// through the same one-shot calls the apply path uses.
     pub fn restoreFrom(self: *ForestState, bytes: []const u8) !void {
-        // Drop existing trees + namespace state first; restore is a full
-        // replace.
-        var it = self.trees.iterator();
-        while (it.next()) |kv| self.freeTree(kv.value_ptr);
-        self.trees.clearRetainingCapacity();
-        self.names.clearRetainingCapacity(); // keys borrow the names below
-        var nit = self.namespaces.valueIterator();
-        while (nit.next()) |n| n.deinit(self.allocator);
-        self.namespaces.clearRetainingCapacity();
-
         const reader = try _zen.ManifestChangeReader.parseRoot(bytes);
+        {
+            const held = self.mu.hold(.exclusive, @src());
+            defer held.release();
 
-        // Order matters: trees must exist before tables can attach to them.
+            // Drop existing trees + namespace state first; restore is a full
+            // replace.
+            var it = self.trees.iterator();
+            while (it.next()) |kv| self.freeTree(kv.value_ptr);
+            self.trees.clearRetainingCapacity();
+            self.names.clearRetainingCapacity(); // keys borrow the names below
+            var nit = self.namespaces.valueIterator();
+            while (nit.next()) |n| n.deinit(self.allocator);
+            self.namespaces.clearRetainingCapacity();
+
+            // Order matters: trees must exist before tables can attach to them.
+            const tc_len = reader.treeChangesLen();
+            var i: u32 = 0;
+            while (i < tc_len) : (i += 1) {
+                const tc = try reader.treeChangesAt(i);
+                try self.applyTreeChange(held, .{
+                    .op = tc.op(),
+                    .tree_id = tc.treeId(),
+                    .namespace_id = tc.namespaceId(),
+                    .left_key = @constCast(tc.leftKey()),
+                    .right_key = @constCast(tc.rightKey()),
+                });
+            }
+
+            const tbl_len = reader.sstableChangesLen();
+            i = 0;
+            while (i < tbl_len) : (i += 1) {
+                const tc = try reader.sstableChangesAt(i);
+                try self.applySSTableChange(held, .{
+                    .op = tc.op(),
+                    .sst_id = tc.sstId(),
+                    .namespace_id = tc.namespaceId(),
+                    .tree_id = tc.treeId(),
+                    .level = tc.level(),
+                });
+            }
+
+            const ns_len = reader.namespacesLen();
+            i = 0;
+            while (i < ns_len) : (i += 1) {
+                const c = try reader.namespacesAt(i);
+                const slot = try self.namespaces.getOrPut(c.id());
+                if (!slot.found_existing) slot.value_ptr.* = .{};
+                slot.value_ptr.next_table_id = c.nextTableId();
+            }
+
+            self.next_ns_id = @max(reader.nextNsId(), first_namespace);
+        }
+
+        // Names: serialize stamps a table's name onto its tree's change
+        // (only user tables carry one; empty is a no-op), and each
+        // namespace record carries the database name.
         const tc_len = reader.treeChangesLen();
         var i: u32 = 0;
         while (i < tc_len) : (i += 1) {
             const tc = try reader.treeChangesAt(i);
-            try self.applyTreeChange(.{
-                .op = tc.op(),
-                .tree_id = tc.treeId(),
-                .namespace_id = tc.namespaceId(),
-                .left_key = @constCast(tc.leftKey()),
-                .right_key = @constCast(tc.rightKey()),
-            });
-            // serialize stamps table names onto tree changes (only user
-            // tables carry one; empty is a no-op).
             if (tc.op() == .create)
                 try self.registerTableName(tc.namespaceId(), treeTableId(tc.treeId()), tc.name());
         }
-
-        const tbl_len = reader.sstableChangesLen();
-        i = 0;
-        while (i < tbl_len) : (i += 1) {
-            const tc = try reader.sstableChangesAt(i);
-            try self.applySSTableChange(.{
-                .op = tc.op(),
-                .sst_id = tc.sstId(),
-                .namespace_id = tc.namespaceId(),
-                .tree_id = tc.treeId(),
-                .level = tc.level(),
-            });
-        }
-
         const ns_len = reader.namespacesLen();
         i = 0;
         while (i < ns_len) : (i += 1) {
             const c = try reader.namespacesAt(i);
-            // getOrPut, not put: the tree loop above already created the
-            // entry when registering table names — don't clobber the map.
-            const slot = try self.namespaces.getOrPut(c.id());
-            if (!slot.found_existing) slot.value_ptr.* = .{};
-            slot.value_ptr.next_table_id = c.nextTableId();
             try self.registerNamespaceName(c.id(), c.name());
         }
-
-        self.next_ns_id = @max(reader.nextNsId(), first_namespace);
     }
 
     /// Deep-copy this ForestState into a fresh standalone copy. Used when
     /// building a snapshot draft so the live state is never mutated by the
     /// snapshot pipeline.
-    pub fn clone(self: *const ForestState, allocator: std.mem.Allocator) !ForestState {
+    pub fn clone(self: *ForestState, allocator: std.mem.Allocator) !ForestState {
         const bytes = try self.serialize(allocator);
         defer allocator.free(bytes);
         var out = ForestState.init(allocator);

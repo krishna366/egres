@@ -37,7 +37,18 @@ const merge_iterator = _table.merge_iterator;
 /// grows past `tree_split_size`, then splits at the primary-key median into more
 /// trees; entries are kept sorted by range.left so we can binary-search.
 pub const TableTrees = struct {
+    pub const Lock = fiber.RWMutex(.untracked);
+
     allocator: std.mem.Allocator,
+    /// Guards `entries`: shared to find a tree or walk the list, exclusive
+    /// to add or remove one (`addTree` can reallocate the list under a
+    /// walker). A tree found here is handed out with a ref taken while
+    /// this is still held — the window in which a split or drop could
+    /// otherwise retire it between the find and the take — and the caller
+    /// releases the ref when done. Writers never wait for readers: they
+    /// swap the list and drop their own ref, and the last holder closes
+    /// the tree.
+    mu: Lock,
     /// The table's trees, sorted by key_range.left for binary search. A tree's
     /// id and range live on the Tree itself (tree.tree_id / tree.key_range), so
     /// TableTrees owns the *Tree directly — no separate entry record.
@@ -46,6 +57,7 @@ pub const TableTrees = struct {
     pub fn init(allocator: std.mem.Allocator) TableTrees {
         return .{
             .allocator = allocator,
+            .mu = .{},
             .entries = .empty,
         };
     }
@@ -58,15 +70,18 @@ pub const TableTrees = struct {
         return a.key_range.left.order(b.key_range.left) == .lt;
     }
 
-    /// Add a tree and keep entries sorted by key_range.left.
-    pub fn addTree(self: *TableTrees, tree: *Tree) !void {
+    /// Add a tree and keep entries sorted by key_range.left. Takes over the
+    /// caller's ref on it (the one `Tree.open` starts with).
+    pub fn addTree(self: *TableTrees, held: Lock.Exclusive, tree: *Tree) !void {
+        self.mu.assertHeld(held);
         try self.entries.append(self.allocator, tree);
         std.mem.sort(*Tree, self.entries.items, {}, lessByLeft);
     }
 
-    /// Remove the tree with `tree_id`, returning it (or null if absent). The
-    /// caller owns teardown (Tree.close + free).
-    pub fn removeTree(self: *TableTrees, tree_id: u64) ?*Tree {
+    /// Remove the tree with `tree_id`, returning it (or null if absent) —
+    /// with the list's ref, which the caller releases once outside `mu`.
+    pub fn removeTree(self: *TableTrees, held: Lock.Exclusive, tree_id: u64) ?*Tree {
+        self.mu.assertHeld(held);
         var i: usize = self.entries.items.len;
         while (i > 0) {
             i -= 1;
@@ -77,8 +92,68 @@ pub const TableTrees = struct {
         return null;
     }
 
+    /// The tree with `tree_id`, or null. One table's trees (one until it
+    /// splits), so effectively O(1).
+    pub fn byId(self: *const TableTrees, held: Lock.Shared, tree_id: u64) ?*Tree {
+        self.mu.assertHeld(held);
+        for (self.entries.items) |tree| {
+            if (tree.tree_id == tree_id) return tree;
+        }
+        return null;
+    }
+
+    /// True iff the table still has trees. A dropped table's TableTrees
+    /// stays in the forest's map, empty — table ids are never reused, and a
+    /// reader may still hold the pointer — so this, not map presence, is
+    /// what "the table exists" means.
+    pub fn hasTrees(self: *TableTrees) bool {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        return self.entries.items.len > 0;
+    }
+
+    /// The tree owning `key`, with a ref taken for the caller — release it
+    /// with `tree.release()` once done reading through the tree. Null if
+    /// no tree owns the key.
+    pub fn getTreeByKey(self: *TableTrees, key: Key) ?*Tree {
+        const held = self.mu.hold(.shared, @src());
+        defer held.release();
+        return retain(self.lookup(held, key));
+    }
+
+    /// `getTree` by tree id.
+    pub fn getTreeById(self: *TableTrees, tree_id: u64) ?*Tree {
+        const held = self.mu.hold(.shared, @src());
+        defer held.release();
+        return retain(self.byId(held, tree_id));
+    }
+
+    /// The list itself, borrowed for as long as `held` is.
+    pub fn list(self: *const TableTrees, held: Lock.Shared) []const *Tree {
+        self.mu.assertHeld(held);
+        return self.entries.items;
+    }
+
+    /// `getTree` for the rightmost tree — where an id-monotonic table's
+    /// newest keys land. Null when the table has no trees.
+    pub fn getRightmostTree(self: *TableTrees) ?*Tree {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        if (self.entries.items.len == 0) return null;
+        return retain(self.entries.items[self.entries.items.len - 1]);
+    }
+
+    /// The ref is taken while `mu` is still held: there is no instant at
+    /// which a caller has found a tree but doesn't hold it.
+    fn retain(found: ?*Tree) ?*Tree {
+        const tree = found orelse return null;
+        tree.acquire();
+        return tree;
+    }
+
     /// Find the tree that owns this key, or null if none.
-    pub fn lookup(self: *const TableTrees, search_key: Key) ?*Tree {
+    pub fn lookup(self: *const TableTrees, held: Lock.Shared, search_key: Key) ?*Tree {
+        self.mu.assertHeld(held);
         if (self.entries.items.len == 1) return self.entries.items[0];
         if (self.entries.items.len == 0) return null;
 
@@ -303,13 +378,19 @@ pub const Memtables = struct {
         imm.release();
     }
 
-    /// Return the oldest immutable memtable without removing it.
+    /// The oldest immutable memtable, with a ref for the caller (release
+    /// when done). The ref is taken under the lock, as `getIterators`
+    /// does: the apply loop's `popOldestIfMatches` may drop the list's ref
+    /// — the phantom sweep drops exactly the oldest ones — at any moment
+    /// after this returns. Null when there is none.
     pub fn peekOldest(self: *Memtables) ?*SkipList {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
 
         if (self.immutables.items.len == 0) return null;
-        return self.immutables.items[self.immutables.items.len - 1];
+        const oldest = self.immutables.items[self.immutables.items.len - 1];
+        oldest.acquire();
+        return oldest;
     }
 };
 
@@ -327,10 +408,12 @@ pub const Forest = struct {
     file_ids: _fi.FileIds,
     /// One TableTrees per table, keyed by its `{namespace, table_id}` identity.
     /// The TableTreess own the live `*Tree` objects (in their sorted entries);
-    /// there is no separate tree map. Look a tree up by id via `treeById`.
-    tables: std.AutoHashMap(TableKey, *TableTrees),
+    /// there is no separate tree map. Look a tree up by id via `getTree`.
+    /// The map guards itself, and a TableTrees once inserted is never freed
+    /// (a dropped table's stays, empty — see `TableTrees.hasTrees`), so
+    /// `getTable` needs no lock and its result never dangles.
+    tables: utils.SafeHashMap(TableKey, *TableTrees),
     table_cache: TableCache,
-    mu: fiber.RWMutex(.tracked),
     memtables: Memtables,
     /// The oldest timestamp any reader is still allowed to ask for. Reads
     /// below it are rejected (`error.ReadBelowMinRead`), which is exactly what
@@ -367,9 +450,8 @@ pub const Forest = struct {
             .opts = opts,
             .ms = ms,
             .file_ids = .{},
-            .tables = std.AutoHashMap(TableKey, *TableTrees).init(allocator),
+            .tables = utils.SafeHashMap(TableKey, *TableTrees).init(allocator),
             .table_cache = TableCache.init(allocator, opts.dir),
-            .mu = .{},
             .memtables = Memtables.init(allocator, mt),
             .global_min_read = std.atomic.Value(u64).init(0),
         };
@@ -401,13 +483,11 @@ pub const Forest = struct {
     pub fn close(self: *Forest) void {
         self.memtables.deinit();
 
-        // TableTreess own the trees: tear down each tree, then the table.
+        // TableTreess own the trees: drop each list's ref (the last one at
+        // shutdown, so the tree closes here), then the table.
         var tables_it = self.tables.valueIterator();
         while (tables_it.next()) |trees| {
-            for (trees.*.entries.items) |tree| {
-                tree.close();
-                self.allocator.destroy(tree);
-            }
+            for (trees.*.entries.items) |tree| tree.release();
             trees.*.deinit();
             self.allocator.destroy(trees.*);
         }
@@ -416,7 +496,6 @@ pub const Forest = struct {
         self.ms.deinit();
         self.file_ids.mu.deinit();
         self.table_cache.deinit();
-        self.mu.deinit();
         self.allocator.destroy(self);
     }
 
@@ -448,6 +527,7 @@ pub const Forest = struct {
 
     pub fn buildFlush(self: *Forest) !?FlushResult {
         const mt = self.memtables.peekOldest() orelse return null;
+        defer mt.release();
         var iter = mt.iterator();
         defer iter.deinit();
 
@@ -474,16 +554,15 @@ pub const Forest = struct {
         // Route each key to a tree and add to the appropriate builder.
         while (iter.itemRef()) |item| {
             const tk = blk: {
-                self.mu.lockShared(@src());
-                defer self.mu.unlockShared();
-                const trees = self.treesFor(item.key.namespace, item.key.table_id) orelse {
+                const trees = self.getTable(item.key.namespace, item.key.table_id) orelse {
                     try iter.next();
                     continue;
                 };
-                const tree = trees.lookup(item.key) orelse {
+                const tree = trees.getTreeByKey(item.key) orelse {
                     try iter.next();
                     continue;
                 };
+                defer tree.release();
                 break :blk TreeKey{ .namespace = item.key.namespace, .tree_id = tree.tree_id };
             };
 
@@ -603,9 +682,8 @@ pub const Forest = struct {
 
         const bottom: u32 = @intCast(self.opts.max_levels - 1);
         const tk, const max_bytes = blk: {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
-            const tree = try self.singleTreeLocked(ns, table_id);
+            const tree = try self.singleTree(ns, table_id);
+            defer tree.release();
             var targets = try tree.levelTargets();
             defer targets.deinit();
             break :blk .{
@@ -677,21 +755,25 @@ pub const Forest = struct {
     /// post-install verification (applyBackfill skips, deterministically
     /// on every node, when the bottom level was not empty).
     pub fn bottomTableCount(self: *Forest, ns: u64, table_id: u32) !usize {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-        const tree = try self.singleTreeLocked(ns, table_id);
-        return tree.levels[tree.levels.len - 1].tableCount();
+        const tree = try self.singleTree(ns, table_id);
+        defer tree.release();
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        return tree.levels[tree.levels.len - 1].tableCount(held);
     }
 
     /// The ONE tree of an un-split table — backfill's addressing mode:
     /// a freshly created index table cannot have split (splits never
     /// touch an empty tree, and ddl_mu serializes DDL against drops).
-    /// Caller holds self.mu.
-    fn singleTreeLocked(self: *Forest, ns: u64, table_id: u32) !*Tree {
-        const trees = self.treesFor(ns, table_id) orelse
+    /// Returned with a ref; the caller releases it.
+    fn singleTree(self: *Forest, ns: u64, table_id: u32) !*Tree {
+        const trees = self.getTable(ns, table_id) orelse
             return error.TreeNotFound;
-        std.debug.assert(trees.entries.items.len == 1);
-        return trees.entries.items[0];
+        const held = trees.mu.hold(.shared, @src());
+        defer held.release();
+        const listed = trees.list(held);
+        std.debug.assert(listed.len == 1);
+        return TableTrees.retain(listed[0]).?;
     }
 
     /// applyFlush is Phase B: commits the manifest changes from a memtable flush
@@ -717,8 +799,13 @@ pub const Forest = struct {
         // needed in the same order they were built, so indices align.
         for (changes, needed.items) |c, n| {
             std.debug.assert(c.sst_id == n.id);
-            const tree = self.treeById(c.namespace_id, c.tree_id) orelse continue;
-            try tree.levels[c.level].addEntry(n.id, n.table.?);
+            const tree = self.getTree(c.namespace_id, c.tree_id) orelse continue;
+            defer tree.release();
+            {
+                const held = tree.mu.hold(.exclusive, @src());
+                defer held.release();
+                try tree.levels[c.level].addEntry(held, n.id, n.table.?);
+            }
 
             // Metrics: one per-tree flush output + bytes written to L0.
             try _metrics.g().flushes.incr(.{ .namespace_id = c.namespace_id, .tree_id = c.tree_id });
@@ -744,7 +831,8 @@ pub const Forest = struct {
             const tk = TreeKey{ .namespace = c.namespace_id, .tree_id = c.tree_id };
             if (!seen_trees.contains(tk)) {
                 try seen_trees.put(tk, {});
-                if (self.treeById(tk.namespace, tk.tree_id)) |tree| {
+                if (self.getTree(tk.namespace, tk.tree_id)) |tree| {
+                    defer tree.release();
                     try tree.updateCompactCandidate();
                 }
             }
@@ -786,11 +874,9 @@ pub const Forest = struct {
             return item;
         }
 
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-
-        const trees = self.treesFor(search_key.namespace, search_key.table_id) orelse return null;
-        const tree = trees.lookup(search_key) orelse return null;
+        const trees = self.getTable(search_key.namespace, search_key.table_id) orelse return null;
+        const tree = trees.getTreeByKey(search_key) orelse return null;
+        defer tree.release();
         return tree.get(search_key, priority);
     }
 
@@ -834,18 +920,12 @@ pub const Forest = struct {
             allocator.free(srcs);
         }
 
-        // Tree pointer resolved under the forest lock, used after —
-        // the same lifetime contract scanRaw relies on between hops.
-        const tree: ?*Tree = blk: {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
-            const trees = self.treesFor(
-                search_key.namespace,
-                search_key.table_id,
-            ) orelse break :blk null;
-            break :blk trees.lookup(search_key);
-        };
-        const t = tree orelse return zroar.Bitmap.init(allocator);
+        const trees = self.getTable(
+            search_key.namespace,
+            search_key.table_id,
+        ) orelse return zroar.Bitmap.init(allocator);
+        const t = trees.getTreeByKey(search_key) orelse return zroar.Bitmap.init(allocator);
+        defer t.release();
 
         const bm = try t.rollupBitmap(
             allocator,
@@ -992,10 +1072,9 @@ pub const Forest = struct {
         forest: *Forest,
         allocator: std.mem.Allocator,
         /// Per-cursor arena: memtable iterator slices and each visited
-        /// tree's duped range live exactly as long as the cursor (the
-        /// forest read lock is released once the hop's merge is open, and
-        /// a split frees the tree's old right bound, so the range cannot
-        /// borrow from the tree).
+        /// tree's duped range live exactly as long as the cursor (the tree
+        /// ref is released once the hop's merge is open, and a split
+        /// retires the tree, so the range cannot borrow from it).
         arena: std.heap.ArenaAllocator,
         /// The window still to visit: the scan's range at open, its left
         /// bound advanced past each drained tree's snapshotted right edge.
@@ -1101,30 +1180,26 @@ pub const Forest = struct {
         /// empty intersection just opens an empty merge; `next` then hops
         /// or finishes as usual.
         ///
-        /// Lookup, range snapshot, and table selection (`openMergeLocked`)
-        /// happen under ONE hold of the forest read lock. A split moves a tree's
-        /// right-half tables to a new tree and narrows its range in place;
-        /// were the lock dropped between the snapshot and the selection, a
-        /// split in that gap would leave the merge pinning only the left
-        /// half while the hop still jumps past the snapshotted right edge —
-        /// the moved keys would never be read. Pinned together, the tables
-        /// always cover the range copied, and a later split just moves
-        /// tables we already hold. The seek — the part that reads blocks —
-        /// runs after the lock is released.
+        /// The tree is held by ref (`TableTrees.getTree`) across the range
+        /// snapshot and the table selection. A split never mutates a live
+        /// tree — it installs fresh objects and retires this one, which
+        /// stays whole for us — so the range copied and the tables pinned
+        /// describe the same instant, and a later split just moves tables
+        /// we already hold. The ref is released before the seek, the part
+        /// that reads blocks.
         fn openNextTree(self: *Cursor) !void {
             const a = self.arena.allocator();
 
             const visit_range = blk: {
-                self.forest.mu.lockShared(@src());
-                defer self.forest.mu.unlockShared();
-                const trees = self.forest.treesFor(self.ns, self.table_id) orelse {
+                const trees = self.forest.getTable(self.ns, self.table_id) orelse {
                     self.done = true;
                     return;
                 };
-                const tree = trees.lookup(self.key_range.left) orelse {
+                const tree = trees.getTreeByKey(self.key_range.left) orelse {
                     self.done = true;
                     return;
                 };
+                defer tree.release();
                 self.tree_range = try tree.key_range.dupe(a);
                 const visit_range = self.key_range.intersect(self.tree_range);
 
@@ -1134,7 +1209,7 @@ pub const Forest = struct {
                 // deinit is fine.) The txn's pending skiplist rides in as
                 // src 0 — the merge's equal-key tie-break.
                 const srcs = try self.forest.memtables.getIterators(a, self.opts.pending);
-                self.merge = try tree.openMergeLocked(a, visit_range, self.opts.priority, srcs);
+                self.merge = try tree.openMerge(a, visit_range, self.opts.priority, srcs);
                 break :blk visit_range;
             };
 
@@ -1212,20 +1287,17 @@ pub const Forest = struct {
         var floor: ?Key = null;
         errdefer if (floor) |f| f.free(allocator);
         {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
-
-            const trees = self.treesFor(ns, table_id) orelse return null;
-            if (trees.entries.items.len == 0) return null;
-
-            const tree = trees.entries.items[trees.entries.items.len - 1]; // rightmost
+            const trees = self.getTable(ns, table_id) orelse return null;
+            const tree = trees.getRightmostTree() orelse return null;
+            defer tree.release();
             var best_sst: Key = .{};
+            const held = tree.mu.hold(.shared, @src());
+            defer held.release();
             for (tree.levels) |*lv| {
-                lv.mu.lockShared(@src());
-                defer lv.mu.unlockShared();
-                if (lv.tables.items.len == 0) continue;
+                const items = lv.entries(held);
+                if (items.len == 0) continue;
 
-                const b = lv.tables.items[lv.tables.items.len - 1].table.biggest; // rightmost
+                const b = items[items.len - 1].table.biggest; // rightmost
                 if (b.primary.len == 0) continue;
 
                 if (best_sst.primary.len == 0 or b.orderWithoutTs(best_sst) == .gt) best_sst = b;
@@ -1276,33 +1348,31 @@ pub const Forest = struct {
     /// installTree opens the in-memory Tree for the given id and adds it to its
     /// table's TableTrees (keyed by the high 32 bits of tree_id). Tree.open
     /// reads the tree's key range from the manifest, so the caller must have
-    /// already committed the TreeChange and must hold the forest write lock.
+    /// already committed the TreeChange. The open — which loads the tree's
+    /// SSTs, file I/O — holds nothing; the publish is the map's own insert
+    /// plus one list append under the table's lock, and the tree is
+    /// invisible until that append.
     fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
-        var tree = try Tree.open(self.allocator, self.opts, namespace_id, tree_id, &self.ms, &self.table_cache);
-        errdefer tree.close();
+        const tree = try Tree.open(self.allocator, self.opts, namespace_id, tree_id, &self.ms, &self.table_cache);
+        errdefer tree.release();
 
-        const tree_ptr = try self.allocator.create(Tree);
-        errdefer self.allocator.destroy(tree_ptr);
-        tree_ptr.* = tree;
-
-        const trees = try self.getOrCreateTableTrees(namespace_id, treeTableId(tree_id));
-        try trees.addTree(tree_ptr);
+        const tbl_trees = try self.getOrCreateTable(namespace_id, treeTableId(tree_id));
+        const held = tbl_trees.mu.hold(.exclusive, @src());
+        defer held.release();
+        try tbl_trees.addTree(held, tree);
     }
 
     /// Walk every tree's level table list and append the file_ids of any SST
     /// not currently on disk. The returned slice is owned by the caller.
     pub fn collectMissingFileIds(self: *Forest, allocator: std.mem.Allocator) ![]u64 {
+        // The ids come out under the manifest lock; the disk check (a stat
+        // per file) runs after it is released.
+        const listed = try self.ms.listedFileIds(allocator);
+        defer allocator.free(listed);
         var out: std.ArrayList(u64) = .empty;
         errdefer out.deinit(allocator);
-
-        var it = self.ms.trees.iterator();
-        while (it.next()) |kv| {
-            for (kv.value_ptr.*.levels.items) |lm| {
-                var tit = lm.tables.keyIterator();
-                while (tit.next()) |fid| {
-                    if (!self.hasFile(fid.*)) try out.append(allocator, fid.*);
-                }
-            }
+        for (listed) |fid| {
+            if (!self.hasFile(fid)) try out.append(allocator, fid);
         }
         return out.toOwnedSlice(allocator);
     }
@@ -1318,24 +1388,17 @@ pub const Forest = struct {
     /// which is independent of (and immune to) ids in other nodes'
     /// namespaces that show up in the manifest.
     pub fn openTablesFromManifest(self: *Forest) !void {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
-
         // installTree opens each Tree (which dupes its key range from the
         // manifest), so we only need the keys here.
-        var it = self.ms.trees.keyIterator();
-        while (it.next()) |tk| {
-            try self.installTree(tk.namespace, tk.tree_id);
-        }
+        const keys = try self.ms.treeKeys(self.allocator, null);
+        defer self.allocator.free(keys);
+        for (keys) |tk| try self.installTree(tk.namespace, tk.tree_id);
     }
 
     /// Create a new tree for the given namespace, table, and key range.
     /// Single-node path (no Raft) — used by tests. Returns the new tree_id,
     /// derived from the table's next free split index.
     pub fn createTree(self: *Forest, namespace_id: u64, table_id: u32, range: KeyRange) !u64 {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
-
         const tree_id = self.nextTreeId(namespace_id, table_id);
 
         const left_raw = try range.left.marshal(self.allocator);
@@ -1361,11 +1424,7 @@ pub const Forest = struct {
     /// already exists, `NameExists` if another namespace holds `name`.
     pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, name: []const u8) !_manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
-        {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
-            if (self.tables.contains(.{ .namespace = namespace_id, .table_id = 0 })) return error.NamespaceAlreadyExists;
-        }
+        if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
         if (self.ms.lookupNamespace(name)) |_| return error.NameExists;
 
         // One tree per system table: the default (raw-KV) table plus the SQL
@@ -1428,16 +1487,13 @@ pub const Forest = struct {
     ///
     /// Skips any TreeChange whose tree already exists (re-apply).
     pub fn applyNamespaceCreate(self: *Forest, mc: _manifest.ManifestChange) !void {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
-
         for (mc.tree_changes) |tc| {
             if (tc.op != .create) continue; // only CREATE for ns_create
             self.ms.advanceNamespace(tc.namespace_id);
             try self.ms.registerNamespaceName(tc.namespace_id, tc.name);
             // Per-tree, not per-namespace: an ns_create carries the default
             // AND catalog trees — checking only table 0 would skip the rest.
-            if (self.treeById(tc.namespace_id, tc.tree_id) != null) {
+            if (self.hasTree(tc.namespace_id, tc.tree_id)) {
                 std.log.warn("applyNamespaceCreate: ns={d} tree_id={d} already exists, skipping", .{ tc.namespace_id, tc.tree_id });
                 continue;
             }
@@ -1455,11 +1511,7 @@ pub const Forest = struct {
     /// (namespace, table_id), so no key-range bound is needed. No state mutates,
     /// so a failed propose costs nothing. create_tree. Caller owns the returned slice.
     pub fn buildCreateTree(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_id: u32) !_manifest.ManifestChange {
-        const tree_id = blk: {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
-            break :blk self.nextTreeId(namespace_id, table_id);
-        };
+        const tree_id = self.nextTreeId(namespace_id, table_id);
         const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
         tree_changes[0] = _manifest.createTreeChange(tree_id, namespace_id, "", "");
         return .{
@@ -1507,11 +1559,7 @@ pub const Forest = struct {
         for (names, 0..) |name, i| {
             const table_id = try self.ms.nextTableId(namespace_id);
             table_ids[i] = table_id;
-            const tree_id = blk: {
-                self.mu.lockShared(@src());
-                defer self.mu.unlockShared();
-                break :blk self.nextTreeId(namespace_id, table_id);
-            };
+            const tree_id = self.nextTreeId(namespace_id, table_id);
             tree_changes[i] = _manifest.createTreeChange(tree_id, namespace_id, "", "");
             tree_changes[i].name = @constCast(name);
         }
@@ -1533,9 +1581,6 @@ pub const Forest = struct {
     /// re-elected leader's allocator current). Idempotent on (namespace,
     /// tree_id). Called on all nodes after Raft commit (create_tree).
     pub fn applyCreateTree(self: *Forest, mc: _manifest.ManifestChange) !void {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
-
         for (mc.tree_changes) |tc| {
             if (tc.op != .create) continue;
             try self.ms.advanceTableId(tc.namespace_id, treeTableId(tc.tree_id));
@@ -1543,7 +1588,7 @@ pub const Forest = struct {
             // (WAL replay over snapshot-restored state) re-registers as a
             // no-op.
             try self.ms.registerTableName(tc.namespace_id, treeTableId(tc.tree_id), tc.name);
-            if (self.treeById(tc.namespace_id, tc.tree_id) != null) continue; // already applied
+            if (self.hasTree(tc.namespace_id, tc.tree_id)) continue; // already applied
             try self.ms.commit(&.{}, &.{tc});
             try self.installTree(tc.namespace_id, tc.tree_id);
         }
@@ -1562,14 +1607,12 @@ pub const Forest = struct {
     pub fn buildDropTables(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_ids: []const u32) !_manifest.ManifestChange {
         var ids: std.ArrayList(u64) = .empty;
         defer ids.deinit(alloc);
-        {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
-            for (table_ids) |table_id|
-                if (self.treesFor(namespace_id, table_id)) |trees| {
-                    for (trees.entries.items) |e| try ids.append(alloc, e.tree_id);
-                };
-        }
+        for (table_ids) |table_id|
+            if (self.getTable(namespace_id, table_id)) |trees| {
+                const held = trees.mu.hold(.shared, @src());
+                defer held.release();
+                for (trees.list(held)) |e| try ids.append(alloc, e.tree_id);
+            };
 
         const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.items.len);
         for (ids.items, 0..) |tree_id, i| {
@@ -1594,9 +1637,7 @@ pub const Forest = struct {
     /// unqueryable (route + manifest gone); physical reclaim of orphaned SSTs is
     /// left to snapshot GC — a follow-up.
     pub fn applyDropTree(self: *Forest, mc: _manifest.ManifestChange) !void {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
-        try self.applyTreeDeletesLocked(mc);
+        try self.applyTreeDeletes(mc);
         // Forget each dropped table's name (first delete of a multi-tree
         // table removes it; the rest are no-ops). drop_ns doesn't
         // come here — dropNamespace frees the whole map.
@@ -1607,25 +1648,26 @@ pub const Forest = struct {
     }
 
     /// The delete-changes walk shared by applyDropTree and applyDropNamespace.
-    /// Caller holds `self.mu` exclusively.
-    fn applyTreeDeletesLocked(self: *Forest, mc: _manifest.ManifestChange) !void {
+    /// Runs on the apply loop, like every other create and drop.
+    fn applyTreeDeletes(self: *Forest, mc: _manifest.ManifestChange) !void {
         for (mc.tree_changes) |tc| {
             if (tc.op != .delete) continue;
 
             // Remove the tree from its table (derived from the tree_id's
             // high 32 bits) and tear it down (releases its level refs on its
             // SSTs). Drop the table once it has no trees left.
-            const table = TableKey{ .namespace = tc.namespace_id, .table_id = treeTableId(tc.tree_id) };
-            if (self.tables.get(table)) |trees| {
-                if (trees.removeTree(tc.tree_id)) |tree| {
-                    tree.close();
-                    self.allocator.destroy(tree);
-                }
-                if (trees.entries.items.len == 0) {
-                    _ = self.tables.remove(table);
-                    trees.deinit();
-                    self.allocator.destroy(trees);
-                }
+            // The tree leaves the list under the table lock, so no reader can
+            // find it from here on; dropping the list's ref then closes it
+            // as soon as the readers that already hold it let go. The
+            // TableTrees itself stays in the map, empty: table ids are never
+            // reused, and a reader may still be holding its pointer.
+            if (self.getTable(tc.namespace_id, treeTableId(tc.tree_id))) |trees| {
+                const gone = blk: {
+                    const held = trees.mu.hold(.exclusive, @src());
+                    defer held.release();
+                    break :blk trees.removeTree(held, tc.tree_id);
+                };
+                if (gone) |tree| tree.release();
             }
 
             // Remove from the manifest (frees the TreeState + its table set).
@@ -1643,12 +1685,14 @@ pub const Forest = struct {
         var changes: std.ArrayList(_manifest.TreeChange) = .empty;
         defer changes.deinit(alloc);
         {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
             var it = self.tables.iterator();
+            defer it.deinit();
             while (it.next()) |kv| {
                 if (kv.key_ptr.namespace != namespace_id) continue;
-                for (kv.value_ptr.*.entries.items) |e| {
+                const trees = kv.value_ptr.*;
+                const held = trees.mu.hold(.shared, @src());
+                defer held.release();
+                for (trees.list(held)) |e| {
                     try changes.append(alloc, _manifest.deleteTreeChange(e.tree_id, namespace_id));
                 }
             }
@@ -1668,47 +1712,21 @@ pub const Forest = struct {
     /// for re-CREATE). Leftover memtable entries for the namespace are dropped
     /// at flush (buildFlush skips items with no route). Idempotent. drop_ns.
     pub fn applyDropNamespace(self: *Forest, mc: _manifest.ManifestChange) !void {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
-        try self.applyTreeDeletesLocked(mc);
+        try self.applyTreeDeletes(mc);
         if (mc.tree_changes.len > 0) {
             self.ms.dropNamespace(mc.tree_changes[0].namespace_id);
         }
     }
 
-    /// Get a tree by its global identity (namespace + namespace-local tree_id).
-    pub fn getTree(self: *Forest, namespace_id: u64, tree_id: u64) ?*Tree {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-        return self.treeById(namespace_id, tree_id);
-    }
-
-    /// True iff a table exists for (namespace, table_id). Used by catalog
-    /// bootstrap to make create_tree idempotent across restarts.
-    pub fn hasTable(self: *Forest, namespace_id: u64, table_id: u32) bool {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-        return self.treesFor(namespace_id, table_id) != null;
-    }
-
-    /// True iff the namespace has been created (its default table exists).
-    /// Used by the leader to reject mutations destined for unknown
-    /// namespaces — those would otherwise pile up in immutable memtables
-    /// since `buildFlush` silently drops items whose namespace has no
-    /// route.
-    pub fn hasNamespace(self: *Forest, namespace_id: u64) bool {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-        // A namespace exists iff its default table (table_id 0) is present —
-        // ns_create always installs it.
-        return self.tables.contains(.{ .namespace = namespace_id, .table_id = 0 });
-    }
-
     /// Compact finds the tree with the highest compaction score and runs one
     /// compaction on it. Returns true if a compaction was executed, false if
     /// no tree needs compaction.
+    /// An identity, not an object: which tree, and what its candidate said.
+    /// The proposer resolves the tree by id (`getTree`) when it builds —
+    /// by then a split or drop may have retired the object the score came
+    /// from, in which case there is nothing to build and the candidate was
+    /// stale anyway. A key can also travel to a peer; a pointer cannot.
     pub const CompactionTarget = struct {
-        tree: *Tree,
         key: TreeKey,
         candidate: _tree.CompactCandidate,
     };
@@ -1725,18 +1743,21 @@ pub const Forest = struct {
         self: *Forest,
         skip: ?*const std.AutoHashMap(TreeKey, void),
     ) ?CompactionTarget {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-
         var best: ?CompactionTarget = null;
-        var tables_it = self.tables.valueIterator();
-        while (tables_it.next()) |trees| {
-            for (trees.*.entries.items) |tree| {
+        var tables_it = self.tables.iterator();
+        defer tables_it.deinit();
+        while (tables_it.next()) |kv| {
+            const trees = kv.value_ptr.*;
+            const held = trees.mu.hold(.shared, @src());
+            defer held.release();
+            for (trees.list(held)) |tree| {
                 const tk = TreeKey{ .namespace = tree.namespace, .tree_id = tree.tree_id };
                 if (skip) |s| if (s.contains(tk)) continue;
+                const th = tree.mu.hold(.shared, @src());
+                defer th.release();
                 const candidate = tree.compact_candidate orelse continue;
                 if (best == null or candidate.score > best.?.candidate.score) {
-                    best = .{ .tree = tree, .key = tk, .candidate = candidate };
+                    best = .{ .key = tk, .candidate = candidate };
                 }
             }
         }
@@ -1754,14 +1775,16 @@ pub const Forest = struct {
     /// hit, instead of any tree in the namespace — which would also drop the
     /// scan below (the flat tables map has no per-namespace index).
     pub fn maxL0TableCountForNs(self: *Forest, ns: u64) u32 {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
         var max_count: u32 = 0;
         var it = self.tables.iterator();
+        defer it.deinit();
         while (it.next()) |kv| {
             if (kv.key_ptr.namespace != ns) continue;
-            for (kv.value_ptr.*.entries.items) |tree| {
-                const n: u32 = @intCast(tree.levels[0].numTables());
+            const trees = kv.value_ptr.*;
+            const held = trees.mu.hold(.shared, @src());
+            defer held.release();
+            for (trees.list(held)) |tree| {
+                const n: u32 = @intCast(tree.numTablesAt(0));
                 if (n > max_count) max_count = n;
             }
         }
@@ -1774,7 +1797,9 @@ pub const Forest = struct {
 
     /// Check if there are frozen memtables waiting to be flushed.
     pub fn hasFrozenMemtables(self: *Forest) bool {
-        return self.memtables.peekOldest() != null;
+        const oldest = self.memtables.peekOldest() orelse return false;
+        oldest.release();
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -1846,23 +1871,27 @@ pub const Forest = struct {
         var largest_tree_size: i64 = 0;
         var tree_count: usize = 0;
 
-        // Walk trees under the forest read lock, but only briefly: collect
-        // the numbers we need, release. Each level access takes its own
-        // lock inside numTables/getTotalSize.
+        // Walk under the map lock, each table's lock shared while its list
+        // is read, but only briefly: collect the numbers we need, release.
+        // Each level access takes its own lock inside numTables/getTotalSize.
         {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
-            var tables_it = self.tables.valueIterator();
-            while (tables_it.next()) |trees| {
-                for (trees.*.entries.items) |tree| {
+            var tables_it = self.tables.iterator();
+            defer tables_it.deinit();
+            while (tables_it.next()) |kv| {
+                const trees = kv.value_ptr.*;
+                const held = trees.mu.hold(.shared, @src());
+                defer held.release();
+                for (trees.list(held)) |tree| {
                     tree_count += 1;
                     const tree_id = tree.tree_id;
 
+                    const th = tree.mu.hold(.shared, @src());
+                    defer th.release();
                     var tree_total: i64 = 0;
                     for (tree.levels, 0..) |*lv, idx| {
                         if (idx >= max_levels) break;
-                        const tcount: u64 = @intCast(lv.numTables());
-                        const tbytes: u64 = @intCast(lv.getTotalSize());
+                        const tcount: u64 = @intCast(lv.numTables(th));
+                        const tbytes: u64 = @intCast(lv.getTotalSize(th));
                         tree_total += @intCast(tbytes);
 
                         aggs[idx].tables_total += tcount;
@@ -1929,28 +1958,38 @@ pub const Forest = struct {
     }
 
     fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tk: TreeKey) !void {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-
-        const tree = self.treeById(tk.namespace, tk.tree_id) orelse {
+        const tree = self.getTree(tk.namespace, tk.tree_id) orelse {
             try w.print("tree id={d}: not found\n", .{tk.tree_id});
             return;
         };
-        const total = tree.totalSize();
+        defer tree.release();
+
+        // Numbers first, under the lock; printing after — the writer may be
+        // a socket, and a slow client must not hold up installs into this
+        // tree.
+        const LevelStat = struct { tables: usize, bytes: u64 };
+        const per_level = try self.allocator.alloc(LevelStat, tree.levels.len);
+        defer self.allocator.free(per_level);
+        const total: i64, const candidate: ?_tree.CompactCandidate = blk: {
+            const held = tree.mu.hold(.shared, @src());
+            defer held.release();
+            for (tree.levels, per_level) |*lv, *st| {
+                st.* = .{ .tables = lv.numTables(held), .bytes = @intCast(lv.getTotalSize(held)) };
+            }
+            break :blk .{ tree.totalSize(held), tree.compact_candidate };
+        };
 
         try w.print("tree id={d} namespace={d} size=", .{ tk.tree_id, tk.namespace });
         try writeBytes(w, @intCast(total));
         try w.print("\n", .{});
 
-        for (tree.levels, 0..) |*lv, idx| {
-            const tcount = lv.numTables();
-            const tbytes: u64 = @intCast(lv.getTotalSize());
-            if (tcount == 0 and tbytes == 0) continue;
-            try w.print("  L{d}: {d} tables, ", .{ idx, tcount });
-            try writeBytes(w, tbytes);
+        for (per_level, 0..) |st, idx| {
+            if (st.tables == 0 and st.bytes == 0) continue;
+            try w.print("  L{d}: {d} tables, ", .{ idx, st.tables });
+            try writeBytes(w, st.bytes);
             try w.print("\n", .{});
         }
-        if (tree.compact_candidate) |c| {
+        if (candidate) |c| {
             try w.print("  compact_candidate: L{d} score={d:.2}\n", .{ c.level, c.score });
         }
     }
@@ -1958,20 +1997,12 @@ pub const Forest = struct {
     fn writeNamespaceStats(self: *Forest, w: *std.Io.Writer, ns_id: u64) !void {
         try w.print("namespace={d}:\n", .{ns_id});
         var any = false;
-        // Collect tree keys in this namespace under the lock, then drop and
-        // call writeTreeStats for each (which re-acquires its own lock).
-        var keys: std.ArrayList(TreeKey) = .empty;
-        defer keys.deinit(self.allocator);
-        {
-            self.mu.lockShared(@src());
-            defer self.mu.unlockShared();
-            var it = self.ms.trees.iterator();
-            while (it.next()) |kv| {
-                if (kv.key_ptr.namespace != ns_id) continue;
-                try keys.append(self.allocator, kv.key_ptr.*);
-            }
-        }
-        for (keys.items) |tk| {
+        // Tree keys come out under the manifest lock (the map they live in
+        // is the apply loop's to rehash); writeTreeStats then takes each
+        // tree's own lock.
+        const keys = try self.ms.treeKeys(self.allocator, ns_id);
+        defer self.allocator.free(keys);
+        for (keys) |tk| {
             any = true;
             try writeTreeStats(self, w, tk);
         }
@@ -2074,9 +2105,15 @@ pub const Forest = struct {
             log.err("writeFile: Table.open failed for {d}: {s}", .{ file_id, @errorName(err) });
             return;
         };
-        self.table_cache.own(file_id, t) catch |err| {
+        const adopted = self.table_cache.own(file_id, t) catch |err| blk: {
             log.err("writeFile: table_cache.own failed for {d}: {s}", .{ file_id, @errorName(err) });
+            break :blk false;
         };
+        // The open-time ref is ours to drop: the cache holds its own once it
+        // adopted the table. Unadopted (the apply loop cached the same id
+        // first, or the insert failed), the struct is ours to free as well.
+        t.decrRef();
+        if (!adopted) self.allocator.destroy(t);
     }
 
     /// Read an SST file from disk. Caller owns the returned slice.
@@ -2089,18 +2126,6 @@ pub const Forest = struct {
         return result.data;
     }
 
-    /// splitTreeForTests splits the given tree at the median key of its
-    /// bottommost level, locally, without going through Raft. **Test-only**
-    /// — production must propose splits through the manifest pipeline so
-    /// all nodes apply the same split deterministically; see
-    /// `proposeSplit` in the engine. Caller must hold the write lock.
-    pub fn splitTreeForTests(self: *Forest, namespace_id: u64, tree_id: u64) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const mc = try self.buildSplit(arena.allocator(), namespace_id, tree_id) orelse return;
-        try self.applySplit(mc);
-    }
-
     /// buildSplit is Phase A: finds the split key, classifies tables, and returns
     /// a ManifestChange with the table and tree changes. All allocations go on
     /// the provided allocator (typically an arena). The caller proposes the
@@ -2108,7 +2133,8 @@ pub const Forest = struct {
     /// table, so its tree_id is the table's next free split index.
     pub fn buildSplit(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, tree_id: u64) !?_manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
-        const left_tree = self.treeById(namespace_id, tree_id) orelse return null;
+        const left_tree = self.getTree(namespace_id, tree_id) orelse return null;
+        defer left_tree.release();
 
         // Find split key from the lowest level in old tree.
         const split_key = try left_tree.findSplitKey(alloc);
@@ -2116,18 +2142,19 @@ pub const Forest = struct {
             return null;
         }
 
-        // Capture old tree state before the manifest commit.
-        const left_tree_state = self.ms.trees.get(.{ .namespace = namespace_id, .tree_id = tree_id }) orelse return null;
+        // The old tree's bounds, copied out under the manifest lock: this
+        // runs on the split-propose fiber while the apply loop may commit
+        // (rehashing the map, freeing a dropped tree's keys).
+        const old_range = try self.ms.treeRange(alloc, .{ .namespace = namespace_id, .tree_id = tree_id }) orelse return null;
         const new_tree_id = self.nextTreeId(namespace_id, treeTableId(tree_id));
 
         // Classify tables per level and build manifest changes.
         var table_changes: std.ArrayList(_manifest.SSTableChange) = .empty;
 
+        const held = left_tree.mu.hold(.shared, @src());
+        defer held.release();
         for (left_tree.levels, 0..) |*llv, llv_idx| {
-            llv.mu.lockShared(@src());
-            defer llv.mu.unlockShared();
-
-            for (llv.tables.items) |tbe| {
+            for (llv.entries(held)) |tbe| {
                 if (tbe.table.smallest.order(split_key) != .lt) { // .eq or .gt
                     // Right-only: remove from old tree, add to new tree.
                     try table_changes.append(alloc, _manifest.deleteSSTableChange(
@@ -2152,8 +2179,8 @@ pub const Forest = struct {
             }
         }
 
-        const left_left_raw_key = try left_tree_state.left.marshal(alloc);
-        const right_right_raw_key = try left_tree_state.right.marshal(alloc);
+        const left_left_raw_key = try old_range.left.marshal(alloc);
+        const right_right_raw_key = try old_range.right.marshal(alloc);
         const split_raw = try split_key.marshal(alloc);
 
         const tree_changes = try alloc.alloc(_manifest.TreeChange, 2);
@@ -2167,11 +2194,17 @@ pub const Forest = struct {
         };
     }
 
-    /// applySplit is Phase B: commits the manifest changes, opens the new tree,
-    /// updates the old tree's key range, removes migrated tables, and updates
-    /// namespace routing. Called on all nodes after Raft commit. The new tree_id
-    /// is derived deterministically (table's next split index), so there is no
-    /// counter for a new leader to re-issue.
+    /// applySplit is Phase B: commits the manifest changes, opens FRESH tree
+    /// objects for both halves from the post-commit manifest — the left
+    /// keeps its id with the narrowed range and only its tables, the right
+    /// is new — swaps them into the table's list, and retires the old
+    /// object. The old one is never mutated: whoever still holds a ref on
+    /// it (a reader mid-selection, a proposer) keeps seeing its full range
+    /// and full table set until they let go, which is what makes a split
+    /// safe against readers without any of them taking a lock across their
+    /// use of a tree. Called on all nodes after Raft commit. The new tree_id
+    /// is derived deterministically (table's next split index), so there is
+    /// no counter for a new leader to re-issue.
     pub fn applySplit(self: *Forest, mc: _manifest.ManifestChange) !void {
         // Commit MANIFEST so we can recover from a crash.
         try self.ms.commit(mc.sstable_changes, mc.tree_changes);
@@ -2190,65 +2223,83 @@ pub const Forest = struct {
             namespace_id = tc.namespace_id;
         }
 
-        // Open the new right tree BEFORE deleting from old tree, so that
-        // loadTables finds the shared tables in the cache with ref > 0.
-        // It would use MANIFEST state to figure out which tables it owns.
-        var new_tree = try Tree.open(self.allocator, self.opts, namespace_id, new_tree_id, &self.ms, &self.table_cache);
-        errdefer new_tree.close();
+        // Both halves are opened from the post-commit manifest while the old
+        // object still lists every table, so loadTables finds the shared
+        // ones in the cache with ref > 0. Their key ranges come from the
+        // manifest too: the left's right edge is the split key.
+        // Refs start at 1, so releasing a half that never gets published
+        // closes and frees it.
+        const left = try Tree.open(self.allocator, self.opts, namespace_id, old_tree_id, &self.ms, &self.table_cache);
+        errdefer left.release();
+        const right = try Tree.open(self.allocator, self.opts, namespace_id, new_tree_id, &self.ms, &self.table_cache);
+        errdefer right.release();
 
-        const left_tree = self.treeById(namespace_id, old_tree_id) orelse return;
+        // Fresh candidates against the post-split state. Without this the
+        // left half would carry the old tree's `{needs_split=true}` verdict
+        // even though half its tables just moved out, and the next
+        // levels-loop iteration would fire another split.
+        try left.updateCompactCandidate();
+        try right.updateCompactCandidate();
 
-        // Update old tree's key range from the manifest state (post-commit).
-        const ms_left = self.ms.trees.getPtr(.{ .namespace = namespace_id, .tree_id = old_tree_id }).?;
-        const new_right = try ms_left.right.dupe(left_tree.allocator);
-        errdefer new_right.free(left_tree.allocator);
-        left_tree.key_range.right.free(left_tree.allocator);
-        left_tree.key_range.right = new_right;
-        left_tree.key_range.inf = false;
-
-        // Remove migrated tables from old tree.
-        for (mc.sstable_changes) |c| {
-            if (c.op == .delete and c.tree_id == old_tree_id) { // DELETE from old tree
-                left_tree.levels[c.level].deleteEntry(c.sst_id);
+        // The swap: both halves in, the old object out, under one exclusive
+        // hold of the table's lock (same table — a split shares the high
+        // 32 bits of the tree_id). Capacity is reserved first so the two
+        // adds cannot fail between the old tree leaving and them landing.
+        std.debug.assert(treeTableId(new_tree_id) == treeTableId(old_tree_id));
+        const trees = self.getTable(namespace_id, treeTableId(old_tree_id)) orelse {
+            left.release();
+            right.release();
+            return;
+        };
+        const old = blk: {
+            const held = trees.mu.hold(.exclusive, @src());
+            defer held.release();
+            if (trees.byId(held.shared(), old_tree_id) == null) { // gone (dropped) — nothing to split
+                left.release();
+                right.release();
+                return;
             }
-        }
+            try trees.entries.ensureUnusedCapacity(trees.allocator, 2);
+            const old = trees.removeTree(held, old_tree_id).?;
+            trees.addTree(held, left) catch unreachable; // capacity reserved above
+            trees.addTree(held, right) catch unreachable;
+            break :blk old;
+        };
 
-        // Add the new tree to its table — same table as the parent (a
-        // split shares the high 32 bits of the tree_id). Its key range was set
-        // by Tree.open from the post-commit manifest, and addTree re-sorts the
-        // table. The old tree's range was narrowed in place above; its left
-        // edge is unchanged, so the sort order holds and needs no fixup.
-        const new_ptr = try self.allocator.create(Tree);
-        errdefer self.allocator.destroy(new_ptr);
-        new_ptr.* = new_tree;
-        const trees = try self.getOrCreateTableTrees(namespace_id, treeTableId(new_tree_id));
-        try trees.addTree(new_ptr);
-
-        // Refresh both trees' compact candidates against the post-split
-        // state. Without this, the old tree keeps its pre-split
-        // `{needs_split=true, score=100}` candidate even though half its
-        // tables just moved out, and the next levels-loop iteration
-        // re-picks it and fires another split.
-        try left_tree.updateCompactCandidate();
-        try new_ptr.updateCompactCandidate();
+        // The list's ref on the old object. Readers that still hold it keep
+        // its full range and tables; the last of them closes it.
+        old.release();
     }
 
-    /// Route to a table's trees by its `{namespace, table_id}` identity. Returns
-    /// null if no table exists for that table. Caller holds the forest lock.
-    fn treesFor(self: *Forest, namespace_id: u64, table_id: u32) ?*TableTrees {
-        return self.tables.get(.{ .namespace = namespace_id, .table_id = table_id });
+    // -----------------------------------------
+    // All the funcs using tables
+    // -----------------------------------------
+
+    /// True iff the namespace has been created (its default table exists).
+    /// Used by the leader to reject mutations destined for unknown
+    /// namespaces — those would otherwise pile up in immutable memtables
+    /// since `buildFlush` silently drops items whose namespace has no
+    /// route.
+    pub fn hasNamespace(self: *Forest, namespace_id: u64) bool {
+        // A namespace exists iff its default table (table_id 0) has trees —
+        // ns_create always installs it, drop_ns removes them.
+        return self.hasTable(namespace_id, 0);
     }
 
-    /// Look up a tree by its `(namespace, tree_id)` without a routing key: find
-    /// the table (high 32 bits of tree_id) and scan its trees. The scan
-    /// is over one table's trees (one until it splits), so effectively O(1).
-    /// Caller holds the forest lock.
-    fn treeById(self: *Forest, namespace_id: u64, tree_id: u64) ?*Tree {
-        const trees = self.treesFor(namespace_id, treeTableId(tree_id)) orelse return null;
-        for (trees.entries.items) |tree| {
-            if (tree.tree_id == tree_id) return tree;
-        }
-        return null;
+    /// Get a tree by its global identity (namespace + namespace-local
+    /// tree_id): find the table (high 32 bits of tree_id), scan its trees.
+    /// Returned with a ref for the caller — `tree.release()` when done.
+    pub fn getTree(self: *Forest, namespace_id: u64, tree_id: u64) ?*Tree {
+        const trees = self.getTable(namespace_id, treeTableId(tree_id)) orelse return null;
+        return trees.getTreeById(tree_id);
+    }
+
+    /// True iff the tree is currently listed (idempotency checks).
+    pub fn hasTree(self: *Forest, namespace_id: u64, tree_id: u64) bool {
+        const trees = self.getTable(namespace_id, treeTableId(tree_id)) orelse return false;
+        const held = trees.mu.hold(.shared, @src());
+        defer held.release();
+        return trees.byId(held, tree_id) != null;
     }
 
     /// Derive the next free tree_id for a (namespace, table_id) table:
@@ -2256,24 +2307,63 @@ pub const Forest = struct {
     /// table has no trees yet. Replaces the old global next_tree_id counter —
     /// the id is a pure function of the table's current trees, so every node
     /// derives the same value and there is nothing to recover on leader change.
-    /// Caller holds at least the shared forest lock.
+    /// Reads the table's list under its own lock. A proposer's derivation
+    /// can still race a publish already in flight — they are a raft round
+    /// trip apart, which no local lock covers — and the apply-side
+    /// `hasTree` check absorbs the duplicate.
     fn nextTreeId(self: *Forest, namespace_id: u64, table_id: u32) u64 {
         var max_tree_id: u64 = makeTreeId(table_id, 0); // table's first tree_id
-        if (self.treesFor(namespace_id, table_id)) |trees| {
-            for (trees.entries.items) |e| {
+        if (self.getTable(namespace_id, table_id)) |trees| {
+            const held = trees.mu.hold(.shared, @src());
+            defer held.release();
+            for (trees.list(held)) |e| {
                 max_tree_id = @max(max_tree_id, e.tree_id + 1);
             }
         }
         return max_tree_id;
     }
 
-    fn getOrCreateTableTrees(self: *Forest, namespace_id: u64, table_id: u32) !*TableTrees {
+    /// Route to a table's trees by its `{namespace, table_id}` identity.
+    /// Returns null if the table was never created. No lock: the map guards
+    /// itself and a TableTrees is never freed, so the pointer stays good —
+    /// though a dropped table's is empty (`hasTrees`).
+    fn getTable(self: *Forest, namespace_id: u64, table_id: u32) ?*TableTrees {
+        return self.tables.get(.{ .namespace = namespace_id, .table_id = table_id });
+    }
+
+    /// True iff a table exists for (namespace, table_id), i.e. has trees.
+    /// Used by catalog bootstrap to make create_tree idempotent across
+    /// restarts.
+    pub fn hasTable(self: *Forest, namespace_id: u64, table_id: u32) bool {
+        const trees = self.getTable(namespace_id, table_id) orelse return false;
+        return trees.hasTrees();
+    }
+
+    fn getOrCreateTable(self: *Forest, namespace_id: u64, table_id: u32) !*TableTrees {
         const key = TableKey{ .namespace = namespace_id, .table_id = table_id };
         if (self.tables.get(key)) |trees| return trees;
 
-        const trees = try self.allocator.create(TableTrees);
-        trees.* = TableTrees.init(self.allocator);
-        try self.tables.put(key, trees);
-        return trees;
+        const fresh = try self.allocator.create(TableTrees);
+        errdefer self.allocator.destroy(fresh);
+        fresh.* = TableTrees.init(self.allocator);
+        const stored = try self.tables.getOrPut(key, fresh);
+        if (stored != fresh) {
+            fresh.deinit();
+            self.allocator.destroy(fresh);
+        }
+        return stored;
+    }
+
+    /// splitTreeForTests splits the given tree at the median key of its
+    /// bottommost level, locally, without going through Raft. **Test-only**
+    /// — production must propose splits through the manifest pipeline so
+    /// all nodes apply the same split deterministically; see
+    /// `proposeSplit` in the engine. Takes the locks it needs itself, like
+    /// applySplit on the apply path.
+    pub fn splitTreeForTests(self: *Forest, namespace_id: u64, tree_id: u64) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const mc = try self.buildSplit(arena.allocator(), namespace_id, tree_id) orelse return;
+        try self.applySplit(mc);
     }
 };

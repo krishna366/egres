@@ -1,4 +1,5 @@
 const std = @import("std");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const zdb = @import("zdb");
 const vfs = zdb.vfs;
@@ -66,8 +67,10 @@ test "forest: route table single entry" {
 
     // Single tree with infinite range covers everything.
     var t10 = fakeTree(10, .{ .inf = true });
-    try trees.addTree(&t10);
-    try std.testing.expectEqual(@as(u64, 10), trees.lookup(.{ .namespace = 1, .primary = "anything" }).?.tree_id);
+    const held = trees.mu.hold(.exclusive, @src());
+    defer held.release();
+    try trees.addTree(held, &t10);
+    try std.testing.expectEqual(@as(u64, 10), trees.lookup(held.shared(), .{ .namespace = 1, .primary = "anything" }).?.tree_id);
 }
 
 test "forest: route table multi-entry" {
@@ -87,13 +90,15 @@ test "forest: route table multi-entry" {
 
     var t1 = fakeTree(1, .{ .left = Key.init(ak), .right = Key.init(lk) });
     var t2 = fakeTree(2, .{ .left = Key.init(mk), .right = Key.init(zk) });
-    try trees.addTree(&t1);
-    try trees.addTree(&t2);
+    const held = trees.mu.hold(.exclusive, @src());
+    defer held.release();
+    try trees.addTree(held, &t1);
+    try trees.addTree(held, &t2);
 
     // "c" falls in tree 1.
-    try std.testing.expectEqual(@as(u64, 1), trees.lookup(.{ .namespace = 1, .primary = "c" }).?.tree_id);
+    try std.testing.expectEqual(@as(u64, 1), trees.lookup(held.shared(), .{ .namespace = 1, .primary = "c" }).?.tree_id);
     // "n" falls in tree 2.
-    try std.testing.expectEqual(@as(u64, 2), trees.lookup(.{ .namespace = 1, .primary = "n" }).?.tree_id);
+    try std.testing.expectEqual(@as(u64, 2), trees.lookup(held.shared(), .{ .namespace = 1, .primary = "n" }).?.tree_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,9 +136,9 @@ test "forest: create tree and get" {
     try std.testing.expectEqual(@as(u64, 0), tree_id);
 
     // Verify the tree exists.
-    const tree = f.getTree(1, tree_id);
-    try std.testing.expect(tree != null);
-    try std.testing.expectEqual(tree_id, tree.?.tree_id);
+    const tree = f.getTree(1, tree_id) orelse return error.TestExpectedTree;
+    defer tree.release();
+    try std.testing.expectEqual(tree_id, tree.tree_id);
 }
 
 // Note: There used to be a `testForestTreePersistsAcrossReopen` test here.
@@ -187,18 +192,14 @@ test "forest: split tree" {
 
     {
         const tree_ptr = f.getTree(42, tree_id).?;
+        defer tree_ptr.release();
         var changes: [10]manifest.SSTableChange = undefined;
         for (&changes, 1..) |*c, tbl_id| c.* = manifest.createSSTableChange(@intCast(tbl_id), 42, tree_id, 3); // L3
         try tree_ptr.applyCompaction(&changes);
-        try std.testing.expectEqual(@as(usize, 10), tree_ptr.levels[3].numTables());
+        try std.testing.expectEqual(@as(usize, 10), tree_ptr.numTablesAt(3));
     }
 
-    // splitTreeForTests requires the write lock.
-    {
-        f.mu.lock(@src());
-        defer f.mu.unlock();
-        try f.splitTreeForTests(42, tree_id);
-    }
+    try f.splitTreeForTests(42, tree_id);
 
     // Now 2 trees should exist.
     try std.testing.expectEqual(@as(usize, 2), treeCount(f));
@@ -208,9 +209,11 @@ test "forest: split tree" {
     // [k01..k05]; new tree gets [k06..k10]. The split's new half is the
     // table's next split index → tree_id 1; the parent stays tree_id 0.
     const old_tree = f.getTree(42, 0).?;
+    defer old_tree.release();
     const new_tree = f.getTree(42, 1).?;
-    try std.testing.expectEqual(@as(usize, 5), old_tree.levels[3].numTables());
-    try std.testing.expectEqual(@as(usize, 5), new_tree.levels[3].numTables());
+    defer new_tree.release();
+    try std.testing.expectEqual(@as(usize, 5), old_tree.numTablesAt(3));
+    try std.testing.expectEqual(@as(usize, 5), new_tree.numTablesAt(3));
 
     // Key ranges: old right = "k06", new left = "k06".
     try std.testing.expectEqualStrings("k06", old_tree.key_range.right.primary);
@@ -221,8 +224,10 @@ test "forest: split tree" {
     try std.testing.expectEqual(@as(usize, 2), trees.entries.items.len);
 
     // Routing: "k01" → old tree (0), "k10" → new tree (1).
-    try std.testing.expectEqual(@as(u64, 0), trees.lookup(.{ .primary = "k01" }).?.tree_id);
-    try std.testing.expectEqual(@as(u64, 1), trees.lookup(.{ .primary = "k10" }).?.tree_id);
+    const held = trees.mu.hold(.shared, @src());
+    defer held.release();
+    try std.testing.expectEqual(@as(u64, 0), trees.lookup(held, .{ .primary = "k01" }).?.tree_id);
+    try std.testing.expectEqual(@as(u64, 1), trees.lookup(held, .{ .primary = "k10" }).?.tree_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +281,11 @@ test "forest: two-level routing isolates by table_id" {
             .timestamp = 1,
         }, b.val);
         const changes = [_]manifest.SSTableChange{manifest.createSSTableChange(@intCast(file_id), 2, b.tree, 1)};
-        try f.getTree(2, b.tree).?.applyCompaction(&changes);
+        {
+            const t = f.getTree(2, b.tree).?;
+            defer t.release();
+            try t.applyCompaction(&changes);
+        }
     }
 
     // A get routes to the tree for its (namespace, table_id) table, so each
@@ -325,7 +334,11 @@ test "forest: create_tree + drop_tree round-trip" {
     try buildAndWriteTableKV(alloc, path, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = 1 }, "v");
     {
         const ch = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, tree_id, 1)};
-        try f.getTree(2, tree_id).?.applyCompaction(&ch);
+        {
+            const t = f.getTree(2, tree_id).?;
+            defer t.release();
+            try t.applyCompaction(&ch);
+        }
     }
     {
         const got = try f.get(alloc, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0);
@@ -340,10 +353,11 @@ test "forest: create_tree + drop_tree round-trip" {
     try std.testing.expectEqual(@as(usize, 1), dc.tree_changes.len);
     try f.applyDropTree(dc);
 
-    // Data is gone, the tree is gone, the table is removed.
+    // Data is gone, the tree is gone, the table has no trees (its TableTrees
+    // stays in the map, empty — ids are never reused).
     try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
-    try std.testing.expect(f.getTree(2, tree_id) == null);
-    try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 100 }) == null);
+    try std.testing.expect(!f.hasTree(2, tree_id));
+    try std.testing.expect(!f.hasTable(2, 100));
 }
 
 test "forest: drop_ns removes every table and forgets the id counter" {
@@ -392,7 +406,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     // for a re-CREATE.
     try std.testing.expect(f.lookupNamespace("seven") == null);
     try std.testing.expect(f.lookupTable(7, "users") == null);
-    try std.testing.expect(f.tables.get(.{ .namespace = 7, .table_id = ct.table_ids[0] }) == null);
+    try std.testing.expect(!f.hasTable(7, ct.table_ids[0]));
 
     // Idempotent: a rebuild on the dropped namespace is empty and re-applies
     // cleanly.
@@ -443,8 +457,16 @@ test "forest: drop_tree keeps an SST shared with another tree" {
     {
         const cha = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, treeA, 1)};
         const chb = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, treeB, 1)};
-        try f.getTree(2, treeA).?.applyCompaction(&cha);
-        try f.getTree(2, treeB).?.applyCompaction(&chb);
+        {
+            const t = f.getTree(2, treeA).?;
+            defer t.release();
+            try t.applyCompaction(&cha);
+        }
+        {
+            const t = f.getTree(2, treeB).?;
+            defer t.release();
+            try t.applyCompaction(&chb);
+        }
     }
     try std.testing.expect(f.table_cache.contains(1));
 
@@ -454,10 +476,14 @@ test "forest: drop_tree keeps an SST shared with another tree" {
     defer alloc.free(dc.tree_changes);
     try f.applyDropTree(dc);
 
-    try std.testing.expect(f.getTree(2, treeA) == null);
-    try std.testing.expect(f.getTree(2, treeB) != null);
+    try std.testing.expect(!f.hasTree(2, treeA));
+    try std.testing.expect(f.hasTree(2, treeB));
     try std.testing.expect(f.table_cache.contains(1));
-    try std.testing.expectEqual(@as(usize, 1), f.getTree(2, treeB).?.levels[1].numTables());
+    {
+        const t = f.getTree(2, treeB).?;
+        defer t.release();
+        try std.testing.expectEqual(@as(usize, 1), t.numTablesAt(1));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +661,7 @@ test "forest: snapshot manifest round-trip" {
         try buildAndWriteTable(alloc, sst_path, "ccc");
 
         const tree1 = src.getTree(42, 0).?;
+        defer tree1.release();
         const changes = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 42, 0, 1)};
         try tree1.applyCompaction(&changes);
 
@@ -651,19 +678,33 @@ test "forest: snapshot manifest round-trip" {
 
     // Both trees present — same namespace-local tree_id 0, distinct namespaces.
     try std.testing.expectEqual(@as(usize, 2), treeCount(dst));
-    try std.testing.expect(dst.getTree(42, 0) != null);
+    try std.testing.expect(dst.hasTree(42, 0));
     // Database names ride the snapshot.
     try std.testing.expectEqual(@as(?u64, 42), dst.lookupNamespace("answers"));
-    try std.testing.expect(dst.getTree(43, 0) != null);
+    try std.testing.expect(dst.hasTree(43, 0));
 
     // Namespace routes wired.
     try std.testing.expect(dst.tables.contains(.{ .namespace = 42, .table_id = 0 }));
     try std.testing.expect(dst.tables.contains(.{ .namespace = 43, .table_id = 0 }));
-    try std.testing.expectEqual(@as(u64, 0), dst.tables.get(.{ .namespace = 42, .table_id = 0 }).?.lookup(.{ .namespace = 42, .primary = "ccc" }).?.tree_id);
-    try std.testing.expectEqual(@as(u64, 0), dst.tables.get(.{ .namespace = 43, .table_id = 0 }).?.lookup(.{ .namespace = 43, .primary = "any" }).?.tree_id);
+    {
+        const t42 = dst.tables.get(.{ .namespace = 42, .table_id = 0 }).?;
+        const held = t42.mu.hold(.shared, @src());
+        defer held.release();
+        try std.testing.expectEqual(@as(u64, 0), t42.lookup(held, .{ .namespace = 42, .primary = "ccc" }).?.tree_id);
+    }
+    {
+        const t43 = dst.tables.get(.{ .namespace = 43, .table_id = 0 }).?;
+        const held = t43.mu.hold(.shared, @src());
+        defer held.release();
+        try std.testing.expectEqual(@as(u64, 0), t43.lookup(held, .{ .namespace = 43, .primary = "any" }).?.tree_id);
+    }
 
     // The ns=42 tree's L1 contains the SST.
-    try std.testing.expectEqual(@as(usize, 1), dst.getTree(42, 0).?.levels[1].numTables());
+    {
+        const t = dst.getTree(42, 0).?;
+        defer t.release();
+        try std.testing.expectEqual(@as(usize, 1), t.numTablesAt(1));
+    }
 
     // No tree-id counter to recover: ids are derived from (table_id, split_id).
     // The file_id counter is restored from the per-node HardState lease
@@ -817,12 +858,8 @@ test "forest: routes to correct tree" {
     _ = try f.createTree(2, 0, .{ .inf = true });
 
     // Both namespaces should have a route table.
-    {
-        f.mu.lockShared(@src());
-        defer f.mu.unlockShared();
-        try std.testing.expect(f.tables.contains(.{ .namespace = 1, .table_id = 0 }));
-        try std.testing.expect(f.tables.contains(.{ .namespace = 2, .table_id = 0 }));
-    }
+    try std.testing.expect(f.tables.contains(.{ .namespace = 1, .table_id = 0 }));
+    try std.testing.expect(f.tables.contains(.{ .namespace = 2, .table_id = 0 }));
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1035,7 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     // Compact L0 → L1. Compaction rewrites every entry through a fresh
     // Builder, so meta has to survive the merge iterator and the re-encode.
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    defer tree.release();
     var comp = try tree.buildCompaction(0, &f.file_ids, 0);
     defer comp.deinit(alloc);
     // Guard against the compaction being a silent no-op, which would make the
@@ -1642,8 +1680,8 @@ test "cursor: a flush between two next calls does not disturb the walk" {
 }
 
 /// Ten one-key L3 SSTs k01..k10 in (namespace 42, table 0), value = the
-/// key, then a split: two trees, the boundary somewhere in the middle.
-fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !void {
+/// key, in one tree. Returns its id.
+fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !u64 {
     const tree_id = try f.createTree(42, 0, .{ .inf = true });
     const keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (keys, 1..) |k, tbl_id| {
@@ -1653,16 +1691,100 @@ fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !
     }
     {
         const tree_ptr = f.getTree(42, tree_id).?;
+        defer tree_ptr.release();
         var changes: [keys.len]manifest.SSTableChange = undefined;
         for (&changes, 1..) |*c, tbl_id| c.* = manifest.createSSTableChange(@intCast(tbl_id), 42, tree_id, 3); // L3
         try tree_ptr.applyCompaction(&changes);
     }
-    {
-        f.mu.lock(@src());
-        defer f.mu.unlock();
-        try f.splitTreeForTests(42, tree_id);
-    }
+    return tree_id;
+}
+
+/// `seedTenKeyTable`, then a split: two trees, the boundary somewhere in
+/// the middle.
+fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !void {
+    const tree_id = try seedTenKeyTable(alloc, f, dir_path);
+    try f.splitTreeForTests(42, tree_id);
     try std.testing.expectEqual(@as(usize, 2), treeCount(f));
+}
+
+test "cursor: a split applied by another fiber mid-walk loses and repeats nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    const tree_id = try seedTenKeyTable(alloc, f, dir_path);
+
+    // Three keys in: the merge is open with the tree's tables pinned, and
+    // between calls the cursor holds neither a lock nor a tree ref.
+    var got = ScanCollector{ .alloc = alloc };
+    defer got.deinit();
+    var cur = try f.openCursor(alloc, tableRange(42, 0), .{});
+    defer cur.deinit();
+    for (0..3) |_| _ = try got.emit((try cur.next()) orelse return error.TestExpectedItem);
+
+    // The split runs on another fiber, as raft apply would: fresh objects
+    // for both halves swapped in, the old one retired.
+    const Split = struct {
+        fn run(forest: *Forest, id: u64) void {
+            forest.splitTreeForTests(42, id) catch |e| std.debug.panic("split: {}", .{e});
+        }
+    };
+    var h = try fiber.spawn(.{}, Split.run, .{ f, tree_id });
+    h.join();
+    try std.testing.expectEqual(@as(usize, 2), treeCount(f));
+
+    // The pinned tables still cover the whole pre-split range, so the walk
+    // finishes from them and the hop lands past the new right tree.
+    try drainCursor(&cur, &got);
+    try std.testing.expectEqual(@as(usize, 10), got.got.items.len);
+    try std.testing.expectEqual(@as(u64, 10), cur.emitted);
+    const keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
+    for (got.got.items, keys) |it, k| {
+        try std.testing.expectEqualStrings(k, it.key.primary);
+        try std.testing.expectEqualStrings(k, it.value);
+    }
+
+    // A cursor opened after the split walks both trees.
+    try expectCursorMatchesScan(alloc, f, 42, 0, .{});
+}
+
+test "split: a reader holding the old tree keeps its full range until it lets go" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    const tree_id = try seedTenKeyTable(alloc, f, dir_path);
+
+    // Take a ref the way a reader does, then split underneath it.
+    const old = f.getTree(42, tree_id) orelse return error.TestExpectedTree;
+    try f.splitTreeForTests(42, tree_id);
+    try std.testing.expectEqual(@as(usize, 2), treeCount(f));
+
+    // The old object is untouched: unbounded right edge, all ten tables.
+    try std.testing.expect(old.key_range.right.primary.len == 0);
+    try std.testing.expectEqual(@as(usize, 10), old.numTablesAt(3));
+    const k10 = try old.get(.{ .namespace = 42, .table_id = 0, .primary = "k10", .timestamp = std.math.maxInt(u64) }, .p0) orelse return error.TestExpectedItem;
+    defer k10.free(alloc);
+    try std.testing.expectEqualStrings("k10", k10.value);
+
+    // The listed left half is a fresh object with the narrowed range.
+    const left = f.getTree(42, tree_id) orelse return error.TestExpectedTree;
+    defer left.release();
+    try std.testing.expect(left != old);
+    try std.testing.expectEqualStrings("k06", left.key_range.right.primary);
+    try std.testing.expectEqual(@as(usize, 5), left.numTablesAt(3));
+
+    // Letting go closes the old object (the testing allocator would report
+    // a leak otherwise).
+    old.release();
 }
 
 test "cursor: hops across a split like scan does" {
@@ -1896,6 +2018,7 @@ test "forest: rollup is read-invariant across flush and compactions" {
     for (cases) |c| try roar.expectBitmap(f, alloc, c.key, c.ts, c.want);
 
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    defer tree.release();
     for ([_]u8{ 0, 1 }) |src| {
         var comp = try tree.buildCompaction(src, &f.file_ids, 0);
         defer comp.deinit(alloc);
@@ -1998,6 +2121,7 @@ test "forest: index backfill installs bottom states below live deltas" {
     defer changes.deinit(alloc);
     try std.testing.expectEqual(1, changes.items.len);
     const tree = f.getTree(1, zdb.kv.makeTreeId(0, 0)).?;
+    defer tree.release();
     try tree.applyBackfill(changes.items);
     try std.testing.expectEqual(1, try f.bottomTableCount(1, 0));
 

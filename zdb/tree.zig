@@ -15,6 +15,7 @@ const Table = _table.Table;
 const TableIterator = _table.TableIterator;
 const Item = _table.table.Item;
 const Level = _level_handler.Level;
+const Lock = _level_handler.Lock;
 const TableEntry = _level_handler.TableEntry;
 const Key = @import("kv.zig").Key;
 const Meta = @import("kv.zig").Meta;
@@ -479,16 +480,31 @@ pub const TableCache = struct {
         return self.tables.contains(id);
     }
 
-    /// own hands ownership of a *Table to the cache. The cache incrRef's so
-    /// the table stays alive until explicitly released (e.g. after a snapshot
-    /// confirms no follower needs the backing SST file). Caller must not
-    /// destroy t after this call.
-    pub fn own(self: *TableCache, id: u64, t: *Table) !void {
+    /// own hands a *Table to the cache, which takes its own ref; the caller
+    /// keeps its ref and drops it when done with `t`. Returns false when
+    /// the id is already cached — the apply loop's `loadTables` can open
+    /// the same file between a caller's `contains` check and this call,
+    /// and Forest.writeFile does exactly that across seconds of I/O — in
+    /// which case the cached one stays, nothing is taken, and the struct's
+    /// disposal is the caller's too (a cache entry is what would otherwise
+    /// own it).
+    pub fn own(self: *TableCache, id: u64, t: *Table) !bool {
         self.mu.lock(@src());
         defer self.mu.unlock();
-        std.debug.assert(!self.tables.contains(id));
+        const gop = try self.tables.getOrPut(id);
+        if (gop.found_existing) return false;
         t.incrRef();
-        try self.tables.put(id, t);
+        gop.value_ptr.* = t;
+        return true;
+    }
+
+    /// Let go of a table nobody published: the open-time ref goes (index,
+    /// filter, file handle freed) and so does the struct, which only a
+    /// cache entry would otherwise own.
+    fn dropUnowned(allocator: std.mem.Allocator, t: *Table) void {
+        std.debug.assert(t.ref.load(.acquire) == 1);
+        t.decrRef();
+        allocator.destroy(t);
     }
 
     /// Evict tables whose ref has reached zero. Since own() holds a cache ref,
@@ -604,21 +620,22 @@ pub const TableCache = struct {
             tse.set(err);
             return;
         };
-        defer t.decrRef(); // Drop the open-time ref; own() takes its own.
 
-        // Phase C: re-acquire write lock to insert; handle race with another fiber.
+        // Phase C: re-acquire write lock to insert; handle race with another
+        // fiber. The open-time ref becomes the cache's on success; on the
+        // two other paths nothing owns `t`, so it is dropped whole.
         self.mu.lock(@src());
         if (self.tables.get(need.id)) |existing| {
             // Another fiber opened the same table while we were in phase B.
             self.mu.unlock();
             need.table = existing;
+            dropUnowned(self.allocator, t);
             return;
         }
-        // Cache takes its own ref; defer above drops the open-time ref.
-        t.incrRef();
         self.tables.put(need.id, t) catch |err| {
             self.mu.unlock();
             tse.set(err);
+            dropUnowned(self.allocator, t);
             return;
         };
         self.mu.unlock();
@@ -666,15 +683,69 @@ pub const Tree = struct {
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
     key_range: KeyRange,
+    /// Holders of this object. One is the `TableTrees` entry that lists it;
+    /// `TableTrees.getTree` hands out another per reader, released with
+    /// `release` when the reader is done. The last release closes and frees
+    /// the tree. This is what lets a split or a drop retire a tree without
+    /// waiting: a split never mutates a live tree — it opens fresh objects
+    /// for both halves from the manifest and swaps them in — so a reader
+    /// that still holds the old one sees its full range and full table
+    /// set until it lets go. Flush and compaction do install into a live
+    /// tree's levels, under the level locks, with readers pinning the
+    /// tables they select there.
+    refs: std.atomic.Value(u32) = .init(1),
+    /// The one lock over this tree's mutable state: every level's table
+    /// list and `compact_candidate`. Shared to read — a point get, a merge
+    /// open, the split-key and compaction pickers, stats — and exclusive to
+    /// install: flush, compaction, backfill, and the candidate refresh.
+    /// Levels have no lock of their own: every `Level` method takes the
+    /// token this lock mints (`hold`), so a level cannot be touched without
+    /// it, and so do the tree methods that read levels on a caller's behalf
+    /// (`computeCompactCandidate`, `totalSize`, `lowestLevelSize`). Never
+    /// held across I/O: readers pin the tables they select while they hold
+    /// it and read after releasing (`Level.acquireTables`,
+    /// `Level.overlappingTables`), so an install only ever waits on a
+    /// selection, never on a block read. Not reentrant — nothing that runs
+    /// under an exclusive hold may call something that takes it
+    /// (`updateCompactCandidate` takes its own, so installs call it after
+    /// releasing theirs). Order: `TableTrees.mu`, then this.
+    mu: Lock = .{},
 
-    /// open builds a Tree from an existing manifest state.
-    /// Tables are loaded via cache, which opens SST files concurrently for misses
-    /// and reuses already-open *Table objects for cache hits.
-    pub fn open(allocator: std.mem.Allocator, opts: _config.Config, namespace: u64, tree_id: u64, ms: *_manifest.ForestState, cache: *TableCache) !Tree {
+    pub fn acquire(self: *Tree) void {
+        const prev = self.refs.fetchAdd(1, .acquire);
+        std.debug.assert(prev > 0);
+    }
+
+    /// Drop a ref; the last one closes the tree and frees it (it must
+    /// have been created with `allocator`, as installTree/applySplit do).
+    pub fn release(self: *Tree) void {
+        const prev = self.refs.fetchSub(1, .release);
+        std.debug.assert(prev > 0);
+        if (prev == 1) {
+            _ = self.refs.load(.acquire);
+            const allocator = self.allocator;
+            self.close();
+            allocator.destroy(self);
+        }
+    }
+
+    /// open builds a Tree from an existing manifest state, on the heap with
+    /// one ref — `release` is its teardown, and a tree lives at one address
+    /// for its whole life. Tables are loaded via cache, which opens SST
+    /// files concurrently for misses and reuses already-open *Table objects
+    /// for cache hits. Runs on the apply loop (or at startup), the only
+    /// place the manifest map it reads is ever written.
+    ///
+    /// No lock here: nobody else can see this tree yet, and the caller may
+    /// publish it (`TableTrees.addTree`) before the first lock is taken.
+    pub fn open(allocator: std.mem.Allocator, opts: _config.Config, namespace: u64, tree_id: u64, ms: *_manifest.ForestState, cache: *TableCache) !*Tree {
+        const self = try allocator.create(Tree);
+        errdefer allocator.destroy(self);
+
         const levels = try allocator.alloc(Level, opts.max_levels);
         errdefer allocator.free(levels);
         for (levels, 0..) |*l, i| {
-            l.* = Level.init(allocator, @intCast(i));
+            l.* = Level.init(allocator, @intCast(i), &self.mu);
         }
         errdefer for (levels) |*l| l.deinit();
 
@@ -684,29 +755,32 @@ pub const Tree = struct {
             kr.right.free(allocator);
         }
 
-        if (ms.trees.getPtr(.{ .namespace = namespace, .tree_id = tree_id })) |tree| {
-            kr.left = try tree.left.dupe(allocator);
-            kr.right = try tree.right.dupe(allocator);
-            if (kr.left.len() == 0 and kr.right.len() == 0) {
-                kr.inf = true;
-            }
-
-            var needed: std.ArrayList(TableNeed) = .empty;
-            defer needed.deinit(allocator);
-            for (tree.levels.items, 0..) |lm, level_idx| {
-                if (level_idx >= opts.max_levels) continue;
-                var tit = lm.tables.keyIterator();
-                while (tit.next()) |tid| {
-                    try needed.append(allocator, .{ .id = tid.*, .level = level_idx });
+        // The manifest record is read under the manifest lock and copied
+        // out — range and table ids — so the loads below, file I/O, run
+        // with it released.
+        var needed: std.ArrayList(TableNeed) = .empty;
+        defer needed.deinit(allocator);
+        {
+            const held = ms.mu.hold(.shared, @src());
+            defer held.release();
+            if (ms.treeState(held, .{ .namespace = namespace, .tree_id = tree_id })) |tree| {
+                kr.left = try tree.left.dupe(allocator);
+                kr.right = try tree.right.dupe(allocator);
+                if (kr.left.len() == 0 and kr.right.len() == 0) {
+                    kr.inf = true;
+                }
+                for (tree.levels.items, 0..) |lm, level_idx| {
+                    if (level_idx >= opts.max_levels) continue;
+                    var tit = lm.tables.keyIterator();
+                    while (tit.next()) |tid| {
+                        try needed.append(allocator, .{ .id = tid.*, .level = level_idx });
+                    }
                 }
             }
-            try cache.loadTables(needed.items);
-            for (needed.items) |n| {
-                try levels[n.level].addEntry(n.id, n.table.?);
-            }
         }
+        try cache.loadTables(needed.items);
 
-        var tree: Tree = .{
+        self.* = .{
             .allocator = allocator,
             .opts = opts,
             .namespace = namespace,
@@ -716,25 +790,54 @@ pub const Tree = struct {
             .levels = levels,
             .key_range = kr,
         };
-        try tree.updateCompactCandidate();
-        return tree;
+        // Unpublished, so uncontended — but the levels take the token, and
+        // the tree is at its final address, so the lock is simply taken.
+        {
+            const held = self.mu.hold(.exclusive, @src());
+            defer held.release();
+            for (needed.items) |n| {
+                try levels[n.level].addEntry(held, n.id, n.table.?);
+            }
+        }
+        try self.updateCompactCandidate();
+        return self;
     }
 
-    /// close tears down all level levels, freeing each table's memory without
-    /// deleting SST files (which are managed by the manifest).
-    pub fn close(self: *Tree) void {
+    /// close tears down all levels, freeing each table's memory without
+    /// deleting SST files (which are managed by the manifest). The
+    /// internal half of `release`, which is the teardown callers use.
+    fn close(self: *Tree) void {
         for (self.levels) |*h| h.deinit();
         self.allocator.free(self.levels);
         self.key_range.left.free(self.allocator);
         self.key_range.right.free(self.allocator);
+        self.mu.deinit();
     }
 
     /// get checks each level from L0 upward and returns the first matching item,
     /// or null if the key is absent. The returned item's key and value are
     /// duplicated with self.allocator; the caller must free them.
+    ///
+    /// Two phases: under one shared hold of `mu`, pin every table that
+    /// could hold the key, across all levels, in read order; then release
+    /// and read them in that order, first hit wins. The pins keep the
+    /// tables readable through any install that lands in between, and the
+    /// lock is never held across a block read.
     pub fn get(self: *Tree, search_key: Key, priority: vfs.Priority) !?Item {
-        for (self.levels) |*h| {
-            if (try h.get(search_key, priority)) |item| return item;
+        var list: std.ArrayList(TableEntry) = .empty;
+        errdefer {
+            for (list.items) |e| e.table.decrRef();
+            list.deinit(self.allocator);
+        }
+        {
+            const held = self.mu.hold(.shared, @src());
+            defer held.release();
+            for (self.levels) |*lv| try lv.acquireTables(held, self.allocator, search_key, &list);
+        }
+        const tables = try list.toOwnedSlice(self.allocator);
+        defer Level.releaseTables(self.allocator, tables);
+        for (tables) |e| {
+            if (try Level.readKey(self.allocator, e.table, search_key, priority)) |item| return item;
         }
         return null;
     }
@@ -744,23 +847,22 @@ pub const Tree = struct {
     /// The walk loop lives in `Forest.Cursor`, which opens one of these
     /// per tree it visits.
     ///
-    /// LOCKED: the caller holds the forest read lock (`Forest.mu` shared)
-    /// across this call, and must have read `key_range` under that same
-    /// hold. A split (`applySplit`, under the write lock) deletes the
-    /// migrated tables from this tree's levels and narrows `key_range` in
-    /// place. If the caller snapshotted the range, dropped the lock, and
-    /// only then selected tables here, a split in that gap would pin just
-    /// the left half — while the caller's hop still jumps past the OLD
-    /// right edge, so the moved keys would never be read. Selected under
-    /// the same hold, the pinned tables always cover the range copied; a
-    /// split after that only moves tables already pinned (a table ref
-    /// keeps it readable whichever tree the manifest now lists it under).
+    /// The caller holds a ref on this tree (`TableTrees.getTree`) and read
+    /// `key_range` from this same object. That is enough for the range and
+    /// the tables selected here to describe one instant: a split never
+    /// mutates a live tree — it installs fresh objects for both halves
+    /// and retires this one, which stays whole for whoever still holds it
+    /// — so there is no gap in which the range says 1..100 while the
+    /// levels hold only 1..50. Flush and compaction do install into the
+    /// levels concurrently, under the level locks; the tables selected
+    /// are pinned, so what was chosen stays readable.
     ///
     /// NOT positioned: `range` only picks the tables (and pins them —
-    /// every iterator wired in holds its own table ref). The caller
-    /// seeks with `merge.seekRange(range.left, range.right)` afterwards,
-    /// so the block reads a seek issues happen outside the lock — that
-    /// is the reason the seek is not done here.
+    /// every iterator wired in holds its own table ref). The selection
+    /// runs under one shared hold of `mu` here; the caller seeks with
+    /// `merge.seekRange(range.left, range.right)` afterwards, so it can
+    /// release the tree first and let the block reads a seek issues run
+    /// holding nothing but table refs.
     ///
     /// Sources fed into the merge:
     ///   - `extras` — passed through verbatim (typically memtable iters)
@@ -779,7 +881,7 @@ pub const Tree = struct {
     /// heap, plus the iters' own scratch (key_buf etc.) — comes from it.
     /// The caller keeps the arena alive for the merge's lifetime and frees
     /// it at end-of-scope; `merge.deinit()` only releases table refs.
-    pub fn openMergeLocked(
+    pub fn openMerge(
         self: *Tree,
         allocator: std.mem.Allocator,
         range: KeyRange,
@@ -797,8 +899,10 @@ pub const Tree = struct {
 
         try iters.appendSlice(allocator, extras);
 
+        const held = self.mu.hold(.shared, @src());
+        defer held.release();
         for (self.levels, 0..) |*lv, level_idx| {
-            const overlapping = try lv.overlappingTables(allocator, range);
+            const overlapping = try lv.overlappingTables(held, allocator, range);
             // The iterators take their own table refs; the selection
             // pins are only needed to bridge the gap between the
             // level lock releasing and the iterators existing.
@@ -821,20 +925,30 @@ pub const Tree = struct {
         return MergeIterator.init(allocator, iters.items);
     }
 
-    pub fn totalSize(self: *Tree) i64 {
+    /// One level's table count, under a hold of its own — for stats and
+    /// tests, where nothing else is read alongside it.
+    pub fn numTablesAt(self: *Tree, level: usize) usize {
+        const held = self.mu.hold(.shared, @src());
+        defer held.release();
+        return self.levels[level].numTables(held);
+    }
+
+    pub fn totalSize(self: *Tree, held: Lock.Shared) i64 {
+        self.mu.assertHeld(held);
         var total: i64 = 0;
-        for (self.levels) |*l| total += l.getTotalSize();
+        for (self.levels) |*l| total += l.getTotalSize(held);
         return total;
     }
 
-    pub fn lowestLevelSize(self: *Tree) struct {
+    pub fn lowestLevelSize(self: *Tree, held: Lock.Shared) struct {
         level: u32,
         size: i64,
     } {
+        self.mu.assertHeld(held);
         var idx: usize = self.levels.len;
         while (idx > 0) {
             idx -= 1;
-            const sz = self.levels[idx].getTotalSize();
+            const sz = self.levels[idx].getTotalSize(held);
             if (sz > 0) return .{ .level = @intCast(idx), .size = sz };
         }
         return .{ .level = 0, .size = 0 };
@@ -877,12 +991,16 @@ pub const Tree = struct {
         // Bail if Lmax doesn't have enough tables for a meaningful split.
         const lmax_idx = self.opts.max_levels - 1;
         var cand_keys: std.ArrayList(Key) = .empty;
+        // Steps 1-2 read the level lists (keys are duped into the arena);
+        // step 3 is arithmetic on the copies. No I/O anywhere, so one
+        // shared hold covers the whole function.
+        const held = self.mu.hold(.shared, @src());
+        defer held.release();
         {
             const lv = &self.levels[lmax_idx];
-            lv.mu.lockShared(@src());
-            defer lv.mu.unlockShared();
-            if (lv.tables.items.len < min_lmax_tables_for_split) return .{};
-            for (lv.tables.items[1..]) |tbe| {
+            const lmax = lv.entries(held);
+            if (lmax.len < min_lmax_tables_for_split) return .{};
+            for (lmax[1..]) |tbe| {
                 try cand_keys.append(a, try tbe.table.smallest.dupe(a));
             }
         }
@@ -893,9 +1011,7 @@ pub const Tree = struct {
         const Entry = struct { smallest: Key, biggest: Key, size: u64 };
         var all_entries: std.ArrayList(Entry) = .empty;
         for (self.levels[1..]) |*lv| {
-            lv.mu.lockShared(@src());
-            defer lv.mu.unlockShared();
-            for (lv.tables.items) |tbe| {
+            for (lv.entries(held)) |tbe| {
                 try all_entries.append(a, .{
                     .smallest = try tbe.table.smallest.dupe(a),
                     .biggest = try tbe.table.biggest.dupe(a),
@@ -941,6 +1057,7 @@ pub const Tree = struct {
     // Level sizing
     // -----------------------------------------------------------------------
 
+    /// Targets are a function of the options alone; no lock needed.
     pub fn levelTargets(self: *Tree) !Targets {
         const n = self.opts.max_levels;
         const target_sz = try self.allocator.alloc(i64, n);
@@ -1011,6 +1128,18 @@ pub const Tree = struct {
     /// stores the result in self.compact_candidate. Called after open and after
     /// every doCompact so the candidate is always fresh.
     pub fn updateCompactCandidate(self: *Tree) !void {
+        // Reads every level's size and writes the verdict, under one
+        // exclusive hold. Installs call this after releasing theirs.
+        const held = self.mu.hold(.exclusive, @src());
+        defer held.release();
+        try self.computeCompactCandidate(held);
+    }
+
+    /// The verdict itself. Caller holds `mu` exclusively — `held` is the
+    /// proof; the level reads below use it as shared.
+    fn computeCompactCandidate(self: *Tree, held: Lock.Exclusive) !void {
+        self.mu.assertHeld(held);
+        const rd = held.shared();
         // Split check overrides compaction. We compare TOTAL tree size
         // (L0+L1+…+Lmax) against `tree_split_size`, not just Lmax. If
         // compactions can't keep up the data piles up across the upper
@@ -1022,8 +1151,8 @@ pub const Tree = struct {
         // wins over normal compaction candidates in the forest. Set
         // `level` to the lowest non-empty level for diagnostic
         // legibility (`stats forest`).
-        const linfo = self.lowestLevelSize();
-        const total = self.totalSize();
+        const linfo = self.lowestLevelSize(rd);
+        const total = self.totalSize(rd);
         // Gate the split on Lmax feasibility: findSplitKey needs Lmax to hold
         // at least min_lmax_tables_for_split tables to pick a boundary key. A
         // tree can be oversized in total while its data is still stacked in the
@@ -1031,7 +1160,7 @@ pub const Tree = struct {
         // needs_split stays true, buildSplit returns null, proposeSplit skips.
         // When infeasible, fall through to compaction, which drains data into
         // Lmax until a split becomes possible.
-        const lmax_tables = self.levels[self.opts.max_levels - 1].numTables();
+        const lmax_tables = self.levels[self.opts.max_levels - 1].numTables(rd);
         if (total > self.opts.tree_split_size and lmax_tables >= min_lmax_tables_for_split) {
             log.debug("split-trigger tree={d} total={d} deepest_level={d} lmax_size={d} lmax_tables={d} > threshold={d}", .{
                 self.tree_id, total, linfo.level, linfo.size, lmax_tables, self.opts.tree_split_size,
@@ -1060,7 +1189,7 @@ pub const Tree = struct {
         // Backpressure (`l0_backpressure_start_count`) is what protects
         // writes from a temporarily-out-of-shape L0; the scoring loop
         // is for steady-state level shape.
-        const l0_tables = self.levels[0].numTables();
+        const l0_tables = self.levels[0].numTables(rd);
         const l0_score = if (self.opts.l0_backpressure_start_count == 0)
             @as(f64, @floatFromInt(l0_tables))
         else
@@ -1072,7 +1201,7 @@ pub const Tree = struct {
         for (1..n) |j| {
             const target = t.target_sz[j];
             const score = if (target > 0)
-                @as(f64, @floatFromInt(self.levels[j].getTotalSize())) /
+                @as(f64, @floatFromInt(self.levels[j].getTotalSize(rd))) /
                     @as(f64, @floatFromInt(target))
             else
                 0.0;
@@ -1129,7 +1258,7 @@ pub const Tree = struct {
         // flushes pushed L0 over the start_count threshold. Lower levels by
         // definition need no work when nothing scored ≥ 1.0, so L0 is always
         // the right idle pick.
-        if (self.levels[0].numTables() > 0) {
+        if (self.levels[0].numTables(rd) > 0) {
             self.compact_candidate = .{ .level = 0, .score = prios[0].score };
         } else {
             self.compact_candidate = null;
@@ -1307,16 +1436,16 @@ pub const Tree = struct {
         // is included; we stop afterwards. Newer L0 tables stay put and
         // continue to shadow the compacted versions on read.
         const src_entries_slice = blk: {
-            // Snapshot the src table list under its own lock so the
-            // per-iteration L1-overlap queries don't hold the src lock.
-            // Pinned under that lock: a remote-built applyCompaction
+            // Snapshot the src table list under a short shared hold so
+            // the per-iteration dest-overlap queries take their own.
+            // Pinned under that hold: a remote-built applyCompaction
             // landing mid-build (leadership flip) must not free tables
             // we're about to read. decrRef at zero frees memory only —
             // the file stays — so a pinned table remains readable.
             const src_snapshot = ss: {
-                self.levels[src].mu.lockShared(@src());
-                defer self.levels[src].mu.unlockShared();
-                const items = self.levels[src].tables.items;
+                const held = self.mu.hold(.shared, @src());
+                defer held.release();
+                const items = self.levels[src].entries(held);
                 if (items.len == 0) return .empty;
                 const snap = try self.allocator.dupe(TableEntry, items);
                 for (snap) |e| e.table.incrRef();
@@ -1344,7 +1473,11 @@ pub const Tree = struct {
                 l0_bytes += e.table.fileSize();
                 n += 1;
 
-                const overlap = try self.levels[dest].overlappingTables(self.allocator, union_kr);
+                const overlap = ov: {
+                    const held = self.mu.hold(.shared, @src());
+                    defer held.release();
+                    break :ov try self.levels[dest].overlappingTables(held, self.allocator, union_kr);
+                };
                 defer Level.releaseTables(self.allocator, overlap);
                 var bot_bytes: u64 = 0;
                 for (overlap) |oe| bot_bytes += oe.table.fileSize();
@@ -1364,7 +1497,11 @@ pub const Tree = struct {
         }
 
         // --- collect overlapping dest (bot) entries ---
-        const bot_entries_slice = try self.levels[dest].overlappingTables(self.allocator, kr);
+        const bot_entries_slice = blk: {
+            const held = self.mu.hold(.shared, @src());
+            defer held.release();
+            break :blk try self.levels[dest].overlappingTables(held, self.allocator, kr);
+        };
         defer Level.releaseTables(self.allocator, bot_entries_slice);
 
         // --- build single MergeIterator over src tables + one ConcatIterator for bot ---
@@ -1600,10 +1737,15 @@ pub const Tree = struct {
         while (status == .more and lvl < self.opts.max_levels) : (lvl += 1) {
             var probe = seek;
             probe.timestamp = bound;
-            const tables = try self.levels[lvl].overlappingTables(
-                self.allocator,
-                KeyRange.versionsAt(probe),
-            );
+            const tables = blk: {
+                const held = self.mu.hold(.shared, @src());
+                defer held.release();
+                break :blk try self.levels[lvl].overlappingTables(
+                    held,
+                    self.allocator,
+                    KeyRange.versionsAt(probe),
+                );
+            };
             defer Level.releaseTables(self.allocator, tables);
 
             // Newest first within a level: L0 sorts by id ascending
@@ -1662,19 +1804,25 @@ pub const Tree = struct {
 
         // Apply level changes in original order: delete old entries, add new.
         // Track total bytes created and the destination level for metrics.
+        // One exclusive hold for the whole batch, so no reader sees the
+        // source gone before the output is in.
         var need_idx: usize = 0;
         var bytes_out: u64 = 0;
         var dest_level: ?u8 = null;
-        for (changes) |c| {
-            if (c.op == .delete) { // DELETE
-                self.levels[c.level].deleteEntry(c.sst_id);
-            } else if (c.op == .create) { // CREATE
-                const n = needed.items[need_idx];
-                need_idx += 1;
-                std.debug.assert(c.sst_id == n.id);
-                try self.levels[c.level].addEntry(n.id, n.table.?);
-                bytes_out += n.table.?.fileSize();
-                dest_level = @intCast(c.level);
+        {
+            const held = self.mu.hold(.exclusive, @src());
+            defer held.release();
+            for (changes) |c| {
+                if (c.op == .delete) { // DELETE
+                    self.levels[c.level].deleteEntry(held, c.sst_id);
+                } else if (c.op == .create) { // CREATE
+                    const n = needed.items[need_idx];
+                    need_idx += 1;
+                    std.debug.assert(c.sst_id == n.id);
+                    try self.levels[c.level].addEntry(held, n.id, n.table.?);
+                    bytes_out += n.table.?.fileSize();
+                    dest_level = @intCast(c.level);
+                }
             }
         }
 
@@ -1715,7 +1863,12 @@ pub const Tree = struct {
             std.debug.assert(c.op == .create);
             std.debug.assert(c.level == bottom);
         }
-        if (self.levels[bottom].tableCount() > 0) {
+        const bottom_tables = blk: {
+            const held = self.mu.hold(.shared, @src());
+            defer held.release();
+            break :blk self.levels[bottom].tableCount(held);
+        };
+        if (bottom_tables > 0) {
             log.err(
                 "backfill install skipped: bottom level not empty tree={d}",
                 .{self.tree_id},

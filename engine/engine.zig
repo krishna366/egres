@@ -229,6 +229,7 @@ pub const StorageImpl = struct {
                 if (mcs.sstable_changes.len > 0) {
                     const sc = mcs.sstable_changes[0];
                     if (self.forest.getTree(sc.namespace_id, sc.tree_id)) |tree| {
+                        defer tree.release();
                         try tree.applyCompaction(mcs.sstable_changes);
                     }
                 }
@@ -237,6 +238,7 @@ pub const StorageImpl = struct {
                 if (mcs.sstable_changes.len > 0) {
                     const sc = mcs.sstable_changes[0];
                     if (self.forest.getTree(sc.namespace_id, sc.tree_id)) |tree| {
+                        defer tree.release();
                         try tree.applyBackfill(mcs.sstable_changes);
                     }
                 }
@@ -1098,7 +1100,15 @@ pub const Engine = struct {
         const t0 = fiber.coarseMs();
         log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.key.tree_id, src, dst });
 
-        var changes = try target.tree.buildCompaction(
+        // Resolve the tree now, by id: the target is an identity, and the
+        // tree it named may have been split or dropped since the pick —
+        // then there is nothing to build, and the candidate was stale.
+        const tree = self.forest.getTree(target.key.namespace, target.key.tree_id) orelse {
+            log.info("compact cid={d} skipped: tree={d} no longer listed", .{ cid, target.key.tree_id });
+            return;
+        };
+        defer tree.release();
+        var changes = try tree.buildCompaction(
             src,
             &self.forest.file_ids,
             self.forest.globalMinRead(),
@@ -1127,7 +1137,11 @@ pub const Engine = struct {
         self.flush_split_mu.lock(@src());
         defer self.flush_split_mu.unlock();
 
-        self.addInFlight(.{ .kind = .split, .tree_id = key.tree_id, .started_at_ms = fiber.coarseMs() });
+        self.addInFlight(.{
+            .kind = .split,
+            .tree_id = key.tree_id,
+            .started_at_ms = fiber.coarseMs(),
+        });
         defer self.removeInFlight(.split, key.tree_id, 0);
         // buildSplit allocates sstable_changes / tree_changes on the arena;
         // encodeManifestChange copies the bytes into a self-owned payload,
@@ -1137,14 +1151,21 @@ pub const Engine = struct {
         // through applyManifestChange to applySplit on every node.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const mc = try self.forest.buildSplit(arena.allocator(), key.namespace, key.tree_id) orelse {
+        const mc = try self.forest.buildSplit(
+            arena.allocator(),
+            key.namespace,
+            key.tree_id,
+        ) orelse {
             // No split key (Lmax has < 2 tables). The candidate that sent
             // us here was stale — refresh it so the next levels-loop
             // iteration picks a different (real) candidate instead of
             // hammering this tree forever. Without this, the loop spins
             // on the same `needs_split=true` tree and starves every
             // other tree's pending compactions.
-            if (self.forest.getTree(key.namespace, key.tree_id)) |t| t.updateCompactCandidate() catch {};
+            if (self.forest.getTree(key.namespace, key.tree_id)) |t| {
+                defer t.release();
+                t.updateCompactCandidate() catch {};
+            }
             log.warn("proposeSplit tree={d} skipped: no split key (refreshed candidate)", .{key.tree_id});
             return;
         };

@@ -447,6 +447,74 @@ pub fn RWMutex(comptime track: Track) type {
         pub fn deinit(self: *Self) void {
             if (track == .tracked) _reg.unregister(&self.reg_node);
         }
+
+        // ---- held tokens ----
+
+        pub const Mode = enum { shared, exclusive };
+
+        /// Proof of a hold, minted only by `hold`. A function that assumes
+        /// this lock takes one as a parameter: it then cannot be called
+        /// without the lock, and the parameter's type says which mode. The
+        /// token carries the lock it came from, so a callee can check it is
+        /// for the lock it expects and, in Debug, that the lock is still
+        /// held (`assertHeld`). An exclusive token stands in for a shared
+        /// one (`shared`).
+        pub fn Held(comptime mode: Mode) type {
+            return struct {
+                mu: *Self,
+
+                pub fn release(h: @This()) void {
+                    switch (mode) {
+                        .shared => h.mu.unlockShared(),
+                        .exclusive => h.mu.unlock(),
+                    }
+                }
+
+                /// An exclusive hold satisfies a shared requirement.
+                pub fn shared(h: @This()) Held(.shared) {
+                    comptime std.debug.assert(mode == .exclusive);
+                    return .{ .mu = h.mu };
+                }
+
+                /// The mode this token proves; `assertHeld` reads it.
+                pub const held_mode = mode;
+            };
+        }
+
+        /// Debug check that `held` is a token for THIS lock and that the
+        /// lock is still held in the token's mode — a token for another
+        /// lock, or one used after `release`, fails here. Takes `*const
+        /// Self` so a `*const` receiver can check its own lock.
+        pub fn assertHeld(self: *const Self, held: anytype) void {
+            std.debug.assert(held.mu == self);
+            std.debug.assert(self.isHeld(@TypeOf(held).held_mode));
+        }
+
+        /// The two token types, so an owner writes `Lock.Shared` /
+        /// `Lock.Exclusive` with `Lock` its own alias for this type.
+        pub const Shared = Held(.shared);
+        pub const Exclusive = Held(.exclusive);
+
+        /// Take the lock in `mode` and mint the token for it; `defer
+        /// held.release()`.
+        pub fn hold(self: *Self, comptime mode: Mode, comptime src: std.builtin.SourceLocation) Held(mode) {
+            switch (mode) {
+                .shared => self.lockShared(src),
+                .exclusive => self.lock(src),
+            }
+            return .{ .mu = self };
+        }
+
+        /// Whether the lock is currently held in `mode` by someone (an
+        /// exclusive hold counts as shared too). A racy read, for debug
+        /// asserts only.
+        pub fn isHeld(self: *const Self, mode: Mode) bool {
+            const writer = @atomicLoad(bool, &self.writer, .acquire);
+            return switch (mode) {
+                .exclusive => writer,
+                .shared => writer or @atomicLoad(u32, &self.readers, .acquire) > 0,
+            };
+        }
     };
 }
 
