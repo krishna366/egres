@@ -19,13 +19,13 @@
 //! notify) doesn't pin a peer thread waiting for our sl.
 
 const std = @import("std");
-const fb = @import("fiber.zig");
-const sync = @import("sync.zig");
-const rt = @import("runtime.zig");
+const _fb = @import("fiber.zig");
+const _sync = @import("sync.zig");
+const _rt = @import("runtime.zig");
 
-const Fiber = fb.Fiber;
-const Spinlock = rt.Spinlock;
-const WaitQueue = sync.WaitQueue;
+const Fiber = _fb.Fiber;
+const Spinlock = _rt.Spinlock;
+const WaitQueue = _sync.WaitQueue;
 
 pub const CloseMode = enum {
     /// Stop accepting new sends but let receivers drain buffered
@@ -80,7 +80,7 @@ pub fn Channel(comptime T: type) type {
         /// senders raced in and re-filled the buffer) re-park
         /// transparently via the outer loop.
         pub fn send(self: *Self, item: T) error{ChannelClosed}!void {
-            const me = rt.currentFiber();
+            const me = _rt.currentFiber();
             while (true) {
                 self.sl.lock();
                 if (self.closed) {
@@ -93,12 +93,12 @@ pub fn Channel(comptime T: type) type {
                     self.len += 1;
                     const waiter = self.receivers.popHead();
                     self.sl.unlock();
-                    if (waiter) |w| rt.wake(w);
+                    if (waiter) |w| _rt.wake(w);
                     return;
                 }
                 self.senders.pushTail(me);
                 self.sl.unlock();
-                rt.park();
+                _rt.park();
                 // Loop: re-acquire sl and re-check state. Could be a
                 // genuine slot, a close, or a spurious wake.
             }
@@ -124,7 +124,7 @@ pub fn Channel(comptime T: type) type {
             self.len += 1;
             const waiter = self.receivers.popHead();
             self.sl.unlock();
-            if (waiter) |w| rt.wake(w);
+            if (waiter) |w| _rt.wake(w);
         }
 
         /// Block until an item is available, then dequeue. Returns
@@ -132,7 +132,7 @@ pub fn Channel(comptime T: type) type {
         /// buffer is empty (graceful close drains first; immediate
         /// close fails immediately).
         pub fn receive(self: *Self) error{ChannelClosed}!T {
-            const me = rt.currentFiber();
+            const me = _rt.currentFiber();
             while (true) {
                 self.sl.lock();
                 if (self.len > 0) {
@@ -141,7 +141,7 @@ pub fn Channel(comptime T: type) type {
                     self.len -= 1;
                     const waiter = self.senders.popHead();
                     self.sl.unlock();
-                    if (waiter) |w| rt.wake(w);
+                    if (waiter) |w| _rt.wake(w);
                     return item;
                 }
                 if (self.closed) {
@@ -150,7 +150,7 @@ pub fn Channel(comptime T: type) type {
                 }
                 self.receivers.pushTail(me);
                 self.sl.unlock();
-                rt.park();
+                _rt.park();
             }
         }
 
@@ -170,7 +170,7 @@ pub fn Channel(comptime T: type) type {
             self.len -= 1;
             const waiter = self.senders.popHead();
             self.sl.unlock();
-            if (waiter) |w| rt.wake(w);
+            if (waiter) |w| _rt.wake(w);
             return item;
         }
 
@@ -204,7 +204,7 @@ pub fn Channel(comptime T: type) type {
             while (to_wake) |f| {
                 const next = f.waker_next;
                 f.waker_next = null;
-                rt.wake(f);
+                _rt.wake(f);
                 to_wake = next;
             }
         }

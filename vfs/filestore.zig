@@ -12,11 +12,11 @@
 
 const std = @import("std");
 const fiber = @import("zfiber");
-const vfs = @import("vfs.zig");
-const s3_mod = @import("s3.zig");
-const lookahead_mod = @import("lookahead.zig");
+const _vfs = @import("vfs.zig");
+const _s3 = @import("s3.zig");
+const _lookahead = @import("lookahead.zig");
 
-pub const S3Config = s3_mod.S3Config;
+pub const S3Config = _s3.S3Config;
 
 pub const FileStore = union(enum) {
     /// No store configured — single-node deployments. Multi-node requires
@@ -24,14 +24,14 @@ pub const FileStore = union(enum) {
     /// joins without one.
     none,
     dir: DirStore,
-    s3: s3_mod.S3Store,
+    s3: _s3.S3Store,
 
     pub fn initDir(a: std.mem.Allocator, depot: []const u8) !FileStore {
         return .{ .dir = try DirStore.init(a, depot) };
     }
 
     pub fn initS3(a: std.mem.Allocator, cfg: S3Config) !FileStore {
-        return .{ .s3 = try s3_mod.S3Store.init(a, cfg) };
+        return .{ .s3 = try _s3.S3Store.init(a, cfg) };
     }
 
     pub fn deinit(self: *FileStore) void {
@@ -161,7 +161,7 @@ pub const Object = union(enum) {
 /// Each read is one ranged GET; the handle is where keep-alive
 /// connection reuse lands later.
 const S3Object = struct {
-    store: *s3_mod.S3Store,
+    store: *_s3.S3Store,
     name: []const u8,
     sz: u64,
 };
@@ -181,7 +181,7 @@ pub const DirStore = struct {
     pub fn init(a: std.mem.Allocator, depot: []const u8) !DirStore {
         const tmp_dir = try std.fmt.allocPrint(a, "{s}/tmp", .{depot});
         defer a.free(tmp_dir);
-        try vfs.createDirPath(tmp_dir);
+        try _vfs.createDirPath(tmp_dir);
         return .{ .a = a, .depot = try a.dupe(u8, depot) };
     }
 
@@ -197,7 +197,7 @@ pub const DirStore = struct {
         // O_DIRECT requires it, and every legit caller already complies
         // (the SST builder pads + aligns its output; forest.readFile
         // returns page-aligned reads) — reject rather than bounce.
-        if (@intFromPtr(data.ptr) % vfs.page_size != 0 or data.len % vfs.page_size != 0)
+        if (@intFromPtr(data.ptr) % _vfs.page_size != 0 or data.len % _vfs.page_size != 0)
             return error.UnalignedPut;
 
         const tmp = try std.fmt.allocPrint(
@@ -217,24 +217,24 @@ pub const DirStore = struct {
         // same class as flush I/O. The NAME's durability (dir entry) is
         // the caller's batch-level barrier: one FileStore.sync after all
         // puts.
-        try vfs.writeAndSync(
+        try _vfs.writeAndSync(
             tmp,
             data,
             .{ .mode = .direct, .flags = .{ .truncate = true } },
             .p1,
         );
-        try vfs.renameFile(tmp, final);
+        try _vfs.renameFile(tmp, final);
     }
 
     fn sync(self: *DirStore) void {
-        vfs.syncDir(self.depot);
+        _vfs.syncDir(self.depot);
     }
 
     fn exists(self: *DirStore, name: []const u8) !bool {
         const path = try self.objectPath(name);
         defer self.a.free(path);
 
-        vfs.access(path) catch return false;
+        _vfs.access(path) catch return false;
         return true;
     }
 
@@ -242,7 +242,7 @@ pub const DirStore = struct {
         const path = try self.objectPath(name);
         defer self.a.free(path);
 
-        try vfs.deleteFile(path);
+        try _vfs.deleteFile(path);
     }
 
     fn open(self: *DirStore, name: []const u8) !Object {
@@ -260,7 +260,7 @@ pub const DirStore = struct {
     pub fn head(self: *DirStore, name: []const u8) !u64 {
         const path = try self.objectPath(name);
         defer self.a.free(path);
-        return vfs.fileSize(path);
+        return _vfs.fileSize(path);
     }
 
     /// Measure this depot's ideal readahead (policy in vfs/lookahead.zig;
@@ -269,7 +269,7 @@ pub const DirStore = struct {
     /// × device bandwidth (~100s of KB on NVMe) instead of network round
     /// trip × link bandwidth (~MBs).
     pub fn calibrateLookahead(self: *DirStore, block_size: u64) !u64 {
-        self.lookahead = try lookahead_mod.calibrate(self.a, self, block_size);
+        self.lookahead = try _lookahead.calibrate(self.a, self, block_size);
         return self.lookahead;
     }
 
@@ -285,18 +285,18 @@ pub const DirStore = struct {
     /// trips that production reads never pay. Opened O_DIRECT so the
     /// page cache can't serve repeats and turn the numbers into memory
     /// bandwidth.
-    pub fn probeRead(self: *DirStore, off: u64, len: u64) !lookahead_mod.Probe {
-        const path = try self.objectPath(lookahead_mod.probe_object);
+    pub fn probeRead(self: *DirStore, off: u64, len: u64) !_lookahead.Probe {
+        const path = try self.objectPath(_lookahead.probe_object);
         defer self.a.free(path);
         // O_DIRECT needs page-aligned offset/length/buffer; align the
         // request itself — any aligned window of ~len bytes probes
         // equally well.
-        const a_off = off & ~@as(u64, vfs.page_size - 1);
-        const a_len: usize = std.mem.alignForward(usize, @intCast(@max(len, vfs.page_size)), vfs.page_size);
-        const buf = try self.a.alignedAlloc(u8, vfs.page_alignment, a_len);
+        const a_off = off & ~@as(u64, _vfs.page_size - 1);
+        const a_len: usize = std.mem.alignForward(usize, @intCast(@max(len, _vfs.page_size)), _vfs.page_size);
+        const buf = try self.a.alignedAlloc(u8, _vfs.page_alignment, a_len);
         defer self.a.free(buf);
 
-        const f = fiber.File.fromFd(try vfs.openDirect(path, .{ .mode = .direct }));
+        const f = fiber.File.fromFd(try _vfs.openDirect(path, .{ .mode = .direct }));
         defer f.close();
         const fsize = (try f.stat()).size;
         if (a_off + a_len > fsize) return error.ShortRead;
@@ -304,25 +304,25 @@ pub const DirStore = struct {
         // The fixed-cost page: hashed from the (already random) offset so
         // repeats can't sit in one device cache slot, dodged out of the
         // main window so it can't pre-warm the ranged read.
-        const pages = fsize / vfs.page_size;
-        var page_off = ((off *% 0x9E3779B97F4A7C15) % pages) * vfs.page_size;
+        const pages = fsize / _vfs.page_size;
+        var page_off = ((off *% 0x9E3779B97F4A7C15) % pages) * _vfs.page_size;
         if (page_off >= a_off and page_off < a_off + a_len) {
-            page_off = ((page_off + a_len) / vfs.page_size % pages) * vfs.page_size;
+            page_off = ((page_off + a_len) / _vfs.page_size % pages) * _vfs.page_size;
         }
-        const t0 = lookahead_mod.nowNs();
-        if (try f.read(buf[0..vfs.page_size], page_off) != vfs.page_size) return error.ShortRead;
-        const fixed_ns = lookahead_mod.nowNs() - t0;
-        if (!lookahead_mod.verifyProbeData(page_off, buf[0..vfs.page_size])) return error.BadProbeData;
+        const t0 = _lookahead.nowNs();
+        if (try f.read(buf[0.._vfs.page_size], page_off) != _vfs.page_size) return error.ShortRead;
+        const fixed_ns = _lookahead.nowNs() - t0;
+        if (!_lookahead.verifyProbeData(page_off, buf[0.._vfs.page_size])) return error.BadProbeData;
 
-        const t1 = lookahead_mod.nowNs();
+        const t1 = _lookahead.nowNs();
         var got: usize = 0;
         while (got < a_len) {
             const n = try f.read(buf[got..], a_off + got);
             if (n == 0) return error.ShortRead;
             got += n;
         }
-        const total = lookahead_mod.nowNs() - t1;
-        if (!lookahead_mod.verifyProbeData(a_off, buf)) return error.BadProbeData;
+        const total = _lookahead.nowNs() - t1;
+        if (!_lookahead.verifyProbeData(a_off, buf)) return error.BadProbeData;
         return .{ .size = a_len, .ttfb_ns = fixed_ns, .total_ns = total };
     }
 };

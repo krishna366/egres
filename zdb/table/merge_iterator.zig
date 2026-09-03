@@ -1,11 +1,11 @@
 const std = @import("std");
-const table = @import("table.zig");
-const cache_mod = @import("../cache.zig");
+const _table = @import("table.zig");
+const _cache = @import("../cache.zig");
 const Key = @import("../kv.zig").Key;
-const skl = @import("../skl/skiplist.zig");
+const _skl = @import("../skl/skiplist.zig");
 const utils = @import("utils");
 
-pub const Error = table.Error;
+pub const Error = _table.Error;
 
 /// A refcounted hold on the storage backing an iterator item's value:
 /// a decompressed block (SST sources) or a memtable's skiplist arena.
@@ -22,8 +22,8 @@ pub const Error = table.Error;
 /// borrowing until a fold completes carries exactly the guarantees
 /// copying at capture time had.
 pub const Pin = union(enum) {
-    block: *cache_mod.Value,
-    skiplist: *skl.SkipList,
+    block: *_cache.Value,
+    skiplist: *_skl.SkipList,
 
     pub fn acquire(self: Pin) Pin {
         switch (self) {
@@ -46,9 +46,9 @@ pub const Pin = union(enum) {
 /// memtable scan (`skl.Iterator`). All three expose the same
 /// `seekRange` / `itemRef` / `next` / `deinit` shape.
 pub const Iterator = union(enum) {
-    table: table.TableIterator,
+    table: _table.TableIterator,
     concat: ConcatIterator,
-    skiplist: skl.Iterator,
+    skiplist: _skl.Iterator,
 
     pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
         switch (self.*) {
@@ -75,7 +75,7 @@ pub const Iterator = union(enum) {
         }
     }
 
-    pub fn itemRef(self: *const Iterator) ?table.Item {
+    pub fn itemRef(self: *const Iterator) ?_table.Item {
         return switch (self.*) {
             inline else => |*it| it.itemRef(),
         };
@@ -109,7 +109,7 @@ pub const MergeIterator = struct {
     /// advances (its key points into that source's key_buf or arena, its
     /// value into a block the source holds a ref on) — which is when we
     /// overwrite it.
-    items: []table.Item = &.{},
+    items: []_table.Item = &.{},
     /// Min-heap (by winsOver) of the sources that still hold an item.
     /// Source indices rather than the items themselves: sift swaps stay
     /// 2 bytes wide and the live heap sits in a single cache line.
@@ -153,7 +153,7 @@ pub const MergeIterator = struct {
     pub fn seekRange(self: *MergeIterator, start: Key, end: Key) !void {
         std.debug.assert(self.iters.len <= std.math.maxInt(Src));
         if (self.heap.len == 0 and self.iters.len > 0) {
-            self.items = try self.allocator.alloc(table.Item, self.iters.len);
+            self.items = try self.allocator.alloc(_table.Item, self.iters.len);
             self.heap = try self.allocator.alloc(Src, self.iters.len);
         }
         self.heap_len = 0;
@@ -178,7 +178,7 @@ pub const MergeIterator = struct {
         return self.iters[self.heap[0]].currentPin();
     }
 
-    pub fn itemRef(self: *MergeIterator) ?table.Item {
+    pub fn itemRef(self: *MergeIterator) ?_table.Item {
         if (self.heap_len == 0) return null;
         return self.items[self.heap[0]];
     }
@@ -219,11 +219,11 @@ pub const MergeIterator = struct {
 };
 
 pub const ConcatIterator = struct {
-    iters: []table.TableIterator, // caller-owned slice; sorted by smallest key
+    iters: []_table.TableIterator, // caller-owned slice; sorted by smallest key
     current: usize, // == iters.len when exhausted
     end: Key = .{}, // upper bound carried over from `seekRange` for lazy seeking
 
-    pub fn init(iters: []table.TableIterator) ConcatIterator {
+    pub fn init(iters: []_table.TableIterator) ConcatIterator {
         return .{ .iters = iters, .current = 0 };
     }
 
@@ -243,8 +243,8 @@ pub const ConcatIterator = struct {
             self.current = 0;
         } else {
             // First table whose biggest key >= start.
-            self.current = utils.search(table.TableIterator, self.iters, start, struct {
-                fn f(sk: Key, it: table.TableIterator) bool {
+            self.current = utils.search(_table.TableIterator, self.iters, start, struct {
+                fn f(sk: Key, it: _table.TableIterator) bool {
                     return it.table.biggest.order(sk) != .lt;
                 }
             }.f);
@@ -253,12 +253,12 @@ pub const ConcatIterator = struct {
         try self.iters[self.current].seekRange(start, end);
     }
 
-    pub fn itemRef(self: *const ConcatIterator) ?table.Item {
+    pub fn itemRef(self: *const ConcatIterator) ?_table.Item {
         if (self.current >= self.iters.len) return null;
         return self.iters[self.current].itemRef();
     }
 
-    pub fn currentBlock(self: *const ConcatIterator) ?*cache_mod.Value {
+    pub fn currentBlock(self: *const ConcatIterator) ?*_cache.Value {
         if (self.current >= self.iters.len) return null;
         return self.iters[self.current].currentBlock();
     }

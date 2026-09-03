@@ -19,8 +19,8 @@
 //! acquire timestamp, and the intrusive registry link (+ a once-flag and the
 //! type-erasure plumbing to read the lock's live state back at dump time).
 const std = @import("std");
-const rt = @import("runtime.zig");
-const context = @import("context.zig");
+const _rt = @import("runtime.zig");
+const _context = @import("context.zig");
 
 const SourceLocation = std.builtin.SourceLocation;
 
@@ -60,10 +60,10 @@ var live_head: ?*Tracking = null;
 var registered_count: std.atomic.Value(usize) = .init(0);
 
 inline fn regLock() void {
-    reg_mu.lockUncancelable(context.g().io);
+    reg_mu.lockUncancelable(_context.g().io);
 }
 inline fn regUnlock() void {
-    reg_mu.unlock(context.g().io);
+    reg_mu.unlock(_context.g().io);
 }
 
 /// Stamp the acquire site + time. Called from inside `lock`/`lockShared`/
@@ -78,7 +78,7 @@ pub fn recordAcquire(
 ) void {
     ensureRegistered(self, owner, snapshot);
     self.holder_src = staticSrc(src);
-    self.held_since_ms = rt.coarseMs();
+    self.held_since_ms = _rt.coarseMs();
 }
 
 /// Lift a comptime `SourceLocation` to a `*rodata` pointer with static storage
@@ -142,7 +142,7 @@ pub fn registeredCount() usize {
 pub fn dumpLocks(w: *std.Io.Writer) !void {
     regLock();
     defer regUnlock();
-    const now = rt.coarseMs();
+    const now = _rt.coarseMs();
     var total: usize = 0;
     var held: usize = 0;
     var node = live_head;

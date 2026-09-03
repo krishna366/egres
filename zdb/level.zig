@@ -1,15 +1,15 @@
 const std = @import("std");
 const Key = @import("kv.zig").Key;
-const table = @import("table.zig");
+const _table = @import("table.zig");
 const vfs = @import("vfs");
 const utils = @import("utils");
 const fiber = @import("zfiber");
 
-const Table = table.Table;
-const TableIterator = table.TableIterator;
-const Item = table.table.Item;
+const Table = _table.Table;
+const TableIterator = _table.TableIterator;
+const Item = _table.table.Item;
 
-pub const Error = table.table.Error;
+pub const Error = _table.table.Error;
 
 // ---------------------------------------------------------------------------
 // KeyRange

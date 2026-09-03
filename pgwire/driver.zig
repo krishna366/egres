@@ -46,8 +46,8 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 
-const conn_state = @import("conn_state.zig");
-const proto = @import("proto.zig");
+const _conn_state = @import("conn_state.zig");
+const _proto = @import("proto.zig");
 
 pub const Stream = fiber.net.Stream;
 
@@ -63,7 +63,7 @@ pub const Options = struct {
     /// memory.
     write_chunk: usize = 16 * 1024,
     /// Configuration handed to ConnState.
-    conn: conn_state.Config = .{},
+    conn: _conn_state.Config = .{},
 };
 
 /// Drive a Postgres v3 simple-query session over `stream`. Returns
@@ -87,7 +87,7 @@ pub fn serve(
     var r = stream.reader(read_buf);
     var w = stream.writer(write_buf);
 
-    var state = conn_state.ConnState.init(alloc, &r.interface, &w.interface, opts.conn);
+    var state = _conn_state.ConnState.init(alloc, &r.interface, &w.interface, opts.conn);
     defer state.deinit();
 
     // The state machine pulls bytes through `r.interface` itself — when
@@ -105,7 +105,7 @@ pub fn serve(
     w.interface.flush() catch {};
 }
 
-fn handleEvent(state: *conn_state.ConnState, handler: anytype) !void {
+fn handleEvent(state: *_conn_state.ConnState, handler: anytype) !void {
     const H = @TypeOf(handler.*);
     const ev = try state.nextEvent();
     switch (ev) {

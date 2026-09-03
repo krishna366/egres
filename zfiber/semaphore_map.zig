@@ -28,11 +28,11 @@
 //! we accept that.
 
 const std = @import("std");
-const sync = @import("sync.zig");
+const _sync = @import("sync.zig");
 
 pub const SemaphoreMap = struct {
     allocator: std.mem.Allocator,
-    mu: sync.Mutex(.tracked) = .{},
+    mu: _sync.Mutex(.tracked) = .{},
     /// Held-or-contended keys only; an entry is created on first
     /// acquire and recycled by whichever release/abort leaves it with
     /// no holders and no waiters.
@@ -63,7 +63,7 @@ pub const SemaphoreMap = struct {
     const Entry = struct {
         /// Does ALL the blocking; writer preference means a pending
         /// exclusive blocks new shared acquirers (see sync.RWMutex).
-        rw: sync.RWMutex(.untracked) = .{},
+        rw: _sync.RWMutex(.untracked) = .{},
         /// One exclusive holder, or any number of shared ones.
         holders: std.ArrayList(OwnerMode) = .empty,
         /// Blocked acquirers, registration order.

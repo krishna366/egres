@@ -21,14 +21,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const xev = @import("xev");
-const fb = @import("fiber.zig");
-const rt = @import("runtime.zig");
-const fsops = @import("fsops.zig");
-const context = @import("context.zig");
+const _fb = @import("fiber.zig");
+const _rt = @import("runtime.zig");
+const _fsops = @import("fsops.zig");
+const _context = @import("context.zig");
 
 const net_log = std.log.scoped(.net);
 
-const Fiber = fb.Fiber;
+const Fiber = _fb.Fiber;
 const Sionet = std.Io.net;
 
 /// Put a socket fd into non-blocking mode. `std.Io.net`'s listen socket is
@@ -68,12 +68,12 @@ pub const ShutdownHow = std.Io.net.ShutdownHow;
 // handle; `address` is never read by close/shutdown.
 fn socketClose(fd: Sionet.Socket.Handle) void {
     var s: Sionet.Stream = .{ .socket = .{ .handle = fd, .address = undefined } };
-    s.close(fsops.io());
+    s.close(_fsops.io());
 }
 
 fn socketShutdown(fd: Sionet.Socket.Handle, how: ShutdownHow) !void {
     var s: Sionet.Stream = .{ .socket = .{ .handle = fd, .address = undefined } };
-    return s.shutdown(fsops.io(), how);
+    return s.shutdown(_fsops.io(), how);
 }
 
 // ───────────────────────── IpAddress ─────────────────────────
@@ -128,12 +128,12 @@ pub fn resolveHost(host: []const u8, port: u16) !IpAddress {
         return .{ .inner = addr };
     } else |_| {}
 
-    return fsops.run(lookupHost, .{ host, port });
+    return _fsops.run(lookupHost, .{ host, port });
 }
 
 /// The blocking half of `resolveHost`: runs on a pool thread.
 fn lookupHost(host: []const u8, port: u16) !IpAddress {
-    const io = fsops.io();
+    const io = _fsops.io();
     const name = std.Io.net.HostName.init(host) catch return error.BadHostName;
     var results: [16]std.Io.net.HostName.LookupResult = undefined;
     var q = std.Io.Queue(std.Io.net.HostName.LookupResult).init(&results);
@@ -201,7 +201,7 @@ pub const Conn = struct {
             errdefer a.destroy(t);
             t.stream_reader = stream.reader(&t.sock_rbuf);
             t.stream_writer = stream.writer(&t.sock_wbuf);
-            const io = context.g().io;
+            const io = _context.g().io;
             io.random(&t.entropy);
             t.client = std.crypto.tls.Client.init(
                 &t.stream_reader.interface,
@@ -273,7 +273,7 @@ pub const IpAddress = struct {
         // Create + bind + listen via std.Io.net — portable, sets SO_REUSEADDR,
         // and resolves an ephemeral (port 0) bind into `socket.address`. Then
         // drive accept asynchronously through libxev on the resulting fd.
-        const srv = try self.inner.listen(fsops.io(), .{
+        const srv = try self.inner.listen(_fsops.io(), .{
             .reuse_address = options.reuse_address,
             .kernel_backlog = options.backlog,
         });
@@ -289,7 +289,7 @@ pub const IpAddress = struct {
         var tcp = try xev.TCP.init(self.inner);
         errdefer socketClose(tcp.fd);
 
-        const w = rt.currentWorker();
+        const w = _rt.currentWorker();
         const f = w.current_fiber.?;
         var c: xev.Completion = undefined;
         var waiter: ConnectWaiter = .{ .fiber = f, .result = {} };
@@ -312,7 +312,7 @@ pub const Server = struct {
 
     pub fn accept(self: Server, options: IpAddress.AcceptOptions) !Stream {
         _ = options;
-        const w = rt.currentWorker();
+        const w = _rt.currentWorker();
         const f = w.current_fiber.?;
         var c: xev.Completion = undefined;
         var waiter: AcceptWaiter = .{ .fiber = f, .result = undefined };
@@ -498,7 +498,7 @@ pub const Stream = struct {
 
 // TODO: Add timeouts to socketRead and socketWrite, perhaps.
 fn socketRead(tcp: xev.TCP, buf: []u8) xev.ReadError!usize {
-    const w = rt.currentWorker();
+    const w = _rt.currentWorker();
     const f = w.current_fiber.?;
     var c: xev.Completion = undefined;
     var waiter: ReadWaiter = .{ .fiber = f, .result = 0 };
@@ -508,7 +508,7 @@ fn socketRead(tcp: xev.TCP, buf: []u8) xev.ReadError!usize {
 }
 
 fn socketWrite(tcp: xev.TCP, buf: []const u8) xev.WriteError!usize {
-    const w = rt.currentWorker();
+    const w = _rt.currentWorker();
     const f = w.current_fiber.?;
     var c: xev.Completion = undefined;
     var waiter: WriteWaiter = .{ .fiber = f, .result = 0 };
@@ -526,7 +526,7 @@ fn writeAllTcp(tcp: xev.TCP, buf: []const u8) xev.WriteError!void {
 
 /// Park until the op's completion callback has fired (`done`).
 fn parkAssertDone(done: *std.atomic.Value(bool)) void {
-    rt.park();
+    _rt.park();
     // Invariant: resume ONLY when the io_uring completion fired and set `done`.
     // A resume with `!done` is a spurious wake — fail loud at the source rather
     // than silently re-parking.
@@ -552,7 +552,7 @@ fn readCallback(
     const w = ud.?;
     w.result = r;
     w.done.store(true, .release);
-    rt.wake(w.fiber);
+    _rt.wake(w.fiber);
     return .disarm;
 }
 
@@ -573,7 +573,7 @@ fn writeCallback(
     const w = ud.?;
     w.result = r;
     w.done.store(true, .release);
-    rt.wake(w.fiber);
+    _rt.wake(w.fiber);
     return .disarm;
 }
 
@@ -593,7 +593,7 @@ fn connectCallback(
     const w = ud.?;
     w.result = r;
     w.done.store(true, .release);
-    rt.wake(w.fiber);
+    _rt.wake(w.fiber);
     return .disarm;
 }
 
@@ -612,6 +612,6 @@ fn acceptCallback(
     const w = ud.?;
     w.result = r;
     w.done.store(true, .release);
-    rt.wake(w.fiber);
+    _rt.wake(w.fiber);
     return .disarm;
 }

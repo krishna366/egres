@@ -14,22 +14,22 @@ const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 const zen = zdb.buffers;
 
-const catalog = @import("catalog.zig");
-const parse = @import("parse.zig");
-const key = @import("key.zig");
-const row = @import("row.zig");
-const schema = @import("schema.zig");
-const table = @import("table.zig");
-const value = @import("value.zig");
-const server = @import("server.zig");
+const _catalog = @import("catalog.zig");
+const _parse = @import("parse.zig");
+const _key = @import("key.zig");
+const _row = @import("row.zig");
+const _schema = @import("schema.zig");
+const _table = @import("table.zig");
+const _value = @import("value.zig");
+const _server = @import("server.zig");
 
-const Handler = server.Handler;
-const String = value.String;
+const Handler = _server.Handler;
+const String = _value.String;
 const log = std.log.scoped(.sql);
-const replyError = server.replyError;
-const replyErrorCode = server.replyErrorCode;
-const replyLockErr = server.replyLockErr;
-const default_database = server.default_database;
+const replyError = _server.replyError;
+const replyErrorCode = _server.replyErrorCode;
+const replyLockErr = _server.replyLockErr;
+const default_database = _server.default_database;
 
 pub fn createDatabase(self: *Handler, state: *pgwire.ConnState, name: []const u8) !void {
     const eng = self.srv.engine;
@@ -96,7 +96,7 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: []const u8) 
     try state.sendCommandComplete("DROP DATABASE");
 }
 
-pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: parse.CreateTable) !void {
+pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTable) !void {
     const eng = self.srv.engine;
     self.srv.ddl_mu.lock(@src());
     defer self.srv.ddl_mu.unlock();
@@ -117,7 +117,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: parse.CreateTab
     // ids from this list, never re-derives them from position. The
     // PRIMARY KEY column (parse allows at most one) gets an auto unique
     // index on its id.
-    const columns = try a.alloc(schema.LogicalColumn, ct.columns.len);
+    const columns = try a.alloc(_schema.LogicalColumn, ct.columns.len);
     var pkey_col: ?u32 = null;
     for (ct.columns, columns, 1..) |c, *lc, id| {
         lc.* = .{
@@ -158,7 +158,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: parse.CreateTab
     // any) into the namespace's catalogs — one proposal, atomic. A crash
     // between the two proposals leaves a named, column-less table (DROP
     // TABLE cleans it up) — acceptable pre-production.
-    var indexes: [1]catalog.IndexDef = undefined;
+    var indexes: [1]_catalog.IndexDef = undefined;
     var n_indexes: usize = 0;
     if (pkey_col) |col| {
         indexes[0] = .{
@@ -191,8 +191,8 @@ fn writeCatalogRows(
     a: std.mem.Allocator,
     ns: u64,
     table_id: u32,
-    columns: []const schema.LogicalColumn,
-    indexes: []const catalog.IndexDef,
+    columns: []const _schema.LogicalColumn,
+    indexes: []const _catalog.IndexDef,
 ) !void {
     const eng = self.srv.engine;
     const n = columns.len + indexes.len;
@@ -202,12 +202,12 @@ fn writeCatalogRows(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(eng.allocator);
     for (columns, 0..) |lc, i| {
-        const cells = catalog.encodeColumn(table_id, lc);
-        const bytes = try row.marshalRow(eng.allocator, &self.srv.catalog_ps, &cells, &buf);
-        const primary = catalog.encodeKey(table_id, lc.column_id);
+        const cells = _catalog.encodeColumn(table_id, lc);
+        const bytes = try _row.marshalRow(eng.allocator, &self.srv.catalog_ps, &cells, &buf);
+        const primary = _catalog.encodeKey(table_id, lc.column_id);
         const k = zdb.kv.Key{
             .namespace = ns,
-            .table_id = catalog.table_id,
+            .table_id = _catalog.table_id,
             .primary = &primary,
         };
         // marshalRow reuses `buf` — copy the row out; marshal copies
@@ -215,17 +215,17 @@ fn writeCatalogRows(
         kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
     }
     for (indexes, columns.len..) |idx, i| {
-        const cells = catalog.encodeIndex(idx);
-        const bytes = try row.marshalRow(
+        const cells = _catalog.encodeIndex(idx);
+        const bytes = try _row.marshalRow(
             eng.allocator,
             &self.srv.index_catalog_ps,
             &cells,
             &buf,
         );
-        const primary = catalog.encodeIndexKey(idx.base_table_id, idx.index_table_id);
+        const primary = _catalog.encodeIndexKey(idx.base_table_id, idx.index_table_id);
         const k = zdb.kv.Key{
             .namespace = ns,
-            .table_id = catalog.index_table_id,
+            .table_id = _catalog.index_table_id,
             .primary = &primary,
         };
         kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
@@ -233,7 +233,7 @@ fn writeCatalogRows(
     try eng.proposeWrites(ns, kvs, .apply);
 }
 
-pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: parse.DropTable) !void {
+pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable) !void {
     const eng = self.srv.engine;
     self.srv.ddl_mu.lock(@src());
     defer self.srv.ddl_mu.unlock();
@@ -253,7 +253,7 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: parse.DropTable) 
     // name an index (reject), and which index trees belong to it (drop
     // with the base below). Safe pre-lock: ddl_mu serializes every
     // catalog mutation; the intent locks only fence in-flight DML.
-    var scan = table.scanIndexKeys(a, eng.forest, ns, table_id) catch |err| {
+    var scan = _table.scanIndexKeys(a, eng.forest, ns, table_id) catch |err| {
         log.err("drop table '{s}': index scan: {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table failed");
     };
@@ -338,7 +338,7 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: parse.DropTable) 
 /// after 4 → an INVALID index accumulating deltas, never
 /// consulted (DROP INDEX cleans it up; a re-run backfill could
 /// finish it).
-pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: parse.CreateIndex) !void {
+pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: _parse.CreateIndex) !void {
     const eng = self.srv.engine;
     self.srv.ddl_mu.lock(@src());
     defer self.srv.ddl_mu.unlock();
@@ -444,7 +444,7 @@ pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: parse.CreateInd
     var barrier_held = true;
     defer if (barrier_held) db.locks.release(tkey, owner);
 
-    const def = catalog.IndexDef{
+    const def = _catalog.IndexDef{
         .base_table_id = base_tid,
         .index_table_id = index_tid,
         .column_id = column_id,
@@ -460,10 +460,10 @@ pub fn createIndex(self: *Handler, state: *pgwire.ConnState, ci: parse.CreateInd
         return replyError(state, "create index failed");
     };
     const snap = blk: {
-        const ck = catalog.encodeIndexKey(base_tid, index_tid);
+        const ck = _catalog.encodeIndexKey(base_tid, index_tid);
         const found = eng.forest.get(eng.allocator, .{
             .namespace = ns,
-            .table_id = catalog.index_table_id,
+            .table_id = _catalog.index_table_id,
             .primary = &ck,
             .timestamp = std.math.maxInt(u64),
         }, .p0) catch |err| {
@@ -548,24 +548,24 @@ fn backfillIndex(
     ns: u64,
     base_tid: u32,
     index_tid: u32,
-    t: *const table.Table,
-    col: *const table.Column,
+    t: *const _table.Table,
+    col: *const _table.Column,
     snap: u64,
 ) !usize {
     const eng = self.srv.engine;
     const Fold = struct {
         a: std.mem.Allocator,
-        t: *const table.Table,
-        col: *const table.Column,
+        t: *const _table.Table,
+        col: *const _table.Column,
         rows: usize = 0,
         map: std.StringArrayHashMapUnmanaged(zdb.zroar.Bitmap) = .empty,
 
         fn emit(ctx: *@This(), item: zdb.kv.Item) anyerror!bool {
-            const egid = key.decodeEgid(item.key.primary) orelse
+            const egid = _key.decodeEgid(item.key.primary) orelse
                 return true; // not row-shaped: nothing to index
             ctx.rows += 1;
             const cell = ctx.t.read(item, ctx.col);
-            const ik = key.encodeIndexKey(ctx.a, cell, null) catch |err|
+            const ik = _key.encodeIndexKey(ctx.a, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
                     else => return err,
@@ -635,7 +635,7 @@ fn backfillIndex(
 /// results), and unlike dropTable's tolerated catalog garbage, a
 /// live IndexDef row would resurrect the index on the next schema
 /// load. The tombstone is mandatory.
-pub fn dropIndex(self: *Handler, state: *pgwire.ConnState, di: parse.DropIndex) !void {
+pub fn dropIndex(self: *Handler, state: *pgwire.ConnState, di: _parse.DropIndex) !void {
     const eng = self.srv.engine;
     self.srv.ddl_mu.lock(@src());
     defer self.srv.ddl_mu.unlock();
@@ -655,7 +655,7 @@ pub fn dropIndex(self: *Handler, state: *pgwire.ConnState, di: parse.DropIndex) 
     defer arena.deinit();
     const a = arena.allocator();
 
-    var scan = table.scanIndexKeys(
+    var scan = _table.scanIndexKeys(
         a,
         eng.forest,
         ns,
@@ -673,7 +673,7 @@ pub fn dropIndex(self: *Handler, state: *pgwire.ConnState, di: parse.DropIndex) 
         );
     const base_tid = scan.base_table_id.?;
 
-    const defs = table.loadIndexes(
+    const defs = _table.loadIndexes(
         a,
         eng.forest,
         &self.srv.index_catalog_ps,
@@ -715,10 +715,10 @@ pub fn dropIndex(self: *Handler, state: *pgwire.ConnState, di: parse.DropIndex) 
         return replyLockErr(state, err);
     defer db.locks.release(tkey, owner);
 
-    const ck = catalog.encodeIndexKey(base_tid, index_tid);
+    const ck = _catalog.encodeIndexKey(base_tid, index_tid);
     const wire_key = (zdb.kv.Key{
         .namespace = ns,
-        .table_id = catalog.index_table_id,
+        .table_id = _catalog.index_table_id,
         .primary = &ck,
         .timestamp = 0,
     }).marshal(a) catch |err| {

@@ -20,8 +20,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const rt = @import("runtime.zig");
-const watermark = @import("watermark.zig");
+const _rt = @import("runtime.zig");
+const _watermark = @import("watermark.zig");
 const sleepMs = @import("deadlines.zig").sleepMs;
 
 /// How often the signal watcher checks the handler's flag. Bounds both
@@ -30,11 +30,11 @@ const poll_ms: u64 = 300;
 
 pub const Shutdown = struct {
     started: std.atomic.Value(bool) = .init(false),
-    wm: watermark.Watermark,
-    watcher: ?rt.JoinHandle(void) = null,
+    wm: _watermark.Watermark,
+    watcher: ?_rt.JoinHandle(void) = null,
 
     pub fn init(allocator: std.mem.Allocator) Shutdown {
-        return .{ .wm = watermark.Watermark.init(allocator) };
+        return .{ .wm = _watermark.Watermark.init(allocator) };
     }
 
     /// Start first (idempotent) so the watcher's next poll sees it and
@@ -87,7 +87,7 @@ pub const Shutdown = struct {
     /// POSIX-only; Windows console-ctrl handling is a TODO.
     pub fn install(self: *Shutdown) !void {
         if (builtin.os.tag == .windows) return;
-        self.watcher = try rt.spawn(.{}, watchSignal, .{self});
+        self.watcher = try _rt.spawn(.{}, watchSignal, .{self});
 
         var sa = std.posix.Sigaction{
             .handler = .{ .handler = signalHandler },

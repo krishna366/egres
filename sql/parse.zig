@@ -16,15 +16,15 @@
 
 const std = @import("std");
 const pgwire = @import("pgwire");
-const parser = pgwire.parser_mod;
-const value = @import("value.zig");
+const parser = pgwire.parser;
+const _value = @import("value.zig");
 
-const String = value.String;
+const String = _value.String;
 
 /// One parsed `name type [PRIMARY KEY]` column. `name` is borrowed.
 pub const ColumnDef = struct {
     name: []const u8,
-    ty: value.Type,
+    ty: _value.Type,
     pkey: bool = false,
 };
 
@@ -366,7 +366,7 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
         const names = cd.typeName.names;
         if (names.len == 0) return .unsupported;
         const tyname = names[names.len - 1].String.sval;
-        const ty = value.Type.fromName(tyname) orelse
+        const ty = _value.Type.fromName(tyname) orelse
             return invalidFmt(alloc, "unsupported type \"{s}\"", .{tyname});
 
         var pkey = false;

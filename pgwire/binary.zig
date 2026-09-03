@@ -11,7 +11,7 @@
 //! mirrors.
 
 const std = @import("std");
-const types = @import("types.zig");
+const _types = @import("types.zig");
 
 pub const DecodeError = error{
     /// Wrong number of bytes for the expected type — e.g. an int4
@@ -104,14 +104,14 @@ pub fn decodeFloat8(bytes: []const u8) DecodeError!f64 {
 
 /// True if we have a binary encoder/decoder for this OID. Lets
 /// callers dispatch ahead of attempting a decode.
-pub fn isBinarySupported(oid: types.Oid) bool {
+pub fn isBinarySupported(oid: _types.Oid) bool {
     return switch (oid) {
-        types.oid.bool_,
-        types.oid.int2,
-        types.oid.int4,
-        types.oid.int8,
-        types.oid.float4,
-        types.oid.float8,
+        _types.oid.bool_,
+        _types.oid.int2,
+        _types.oid.int4,
+        _types.oid.int8,
+        _types.oid.float4,
+        _types.oid.float8,
         => true,
         else => false,
     };

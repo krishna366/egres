@@ -14,8 +14,8 @@
 //! persisting, never a snapshot of every historical layout.
 
 const std = @import("std");
-const value = @import("value.zig");
-const Type = value.Type;
+const _value = @import("value.zig");
+const Type = _value.Type;
 
 /// A column as the catalog defines it, across its whole lifetime — the
 /// logical schema's column. The codec uses only the layout-relevant subset

@@ -9,20 +9,20 @@ const engine = @import("engine");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 
-const parse = @import("parse.zig");
-const key = @import("key.zig");
-const row = @import("row.zig");
-const schema = @import("schema.zig");
-const table = @import("table.zig");
-const txn = @import("txn.zig");
-const value = @import("value.zig");
-const server = @import("server.zig");
+const _parse = @import("parse.zig");
+const _key = @import("key.zig");
+const _row = @import("row.zig");
+const _schema = @import("schema.zig");
+const _table = @import("table.zig");
+const _txn = @import("txn.zig");
+const _value = @import("value.zig");
+const _server = @import("server.zig");
 
 const log = std.log.scoped(.sql);
-const replyErrorCode = server.replyErrorCode;
+const replyErrorCode = _server.replyErrorCode;
 
 /// A resolved `column = value` filter: the column + the target value.
-pub const CellFilter = struct { col: *const table.Column, val: value.Value };
+pub const CellFilter = struct { col: *const _table.Column, val: _value.Value };
 /// A resolved index point lookup: which index tree + the memcomparable key.
 pub const IndexLookup = struct { index_table_id: u32, key: []const u8 };
 
@@ -46,8 +46,8 @@ const ResolvedFilter = union(enum) {
 pub fn resolveFilter(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,
-    tbl: *const table.Table,
-    filter: parse.Filter,
+    tbl: *const _table.Table,
+    filter: _parse.Filter,
 ) !?ResolvedFilter {
     const bad_value = pgwire.sqlstate.invalid_text_representation;
     const fcol = tbl.column(filter.column) orelse {
@@ -98,7 +98,7 @@ pub fn resolveFilter(
         // trust it yet (catalog.IndexDef.valid); fall through to the
         // cell scan.
         if (!idx.valid) continue;
-        const ik = key.encodeIndexKey(a, val, null) catch |err| {
+        const ik = _key.encodeIndexKey(a, val, null) catch |err| {
             if (err == error.OutOfMemory) return err;
             break :index;
         };
@@ -123,9 +123,9 @@ pub fn resolveFilter(
 /// which the connection's buffered writer batches to the socket.
 pub const RowEmitter = struct {
     state: *pgwire.ConnState,
-    t: *const table.Table,
+    t: *const _table.Table,
     /// The projection — egid is a column too (table.egid_column).
-    outs: []const *const table.Column,
+    outs: []const *const _table.Column,
     count: u64 = 0,
 
     /// Project and send one row — each output cell decoded on its own
@@ -137,7 +137,7 @@ pub const RowEmitter = struct {
             if (v == .null_value) {
                 try dw.writeNull();
             } else {
-                try value.formatValue(try dw.beginColumn(), v);
+                try _value.formatValue(try dw.beginColumn(), v);
                 dw.endColumn();
             }
         }
@@ -150,7 +150,7 @@ pub const RowEmitter = struct {
 /// value.parseValue by rendering non-string literals to text first (int/bool
 /// stringified into `a`, so a text-typed column can borrow it). NULL passes
 /// through; a non-literal item is `error.UnsupportedLiteral`.
-pub fn litToValue(a: std.mem.Allocator, lit: parse.Literal, ty: value.Type) !value.Value {
+pub fn litToValue(a: std.mem.Allocator, lit: _parse.Literal, ty: _value.Type) !_value.Value {
     const text: []const u8 = switch (lit) {
         .null_value => return .null_value,
         .unsupported => return error.UnsupportedLiteral,
@@ -158,7 +158,7 @@ pub fn litToValue(a: std.mem.Allocator, lit: parse.Literal, ty: value.Type) !val
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",
     };
-    return value.parseValue(ty, text);
+    return _value.parseValue(ty, text);
 }
 
 /// The statement scanner — the one forest.scan callback for DML. Filters
@@ -169,7 +169,7 @@ pub fn litToValue(a: std.mem.Allocator, lit: parse.Literal, ty: value.Type) !val
 /// tombstones, so only live rows are seen — re-running a DELETE reports 0.
 pub const Scanner = struct {
     a: std.mem.Allocator, // statement arena — backs items
-    t: *const table.Table,
+    t: *const _table.Table,
     cell_filter: ?CellFilter = null,
     source: Source = .table,
     mode: Mode,
@@ -184,7 +184,7 @@ pub const Scanner = struct {
     /// must NOT lock: its rows are already on the wire and a Restart
     /// would resend them.
     lock: bool = false,
-    decoded: value.Row = .{}, // rewrite decode scratch, arena-backed
+    decoded: _value.Row = .{}, // rewrite decode scratch, arena-backed
     /// Captured matches. The post-lock pass tombstones/puts/emits
     /// straight from these: reaching it means no candidate committed
     /// above read_ts (that lockRow would have bumped → restarted →
@@ -242,7 +242,7 @@ pub const Scanner = struct {
     fn collect(self: *Scanner, item: zdb.kv.Item) !void {
         // Filter on the ONE cell it names — no full-row decode here.
         if (self.cell_filter) |cf| {
-            if (!value.valuesEqual(self.t.read(item, cf.col), cf.val))
+            if (!_value.valuesEqual(self.t.read(item, cf.col), cf.val))
                 return;
         }
         const captured: zdb.kv.Item = switch (self.mode) {
@@ -293,11 +293,11 @@ pub const Scanner = struct {
         self: *Scanner,
         ns: u64,
         table_id: u32,
-        tx: *txn.Txn,
+        tx: *_txn.Txn,
         egid: u64,
         index_tid: ?u32,
     ) !bool {
-        const k = key.encodeEgid(egid);
+        const k = _key.encodeEgid(egid);
         if (self.lock) try tx.lockRow(table_id, &k);
 
         const found = (try tx.lookup(.{
@@ -334,7 +334,7 @@ pub const Scanner = struct {
         eng: *engine.Engine,
         ns: u64,
         table_id: u32,
-        tx: *txn.Txn,
+        tx: *_txn.Txn,
     ) !void {
         std.debug.assert(!(self.lock and self.mode == .emit_value));
         switch (self.source) {
@@ -406,7 +406,7 @@ pub const Scanner = struct {
                     // "no match" rather than failing the statement.
                     log.err(
                         "corrupt index entry: index={d} names egid={d}, no such row in table={d}",
-                        .{ ix.index_table_id, key.decodeEgid(rk) orelse 0, table_id },
+                        .{ ix.index_table_id, _key.decodeEgid(rk) orelse 0, table_id },
                     );
                     return;
                 };
@@ -436,7 +436,7 @@ pub const Scanner = struct {
 };
 
 /// One resolved SET assignment: the column + its typed replacement value.
-pub const SetVal = struct { col: *const table.Column, val: value.Value };
+pub const SetVal = struct { col: *const _table.Column, val: _value.Value };
 
 /// UPDATE's rewrite: decode `src` (its cells borrow from src — the call
 /// must finish while src is alive), overlay the SET values, marshal the
@@ -445,15 +445,15 @@ pub const SetVal = struct { col: *const table.Column, val: value.Value };
 /// same bytes when the row was found, so there is nothing to re-verify.
 pub fn rewriteRowBytes(
     a: std.mem.Allocator,
-    ps: *const schema.PhysicalSchema,
+    ps: *const _schema.PhysicalSchema,
     sets: []const SetVal,
-    dec: *value.Row,
+    dec: *_value.Row,
     src: []const u8,
     buf: *std.ArrayList(u8),
 ) ![]const u8 {
-    try row.unmarshalRow(a, ps, src, &.{}, dec);
+    try _row.unmarshalRow(a, ps, src, &.{}, dec);
     // Overlaying into the codec's backing store is fine: the next
     // unmarshalRow refills every cell.
     for (sets) |sv| dec.cells.items[sv.col.pos] = sv.val;
-    return row.marshalRow(a, ps, dec.items(), buf);
+    return _row.marshalRow(a, ps, dec.items(), buf);
 }

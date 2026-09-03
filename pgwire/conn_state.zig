@@ -19,8 +19,8 @@
 //! `Reader.fixed` and inspect the output via `Allocating.writer.buffered()`.
 
 const std = @import("std");
-const proto = @import("proto.zig");
-const types = @import("types.zig");
+const _proto = @import("proto.zig");
+const _types = @import("types.zig");
 
 pub const Phase = enum {
     /// Awaiting the very first frame (Startup3 / SSLRequest / etc.).
@@ -77,7 +77,7 @@ pub const ExecuteCtx = struct {
     max_rows: u32,
 };
 
-pub const DescribeKind = proto.DescribeKind;
+pub const DescribeKind = _proto.DescribeKind;
 
 /// Resolved view of a Describe. For 'statement' kind, `params` is
 /// empty (Bind hasn't happened yet). For 'portal' kind, `params`
@@ -98,7 +98,7 @@ pub const Event = union(enum) {
     /// Completed startup parameter parse. Slices borrow from
     /// `scratch_in`; copy them out before the next `nextEvent` call,
     /// which resets scratch_in.
-    startup_complete: proto.StartupParams,
+    startup_complete: _proto.StartupParams,
     /// A simple Query message arrived. `sql` borrows from `scratch_in`
     /// and is invalidated on the next `nextEvent` call.
     query: []const u8,
@@ -143,7 +143,7 @@ pub const Config = struct {
     /// Always idle today because we have no transaction support.
     /// TODO: real BEGIN/COMMIT/ROLLBACK driving tx_status to .in_tx /
     /// .failed_tx.
-    initial_tx_status: types.TxStatus = .idle,
+    initial_tx_status: _types.TxStatus = .idle,
 };
 
 /// Errors surfaced from the state machine. Reader/Writer interface
@@ -184,7 +184,7 @@ pub const ConnState = struct {
     alloc: std.mem.Allocator,
     /// Transaction status byte for ReadyForQuery; the SQL handler flips
     /// it on BEGIN/COMMIT/ROLLBACK and statement failure.
-    tx_status: types.TxStatus = .idle,
+    tx_status: _types.TxStatus = .idle,
     /// True once `sendError` fired. The SQL handler clears it per
     /// statement and reads it afterwards — "did this statement error?" —
     /// to drive failed-transaction state without threading a result
@@ -307,7 +307,7 @@ pub const ConnState = struct {
     /// `.terminate` event.
     fn readStartupFrame(self: *ConnState) StateError!u32 {
         const len = try self.in.takeInt(u32, .big);
-        if (len < 8 or len > proto.max_message_body) return error.BadProtocol;
+        if (len < 8 or len > _proto.max_message_body) return error.BadProtocol;
         const code = try self.in.takeInt(u32, .big);
         try self.scratch_in.resize(self.alloc, len - 8);
         try self.in.readSliceAll(self.scratch_in.items);
@@ -321,7 +321,7 @@ pub const ConnState = struct {
     fn readTaggedFrame(self: *ConnState) StateError!u8 {
         const tag = try self.in.takeByte();
         const len = try self.in.takeInt(u32, .big);
-        if (len < 4 or len > proto.max_message_body + 4) return error.BadProtocol;
+        if (len < 4 or len > _proto.max_message_body + 4) return error.BadProtocol;
         try self.scratch_in.resize(self.alloc, len - 4);
         try self.in.readSliceAll(self.scratch_in.items);
         return tag;
@@ -340,8 +340,8 @@ pub const ConnState = struct {
             // SSLRequest / GSSEncRequest: client sniffs to see if we
             // support TLS. We send 'N' (no) and let it retry plain.
             // The byte goes raw — not framed — per protocol.
-            if (code == types.ssl_request_code or
-                code == types.gss_enc_request_code)
+            if (code == _types.ssl_request_code or
+                code == _types.gss_enc_request_code)
             {
                 try self.out.writeByte('N');
                 continue;
@@ -349,11 +349,11 @@ pub const ConnState = struct {
             // CancelRequest: we have no cancel keys, so ignore and
             // close immediately. libpq opens a separate socket for
             // this so dropping it is safe.
-            if (code == types.cancel_request_code) {
+            if (code == _types.cancel_request_code) {
                 self.phase = .closed;
                 return .terminate;
             }
-            if (code != types.protocol_version_3) {
+            if (code != _types.protocol_version_3) {
                 // Unknown version — send a fatal error and close.
                 try self.emitFatal("unsupported frontend protocol", .{
                     'X', 'X', '0', '0', '0',
@@ -362,13 +362,13 @@ pub const ConnState = struct {
                 return .terminate;
             }
 
-            const params = proto.parseStartupParams(self.scratch_in.items) catch
+            const params = _proto.parseStartupParams(self.scratch_in.items) catch
                 return error.BadProtocol;
 
             // AuthenticationOk + a small bundle of ParameterStatus +
             // BackendKeyData + ReadyForQuery. Everything goes into
             // `out` in one batch so the driver can flush once.
-            try proto.encodeAuthenticationOk(self.out);
+            try _proto.encodeAuthenticationOk(self.out);
             // The set of ParameterStatus messages a real Postgres
             // backend sends after AuthOk. Some clients refuse to
             // proceed without specific entries — pgx's simple-query
@@ -389,15 +389,15 @@ pub const ConnState = struct {
                 .{ .k = "application_name", .v = "" },
             };
             for (announce) |p| {
-                try proto.encodeParameterStatus(&self.scratch_out, p.k, p.v);
-                try proto.writeFrame(self.out, .parameter_status, self.scratch_out.writer.buffered());
+                try _proto.encodeParameterStatus(&self.scratch_out, p.k, p.v);
+                try _proto.writeFrame(self.out, .parameter_status, self.scratch_out.writer.buffered());
             }
-            try proto.encodeBackendKeyData(
+            try _proto.encodeBackendKeyData(
                 self.out,
                 self.cfg.backend_pid,
                 self.cfg.backend_secret,
             );
-            try proto.encodeReadyForQuery(self.out, self.tx_status);
+            try _proto.encodeReadyForQuery(self.out, self.tx_status);
 
             self.phase = .ready;
             return .{ .startup_complete = params };
@@ -419,15 +419,15 @@ pub const ConnState = struct {
                 else => return err,
             };
 
-            const tag: proto.FrontendTag = blk: {
-                inline for (std.meta.fields(proto.FrontendTag)) |f| {
+            const tag: _proto.FrontendTag = blk: {
+                inline for (std.meta.fields(_proto.FrontendTag)) |f| {
                     if (f.value == tag_byte) {
                         break :blk @enumFromInt(f.value);
                     }
                 }
                 try self.emitFatal(
                     "unknown frontend message",
-                    types.sqlstate.internal_error,
+                    _types.sqlstate.internal_error,
                 );
                 self.phase = .closed;
                 return .terminate;
@@ -442,7 +442,7 @@ pub const ConnState = struct {
 
             switch (tag) {
                 .query => {
-                    const sql = proto.parseQuery(body) catch
+                    const sql = _proto.parseQuery(body) catch
                         return error.BadProtocol;
                     self.phase = .in_query;
                     self.ext_failed = false;
@@ -474,7 +474,7 @@ pub const ConnState = struct {
                 },
                 .sync => {
                     self.ext_failed = false;
-                    try proto.encodeReadyForQuery(self.out, self.tx_status);
+                    try _proto.encodeReadyForQuery(self.out, self.tx_status);
                     return .sync;
                 },
                 .flush => {
@@ -486,7 +486,7 @@ pub const ConnState = struct {
                 else => {
                     try self.emitErrorReady(
                         "unsupported message",
-                        types.sqlstate.internal_error,
+                        _types.sqlstate.internal_error,
                     );
                     self.ext_failed = true;
                     continue;
@@ -507,7 +507,7 @@ pub const ConnState = struct {
     ) StateError!void {
         self.ext_failed = true;
         try self.writeError(.{
-            .severity = types.severity_error,
+            .severity = _types.severity_error,
             .code = code,
             .message = msg,
         });
@@ -518,10 +518,10 @@ pub const ConnState = struct {
         // tolerates int16-max but real workloads stay tiny; this
         // gives us a stack-friendly upper bound.
         var oids_storage: [256]u32 = undefined;
-        const p = proto.parseParse(body, &oids_storage) catch {
+        const p = _proto.parseParse(body, &oids_storage) catch {
             try self.extError(
                 "malformed Parse message",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return;
         };
@@ -545,15 +545,15 @@ pub const ConnState = struct {
             .sql = sql_dup,
             .param_oids = oids_dup,
         });
-        try proto.encodeParseComplete(self.out);
+        try _proto.encodeParseComplete(self.out);
     }
 
     fn handleBind(self: *ConnState, body: []const u8) StateError!void {
         // Same comment as handleParse re: the upper bounds.
         var pfmt_storage: [256]i16 = undefined;
-        var params_storage: [256]proto.BindParam = undefined;
+        var params_storage: [256]_proto.BindParam = undefined;
         var rfmt_storage: [256]i16 = undefined;
-        const b = proto.parseBind(
+        const b = _proto.parseBind(
             body,
             &pfmt_storage,
             &params_storage,
@@ -561,7 +561,7 @@ pub const ConnState = struct {
         ) catch {
             try self.extError(
                 "malformed Bind message",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return;
         };
@@ -569,7 +569,7 @@ pub const ConnState = struct {
         if (!self.statements.contains(b.statement_name)) {
             try self.extError(
                 "Bind references unknown prepared statement",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return;
         }
@@ -583,14 +583,14 @@ pub const ConnState = struct {
         for (b.param_formats) |f| if (f != 0 and f != 1) {
             try self.extError(
                 "invalid parameter format code (must be 0 or 1)",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return;
         };
         for (b.result_formats) |f| if (f != 0 and f != 1) {
             try self.extError(
                 "invalid result format code (must be 0 or 1)",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return;
         };
@@ -634,7 +634,7 @@ pub const ConnState = struct {
         } else {
             try self.extError(
                 "Bind: param_formats count must be 0, 1, or n_params",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return;
         }
@@ -653,24 +653,24 @@ pub const ConnState = struct {
             .param_formats = pfmt_dup,
             .result_formats = rfmt_dup,
         });
-        try proto.encodeBindComplete(self.out);
+        try _proto.encodeBindComplete(self.out);
     }
 
     /// Returns null when an error was emitted (caller should continue
     /// the consumeReady loop), or the `.execute` event when the
     /// portal+statement resolved successfully.
     fn handleExecute(self: *ConnState, body: []const u8) StateError!?Event {
-        const e = proto.parseExecute(body) catch {
+        const e = _proto.parseExecute(body) catch {
             try self.extError(
                 "malformed Execute message",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return null;
         };
         const portal = self.portals.get(e.portal_name) orelse {
             try self.extError(
                 "Execute references unknown portal",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return null;
         };
@@ -679,7 +679,7 @@ pub const ConnState = struct {
             // statement name, but defensively close out.
             try self.extError(
                 "Execute portal references missing statement",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return null;
         };
@@ -696,10 +696,10 @@ pub const ConnState = struct {
 
     /// Same null-vs-event convention as handleExecute.
     fn handleDescribe(self: *ConnState, body: []const u8) StateError!?Event {
-        const d = proto.parseDescribe(body) catch {
+        const d = _proto.parseDescribe(body) catch {
             try self.extError(
                 "malformed Describe message",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return null;
         };
@@ -708,14 +708,14 @@ pub const ConnState = struct {
                 const stmt = self.statements.get(d.name) orelse {
                     try self.extError(
                         "Describe references unknown statement",
-                        types.sqlstate.internal_error,
+                        _types.sqlstate.internal_error,
                     );
                     return null;
                 };
                 // ParameterDescription is fully owned by the state
                 // machine — we just echo whatever Parse said.
-                try proto.encodeParameterDescription(&self.scratch_out, stmt.param_oids);
-                try proto.writeFrame(self.out, .parameter_description, self.scratch_out.writer.buffered());
+                try _proto.encodeParameterDescription(&self.scratch_out, stmt.param_oids);
+                try _proto.writeFrame(self.out, .parameter_description, self.scratch_out.writer.buffered());
                 return .{ .describe = .{
                     .kind = .statement,
                     .sql = stmt.sql,
@@ -726,14 +726,14 @@ pub const ConnState = struct {
                 const portal = self.portals.get(d.name) orelse {
                     try self.extError(
                         "Describe references unknown portal",
-                        types.sqlstate.internal_error,
+                        _types.sqlstate.internal_error,
                     );
                     return null;
                 };
                 const stmt = self.statements.get(portal.stmt_name) orelse {
                     try self.extError(
                         "Describe portal missing statement",
-                        types.sqlstate.internal_error,
+                        _types.sqlstate.internal_error,
                     );
                     return null;
                 };
@@ -748,10 +748,10 @@ pub const ConnState = struct {
     }
 
     fn handleClose(self: *ConnState, body: []const u8) StateError!void {
-        const c = proto.parseClose(body) catch {
+        const c = _proto.parseClose(body) catch {
             try self.extError(
                 "malformed Close message",
-                types.sqlstate.internal_error,
+                _types.sqlstate.internal_error,
             );
             return;
         };
@@ -761,16 +761,16 @@ pub const ConnState = struct {
         }
         // Spec says CloseComplete is emitted whether or not the
         // target existed.
-        try proto.encodeCloseComplete(self.out);
+        try _proto.encodeCloseComplete(self.out);
     }
 
     /// Emit an ErrorResponse frame from a pre-built ErrorField. Shared
     /// by `emitFatal`, `emitErrorReady`, `extError`, and the public
     /// `sendError` — they all build the body in scratch and ship it
     /// here.
-    fn writeError(self: *ConnState, f: proto.ErrorField) StateError!void {
-        try proto.encodeErrorResponse(&self.scratch_out, f);
-        try proto.writeFrame(self.out, .error_response, self.scratch_out.writer.buffered());
+    fn writeError(self: *ConnState, f: _proto.ErrorField) StateError!void {
+        try _proto.encodeErrorResponse(&self.scratch_out, f);
+        try _proto.writeFrame(self.out, .error_response, self.scratch_out.writer.buffered());
     }
 
     fn emitFatal(
@@ -791,48 +791,48 @@ pub const ConnState = struct {
         code: [5]u8,
     ) StateError!void {
         try self.writeError(.{
-            .severity = types.severity_error,
+            .severity = _types.severity_error,
             .code = code,
             .message = msg,
         });
-        try proto.encodeReadyForQuery(self.out, self.tx_status);
+        try _proto.encodeReadyForQuery(self.out, self.tx_status);
     }
 
     // ---------- Caller-side response builders ----------
 
     pub fn sendRowDescription(
         self: *ConnState,
-        fields: []const types.FieldDescription,
+        fields: []const _types.FieldDescription,
     ) StateError!void {
-        try proto.encodeRowDescription(&self.scratch_out, fields);
-        try proto.writeFrame(self.out, .row_description, self.scratch_out.writer.buffered());
+        try _proto.encodeRowDescription(&self.scratch_out, fields);
+        try _proto.writeFrame(self.out, .row_description, self.scratch_out.writer.buffered());
     }
 
     pub fn sendDataRow(
         self: *ConnState,
-        cols: []const proto.DataValue,
+        cols: []const _proto.DataValue,
     ) StateError!void {
-        try proto.encodeDataRow(&self.scratch_out, cols);
-        try proto.writeFrame(self.out, .data_row, self.scratch_out.writer.buffered());
+        try _proto.encodeDataRow(&self.scratch_out, cols);
+        try _proto.writeFrame(self.out, .data_row, self.scratch_out.writer.buffered());
     }
 
     /// Streaming DataRow: format each column directly into the output scratch,
     /// then `finish`. See proto.DataRowWriter — one format pass, one frame
     /// write (no per-cell buffering).
-    pub fn beginDataRow(self: *ConnState, field_count: u16) StateError!proto.DataRowWriter {
-        return proto.DataRowWriter.begin(&self.scratch_out, self.out, field_count);
+    pub fn beginDataRow(self: *ConnState, field_count: u16) StateError!_proto.DataRowWriter {
+        return _proto.DataRowWriter.begin(&self.scratch_out, self.out, field_count);
     }
 
     pub fn sendCommandComplete(self: *ConnState, tag: []const u8) StateError!void {
-        try proto.encodeCommandComplete(&self.scratch_out, tag);
-        try proto.writeFrame(self.out, .command_complete, self.scratch_out.writer.buffered());
+        try _proto.encodeCommandComplete(&self.scratch_out, tag);
+        try _proto.writeFrame(self.out, .command_complete, self.scratch_out.writer.buffered());
     }
 
     pub fn sendEmptyQueryResponse(self: *ConnState) StateError!void {
-        try proto.encodeEmptyQueryResponse(self.out);
+        try _proto.encodeEmptyQueryResponse(self.out);
     }
 
-    pub fn sendError(self: *ConnState, f: proto.ErrorField) StateError!void {
+    pub fn sendError(self: *ConnState, f: _proto.ErrorField) StateError!void {
         self.error_sent = true;
         try self.writeError(f);
     }
@@ -840,13 +840,13 @@ pub const ConnState = struct {
     /// NoData ('n'): legal response to Describe when no result rows
     /// will be produced (e.g. INSERT/DELETE without RETURNING).
     pub fn sendNoData(self: *ConnState) StateError!void {
-        try proto.encodeNoData(self.out);
+        try _proto.encodeNoData(self.out);
     }
 
     /// Wrap up the current command: emit ReadyForQuery and flip back
     /// to `.ready`.
     pub fn endCommand(self: *ConnState) StateError!void {
-        try proto.encodeReadyForQuery(self.out, self.tx_status);
+        try _proto.encodeReadyForQuery(self.out, self.tx_status);
         self.phase = .ready;
     }
 };

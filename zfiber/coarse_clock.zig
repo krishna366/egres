@@ -41,7 +41,7 @@
 //! clock only stops when the whole runtime is idle.
 
 const std = @import("std");
-const context = @import("context.zig");
+const _context = @import("context.zig");
 
 pub const ClockKind = enum { monotonic, realtime };
 
@@ -58,7 +58,7 @@ pub const ClockKind = enum { monotonic, realtime };
 pub fn clockMsUseRarely(comptime kind: ClockKind) i64 {
     // std.Io.Clock spells monotonic as `.awake` (Linux CLOCK_MONOTONIC,
     // macOS CLOCK_UPTIME_RAW); `.real` is wall-clock Unix time.
-    const ts = std.Io.Timestamp.now(context.g().io, switch (kind) {
+    const ts = std.Io.Timestamp.now(_context.g().io, switch (kind) {
         .monotonic => .awake,
         .realtime => .real,
     });

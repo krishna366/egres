@@ -22,15 +22,15 @@
 
 const std = @import("std");
 const xev = @import("xev");
-const heap = @import("heap.zig");
-const coarse = @import("coarse_clock.zig");
+const _heap = @import("heap.zig");
+const _coarse = @import("coarse_clock.zig");
 // `sleepMs` (bottom of file) is the one fiber-aware helper here, so we import
 // the runtime for park/wake. The `Deadlines` struct itself stays oblivious to
 // fibers — this is a mutual file import, which Zig resolves lazily (runtime.zig
 // imports us back for the `Deadlines` type).
-const rt = @import("runtime.zig");
-const fb = @import("fiber.zig");
-const Fiber = fb.Fiber;
+const _rt = @import("runtime.zig");
+const _fb = @import("fiber.zig");
+const Fiber = _fb.Fiber;
 
 const Spinlock = @import("spinlock.zig").Spinlock;
 const Allocator = std.mem.Allocator;
@@ -47,7 +47,7 @@ pub const min_timeout_ms: u64 = 1;
 /// Definition lives in `fiber.zig` (the fiber owns it); see `Timeout` there.
 /// When the deadline fires (before `cancel`), the owner worker invokes
 /// `on_fire(on_fire_ctx)` exactly once (gated by `_done`).
-pub const Timeout = fb.Timeout;
+pub const Timeout = _fb.Timeout;
 
 /// One reusable timer SQE. `completion` must stay put (io_uring holds its
 /// address until the CQE), so nodes are heap-allocated and never moved. A node
@@ -148,7 +148,7 @@ pub const Deadlines = struct {
         t: *Timeout,
         ms_from_now: u64,
     ) !void {
-        const current_ms = coarse.clockMsUseRarely(.monotonic);
+        const current_ms = _coarse.clockMsUseRarely(.monotonic);
         const ms = @max(ms_from_now, min_timeout_ms);
         t._deadline_ms = current_ms + @as(i64, @intCast(ms));
 
@@ -328,7 +328,7 @@ fn onTimerNode(
     // a future register re-arms). Don't drain / re-arm.
     _ = result catch return .disarm;
 
-    const now = coarse.clockMsUseRarely(.monotonic);
+    const now = _coarse.clockMsUseRarely(.monotonic);
     self.drainExpired(now);
     // Re-arm for whatever remains (this node fired, so the head lost its timer).
     self.armForHead(now);
@@ -351,7 +351,7 @@ fn onTimerNode(
 pub fn wonRaceAndTimedOut(ctx: *anyopaque) void {
     const f: *Fiber = @ptrCast(@alignCast(ctx));
     f.timeout._fired.store(true, .release);
-    rt.wake(f);
+    _rt.wake(f);
 }
 
 /// Arm fiber `f`'s own timeout `ms` from now on its current worker's heap.
@@ -363,7 +363,7 @@ pub fn armSelf(f: *Fiber, ms: u64) !*Deadlines {
     f.timeout.reset();
     f.timeout.on_fire = &wonRaceAndTimedOut;
     f.timeout.on_fire_ctx = f;
-    const o = &rt.currentWorker().deadlines;
+    const o = &_rt.currentWorker().deadlines;
     try o.register(&f.timeout, ms);
     return o;
 }
@@ -387,12 +387,12 @@ pub fn disarmSelf(f: *Fiber, owner: *Deadlines) void {
 /// a re-park — a park must only return for a real reason, so a violation is a
 /// runtime bug surfaced loudly with an attributable stack.
 pub fn sleepMs(ms: u64) void {
-    const f = rt.currentFiber();
+    const f = _rt.currentFiber();
     const owner = armSelf(f, ms) catch |err| {
         std.debug.panic("sleepMs: deadline register failed: {}", .{err});
     };
     defer disarmSelf(f, owner);
-    rt.park();
+    _rt.park();
     if (!f.timeout.didFire()) std.debug.panic(
         "sleepMs: resumed before our own deadline fired — spurious wake",
         .{},

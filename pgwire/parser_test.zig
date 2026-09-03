@@ -6,7 +6,7 @@ const testing = std.testing;
 const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
 
-const parser = pgwire.parser_mod;
+const parser = pgwire.parser;
 
 /// Walk into the first statement's "stmt" wrapper and return its key
 /// (the statement-kind name libpg_query emits, e.g. "SelectStmt").

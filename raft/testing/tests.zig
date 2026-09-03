@@ -1,11 +1,11 @@
 const std = @import("std");
 const raft = @import("raft");
 const fiber = @import("zfiber");
-const cluster_mod = @import("cluster.zig");
+const _cluster = @import("cluster.zig");
 const zen = raft.buffers;
 
-const TestCluster = cluster_mod.TestCluster;
-const TestLog = cluster_mod.TestLog;
+const TestCluster = _cluster.TestCluster;
+const TestLog = _cluster.TestLog;
 const Config = raft.Config;
 const NodeId = raft.NodeId;
 

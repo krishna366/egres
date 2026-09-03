@@ -4,9 +4,9 @@ const zdb = @import("zdb");
 const vfs = zdb.vfs;
 
 const Key = zdb.kv.Key;
-const table_mod = zdb.table;
-const Builder = table_mod.builder.Builder;
-const Table = table_mod.Table;
+const _table = zdb.table;
+const Builder = _table.builder.Builder;
+const Table = _table.Table;
 
 const manifest = zdb.manifest;
 const KeyRange = zdb.level.KeyRange;
@@ -29,9 +29,9 @@ fn treeCount(f: *Forest) usize {
     return n;
 }
 
-const forest_mod = zdb.forest;
-const Forest = forest_mod.Forest;
-const TableTrees = forest_mod.TableTrees;
+const _forest = zdb.forest;
+const Forest = _forest.Forest;
+const TableTrees = _forest.TableTrees;
 
 const config = zdb.config;
 
@@ -679,9 +679,9 @@ test "forest: snapshot manifest round-trip" {
 // freezes the prior current and makes a new current with id_i. After N swaps,
 // immutables = [id_{N-1}, ..., id_2, id_1] (newest first), current = id_N.
 
-fn buildMemtables(alloc: std.mem.Allocator, ids: []const u64) !forest_mod.Memtables {
+fn buildMemtables(alloc: std.mem.Allocator, ids: []const u64) !_forest.Memtables {
     const initial = try zdb.skl.SkipList.init(alloc);
-    var mts = forest_mod.Memtables.init(alloc, initial);
+    var mts = _forest.Memtables.init(alloc, initial);
     errdefer mts.deinit();
     for (ids) |id| try mts.swapCurrentOut(id, 0);
     return mts;

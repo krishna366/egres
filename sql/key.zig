@@ -22,7 +22,7 @@
 //! index's column type is fixed so key widths never mix.
 
 const std = @import("std");
-const value = @import("value.zig");
+const _value = @import("value.zig");
 
 /// The 8-byte big-endian primary key for a row with this egid.
 pub fn encodeEgid(egid: u64) [8]u8 {
@@ -78,7 +78,7 @@ const tag_null: u8 = 0x01;
 /// (value.zig), so they encode as signed integers.
 pub fn encodeIndexKey(
     a: std.mem.Allocator,
-    v: value.Value,
+    v: _value.Value,
     buf: ?*std.ArrayList(u8),
 ) ![]u8 {
     var own: std.ArrayList(u8) = .empty;

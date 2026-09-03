@@ -25,7 +25,7 @@ const utils = @import("utils");
 const Allocator = std.mem.Allocator;
 
 // Re-export the canonical refcounted buffer from utils. Kept under the old
-// name so existing cache call sites (`cache_mod.Value.init`, `incrRef`, etc.)
+// name so existing cache call sites (`_cache.Value.init`, `incrRef`, etc.)
 // keep compiling without churn.
 pub const Value = utils.RefValue;
 

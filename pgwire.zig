@@ -9,17 +9,15 @@
 
 pub const proto = @import("pgwire/proto.zig");
 pub const conn_state = @import("pgwire/conn_state.zig");
-pub const parser_mod = @import("pgwire/parser.zig");
-pub const driver_mod = @import("pgwire/driver.zig");
+pub const parser = @import("pgwire/parser.zig");
+pub const driver = @import("pgwire/driver.zig");
 pub const types = @import("pgwire/types.zig");
 pub const binary = @import("pgwire/binary.zig");
 
-const types_mod = types;
-
 // Driver — the one I/O entry point most callers want.
-pub const serve = driver_mod.serve;
-pub const Options = driver_mod.Options;
-pub const Stream = driver_mod.Stream;
+pub const serve = driver.serve;
+pub const Options = driver.Options;
+pub const Stream = driver.Stream;
 
 // State machine — exposed for callers that want to drive pgwire from
 // somewhere other than fiber.net.Stream (e.g. tests, alternate runtimes).
@@ -32,18 +30,18 @@ pub const DescribeCtx = conn_state.DescribeCtx;
 pub const DescribeKind = conn_state.DescribeKind;
 
 // Parser — libpg_query JSON wrapper.
-pub const parse = parser_mod.parse;
-pub const ParseTree = parser_mod.ParseTree;
-pub const ParseError = parser_mod.ParseError;
-pub const ErrorInfo = parser_mod.ErrorInfo;
-pub const parserShutdown = parser_mod.shutdown;
+pub const parse = parser.parse;
+pub const ParseTree = parser.ParseTree;
+pub const ParseError = parser.ParseError;
+pub const ErrorInfo = parser.ErrorInfo;
+pub const parserShutdown = parser.shutdown;
 
 // Shared protocol types.
-pub const FieldDescription = types_mod.FieldDescription;
-pub const Oid = types_mod.Oid;
-pub const oid = types_mod.oid;
-pub const TxStatus = types_mod.TxStatus;
-pub const sqlstate = types_mod.sqlstate;
+pub const FieldDescription = types.FieldDescription;
+pub const Oid = types.Oid;
+pub const oid = types.oid;
+pub const TxStatus = types.TxStatus;
+pub const sqlstate = types.sqlstate;
 
 // Re-export proto.* for callers that want to talk frames directly
 // (test fixtures, alternative drivers).

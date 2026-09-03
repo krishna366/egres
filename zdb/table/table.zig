@@ -3,14 +3,14 @@ const zbuf = @import("zbuf").zbuf;
 const Key = @import("../kv.zig").Key;
 const Meta = @import("../kv.zig").Meta;
 pub const Item = @import("../kv.zig").Item;
-const idx = @import("index.zig");
-const buffers = @import("../buffers.gen.zig");
+const _idx = @import("index.zig");
+const _buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
 const compress = utils.compression;
-const binaryfuse = @import("../binaryfusefilter.zig");
+const _binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("vfs");
-const cache_mod = @import("../cache.zig");
-const fi = @import("../file_ids.zig");
+const _cache = @import("../cache.zig");
+const _fi = @import("../file_ids.zig");
 
 /// Module-level block cache singleton. Set before opening tables to enable
 /// caching. When null (default), readBlock always reads from disk.
@@ -18,9 +18,9 @@ const fi = @import("../file_ids.zig");
 /// Key layout: high 64 bits = file_id, low 64 bits = block_idx. Storing
 /// both fields in their own halves of a u128 means no hash combine and
 /// zero collision risk across the node_id-namespaced file_id space.
-pub var block_cache: ?*cache_mod.ShardedCache(u128) = null;
+pub var block_cache: ?*_cache.ShardedCache(u128) = null;
 
-pub const Error = idx.Error || buffers.Error || compress.Error ||
+pub const Error = _idx.Error || _buffers.Error || compress.Error ||
     std.mem.Allocator.Error || error{
     ChecksumMismatch,
     CorruptTable,
@@ -43,9 +43,9 @@ pub const BlockLayout = struct {
 pub const Table = struct {
     allocator: std.mem.Allocator,
     handle: vfs.FileHandle,
-    index: *buffers.TableIndexStruct,
+    index: *_buffers.TableIndexStruct,
     codec: compress.Codec,
-    binary_fuse: ?binaryfuse.BinaryFuse(u16),
+    binary_fuse: ?_binaryfuse.BinaryFuse(u16),
     ref: std.atomic.Value(i32),
     smallest: Key,
     biggest: Key,
@@ -69,7 +69,7 @@ pub const Table = struct {
         const handle = try vfs.g().openFile(allocator, path, .{});
         const t = try initFromHandle(allocator, handle, priority);
         errdefer t.decrRef();
-        t.file_id = fi.fromPath(path);
+        t.file_id = _fi.fromPath(path);
         const duped = try allocator.dupe(u8, path);
         t.path_ptr = std.atomic.Value(?[*]const u8).init(duped.ptr);
         t.path_len = duped.len;
@@ -94,17 +94,17 @@ pub const Table = struct {
         errdefer allocator.destroy(t);
 
         // Read the trailer: [u32 index_len][u64 index_hash] (idx.trailer_len bytes).
-        if (size < idx.trailer_len) return error.CorruptTable;
-        const trailer_offset: u64 = @intCast(size - idx.trailer_len);
-        const trailer_result = try handle.readAligned(allocator, trailer_offset, idx.trailer_len, priority);
+        if (size < _idx.trailer_len) return error.CorruptTable;
+        const trailer_offset: u64 = @intCast(size - _idx.trailer_len);
+        const trailer_result = try handle.readAligned(allocator, trailer_offset, _idx.trailer_len, priority);
         defer trailer_result.free();
 
-        if (trailer_result.data.len < idx.trailer_len) return error.CorruptTable;
-        const index_len = idx.readU32LE(trailer_result.data, 0) catch return error.CorruptTable;
-        const stored_checksum = idx.readU64LE(trailer_result.data, 4) catch return error.CorruptTable;
+        if (trailer_result.data.len < _idx.trailer_len) return error.CorruptTable;
+        const index_len = _idx.readU32LE(trailer_result.data, 0) catch return error.CorruptTable;
+        const stored_checksum = _idx.readU64LE(trailer_result.data, 4) catch return error.CorruptTable;
 
         // Read index bytes.
-        const index_end: u64 = @intCast(size - idx.trailer_len);
+        const index_end: u64 = @intCast(size - _idx.trailer_len);
         if (index_len > index_end) return error.CorruptTable;
         const index_offset = index_end - index_len;
         const index_result = try handle.readAligned(allocator, index_offset, index_len, priority);
@@ -115,7 +115,7 @@ pub const Table = struct {
         const got_checksum = zbuf.hash(index_bytes);
         if (got_checksum != stored_checksum) return error.ChecksumMismatch;
 
-        const index_reader = try buffers.TableIndexReader.init(index_bytes, 0);
+        const index_reader = try _buffers.TableIndexReader.init(index_bytes, 0);
         var table_index = try index_reader.toStruct(allocator);
         // destroy, not deinit: toStruct hands back a created pointer, and
         // deinit frees only what the struct points at. Same call Table.deinit
@@ -126,10 +126,10 @@ pub const Table = struct {
         // checksums can't catch this: a stale table's blocks are internally
         // consistent, so they verify fine and then decode into keys shifted by
         // a byte. There is no migration path — wipe the data dir and reload.
-        if (table_index.format_version != idx.format_version) {
+        if (table_index.format_version != _idx.format_version) {
             log.err(
                 "SST format_version={d}, expected {d}: wipe the data dir and reload",
-                .{ table_index.format_version, idx.format_version },
+                .{ table_index.format_version, _idx.format_version },
             );
             return error.UnsupportedTableFormat;
         }
@@ -140,8 +140,8 @@ pub const Table = struct {
         // BinaryFuse(u16) that we keep for the lifetime of this Table.  After
         // the transfer table_index.binary_fuse holds no heap memory (fingerprints is
         // &.{}) so index.deinit() becomes a no-op for that field.
-        const binary_fuse: ?binaryfuse.BinaryFuse(u16) = if (table_index.binary_fuse) |*bf| blk: {
-            const filter = binaryfuse.BinaryFuse(u16){
+        const binary_fuse: ?_binaryfuse.BinaryFuse(u16) = if (table_index.binary_fuse) |*bf| blk: {
+            const filter = _binaryfuse.BinaryFuse(u16){
                 .seed = bf.seed,
                 .segment_length = bf.segment_length,
                 .segment_length_mask = bf.segment_length_mask,
@@ -221,7 +221,7 @@ pub const Table = struct {
         }
     }
 
-    pub fn getIndex(self: *const Table) *const buffers.TableIndexStruct {
+    pub fn getIndex(self: *const Table) *const _buffers.TableIndexStruct {
         return &self.index;
     }
 
@@ -242,7 +242,7 @@ pub const Table = struct {
         return self.index.blocks[block_idx].key;
     }
 
-    pub fn readBlock(self: *const Table, block_idx: usize, priority: vfs.Priority) Error!*cache_mod.Value {
+    pub fn readBlock(self: *const Table, block_idx: usize, priority: vfs.Priority) Error!*_cache.Value {
         if (block_idx >= self.index.blocks.len) return error.CorruptTable;
 
         // file_id in high 64 bits, block_idx in low 64 bits — no hashing,
@@ -278,7 +278,7 @@ pub const Table = struct {
         if (sz < 8) return error.CorruptTable;
         std.debug.assert(out.items.len == sz);
 
-        const stored_checksum = try idx.readU64LE(out.items, 0);
+        const stored_checksum = try _idx.readU64LE(out.items, 0);
         const got_checksum = zbuf.hash(out.items[8..]);
         if (stored_checksum != got_checksum) return error.ChecksumMismatch;
 
@@ -287,7 +287,7 @@ pub const Table = struct {
         errdefer self.allocator.free(owned_data);
 
         // val has ref=1
-        const val = cache_mod.Value.init(self.allocator, owned_data) catch return error.OutOfMemory;
+        const val = _cache.Value.init(self.allocator, owned_data) catch return error.OutOfMemory;
         errdefer val.decrRef();
 
         // Cache insert (best-effort); put incrRefs on success → ref=2
@@ -326,7 +326,7 @@ pub const BlockIterator = struct {
         // decompress step.
         if (block.len < 12) return error.CorruptTable;
 
-        const entry_count: usize = @intCast(try idx.readU32LE(block, 8));
+        const entry_count: usize = @intCast(try _idx.readU32LE(block, 8));
         if (entry_count == 0) return error.CorruptTable;
 
         const offsets_off: usize = 12;
@@ -430,8 +430,8 @@ pub const BlockIterator = struct {
         const off = try self.getOffset(i);
         if (off + 5 > er.len) return error.CorruptTable;
 
-        const overlap: usize = @intCast(try idx.readU16LE(er, off));
-        const dlen: usize = @intCast(try idx.readU16LE(er, off + 2));
+        const overlap: usize = @intCast(try _idx.readU16LE(er, off));
+        const dlen: usize = @intCast(try _idx.readU16LE(er, off + 2));
         if (overlap > self.base_key.len) return error.CorruptTable;
         // 12-byte ns/tid prefix, >=1 primary byte, 8-byte timestamp.
         if (overlap + dlen < 21) return error.CorruptTable;
@@ -536,7 +536,7 @@ pub const BlockIterator = struct {
     /// Start of entry i within entries_region.
     inline fn getOffset(self: *BlockIterator, i: usize) Error!usize {
         const at = self.layout.offsets_off + (i * 4);
-        return @intCast(try idx.readU32LE(self.block, at));
+        return @intCast(try _idx.readU32LE(self.block, at));
     }
 
     fn setIdx(self: *BlockIterator, i: usize) Error!void {
@@ -550,8 +550,8 @@ pub const BlockIterator = struct {
         // 5-byte fixed header: [u16 overlap][u16 diff_len][u8 meta].
         if (off + 5 > er.len) return error.CorruptTable;
 
-        const key_overlap: usize = @intCast(try idx.readU16LE(er, off));
-        const key_diff_len: usize = @intCast(try idx.readU16LE(er, off + 2));
+        const key_overlap: usize = @intCast(try _idx.readU16LE(er, off));
+        const key_diff_len: usize = @intCast(try _idx.readU16LE(er, off + 2));
         if (key_overlap > self.base_key.len) return error.CorruptTable;
         const meta = Meta.fromByte(er[off + 4]);
 
@@ -589,7 +589,7 @@ pub const TableIterator = struct {
     table: *Table,
     bpos: usize,
     bi: ?BlockIterator,
-    current_block: ?*cache_mod.Value = null,
+    current_block: ?*_cache.Value = null,
     valid: bool,
     priority: vfs.Priority,
     end_key: ?Key = null, // exclusive upper bound; owned (duped)
@@ -639,8 +639,8 @@ pub const TableIterator = struct {
                 self.end_key = try end.dupe(self.allocator);
                 // Find the block containing end_key: last block with base key <= end.
                 const blocks = self.table.index.blocks;
-                const ei = utils.search(buffers.BlockIndexStruct, blocks, end, struct {
-                    fn f(ek: Key, b: buffers.BlockIndexStruct) bool {
+                const ei = utils.search(_buffers.BlockIndexStruct, blocks, end, struct {
+                    fn f(ek: Key, b: _buffers.BlockIndexStruct) bool {
                         return Key.init(b.key).order(ek) == .gt;
                     }
                 }.f);
@@ -675,8 +675,8 @@ pub const TableIterator = struct {
         if (blocks.len == 0) return;
 
         // First block whose base key > target.
-        const bi_idx = utils.search(buffers.BlockIndexStruct, blocks, target, struct {
-            fn f(sk: Key, b: buffers.BlockIndexStruct) bool {
+        const bi_idx = utils.search(_buffers.BlockIndexStruct, blocks, target, struct {
+            fn f(sk: Key, b: _buffers.BlockIndexStruct) bool {
                 return Key.init(b.key).order(sk) == .gt;
             }
         }.f);
@@ -757,7 +757,7 @@ pub const TableIterator = struct {
     /// incrRefs this pin (and decrRefs when done) instead of copying
     /// the bytes — the block stays alive even after the iterator
     /// advances or dies.
-    pub fn currentBlock(self: *const TableIterator) ?*cache_mod.Value {
+    pub fn currentBlock(self: *const TableIterator) ?*_cache.Value {
         if (!self.valid) return null;
         return self.current_block;
     }

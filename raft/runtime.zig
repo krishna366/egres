@@ -1,22 +1,22 @@
 const std = @import("std");
 const fiber = @import("zfiber");
-const node_mod = @import("node.zig");
-const serial_mod = @import("serial");
-const Serial = serial_mod.Serial;
-const transport_mod = @import("transport");
-const Transport = transport_mod.Transport;
+const _node = @import("node.zig");
+const _serial = @import("serial");
+const Serial = _serial.Serial;
+const _transport = @import("transport");
+const Transport = _transport.Transport;
 const zen = @import("buffers_gen");
 const log = std.log.scoped(.raft_runtime);
 
-pub const NodeId = node_mod.NodeId;
+pub const NodeId = _node.NodeId;
 
-pub const msg_type_join_request = node_mod.msg_type_join_request;
+pub const msg_type_join_request = _node.msg_type_join_request;
 
 pub const RaftRuntime = struct {
     allocator: std.mem.Allocator,
-    node: *node_mod.Node,
+    node: *_node.Node,
 
-    pub fn init(allocator: std.mem.Allocator, node: *node_mod.Node) RaftRuntime {
+    pub fn init(allocator: std.mem.Allocator, node: *_node.Node) RaftRuntime {
         return .{
             .allocator = allocator,
             .node = node,
@@ -121,11 +121,11 @@ pub fn joinCluster(
             log.info("joinCluster: rejected by {s}, reason={d}", .{ target, reason });
             // Terminal rejection — the cluster has no shared file store, so
             // retrying can never succeed until the leader restarts with one.
-            if (reason == node_mod.Node.JoinReason.no_file_store) {
+            if (reason == _node.Node.JoinReason.no_file_store) {
                 log.err("joinCluster: cluster has no file store (--store); cannot join", .{});
                 return error.NoFileStore;
             }
-            if (reason == node_mod.Node.JoinReason.not_leader) {
+            if (reason == _node.Node.JoinReason.not_leader) {
                 const leader_addr = reader.leaderAddr();
                 if (leader_addr.len > 0) {
                     log.info("joinCluster: redirecting to leader at {s}", .{leader_addr});

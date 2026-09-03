@@ -9,12 +9,12 @@
 //! projection touches only the bytes it asks for.
 
 const std = @import("std");
-const value = @import("value.zig");
-const schema = @import("schema.zig");
-const Value = value.Value;
-const Row = value.Row;
-const PhysicalSchema = schema.PhysicalSchema;
-const ColumnLayout = schema.ColumnLayout;
+const _value = @import("value.zig");
+const _schema = @import("schema.zig");
+const Value = _value.Value;
+const Row = _value.Row;
+const PhysicalSchema = _schema.PhysicalSchema;
+const ColumnLayout = _schema.ColumnLayout;
 
 /// Marshal a row into `buf` (cleared first; its capacity is reused across
 /// calls — the caller owns it and frees it once). `values[i]` corresponds

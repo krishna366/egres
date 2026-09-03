@@ -2,7 +2,7 @@ const std = @import("std");
 const fiber = @import("zfiber");
 const flags = @import("flags");
 const utils = @import("utils");
-const proto = @import("engine/admin.zig");
+const _proto = @import("engine/admin.zig");
 
 const log = std.log.scoped(.zdb_client);
 
@@ -351,7 +351,7 @@ fn workerImpl(ctx: *WorkerCtx) !void {
     // Clamp to the server's wire-level cap so we never generate a value
     // the server would reject with error.TokenTooLong. Single source of
     // truth lives in protocol.zig.
-    const value_size: usize = @min(args.value_size, proto.max_token_size);
+    const value_size: usize = @min(args.value_size, _proto.max_token_size);
     const bs: u32 = @max(args.batch_size, 1);
     // Pre-alloc batch buffers once per worker (keys + values flat + their
     // slice-of-slice headers). Reused every batch iteration.

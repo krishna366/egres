@@ -1,13 +1,13 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
-const vfs = @import("vfs.zig");
+const _vfs = @import("vfs.zig");
 
 pub const Config = struct {
     bytes_per_sec: u64, // bytes per second
     write_cost: u8 = 4, // write multiplier - each write costs k * read cost.
     timeout_ms: u64 = 100, // After this timeout, provide min_alloc.
-    min_alloc_bytes: u64 = 8 * vfs.page_size, // default: write_cost (8) * page_size
+    min_alloc_bytes: u64 = 8 * _vfs.page_size, // default: write_cost (8) * page_size
 };
 
 /// Atomically subtract `n` from `v`, clamping at zero.
@@ -22,8 +22,8 @@ fn atomicSaturatingSub(v: *std.atomic.Value(u64), n: u64) void {
 /// Not thread-safe — must be used from a single thread/coroutine.
 pub const Spinner = struct {
     limiter: *Limiter,
-    priority: vfs.Priority,
-    kind: vfs.IOKind,
+    priority: _vfs.Priority,
+    kind: _vfs.IOKind,
     rem_pages: u64, // pages still needed (rounded up)
     rem_bytes: u64, // exact bytes still needed
 
@@ -48,7 +48,7 @@ pub const Spinner = struct {
         };
         _ = counter.fetchAdd(granted_pages, .monotonic);
 
-        const granted_bytes = granted_pages * vfs.page_size;
+        const granted_bytes = granted_pages * _vfs.page_size;
         // On the last chunk, rem_bytes may be less than granted_bytes.
         // Return exactly what's left, so caller gets exactly how much they asked for.
         const result = @min(self.rem_bytes, granted_bytes);
@@ -178,20 +178,20 @@ pub const Limiter = struct {
     }
 
     pub fn init(config: Config) Limiter {
-        const pps = config.bytes_per_sec / vfs.page_size;
+        const pps = config.bytes_per_sec / _vfs.page_size;
         return .{
             .pages = std.atomic.Value(u64).init(pps),
             .last_refill = std.atomic.Value(i64).init(fiber.coarseMs()),
             .demand_p1 = std.atomic.Value(u64).init(0),
             .pages_per_sec = pps,
-            .min_alloc_pages = @max(config.min_alloc_bytes / vfs.page_size, 1),
+            .min_alloc_pages = @max(config.min_alloc_bytes / _vfs.page_size, 1),
             .conf = config,
         };
     }
 
     /// Create a spinner for an I/O operation at the given priority.
-    pub fn spinner(self: *Limiter, priority: vfs.Priority, bytes: usize, kind: vfs.IOKind) Spinner {
-        const pages: u64 = std.mem.alignForward(u64, @intCast(bytes), vfs.page_size) / vfs.page_size;
+    pub fn spinner(self: *Limiter, priority: _vfs.Priority, bytes: usize, kind: _vfs.IOKind) Spinner {
+        const pages: u64 = std.mem.alignForward(u64, @intCast(bytes), _vfs.page_size) / _vfs.page_size;
         if (priority == .p1) {
             _ = self.demand_p1.fetchAdd(pages, .release);
         }

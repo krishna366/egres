@@ -11,11 +11,11 @@
 const std = @import("std");
 const zdb = @import("zdb");
 
-const value = @import("value.zig");
-const schema = @import("schema.zig");
-const row = @import("row.zig");
-const key = @import("key.zig");
-const catalog = @import("catalog.zig");
+const _value = @import("value.zig");
+const _schema = @import("schema.zig");
+const _row = @import("row.zig");
+const _key = @import("key.zig");
+const _catalog = @import("catalog.zig");
 
 const Forest = zdb.forest.Forest;
 const Key = zdb.kv.Key;
@@ -29,8 +29,8 @@ pub const Error = error{UndefinedTable};
 // (buildFlush skips keys whose table has no tree). catalog.zig deliberately
 // imports no zdb, so the tie-down lives here.
 comptime {
-    std.debug.assert(catalog.table_id == zdb.manifest.catalog_table_id);
-    std.debug.assert(catalog.index_table_id ==
+    std.debug.assert(_catalog.table_id == zdb.manifest.catalog_table_id);
+    std.debug.assert(_catalog.index_table_id ==
         zdb.manifest.index_catalog_table_id);
 }
 
@@ -47,7 +47,7 @@ pub const Column = struct {
     /// loadTableSchema, where the parallel-arrays invariant is asserted.
     pos: usize,
     name: []const u8,
-    ty: value.Type,
+    ty: _value.Type,
     pkey_position: ?u16,
 
     /// The row-key pseudo-column (`egid_column`).
@@ -96,7 +96,7 @@ pub const Table = struct {
     /// The PRIMARY KEY's index — the one on the column with `pkey_position`
     /// set — or null for a table without one.
     primary_index: ?*const Index,
-    ps: schema.PhysicalSchema,
+    ps: _schema.PhysicalSchema,
     version: u16,
     arena: std.heap.ArenaAllocator,
     /// Next egid (row id) to hand out. Maintained on EVERY node by the apply
@@ -124,9 +124,9 @@ pub const Table = struct {
     /// One column's value out of a stored row: the egid from the key,
     /// any other cell by a null-bit test plus one O(1) read
     /// (row.readCell) — no full-row decode.
-    pub fn read(self: *const Table, item: Item, col: *const Column) value.Value {
-        if (col.isEgid()) return .{ .uint8 = key.decodeEgid(item.key.primary).? };
-        return row.readCell(&self.ps, item.value, col.pos);
+    pub fn read(self: *const Table, item: Item, col: *const Column) _value.Value {
+        if (col.isEgid()) return .{ .uint8 = _key.decodeEgid(item.key.primary).? };
+        return _row.readCell(&self.ps, item.value, col.pos);
     }
 };
 
@@ -149,8 +149,8 @@ const CatalogWindow = struct {
             .ns = ns,
             .catalog_tid = catalog_tid,
             .has_upper = owner_id != std.math.maxInt(u32),
-            .left = catalog.encodeKey(owner_id, 0),
-            .right = catalog.encodeKey(owner_id +% 1, 0),
+            .left = _catalog.encodeKey(owner_id, 0),
+            .right = _catalog.encodeKey(owner_id +% 1, 0),
         };
     }
 
@@ -167,20 +167,20 @@ const CatalogWindow = struct {
 
 const LoadCtx = struct {
     a: std.mem.Allocator, // arena
-    catalog_ps: *const schema.PhysicalSchema,
-    all: std.ArrayList(schema.LogicalColumn) = .empty, // every column, live or dropped
-    scratch: value.Row = .{}, // reused across catalog rows
+    catalog_ps: *const _schema.PhysicalSchema,
+    all: std.ArrayList(_schema.LogicalColumn) = .empty, // every column, live or dropped
+    scratch: _value.Row = .{}, // reused across catalog rows
     err: ?anyerror = null,
 
     fn emit(c: *LoadCtx, item: Item) anyerror!bool {
         // Decode all seven catalog cells (column_id order = SELECT *).
         // TODO: How do we know the version of the row, and whether the physical
         // schema corresponds to that version?
-        row.unmarshalRow(c.a, c.catalog_ps, item.value, &.{}, &c.scratch) catch |e| {
+        _row.unmarshalRow(c.a, c.catalog_ps, item.value, &.{}, &c.scratch) catch |e| {
             c.err = e;
             return false;
         };
-        const tc = catalog.decodeColumn(&c.scratch) catch |e| {
+        const tc = _catalog.decodeColumn(&c.scratch) catch |e| {
             c.err = e;
             return false;
         };
@@ -206,8 +206,8 @@ const LoadCtx = struct {
 pub fn loadTableSchema(
     alloc: std.mem.Allocator,
     forest: *Forest,
-    catalog_ps: *const schema.PhysicalSchema,
-    index_catalog_ps: *const schema.PhysicalSchema,
+    catalog_ps: *const _schema.PhysicalSchema,
+    index_catalog_ps: *const _schema.PhysicalSchema,
     ns: u64,
     table_id: u32,
 ) !Table {
@@ -217,7 +217,7 @@ pub fn loadTableSchema(
 
     // Scan the catalog tree for this table's column rows; `win` owns the
     // boundary key bytes, so it lives for the whole synchronous scan below.
-    const win = CatalogWindow.init(ns, catalog.table_id, table_id);
+    const win = CatalogWindow.init(ns, _catalog.table_id, table_id);
     var ctx = LoadCtx{ .a = a, .catalog_ps = catalog_ps };
     // scan uses `alloc` for its own transient arena (freed at scan end); the
     // callback dupes anything it keeps into `a` (the Table's arena).
@@ -228,9 +228,9 @@ pub fn loadTableSchema(
     // Ascending by column_id (the scan already yields this order; sort defends
     // against any future reordering). compile() derives the layout from the
     // full history; reconstruct() derives current_version across all columns.
-    std.mem.sort(schema.LogicalColumn, ctx.all.items, {}, lessByColumnId);
-    const logical = catalog.reconstruct(ctx.all.items);
-    const ps = try schema.compile(a, logical, logical.current_version);
+    std.mem.sort(_schema.LogicalColumn, ctx.all.items, {}, lessByColumnId);
+    const logical = _catalog.reconstruct(ctx.all.items);
+    const ps = try _schema.compile(a, logical, logical.current_version);
 
     // Expose only the columns live at the current version, in ps order:
     // `pos` is the slot in both, asserted here where it is minted.
@@ -282,17 +282,17 @@ pub fn loadTableSchema(
 
 const IndexLoadCtx = struct {
     a: std.mem.Allocator,
-    ips: *const schema.PhysicalSchema,
-    out: std.ArrayList(catalog.IndexDef) = .empty,
-    scratch: value.Row = .{}, // reused across index rows
+    ips: *const _schema.PhysicalSchema,
+    out: std.ArrayList(_catalog.IndexDef) = .empty,
+    scratch: _value.Row = .{}, // reused across index rows
     err: ?anyerror = null,
 
     fn emit(c: *IndexLoadCtx, item: Item) anyerror!bool {
-        row.unmarshalRow(c.a, c.ips, item.value, &.{}, &c.scratch) catch |e| {
+        _row.unmarshalRow(c.a, c.ips, item.value, &.{}, &c.scratch) catch |e| {
             c.err = e;
             return false;
         };
-        const def = catalog.decodeIndex(&c.scratch) catch |e| {
+        const def = _catalog.decodeIndex(&c.scratch) catch |e| {
             c.err = e;
             return false;
         };
@@ -310,14 +310,14 @@ const IndexLoadCtx = struct {
 pub fn loadIndexes(
     alloc: std.mem.Allocator,
     forest: *Forest,
-    index_catalog_ps: *const schema.PhysicalSchema,
+    index_catalog_ps: *const _schema.PhysicalSchema,
     ns: u64,
     base_table_id: u32,
-) ![]catalog.IndexDef {
+) ![]_catalog.IndexDef {
     var ctx = IndexLoadCtx{ .a = alloc, .ips = index_catalog_ps };
     errdefer ctx.out.deinit(alloc);
 
-    const win = CatalogWindow.init(ns, catalog.index_table_id, base_table_id);
+    const win = CatalogWindow.init(ns, _catalog.index_table_id, base_table_id);
     _ = try forest.scan(alloc, win.range(), .{}, &ctx, IndexLoadCtx.emit);
 
     ctx.scratch.deinit(alloc);
@@ -337,7 +337,7 @@ const IndexKeyCtx = struct {
     err: ?anyerror = null,
 
     fn emit(c: *IndexKeyCtx, item: Item) anyerror!bool {
-        const def = catalog.decodeIndexKey(item.key.primary) orelse {
+        const def = _catalog.decodeIndexKey(item.key.primary) orelse {
             c.err = error.CorruptCatalogKey;
             return false;
         };
@@ -380,7 +380,7 @@ pub fn scanIndexKeys(
 ) !IndexScan {
     var ctx = IndexKeyCtx{ .a = alloc, .target = table_id };
     errdefer ctx.table_ids.deinit(alloc);
-    const range = (KeyRange{}).limitToTable(ns, catalog.index_table_id);
+    const range = (KeyRange{}).limitToTable(ns, _catalog.index_table_id);
 
     _ = try forest.scan(alloc, range, .{}, &ctx, IndexKeyCtx.emit);
     if (ctx.err) |e| return e;
@@ -391,6 +391,6 @@ pub fn scanIndexKeys(
     };
 }
 
-fn lessByColumnId(_: void, x: schema.LogicalColumn, y: schema.LogicalColumn) bool {
+fn lessByColumnId(_: void, x: _schema.LogicalColumn, y: _schema.LogicalColumn) bool {
     return x.column_id < y.column_id;
 }

@@ -28,17 +28,17 @@
 //! SQL/pgwire front-end; the engine itself never imports `sql`/`pgwire` —
 //! dependencies point down only (front-ends → engine → zdb/raft).
 
-const engine = @import("engine.zig");
+const _engine = @import("engine.zig");
 
 /// The admin protocol + its front-end server (wire format + the listener).
 pub const admin = @import("admin.zig");
 
 /// The replicated storage engine (forest + raft node + apply + loops).
-pub const Engine = engine.Engine;
-pub const StorageImpl = engine.StorageImpl;
-pub const SnapshotCfg = engine.SnapshotCfg;
-pub const InFlight = engine.InFlight;
-pub const ApplyObserver = engine.ApplyObserver;
+pub const Engine = _engine.Engine;
+pub const StorageImpl = _engine.StorageImpl;
+pub const SnapshotCfg = _engine.SnapshotCfg;
+pub const InFlight = _engine.InFlight;
+pub const ApplyObserver = _engine.ApplyObserver;
 
 /// The admin protocol front-end: a line-protocol listener over an Engine.
 pub const AdminServer = admin.AdminServer;

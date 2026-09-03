@@ -15,8 +15,8 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
-const sigv4 = @import("sigv4.zig");
-const lookahead = @import("lookahead.zig");
+const _sigv4 = @import("sigv4.zig");
+const _lookahead = @import("lookahead.zig");
 
 const log = std.log.scoped(.s3);
 
@@ -25,7 +25,7 @@ const attempts_max = 3; // connect/5xx retries per request
 const pool_cap = 8; // idle keep-alive connections held per store
 const idle_ttl_ms = 30_000; // drop idle conns older than this at checkout
 
-const nowNs = lookahead.nowNs;
+const nowNs = _lookahead.nowNs;
 
 pub const S3Config = struct {
     /// Endpoint URL: `http://host[:port]` or `https://host[:port]`. The
@@ -367,9 +367,9 @@ pub const S3Store = struct {
             try std.fmt.allocPrint(a, "/{s}/{s}", .{ self.bucket, name });
         defer a.free(path);
 
-        const amz = sigv4.AmzDate.fromEpochSeconds(@intCast(@divTrunc(fiber.coarseMs(), 1000)));
-        const payload_hash = sigv4.hashHex(body orelse "");
-        const auth = try sigv4.authorization(
+        const amz = _sigv4.AmzDate.fromEpochSeconds(@intCast(@divTrunc(fiber.coarseMs(), 1000)));
+        const payload_hash = _sigv4.hashHex(body orelse "");
+        const auth = try _sigv4.authorization(
             a,
             self.access_key,
             self.secret_key,
@@ -417,17 +417,17 @@ pub const S3Store = struct {
     /// the object ops) and record it in `lookahead`. Run at startup;
     /// callers treat failure as non-fatal.
     pub fn calibrateLookahead(self: *S3Store, block_size: u64) !u64 {
-        self.lookahead = try lookahead.calibrate(self.a, self, block_size);
+        self.lookahead = try _lookahead.calibrate(self.a, self, block_size);
         return self.lookahead;
     }
 
     /// One timed ranged GET of the calibration probe object — the
     /// measurement primitive behind lookahead.calibrate.
-    pub fn probeRead(self: *S3Store, off: u64, len: u64) !lookahead.Probe {
+    pub fn probeRead(self: *S3Store, off: u64, len: u64) !_lookahead.Probe {
         const conn = try self.getConn(false);
         var ttfb: u64 = 0;
         const t0 = nowNs();
-        var resp = self.requestOnce(conn, "GET", lookahead.probe_object, null, .{ off, len }, true, &ttfb) catch |err| {
+        var resp = self.requestOnce(conn, "GET", _lookahead.probe_object, null, .{ off, len }, true, &ttfb) catch |err| {
             conn.deinit(self.a);
             return err;
         };
@@ -439,7 +439,7 @@ pub const S3Store = struct {
         // we actually received the bytes we timed.
         const body = resp.body orelse return error.MissingBody;
         if (body.len != len) return error.ShortRead;
-        if (!lookahead.verifyProbeData(off, body)) return error.BadProbeData;
+        if (!_lookahead.verifyProbeData(off, body)) return error.BadProbeData;
         return .{ .size = len, .ttfb_ns = ttfb, .total_ns = total };
     }
 };

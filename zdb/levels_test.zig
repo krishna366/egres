@@ -6,19 +6,19 @@ fn noopPersist(_: *anyopaque, _: u64) anyerror!void {}
 const vfs = zdb.vfs;
 
 const Key = zdb.kv.Key;
-const table_mod = zdb.table;
-const Builder = table_mod.builder.Builder;
-const Table = table_mod.Table;
-const TableIterator = table_mod.TableIterator;
+const _table = zdb.table;
+const Builder = _table.builder.Builder;
+const Table = _table.Table;
+const TableIterator = _table.TableIterator;
 
 const manifest = zdb.manifest;
 const createSSTableChange = manifest.createSSTableChange;
 const createTreeChange = manifest.createTreeChange;
 
-const level_mod = zdb.level;
-const Level = level_mod.Level;
-const TableEntry = level_mod.TableEntry;
-const KeyRange = level_mod.KeyRange;
+const _level = zdb.level;
+const Level = _level.Level;
+const TableEntry = _level.TableEntry;
+const KeyRange = _level.KeyRange;
 
 const Tree = zdb.tree.Tree;
 const TableCache = zdb.tree.TableCache;
@@ -42,7 +42,7 @@ fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
 fn buildTable(
     alloc: std.mem.Allocator,
     entries: []const struct { key: []const u8, ts: u64, val: []const u8 },
-) !table_mod.builder.TableBuffer {
+) !_table.builder.TableBuffer {
     var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer b.deinit();
     for (entries) |e| {
@@ -66,7 +66,7 @@ const MetaEntry = struct {
 fn buildTableMeta(
     alloc: std.mem.Allocator,
     entries: []const MetaEntry,
-) !table_mod.builder.TableBuffer {
+) !_table.builder.TableBuffer {
     var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer b.deinit();
     for (entries) |e| {
@@ -84,7 +84,7 @@ fn installTable(
     alloc: std.mem.Allocator,
     ms: *manifest.ForestState,
     dir_path: []const u8,
-    tb: *table_mod.builder.TableBuffer,
+    tb: *_table.builder.TableBuffer,
     id: u64,
     tree_id: u64,
     level: u32,
@@ -117,7 +117,7 @@ fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
 
 /// Opens a heap-allocated Table from a TableBuffer via VFS FileHandle.
 /// Duplicates tb.bytes internally; caller retains ownership of tb.
-fn openTableOwned(alloc: std.mem.Allocator, tb: *table_mod.builder.TableBuffer) !*Table {
+fn openTableOwned(alloc: std.mem.Allocator, tb: *_table.builder.TableBuffer) !*Table {
     return Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
 }
 
@@ -216,7 +216,7 @@ test "levels: overlapping tables L1" {
     };
 
     var tables: [5]*Table = undefined;
-    var tbs: [5]table_mod.builder.TableBuffer = undefined;
+    var tbs: [5]_table.builder.TableBuffer = undefined;
     for (ranges, 0..) |r, i| {
         tbs[i] = try buildTable(alloc, &.{
             .{ .key = r[0], .ts = 0, .val = "v" },

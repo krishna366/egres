@@ -19,15 +19,15 @@
 //! before it lands here.
 
 const std = @import("std");
-const fb = @import("fiber.zig");
-const runtime = @import("runtime.zig");
+const _fb = @import("fiber.zig");
+const _runtime = @import("runtime.zig");
 
 pub fn Group(comptime T: type) type {
     return struct {
         const Self = @This();
 
         alloc: std.mem.Allocator,
-        handles: std.ArrayList(runtime.JoinHandle(T)) = .empty,
+        handles: std.ArrayList(_runtime.JoinHandle(T)) = .empty,
         /// Pre-sized slot per spawn so `wait()` can write without
         /// allocating. Empty when `T == void`.
         results: std.ArrayList(T) = .empty,
@@ -66,19 +66,19 @@ pub fn Group(comptime T: type) type {
         /// Pre-size with `ensureTotalCapacity` if that matters.
         pub fn spawn(
             self: *Self,
-            opts: fb.SpawnOptions,
+            opts: _fb.SpawnOptions,
             comptime func: anytype,
             args: std.meta.ArgsTuple(@TypeOf(func)),
         ) !void {
             comptime {
-                if (fb.ReturnOf(func) != T) {
+                if (_fb.ReturnOf(func) != T) {
                     @compileError(
                         "Group(" ++ @typeName(T) ++ ").spawn: func must return " ++
-                            @typeName(T) ++ ", got " ++ @typeName(fb.ReturnOf(func)),
+                            @typeName(T) ++ ", got " ++ @typeName(_fb.ReturnOf(func)),
                     );
                 }
             }
-            const h = try runtime.spawn(opts, func, args);
+            const h = try _runtime.spawn(opts, func, args);
             try self.handles.append(self.alloc, h);
             if (comptime T != void) try self.results.append(self.alloc, undefined);
         }

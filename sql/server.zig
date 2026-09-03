@@ -15,21 +15,21 @@ const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 const zen = zdb.buffers;
 
-const catalog = @import("catalog.zig");
-const parse = @import("parse.zig");
-const ddl = @import("ddl.zig");
-const dml = @import("dml.zig");
-const row = @import("row.zig");
-const key = @import("key.zig");
-const schema = @import("schema.zig");
-const table = @import("table.zig");
-const txn = @import("txn.zig");
-const value = @import("value.zig");
+const _catalog = @import("catalog.zig");
+const _parse = @import("parse.zig");
+const _ddl = @import("ddl.zig");
+const _dml = @import("dml.zig");
+const _row = @import("row.zig");
+const _key = @import("key.zig");
+const _schema = @import("schema.zig");
+const _table = @import("table.zig");
+const _txn = @import("txn.zig");
+const _value = @import("value.zig");
 const Oracle = @import("oracle.zig").Oracle;
 
 const log = std.log.scoped(.sql);
 
-const String = value.String;
+const String = _value.String;
 
 /// The default database, present from a node's very first boot — created
 /// by the WAL's genesis entry (see egres seedGenesis), never at runtime.
@@ -60,14 +60,14 @@ pub const Database = struct {
     /// table's `next_egid` (mutated on hand-out and on the apply fiber via
     /// applyCommitted). Heap entries so held pointers survive map growth.
     tables_mu: fiber.Mutex(.tracked) = .{},
-    tables: std.AutoHashMap(u32, *table.Table),
+    tables: std.AutoHashMap(u32, *_table.Table),
 
     fn init(allocator: std.mem.Allocator, ns: u64) !Database {
         return .{
             .ns = ns,
             .locks = try fiber.SemaphoreMap.init(allocator),
             .oracle = Oracle.init(allocator),
-            .tables = std.AutoHashMap(u32, *table.Table).init(allocator),
+            .tables = std.AutoHashMap(u32, *_table.Table).init(allocator),
         };
     }
 
@@ -95,7 +95,7 @@ pub const Database = struct {
             defer self.tables_mu.unlock();
             // Items in a run share this namespace; only table_id varies,
             // and consecutive items share a table in practice.
-            var tbl: ?*table.Table = null;
+            var tbl: ?*_table.Table = null;
             var table_id: u32 = 0;
             for (items) |item| {
                 if (tbl == null or item.key.table_id != table_id) {
@@ -103,7 +103,7 @@ pub const Database = struct {
                     tbl = self.tables.get(table_id);
                 }
                 const cached = tbl orelse continue;
-                if (key.decodeEgid(item.key.primary)) |egid| {
+                if (_key.decodeEgid(item.key.primary)) |egid| {
                     if (egid + 1 > cached.next_egid)
                         cached.next_egid = egid + 1;
                 }
@@ -123,10 +123,10 @@ pub const Server = struct {
     /// catalog, that would be circular), so one compile serves all
     /// databases. User tables' schemas live as rows inside each catalog
     /// and get their own per-(table, version) compiles when reads land.
-    catalog_ps: schema.PhysicalSchema,
+    catalog_ps: _schema.PhysicalSchema,
     /// Compiled layout of the INDEX catalog table's rows (table 2), the
     /// same compiled-in schema in every namespace — one compile serves all.
-    index_catalog_ps: schema.PhysicalSchema,
+    index_catalog_ps: _schema.PhysicalSchema,
     /// Serializes DDL: the leader-side name-uniqueness checks in
     /// buildCreateNamespace/buildCreateTable are only sound if one DDL
     /// runs at a time.
@@ -146,8 +146,8 @@ pub const Server = struct {
         return .{
             .engine = eng,
             .listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr),
-            .catalog_ps = try schema.compile(eng.allocator, catalog.logical_schema, catalog.logical_schema.current_version),
-            .index_catalog_ps = try schema.compile(eng.allocator, catalog.index_logical_schema, catalog.index_logical_schema.current_version),
+            .catalog_ps = try _schema.compile(eng.allocator, _catalog.logical_schema, _catalog.logical_schema.current_version),
+            .index_catalog_ps = try _schema.compile(eng.allocator, _catalog.index_logical_schema, _catalog.index_logical_schema.current_version),
             .databases = std.AutoHashMap(u64, *Database).init(eng.allocator),
         };
     }
@@ -228,21 +228,21 @@ pub const Server = struct {
 
     /// The cached Table for `table_id` in `db`, loading + seeding it on
     /// first use. Caller holds `db.tables_mu`.
-    fn openTableLocked(self: *Server, db: *Database, table_id: u32) !*table.Table {
+    fn openTableLocked(self: *Server, db: *Database, table_id: u32) !*_table.Table {
         if (db.tables.get(table_id)) |t| return t;
 
-        var loaded = try table.loadTableSchema(self.engine.allocator, self.engine.forest, &self.catalog_ps, &self.index_catalog_ps, db.ns, table_id);
+        var loaded = try _table.loadTableSchema(self.engine.allocator, self.engine.forest, &self.catalog_ps, &self.index_catalog_ps, db.ns, table_id);
         errdefer loaded.deinit();
         // Seed the egid counter past the table's max applied row id (covers
         // snapshot SSTs the apply observer never saw). Empty table → start at 1.
         if (try self.engine.forest.maxKey(self.engine.allocator, db.ns, table_id)) |mk| {
             defer mk.free(self.engine.allocator);
-            loaded.next_egid = (key.decodeEgid(mk.primary) orelse 0) + 1;
+            loaded.next_egid = (_key.decodeEgid(mk.primary) orelse 0) + 1;
         } else {
             loaded.next_egid = 1;
         }
 
-        const t = try self.engine.allocator.create(table.Table);
+        const t = try self.engine.allocator.create(_table.Table);
         errdefer self.engine.allocator.destroy(t);
         t.* = loaded;
         try db.tables.put(table_id, t);
@@ -250,7 +250,7 @@ pub const Server = struct {
     }
 
     /// The cached Table for (namespace, table_id) — schema for INSERT/SELECT.
-    pub fn openTable(self: *Server, ns: u64, table_id: u32) !*table.Table {
+    pub fn openTable(self: *Server, ns: u64, table_id: u32) !*_table.Table {
         const db = try self.database(ns);
         db.tables_mu.lock(@src());
         defer db.tables_mu.unlock();
@@ -376,7 +376,7 @@ pub const Handler = struct {
     /// re-run the handler without destroying the txn — its locks and
     /// bumped read_ts must survive the retry. Heap — it outlives
     /// individual statements.
-    txn: ?*txn.Txn = null,
+    txn: ?*_txn.Txn = null,
 
     /// Session teardown: roll back any open transaction. Wired as a
     /// defer in handleConn, so it runs on every exit from serve.
@@ -387,7 +387,7 @@ pub const Handler = struct {
         }
     }
 
-    pub fn destroyTxn(self: *Handler, t: *txn.Txn) void {
+    pub fn destroyTxn(self: *Handler, t: *_txn.Txn) void {
         t.deinit();
         self.srv.engine.allocator.destroy(t);
     }
@@ -454,7 +454,7 @@ pub const Handler = struct {
         // borrowed statement alike — when this scope ends.
         var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
         defer arena.deinit();
-        const stmt = parse.statement(arena.allocator(), sql_text) catch {
+        const stmt = _parse.statement(arena.allocator(), sql_text) catch {
             try state.sendError(.{
                 .code = pgwire.sqlstate.syntax_error,
                 .message = "syntax error",
@@ -487,12 +487,12 @@ pub const Handler = struct {
         }
 
         switch (stmt) {
-            .create_database => |name| try ddl.createDatabase(self, state, name),
-            .drop_database => |name| try ddl.dropDatabase(self, state, name),
-            .create_table => |ct| try ddl.createTable(self, state, ct),
-            .drop_table => |dt| try ddl.dropTable(self, state, dt),
-            .create_index => |ci| try ddl.createIndex(self, state, ci),
-            .drop_index => |di| try ddl.dropIndex(self, state, di),
+            .create_database => |name| try _ddl.createDatabase(self, state, name),
+            .drop_database => |name| try _ddl.dropDatabase(self, state, name),
+            .create_table => |ct| try _ddl.createTable(self, state, ct),
+            .drop_table => |dt| try _ddl.dropTable(self, state, dt),
+            .create_index => |ci| try _ddl.createIndex(self, state, ci),
+            .drop_index => |di| try _ddl.dropIndex(self, state, di),
             .insert, .select, .delete, .update => try self.runDml(state, stmt),
             .begin_txn => try self.beginTxn(state),
             .commit_txn => try self.endTxn(state, true),
@@ -510,7 +510,7 @@ pub const Handler = struct {
     /// implicit txn (if this statement created one) ends here, after
     /// the handler committed it — which keeps its locks held until the
     /// commit has applied.
-    fn runDml(self: *Handler, state: *pgwire.ConnState, stmt: parse.Stmt) !void {
+    fn runDml(self: *Handler, state: *pgwire.ConnState, stmt: _parse.Stmt) !void {
         // A write can only commit on the leader — reject it up front
         // rather than scanning, locking, and failing at propose. Reads
         // run on any node (newTxn sets read_ts best-effort), but FOR
@@ -533,10 +533,10 @@ pub const Handler = struct {
         var attempts: u32 = 0;
         while (true) {
             const result = switch (stmt) {
-                .insert => |ins| dml.insert(self, state, ins),
-                .select => |sel| dml.select(self, state, sel),
-                .delete => |del| dml.delete(self, state, del),
-                .update => |up| dml.update(self, state, up),
+                .insert => |ins| _dml.insert(self, state, ins),
+                .select => |sel| _dml.select(self, state, sel),
+                .delete => |del| _dml.delete(self, state, del),
+                .update => |up| _dml.update(self, state, up),
                 else => unreachable,
             };
             result catch |err| {
@@ -563,7 +563,7 @@ pub const Handler = struct {
         self.endImplicit();
     }
 
-    pub fn newTxn(self: *Handler, ns: u64) !*txn.Txn {
+    pub fn newTxn(self: *Handler, ns: u64) !*_txn.Txn {
         const eng = self.srv.engine;
         // Best-effort catch-up: a leader waits out its committed tail
         // (once per term) so read_ts covers it; a non-leader keeps what
@@ -573,9 +573,9 @@ pub const Handler = struct {
         // the two lands in this database's now-existing oracle, so a
         // conflict newer than our snapshot can never go unrecorded.
         const db = try self.srv.database(ns);
-        const t = try eng.allocator.create(txn.Txn);
+        const t = try eng.allocator.create(_txn.Txn);
         errdefer eng.allocator.destroy(t);
-        t.* = txn.Txn.init(
+        t.* = _txn.Txn.init(
             eng.allocator,
             self.srv.next_txn_id.fetchAdd(1, .monotonic),
             ns,
@@ -591,7 +591,7 @@ pub const Handler = struct {
     /// The transaction a DML statement runs in: the open interactive
     /// block, or a fresh implicit txn (implicit=true) the statement itself
     /// commits.
-    pub fn statementTxn(self: *Handler, ns: u64) !*txn.Txn {
+    pub fn statementTxn(self: *Handler, ns: u64) !*_txn.Txn {
         // The open block's txn — or, on a restart re-entry, the
         // statement's own implicit txn (locks + bumped read_ts intact).
         if (self.txn) |t| return t;
@@ -614,7 +614,7 @@ pub const Handler = struct {
         state: *pgwire.ConnState,
         ns: u64,
         table_id: u32,
-    ) !?*txn.Txn {
+    ) !?*_txn.Txn {
         const tx = try self.statementTxn(ns);
         tx.lockNamespace(.shared) catch |err| {
             try replyLockErr(state, err);
@@ -689,7 +689,7 @@ pub const Handler = struct {
     /// write set → nothing to propose. `error.LeaderChanged` if the term
     /// moved since begin: another leader may have committed writes our
     /// locked reads never saw, so the write set must not be proposed.
-    pub fn commitTxn(self: *Handler, a: std.mem.Allocator, tx: *txn.Txn) !void {
+    pub fn commitTxn(self: *Handler, a: std.mem.Allocator, tx: *_txn.Txn) !void {
         const kvs = try tx.wireKvs(a);
         if (kvs.len == 0) return;
         const node = self.srv.engine.node;
@@ -705,7 +705,7 @@ pub const Handler = struct {
         self: *Handler,
         state: *pgwire.ConnState,
         a: std.mem.Allocator,
-        tx: *txn.Txn,
+        tx: *_txn.Txn,
         comptime verb: []const u8,
         table_name: []const u8,
     ) !bool {

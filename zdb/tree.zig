@@ -1,29 +1,29 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
-const config = @import("config.zig");
-const manifest = @import("manifest.zig");
-const level_handler = @import("level.zig");
-const table_mod = @import("table.zig");
+const _config = @import("config.zig");
+const _manifest = @import("manifest.zig");
+const _level_handler = @import("level.zig");
+const _table = @import("table.zig");
 const vfs = @import("vfs");
-const metrics = @import("metrics.zig");
-const fi = @import("file_ids.zig");
+const _metrics = @import("metrics.zig");
+const _fi = @import("file_ids.zig");
 const DeltaReader = @import("buffers.gen.zig").RoaringDeltaReader;
 const zroar = @import("zroar");
 
-const Table = table_mod.Table;
-const TableIterator = table_mod.TableIterator;
-const Item = table_mod.table.Item;
-const Level = level_handler.Level;
-const TableEntry = level_handler.TableEntry;
+const Table = _table.Table;
+const TableIterator = _table.TableIterator;
+const Item = _table.table.Item;
+const Level = _level_handler.Level;
+const TableEntry = _level_handler.TableEntry;
 const Key = @import("kv.zig").Key;
 const Meta = @import("kv.zig").Meta;
-const KeyRange = level_handler.KeyRange;
-const MergeIterator = table_mod.merge_iterator.MergeIterator;
-const Pin = table_mod.merge_iterator.Pin;
-const ConcatIterator = table_mod.merge_iterator.ConcatIterator;
-const Iterator = table_mod.merge_iterator.Iterator;
-const Builder = table_mod.builder.Builder;
+const KeyRange = _level_handler.KeyRange;
+const MergeIterator = _table.merge_iterator.MergeIterator;
+const Pin = _table.merge_iterator.Pin;
+const ConcatIterator = _table.merge_iterator.ConcatIterator;
+const Iterator = _table.merge_iterator.Iterator;
+const Builder = _table.builder.Builder;
 
 const log = std.log.scoped(.zdb_tree);
 
@@ -595,7 +595,7 @@ pub const TableCache = struct {
         // Phase B: open the SST file WITHOUT holding the lock.
         // Table.open may yield the fiber (async I/O); holding the lock here
         // would deadlock cooperative fibers on the same OS thread (EDEADLK).
-        const path = fi.sstPath(self.allocator, self.dir, need.id) catch |err| {
+        const path = _fi.sstPath(self.allocator, self.dir, need.id) catch |err| {
             tse.set(err);
             return;
         };
@@ -658,10 +658,10 @@ pub const split_priority_score: f64 = 100.0;
 
 pub const Tree = struct {
     allocator: std.mem.Allocator,
-    opts: config.Config,
+    opts: _config.Config,
     namespace: u64,
     tree_id: u64,
-    ms: *manifest.ForestState,
+    ms: *_manifest.ForestState,
     cache: *TableCache,
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
@@ -670,7 +670,7 @@ pub const Tree = struct {
     /// open builds a Tree from an existing manifest state.
     /// Tables are loaded via cache, which opens SST files concurrently for misses
     /// and reuses already-open *Table objects for cache hits.
-    pub fn open(allocator: std.mem.Allocator, opts: config.Config, namespace: u64, tree_id: u64, ms: *manifest.ForestState, cache: *TableCache) !Tree {
+    pub fn open(allocator: std.mem.Allocator, opts: _config.Config, namespace: u64, tree_id: u64, ms: *_manifest.ForestState, cache: *TableCache) !Tree {
         const levels = try allocator.alloc(Level, opts.max_levels);
         errdefer allocator.free(levels);
         for (levels, 0..) |*l, i| {
@@ -1131,7 +1131,7 @@ pub const Tree = struct {
     /// doCompact runs the full compaction pipeline: buildCompaction (Phase A)
     /// then applyCompaction (Phase B). For Raft integration, callers can use
     /// buildCompaction and applyCompaction separately.
-    pub fn doCompact(self: *Tree, src_level: u8, file_ids: *fi.FileIds, global_min_read: u64) !void {
+    pub fn doCompact(self: *Tree, src_level: u8, file_ids: *_fi.FileIds, global_min_read: u64) !void {
         var changes = try self.buildCompaction(src_level, file_ids, global_min_read);
         defer changes.deinit(self.allocator);
         try self.applyCompaction(changes.items);
@@ -1171,7 +1171,7 @@ pub const Tree = struct {
         tree: *Tree,
         bld: *Builder,
         group: *fiber.Group(?FlushResult),
-        file_ids: *fi.FileIds,
+        file_ids: *_fi.FileIds,
         stats: *Metrics,
         file_sz: usize,
         dest: usize,
@@ -1182,7 +1182,7 @@ pub const Tree = struct {
             tree: *Tree,
             bld: *Builder,
             group: *fiber.Group(?FlushResult),
-            file_ids: *fi.FileIds,
+            file_ids: *_fi.FileIds,
             stats: *Metrics,
             file_sz: usize,
             dest: usize,
@@ -1269,7 +1269,7 @@ pub const Tree = struct {
     /// `global_min_read` is the oldest timestamp a reader may still ask for
     /// (`Forest.global_min_read`); anything strictly below it is unobservable
     /// and eligible to be discarded. Pass 0 to discard nothing.
-    pub fn buildCompaction(self: *Tree, src_level: u8, file_ids: *fi.FileIds, global_min_read: u64) !std.ArrayList(manifest.SSTableChange) {
+    pub fn buildCompaction(self: *Tree, src_level: u8, file_ids: *_fi.FileIds, global_min_read: u64) !std.ArrayList(_manifest.SSTableChange) {
         const src: usize = src_level;
         const prio: vfs.Priority = if (src_level == 0) .p1 else .p2;
 
@@ -1377,7 +1377,7 @@ pub const Tree = struct {
         defer output_file_ids.deinit(self.allocator);
 
         // --- merge loop ---
-        const cfg = table_mod.builder.Config{
+        const cfg = _table.builder.Config{
             .target_block_size = self.opts.block_size,
             .codec = self.opts.compression,
             .priority = prio,
@@ -1447,7 +1447,7 @@ pub const Tree = struct {
             },
         );
         if (stats.rollups > 0) {
-            try metrics.g().rollups.incrBy(.{
+            try _metrics.g().rollups.incrBy(.{
                 .namespace_id = self.namespace,
                 .tree_id = self.tree_id,
                 .level = @intCast(dest),
@@ -1468,21 +1468,21 @@ pub const Tree = struct {
         }
 
         // --- build manifest changes ---
-        var changes = try std.ArrayList(manifest.SSTableChange).initCapacity(
+        var changes = try std.ArrayList(_manifest.SSTableChange).initCapacity(
             self.allocator,
             src_entries_slice.len + bot_entries_slice.len + output_file_ids.items.len,
         );
 
         for (src_entries_slice) |e| try changes.append(
             self.allocator,
-            manifest.deleteSSTableChange(e.id, self.namespace, self.tree_id, @intCast(src)),
+            _manifest.deleteSSTableChange(e.id, self.namespace, self.tree_id, @intCast(src)),
         );
         for (bot_entries_slice) |e| try changes.append(
             self.allocator,
-            manifest.deleteSSTableChange(e.id, self.namespace, self.tree_id, @intCast(dest)),
+            _manifest.deleteSSTableChange(e.id, self.namespace, self.tree_id, @intCast(dest)),
         );
         for (output_file_ids.items) |fid| {
-            try changes.append(self.allocator, manifest.createSSTableChange(fid, self.namespace, self.tree_id, @intCast(dest))); // usize → u32
+            try changes.append(self.allocator, _manifest.createSSTableChange(fid, self.namespace, self.tree_id, @intCast(dest))); // usize → u32
         }
 
         return changes;
@@ -1630,7 +1630,7 @@ pub const Tree = struct {
     /// applyCompaction is Phase B: commits the manifest changes and updates the
     /// in-memory levels by opening tables from the SST directory.
     /// Called after Raft commit on all nodes (leader and followers).
-    pub fn applyCompaction(self: *Tree, changes: []const manifest.SSTableChange) !void {
+    pub fn applyCompaction(self: *Tree, changes: []const _manifest.SSTableChange) !void {
         if (changes.len == 0) return;
 
         // Commit to manifest (durable) before touching the levels.
@@ -1669,12 +1669,12 @@ pub const Tree = struct {
         // Metrics: one compaction run, plus bytes written to the dest level.
         const ns_id = self.namespace;
         if (dest_level) |lvl| {
-            try metrics.g().compactions.incr(.{
+            try _metrics.g().compactions.incr(.{
                 .namespace_id = ns_id,
                 .tree_id = self.tree_id,
                 .level = lvl,
             });
-            try metrics.g().bytes_written.incrBy(.{
+            try _metrics.g().bytes_written.incrBy(.{
                 .source = "compact",
                 .namespace_id = ns_id,
                 .tree_id = self.tree_id,
@@ -1696,7 +1696,7 @@ pub const Tree = struct {
     /// node skips (or installs) identically; the DDL session verifies
     /// via Forest.bottomTableCount after the apply and fails CREATE
     /// INDEX loudly on a skip.
-    pub fn applyBackfill(self: *Tree, changes: []const manifest.SSTableChange) !void {
+    pub fn applyBackfill(self: *Tree, changes: []const _manifest.SSTableChange) !void {
         if (changes.len == 0) return;
         const bottom: u32 = @intCast(self.opts.max_levels - 1);
         for (changes) |c| {
@@ -1721,14 +1721,14 @@ pub const Tree = struct {
         self: *Tree,
         bld: *Builder,
         group: *fiber.Group(?FlushResult),
-        file_ids: *fi.FileIds,
+        file_ids: *_fi.FileIds,
     ) !void {
         var tb = try bld.finish();
         defer tb.deinit();
         if (tb.bytes.len == 0) return;
 
         const id = try file_ids.allocate();
-        const path = try fi.sstPath(self.allocator, self.opts.dir, id);
+        const path = try _fi.sstPath(self.allocator, self.opts.dir, id);
         errdefer self.allocator.free(path);
 
         const wh = try vfs.g().createFile(path, .{ .mode = .direct });

@@ -1,11 +1,11 @@
 const std = @import("std");
 const Key = @import("../kv.zig").Key;
 const Item = @import("../kv.zig").Item;
-const idx = @import("index.zig");
-const buffers = @import("../buffers.gen.zig");
+const _idx = @import("index.zig");
+const _buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
 const compress = utils.compression;
-const binaryfuse = @import("../binaryfusefilter.zig");
+const _binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
 
@@ -85,7 +85,7 @@ pub const Error = error{
     ValueTooLarge,
     TooManyBlocks,
     IntegerOverflow,
-} || buffers.Error || compress.Error || std.mem.Allocator.Error || binaryfuse.Error;
+} || _buffers.Error || compress.Error || std.mem.Allocator.Error || _binaryfuse.Error;
 
 pub const Config = struct {
     target_block_size: usize = 32 * 1024,
@@ -314,14 +314,14 @@ pub const Builder = struct {
         defer index_bytes.deinit(self.allocator);
 
         // Build index bytes in a separate buffer, then append to table tail.
-        var index_writer = try buffers.TableIndexWriter.initWithBuf(self.allocator, &index_bytes);
+        var index_writer = try _buffers.TableIndexWriter.initWithBuf(self.allocator, &index_bytes);
 
         var block_offsets = try self.allocator.alloc(u32, self.block_infos.items.len);
         defer self.allocator.free(block_offsets);
 
         for (self.block_infos.items, 0..) |info, i| {
             // BlockIndex records each block's base key and byte range in table bytes.
-            var block_writer = try buffers.BlockIndexWriter.initWithBuf(
+            var block_writer = try _buffers.BlockIndexWriter.initWithBuf(
                 self.allocator,
                 &index_bytes,
             );
@@ -336,7 +336,7 @@ pub const Builder = struct {
 
         var binary_fuse_off: ?u32 = null;
         if (self.bf_hashes.items.len > 0) {
-            var filter = try binaryfuse.BinaryFuse(u16).init(self.allocator, self.bf_hashes.items.len);
+            var filter = try _binaryfuse.BinaryFuse(u16).init(self.allocator, self.bf_hashes.items.len);
             defer filter.deinit(self.allocator);
             filter.populate(self.allocator, self.bf_hashes.items) catch |err| {
                 // Diagnose before failing the build: count duplicates in
@@ -392,7 +392,7 @@ pub const Builder = struct {
                 std.debug.panic("binary fuse populate failed with {d} unique hashes; see {s}", .{ self.bf_hashes.items.len, path });
             };
 
-            var bf_writer = try buffers.BinaryFuseFilterWriter.initWithBuf(self.allocator, &index_bytes);
+            var bf_writer = try _buffers.BinaryFuseFilterWriter.initWithBuf(self.allocator, &index_bytes);
             try bf_writer.set(.{
                 .seed = filter.seed,
                 .segment_length = filter.segment_length,
@@ -413,7 +413,7 @@ pub const Builder = struct {
             .uncompressed_size = self.uncompressed_size,
             .compressed_size = self.compressed_size,
             .stale_data_size = self.stale_data_size,
-            .format_version = idx.format_version,
+            .format_version = _idx.format_version,
         });
         try index_writer.setCompression(@enumFromInt(@intFromEnum(self.cfg.codec)));
         if (binary_fuse_off) |off| {
@@ -432,7 +432,7 @@ pub const Builder = struct {
         // Page-aligned files dodge any O_DIRECT / iomap edge case where an
         // unaligned-tail write could be silently dropped on some kernels;
         // the cost is at most page_size-1 zero bytes per SST.
-        const tail_size = index_bytes.items.len + idx.trailer_len;
+        const tail_size = index_bytes.items.len + _idx.trailer_len;
         const total_unpadded = self.table_bytes.items.len + tail_size;
         const remainder = total_unpadded % vfs.page_size;
         const pad_bytes = if (remainder == 0) 0 else vfs.page_size - remainder;
@@ -445,7 +445,7 @@ pub const Builder = struct {
         // The reader seeks by idx.trailer_len, so what we wrote has to be
         // exactly that wide — the padding above was sized on it too.
         std.debug.assert(self.table_bytes.items.len - trailer_at ==
-            idx.trailer_len);
+            _idx.trailer_len);
 
         std.debug.assert(self.table_bytes.items.len % vfs.page_size == 0);
 

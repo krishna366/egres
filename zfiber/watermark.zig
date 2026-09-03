@@ -16,12 +16,12 @@
 //! arriving in the sl.unlock → park gap.
 
 const std = @import("std");
-const fb = @import("fiber.zig");
-const rt = @import("runtime.zig");
-const dd = @import("deadlines.zig");
+const _fb = @import("fiber.zig");
+const _rt = @import("runtime.zig");
+const _dd = @import("deadlines.zig");
 
-const Fiber = fb.Fiber;
-const Spinlock = rt.Spinlock;
+const Fiber = _fb.Fiber;
+const Spinlock = _rt.Spinlock;
 const Allocator = std.mem.Allocator;
 
 const Entry = struct {
@@ -110,12 +110,12 @@ pub const Watermark = struct {
         if (self.value.load(.acquire) >= target) return;
         if (self.closed.load(.acquire)) return error.Closed;
 
-        const me = rt.currentFiber();
+        const me = _rt.currentFiber();
 
         // `armSelf` captures the owning `Deadlines` so `disarmSelf` hits the
         // same one even after a work-stealing migration.
-        const owner: ?*dd.Deadlines = if (timeout_ms) |ms| try dd.armSelf(me, ms) else null;
-        defer if (owner) |o| dd.disarmSelf(me, o);
+        const owner: ?*_dd.Deadlines = if (timeout_ms) |ms| try _dd.armSelf(me, ms) else null;
+        defer if (owner) |o| _dd.disarmSelf(me, o);
 
         if (timeout_ms == null) {
             me.timeout.reset();
@@ -151,7 +151,7 @@ pub const Watermark = struct {
             self.sl.unlock();
         };
 
-        rt.park();
+        _rt.park();
 
         // Resumed — exactly one waker condition must hold (see the doc comment).
         // Prefer a satisfied/closed result over Timeout if both landed.
@@ -214,7 +214,7 @@ pub const Watermark = struct {
         while (to_wake) |f| {
             const next = f.waker_next;
             f.waker_next = null;
-            rt.wake(f);
+            _rt.wake(f);
             to_wake = next;
         }
     }
@@ -245,7 +245,7 @@ pub const Watermark = struct {
         while (to_wake) |f| {
             const next = f.waker_next;
             f.waker_next = null;
-            rt.wake(f);
+            _rt.wake(f);
             to_wake = next;
         }
     }

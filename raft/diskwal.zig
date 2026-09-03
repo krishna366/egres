@@ -1,12 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const raftlog = @import("raftwal.zig");
+const _raftlog = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
-const vfs_mod = @import("vfs");
+const _vfs = @import("vfs");
 const fiber = @import("zfiber");
 const utils = @import("utils");
-const meta = @import("meta.zig");
+const _meta = @import("meta.zig");
 
 // DiskWAL handles disk access and writes for the Raft write-ahead log.
 // Directory layout contains `wal.meta` and `<start-idx>.wal` segment files.
@@ -78,7 +78,7 @@ pub const Error = error{
 
 pub const err_not_found = error{NotFound};
 
-pub const EntryType = raftlog.EntryType;
+pub const EntryType = _raftlog.EntryType;
 
 /// In-memory slot entry. Same shape as the on-disk zbuf format
 /// (`zen.WalSlotStruct`) so we can read the disk slot directly with no
@@ -88,7 +88,7 @@ pub const entry = zen.WalSlotStruct;
 
 pub const logFile = struct {
     fid: u64,
-    handle: vfs_mod.FileHandle,
+    handle: _vfs.FileHandle,
     allocator: std.mem.Allocator,
     slots: std.ArrayList(entry), // each slots[i] is a real data entry
     write_offset: u64, // next write position (meaningful for current file)
@@ -108,7 +108,7 @@ pub const logFile = struct {
     /// record). Caller owns the returned list.
     pub fn readHeader(
         alloc: std.mem.Allocator,
-        handle: vfs_mod.FileHandle,
+        handle: _vfs.FileHandle,
     ) !std.ArrayList(entry) {
         // Read the entire 1 MiB header region in one shot.
         const hdr_result = try handle.readAligned(alloc, 0, log_file_offset, .p0);
@@ -138,7 +138,7 @@ pub const logFile = struct {
 
     /// Open a rotated <fid>.wal file. Reads header to populate in-memory slots.
     pub fn openRotated(
-        vfs_inst: *const vfs_mod.VFS,
+        vfs_inst: *const _vfs.VFS,
         alloc: std.mem.Allocator,
         dir_path: []const u8,
         fid: u64,
@@ -177,7 +177,7 @@ pub const logFile = struct {
     /// CRC-framed records. Reads the entire payload region in one read, then
     /// scans in-memory.
     pub fn openCurrent(
-        vfs_inst: *const vfs_mod.VFS,
+        vfs_inst: *const _vfs.VFS,
         alloc: std.mem.Allocator,
         dir_path: []const u8,
         fid: u64,
@@ -262,7 +262,7 @@ pub const logFile = struct {
     /// header parses cleanly via openRotated; the wal layer derives the
     /// first append's index from the previous file's lastEntry.
     pub fn createCurrent(
-        vfs_inst: *const vfs_mod.VFS,
+        vfs_inst: *const _vfs.VFS,
         alloc: std.mem.Allocator,
         dir_path: []const u8,
         fid: u64,
@@ -468,7 +468,7 @@ pub const logFile = struct {
 /// going through `DiskWAL` is unsafe under concurrency.
 pub const wal = struct {
     allocator: std.mem.Allocator,
-    vfs_inst: *const vfs_mod.VFS,
+    vfs_inst: *const _vfs.VFS,
     dir_path: []u8,
     files: std.ArrayList(logFile), // all files; last is current
     current: *logFile, // points to files.items[files.items.len - 1]
@@ -509,7 +509,7 @@ pub const wal = struct {
     fn deleteFileByName(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8) void {
         const path = logFile.fullPath(alloc, dir_path, name) catch return;
         defer alloc.free(path);
-        vfs_mod.deleteFile(path) catch {};
+        _vfs.deleteFile(path) catch {};
     }
 
     fn deleteFileByFid(self: *wal, fid: u64) void {
@@ -531,7 +531,7 @@ pub const wal = struct {
         alloc: std.mem.Allocator,
         cache_capacity: usize,
     ) !wal {
-        const vfs_inst = vfs_mod.g();
+        const vfs_inst = _vfs.g();
         const io = utils.context.g().io;
         const cwd = std.Io.Dir.cwd();
         cwd.access(io, path, .{}) catch |err| switch (err) {
@@ -714,22 +714,22 @@ pub const wal = struct {
         return .{ .file_idx = lo, .slot_idx = self.files.items[lo].slotGe(raft_index) };
     }
 
-    fn seekEntry(self: *wal, raft_index: u64) (Error || raftlog.RaftLogError || err_not_found)!entry {
+    fn seekEntry(self: *wal, raft_index: u64) (Error || _raftlog.RaftLogError || err_not_found)!entry {
         if (raft_index == 0) {
             return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .entry_type = .any };
         }
 
         const pos = self.slotGe(raft_index);
-        const slot_idx = pos.slot_idx orelse return raftlog.RaftLogError.Compacted;
-        if (slot_idx >= max_num_entries) return raftlog.RaftLogError.Unavailable;
+        const slot_idx = pos.slot_idx orelse return _raftlog.RaftLogError.Compacted;
+        if (slot_idx >= max_num_entries) return _raftlog.RaftLogError.Unavailable;
 
-        const lf = self.getEntryFile(pos.file_idx) orelse return raftlog.RaftLogError.Unavailable;
-        const ent = lf.getEntry(slot_idx) orelse return raftlog.RaftLogError.Unavailable;
+        const lf = self.getEntryFile(pos.file_idx) orelse return _raftlog.RaftLogError.Unavailable;
+        const ent = lf.getEntry(slot_idx) orelse return _raftlog.RaftLogError.Unavailable;
         if (ent.index != raft_index) return err_not_found.NotFound;
         return ent;
     }
 
-    pub fn term(self: *wal, idx: u64) (Error || raftlog.RaftLogError || err_not_found)!u64 {
+    pub fn term(self: *wal, idx: u64) (Error || _raftlog.RaftLogError || err_not_found)!u64 {
         const ent = try self.seekEntry(idx);
         return ent.term;
     }
@@ -751,7 +751,7 @@ pub const wal = struct {
         self: *wal,
         lf: *const logFile,
         start: usize,
-        opts: raftlog.EntriesRangeOpts,
+        opts: _raftlog.EntriesRangeOpts,
         bytes_so_far: u64,
     ) ReadPlan {
         var plan = ReadPlan{
@@ -809,13 +809,13 @@ pub const wal = struct {
     pub fn allEntries(
         self: *wal,
         parent_alloc: std.mem.Allocator,
-        opts: raftlog.EntriesRangeOpts,
-    ) !raftlog.EntriesResult {
+        opts: _raftlog.EntriesRangeOpts,
+    ) !_raftlog.EntriesResult {
         var arena = std.heap.ArenaAllocator.init(parent_alloc);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var out = std.ArrayList(raftlog.StoredEntry).empty;
+        var out = std.ArrayList(_raftlog.StoredEntry).empty;
         var eof = true;
 
         const pos = self.slotGe(opts.lo);
@@ -859,7 +859,7 @@ pub const wal = struct {
             }
 
             // Resolve cache/bulk hits and collect disk read requests in one pass.
-            var requests = std.ArrayList(vfs_mod.FileHandle.ReadRequest).empty;
+            var requests = std.ArrayList(_vfs.FileHandle.ReadRequest).empty;
             for (plan.scan_start..plan.scan_end) |si| {
                 const ent = lf.getEntry(si) orelse continue;
                 if (opts.ty != .any and ent.entry_type != opts.ty) continue;
@@ -908,7 +908,7 @@ pub const wal = struct {
             if (requests.items.len > 0) {
                 try lf.handle.batchRead(&arena, requests.items, .p0);
                 for (requests.items) |req| {
-                    const se: *raftlog.StoredEntry = @ptrCast(@alignCast(req.ctx.?));
+                    const se: *_raftlog.StoredEntry = @ptrCast(@alignCast(req.ctx.?));
                     se.bytes = try zbuf.Frame.read(req.data);
                 }
             }
@@ -947,7 +947,7 @@ pub const wal = struct {
         self.next_fid += 1;
     }
 
-    pub fn addEntries(self: *wal, entries: []const raftlog.LogEntryBuffer) !void {
+    pub fn addEntries(self: *wal, entries: []const _raftlog.LogEntryBuffer) !void {
         if (entries.len == 0) return;
 
         // If the leader is overwriting conflicting suffix entries,
@@ -962,7 +962,7 @@ pub const wal = struct {
         // The next expected index is one past the last entry seen in any
         // file; for an empty WAL it's 1 (start of log).
         const expected_first: u64 = if (self.lastSlot()) |s| s.index + 1 else 1;
-        if (first_index != expected_first) return raftlog.RaftLogError.Invalid;
+        if (first_index != expected_first) return _raftlog.RaftLogError.Invalid;
 
         // Append into self.write_buf — the actual pwrite is deferred to
         // sync(). Cache + slot table get updated immediately so reads see
@@ -970,10 +970,10 @@ pub const wal = struct {
         var expected_index = first_index;
         for (entries) |entry_buf| {
             const reader = try entry_buf.initReader();
-            if (reader.index() != expected_index) return raftlog.RaftLogError.Invalid;
+            if (reader.index() != expected_index) return _raftlog.RaftLogError.Invalid;
             expected_index += 1;
 
-            const bytes = entry_buf.bytes orelse return raftlog.RaftLogError.Invalid;
+            const bytes = entry_buf.bytes orelse return _raftlog.RaftLogError.Invalid;
             if (self.current.firstEmptySlot() >= max_num_entries or
                 self.current.write_offset + zbuf.Frame.hdr_size + bytes.len > log_file_size)
             {
@@ -1124,7 +1124,7 @@ pub const DiskWAL = struct {
     allocator: std.mem.Allocator,
     /// MetaStore owns the in-memory authoritative HardState + Snapshot, so
     /// the old `hard_state_cache` + `snapshot_cache` pointers go away.
-    meta: meta.MetaStore,
+    meta: _meta.MetaStore,
     wal_store: wal,
     /// Single rwlock guarding all DiskWAL state — covers both `meta` and
     /// `wal_store` since the public API (hardState/snapshot/append/...)
@@ -1136,7 +1136,7 @@ pub const DiskWAL = struct {
         allocator: std.mem.Allocator,
         cache_capacity: usize,
     ) !DiskWAL {
-        var ms = try meta.MetaStore.openPath(path, allocator);
+        var ms = try _meta.MetaStore.openPath(path, allocator);
         errdefer ms.deinit();
 
         var wf = try wal.openPath(path, allocator, cache_capacity);
@@ -1167,15 +1167,15 @@ pub const DiskWAL = struct {
         self.mu.deinit();
     }
 
-    fn mapToRaftLogError(err: anyerror) raftlog.RaftLogError {
+    fn mapToRaftLogError(err: anyerror) _raftlog.RaftLogError {
         return switch (err) {
-            raftlog.RaftLogError.Compacted => raftlog.RaftLogError.Compacted,
-            raftlog.RaftLogError.Unavailable => raftlog.RaftLogError.Unavailable,
-            err_not_found.NotFound => raftlog.RaftLogError.Unavailable,
+            _raftlog.RaftLogError.Compacted => _raftlog.RaftLogError.Compacted,
+            _raftlog.RaftLogError.Unavailable => _raftlog.RaftLogError.Unavailable,
+            err_not_found.NotFound => _raftlog.RaftLogError.Unavailable,
             error.OutOfMemory => error.OutOfMemory,
             else => {
                 std.log.err("mapToRaftLogError: unmapped error: {}", .{err});
-                return raftlog.RaftLogError.Unavailable;
+                return _raftlog.RaftLogError.Unavailable;
             },
         };
     }
@@ -1185,7 +1185,7 @@ pub const DiskWAL = struct {
     // writes, _uncancelable for cheap struct-field reads where blocking
     // on cancellation isn't useful).
 
-    pub fn hardState(self: *DiskWAL) *const raftlog.HardState {
+    pub fn hardState(self: *DiskWAL) *const _raftlog.HardState {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.meta.hardState();
@@ -1196,7 +1196,7 @@ pub const DiskWAL = struct {
     /// every other DiskWAL writer, so concurrent calls (e.g. raft
     /// mainLoop persisting term/vote, commitPersistLoop persisting
     /// commit_index) can't race-clobber each other's fields.
-    pub fn setHardState(self: *DiskWAL, update: raftlog.HardStateUpdate) raftlog.RaftLogError!void {
+    pub fn setHardState(self: *DiskWAL, update: _raftlog.HardStateUpdate) _raftlog.RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         var next = self.meta.hardState().*;
@@ -1218,13 +1218,13 @@ pub const DiskWAL = struct {
         try self.setHardState(.{ .max_file_id = new_max });
     }
 
-    pub fn snapshot(self: *DiskWAL) *const raftlog.Snapshot {
+    pub fn snapshot(self: *DiskWAL) *const _raftlog.Snapshot {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.meta.snapshotState();
     }
 
-    pub fn setSnapshot(self: *DiskWAL, snap: raftlog.Snapshot) raftlog.RaftLogError!void {
+    pub fn setSnapshot(self: *DiskWAL, snap: _raftlog.Snapshot) _raftlog.RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         self.meta.setSnapshot(snap) catch |err| return mapToRaftLogError(err);
@@ -1295,19 +1295,19 @@ pub const DiskWAL = struct {
         return self.wal_store.term(last_idx) catch snap_term;
     }
 
-    pub fn term(self: *DiskWAL, idx: u64) raftlog.RaftLogError!?u64 {
+    pub fn term(self: *DiskWAL, idx: u64) _raftlog.RaftLogError!?u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         if (idx == 0) return 0;
         return self.wal_store.term(idx) catch |err| switch (err) {
-            raftlog.RaftLogError.Compacted => null,
-            raftlog.RaftLogError.Unavailable => null,
+            _raftlog.RaftLogError.Compacted => null,
+            _raftlog.RaftLogError.Unavailable => null,
             err_not_found.NotFound => null,
             else => return mapToRaftLogError(err),
         };
     }
 
-    pub fn entriesRange(self: *DiskWAL, opts: raftlog.EntriesRangeOpts) raftlog.RaftLogError!raftlog.EntriesResult {
+    pub fn entriesRange(self: *DiskWAL, opts: _raftlog.EntriesRangeOpts) _raftlog.RaftLogError!_raftlog.EntriesResult {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.wal_store.allEntries(self.allocator, opts) catch |err| {
@@ -1327,25 +1327,25 @@ pub const DiskWAL = struct {
         return 0;
     }
 
-    pub fn append(self: *DiskWAL, entries: []const raftlog.LogEntryBuffer) raftlog.RaftLogError!void {
+    pub fn append(self: *DiskWAL, entries: []const _raftlog.LogEntryBuffer) _raftlog.RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.addEntries(entries) catch |err| return mapToRaftLogError(err);
     }
 
-    pub fn truncateFrom(self: *DiskWAL, from_index: u64) raftlog.RaftLogError!void {
+    pub fn truncateFrom(self: *DiskWAL, from_index: u64) _raftlog.RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.truncateFrom(from_index) catch |err| return mapToRaftLogError(err);
     }
 
-    pub fn compactUntil(self: *DiskWAL, index: u64) raftlog.RaftLogError!void {
+    pub fn compactUntil(self: *DiskWAL, index: u64) _raftlog.RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.deleteBefore(index);
     }
 
-    pub fn sync(self: *DiskWAL) raftlog.RaftLogError!void {
+    pub fn sync(self: *DiskWAL) _raftlog.RaftLogError!void {
         // MetaStore writes are durable inline (state.bin opens with O_DSYNC,
         // snapshot.bin uses tmp+rename+dir-sync), so only the WAL needs an
         // explicit sync here.

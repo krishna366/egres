@@ -20,10 +20,10 @@
 //! supply the actual syscall.
 
 const std = @import("std");
-const fb = @import("fiber.zig");
-const rt = @import("runtime.zig");
+const _fb = @import("fiber.zig");
+const _rt = @import("runtime.zig");
 
-const Fiber = fb.Fiber;
+const Fiber = _fb.Fiber;
 
 /// A unit of work on the pool. Embedded in the caller's `run` frame (which
 /// lives on the parked fiber's stack).
@@ -141,7 +141,7 @@ fn workerLoop() void {
         job.run_fn(job);
         job.done.store(true, .release);
         // Cross-thread wake: routes the fiber back to a worker + notifies it.
-        rt.wake(job.fiber);
+        _rt.wake(job.fiber);
     }
 }
 
@@ -167,13 +167,13 @@ pub fn run(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Retu
     };
 
     var frame: Frame = .{
-        .job = .{ .run_fn = Frame.trampoline, .fiber = rt.currentFiber() },
+        .job = .{ .run_fn = Frame.trampoline, .fiber = _rt.currentFiber() },
         .args = args,
         .result = undefined,
     };
     enqueue(&frame.job);
 
-    rt.park();
+    _rt.park();
     // Invariant: this fiber parks and resumes ONLY when the pool ran its job and
     // set `done`. A resume with `!done` is a spurious wake — a bug at its source
     // (e.g. a stale deadline firing into us), not something to silently re-park

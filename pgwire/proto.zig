@@ -16,7 +16,7 @@
 //! anything touching sockets lives in driver.zig.
 
 const std = @import("std");
-const types = @import("types.zig");
+const _types = @import("types.zig");
 
 /// Byte tag a backend may send. Names follow the protocol docs (single
 /// uppercase letter on the wire), but we keep readable Zig identifiers.
@@ -493,7 +493,7 @@ pub fn encodeBackendKeyData(
 /// ReadyForQuery: tag 'Z', body is one byte (transaction status).
 pub fn encodeReadyForQuery(
     out: *std.Io.Writer,
-    status: types.TxStatus,
+    status: _types.TxStatus,
 ) std.Io.Writer.Error!void {
     try out.writeByte(@intFromEnum(BackendTag.ready_for_query));
     try out.writeInt(u32, 5, .big); // 4 (self) + 1 (status byte)
@@ -505,7 +505,7 @@ pub fn encodeReadyForQuery(
 /// int16 type_size, int32 type_modifier, int16 format_code).
 pub fn encodeRowDescription(
     scratch: *std.Io.Writer.Allocating,
-    fields: []const types.FieldDescription,
+    fields: []const _types.FieldDescription,
 ) !void {
     resetScratch(scratch);
     const w = &scratch.writer;
@@ -616,7 +616,7 @@ pub fn encodeEmptyQueryResponse(out: *std.Io.Writer) std.Io.Writer.Error!void {
 /// a final 0 byte ends the message.
 pub const ErrorField = struct {
     /// Severity: 'ERROR', 'FATAL', 'PANIC', etc.
-    severity: []const u8 = types.severity_error,
+    severity: []const u8 = _types.severity_error,
     /// 5-char SQLSTATE.
     code: [5]u8,
     message: []const u8,

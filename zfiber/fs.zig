@@ -18,11 +18,11 @@
 
 const std = @import("std");
 const xev = @import("xev");
-const fb = @import("fiber.zig");
-const rt = @import("runtime.zig");
-const fsops = @import("fsops.zig");
+const _fb = @import("fiber.zig");
+const _rt = @import("runtime.zig");
+const _fsops = @import("fsops.zig");
 
-const Fiber = fb.Fiber;
+const Fiber = _fb.Fiber;
 const SioFile = std.Io.File;
 const SioDir = std.Io.Dir;
 
@@ -53,7 +53,7 @@ pub const File = struct {
     /// op directly; the epoll backend offloads to libxev's threadpool) —
     /// never blocks the worker thread.
     pub fn read(self: File, buf: []u8, offset: u64) xev.ReadError!usize {
-        const w = rt.currentWorker();
+        const w = _rt.currentWorker();
         const f = w.current_fiber.?;
         const xf = xev.File.initFd(self.fd);
         var c: xev.Completion = undefined;
@@ -66,7 +66,7 @@ pub const File = struct {
     /// Positional write. Parks until the op completes. Returns the number
     /// of bytes written (may be short).
     pub fn write(self: File, data: []const u8, offset: u64) xev.WriteError!usize {
-        const w = rt.currentWorker();
+        const w = _rt.currentWorker();
         const f = w.current_fiber.?;
         const xf = xev.File.initFd(self.fd);
         var c: xev.Completion = undefined;
@@ -95,7 +95,7 @@ pub const File = struct {
     /// last completion fires, so they survive across the park).
     pub fn preadBatch(self: File, allocator: std.mem.Allocator, ops: []BatchOp) !void {
         if (ops.len == 0) return;
-        const w = rt.currentWorker();
+        const w = _rt.currentWorker();
         const f = w.current_fiber.?;
         const xf = xev.File.initFd(self.fd);
 
@@ -115,7 +115,7 @@ pub const File = struct {
         // wakes us, so on resume every CQE has been reaped and the stack `comps`
         // (freed when this frame returns) safely outlived their ops. A resume
         // with `remaining != 0` is a spurious wake — fail loud at the source.
-        rt.park();
+        _rt.park();
         if (batch.remaining.load(.acquire) != 0)
             @panic("fs.preadBatch: fiber woken before all reads completed — spurious wake");
     }
@@ -125,19 +125,19 @@ pub const File = struct {
     /// thread stays free for other fibers.
     pub fn sync(self: File, flags: SyncFlags) !void {
         _ = flags;
-        return fsops.run(syncImpl, .{self.fd});
+        return _fsops.run(syncImpl, .{self.fd});
     }
 
     /// Truncate / extend the file to `length` bytes. Offloaded (can block on
     /// disk).
     pub fn setSize(self: File, length: u64) !void {
-        return fsops.run(setLengthImpl, .{ self.fd, length });
+        return _fsops.run(setLengthImpl, .{ self.fd, length });
     }
 
     /// Stat the open file (currently just its size). A fast `fstat` (cached
     /// inode), so it runs inline.
     pub fn stat(self: File) !Stat {
-        const st = try sioFile(self.fd).stat(fsops.io());
+        const st = try sioFile(self.fd).stat(_fsops.io());
         return .{ .size = st.size };
     }
 
@@ -147,20 +147,20 @@ pub const File = struct {
 
     /// Close releases the fd (instant), so it runs inline.
     pub fn close(self: File) void {
-        sioFile(self.fd).close(fsops.io());
+        sioFile(self.fd).close(_fsops.io());
     }
 };
 
 fn syncImpl(fd: SioFile.Handle) !void {
-    return sioFile(fd).sync(fsops.io());
+    return sioFile(fd).sync(_fsops.io());
 }
 
 fn setLengthImpl(fd: SioFile.Handle, length: u64) !void {
-    return sioFile(fd).setLength(fsops.io(), length);
+    return sioFile(fd).setLength(_fsops.io(), length);
 }
 
 fn parkAssertDone(done: *std.atomic.Value(bool)) void {
-    rt.park();
+    _rt.park();
     // Invariant: resume ONLY when the io_uring completion fired and set `done`.
     // A resume with `!done` is a spurious wake — fail loud at the source rather
     // than silently re-parking.
@@ -186,7 +186,7 @@ fn preadCallback(
     const w = ud.?;
     w.result = r;
     w.done.store(true, .release);
-    rt.wake(w.fiber);
+    _rt.wake(w.fiber);
     return .disarm;
 }
 
@@ -207,7 +207,7 @@ fn pwriteCallback(
     const w = ud.?;
     w.result = r;
     w.done.store(true, .release);
-    rt.wake(w.fiber);
+    _rt.wake(w.fiber);
     return .disarm;
 }
 
@@ -235,7 +235,7 @@ fn batchCallback(
     const ctx = ud.?;
     ctx.op.result = r;
     // `- 1` returns the OLD value, so the op that drove it to 0 wakes the fiber.
-    if (ctx.batch.remaining.fetchSub(1, .acq_rel) == 1) rt.wake(ctx.batch.fiber);
+    if (ctx.batch.remaining.fetchSub(1, .acq_rel) == 1) _rt.wake(ctx.batch.fiber);
     return .disarm;
 }
 
@@ -259,18 +259,18 @@ pub const Dir = struct {
     pub fn access(self: Dir, path: []const u8, flags: AccessFlags) !void {
         _ = self;
         _ = flags;
-        return fsops.run(accessImpl, .{path});
+        return _fsops.run(accessImpl, .{path});
     }
 
     pub fn rename(self: Dir, old_path: []const u8, new_dir: Dir, new_path: []const u8) !void {
         _ = self;
         _ = new_dir;
-        return fsops.run(renameImpl, .{ old_path, new_path });
+        return _fsops.run(renameImpl, .{ old_path, new_path });
     }
 
     pub fn deleteFile(self: Dir, path: []const u8) !void {
         _ = self;
-        return fsops.run(deleteImpl, .{path});
+        return _fsops.run(deleteImpl, .{path});
     }
 
     /// Create (truncating) a file with read+write access, returning a fiber `File`.
@@ -278,36 +278,36 @@ pub const Dir = struct {
     pub fn createFile(self: Dir, path: []const u8, flags: CreateFlags) !File {
         _ = self;
         _ = flags;
-        return fsops.run(createImpl, .{path});
+        return _fsops.run(createImpl, .{path});
     }
 
     /// Open an existing file read-only, returning a fiber `File`.
     pub fn openFile(self: Dir, path: []const u8, flags: OpenFlags) !File {
         _ = self;
         _ = flags;
-        return fsops.run(openImpl, .{path});
+        return _fsops.run(openImpl, .{path});
     }
 };
 
 fn accessImpl(path: []const u8) !void {
-    return SioDir.cwd().access(fsops.io(), path, .{});
+    return SioDir.cwd().access(_fsops.io(), path, .{});
 }
 
 fn renameImpl(old_path: []const u8, new_path: []const u8) !void {
-    return SioDir.cwd().rename(old_path, SioDir.cwd(), new_path, fsops.io());
+    return SioDir.cwd().rename(old_path, SioDir.cwd(), new_path, _fsops.io());
 }
 
 fn deleteImpl(path: []const u8) !void {
-    return SioDir.cwd().deleteFile(fsops.io(), path);
+    return SioDir.cwd().deleteFile(_fsops.io(), path);
 }
 
 fn createImpl(path: []const u8) !File {
-    const f = try SioDir.cwd().createFile(fsops.io(), path, .{ .read = true, .truncate = true });
+    const f = try SioDir.cwd().createFile(_fsops.io(), path, .{ .read = true, .truncate = true });
     return File.fromFd(f.handle);
 }
 
 fn openImpl(path: []const u8) !File {
-    const f = try SioDir.cwd().openFile(fsops.io(), path, .{ .mode = .read_only });
+    const f = try SioDir.cwd().openFile(_fsops.io(), path, .{ .mode = .read_only });
     return File.fromFd(f.handle);
 }
 
@@ -324,7 +324,7 @@ pub fn openPosix(
     flags: std.posix.O,
     mode: std.posix.mode_t,
 ) std.posix.OpenError!std.posix.fd_t {
-    return fsops.run(openPosixImpl, .{ path, flags, mode });
+    return _fsops.run(openPosixImpl, .{ path, flags, mode });
 }
 
 fn openPosixImpl(

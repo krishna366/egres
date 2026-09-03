@@ -30,9 +30,9 @@
 //! semantics (removes-then-adds per delta) on every node.
 
 const std = @import("std");
-const buffers = @import("buffers.gen.zig");
+const _buffers = @import("buffers.gen.zig");
 
-const DeltaReader = buffers.RoaringDeltaReader;
+const DeltaReader = _buffers.RoaringDeltaReader;
 
 pub const Error = error{CorruptPosting};
 

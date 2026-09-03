@@ -7,48 +7,48 @@
 pub const xev = @import("xev");
 
 // From fiber.zig — the Fiber primitive and its types.
-const fb = @import("fiber.zig");
+const _fb = @import("fiber.zig");
 
-pub const coro = fb.coro;
-pub const default_stack_size = fb.default_stack_size;
-pub const Priority = fb.Priority;
-pub const Lane = fb.Lane;
-pub const Tag = fb.Tag;
-pub const State = fb.State;
-pub const YieldIntent = fb.YieldIntent;
-pub const SpawnOptions = fb.SpawnOptions;
-pub const FiberFn = fb.FiberFn;
-pub const Fiber = fb.Fiber;
-pub const JoinState = fb.JoinState;
-pub const JoinHandle = fb.JoinHandle;
-pub const ReturnOf = fb.ReturnOf;
+pub const coro = _fb.coro;
+pub const default_stack_size = _fb.default_stack_size;
+pub const Priority = _fb.Priority;
+pub const Lane = _fb.Lane;
+pub const Tag = _fb.Tag;
+pub const State = _fb.State;
+pub const YieldIntent = _fb.YieldIntent;
+pub const SpawnOptions = _fb.SpawnOptions;
+pub const FiberFn = _fb.FiberFn;
+pub const Fiber = _fb.Fiber;
+pub const JoinState = _fb.JoinState;
+pub const JoinHandle = _fb.JoinHandle;
+pub const ReturnOf = _fb.ReturnOf;
 
 // From runtime.zig — the scheduler.
-const rt = @import("runtime.zig");
+const _rt = @import("runtime.zig");
 
-pub const Worker = rt.Worker;
-pub const Runtime = rt.Runtime;
-pub const CoarseClock = rt.CoarseClock;
-pub const coarseMs = rt.coarseMs;
+pub const Worker = _rt.Worker;
+pub const Runtime = _rt.Runtime;
+pub const CoarseClock = _rt.CoarseClock;
+pub const coarseMs = _rt.coarseMs;
 pub const clockMsUseRarely = @import("coarse_clock.zig").clockMsUseRarely;
 pub const ClockKind = @import("coarse_clock.zig").ClockKind;
-pub const Deadlines = rt.Deadlines;
-pub const Timeout = rt.Timeout;
-pub const Stats = rt.Stats;
-pub const spawn = rt.spawn;
-pub const spawnDetached = rt.spawnDetached;
-pub const yield = rt.yield;
-pub const park = rt.park;
-pub const wake = rt.wake;
-pub const stop = rt.stop;
-pub const runtime = rt.runtime;
-pub const currentWorker = rt.currentWorker;
-pub const currentWorkerOrNull = rt.currentWorkerOrNull;
-pub const currentFiber = rt.currentFiber;
-pub const currentFiberOrNull = rt.currentFiberOrNull;
-pub const dumpFibers = rt.dumpFibers;
-pub const dumpWorkerCpu = rt.dumpWorkerCpu;
-pub const tscNsPerCycleQ32 = rt.tscNsPerCycleQ32;
+pub const Deadlines = _rt.Deadlines;
+pub const Timeout = _rt.Timeout;
+pub const Stats = _rt.Stats;
+pub const spawn = _rt.spawn;
+pub const spawnDetached = _rt.spawnDetached;
+pub const yield = _rt.yield;
+pub const park = _rt.park;
+pub const wake = _rt.wake;
+pub const stop = _rt.stop;
+pub const runtime = _rt.runtime;
+pub const currentWorker = _rt.currentWorker;
+pub const currentWorkerOrNull = _rt.currentWorkerOrNull;
+pub const currentFiber = _rt.currentFiber;
+pub const currentFiberOrNull = _rt.currentFiberOrNull;
+pub const dumpFibers = _rt.dumpFibers;
+pub const dumpWorkerCpu = _rt.dumpWorkerCpu;
+pub const tscNsPerCycleQ32 = _rt.tscNsPerCycleQ32;
 
 // Lower-level data structure used by `Deadlines`.
 pub const heap = @import("heap.zig");
@@ -56,36 +56,36 @@ pub const heap = @import("heap.zig");
 // Per-worker ready queue + its lock-mode constructor. Exported so benches can
 // measure `LocalQueue(.none)` vs `LocalQueue(.withlock)` (the runtime uses
 // `.none`); the scheduler reaches `queue.zig` directly.
-const queue = @import("queue.zig");
-pub const LocalQueue = queue.LocalQueue;
-pub const QueueLockMode = queue.LockMode;
+const _queue = @import("queue.zig");
+pub const LocalQueue = _queue.LocalQueue;
+pub const QueueLockMode = _queue.LockMode;
 
 // Sync primitives built on `park` / `wake`. `Mutex`/`RWMutex` are
 // type constructors: `Mutex(.tracked)` records its holder for `dumpLocks`,
 // `Mutex(.untracked)` is the zero-overhead variant.
-const sync = @import("sync.zig");
-pub const WaitQueue = sync.WaitQueue;
-pub const Track = sync.Track;
-pub const Mutex = sync.Mutex;
-pub const Condition = sync.Condition;
-pub const RWMutex = sync.RWMutex;
-pub const Notify = sync.Notify;
+const _sync = @import("sync.zig");
+pub const WaitQueue = _sync.WaitQueue;
+pub const Track = _sync.Track;
+pub const Mutex = _sync.Mutex;
+pub const Condition = _sync.Condition;
+pub const RWMutex = _sync.RWMutex;
+pub const Notify = _sync.Notify;
 
 // Lock-holder tracking for the tracked Mutex/RWMutex modes — `dumpLocks`
 // answers "which locks are held, by what code?" on a wedged server.
-const lock_registry = @import("lock_registry.zig");
-pub const dumpLocks = lock_registry.dumpLocks;
-pub const trackedLockCount = lock_registry.registeredCount;
+const _lock_registry = @import("lock_registry.zig");
+pub const dumpLocks = _lock_registry.dumpLocks;
+pub const trackedLockCount = _lock_registry.registeredCount;
 
-const channel_mod = @import("channel.zig");
-pub const Channel = channel_mod.Channel;
-pub const CloseMode = channel_mod.CloseMode;
+const _channel = @import("channel.zig");
+pub const Channel = _channel.Channel;
+pub const CloseMode = _channel.CloseMode;
 
-const group_mod = @import("group.zig");
-pub const Group = group_mod.Group;
+const _group = @import("group.zig");
+pub const Group = _group.Group;
 
-const watermark_mod = @import("watermark.zig");
-pub const Watermark = watermark_mod.Watermark;
+const _watermark = @import("watermark.zig");
+pub const Watermark = _watermark.Watermark;
 
 // One-shot shutdown signal: pollable (`hasStarted`), blockable (`wait`),
 // with optional SIGINT/SIGTERM wiring via the self-pipe trick.

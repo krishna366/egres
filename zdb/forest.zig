@@ -2,15 +2,15 @@ const std = @import("std");
 const log = std.log.scoped(.forest);
 const fiber = @import("zfiber");
 const utils = @import("utils");
-const config = @import("config.zig");
-const manifest = @import("manifest.zig");
-const level = @import("level.zig");
-const table_mod = @import("table.zig");
+const _config = @import("config.zig");
+const _manifest = @import("manifest.zig");
+const _level = @import("level.zig");
+const _table = @import("table.zig");
 const vfs = @import("vfs");
-const tree_mod = @import("tree.zig");
-const skl = @import("skl/skiplist.zig");
-const metrics = @import("metrics.zig");
-const fi = @import("file_ids.zig");
+const _tree = @import("tree.zig");
+const _skl = @import("skl/skiplist.zig");
+const _metrics = @import("metrics.zig");
+const _fi = @import("file_ids.zig");
 const zroar = @import("zroar");
 
 const Key = @import("kv.zig").Key;
@@ -19,14 +19,14 @@ const TableKey = @import("kv.zig").TableKey;
 const makeTreeId = @import("kv.zig").makeTreeId;
 const treeTableId = @import("kv.zig").treeTableId;
 const treeSplitId = @import("kv.zig").treeSplitId;
-const KeyRange = level.KeyRange;
-const Tree = tree_mod.Tree;
-const TableCache = tree_mod.TableCache;
-const Table = table_mod.Table;
-const Item = table_mod.table.Item;
-const SkipList = skl.SkipList;
-const Builder = table_mod.builder.Builder;
-const merge_iterator = table_mod.merge_iterator;
+const KeyRange = _level.KeyRange;
+const Tree = _tree.Tree;
+const TableCache = _tree.TableCache;
+const Table = _table.Table;
+const Item = _table.table.Item;
+const SkipList = _skl.SkipList;
+const Builder = _table.builder.Builder;
+const merge_iterator = _table.merge_iterator;
 
 // ---------------------------------------------------------------------------
 // TableTrees
@@ -155,17 +155,17 @@ pub const Memtables = struct {
     pub fn getIterators(
         self: *Memtables,
         allocator: std.mem.Allocator,
-        pending: ?*skl.SkipList,
+        pending: ?*_skl.SkipList,
     ) ![]merge_iterator.Iterator {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         const extra: usize = @intFromBool(pending != null);
         const total = extra + 1 + self.immutables.items.len;
         const out = try allocator.alloc(merge_iterator.Iterator, total);
-        if (pending) |p| out[0] = .{ .skiplist = skl.Iterator.init(p) };
-        out[extra] = .{ .skiplist = skl.Iterator.init(self.current) };
+        if (pending) |p| out[0] = .{ .skiplist = _skl.Iterator.init(p) };
+        out[extra] = .{ .skiplist = _skl.Iterator.init(self.current) };
         for (self.immutables.items, 0..) |imm, i| {
-            out[extra + 1 + i] = .{ .skiplist = skl.Iterator.init(imm) };
+            out[extra + 1 + i] = .{ .skiplist = _skl.Iterator.init(imm) };
         }
         return out;
     }
@@ -319,12 +319,12 @@ pub const Memtables = struct {
 
 pub const Forest = struct {
     allocator: std.mem.Allocator,
-    opts: config.Config,
-    ms: manifest.ForestState,
+    opts: _config.Config,
+    ms: _manifest.ForestState,
     /// Per-node file_id allocator. Wired at startup via `bindWorker`.
     /// All callers go through `file_ids.allocate()`; raw `fetchAdd` is
     /// never correct because it skips the HardState lease.
-    file_ids: fi.FileIds,
+    file_ids: _fi.FileIds,
     /// One TableTrees per table, keyed by its `{namespace, table_id}` identity.
     /// The TableTreess own the live `*Tree` objects (in their sorted entries);
     /// there is no separate tree map. Look a tree up by id via `treeById`.
@@ -349,8 +349,8 @@ pub const Forest = struct {
     /// Open a forest with empty in-memory state. Persistent state is restored
     /// later via `installManifest` (called by recovery if a Raft snapshot is
     /// present); fresh starts go straight to `createTree` / Raft replay.
-    pub fn open(allocator: std.mem.Allocator, opts: config.Config) !*Forest {
-        var ms = manifest.ForestState.init(allocator);
+    pub fn open(allocator: std.mem.Allocator, opts: _config.Config) !*Forest {
+        var ms = _manifest.ForestState.init(allocator);
         errdefer ms.deinit();
 
         const self = try allocator.create(Forest);
@@ -442,7 +442,7 @@ pub const Forest = struct {
     /// memtable, routes each key to its tree, builds one L0 SST per tree,
     /// and returns the manifest changes. The caller proposes these through Raft.
     pub const FlushResult = struct {
-        changes: std.ArrayList(manifest.SSTableChange),
+        changes: std.ArrayList(_manifest.SSTableChange),
         memtable_id: u64,
     };
 
@@ -465,7 +465,7 @@ pub const Forest = struct {
             builders.deinit();
         }
 
-        const cfg = table_mod.builder.Config{
+        const cfg = _table.builder.Config{
             .target_block_size = self.opts.block_size,
             .codec = self.opts.compression,
             .priority = .p0,
@@ -501,7 +501,7 @@ pub const Forest = struct {
         // write path (finish → create file → write → sync → close) and returns
         // the manifest SSTableChange directly.
         var flush_err: utils.SafeError = .{};
-        var g = fiber.Group(?manifest.SSTableChange).init(self.allocator);
+        var g = fiber.Group(?_manifest.SSTableChange).init(self.allocator);
         defer {
             _ = g.wait();
             g.deinit();
@@ -519,7 +519,7 @@ pub const Forest = struct {
             }
 
             const file_id = try self.file_ids.allocate();
-            const path = try fi.sstPath(self.allocator, self.opts.dir, file_id);
+            const path = try _fi.sstPath(self.allocator, self.opts.dir, file_id);
 
             try g.spawn(.{}, writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tk, 0, &flush_err,
@@ -528,7 +528,7 @@ pub const Forest = struct {
 
         // Join fibers and collect manifest changes.
         const tcs = g.wait();
-        var changes: std.ArrayList(manifest.SSTableChange) = .empty;
+        var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
         for (tcs) |tc_opt| {
             const tc = tc_opt orelse continue;
             try changes.append(self.allocator, tc);
@@ -548,13 +548,13 @@ pub const Forest = struct {
     /// Returns a manifest.SSTableChange (CREATE at `level`) on success.
     fn writeAndSyncTable(
         allocator: std.mem.Allocator,
-        tb: table_mod.builder.TableBuffer,
+        tb: _table.builder.TableBuffer,
         path: []const u8,
         file_id: u64,
         tk: TreeKey,
         lvl: u32,
         err_out: *utils.SafeError,
-    ) ?manifest.SSTableChange {
+    ) ?_manifest.SSTableChange {
         defer allocator.free(path);
         var mtb = tb;
         defer mtb.deinit();
@@ -563,7 +563,7 @@ pub const Forest = struct {
             err_out.set(err);
             return null;
         };
-        return manifest.createSSTableChange(file_id, tk.namespace, tk.tree_id, lvl);
+        return _manifest.createSSTableChange(file_id, tk.namespace, tk.tree_id, lvl);
     }
 
     /// Build BOTTOM-level SSTs for (`ns`, `table_id`) from
@@ -596,8 +596,8 @@ pub const Forest = struct {
         ns: u64,
         table_id: u32,
         items: []const Item,
-    ) !std.ArrayList(manifest.SSTableChange) {
-        var changes: std.ArrayList(manifest.SSTableChange) = .empty;
+    ) !std.ArrayList(_manifest.SSTableChange) {
+        var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
         errdefer changes.deinit(allocator);
         if (items.len == 0) return changes;
 
@@ -615,7 +615,7 @@ pub const Forest = struct {
         };
 
         var build_err: utils.SafeError = .{};
-        var g = fiber.Group(?manifest.SSTableChange).init(self.allocator);
+        var g = fiber.Group(?_manifest.SSTableChange).init(self.allocator);
         defer {
             _ = g.wait();
             g.deinit();
@@ -655,7 +655,7 @@ pub const Forest = struct {
     /// nothing.
     fn spawnTableWrite(
         self: *Forest,
-        g: *fiber.Group(?manifest.SSTableChange),
+        g: *fiber.Group(?_manifest.SSTableChange),
         bld: *Builder,
         tk: TreeKey,
         lvl: u32,
@@ -667,7 +667,7 @@ pub const Forest = struct {
             return;
         }
         const file_id = try self.file_ids.allocate();
-        const path = try fi.sstPath(self.allocator, self.opts.dir, file_id);
+        const path = try _fi.sstPath(self.allocator, self.opts.dir, file_id);
         try g.spawn(.{}, writeAndSyncTable, .{
             self.allocator, tb, path, file_id, tk, lvl, err_out,
         });
@@ -697,7 +697,7 @@ pub const Forest = struct {
     /// applyFlush is Phase B: commits the manifest changes from a memtable flush
     /// and updates in-memory levels. Called on all nodes after Raft commit.
     /// Also removes the flushed memtable from the immutable list.
-    pub fn applyFlush(self: *Forest, changes: []const manifest.SSTableChange, memtable_id: u64) !void {
+    pub fn applyFlush(self: *Forest, changes: []const _manifest.SSTableChange, memtable_id: u64) !void {
         if (changes.len > 0) {
             try self.ms.commit(changes, &.{});
         }
@@ -705,7 +705,7 @@ pub const Forest = struct {
         // Load all new L0 tables concurrently via the cache. writeFile may
         // have pre-opened these (follower path) → cache hit. On the leader,
         // flush writes bytes directly, so these will typically be misses.
-        var needed: std.ArrayList(tree_mod.TableNeed) = .empty;
+        var needed: std.ArrayList(_tree.TableNeed) = .empty;
         defer needed.deinit(self.allocator);
         for (changes) |c| {
             std.debug.assert(c.op == .create); // flush only creates
@@ -721,8 +721,8 @@ pub const Forest = struct {
             try tree.levels[c.level].addEntry(n.id, n.table.?);
 
             // Metrics: one per-tree flush output + bytes written to L0.
-            try metrics.g().flushes.incr(.{ .namespace_id = c.namespace_id, .tree_id = c.tree_id });
-            try metrics.g().bytes_written.incrBy(.{
+            try _metrics.g().flushes.incr(.{ .namespace_id = c.namespace_id, .tree_id = c.tree_id });
+            try _metrics.g().bytes_written.incrBy(.{
                 .source = "flush",
                 .namespace_id = c.namespace_id,
                 .tree_id = c.tree_id,
@@ -906,7 +906,7 @@ pub const Forest = struct {
         /// uncommitted writes. Its entries carry ts = read_ts, which the
         /// visibility filter admits and which wins equal-key ties against
         /// committed versions (lower src wins in the merge). null = none.
-        pending: ?*skl.SkipList = null,
+        pending: ?*_skl.SkipList = null,
     };
 
     /// Forward scan over a table-limited `scan_range` — a KeyRange run through
@@ -1237,7 +1237,7 @@ pub const Forest = struct {
         const right_raw = try range.right.marshal(self.allocator);
         defer self.allocator.free(right_raw);
 
-        try self.ms.commit(&.{}, &.{manifest.createTreeChange(tree_id, namespace_id, left_raw, right_raw)});
+        try self.ms.commit(&.{}, &.{_manifest.createTreeChange(tree_id, namespace_id, left_raw, right_raw)});
         try self.installTree(namespace_id, tree_id);
         return tree_id;
     }
@@ -1253,7 +1253,7 @@ pub const Forest = struct {
     ///
     /// Errors with `NamespaceAlreadyExists` if `namespace_id`'s default table
     /// already exists, `NameExists` if another namespace holds `name`.
-    pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, name: []const u8) !manifest.ManifestChange {
+    pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, name: []const u8) !_manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
         {
             self.mu.lockShared(@src());
@@ -1266,10 +1266,10 @@ pub const Forest = struct {
         // catalogs, born with the namespace — catalog rows must never race
         // tree creation, because buildFlush silently drops keys whose
         // (ns, table_id) has no tree.
-        const ids = manifest.namespace_system_table_ids;
-        const tree_changes = try alloc.alloc(manifest.TreeChange, ids.len);
+        const ids = _manifest.namespace_system_table_ids;
+        const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.len);
         for (ids, tree_changes) |table_id, *tc|
-            tc.* = manifest.createTreeChange(makeTreeId(table_id, 0), namespace_id, "", "");
+            tc.* = _manifest.createTreeChange(makeTreeId(table_id, 0), namespace_id, "", "");
         // table_id 0 carries the namespace's name.
         tree_changes[0].name = @constCast(name);
 
@@ -1285,7 +1285,7 @@ pub const Forest = struct {
     /// ns_create ManifestChange carrying the database name.
     pub const CreateNamespaceResult = struct {
         namespace: u64,
-        change: manifest.ManifestChange,
+        change: _manifest.ManifestChange,
     };
 
     /// buildCreateNamespace is the allocating namespace create (SQL: CREATE
@@ -1321,7 +1321,7 @@ pub const Forest = struct {
     /// (create_ns).
     ///
     /// Skips any TreeChange whose tree already exists (re-apply).
-    pub fn applyNamespaceCreate(self: *Forest, mc: manifest.ManifestChange) !void {
+    pub fn applyNamespaceCreate(self: *Forest, mc: _manifest.ManifestChange) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
@@ -1348,14 +1348,14 @@ pub const Forest = struct {
     /// infinite-range *within* its table — routing isolates by
     /// (namespace, table_id), so no key-range bound is needed. No state mutates,
     /// so a failed propose costs nothing. create_tree. Caller owns the returned slice.
-    pub fn buildCreateTree(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_id: u32) !manifest.ManifestChange {
+    pub fn buildCreateTree(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_id: u32) !_manifest.ManifestChange {
         const tree_id = blk: {
             self.mu.lockShared(@src());
             defer self.mu.unlockShared();
             break :blk self.nextTreeId(namespace_id, table_id);
         };
-        const tree_changes = try alloc.alloc(manifest.TreeChange, 1);
-        tree_changes[0] = manifest.createTreeChange(tree_id, namespace_id, "", "");
+        const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
+        tree_changes[0] = _manifest.createTreeChange(tree_id, namespace_id, "", "");
         return .{
             .tree_changes = tree_changes,
             .sstable_changes = &.{},
@@ -1369,7 +1369,7 @@ pub const Forest = struct {
     /// all. Caller owns `table_ids` and `change.tree_changes`.
     pub const CreateTablesResult = struct {
         table_ids: []u32,
-        change: manifest.ManifestChange,
+        change: _manifest.ManifestChange,
     };
 
     /// buildCreateTables creates N sibling tables in ONE change — a
@@ -1395,7 +1395,7 @@ pub const Forest = struct {
 
         const table_ids = try alloc.alloc(u32, names.len);
         errdefer alloc.free(table_ids);
-        const tree_changes = try alloc.alloc(manifest.TreeChange, names.len);
+        const tree_changes = try alloc.alloc(_manifest.TreeChange, names.len);
         errdefer alloc.free(tree_changes);
 
         for (names, 0..) |name, i| {
@@ -1406,7 +1406,7 @@ pub const Forest = struct {
                 defer self.mu.unlockShared();
                 break :blk self.nextTreeId(namespace_id, table_id);
             };
-            tree_changes[i] = manifest.createTreeChange(tree_id, namespace_id, "", "");
+            tree_changes[i] = _manifest.createTreeChange(tree_id, namespace_id, "", "");
             tree_changes[i].name = @constCast(name);
         }
         return .{
@@ -1426,7 +1426,7 @@ pub const Forest = struct {
     /// counter past the created table (idempotent; this is what keeps a
     /// re-elected leader's allocator current). Idempotent on (namespace,
     /// tree_id). Called on all nodes after Raft commit (create_tree).
-    pub fn applyCreateTree(self: *Forest, mc: manifest.ManifestChange) !void {
+    pub fn applyCreateTree(self: *Forest, mc: _manifest.ManifestChange) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
@@ -1453,7 +1453,7 @@ pub const Forest = struct {
     /// The dropped tables' rows in the namespace's CATALOG trees are NOT
     /// touched — with their names gone and table_ids never reused they are
     /// unreachable garbage. TODO: issue tombstones for them.
-    pub fn buildDropTables(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_ids: []const u32) !manifest.ManifestChange {
+    pub fn buildDropTables(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_ids: []const u32) !_manifest.ManifestChange {
         var ids: std.ArrayList(u64) = .empty;
         defer ids.deinit(alloc);
         {
@@ -1465,9 +1465,9 @@ pub const Forest = struct {
                 };
         }
 
-        const tree_changes = try alloc.alloc(manifest.TreeChange, ids.items.len);
+        const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.items.len);
         for (ids.items, 0..) |tree_id, i| {
-            tree_changes[i] = manifest.deleteTreeChange(tree_id, namespace_id);
+            tree_changes[i] = _manifest.deleteTreeChange(tree_id, namespace_id);
         }
         return .{
             .tree_changes = tree_changes,
@@ -1487,7 +1487,7 @@ pub const Forest = struct {
     /// detaches, and the table cache holds its own ref). The data is immediately
     /// unqueryable (route + manifest gone); physical reclaim of orphaned SSTs is
     /// left to snapshot GC — a follow-up.
-    pub fn applyDropTree(self: *Forest, mc: manifest.ManifestChange) !void {
+    pub fn applyDropTree(self: *Forest, mc: _manifest.ManifestChange) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         try self.applyTreeDeletesLocked(mc);
@@ -1502,7 +1502,7 @@ pub const Forest = struct {
 
     /// The delete-changes walk shared by applyDropTree and applyDropNamespace.
     /// Caller holds `self.mu` exclusively.
-    fn applyTreeDeletesLocked(self: *Forest, mc: manifest.ManifestChange) !void {
+    fn applyTreeDeletesLocked(self: *Forest, mc: _manifest.ManifestChange) !void {
         for (mc.tree_changes) |tc| {
             if (tc.op != .delete) continue;
 
@@ -1533,8 +1533,8 @@ pub const Forest = struct {
     /// never reused, so no counter rewind is needed; applyDropNamespace forgets
     /// the counter entirely. Returns an empty change set for an unknown
     /// namespace (idempotent). Caller owns the returned slice.
-    pub fn buildDropNamespace(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64) !manifest.ManifestChange {
-        var changes: std.ArrayList(manifest.TreeChange) = .empty;
+    pub fn buildDropNamespace(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64) !_manifest.ManifestChange {
+        var changes: std.ArrayList(_manifest.TreeChange) = .empty;
         defer changes.deinit(alloc);
         {
             self.mu.lockShared(@src());
@@ -1543,7 +1543,7 @@ pub const Forest = struct {
             while (it.next()) |kv| {
                 if (kv.key_ptr.namespace != namespace_id) continue;
                 for (kv.value_ptr.*.entries.items) |e| {
-                    try changes.append(alloc, manifest.deleteTreeChange(e.tree_id, namespace_id));
+                    try changes.append(alloc, _manifest.deleteTreeChange(e.tree_id, namespace_id));
                 }
             }
         }
@@ -1561,7 +1561,7 @@ pub const Forest = struct {
     /// namespace's manifest state (table_id counter + name, freeing the name
     /// for re-CREATE). Leftover memtable entries for the namespace are dropped
     /// at flush (buildFlush skips items with no route). Idempotent. drop_ns.
-    pub fn applyDropNamespace(self: *Forest, mc: manifest.ManifestChange) !void {
+    pub fn applyDropNamespace(self: *Forest, mc: _manifest.ManifestChange) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         try self.applyTreeDeletesLocked(mc);
@@ -1604,7 +1604,7 @@ pub const Forest = struct {
     pub const CompactionTarget = struct {
         tree: *Tree,
         key: TreeKey,
-        candidate: tree_mod.CompactCandidate,
+        candidate: _tree.CompactCandidate,
     };
 
     /// Find the best tree/level to compact without performing compaction.
@@ -1894,7 +1894,7 @@ pub const Forest = struct {
 
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = fi.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
+        const path = _fi.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
         defer self.allocator.free(path);
         vfs.access(path) catch return false;
         return true;
@@ -1912,7 +1912,7 @@ pub const Forest = struct {
             return;
         }
 
-        const path = fi.sstPath(self.allocator, self.opts.dir, file_id) catch return;
+        const path = _fi.sstPath(self.allocator, self.opts.dir, file_id) catch return;
         defer self.allocator.free(path);
 
         // Probe existence + size via vfs (no allocation, just open + getEndPos).
@@ -1975,7 +1975,7 @@ pub const Forest = struct {
 
     /// Read an SST file from disk. Caller owns the returned slice.
     pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-        const path = fi.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
+        const path = _fi.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
         defer self.allocator.free(path);
         const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
         defer handle.close();
@@ -2000,7 +2000,7 @@ pub const Forest = struct {
     /// the provided allocator (typically an arena). The caller proposes the
     /// ManifestChange through Raft. The new half stays in the parent's table
     /// table, so its tree_id is the table's next free split index.
-    pub fn buildSplit(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, tree_id: u64) !?manifest.ManifestChange {
+    pub fn buildSplit(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, tree_id: u64) !?_manifest.ManifestChange {
         std.debug.assert(namespace_id > 0);
         const left_tree = self.treeById(namespace_id, tree_id) orelse return null;
 
@@ -2015,7 +2015,7 @@ pub const Forest = struct {
         const new_tree_id = self.nextTreeId(namespace_id, treeTableId(tree_id));
 
         // Classify tables per level and build manifest changes.
-        var table_changes: std.ArrayList(manifest.SSTableChange) = .empty;
+        var table_changes: std.ArrayList(_manifest.SSTableChange) = .empty;
 
         for (left_tree.levels, 0..) |*llv, llv_idx| {
             llv.mu.lockShared(@src());
@@ -2024,13 +2024,13 @@ pub const Forest = struct {
             for (llv.tables.items) |tbe| {
                 if (tbe.table.smallest.order(split_key) != .lt) { // .eq or .gt
                     // Right-only: remove from old tree, add to new tree.
-                    try table_changes.append(alloc, manifest.deleteSSTableChange(
+                    try table_changes.append(alloc, _manifest.deleteSSTableChange(
                         tbe.id,
                         namespace_id,
                         tree_id,
                         @intCast(llv_idx),
                     ));
-                    try table_changes.append(alloc, manifest.createSSTableChange(
+                    try table_changes.append(alloc, _manifest.createSSTableChange(
                         tbe.id,
                         namespace_id,
                         new_tree_id,
@@ -2040,7 +2040,7 @@ pub const Forest = struct {
                     // order: smallest key < split key <= biggest key
                     // Therefore, the split key falls within the table.
                     // Shared: keep in old tree, also add to new tree.
-                    try table_changes.append(alloc, manifest.createSSTableChange(tbe.id, namespace_id, new_tree_id, @intCast(llv_idx)));
+                    try table_changes.append(alloc, _manifest.createSSTableChange(tbe.id, namespace_id, new_tree_id, @intCast(llv_idx)));
                 }
                 // Left-only: no manifest change needed.
             }
@@ -2050,9 +2050,9 @@ pub const Forest = struct {
         const right_right_raw_key = try left_tree_state.right.marshal(alloc);
         const split_raw = try split_key.marshal(alloc);
 
-        const tree_changes = try alloc.alloc(manifest.TreeChange, 2);
-        tree_changes[0] = manifest.updateTreeChange(tree_id, namespace_id, left_left_raw_key, split_raw);
-        tree_changes[1] = manifest.createTreeChange(new_tree_id, namespace_id, split_raw, right_right_raw_key);
+        const tree_changes = try alloc.alloc(_manifest.TreeChange, 2);
+        tree_changes[0] = _manifest.updateTreeChange(tree_id, namespace_id, left_left_raw_key, split_raw);
+        tree_changes[1] = _manifest.createTreeChange(new_tree_id, namespace_id, split_raw, right_right_raw_key);
 
         return .{
             .sstable_changes = try table_changes.toOwnedSlice(alloc),
@@ -2066,7 +2066,7 @@ pub const Forest = struct {
     /// namespace routing. Called on all nodes after Raft commit. The new tree_id
     /// is derived deterministically (table's next split index), so there is no
     /// counter for a new leader to re-issue.
-    pub fn applySplit(self: *Forest, mc: manifest.ManifestChange) !void {
+    pub fn applySplit(self: *Forest, mc: _manifest.ManifestChange) !void {
         // Commit MANIFEST so we can recover from a crash.
         try self.ms.commit(mc.sstable_changes, mc.tree_changes);
 

@@ -25,13 +25,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
-const spinlock = @import("spinlock.zig");
-const rt = @import("runtime.zig");
+const _spinlock = @import("spinlock.zig");
+const _rt = @import("runtime.zig");
 
 pub const coro = zio.coro;
 const Coroutine = coro.Coroutine;
 const Context = coro.Context;
-const Spinlock = spinlock.Spinlock;
+const Spinlock = _spinlock.Spinlock;
 
 /// One pending deadline in a per-worker `Deadlines` min-heap. Each `Fiber`
 /// OWNS one of these (`Fiber.timeout`) rather than putting it on the caller's
@@ -151,10 +151,10 @@ pub fn JoinHandle(comptime T: type) type {
             }
             // Single-joiner: no OTHER fiber may already be parked on this handle.
             std.debug.assert(self.state.joiner == null);
-            self.state.joiner = rt.currentFiber();
+            self.state.joiner = _rt.currentFiber();
             self.state.sl.unlock();
 
-            rt.park();
+            _rt.park();
             if (!self.fiber.isFinished()) std.debug.panic(
                 "JoinHandle.join: woken but fiber 0x{x} not finished — spurious wake",
                 .{@intFromPtr(self.fiber)},
@@ -169,7 +169,7 @@ pub fn JoinHandle(comptime T: type) type {
         fn reap(self: *Self) T {
             self.cpu_total_ns = self.fiber.cpu_total_ns;
             const result = self.state.result;
-            rt.runtime().freeFiber(self.fiber);
+            _rt.runtime().freeFiber(self.fiber);
             return result;
         }
     };

@@ -22,13 +22,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const xev = @import("xev");
-const fb = @import("fiber.zig");
-const coarse = @import("coarse_clock.zig");
-const deadlines = @import("deadlines.zig");
-const spinlock = @import("spinlock.zig");
-const queue = @import("queue.zig");
-const fsops = @import("fsops.zig");
-const context = @import("context.zig");
+const _fb = @import("fiber.zig");
+const _coarse = @import("coarse_clock.zig");
+const _deadlines = @import("deadlines.zig");
+const _spinlock = @import("spinlock.zig");
+const _queue = @import("queue.zig");
+const _fsops = @import("fsops.zig");
+const _context = @import("context.zig");
 
 /// Flush a busy worker's io_uring SQ once this many SQEs have queued, so reads
 /// issued by running fibers dispatch promptly instead of waiting for the ~1 ms
@@ -52,22 +52,22 @@ var tsc_ns_per_cycle_q32: std.atomic.Value(u64) = .init(0);
 /// allocate workers → workers.run).
 threadlocal var tsc_factor_tls: u64 = 0;
 
-const Fiber = fb.Fiber;
-const State = fb.State;
-const Tag = fb.Tag;
-const Priority = fb.Priority;
-const Lane = fb.Lane;
-const SpawnOptions = fb.SpawnOptions;
-const FiberFn = fb.FiberFn;
-const YieldIntent = fb.YieldIntent;
+const Fiber = _fb.Fiber;
+const State = _fb.State;
+const Tag = _fb.Tag;
+const Priority = _fb.Priority;
+const Lane = _fb.Lane;
+const SpawnOptions = _fb.SpawnOptions;
+const FiberFn = _fb.FiberFn;
+const YieldIntent = _fb.YieldIntent;
 
-const LockedLocalQueue = queue.LocalQueue(.withlock);
-const IdleWorkers = queue.IdleWorkers;
+const LockedLocalQueue = _queue.LocalQueue(.withlock);
+const IdleWorkers = _queue.IdleWorkers;
 
-pub const CoarseClock = coarse.CoarseClock;
-pub const Deadlines = deadlines.Deadlines;
-pub const Timeout = deadlines.Timeout;
-pub const Spinlock = spinlock.Spinlock;
+pub const CoarseClock = _coarse.CoarseClock;
+pub const Deadlines = _deadlines.Deadlines;
+pub const Timeout = _deadlines.Timeout;
+pub const Spinlock = _spinlock.Spinlock;
 
 /// Scratch chunk for `trySteal`: a thief copies up to this many fibers out of
 /// a victim under its lock, releases, enqueues them on its own ring, then
@@ -184,7 +184,7 @@ pub const Worker = struct {
         var made: usize = 0;
         errdefer for (w.ready[0..made]) |*q| q.deinit();
         for (&w.ready) |*q| {
-            q.* = try LockedLocalQueue.init(allocator, queue.local_queue_capacity);
+            q.* = try LockedLocalQueue.init(allocator, _queue.local_queue_capacity);
             made += 1;
         }
     }
@@ -333,7 +333,7 @@ pub const Worker = struct {
                 if (n == 0) break; // balanced with the victim, or it drained
 
                 for (scratch[0..n]) |f| {
-                    if (comptime fb.guard_level >= 1) {
+                    if (comptime _fb.guard_level >= 1) {
                         // The stolen fiber must be runnable in the victim's ring.
                         const st = f.loadState();
                         if (st.tag != .ready) std.debug.panic(
@@ -460,7 +460,7 @@ pub const Worker = struct {
         // spill to the global queue, where a peer may legitimately pick
         // the fiber up the instant we let go.
         const finished = blk: {
-            if (comptime fb.guard_level >= 1) {
+            if (comptime _fb.guard_level >= 1) {
                 // Claim the step FIRST: if `running` reaches 2 a peer is
                 // concurrently stepping this fiber, so the context reads below
                 // would be a torn-read race. Firing this guard (not the rsp one)
@@ -481,7 +481,7 @@ pub const Worker = struct {
                     .{ @intFromPtr(f), @tagName(st.tag), st.awaken, self.id },
                 );
             }
-            defer if (comptime fb.guard_level >= 1) {
+            defer if (comptime _fb.guard_level >= 1) {
                 _ = f.running.fetchSub(1, .release);
             };
 
@@ -839,8 +839,8 @@ pub const Runtime = struct {
 
         // Blocking-I/O offload pool (fsync + fs metadata). Started before we
         // publish the singleton; no jobs arrive until fibers run.
-        try fsops.start(allocator, opts.io_threads);
-        errdefer fsops.stop();
+        try _fsops.start(allocator, opts.io_threads);
+        errdefer _fsops.stop();
 
         // Publish as the process singleton. There is exactly one runtime
         // alive at a time; `spawn` resolves it through `runtime()`.
@@ -850,7 +850,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         // Stop the offload pool first: join every pool thread so none is
         // mid-`wake()` into the runtime state we're about to free.
-        fsops.stop();
+        _fsops.stop();
         for (self.fibers.items) |f| {
             f.deinit(self.allocator);
         }
@@ -1055,7 +1055,7 @@ fn routeReady(rt: *Runtime, f: *Fiber) void {
 /// Lives in `fiber.zig` next to `JoinState`/`onFinished` (the whole join
 /// protocol in one file); re-exported here because the handle is what
 /// `spawn` returns.
-pub const JoinHandle = fb.JoinHandle;
+pub const JoinHandle = _fb.JoinHandle;
 
 /// Shared spawn body: init the fiber, register it, and make it runnable.
 /// `detached` (comptime) marks the fiber so `Worker.run` frees it on finish (it
@@ -1113,13 +1113,13 @@ pub fn spawn(
     opts: SpawnOptions,
     comptime func: anytype,
     args: std.meta.ArgsTuple(@TypeOf(func)),
-) !JoinHandle(fb.ReturnOf(func)) {
+) !JoinHandle(_fb.ReturnOf(func)) {
     const f = try spawnInner(opts, func, args, false);
     // Same comptime-generated Ctx type Fiber.init used to allocate `f.ctx`.
     // Accessing `&ctx.state` by name lets Zig compute the offset — no dependence
     // on field order in `Ctx`. Safe to deref: a non-detached fiber is freed only
     // by `join()`, so it can't have freed itself even if it already ran.
-    const ctx: *fb.Ctx(func) = @ptrCast(@alignCast(f.ctx));
+    const ctx: *_fb.Ctx(func) = @ptrCast(@alignCast(f.ctx));
     return .{ .fiber = f, .state = &ctx.state };
 }
 
@@ -1300,7 +1300,7 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
     // cap above the initial size means that priority's ring absorbed a burst
     // (peak depth was in [cap/2, cap)).
     try writer.print("  ring capacity (never shrinks → ≈ peak): hi_max={d} nm_max={d} (init {d})\n", .{
-        cap_hi, cap_nm, queue.local_queue_capacity,
+        cap_hi, cap_nm, _queue.local_queue_capacity,
     });
 }
 
@@ -1315,7 +1315,7 @@ pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {
     // either running/runnable (no stable stack), done, or not yet started.
     const Parked = struct { f: *Fiber, for_ms: i64 };
     var parked: std.ArrayList(Parked) = .empty;
-    defer parked.deinit(context.g().gpa);
+    defer parked.deinit(_context.g().gpa);
     var n_running: usize = 0;
     var n_finished: usize = 0;
     var n_new: usize = 0;
@@ -1328,7 +1328,7 @@ pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {
             .new => n_new += 1,
             .waiting => {
                 n_waiting += 1;
-                parked.append(context.g().gpa, .{
+                parked.append(_context.g().gpa, .{
                     .f = f,
                     .for_ms = now_ms - f.parked_since_ms,
                 }) catch {}; // best-effort: under memory pressure, drop + note below
@@ -1587,7 +1587,7 @@ fn writeStackTrace(writer: *std.Io.Writer, f: *const Fiber) !void {
 /// Best-effort: stripped / missing debug info degrades to the raw-address line
 /// already printed (resolve those offline with `addr2line` against the binary).
 fn symbolizeFrames(writer: *std.Io.Writer, addrs: []const usize) void {
-    const io = context.g().io;
+    const io = _context.g().io;
     const di = std.debug.getSelfDebugInfo() catch return; // stripped/unsupported
     var arena: std.heap.ArenaAllocator = .init(std.debug.getDebugInfoAllocator());
     defer arena.deinit();

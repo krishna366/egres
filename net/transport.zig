@@ -1,8 +1,8 @@
 const std = @import("std");
 const fiber = @import("zfiber");
-const serial_mod = @import("serial");
+const _serial = @import("serial");
 const utils = @import("utils");
-const Serial = serial_mod.Serial;
+const Serial = _serial.Serial;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.transport);
 
@@ -39,8 +39,8 @@ pub const Transport = struct {
         cluster_id: u64,
         listen_addr: []const u8, // "ip:port"
         ctx: *anyopaque,
-        on_message_p0: serial_mod.Serial.OnMessageFn,
-        on_message_p1: serial_mod.Serial.OnMessageFn,
+        on_message_p0: _serial.Serial.OnMessageFn,
+        on_message_p1: _serial.Serial.OnMessageFn,
     };
 
     const PeerSlot = struct {
@@ -479,7 +479,7 @@ pub const Transport = struct {
             }
 
             for (to_probe.items) |s| {
-                s.send(serial_mod.msg_type_ping, &.{}) catch |err| {
+                s.send(_serial.msg_type_ping, &.{}) catch |err| {
                     log.err("liveness: ping failed: {s}", .{@errorName(err)});
                 };
             }

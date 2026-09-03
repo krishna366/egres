@@ -1,24 +1,24 @@
 const std = @import("std");
 const fiber = @import("zfiber");
-const raftwal_mod = @import("raftwal.zig");
+const _raftwal = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const utils = @import("utils");
-const transport_mod = @import("transport");
-const Transport = transport_mod.Transport;
-const serial_mod = @import("serial");
-const Serial = serial_mod.Serial;
-const metrics = @import("metrics.zig");
+const _transport = @import("transport");
+const Transport = _transport.Transport;
+const _serial = @import("serial");
+const Serial = _serial.Serial;
+const _metrics = @import("metrics.zig");
 const raft_log = std.log.scoped(.raft);
 
-pub const NodeId = raftwal_mod.NodeId;
+pub const NodeId = _raftwal.NodeId;
 pub const State = enum {
     follower,
     candidate,
     leader,
     learner,
 };
-pub const ConfChange = raftwal_mod.ConfChange;
-pub const ConfChangeType = raftwal_mod.ConfChangeType;
+pub const ConfChange = _raftwal.ConfChange;
+pub const ConfChangeType = _raftwal.ConfChangeType;
 
 pub const PeerRole = zen.RoleEnum;
 
@@ -62,7 +62,7 @@ pub const ConfigError = error{
 pub const Watermark = fiber.Watermark;
 
 pub const DiskWAL = @import("diskwal.zig").DiskWAL;
-pub const RaftLogError = raftwal_mod.RaftLogError;
+pub const RaftLogError = _raftwal.RaftLogError;
 
 pub const RaftError = error{
     NotLeader,
@@ -87,8 +87,8 @@ pub const Peer = struct {
     addr: []const u8 = "",
 };
 
-pub const msg_type_raft = serial_mod.msg_type_raft;
-pub const msg_type_join_request = serial_mod.msg_type_join_request;
+pub const msg_type_raft = _serial.msg_type_raft;
+pub const msg_type_join_request = _serial.msg_type_join_request;
 
 pub const InboundMsg = struct {
     message_type: u16,
@@ -458,7 +458,7 @@ pub const Node = struct {
     fn handleP0Message(ctx: *anyopaque, conn: *Serial, message_type: u16, payload: []const u8) void {
         const self: *Node = @ptrCast(@alignCast(ctx));
         switch (message_type) {
-            serial_mod.msg_type_raft => {
+            _serial.msg_type_raft => {
                 const owned = self.allocator.dupe(u8, payload) catch return;
                 self.inbound_ch.send(.{
                     .message_type = message_type,
@@ -469,7 +469,7 @@ pub const Node = struct {
                 };
                 self.event_notify.notify();
             },
-            serial_mod.msg_type_join_request => {
+            _serial.msg_type_join_request => {
                 // Handle join requests in the Serial reader's coroutine directly.
                 // This blocks the reader until the join is processed, which is fine —
                 // the joiner waits for a response anyway.
@@ -582,7 +582,7 @@ pub const Node = struct {
         var reply_buf = writer.finishWithTail() catch return;
         defer reply_buf.deinit();
         const bytes = reply_buf.bytes orelse return;
-        conn.send(serial_mod.msg_type_join_request, bytes) catch |err| {
+        conn.send(_serial.msg_type_join_request, bytes) catch |err| {
             raft_log.err("sendJoinResponse failed: {s}", .{@errorName(err)});
         };
     }
@@ -593,7 +593,7 @@ pub const Node = struct {
         _ = conn; // dispatch only relays ids; responses go via the transport
         const self: *Node = @ptrCast(@alignCast(ctx));
         switch (message_type) {
-            serial_mod.msg_type_announce => {
+            _serial.msg_type_announce => {
                 const parsed = zen.parseMessageWithTail(payload) catch {
                     raft_log.err("announce: invalid message", .{});
                     return;
@@ -618,7 +618,7 @@ pub const Node = struct {
                     raft_log.err("announce: spawn failed: {s}", .{@errorName(err)});
                 };
             },
-            serial_mod.msg_type_announce_resp => {
+            _serial.msg_type_announce_resp => {
                 const parsed = zen.parseMessageWithTail(payload) catch {
                     raft_log.err("announce_resp: invalid message", .{});
                     return;
@@ -673,7 +673,7 @@ pub const Node = struct {
         defer value.decrRef();
         var peer_it = self.peers.iterator();
         while (peer_it.next()) |kv| {
-            tr.sendMsg(kv.key_ptr.*, .p1, serial_mod.msg_type_announce, value) catch {};
+            tr.sendMsg(kv.key_ptr.*, .p1, _serial.msg_type_announce, value) catch {};
         }
 
         // Poll the tallies. Enough oks (self included) → quorum holds the
@@ -744,7 +744,7 @@ pub const Node = struct {
         defer value.decrRef();
         // Via the transport, not the announce's conn: the conn can be torn
         // down and replaced while we were fetching.
-        tr.sendMsg(ann.sender_id, .p1, serial_mod.msg_type_announce_resp, value) catch |err| {
+        tr.sendMsg(ann.sender_id, .p1, _serial.msg_type_announce_resp, value) catch |err| {
             raft_log.err("announce {d}: resp send failed: {s}", .{ ann.announce_id, @errorName(err) });
         };
     }
@@ -846,9 +846,9 @@ pub const Node = struct {
         });
     }
 
-    pub fn confState(self: *Node) !raftwal_mod.ConfState {
+    pub fn confState(self: *Node) !_raftwal.ConfState {
         const total = self.peers.count() + 1; // +1 for self
-        var cs_peers = try self.allocator.alloc(raftwal_mod.ConfStatePeer, total);
+        var cs_peers = try self.allocator.alloc(_raftwal.ConfStatePeer, total);
         errdefer self.allocator.free(cs_peers);
         @memset(cs_peers, .{});
 
@@ -1073,7 +1073,7 @@ pub const Node = struct {
         while (it.next()) |kv| {
             const p = kv.value_ptr.*;
             if (p.next_index >= window_lo) {
-                tr.sendMsg(kv.key_ptr.*, .p0, serial_mod.msg_type_raft, cluster_value) catch {};
+                tr.sendMsg(kv.key_ptr.*, .p0, _serial.msg_type_raft, cluster_value) catch {};
             } else {
                 self.sendAppendEntries(kv.key_ptr.*) catch {};
             }
@@ -1132,7 +1132,7 @@ pub const Node = struct {
         const tr = self.transport orelse return;
         const value = try self.buildAppendEntries(state.next_index);
         defer value.decrRef();
-        tr.sendMsg(peer, .p0, serial_mod.msg_type_raft, value) catch |err| {
+        tr.sendMsg(peer, .p0, _serial.msg_type_raft, value) catch |err| {
             utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ peer, @errorName(err) });
         };
     }
@@ -1441,7 +1441,7 @@ pub const Node = struct {
     /// through the raft queue with `entry_type=.snapshot`. Followers receive
     /// the byte-identical proposal via AppendEntries; on apply, every node
     /// (leader included) installs via `Node.applySnapshotEntry`.
-    pub fn proposeSnapshot(self: *Node, snap: raftwal_mod.Snapshot) RaftError!void {
+    pub fn proposeSnapshot(self: *Node, snap: _raftwal.Snapshot) RaftError!void {
         const buf = try zen.marshalRoot(self.allocator, snap);
         defer self.allocator.free(buf);
 
@@ -1694,14 +1694,14 @@ pub const Node = struct {
             index += 1;
         }
 
-        metrics.g().observePhase("propose_build", t_build);
+        _metrics.g().observePhase("propose_build", t_build);
 
         // Sub-phase: propose_persist — DiskWAL.append batches the framed
         // records into one pwrite. The fdatasync is no longer issued here;
         // mainLoop spawns it in a fiber so it can overlap with broadcast.
         const t_persist = fiber.coarseMs();
         try self.log.append(entries.items);
-        metrics.g().observePhase("log_append", t_persist);
+        _metrics.g().observePhase("log_append", t_persist);
 
         if (has_conf) self.pending_conf_change = true;
     }
@@ -1727,7 +1727,7 @@ pub const Node = struct {
         // Drain depth — emitted before the early-out so a separate "queue was
         // empty" sample isn't accidentally generated (observeBatchSize skips
         // on count==0 anyway, but the early return below would skip it too).
-        metrics.g().observeBatchSize(batch.items.len);
+        _metrics.g().observeBatchSize(batch.items.len);
         if (batch.items.len == 0) return 0;
 
         defer for (batch.items) |req| self.allocator.free(req.data);
@@ -1874,7 +1874,7 @@ pub const Node = struct {
                             };
                             break;
                         }
-                        metrics.g().observePhase("apply", t_apply);
+                        _metrics.g().observePhase("apply", t_apply);
                     }
                 } else if (ety == .snapshot and reader.data().len > 0) {
                     self.applySnapshotEntry(reader.data()) catch |err| {
@@ -1967,7 +1967,7 @@ pub const Node = struct {
                     else => {},
                 }
             } else |_| {}
-            metrics.g().observePhase("inbound", t);
+            _metrics.g().observePhase("inbound", t);
 
             const ci_before = self.commit_index.load();
             const last_before = self.log.lastIndex();
@@ -1977,7 +1977,7 @@ pub const Node = struct {
             // "propose_persist") are observed inside appendProposalsToLeaderLog.
             t = fiber.coarseMs();
             _ = self.processProposalRequests() catch {};
-            metrics.g().observePhase("propose", t);
+            _metrics.g().observePhase("propose", t);
             const log_grew = self.log.lastIndex() > last_before;
 
             // Spawn WAL fsync into a sub-fiber so it can overlap with
@@ -2003,14 +2003,14 @@ pub const Node = struct {
                 sync_handle.join() catch |err| {
                     raft_log.err("node {d}: sync_handle.join (pre-advance) failed: {s}", .{ self.id, @errorName(err) });
                 };
-                metrics.g().observePhase("log_sync_q_one", t);
+                _metrics.g().observePhase("log_sync_q_one", t);
                 sync_pending = false;
             }
 
             // Phase: advance — advanceCommitIndex + applyConfChanges + notify.
             t = fiber.coarseMs();
             self.advance();
-            metrics.g().observePhase("advance", t);
+            _metrics.g().observePhase("advance", t);
 
             const ci_advanced = self.commit_index.load() > ci_before;
 
@@ -2025,7 +2025,7 @@ pub const Node = struct {
             // runs concurrently with these network sends.
             t = fiber.coarseMs();
             self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
-            metrics.g().observePhase("broadcast", t);
+            _metrics.g().observePhase("broadcast", t);
 
             // Phase: sync_wait — time waiting for the sync fiber to finish
             // AFTER broadcast already completed. Near-zero when sync fully
@@ -2036,7 +2036,7 @@ pub const Node = struct {
                 sync_handle.join() catch |err| {
                     raft_log.err("node {d}: sync_handle.join (post-broadcast) failed: {s}", .{ self.id, @errorName(err) });
                 };
-                metrics.g().observePhase("log_sync_q_many", t);
+                _metrics.g().observePhase("log_sync_q_many", t);
             }
         }
     }
@@ -2144,7 +2144,7 @@ pub const Node = struct {
             return;
         };
         defer value.decrRef();
-        tr.sendMsg(to, .p0, serial_mod.msg_type_raft, value) catch |err| {
+        tr.sendMsg(to, .p0, _serial.msg_type_raft, value) catch |err| {
             utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ to, @errorName(err) });
         };
     }

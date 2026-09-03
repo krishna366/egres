@@ -1,5 +1,5 @@
 const std = @import("std");
-const zen = @import("buffers.gen.zig");
+const _zen = @import("buffers.gen.zig");
 const Key = @import("kv.zig").Key;
 const TreeKey = @import("kv.zig").TreeKey;
 const TableKey = @import("kv.zig").TableKey;
@@ -424,7 +424,7 @@ pub const ForestState = struct {
             }
         }
 
-        var namespaces: std.ArrayList(zen.NamespaceStruct) = .empty;
+        var namespaces: std.ArrayList(_zen.NamespaceStruct) = .empty;
         var cit = self.namespaces.iterator();
         while (cit.next()) |kv| {
             try namespaces.append(a, .{
@@ -436,7 +436,7 @@ pub const ForestState = struct {
 
         // The arena holds the source changes; marshalRoot copies them into a
         // fresh `allocator`-owned payload, so the arena can be torn down after.
-        return zen.marshalRoot(allocator, ManifestChange{
+        return _zen.marshalRoot(allocator, ManifestChange{
             .tree_changes = tree_changes.items,
             .sstable_changes = table_changes.items,
             .namespaces = namespaces.items,
@@ -458,7 +458,7 @@ pub const ForestState = struct {
         while (nit.next()) |n| n.deinit(self.allocator);
         self.namespaces.clearRetainingCapacity();
 
-        const reader = try zen.ManifestChangeReader.parseRoot(bytes);
+        const reader = try _zen.ManifestChangeReader.parseRoot(bytes);
 
         // Order matters: trees must exist before tables can attach to them.
         const tc_len = reader.treeChangesLen();
@@ -523,10 +523,10 @@ pub const ForestState = struct {
 // Change types — aliases to generated structs
 // -------------------------------------------------------------------------
 
-pub const SSTableChange = zen.SSTableChangeStruct;
-pub const TreeChange = zen.TreeChangeStruct;
-pub const ManifestChange = zen.ManifestChangeStruct;
-pub const Command = zen.CommandEnum;
+pub const SSTableChange = _zen.SSTableChangeStruct;
+pub const TreeChange = _zen.TreeChangeStruct;
+pub const ManifestChange = _zen.ManifestChangeStruct;
+pub const Command = _zen.CommandEnum;
 
 pub fn createSSTableChange(sst_id: u64, namespace_id: u64, tree_id: u64, level: u32) SSTableChange {
     return .{ .op = .create, .sst_id = sst_id, .namespace_id = namespace_id, .tree_id = tree_id, .level = level };

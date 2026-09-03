@@ -11,30 +11,30 @@ const engine = @import("engine");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 
-const parse = @import("parse.zig");
-const key = @import("key.zig");
-const row = @import("row.zig");
-const scanner = @import("scanner.zig");
-const schema = @import("schema.zig");
-const table = @import("table.zig");
-const txn = @import("txn.zig");
-const value = @import("value.zig");
-const server = @import("server.zig");
+const _parse = @import("parse.zig");
+const _key = @import("key.zig");
+const _row = @import("row.zig");
+const _scanner = @import("scanner.zig");
+const _schema = @import("schema.zig");
+const _table = @import("table.zig");
+const _txn = @import("txn.zig");
+const _value = @import("value.zig");
+const _server = @import("server.zig");
 
-const Handler = server.Handler;
-const RowEmitter = scanner.RowEmitter;
-const Scanner = scanner.Scanner;
-const SetVal = scanner.SetVal;
-const String = value.String;
-const litToValue = scanner.litToValue;
-const resolveFilter = scanner.resolveFilter;
-const rewriteRowBytes = scanner.rewriteRowBytes;
+const Handler = _server.Handler;
+const RowEmitter = _scanner.RowEmitter;
+const Scanner = _scanner.Scanner;
+const SetVal = _scanner.SetVal;
+const String = _value.String;
+const litToValue = _scanner.litToValue;
+const resolveFilter = _scanner.resolveFilter;
+const rewriteRowBytes = _scanner.rewriteRowBytes;
 const log = std.log.scoped(.sql);
-const replyError = server.replyError;
-const replyErrorCode = server.replyErrorCode;
-const replyLockErr = server.replyLockErr;
+const replyError = _server.replyError;
+const replyErrorCode = _server.replyErrorCode;
+const replyLockErr = _server.replyLockErr;
 
-pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void {
+pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !void {
     const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
     const table_id = eng.forest.lookupTable(ns, ins.table) orelse
@@ -61,11 +61,11 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
     // TODO: allow user-provided egids once unique-index enforcement exists
     // — a below-counter egid needs a data-tree existence check, and
     // concurrent inserts of the same egid need apply-time validation.
-    const values = try arloc.alloc(value.Value, tbl.columns.len);
-    const target_cols: []const table.Column = blk: {
+    const values = try arloc.alloc(_value.Value, tbl.columns.len);
+    const target_cols: []const _table.Column = blk: {
         const cols = ins.columns orelse break :blk tbl.columns;
 
-        const list = try arloc.alloc(table.Column, cols.len);
+        const list = try arloc.alloc(_table.Column, cols.len);
         for (cols, list) |name, *target| {
             const col = tbl.column(name) orelse
                 return replyErrorCode(state, pgwire.sqlstate.undefined_column, "column does not exist");
@@ -122,7 +122,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
                     pgwire.sqlstate.not_null_violation,
                     "null value in primary key column violates not-null constraint",
                 );
-            prow.pkey = key.encodeIndexKey(arloc, val, null) catch |err|
+            prow.pkey = _key.encodeIndexKey(arloc, val, null) catch |err|
                 switch (err) {
                     error.OutOfMemory => return err,
                     error.Unencodable => return replyErrorCode(
@@ -135,7 +135,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
         if (bitmap_idxs.len > 0) {
             prow.bitmap_keys = try arloc.alloc(String, bitmap_idxs.len);
             for (bitmap_idxs, prow.bitmap_keys) |ix, *bm_key| {
-                bm_key.* = key.encodeIndexKey(
+                bm_key.* = _key.encodeIndexKey(
                     arloc,
                     values[ix.column.pos],
                     null,
@@ -146,7 +146,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
             }
         }
         // marshalRow reuses `buf`; dupe out before the next row clobbers it.
-        const bytes = try row.marshalRow(eng.allocator, &tbl.ps, values, &buf);
+        const bytes = try _row.marshalRow(eng.allocator, &tbl.ps, values, &buf);
         prow.bytes = try arloc.dupe(u8, bytes);
     }
 
@@ -198,7 +198,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
                 return replyError(state, "row id allocation failed");
             },
         };
-        const ekey = key.encodeEgid(egid);
+        const ekey = _key.encodeEgid(egid);
         try tx.put(table_id, &ekey, prow.bytes, .{});
         // The index entry's value is the row key: the same 8 BE bytes.
         if (tbl.primary_index) |pk|
@@ -217,7 +217,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: parse.Insert) !void
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "INSERT 0 {d}", .{ins.rows.len}));
 }
 
-pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void {
+pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !void {
     const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
     const table_id = eng.forest.lookupTable(ns, sel.table) orelse
@@ -237,7 +237,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void
 
     // Resolve outputs: `*` is the user columns; by name, egid resolves
     // like any other column (Table.column).
-    var cols: std.ArrayList(*const table.Column) = .empty;
+    var cols: std.ArrayList(*const _table.Column) = .empty;
     switch (sel.projection) {
         .star => for (t.columns) |*c| try cols.append(arloc, c),
         .columns => |names| for (names) |nm| {
@@ -254,7 +254,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void
     const fields = try arloc.alloc(pgwire.FieldDescription, cols.items.len);
     for (cols.items, fields) |c, *fd| fd.* = .{
         .name = c.name,
-        .type_oid = value.pgTypeOid(c.ty),
+        .type_oid = _value.pgTypeOid(c.ty),
         .format_code = 0,
     };
     // FOR UPDATE sends NOTHING until every lock is held: lockRow may
@@ -312,7 +312,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: parse.Select) !void
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "SELECT {d}", .{emitter.count}));
 }
 
-pub fn delete(self: *Handler, state: *pgwire.ConnState, del: parse.Delete) !void {
+pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !void {
     const eng = self.srv.engine;
 
     const ns = try self.sessionNamespace(state) orelse return;
@@ -373,7 +373,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: parse.Delete) !void
 
         for (items, index_keys) |item, *ik| {
             const pkv = tbl.read(item, pk.column);
-            ik.* = key.encodeIndexKey(arloc, pkv, null) catch |err|
+            ik.* = _key.encodeIndexKey(arloc, pkv, null) catch |err|
                 switch (err) {
                     error.OutOfMemory => return err,
                     error.Unencodable => {
@@ -398,10 +398,10 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: parse.Delete) !void
     // classes). All locking is done (run()'s row locks, the PK
     // block above), so no Restart can strand these.
     for (sc.items.items) |item| {
-        const egid = key.decodeEgid(item.key.primary).?;
+        const egid = _key.decodeEgid(item.key.primary).?;
         for (posting_idx) |ix| {
             const cell = tbl.read(item, ix.column);
-            const old_key = key.encodeIndexKey(arloc, cell, null) catch |err|
+            const old_key = _key.encodeIndexKey(arloc, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
                     else => return err,
@@ -423,7 +423,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: parse.Delete) !void
     try state.sendCommandComplete(tag);
 }
 
-pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void {
+pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void {
     const eng = self.srv.engine;
 
     const ns = try self.sessionNamespace(state) orelse return;
@@ -453,7 +453,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
     // encoded new key. Parse rejects duplicate SET columns, so
     // one entry per column.
     const MovedCol = struct {
-        index: *const table.Index,
+        index: *const _table.Index,
         new_key: String,
     };
     var moved_cols: std.ArrayList(MovedCol) = .empty;
@@ -491,7 +491,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
             if (ix.column != col) continue;
             try moved_cols.append(arloc, .{
                 .index = ix,
-                .new_key = key.encodeIndexKey(arloc, val, null) catch |err|
+                .new_key = _key.encodeIndexKey(arloc, val, null) catch |err|
                     switch (err) {
                         error.Unencodable => unreachable,
                         else => return err,
@@ -532,15 +532,15 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
     // NO locks per docs/transactions.md; all locking is done, so
     // no Restart can strand these), then rewrite and buffer the
     // row.
-    var dec: value.Row = .{};
+    var dec: _value.Row = .{};
     // Reused across items: marshalRow resets it, and tx.put
     // copies the bytes into the txn arena before returning.
     var rbuf: std.ArrayList(u8) = .empty;
     for (sc.items.items) |item| {
-        const egid = key.decodeEgid(item.key.primary).?;
+        const egid = _key.decodeEgid(item.key.primary).?;
         for (moved_cols.items) |mv| {
             const cell = t.read(item, mv.index.column);
-            const old_key = key.encodeIndexKey(arloc, cell, null) catch |err|
+            const old_key = _key.encodeIndexKey(arloc, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
                     else => return err,
@@ -575,9 +575,9 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: parse.Update) !void 
 fn coerceLiteral(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,
-    lit: parse.Literal,
-    ty: value.Type,
-) !?value.Value {
+    lit: _parse.Literal,
+    ty: _value.Type,
+) !?_value.Value {
     return litToValue(a, lit, ty) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.UnsupportedLiteral, error.UnsupportedType => {
@@ -613,9 +613,9 @@ fn lessThanBytes(_: void, x: []const u8, y: []const u8) bool {
 /// t.indexes, in a stable order callers zip parallel slices against.
 fn bitmapIndexes(
     a: std.mem.Allocator,
-    t: *const table.Table,
-) ![]const *const table.Index {
-    var list: std.ArrayList(*const table.Index) = .empty;
+    t: *const _table.Table,
+) ![]const *const _table.Index {
+    var list: std.ArrayList(*const _table.Index) = .empty;
     for (t.indexes) |*idx| {
         if (idx.unique) continue;
         try list.append(a, idx);

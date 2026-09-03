@@ -19,12 +19,12 @@
 //! must have a reason). FIFO fairness comes free.
 
 const std = @import("std");
-const fb = @import("fiber.zig");
-const rt = @import("runtime.zig");
-const reg = @import("lock_registry.zig");
+const _fb = @import("fiber.zig");
+const _rt = @import("runtime.zig");
+const _reg = @import("lock_registry.zig");
 
-const Fiber = fb.Fiber;
-const Spinlock = rt.Spinlock;
+const Fiber = _fb.Fiber;
+const Spinlock = _rt.Spinlock;
 
 /// Intrusive doubly-linked list of `*Fiber`. Fibers store their
 /// `waker_prev`/`waker_next` slots; a fiber can be in at most one
@@ -109,18 +109,18 @@ pub fn Mutex(comptime track: Track) type {
         /// Holder breadcrumb (acquire `@src` + timestamp + registry link), only
         /// when `.tracked`; `void` otherwise. Holder/waiter counts are derived
         /// from `state`/`waiters` at dump time, never stored here.
-        reg_node: if (track == .tracked) reg.Tracking else void =
+        reg_node: if (track == .tracked) _reg.Tracking else void =
             if (track == .tracked) .{} else {},
 
         /// Derive this lock's live state for `dumpLocks` from its own fields
         /// (racy reads — the system is wedged when we look).
-        fn snapshot(ptr: *anyopaque) reg.Snap {
+        fn snapshot(ptr: *anyopaque) _reg.Snap {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return .{ .held = self.state.load(.monotonic), .has_waiters = self.waiters.head != null };
         }
         inline fn record(self: *Self, comptime src: std.builtin.SourceLocation) void {
             // Comptime-elided when untracked — no cost, no `reg_node` access.
-            if (track == .tracked) reg.recordAcquire(&self.reg_node, self, &snapshot, src);
+            if (track == .tracked) _reg.recordAcquire(&self.reg_node, self, &snapshot, src);
         }
 
         /// Raw CAS — the old `tryLock` body, used internally by `lock` (which
@@ -151,10 +151,10 @@ pub fn Mutex(comptime track: Track) type {
                 self.record(src);
                 return;
             }
-            const f = rt.currentFiber();
+            const f = _rt.currentFiber();
             self.waiters.pushTail(f);
             self.sl.unlock();
-            rt.park();
+            _rt.park();
             // Resumed by `unlock`'s hand-off: we now hold the lock,
             // `state` is still 1, and the critical section is ours.
             // Verify the grant — a resume without it is a spurious wake.
@@ -185,13 +185,13 @@ pub fn Mutex(comptime track: Track) type {
             // a target worker's ready ring and issue an eventfd
             // notify (kernel syscall). Holding sl during that would
             // pin a peer thread to a cache line for an entire syscall.
-            if (waiter) |w| rt.wake(w);
+            if (waiter) |w| _rt.wake(w);
         }
 
         /// Unlink from the tracking registry before destruction (tracked only;
         /// no-op otherwise). Long-lived locks needn't call it.
         pub fn deinit(self: *Self) void {
-            if (track == .tracked) reg.unregister(&self.reg_node);
+            if (track == .tracked) _reg.unregister(&self.reg_node);
         }
     };
 }
@@ -221,7 +221,7 @@ pub const Condition = struct {
     /// untracked `Mutex` (they're distinct types). The reacquire passes this
     /// site's `@src()` — a cv wake that reacquires shows up as held here.
     pub fn wait(self: *Condition, mutex: anytype) void {
-        const f = rt.currentFiber();
+        const f = _rt.currentFiber();
 
         // Add to wait queue *before* releasing the mutex so a
         // concurrent `signal` from the next mutex-holder can find
@@ -232,7 +232,7 @@ pub const Condition = struct {
         self.sl.unlock();
 
         mutex.unlock();
-        rt.park();
+        _rt.park();
         mutex.lock(@src());
     }
 
@@ -240,7 +240,7 @@ pub const Condition = struct {
         self.sl.lock();
         const w = self.waiters.popHead();
         self.sl.unlock();
-        if (w) |f| rt.wake(f);
+        if (w) |f| _rt.wake(f);
     }
 
     /// Wake every fiber currently in the wait queue. We collect the
@@ -264,7 +264,7 @@ pub const Condition = struct {
         while (head) |f| {
             const next = f.waker_next;
             f.waker_next = null;
-            rt.wake(f);
+            _rt.wake(f);
             head = next;
         }
     }
@@ -311,10 +311,10 @@ pub fn RWMutex(comptime track: Track) type {
         /// records — the `readers` 0->1 edge under `sl` is the race-free
         /// "opener" signal, so concurrent readers don't fight over
         /// `holder_src` (no extra state needed).
-        reg_node: if (track == .tracked) reg.Tracking else void =
+        reg_node: if (track == .tracked) _reg.Tracking else void =
             if (track == .tracked) .{} else {},
 
-        fn snapshot(ptr: *anyopaque) reg.Snap {
+        fn snapshot(ptr: *anyopaque) _reg.Snap {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return .{
                 .held = if (self.writer) 1 else self.readers,
@@ -322,7 +322,7 @@ pub fn RWMutex(comptime track: Track) type {
             };
         }
         inline fn record(self: *Self, comptime src: std.builtin.SourceLocation) void {
-            if (track == .tracked) reg.recordAcquire(&self.reg_node, self, &snapshot, src);
+            if (track == .tracked) _reg.recordAcquire(&self.reg_node, self, &snapshot, src);
         }
 
         // ---- shared (read) ----
@@ -341,7 +341,7 @@ pub fn RWMutex(comptime track: Track) type {
         }
 
         pub fn lockShared(self: *Self, comptime src: std.builtin.SourceLocation) void {
-            const me = rt.currentFiber();
+            const me = _rt.currentFiber();
             while (true) {
                 self.sl.lock();
                 if (!self.writer and self.writers_pending == 0) {
@@ -353,7 +353,7 @@ pub fn RWMutex(comptime track: Track) type {
                 }
                 self.readers_wq.pushTail(me);
                 self.sl.unlock();
-                rt.park();
+                _rt.park();
             }
         }
 
@@ -367,7 +367,7 @@ pub fn RWMutex(comptime track: Track) type {
             if (self.readers == 0 and self.writers_pending > 0) {
                 const w = self.writers_wq.popHead();
                 self.sl.unlock();
-                if (w) |waiter| rt.wake(waiter);
+                if (w) |waiter| _rt.wake(waiter);
                 return;
             }
             self.sl.unlock();
@@ -388,14 +388,14 @@ pub fn RWMutex(comptime track: Track) type {
         }
 
         pub fn lock(self: *Self, comptime src: std.builtin.SourceLocation) void {
-            const me = rt.currentFiber();
+            const me = _rt.currentFiber();
 
             self.sl.lock();
             self.writers_pending += 1;
             while (self.readers > 0 or self.writer) {
                 self.writers_wq.pushTail(me);
                 self.sl.unlock();
-                rt.park();
+                _rt.park();
                 self.sl.lock();
             }
             // It's important to keep this writers_pending counter and have the just
@@ -420,7 +420,7 @@ pub fn RWMutex(comptime track: Track) type {
             if (self.writers_pending > 0) {
                 const w = self.writers_wq.popHead();
                 self.sl.unlock();
-                if (w) |waiter| rt.wake(waiter);
+                if (w) |waiter| _rt.wake(waiter);
                 return;
             }
 
@@ -437,7 +437,7 @@ pub fn RWMutex(comptime track: Track) type {
             while (to_wake) |f| {
                 const next = f.waker_next;
                 f.waker_next = null;
-                rt.wake(f);
+                _rt.wake(f);
                 to_wake = next;
             }
         }
@@ -445,7 +445,7 @@ pub fn RWMutex(comptime track: Track) type {
         /// Unlink from the tracking registry before destruction (tracked only;
         /// no-op otherwise).
         pub fn deinit(self: *Self) void {
-            if (track == .tracked) reg.unregister(&self.reg_node);
+            if (track == .tracked) _reg.unregister(&self.reg_node);
         }
     };
 }
@@ -471,9 +471,9 @@ pub const Notify = struct {
             return;
         }
         std.debug.assert(self.waiter == null);
-        self.waiter = rt.currentFiber();
+        self.waiter = _rt.currentFiber();
         self.sl.unlock();
-        rt.park();
+        _rt.park();
     }
 
     pub fn notify(self: *Notify) void {
@@ -487,6 +487,6 @@ pub const Notify = struct {
         self.sl.unlock();
 
         // Wake outside the spinlock (same rationale as Mutex.unlock).
-        if (w) |f| rt.wake(f);
+        if (w) |f| _rt.wake(f);
     }
 };

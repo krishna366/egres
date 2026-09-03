@@ -25,15 +25,15 @@
 //! schema load consume. Its own compiled-in schema, same as table 1's.
 
 const std = @import("std");
-const value = @import("value.zig");
-const schema = @import("schema.zig");
-const key = @import("key.zig");
+const _value = @import("value.zig");
+const _schema = @import("schema.zig");
+const _key = @import("key.zig");
 
-const Type = value.Type;
-const Value = value.Value;
-const Row = value.Row;
-const LogicalColumn = schema.LogicalColumn;
-const LogicalSchema = schema.LogicalSchema;
+const Type = _value.Type;
+const Value = _value.Value;
+const Row = _value.Row;
+const LogicalColumn = _schema.LogicalColumn;
+const LogicalSchema = _schema.LogicalSchema;
 
 /// Every namespace reserves table_id 1 for its column catalog and table_id 2
 /// for its index catalog (0 is the raw-KV default table; tids 3–15 stay
@@ -157,11 +157,11 @@ pub fn reconstruct(columns: []const LogicalColumn) LogicalSchema {
 /// order matches numeric order — a prefix scan over a table_id walks its
 /// columns in ascending column_id.
 pub fn encodeKey(owner_table_id: u32, column_id: u32) [8]u8 {
-    return (key.U64{ .upper = owner_table_id, .lower = column_id }).encode();
+    return (_key.U64{ .upper = owner_table_id, .lower = column_id }).encode();
 }
 
 pub fn decodeKey(k: []const u8) Error!Key {
-    const p = key.U64.decode(k) orelse return error.CorruptCatalogRow;
+    const p = _key.U64.decode(k) orelse return error.CorruptCatalogRow;
     return .{ .table_id = p.upper, .column_id = p.lower };
 }
 
