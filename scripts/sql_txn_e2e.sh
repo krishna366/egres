@@ -411,6 +411,66 @@ if [ "$(grep -c "INSERT 0 1" "$D/out2")" -gt "$GI0" ]; then
     ok "the insert proceeds once the guard's txn ends"
 else bad "insert never proceeded after the guard released"; fi
 
+# --- FOR UPDATE over more than one executor batch (1024 rows) ---------------
+# values_list <first id> <count>: "(i, 'ri'), ..." for one INSERT.
+values_list() {
+    local i=$1 end=$(($1 + $2)) sep=""
+    while [ "$i" -lt "$end" ]; do
+        printf '%s(%d, %s)' "$sep" "$i" "'r$i'"
+        sep=", "
+        i=$((i + 1))
+    done
+}
+q "CREATE TABLE wide (id int4, name text);" >/dev/null
+for s in $(seq 1 500 2500); do
+    q "INSERT INTO wide VALUES $(values_list "$s" 500);" >/dev/null
+done
+W0=$(grep -cE '^[0-9]+$' "$D/out1" || true)
+send 1 "BEGIN;"
+send 1 "SELECT id FROM wide FOR UPDATE;" # 2500 rows: drain, lock all, emit
+sync_session 1
+if [ "$(grep -cE '^[0-9]+$' "$D/out1" || true)" = "$((W0 + 2500))" ]; then
+    ok "FOR UPDATE emits every row across batches"
+else bad "FOR UPDATE over 2500 rows emitted the wrong count"; fi
+NU=$(grep -c "UPDATE 1" "$D/out2" || true)
+send 2 "UPDATE wide SET name = 'w' WHERE id = 2000;" # a row past batch 1
+sleep 0.3
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$NU" ]; then
+    ok "a row in a later batch is locked by FOR UPDATE"
+else bad "FOR UPDATE did not lock a row past the first batch"; fi
+send 1 "COMMIT;"
+sync_session 2
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$((NU + 1))" ]; then
+    ok "blocked writer lands after the multi-batch FOR UPDATE commits"
+else bad "blocked writer never landed"; fi
+
+# --- restart mid-drain: a full-table UPDATE parks, bumps, re-runs once -------
+# S2 holds row 1300 (mid-table). S1's UPDATE drains all 2500 rows, then
+# its lock pass parks on 1300. S2's commit changes that row's id, so
+# S1's lockRow sees a newer commit, bumps read_ts, Restarts, re-drains
+# from scratch and applies exactly once: one UPDATE 2500, every row
+# rewritten, and the re-read pre-image carries S2's id.
+send 2 "BEGIN;"
+send 2 "UPDATE wide SET id = 9999 WHERE id = 1300;"
+sync_session 2
+R0=$(grep -c "UPDATE 2500" "$D/out1" || true)
+send 1 "UPDATE wide SET name = 'r';" # drains, then parks on row 1300
+sleep 0.5
+send 2 "COMMIT;"
+sync_session 1
+if [ "$(grep -c "UPDATE 2500" "$D/out1" || true)" = "$((R0 + 1))" ]; then
+    ok "full-table UPDATE restarted past the held row and applied once"
+else bad "full-table UPDATE did not report UPDATE 2500 exactly once"; fi
+if grep -q "40001" "$D/out1"; then
+    bad "the mid-drain restart surfaced a serialization abort"
+else ok "no serialization abort during the mid-drain restart"; fi
+if [ "$(v "SELECT name FROM wide WHERE id = 9999;")" = "r" ]; then
+    ok "the restart re-read the concurrent commit"
+else bad "the restarted UPDATE missed the concurrent commit"; fi
+if q "SELECT id FROM wide WHERE name = 'r';" | grep -q "(2500 rows)"; then
+    ok "every row carries the restarted UPDATE's value"
+else bad "rows missing the restarted UPDATE's value"; fi
+
 # --- disconnect mid-txn: rollback + lock release (t is dropped; use t2) ------
 send 1 "BEGIN;"
 send 1 "INSERT INTO t2 VALUES (9, 'ghost');"

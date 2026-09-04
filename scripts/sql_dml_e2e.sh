@@ -162,6 +162,43 @@ expect "DELETE all" "DELETE 2" q "DELETE FROM t;" # a (egid 1), e (egid 5)
 expect "table empty" "(0 rows)" q "SELECT * FROM t;"
 expect "DELETE on empty is 0" "DELETE 0" q "DELETE FROM t;"
 
+# --- multi-batch: 5000 rows cross the executor's 1024-row batches ----------
+# values_list <first id> <count>: "(i, 'ri'), ..." for one INSERT.
+values_list() {
+    local i=$1 end=$(($1 + $2)) sep=""
+    while [ "$i" -lt "$end" ]; do
+        printf '%s(%d, %s)' "$sep" "$i" "'r$i'"
+        sep=", "
+        i=$((i + 1))
+    done
+}
+q "CREATE TABLE big (id int4, name text);" >/dev/null
+for s in $(seq 1 500 5000); do
+    q "INSERT INTO big VALUES $(values_list "$s" 500);" >/dev/null
+done
+expect "SELECT streams 5000 rows" "(5000 rows)" q "SELECT id FROM big;"
+expect "WHERE past batch 1" "r3000" v "SELECT name FROM big WHERE id = 3000;"
+expect "UPDATE 5000 rows" "UPDATE 5000" q "UPDATE big SET name = 'u';"
+expect "all rewritten" "(5000 rows)" q "SELECT id FROM big WHERE name = 'u';"
+expect "FOR UPDATE 5000 rows" "(5000 rows)" q "SELECT id FROM big FOR UPDATE;"
+expect "DELETE 5000 rows" "DELETE 5000" q "DELETE FROM big;"
+expect "big is empty" "(0 rows)" q "SELECT id FROM big;"
+
+# --- a row above the batch's byte capacity (256 KiB) -----------------------
+# The SQL text is too long for an argv entry, so it goes in on stdin.
+qin() { psql "$E" -X -f - <<<"$1"; }
+BIGTEXT=$(head -c 300000 /dev/zero | tr '\0' 'x')
+big_insert() { qin "INSERT INTO big VALUES ($1, '$BIGTEXT');"; }
+expect "INSERT 300 KB row" "INSERT 0 1" big_insert 1
+expect "INSERT second 300 KB row" "INSERT 0 1" big_insert 2
+expect "small row after them" "INSERT 0 1" q "INSERT INTO big VALUES (3, 's');"
+expect "oversized rows stream" "(3 rows)" q "SELECT id FROM big;"
+if [ "$(v "SELECT name FROM big WHERE id = 2;" | wc -c)" = "300001" ]; then
+    ok "oversized row round-trips intact"
+else bad "oversized row came back with the wrong length"; fi
+expect "UPDATE oversized rows" "UPDATE 3" q "UPDATE big SET id = 9;"
+expect "DELETE oversized rows" "DELETE 3" q "DELETE FROM big WHERE id = 9;"
+
 # --- no unexpected server-side errors --------------------------------------
 if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
 

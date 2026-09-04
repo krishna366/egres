@@ -1,8 +1,9 @@
 //! The four DML statement bodies — INSERT, SELECT, DELETE, UPDATE.
-//! Each resolves its table and WHERE, drives a Scanner for the rows it
-//! acts on (scanner.zig), maintains the PK index entry and any posting
-//! deltas, and buffers the result into the statement's txn. The restart
-//! loop that re-runs these on a read_ts bump lives in server.runDml.
+//! Each resolves its table and WHERE, plans the read (plan.zig) and
+//! runs it (exec.zig) for the rows it acts on, maintains the PK index
+//! entry and any posting deltas, and buffers the result into the
+//! statement's txn. The restart loop that re-runs these on a read_ts
+//! bump lives in server.runDml.
 //!
 //! Free functions over `*Handler` — see the note in ddl.zig.
 
@@ -11,25 +12,25 @@ const engine = @import("engine");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 
+const _exec = @import("exec.zig");
 const _parse = @import("parse.zig");
 const _key = @import("key.zig");
+const _plan = @import("plan.zig");
 const _pred = @import("pred.zig");
 const _row = @import("row.zig");
-const _scanner = @import("scanner.zig");
 const _schema = @import("schema.zig");
 const _table = @import("table.zig");
 const _txn = @import("txn.zig");
 const _value = @import("value.zig");
 const _server = @import("server.zig");
 
+const ExecCtx = _exec.ExecCtx;
 const Handler = _server.Handler;
-const RowEmitter = _scanner.RowEmitter;
-const Scanner = _scanner.Scanner;
-const SetVal = _scanner.SetVal;
+const Pred = _pred.Pred;
+const SetVal = _row.SetVal;
 const String = _value.String;
 const litToValue = _parse.litToValue;
-const resolveSource = _scanner.resolveSource;
-const rewriteRowBytes = _scanner.rewriteRowBytes;
+const updateRowBytes = _row.updateRowBytes;
 const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
 const replyErrorCode = _server.replyErrorCode;
@@ -265,46 +266,47 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
 
     var emitter = RowEmitter{
         .state = state,
-        .t = tbl,
+        .tbl = tbl,
         .outs = cols.items,
     };
 
-    // Plain SELECT streams matches to the wire as run() visits
-    // them; FOR UPDATE captures them (values included) to lock
-    // every one BEFORE the first byte is sent — the UPDATE/DELETE
-    // lock-all shape with "act" = emission.
-    var sc = Scanner{
-        .a = arloc,
-        .t = tbl,
-        .mode = if (sel.for_update)
-            .copy_value
-        else
-            .{ .emit_value = &emitter },
+    // Plain SELECT streams each batch to the wire; FOR UPDATE gathers
+    // the matches (values included) to lock every one BEFORE the
+    // first byte is sent — the UPDATE/DELETE lock-all shape with
+    // "act" = emission.
+    var plan = (try planFor(state, arloc, tbl, sel.where, .{
+        .lock = sel.for_update,
+    })) orelse return;
+    defer plan.deinit();
+    var ctx = ExecCtx{
+        .arloc = arloc,
+        .tx = tx,
+        .tbl = tbl,
+        .table_id = table_id,
         .lock = sel.for_update,
     };
-    if (sel.where) |where| {
-        const p = (try _pred.bind(state, arloc, tbl, where)) orelse return;
-        sc.residual = p;
-        sc.source = try resolveSource(arloc, tbl, p);
-    }
-    sc.run(eng, ns, table_id, tx) catch |err|
-        return replyRunErr(state, "select from", sel.table, err);
-    if (sc.err) |err| {
-        // Streaming: an emit error is a wire error — surface it
-        // to the serve loop. Capture: arena OOM — reply.
-        if (!sel.for_update) return err;
-        log.err("select from '{s}': collect: {s}", .{
-            sel.table, @errorName(err),
-        });
-        return replyError(state, "select failed");
-    }
+    const batch = try self.batch();
     if (sel.for_update) {
-        // run() returned with every match locked: none committed
-        // above read_ts (that lockRow would have bumped →
-        // restarted), so the captured values are the newest
-        // versions, frozen by our locks — emit them now.
+        // gatherAndLockRows returns with every match locked: none committed
+        // above read_ts (that lockRow would have bumped → restarted),
+        // so the gathered values are the newest versions, frozen by
+        // our locks — emit them now.
+        const rows = plan.root.materialize.gatherAndLockRows( //
+            &ctx, batch) catch |err|
+            return replyRunErr(state, "select from", sel.table, err);
+
         try state.sendRowDescription(fields);
-        for (sc.items.items) |item| try emitter.emit(item);
+        for (rows) |row| try emitter.emit(row);
+    } else {
+        while (true) {
+            // An executor error is a read failure — replied; an emit
+            // error is a wire error — surfaced to the serve loop.
+            const more = plan.root.next(&ctx, batch) catch |err|
+                return replyRunErr(state, "select from", sel.table, err);
+            if (!more) break;
+            var it = batch.selected();
+            while (it.next()) |row| try emitter.emit(row);
+        }
     }
 
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "SELECT {d}", .{emitter.count}));
@@ -332,41 +334,40 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         return replyError(state, "failed to load table schema");
     };
 
-    // Resolve WHERE: `egid = N` → a point lookup; a payload column
-    // → scan + compare; no WHERE → tombstone every live row. Either
-    // way run() captures the matches; every one is locked, then
-    // tombstoned from the capture.
+    // Plan the WHERE: an egid or indexed term drives point reads,
+    // anything else scans; no WHERE → tombstone every live row.
+    // Materialize gathers the matches and locks every one; then they
+    // are tombstoned from the gathered rows.
     const posting_idx = try bitmapIndexes(arloc, tbl);
-    var sc = Scanner{
-        .a = arloc,
-        .t = tbl,
+    var plan = (try planFor(state, arloc, tbl, del.where, .{
+        .lock = true,
         // Indexed tables keep the old bytes so every index entry —
         // the PK's (PK value → egid) and each posting's remove —
         // can be derived from the row being tombstoned.
-        .mode = if (tbl.indexes.len > 0) .copy_value else .no_value,
+        .keep_value = tbl.indexes.len > 0,
+    })) orelse return;
+    defer plan.deinit();
+
+    var ctx = ExecCtx{
+        .arloc = arloc,
+        .tx = tx,
+        .tbl = tbl,
+        .table_id = table_id,
         .lock = true,
     };
-    if (del.where) |where| {
-        const p = (try _pred.bind(state, arloc, tbl, where)) orelse return;
-        sc.residual = p;
-        sc.source = try resolveSource(arloc, tbl, p);
-    }
-    sc.run(eng, ns, table_id, tx) catch |err|
+    const batch = try self.batch();
+    const mat = &plan.root.materialize;
+    const rows = mat.gatherAndLockRows(&ctx, batch) catch |err|
         return replyRunErr(state, "delete from", del.table, err);
-    if (sc.err) |err| {
-        logDeleteErr(del.table, "collect", err);
-        return replyError(state, "delete failed");
-    }
 
-    // Lock and tombstone each captured row's PK index entry BEFORE the
+    // Lock and tombstone each gathered row's PK index entry BEFORE the
     // row tombstones: the index-key lock serializes against a concurrent
     // re-insert of the same key (whose fresh entry a late tombstone would
     // otherwise shadow). Locking may Restart — safe, nothing buffered yet.
     if (tbl.primary_index) |pk| {
-        const items = sc.items.items;
-        const index_keys = try arloc.alloc([]const u8, items.len);
+        const index_keys = try arloc.alloc([]const u8, rows.len);
 
-        for (items, index_keys) |item, *ik| {
+        for (rows, index_keys) |item, *ik| {
             const pkv = tbl.read(item, pk.column);
             ik.* = _key.encodeIndexKey(arloc, pkv, null) catch |err|
                 switch (err) {
@@ -390,9 +391,9 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
 
     // Non-unique indexes: remove each row's egid from its postings
     // — commuting deltas, NO locks (docs/transactions.md, lock
-    // classes). All locking is done (run()'s row locks, the PK
+    // classes). All locking is done (gatherAndLockRows' row locks, the PK
     // block above), so no Restart can strand these.
-    for (sc.items.items) |item| {
+    for (rows) |item| {
         const egid = _key.decodeEgid(item.key.primary).?;
         for (posting_idx) |ix| {
             const cell = tbl.read(item, ix.column);
@@ -405,12 +406,12 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         }
     }
 
-    // Past run()'s locks no candidate committed above read_ts — the
-    // captured rows are the newest versions, frozen by our locks, so
-    // they are tombstoned directly with no re-read.
-    for (sc.items.items) |item|
+    // Past gatherAndLockRows' locks no candidate committed above read_ts —
+    // the gathered rows are the newest versions, frozen by our locks,
+    // so they are tombstoned directly with no re-read.
+    for (rows) |item|
         try tx.put(table_id, item.key.primary, "", .{ .kind = .deleted });
-    const n = sc.items.items.len;
+    const n = rows.len;
     if (n > 0 and tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "delete", del.table)) return;
     }
@@ -480,7 +481,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         const val =
             (try coerceLiteral(state, arloc, clause.literal, col.ty)) orelse
             return;
-        sv.* = .{ .col = col, .val = val };
+        sv.* = .{ .pos = col.pos, .val = val };
 
         for (posting_idx) |ix| {
             if (ix.column != col) continue;
@@ -495,30 +496,28 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         }
     }
 
-    // Resolve WHERE: `egid = N` → a point lookup; a payload column
-    // → scan + compare; no WHERE → rewrite every live row. run()
-    // captures each match's PRE-image; the rewrite (and any
-    // posting moves, whose old keys come from that pre-image)
-    // happens post-lock.
-    var sc = Scanner{
-        .a = arloc,
-        .t = tbl,
-        .mode = .copy_value,
+    // Plan the WHERE: an egid or indexed term drives point reads,
+    // anything else scans; no WHERE → rewrite every live row.
+    // Materialize gathers each match's PRE-image and locks every
+    // one; the rewrite (and any posting moves, whose old keys come
+    // from that pre-image) happens post-lock.
+    var plan = (try planFor(state, arloc, tbl, up.where, .{
+        .lock = true,
+    })) orelse return;
+    defer plan.deinit();
+    var ctx = ExecCtx{
+        .arloc = arloc,
+        .tx = tx,
+        .tbl = tbl,
+        .table_id = table_id,
         .lock = true,
     };
-    if (up.where) |where| {
-        const p = (try _pred.bind(state, arloc, tbl, where)) orelse return;
-        sc.residual = p;
-        sc.source = try resolveSource(arloc, tbl, p);
-    }
-    sc.run(eng, ns, table_id, tx) catch |err|
+    const batch = try self.batch();
+    const mat = &plan.root.materialize;
+    const rows = mat.gatherAndLockRows(&ctx, batch) catch |err|
         return replyRunErr(state, "update", up.table, err);
-    if (sc.err) |err| {
-        log.err("update '{s}': collect: {s}", .{ up.table, @errorName(err) });
-        return replyError(state, "update failed");
-    }
-    // Past run()'s locks no candidate committed above read_ts — the
-    // captured pre-images are the newest versions, frozen by our
+    // Past gatherAndLockRows' locks no candidate committed above read_ts —
+    // the gathered pre-images are the newest versions, frozen by our
     // locks. Move each row's egid between postings when an indexed
     // column changed (equal keys move nothing — commuting deltas,
     // NO locks per docs/transactions.md; all locking is done, so
@@ -528,7 +527,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // Reused across items: marshalRow resets it, and tx.put
     // copies the bytes into the txn arena before returning.
     var rbuf: std.ArrayList(u8) = .empty;
-    for (sc.items.items) |item| {
+    for (rows) |item| {
         const egid = _key.decodeEgid(item.key.primary).?;
         for (moved_cols.items) |mv| {
             const cell = tbl.read(item, mv.index.column);
@@ -540,25 +539,67 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
             // If old_key and new_key match, there's no change. Skip.
             if (std.mem.eql(u8, old_key, mv.new_key)) continue;
 
-            try tx.putPosting(mv.index.index_table_id, old_key, egid, .remove);
-            try tx.putPosting(mv.index.index_table_id, mv.new_key, egid, .add);
+            try tx.putPosting(mv.index.index_table_id, //
+                old_key, egid, .remove);
+            try tx.putPosting(mv.index.index_table_id, //
+                mv.new_key, egid, .add);
         }
-        const rewritten = try rewriteRowBytes(
-            arloc,
-            &tbl.ps,
-            set_cols,
-            &dec,
-            item.value,
-            &rbuf,
-        );
+        const rewritten = try updateRowBytes(arloc, //
+            &tbl.ps, set_cols, &dec, item.value, &rbuf);
         try tx.put(table_id, item.key.primary, rewritten, .{});
     }
-    const n = sc.items.items.len;
+    const n = rows.len;
 
     if (tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "update", up.table)) return;
     }
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "UPDATE {d}", .{n}));
+}
+
+/// Turns each row into a projected DataRow on the wire — plain
+/// SELECT's sink per batch, and driven over a FOR UPDATE capture
+/// post-lock. Columns format straight into the frame (pgwire
+/// DataRowWriter), which the connection's buffered writer batches to
+/// the socket.
+pub const RowEmitter = struct {
+    state: *pgwire.ConnState,
+    tbl: *const _table.Table,
+    /// The projection — egid is a column too (table.egid_column).
+    outs: []const *const _table.Column,
+    count: u64 = 0,
+
+    /// Project and send one row — each output cell decoded on its own
+    /// (O(1) each, Table.read), no full-row decode.
+    pub fn emit(self: *RowEmitter, item: zdb.kv.Item) !void {
+        var dw = try self.state.beginDataRow(@intCast(self.outs.len));
+        for (self.outs) |col| {
+            const v = self.tbl.read(item, col);
+            if (v == .null_value) {
+                try dw.writeNull();
+            } else {
+                try _value.formatValue(try dw.beginColumn(), v);
+                dw.endColumn();
+            }
+        }
+        try dw.finish();
+        self.count += 1;
+    }
+};
+
+/// Bind the WHERE (null: every row) and plan it. null = bind already
+/// sent the error reply (the pred.bind convention).
+fn planFor(
+    state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
+    tbl: *const _table.Table,
+    where: ?_parse.Where,
+    opts: _plan.Options,
+) !?_plan.Plan {
+    var pred: ?*const Pred = null;
+    if (where) |tree| {
+        pred = (try _pred.bind(state, arloc, tbl, tree)) orelse return null;
+    }
+    return try _plan.plan(arloc, tbl, pred, opts);
 }
 
 /// litToValue plus the client-facing error mapping shared by INSERT
@@ -622,10 +663,10 @@ fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {
     );
 }
 
-/// Map a Scanner.run failure onto the wire: row-lock errors (run locks
-/// the matches when Scanner.lock is set) ride replyLockErr — Restart
-/// propagates to the statement driver — and anything else is an
-/// internal scan failure.
+/// Map an executor failure (root.next / gatherAndLockRows) onto the wire:
+/// row-lock errors (a locking plan locks the matches) ride
+/// replyLockErr — Restart propagates to the statement driver — and
+/// anything else is an internal read failure.
 fn replyRunErr(
     state: *pgwire.ConnState,
     comptime verb: []const u8,

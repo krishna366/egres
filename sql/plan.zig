@@ -3,8 +3,7 @@
 //! (seq_scan | fetch(bitmap))` — with the WHOLE predicate re-checked
 //! on the source, so a bitmap only has to be a SUPERSET of the rows
 //! and no remainder is ever computed. Files form a DAG: plan → exec →
-//! pred. Not yet driving DML (B3) — scanner.zig still serves
-//! statements.
+//! pred; dml.zig calls `plan` and drives the tree.
 
 const std = @import("std");
 const zdb = @import("zdb");
@@ -62,10 +61,10 @@ pub fn plan(
 
     var root = try arloc.create(RowNode);
     if (bitmap) |bm| {
-        const src = try arloc.create(BitmapNode);
-        src.* = bm;
+        const bnode = try arloc.create(BitmapNode);
+        bnode.* = bm;
         root.* = .{ .fetch = .{
-            .bnode = src,
+            .bnode = bnode,
             .pred = pred,
             .keep_value = opts.keep_value,
         } };

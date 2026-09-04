@@ -3,8 +3,7 @@
 //! them survive — and BitmapNodes that turn index reads into egid sets.
 //! The source copies; operators after it only clear bits; sinks
 //! (Materialize, the wire emitter) are the only ones to touch bytes
-//! again. Design and the benchmarks behind it: the plan's §2. Not yet
-//! wired into DML (B3) — scanner.zig still serves statements.
+//! again. plan.zig builds the trees; dml.zig drives them.
 
 const std = @import("std");
 const zdb = @import("zdb");
@@ -563,7 +562,7 @@ pub const Materialize = struct {
     /// once EVERY lock is held (lockRow may Restart the statement, which
     /// is safe exactly because nothing was written or sent yet). `batch`
     /// is scratch to drive the child.
-    pub fn gatherRows(
+    pub fn gatherAndLockRows(
         self: *Materialize,
         ctx: *ExecCtx,
         batch: *Batch,
@@ -605,7 +604,7 @@ pub const Materialize = struct {
         ctx: *ExecCtx,
         batch: *Batch,
     ) anyerror!bool {
-        const rows = try self.gatherRows(ctx, batch);
+        const rows = try self.gatherAndLockRows(ctx, batch);
         batch.reset();
 
         const n = batch.appendRefs(rows[self.pos..]);

@@ -4,9 +4,9 @@
 //! state, statement dispatch, the DML restart driver, and transaction
 //! lifetime. The statements themselves live in siblings: ddl.zig
 //! (catalog/manifest choreography), dml.zig (INSERT/SELECT/DELETE/
-//! UPDATE), scanner.zig (WHERE resolution + the row pipeline). Mirrors
-//! AdminServer's accept loop, and shuts down with the engine via
-//! `node.isShuttingDown()`.
+//! UPDATE), plan.zig (index vs. scan) and exec.zig (the row
+//! pipeline). Mirrors AdminServer's accept loop, and shuts down with
+//! the engine via `node.isShuttingDown()`.
 
 const std = @import("std");
 const engine = @import("engine");
@@ -19,6 +19,7 @@ const _catalog = @import("catalog.zig");
 const _parse = @import("parse.zig");
 const _ddl = @import("ddl.zig");
 const _dml = @import("dml.zig");
+const _exec = @import("exec.zig");
 const _row = @import("row.zig");
 const _key = @import("key.zig");
 const _schema = @import("schema.zig");
@@ -377,6 +378,10 @@ pub const Handler = struct {
     /// bumped read_ts must survive the retry. Heap — it outlives
     /// individual statements.
     txn: ?*_txn.Txn = null,
+    /// The executor's row batch — one per connection, created on the
+    /// first DML and reused by every statement after (a portal will
+    /// keep it across Execute messages). See `batch`.
+    exec_batch: ?_exec.Batch = null,
 
     /// Session teardown: roll back any open transaction. Wired as a
     /// defer in handleConn, so it runs on every exit from serve.
@@ -385,6 +390,15 @@ pub const Handler = struct {
             self.destroyTxn(t);
             self.txn = null;
         }
+        if (self.exec_batch) |*b| b.deinit();
+    }
+
+    /// The session's row batch, made on first use.
+    pub fn batch(self: *Handler) !*_exec.Batch {
+        if (self.exec_batch == null) {
+            self.exec_batch = try _exec.Batch.init(self.srv.engine.allocator);
+        }
+        return &self.exec_batch.?;
     }
 
     pub fn destroyTxn(self: *Handler, t: *_txn.Txn) void {

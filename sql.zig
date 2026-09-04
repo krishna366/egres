@@ -24,13 +24,9 @@
 //!         and its SQL three-valued evaluation per row.
 //! exec:   the pull executor — RowNodes exchanging one Batch (rows
 //!         copied once at the source + a survivor bit set) and
-//!         BitmapNodes turning index reads into egid sets. Not yet
-//!         driving DML.
+//!         BitmapNodes turning index reads into egid sets.
 //! plan:   the planner — a bound Pred to a tree of exec nodes; the one
-//!         place that chooses index vs. scan. Not yet driving DML.
-//! scanner: source selection (the planner) and the row pipeline every
-//!         statement reads through — table scan, egid lookups, unique
-//!         index lookup, posting bitmap — filtered by the Pred.
+//!         place that chooses index vs. scan.
 
 const std = @import("std");
 
@@ -49,7 +45,6 @@ pub const dml = @import("sql/dml.zig");
 pub const exec = @import("sql/exec.zig");
 pub const plan = @import("sql/plan.zig");
 pub const pred = @import("sql/pred.zig");
-pub const scanner = @import("sql/scanner.zig");
 
 pub const Server = server.Server;
 pub const default_database = server.default_database;

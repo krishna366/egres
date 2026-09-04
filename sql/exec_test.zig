@@ -483,7 +483,7 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
     var node = RowNode{ .materialize = .{ .child = &scan } };
     defer node.deinit();
 
-    const rows = try node.materialize.gatherRows(&ctx, &b);
+    const rows = try node.materialize.gatherAndLockRows(&ctx, &b);
     try testing.expectEqual(@as(usize, 1250), rows.len);
     try testing.expectEqual(@as(usize, 1250), tx.held.items.len);
     var last: u64 = 0;
@@ -502,7 +502,7 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
     // Second call is idempotent; next() streams the capture in batches
     // by reference: the batch's bytes stay empty, rows point into the
     // arena.
-    const again = try node.materialize.gatherRows(&ctx, &b);
+    const again = try node.materialize.gatherAndLockRows(&ctx, &b);
     try testing.expectEqual(rows.ptr, again.ptr);
     var total: usize = 0;
     var batches: usize = 0;

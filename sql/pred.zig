@@ -2,8 +2,8 @@
 //! tree — parse.Where with its columns bound to the table and its
 //! literals coerced to the columns' types — and `eval` is its SQL
 //! three-valued evaluation against one row. Choosing HOW rows are read
-//! (index vs. scan) is scanner.resolveSource's job; a Pred only says
-//! which rows match.
+//! (index vs. scan) is plan.zig's job; a Pred only says which rows
+//! match.
 
 const std = @import("std");
 const pgwire = @import("pgwire");
