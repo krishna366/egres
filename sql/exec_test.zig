@@ -1,0 +1,519 @@
+const std = @import("std");
+const testing = std.testing;
+const fiber = @import("zfiber");
+const sql = @import("sql");
+const utils = @import("utils");
+const zdb = @import("zdb");
+
+const exec = sql.exec;
+const Batch = exec.Batch;
+const BitmapNode = exec.BitmapNode;
+const RowNode = exec.RowNode;
+const Pred = sql.pred.Pred;
+const Table = sql.table.Table;
+const Txn = sql.txn.Txn;
+const Oracle = sql.oracle.Oracle;
+const Forest = zdb.forest.Forest;
+const Item = zdb.kv.Item;
+const Value = sql.value.Value;
+const zroar = zdb.zroar;
+
+const ns: u64 = 16;
+const tid: u32 = 16;
+const read_ts: u64 = 500;
+
+/// Builds a fixture's committed rows under the table's layout.
+const RowBuilder = *const fn (
+    a: std.mem.Allocator,
+    tbl: *const Table,
+) anyerror![]const Item;
+
+/// A Forest in a tmpdir with one tree for (ns, tid) and the built rows,
+/// the lock map and oracle a Txn needs, and a hand-built table
+/// (a int4, b text) whose layout the rows were marshalled under.
+const Fixture = struct {
+    tmp: std.testing.TmpDir,
+    dir_path: [:0]u8,
+    forest: *Forest,
+    sm: fiber.SemaphoreMap,
+    oracle: Oracle,
+    arena: std.heap.ArenaAllocator,
+    tbl: Table,
+
+    fn setup(build: RowBuilder) !Fixture {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const logical = [_]sql.schema.LogicalColumn{
+            .{ .column_id = 1, .name = "a", .ty = .int4 },
+            .{ .column_id = 2, .name = "b", .ty = .text },
+        };
+        const ps = try sql.schema.compile(
+            a,
+            .{ .columns = &logical, .current_version = 1 },
+            1,
+        );
+        const columns = try a.alloc(sql.table.Column, 2);
+        columns[0] = .{
+            .column_id = 1,
+            .pos = 0,
+            .name = "a",
+            .ty = .int4,
+            .pkey_position = null,
+        };
+        columns[1] = .{
+            .column_id = 2,
+            .pos = 1,
+            .name = "b",
+            .ty = .text,
+            .pkey_position = null,
+        };
+        const tbl = Table{
+            .columns = columns,
+            .indexes = try a.alloc(sql.table.Index, 0),
+            .primary_index = null,
+            .ps = ps,
+            .version = 1,
+            .arena = std.heap.ArenaAllocator.init(testing.allocator),
+        };
+
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const dir_path = try tmp.dir.realPathFileAlloc(
+            utils.context.g().io,
+            ".",
+            testing.allocator,
+        );
+        errdefer testing.allocator.free(dir_path);
+
+        const f = try Forest.open(testing.allocator, .{ .dir = dir_path });
+        errdefer f.close();
+        _ = try f.createTree(ns, tid, .{ .inf = true });
+        try f.put(try build(a, &tbl));
+
+        return .{
+            .tmp = tmp,
+            .dir_path = dir_path,
+            .forest = f,
+            .sm = try fiber.SemaphoreMap.init(testing.allocator),
+            .oracle = Oracle.init(testing.allocator),
+            .arena = arena,
+            .tbl = tbl,
+        };
+    }
+
+    fn teardown(self: *Fixture) void {
+        self.tbl.deinit();
+        self.oracle.deinit();
+        self.sm.deinit();
+        self.forest.close();
+        testing.allocator.free(self.dir_path);
+        self.tmp.cleanup();
+        self.arena.deinit();
+    }
+
+    fn txn(self: *Fixture) Txn {
+        return Txn.init(
+            testing.allocator,
+            1,
+            ns,
+            read_ts,
+            1,
+            &self.sm,
+            &self.oracle,
+            self.forest,
+        );
+    }
+
+    fn ctx(self: *Fixture, tx: *Txn, lock: bool) exec.ExecCtx {
+        return .{
+            .arloc = self.arena.allocator(),
+            .tx = tx,
+            .tbl = &self.tbl,
+            .table_id = tid,
+            .lock = lock,
+        };
+    }
+
+    fn col(self: *const Fixture, name: []const u8) *const sql.table.Column {
+        return self.tbl.column(name).?;
+    }
+};
+
+/// A stored row: the egid in the key, (a, b) marshalled under `tbl`.
+fn row(
+    a: std.mem.Allocator,
+    tbl: *const Table,
+    egid: u64,
+    a_val: i32,
+    b_val: []const u8,
+) !Item {
+    var buf: std.ArrayList(u8) = .empty;
+    const cells = [_]Value{ .{ .int4 = a_val }, .{ .text = b_val } };
+    const bytes = try sql.row.marshalRow(a, &tbl.ps, &cells, &buf);
+    return .{
+        .key = .{
+            .namespace = ns,
+            .table_id = tid,
+            .primary = try a.dupe(u8, &sql.key.encodeEgid(egid)),
+            .timestamp = 100,
+        },
+        .value = bytes,
+        .meta = .{},
+    };
+}
+
+fn noRows(_: std.mem.Allocator, _: *const Table) anyerror![]const Item {
+    return &.{};
+}
+
+/// 2500 rows: a = egid, b alternates "x" (even egid) / "y".
+fn alternatingRows(
+    a: std.mem.Allocator,
+    tbl: *const Table,
+) anyerror![]const Item {
+    const items = try a.alloc(Item, 2500);
+    for (items, 1..) |*it, egid| {
+        const b_val: []const u8 = if (egid % 2 == 0) "x" else "y";
+        it.* = try row(a, tbl, egid, @intCast(egid), b_val);
+    }
+    return items;
+}
+
+/// 400 rows with 1 KiB text — a batch's byte cap fills before its row cap.
+fn wideRows(a: std.mem.Allocator, tbl: *const Table) anyerror![]const Item {
+    const wide = try a.alloc(u8, 1024);
+    @memset(wide, 'w');
+    const items = try a.alloc(Item, 400);
+    for (items, 1..) |*it, egid| {
+        it.* = try row(a, tbl, egid, @intCast(egid), wide);
+    }
+    return items;
+}
+
+fn tinyItem(primary: *const [8]u8, value: []const u8) Item {
+    return .{
+        .key = .{
+            .namespace = ns,
+            .table_id = tid,
+            .primary = primary,
+            .timestamp = 1,
+        },
+        .value = value,
+        .meta = .{},
+    };
+}
+
+fn firstEgid(b: *const Batch) u64 {
+    return sql.key.decodeEgid(b.rows.items[0].key.primary).?;
+}
+
+test "sql.exec: Batch row cap, byte cap, growth only when empty" {
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+    const cap0 = b.bytes.capacity;
+    try testing.expectEqual(exec.byte_cap, cap0);
+
+    // Row cap: 1024 tiny rows in, the 1025th refused, every slice resolves.
+    var keys: [exec.row_cap][8]u8 = undefined;
+    for (&keys, 1..) |*k, egid| k.* = sql.key.encodeEgid(egid);
+    for (&keys) |*k| try testing.expect(try b.append(tinyItem(k, "v"), true));
+    try testing.expect(b.full());
+    try testing.expect(!try b.append(tinyItem(&keys[0], "v"), true));
+    try testing.expectEqual(@as(usize, exec.row_cap), b.sel.count());
+    try testing.expectEqual(cap0, b.bytes.capacity);
+    var n: usize = 0;
+    var it = b.selected();
+    while (it.next()) |r| : (n += 1) {
+        try testing.expectEqual(n + 1, sql.key.decodeEgid(r.key.primary).?);
+        try testing.expectEqualStrings("v", r.value);
+    }
+    try testing.expectEqual(@as(usize, exec.row_cap), n);
+
+    // Byte cap: 1 KiB values fill the bytes long before 1024 rows; the
+    // first row that does not fit is refused and the capacity is untouched.
+    b.reset();
+    try testing.expectEqual(@as(usize, 0), b.sel.count());
+    const big = [_]u8{0xAB} ** 1024;
+    n = 0;
+    try testing.expect(!b.full());
+    while (try b.append(tinyItem(&keys[n], &big), true)) n += 1;
+    try testing.expectEqual(exec.byte_cap / (8 + big.len), n);
+    try testing.expectEqual(n, b.numRows());
+    try testing.expectEqual(cap0, b.bytes.capacity);
+    // A refusal for bytes closes the fill: full() agrees with append()
+    // even though the row limit is far away, and a tiny row that would
+    // fit is refused too. reset() reopens.
+    try testing.expect(b.full());
+    try testing.expect(!try b.append(tinyItem(&keys[0], "v"), true));
+    b.reset();
+    try testing.expect(!b.full());
+
+    // keep_value = false copies the key only.
+    try testing.expect(try b.append(tinyItem(&keys[0], &big), false));
+    try testing.expectEqual(@as(usize, 8), b.bytes.items.len);
+    try testing.expectEqualStrings("", b.rows.items[0].value);
+
+    // One oversized row is admitted into an EMPTY batch by growing.
+    b.reset();
+    const huge = try testing.allocator.alloc(u8, exec.byte_cap + 1);
+    defer testing.allocator.free(huge);
+    @memset(huge, 1);
+    try testing.expect(try b.append(tinyItem(&keys[0], huge), true));
+    try testing.expectEqual(@as(usize, 1), b.numRows());
+    try testing.expect(b.bytes.capacity > cap0);
+    try testing.expectEqualSlices(u8, huge, b.rows.items[0].value);
+}
+
+test "sql.exec: BitmapNode and_/or_/egids algebra" {
+    var fx = try Fixture.setup(&noRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+
+    const leaf = struct {
+        fn make(vals: []const u64) !BitmapNode {
+            var bm = try zroar.Bitmap.init(testing.allocator);
+            errdefer bm.deinit();
+            for (vals) |v| _ = try bm.set(v);
+            return .{ .egids = bm };
+        }
+    }.make;
+
+    var and_kids = [_]BitmapNode{
+        try leaf(&.{ 1, 2, 3 }),
+        try leaf(&.{ 2, 3, 4 }),
+    };
+    var and_node = BitmapNode{ .and_ = &and_kids };
+    defer and_node.deinit();
+    try testing.expect(!and_node.fromIndex());
+    var got = try and_node.eval(&ctx);
+    defer got.deinit();
+    try testing.expectEqual(@as(u64, 2), got.getCardinality());
+    try testing.expect(got.contains(2) and got.contains(3));
+
+    var or_kids = [_]BitmapNode{
+        try leaf(&.{ 1, 2, 3 }),
+        try leaf(&.{ 2, 3, 4 }),
+        try leaf(&.{9}),
+    };
+    var or_node = BitmapNode{ .or_ = &or_kids };
+    defer or_node.deinit();
+    var got_or = try or_node.eval(&ctx);
+    defer got_or.deinit();
+    try testing.expectEqual(@as(u64, 5), got_or.getCardinality());
+    try testing.expect(got_or.contains(1));
+    try testing.expect(got_or.contains(4) and got_or.contains(9));
+
+    // AND with an empty leaf is empty; the leaf's own bitmap is untouched
+    // (eval hands out clones).
+    var empty_kids = [_]BitmapNode{ try leaf(&.{}), try leaf(&.{ 1, 2 }) };
+    var empty_and = BitmapNode{ .and_ = &empty_kids };
+    defer empty_and.deinit();
+    var got_empty = try empty_and.eval(&ctx);
+    defer got_empty.deinit();
+    try testing.expect(got_empty.isEmpty());
+    try testing.expectEqual(@as(u64, 2), empty_kids[1].egids.getCardinality());
+}
+
+test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // No predicate: 2500 rows in 3 batches, all full but the last.
+    {
+        var node = RowNode{ .seq_scan = .{} };
+        defer node.deinit();
+        var batches: usize = 0;
+        var total: usize = 0;
+        var last: u64 = 0;
+        while (try node.next(&ctx, &b)) : (batches += 1) {
+            if (batches < 2) try testing.expect(b.full());
+            try testing.expectEqual(b.numRows(), b.sel.count());
+            var it = b.selected();
+            while (it.next()) |r| : (total += 1) {
+                const egid = sql.key.decodeEgid(r.key.primary).?;
+                try testing.expect(egid > last);
+                last = egid;
+                const a_val = fx.tbl.read(r, fx.col("a"));
+                try testing.expectEqual(Value{ .int4 = @intCast(egid) }, a_val);
+            }
+        }
+        try testing.expectEqual(@as(usize, 3), batches);
+        try testing.expectEqual(@as(usize, 2500), total);
+        try testing.expect(!try node.next(&ctx, &b)); // sticky
+    }
+
+    // b = 'x': half the rows, and the batch holds bytes for matches ONLY.
+    {
+        const pred = Pred{
+            .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
+        };
+        var node = RowNode{ .seq_scan = .{ .pred = &pred } };
+        defer node.deinit();
+        var total: usize = 0;
+        while (try node.next(&ctx, &b)) {
+            const row_len = 8 + b.rows.items[0].value.len;
+            try testing.expectEqual(b.numRows() * row_len, b.bytes.items.len);
+            var it = b.selected();
+            while (it.next()) |r| : (total += 1) {
+                const b_val = fx.tbl.read(r, fx.col("b"));
+                try testing.expectEqualStrings("x", b_val.text);
+            }
+        }
+        try testing.expectEqual(@as(usize, 1250), total);
+    }
+}
+
+test "sql.exec: row_limit bounds a fill — a LIMIT pulls only what it needs" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+    b.row_limit = 10;
+
+    var node = RowNode{ .seq_scan = .{} };
+    defer node.deinit();
+    try testing.expect(try node.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, 10), b.numRows());
+    try testing.expect(b.full());
+    // The scan stopped AT the limit — nothing was pulled past row 10.
+    try testing.expect(try node.next(&ctx, &b));
+    try testing.expectEqual(@as(u64, 11), firstEgid(&b));
+    // Raising the limit takes effect on the next fill.
+    b.row_limit = exec.row_cap;
+    try testing.expect(try node.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, exec.row_cap), b.numRows());
+    try testing.expectEqual(@as(u64, 21), firstEgid(&b));
+}
+
+test "sql.exec: fetch under lock: one lock per egid, held row across batches" {
+    var fx = try Fixture.setup(&wideRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, true);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // egids 1..300 plus one that does not exist — a literal id, so it
+    // is skipped quietly.
+    var bm = try zroar.Bitmap.init(testing.allocator);
+    for (1..301) |egid| _ = try bm.set(egid);
+    _ = try bm.set(9_999);
+    var leaf = BitmapNode{ .egids = bm };
+
+    // The fetch owns its bitmap tree: one deinit frees the leaf too.
+    var node = RowNode{ .fetch = .{ .bnode = &leaf } };
+    defer node.deinit();
+    try testing.expectEqual(@as(usize, 0), tx.held.items.len);
+    var batches: usize = 0;
+    var total: usize = 0;
+    var last: u64 = 0;
+    while (try node.next(&ctx, &b)) : (batches += 1) {
+        // 1 KiB rows: the byte cap ends a batch well before 300 rows.
+        try testing.expect(b.numRows() < 300);
+        var it = b.selected();
+        while (it.next()) |r| : (total += 1) {
+            const egid = sql.key.decodeEgid(r.key.primary).?;
+            try testing.expect(egid > last);
+            last = egid;
+        }
+    }
+    try testing.expectEqual(@as(usize, 300), total);
+    try testing.expect(batches >= 2);
+    // One lock per egid named — the absent one included: it is locked
+    // BEFORE its read, which is what makes it a phantom-insert guard.
+    try testing.expectEqual(@as(usize, 301), tx.held.items.len);
+}
+
+test "sql.exec: filter clears bits and copies nothing" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    const pred = Pred{
+        .eq = .{ .col = fx.col("b"), .val = .{ .text = "y" } },
+    };
+    var scan = RowNode{ .seq_scan = .{} };
+    var node = RowNode{ .filter = .{ .child = &scan, .pred = &pred } };
+    defer node.deinit();
+    var total: usize = 0;
+    while (try node.next(&ctx, &b)) {
+        // Every scanned row is still in the batch; only the bits changed.
+        const row_len = 8 + b.rows.items[0].value.len;
+        try testing.expectEqual(b.numRows() * row_len, b.bytes.items.len);
+        try testing.expect(b.sel.count() < b.numRows());
+        var it = b.selected();
+        while (it.next()) |r| : (total += 1) {
+            const b_val = fx.tbl.read(r, fx.col("b"));
+            try testing.expectEqualStrings("y", b_val.text);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1250), total);
+}
+
+test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, true);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    const pred = Pred{
+        .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
+    };
+    var scan = RowNode{ .seq_scan = .{ .pred = &pred } };
+    var node = RowNode{ .materialize = .{ .child = &scan } };
+    defer node.deinit();
+
+    const rows = try node.materialize.gatherRows(&ctx, &b);
+    try testing.expectEqual(@as(usize, 1250), rows.len);
+    try testing.expectEqual(@as(usize, 1250), tx.held.items.len);
+    var last: u64 = 0;
+    for (rows) |r| {
+        const egid = sql.key.decodeEgid(r.key.primary).?;
+        try testing.expect(egid > last);
+        last = egid;
+        const a_val = fx.tbl.read(r, fx.col("a"));
+        try testing.expectEqual(Value{ .int4 = @intCast(egid) }, a_val);
+    }
+    // The copies outlive the batch: refill it and the rows still read.
+    b.reset();
+    const first = fx.tbl.read(rows[0], fx.col("a"));
+    try testing.expectEqual(Value{ .int4 = 2 }, first);
+
+    // Second call is idempotent; next() streams the capture in batches
+    // by reference: the batch's bytes stay empty, rows point into the
+    // arena.
+    const again = try node.materialize.gatherRows(&ctx, &b);
+    try testing.expectEqual(rows.ptr, again.ptr);
+    var total: usize = 0;
+    var batches: usize = 0;
+    while (try node.next(&ctx, &b)) : (batches += 1) {
+        try testing.expectEqual(@as(usize, 0), b.bytes.items.len);
+        var it = b.selected();
+        while (it.next()) |r| : (total += 1) {
+            const want = rows[total].key.primary.ptr;
+            try testing.expectEqual(want, r.key.primary.ptr);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1250), total);
+    try testing.expectEqual(@as(usize, 2), batches);
+}
