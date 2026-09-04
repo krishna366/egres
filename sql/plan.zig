@@ -89,8 +89,10 @@ pub fn plan(
 /// row; non-unique: the posting bitmap); `col IS NULL` on a valid
 /// non-unique index the posting under the NULL tag key. A comparison
 /// against NULL can never be true (3VL), so it is the EMPTY set. An
-/// AND is indexable when ANY child is (the rest is the residual's
-/// job); an OR only when EVERY child is; NOT never.
+/// AND intersects every indexable child and can drop the rest, so one
+/// indexable child is enough to route it (the dropped terms are the
+/// residual's job); an OR must union EVERY child, so all of them must
+/// be indexable; NOT never is.
 fn bitmapFor(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,

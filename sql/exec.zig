@@ -31,9 +31,10 @@ pub const ExecCtx = struct {
     tx: *Txn,
     tbl: *const _table.Table,
     table_id: u32,
-    /// Lock rows: sources BEFORE each read (the lock's bump makes the
-    /// read the newest version), Materialize after its drain. lockRow
-    /// may raise Restart, so a locking plan never streams.
+    /// Take row locks — on the OUTPUT, by Materialize after its drain,
+    /// so a row a filter discarded is never locked and sources never
+    /// lock at all. lockRow may raise Restart, so a locking plan never
+    /// streams.
     lock: bool,
 };
 
@@ -44,13 +45,14 @@ pub const byte_cap: usize = 256 << 10;
 /// (postings, BitmapNode.egids), where the universe really is u64.
 pub const Selection = std.StaticBitSet(row_cap);
 
-/// The rows in flight between operators. A row is either COPIED in by
-/// `append` — its key and value slice into `bytes`, which is
-/// capacity-pinned while non-empty and grows only to admit ONE
-/// oversized row into an EMPTY batch — or REFERENCED by `appendRefs`
-/// from memory that outlives the fill (the statement arena; pinned
-/// blocks later), the caller's promise. Sources fill it and set the
-/// bits; filters clear bits; consumers walk `selected()` (ascending).
+/// The rows in flight between operators. `append` copies a row's key
+/// into `bytes` — capacity-pinned while non-empty, growing only to
+/// admit ONE oversized row into an EMPTY batch — and its value per
+/// `ValueMode`: copied next to the key, borrowed against a pin the
+/// source holds for the batch's lifetime, or dropped. `appendRefs`
+/// places whole rows that live elsewhere (the statement arena), the
+/// caller's promise. Sources fill it and set the bits; filters clear
+/// bits; consumers walk `selected()` (ascending).
 pub const Batch = struct {
     allocator: std.mem.Allocator,
     /// Reserved to row_cap once; never grows past it.
@@ -100,15 +102,27 @@ pub const Batch = struct {
         return self.no_space or self.numRows() >= self.row_limit;
     }
 
-    /// Copy `item` in (its key, and its value when `keep_value`) and
-    /// select it. false = no room — the caller keeps the row for the
-    /// next fill, and `full` is true from here on. A row larger than the
+    /// What `append` does with a row's value. The key is always copied:
+    /// a cursor rebuilds it in its own buffer on every advance.
+    pub const ValueMode = enum {
+        /// Copy it into `bytes` next to the key.
+        copy,
+        /// Keep the slice as is: the source holds a pin on the storage
+        /// behind it for as long as the batch holds the row.
+        borrow,
+        /// Drop it — a key-only consumer.
+        none,
+    };
+
+    /// Place `item` — its key copied, its value per `mode` — and select
+    /// it. false = no room — the caller keeps the row for the next
+    /// fill, and `full` is true from here on. A row larger than the
     /// whole byte capacity is admitted only into an EMPTY batch: nothing
     /// slices into `bytes` then, so growing it is safe.
-    pub fn append(self: *Batch, item: Item, keep_value: bool) !bool {
+    pub fn append(self: *Batch, item: Item, mode: ValueMode) !bool {
         if (self.full()) return false;
 
-        const vlen = if (keep_value) item.value.len else 0;
+        const vlen = if (mode == .copy) item.value.len else 0;
         const need = item.key.primary.len + vlen;
         if (self.bytes.items.len + need > self.bytes.capacity) {
             if (self.numRows() > 0) {
@@ -124,10 +138,14 @@ pub const Batch = struct {
         const primary = self.bytes.items[kstart..][0..item.key.primary.len];
 
         var value: []const u8 = "";
-        if (keep_value) {
-            const vstart = self.bytes.items.len;
-            self.bytes.appendSliceAssumeCapacity(item.value);
-            value = self.bytes.items[vstart..][0..item.value.len];
+        switch (mode) {
+            .copy => {
+                const vstart = self.bytes.items.len;
+                self.bytes.appendSliceAssumeCapacity(item.value);
+                value = self.bytes.items[vstart..][0..item.value.len];
+            },
+            .borrow => value = item.value,
+            .none => {},
         }
 
         self.sel.set(self.numRows());
@@ -214,39 +232,12 @@ pub const BitmapNode = union(enum) {
         };
     }
 
-    /// Lock every unique-index key in the subtree — even an absent key
-    /// is the phantom-insert guard (a racing INSERT of it blocks) — in
-    /// (table_id, key) order so concurrent statements cannot cycle.
-    /// No-op unless ctx.lock. Call BEFORE eval.
-    pub fn lockKeys(self: *const BitmapNode, ctx: *ExecCtx) !void {
-        if (!ctx.lock) return;
-        var keys: std.ArrayList(IndexLookup) = .empty;
-        try self.collectUniqueIndexKeys(ctx.arloc, &keys);
-        std.mem.sort(IndexLookup, keys.items, {}, lessThanKey);
-        for (keys.items) |lu| try ctx.tx.lockRow(lu.index_table_id, lu.key);
-    }
-
-    fn collectUniqueIndexKeys(
-        self: *const BitmapNode,
-        arloc: std.mem.Allocator,
-        out: *std.ArrayList(IndexLookup),
-    ) !void {
-        switch (self.*) {
-            .index_lookup => |lu| if (lu.unique) try out.append(arloc, lu),
-            .egids => {},
-            .and_, .or_ => |kids| for (kids) |*kid| {
-                try kid.collectUniqueIndexKeys(arloc, out);
-            },
-        }
-    }
-
-    fn lessThanKey(_: void, a: IndexLookup, b: IndexLookup) bool {
-        if (a.index_table_id != b.index_table_id)
-            return a.index_table_id < b.index_table_id;
-        return std.mem.order(u8, a.key, b.key) == .lt;
-    }
-
     /// The egid set this node names, OWNED by the caller (tx.allocator).
+    /// Pure reads, recorded on the txn: no locks are taken here — not
+    /// even on an absent unique key. A reader that finds no row locks
+    /// nothing (Postgres's rule too); a concurrent INSERT of that key
+    /// lands, and the reader's own later write of it sees the stale
+    /// read and gets a serialization failure to retry.
     /// AND folds in place and stops at the first empty result; OR
     /// evaluates every child and unions them in one pass.
     pub fn eval(self: *const BitmapNode, ctx: *ExecCtx) !zroar.Bitmap {
@@ -294,9 +285,9 @@ pub const BitmapNode = union(enum) {
     }
 
     /// `WHERE <unique col> = v`: the entry under the key names the one
-    /// row. The key is locked already (lockKeys). Absent → empty. The
-    /// value is the 8 BE egid bytes INSERT wrote — anything else is
-    /// corruption, failed loudly rather than read as "0 rows".
+    /// row. Absent → empty. The value is the 8 BE egid bytes INSERT
+    /// wrote — anything else is corruption, failed loudly rather than
+    /// read as "0 rows".
     fn uniqueLookup(ctx: *ExecCtx, lu: IndexLookup) !zroar.Bitmap {
         var bm = try zroar.Bitmap.init(ctx.tx.allocator);
         errdefer bm.deinit();
@@ -375,7 +366,10 @@ pub const RowNode = union(enum) {
 /// Snapshot scan of the whole table at read_ts, own pending writes
 /// merged in. Recorded on the txn as a scan (SI: a later read_ts bump
 /// cannot revalidate it). The residual predicate runs on the cursor's
-/// BORROW, before the copy, so a non-matching row is never copied.
+/// BORROW, so a non-matching row costs nothing — and a matching row's
+/// value is never copied either: the cursor is opened pinning, so the
+/// storage behind every value it hands out stays held until the next
+/// fill releases it (Cursor.releasePins).
 pub const SeqScan = struct {
     pred: ?*const Pred = null,
     /// false = keys only (a DELETE that never reads the row back).
@@ -387,6 +381,8 @@ pub const SeqScan = struct {
     done: bool = false,
 
     pub fn next(self: *SeqScan, ctx: *ExecCtx, b: *Batch) !bool {
+        // The previous batch is consumed: let its values go.
+        if (self.cursor) |*c| c.releasePins();
         b.reset();
         if (self.done) return false;
 
@@ -395,13 +391,18 @@ pub const SeqScan = struct {
             self.cursor = try ctx.tx.forest.openCursor(
                 ctx.tx.allocator,
                 (KeyRange{}).limitToTable(ctx.tx.ns, ctx.table_id),
-                .{ .read_ts = ctx.tx.read_ts, .pending = ctx.tx.writes },
+                .{
+                    .read_ts = ctx.tx.read_ts,
+                    .pending = ctx.tx.writes,
+                    .pin_values = self.keep_value,
+                },
             );
         }
         const cursor = &self.cursor.?;
+        const mode: Batch.ValueMode = if (self.keep_value) .borrow else .none;
         if (self.stash) |item| {
             // An empty batch admits any single row.
-            const ok = try b.append(item, self.keep_value);
+            const ok = try b.append(item, mode);
             std.debug.assert(ok);
             self.stash = null;
         }
@@ -414,7 +415,7 @@ pub const SeqScan = struct {
                 if (!_pred.matches(ctx.tbl, item, pred)) continue;
             }
 
-            if (!try b.append(item, self.keep_value)) {
+            if (!try b.append(item, mode)) {
                 self.stash = item;
                 break;
             }
@@ -429,8 +430,8 @@ pub const SeqScan = struct {
 };
 
 /// Point lookups of every egid a BitmapNode names, egid-ascending —
-/// the same order a table scan yields. With ctx.lock each row is
-/// locked BEFORE its read.
+/// the same order a table scan yields. Takes no locks: row locks are
+/// Materialize's, on the output.
 pub const Fetch = struct {
     bnode: *BitmapNode,
     pred: ?*const Pred = null,
@@ -452,7 +453,6 @@ pub const Fetch = struct {
         if (self.done) return false;
 
         if (self.bm == null) {
-            try self.bnode.lockKeys(ctx);
             self.bm = try self.bnode.eval(ctx);
 
             self.it = self.bm.?.iterator();
@@ -460,7 +460,7 @@ pub const Fetch = struct {
         }
 
         if (self.held) |held| {
-            const ok = try batch.append(held.item, self.keep_value);
+            const ok = try batch.append(held.item, self.valueMode());
             std.debug.assert(ok);
             held.release();
             self.held = null;
@@ -471,12 +471,14 @@ pub const Fetch = struct {
                 self.done = true;
                 break;
             };
+            // TODO: Might be worth Fetch having an arena, where forest.get can
+            // dupe the item. So, we can avoid a second copy here.
             const found = (try self.lookupEgid(ctx, egid)) orelse continue;
             if (self.pred) |p| if (!_pred.matches(ctx.tbl, found.item, p)) {
                 found.release();
                 continue;
             };
-            if (!try batch.append(found.item, self.keep_value)) {
+            if (!try batch.append(found.item, self.valueMode())) {
                 self.held = found;
                 break;
             }
@@ -485,15 +487,12 @@ pub const Fetch = struct {
         return batch.numRows() > 0;
     }
 
-    /// One base row by egid. Locked BEFORE the read when ctx.lock: the
-    /// lock's bump has already advanced read_ts, so the value read is
-    /// the newest. An absent row is a legit empty result when a literal
-    /// named it, but CORRUPTION when an index did (rows and entries
-    /// commit atomically) — logged loudly, then still skipped so the
-    /// statement answers from the rows that do exist.
+    /// One base row by egid, at read_ts. An absent row is a legit empty
+    /// result when a literal named it, but CORRUPTION when an index did
+    /// (rows and entries commit atomically) — logged loudly, then still
+    /// skipped so the statement answers from the rows that do exist.
     fn lookupEgid(self: *const Fetch, ctx: *ExecCtx, egid: u64) !?Txn.Found {
         const k = _key.encodeEgid(egid);
-        if (ctx.lock) try ctx.tx.lockRow(ctx.table_id, &k);
         const found = (try ctx.tx.lookup(.{
             .namespace = ctx.tx.ns,
             .table_id = ctx.table_id,
@@ -508,6 +507,15 @@ pub const Fetch = struct {
             return null;
         };
         return found;
+    }
+
+    /// A Found's bytes are already a copy `get` made, and they go with
+    /// its release — so the batch copies them once more. Holding the
+    /// Founds instead saves only that memcpy against a µs-scale lookup
+    /// (tried 2026-09-04, reverted); the real fix is a sorted multi-get
+    /// walk that pins like SeqScan's cursor (the plan's stage C).
+    fn valueMode(self: *const Fetch) Batch.ValueMode {
+        return if (self.keep_value) .copy else .none;
     }
 
     /// Also frees the bitmap tree: the planner built it for this node.
@@ -556,12 +564,13 @@ pub const Materialize = struct {
     /// Every selected row of the child, copied into the statement arena
     /// (keys and whatever values the source kept), in the order the
     /// child yielded them — an ORDER BY below survives. With ctx.lock
-    /// every key is then locked in KEY order — the order that keeps
-    /// concurrent statements from cycling, taken from a separate sorted
-    /// key list so the rows keep their order — and this returns only
-    /// once EVERY lock is held (lockRow may Restart the statement, which
-    /// is safe exactly because nothing was written or sent yet). `batch`
-    /// is scratch to drive the child.
+    /// every row is then locked — the OUTPUT rows, so nothing a filter
+    /// discarded is ever locked — in (table, key) order, the order that
+    /// keeps concurrent statements from cycling, taken from a separate
+    /// sorted key list so the rows keep their order; and this returns
+    /// only once EVERY lock is held (lockRow may Restart the statement,
+    /// which is safe exactly because nothing was written or sent yet).
+    /// `batch` is scratch to drive the child.
     pub fn gatherAndLockRows(
         self: *Materialize,
         ctx: *ExecCtx,
@@ -582,19 +591,22 @@ pub const Materialize = struct {
         return rows;
     }
 
-    /// Lock every row's key ascending, whatever order `rows` is in.
-    /// Both sources already yield ascending keys, so the sort is one
-    /// pass in practice; it makes the lock order this node's own
-    /// property rather than the child's.
+    /// Lock every row ascending by (table, key), whatever order `rows`
+    /// is in. Both sources already yield ascending keys, so the sort is
+    /// one pass in practice; it makes the lock order this node's own
+    /// property rather than the child's. Rows carry their table in the
+    /// key, so a multi-table output (a join, later) needs nothing more.
     fn lockInKeyOrder(ctx: *ExecCtx, rows: []const Item) !void {
-        const keys = try ctx.arloc.alloc([]const u8, rows.len);
-        for (rows, keys) |row, *key| key.* = row.key.primary;
-        std.mem.sort([]const u8, keys, {}, lessThanBytes);
-        for (keys) |key| try ctx.tx.lockRow(ctx.table_id, key);
+        const keys = try ctx.arloc.alloc(Key, rows.len);
+        for (rows, keys) |row, *key| key.* = row.key;
+
+        std.mem.sort(Key, keys, {}, lessThanKey);
+        for (keys) |key| try ctx.tx.lockRow(key.table_id, key.primary);
     }
 
-    fn lessThanBytes(_: void, a: []const u8, b: []const u8) bool {
-        return std.mem.order(u8, a, b) == .lt;
+    fn lessThanKey(_: void, a: Key, b: Key) bool {
+        if (a.table_id != b.table_id) return a.table_id < b.table_id;
+        return std.mem.order(u8, a.primary, b.primary) == .lt;
     }
 
     /// Serve the captured rows back a batch at a time, by reference:

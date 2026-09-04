@@ -22,6 +22,13 @@ const ns: u64 = 16;
 const tid: u32 = 16;
 const read_ts: u64 = 500;
 
+/// buildFlush allocates an SST id, which needs a durable-lease callback;
+/// nothing here restarts, so persisting the ceiling is a no-op.
+const Lease = struct {
+    fn call(_: *anyopaque, _: u64) anyerror!void {}
+};
+var lease_ctx: u8 = 0;
+
 /// Builds a fixture's committed rows under the table's layout.
 const RowBuilder = *const fn (
     a: std.mem.Allocator,
@@ -41,6 +48,16 @@ const Fixture = struct {
     tbl: Table,
 
     fn setup(build: RowBuilder) !Fixture {
+        return setupWith(build, false);
+    }
+
+    /// `setup`, with the rows flushed to an L0 SST rather than left in
+    /// the memtable.
+    fn setupOnDisk(build: RowBuilder) !Fixture {
+        return setupWith(build, true);
+    }
+
+    fn setupWith(build: RowBuilder, on_disk: bool) !Fixture {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -90,7 +107,21 @@ const Fixture = struct {
         const f = try Forest.open(testing.allocator, .{ .dir = dir_path });
         errdefer f.close();
         _ = try f.createTree(ns, tid, .{ .inf = true });
+        if (on_disk) {
+            // The id-0 placeholder memtable is released, never flushed:
+            // write into a real one.
+            f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
+            try f.newMemtable(1, 1);
+        }
         try f.put(try build(a, &tbl));
+        if (on_disk) {
+            try f.newMemtable(2, 2);
+            const fl = (try f.buildFlush()) orelse
+                return error.TestExpectedFlush;
+            var changes = fl.changes;
+            defer changes.deinit(testing.allocator);
+            try f.applyFlush(changes.items, fl.memtable_id);
+        }
 
         return .{
             .tmp = tmp,
@@ -209,6 +240,14 @@ fn firstEgid(b: *const Batch) u64 {
     return sql.key.decodeEgid(b.rows.items[0].key.primary).?;
 }
 
+/// Does `slice` lie inside the batch's own byte buffer?
+fn withinBytes(b: *const Batch, slice: []const u8) bool {
+    const start = @intFromPtr(b.bytes.items.ptr);
+    const end = start + b.bytes.capacity;
+    const p = @intFromPtr(slice.ptr);
+    return p >= start and p < end;
+}
+
 test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     var b = try Batch.init(testing.allocator);
     defer b.deinit();
@@ -218,9 +257,9 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     // Row cap: 1024 tiny rows in, the 1025th refused, every slice resolves.
     var keys: [exec.row_cap][8]u8 = undefined;
     for (&keys, 1..) |*k, egid| k.* = sql.key.encodeEgid(egid);
-    for (&keys) |*k| try testing.expect(try b.append(tinyItem(k, "v"), true));
+    for (&keys) |*k| try testing.expect(try b.append(tinyItem(k, "v"), .copy));
     try testing.expect(b.full());
-    try testing.expect(!try b.append(tinyItem(&keys[0], "v"), true));
+    try testing.expect(!try b.append(tinyItem(&keys[0], "v"), .copy));
     try testing.expectEqual(@as(usize, exec.row_cap), b.sel.count());
     try testing.expectEqual(cap0, b.bytes.capacity);
     var n: usize = 0;
@@ -238,7 +277,7 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     const big = [_]u8{0xAB} ** 1024;
     n = 0;
     try testing.expect(!b.full());
-    while (try b.append(tinyItem(&keys[n], &big), true)) n += 1;
+    while (try b.append(tinyItem(&keys[n], &big), .copy)) n += 1;
     try testing.expectEqual(exec.byte_cap / (8 + big.len), n);
     try testing.expectEqual(n, b.numRows());
     try testing.expectEqual(cap0, b.bytes.capacity);
@@ -246,21 +285,27 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     // even though the row limit is far away, and a tiny row that would
     // fit is refused too. reset() reopens.
     try testing.expect(b.full());
-    try testing.expect(!try b.append(tinyItem(&keys[0], "v"), true));
+    try testing.expect(!try b.append(tinyItem(&keys[0], "v"), .copy));
     b.reset();
     try testing.expect(!b.full());
 
-    // keep_value = false copies the key only.
-    try testing.expect(try b.append(tinyItem(&keys[0], &big), false));
+    // .none copies the key only; .borrow copies the key only too and
+    // keeps the value slice as given — the caller's storage, pinned.
+    try testing.expect(try b.append(tinyItem(&keys[0], &big), .none));
     try testing.expectEqual(@as(usize, 8), b.bytes.items.len);
     try testing.expectEqualStrings("", b.rows.items[0].value);
+    b.reset();
+    try testing.expect(try b.append(tinyItem(&keys[0], &big), .borrow));
+    try testing.expectEqual(@as(usize, 8), b.bytes.items.len);
+    try testing.expectEqual(@as([*]const u8, &big), b.rows.items[0].value.ptr);
+    try testing.expectEqual(big.len, b.rows.items[0].value.len);
 
     // One oversized row is admitted into an EMPTY batch by growing.
     b.reset();
     const huge = try testing.allocator.alloc(u8, exec.byte_cap + 1);
     defer testing.allocator.free(huge);
     @memset(huge, 1);
-    try testing.expect(try b.append(tinyItem(&keys[0], huge), true));
+    try testing.expect(try b.append(tinyItem(&keys[0], huge), .copy));
     try testing.expectEqual(@as(usize, 1), b.numRows());
     try testing.expect(b.bytes.capacity > cap0);
     try testing.expectEqualSlices(u8, huge, b.rows.items[0].value);
@@ -351,7 +396,8 @@ test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
         try testing.expect(!try node.next(&ctx, &b)); // sticky
     }
 
-    // b = 'x': half the rows, and the batch holds bytes for matches ONLY.
+    // b = 'x': half the rows. The batch holds the KEYS of matches only;
+    // values are borrows into storage the cursor pins, never copied.
     {
         const pred = Pred{
             .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
@@ -360,16 +406,51 @@ test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
         defer node.deinit();
         var total: usize = 0;
         while (try node.next(&ctx, &b)) {
-            const row_len = 8 + b.rows.items[0].value.len;
-            try testing.expectEqual(b.numRows() * row_len, b.bytes.items.len);
+            try testing.expectEqual(b.numRows() * 8, b.bytes.items.len);
             var it = b.selected();
             while (it.next()) |r| : (total += 1) {
+                try testing.expect(!withinBytes(&b, r.value));
                 const b_val = fx.tbl.read(r, fx.col("b"));
                 try testing.expectEqualStrings("x", b_val.text);
             }
         }
         try testing.expectEqual(@as(usize, 1250), total);
     }
+}
+
+test "sql.exec: seq_scan: borrowed values outlive the blocks the walk left" {
+    var fx = try Fixture.setupOnDisk(&wideRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // 400 rows of 1 KiB across several 32 KiB SST blocks, all in ONE
+    // batch: only keys land in `bytes`; values are borrows into blocks
+    // the cursor pinned — and every one still reads after the walk
+    // moved past its block.
+    var node = RowNode{ .seq_scan = .{} };
+    defer node.deinit();
+    try testing.expect(try node.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, 400), b.numRows());
+    try testing.expectEqual(@as(usize, 400 * 8), b.bytes.items.len);
+    const pins = &node.seq_scan.cursor.?.pins;
+    try testing.expect(pins.items.len >= 2);
+    var it = b.selected();
+    while (it.next()) |r| {
+        try testing.expect(!withinBytes(&b, r.value));
+        const egid = sql.key.decodeEgid(r.key.primary).?;
+        const a_val = fx.tbl.read(r, fx.col("a"));
+        try testing.expectEqual(Value{ .int4 = @intCast(egid) }, a_val);
+        const b_val = fx.tbl.read(r, fx.col("b"));
+        try testing.expectEqual(@as(usize, 1024), b_val.text.len);
+        try testing.expectEqual(@as(u8, 'w'), b_val.text[1023]);
+    }
+    // The next fill lets them go; the walk is over.
+    try testing.expect(!try node.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, 0), pins.items.len);
 }
 
 test "sql.exec: row_limit bounds a fill — a LIMIT pulls only what it needs" {
@@ -397,7 +478,7 @@ test "sql.exec: row_limit bounds a fill — a LIMIT pulls only what it needs" {
     try testing.expectEqual(@as(u64, 21), firstEgid(&b));
 }
 
-test "sql.exec: fetch under lock: one lock per egid, held row across batches" {
+test "sql.exec: fetch: no row locks of its own, held row across batches" {
     var fx = try Fixture.setup(&wideRows);
     defer fx.teardown();
     var tx = fx.txn();
@@ -421,7 +502,8 @@ test "sql.exec: fetch under lock: one lock per egid, held row across batches" {
     var total: usize = 0;
     var last: u64 = 0;
     while (try node.next(&ctx, &b)) : (batches += 1) {
-        // 1 KiB rows: the byte cap ends a batch well before 300 rows.
+        // 1 KiB rows, copied: the byte cap ends a batch well before
+        // 300 rows.
         try testing.expect(b.numRows() < 300);
         var it = b.selected();
         while (it.next()) |r| : (total += 1) {
@@ -432,9 +514,9 @@ test "sql.exec: fetch under lock: one lock per egid, held row across batches" {
     }
     try testing.expectEqual(@as(usize, 300), total);
     try testing.expect(batches >= 2);
-    // One lock per egid named — the absent one included: it is locked
-    // BEFORE its read, which is what makes it a phantom-insert guard.
-    try testing.expectEqual(@as(usize, 301), tx.held.items.len);
+    // Row locks are Materialize's, on the output: a bare fetch under a
+    // locking ctx takes none.
+    try testing.expectEqual(@as(usize, 0), tx.held.items.len);
 }
 
 test "sql.exec: filter clears bits and copies nothing" {
@@ -455,8 +537,7 @@ test "sql.exec: filter clears bits and copies nothing" {
     var total: usize = 0;
     while (try node.next(&ctx, &b)) {
         // Every scanned row is still in the batch; only the bits changed.
-        const row_len = 8 + b.rows.items[0].value.len;
-        try testing.expectEqual(b.numRows() * row_len, b.bytes.items.len);
+        try testing.expectEqual(b.numRows() * 8, b.bytes.items.len);
         try testing.expect(b.sel.count() < b.numRows());
         var it = b.selected();
         while (it.next()) |r| : (total += 1) {
@@ -516,4 +597,36 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
     }
     try testing.expectEqual(@as(usize, 1250), total);
     try testing.expectEqual(@as(usize, 2), batches);
+}
+
+test "sql.exec: materialize over a fetch locks the output rows only" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, true);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // egids 1..300 plus an absent one; the residual keeps the even
+    // ones. Locks land on the 150 rows that come OUT — not on the odd
+    // rows the residual dropped, not on the absent id.
+    var bm = try zroar.Bitmap.init(testing.allocator);
+    for (1..301) |egid| _ = try bm.set(egid);
+    _ = try bm.set(9_999);
+    var leaf = BitmapNode{ .egids = bm };
+    const pred = Pred{
+        .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
+    };
+    var fetch = RowNode{ .fetch = .{ .bnode = &leaf, .pred = &pred } };
+    var node = RowNode{ .materialize = .{ .child = &fetch } };
+    defer node.deinit();
+
+    const rows = try node.materialize.gatherAndLockRows(&ctx, &b);
+    try testing.expectEqual(@as(usize, 150), rows.len);
+    try testing.expectEqual(@as(usize, 150), tx.held.items.len);
+    for (rows) |r| {
+        const egid = sql.key.decodeEgid(r.key.primary).?;
+        try testing.expect(egid % 2 == 0);
+    }
 }

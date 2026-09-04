@@ -1679,6 +1679,102 @@ test "cursor: a flush between two next calls does not disturb the walk" {
     }
 }
 
+test "cursor: pin_values holds handed-out values until releasePins" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    const Lease = struct {
+        fn call(_: *anyopaque, _: u64) anyerror!void {}
+    };
+    var lease_ctx: u8 = 0;
+    f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
+    try f.newMemtable(1, 1);
+
+    // 200 rows of 1 KiB, value[0] = the row number: one memtable arena
+    // now, several SST blocks (the builder targets 32 KiB) once flushed.
+    const n_rows = 200;
+    var keys: [n_rows][3]u8 = undefined;
+    for (&keys, 0..) |*k, i| _ = try std.fmt.bufPrint(k, "{d:0>3}", .{i});
+    var value: [1024]u8 = undefined;
+    for (keys, 0..) |k, i| {
+        @memset(&value, 'w');
+        value[0] = @intCast(i);
+        try f.put(&[_]zdb.kv.Item{.{
+            .key = .{
+                .namespace = 1,
+                .table_id = 0,
+                .primary = &k,
+                .timestamp = 5,
+            },
+            .value = &value,
+            .meta = .{},
+        }});
+    }
+    const pinning = Forest.ScanOptions{ .pin_values = true };
+
+    const Walk = struct {
+        /// Hand out `out.len` items, keeping only their value slices.
+        fn take(cur: *Forest.Cursor, out: [][]const u8) !void {
+            for (out) |*slot| {
+                const it = (try cur.next()) orelse
+                    return error.TestExpectedItem;
+                slot.* = it.value;
+            }
+        }
+        /// The slices still read as the rows they were, from `first` on.
+        fn check(vals: []const []const u8, first: usize) !void {
+            for (vals, first..) |v, i| {
+                try std.testing.expectEqual(@as(usize, 1024), v.len);
+                try std.testing.expectEqual(@as(u8, @intCast(i)), v[0]);
+                try std.testing.expectEqual(@as(u8, 'w'), v[1023]);
+            }
+        }
+    };
+
+    // Memtable-backed: every value lives in one arena — one pin.
+    {
+        var cur = try f.openCursor(alloc, tableRange(1, 0), pinning);
+        defer cur.deinit();
+        var vals: [n_rows][]const u8 = undefined;
+        try Walk.take(&cur, &vals);
+        try std.testing.expectEqual(@as(usize, 1), cur.pins.items.len);
+        try Walk.check(&vals, 0);
+    }
+
+    try roar.flush(f, alloc, 2);
+
+    // SST-backed: the first half spans blocks the table iterator has
+    // moved past by the time the walk pauses — the pins keep them.
+    var cur = try f.openCursor(alloc, tableRange(1, 0), pinning);
+    defer cur.deinit();
+    var first: [n_rows / 2][]const u8 = undefined;
+    try Walk.take(&cur, &first);
+    try std.testing.expect(cur.pins.items.len >= 2);
+    try Walk.check(&first, 0);
+
+    // Release: only the parked item's storage stays held, and that item
+    // (the last one handed out) still reads.
+    cur.releasePins();
+    try std.testing.expectEqual(@as(usize, 1), cur.pins.items.len);
+    try Walk.check(first[first.len - 1 ..], first.len - 1);
+
+    // The rest pins afresh; once the walk is over nothing is parked, so
+    // a release leaves nothing held.
+    var rest: [n_rows / 2][]const u8 = undefined;
+    try Walk.take(&cur, &rest);
+    try Walk.check(&rest, n_rows / 2);
+    try std.testing.expect(cur.pins.items.len >= 2);
+    try std.testing.expect((try cur.next()) == null);
+    cur.releasePins();
+    try std.testing.expectEqual(@as(usize, 0), cur.pins.items.len);
+}
+
 /// Ten one-key L3 SSTs k01..k10 in (namespace 42, table 0), value = the
 /// key, in one tree. Returns its id.
 fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !u64 {

@@ -133,7 +133,12 @@ removed when the queue drains.
   on — that ordering is what makes `duplicate key` deterministic.
 - **Row data keys** (egid): fresh egids are never contended on insert;
   updates/deletes of an existing row lock its data key — the per-row
-  serialization point.
+  serialization point. Locking readers (FOR UPDATE, and UPDATE/DELETE
+  finding their rows) lock exactly the rows they return, after the
+  read — never index keys, and nothing for a key with no row behind
+  it, as in Postgres. A check-then-insert race therefore ends in the
+  SI way: the reader's own later insert of the key sees its stale
+  read and gets 40001 to retry.
 - **Non-unique index postings: NO lock.** The posting for index key K is
   a set of egids; two transactions inserting different rows with the
   same indexed value both add an egid to K. Appends to a set commute and

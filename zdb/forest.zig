@@ -27,6 +27,7 @@ const Item = _table.table.Item;
 const SkipList = _skl.SkipList;
 const Builder = _table.builder.Builder;
 const merge_iterator = _table.merge_iterator;
+const Pin = merge_iterator.Pin;
 
 // ---------------------------------------------------------------------------
 // TableTrees
@@ -985,6 +986,13 @@ pub const Forest = struct {
         /// visibility filter admits and which wins equal-key ties against
         /// committed versions (lower src wins in the merge). null = none.
         pending: ?*_skl.SkipList = null,
+        /// Cursor only. Off: an item's value is a borrow valid until the
+        /// following `next`. On: the cursor holds the storage behind
+        /// every value it hands out until `Cursor.releasePins`, so a
+        /// caller can keep a whole batch of borrows instead of copying
+        /// them. Costs one refcount pair per block or memtable arena
+        /// walked, and keeps those blocks resident until released.
+        pin_values: bool = false,
     };
 
     /// Forward scan over a table-limited `scan_range` — a KeyRange run through
@@ -1096,6 +1104,11 @@ pub const Forest = struct {
         /// the following `next`. False only before the first hand-out from a
         /// freshly opened tree.
         next_pending: bool = false,
+        /// With `opts.pin_values`: a hold on the storage behind every
+        /// value handed out since the last `releasePins` — one entry per
+        /// block or memtable arena, since consecutive items share one —
+        /// so those borrows stay valid past the following `next`.
+        pins: std.ArrayList(Pin) = .empty,
         /// No tree left to visit.
         done: bool = false,
         /// Per-primary emit state. A primary's versions arrive contiguously,
@@ -1123,6 +1136,8 @@ pub const Forest = struct {
         /// Releases the open merge (table + skiplist refs) and the cursor's
         /// memory. Safe after exhaustion, and after an error from `next`.
         pub fn deinit(self: *Cursor) void {
+            for (self.pins.items) |pin| pin.release();
+            self.pins.deinit(self.allocator);
             if (self.merge) |*m| m.deinit();
             self.merge = null;
             self.cur_primary.deinit(self.allocator);
@@ -1137,7 +1152,8 @@ pub const Forest = struct {
         /// or `deinit`: its key points into a source's key buffer, its
         /// value into a block or arena the source holds a ref on, and the
         /// advance overwrites the one and may release the other. Copy what
-        /// must outlive the call.
+        /// must outlive the call — except the value under
+        /// `opts.pin_values`, which stays valid until `releasePins`.
         pub fn next(self: *Cursor) !?Item {
             while (self.emitted < self.opts.max_rows) {
                 if (self.merge == null) {
@@ -1155,6 +1171,7 @@ pub const Forest = struct {
                     // The merge stays parked on `item` so the borrow holds;
                     // the step past it is owed to the next call.
                     self.next_pending = true;
+                    if (self.opts.pin_values) try self.pinCurrent(merge);
                     return item;
                 }
 
@@ -1170,6 +1187,34 @@ pub const Forest = struct {
                 self.key_range.left = self.tree_range.right;
             }
             return null;
+        }
+
+        /// Hold the storage behind the parked item's value, unless the
+        /// last pin already covers it (Pin's doc has the stability
+        /// guarantee a hold gives).
+        fn pinCurrent(
+            self: *Cursor,
+            merge: *const merge_iterator.MergeIterator,
+        ) !void {
+            const pin = merge.currentPin().?;
+            const covered = self.pins.items.len > 0 and
+                std.meta.eql(self.pins.getLast(), pin);
+            if (!covered) try self.pins.append(self.allocator, pin.acquire());
+        }
+
+        /// The caller is done with the values handed out so far: drop
+        /// their holds — except the item most recently handed out, which
+        /// the merge is still parked on and the caller may still be
+        /// holding; it stays pinned. No-op unless `opts.pin_values`.
+        pub fn releasePins(self: *Cursor) void {
+            for (self.pins.items) |pin| pin.release();
+            self.pins.clearRetainingCapacity();
+            if (self.opts.pin_values and self.next_pending) {
+                // That item's own pin sat in the list, so the capacity
+                // retained covers this one.
+                const pin = self.merge.?.currentPin().?;
+                self.pins.appendAssumeCapacity(pin.acquire());
+            }
         }
 
         /// Look up the tree owning `key_range.left`, snapshot its range, and

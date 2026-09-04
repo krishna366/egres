@@ -393,23 +393,31 @@ if [ "$(v "SELECT name FROM pk WHERE id = 4;")" = "d" ]; then
     ok "SELECT WHERE pk routes through the index and returns the row"
 else bad "index point SELECT wrong: $(v "SELECT name FROM pk WHERE id = 4;")"; fi
 
-# Phantom-insert guard: FOR UPDATE on an ABSENT key locks that index key, so a
-# concurrent INSERT of it blocks until the guard's txn ends. A cell scan of an
-# absent row would lock nothing — this works only via the index.
+# FOR UPDATE on an ABSENT key locks nothing (readers lock rows they return,
+# never keys — Postgres's rule): a concurrent INSERT of that key lands at
+# once. The reader's own later INSERT of it then finds a commit above its
+# snapshot on a key it already read — an unrepairable stale read → 40001,
+# the SI outcome; the row is the other session's.
 GI0=$(grep -c "INSERT 0 1" "$D/out2" || true)
+S1_40001=$(grep -c "40001" "$D/out1" || true)
 send 1 "BEGIN;"
-send 1 "SELECT name FROM pk WHERE id = 50 FOR UPDATE;" # 0 rows, locks index[50]
+send 1 "SELECT name FROM pk WHERE id = 50 FOR UPDATE;" # 0 rows, no lock
 sync_session 1
-send 2 "INSERT INTO pk VALUES (50, 'ghost');" # parks on the absent-key lock
-sleep 0.3
-if [ "$(grep -c "INSERT 0 1" "$D/out2")" = "$GI0" ]; then
-    ok "FOR UPDATE on an absent PK blocks a concurrent insert (phantom guard)"
-else bad "phantom insert was not blocked"; fi
-send 1 "COMMIT;"
+send 2 "INSERT INTO pk VALUES (50, 'ghost');"
 sync_session 2
-if [ "$(grep -c "INSERT 0 1" "$D/out2")" -gt "$GI0" ]; then
-    ok "the insert proceeds once the guard's txn ends"
-else bad "insert never proceeded after the guard released"; fi
+if [ "$(grep -c "INSERT 0 1" "$D/out2")" = "$((GI0 + 1))" ]; then
+    ok "FOR UPDATE on an absent PK does not block a concurrent insert"
+else bad "insert of an absent key blocked behind a FOR UPDATE reader"; fi
+send 1 "INSERT INTO pk VALUES (50, 'late');"
+sync_session 1
+if [ "$(grep -c "40001" "$D/out1")" = "$((S1_40001 + 1))" ]; then
+    ok "the reader's own insert of that key sees its stale read: 40001"
+else bad "no 40001 for an insert after a stale absent-key read"; fi
+send 1 "ROLLBACK;"
+sync_session 1
+if [ "$(v "SELECT name FROM pk WHERE id = 50;")" = "ghost" ]; then
+    ok "the concurrent insert's row is the one that stands"
+else bad "unexpected row 50: $(v "SELECT name FROM pk WHERE id = 50;")"; fi
 
 # --- FOR UPDATE over more than one executor batch (1024 rows) ---------------
 # values_list <first id> <count>: "(i, 'ri'), ..." for one INSERT.
@@ -454,6 +462,7 @@ send 2 "BEGIN;"
 send 2 "UPDATE wide SET id = 9999 WHERE id = 1300;"
 sync_session 2
 R0=$(grep -c "UPDATE 2500" "$D/out1" || true)
+A0=$(grep -c "40001" "$D/out1" || true) # earlier legs expect some
 send 1 "UPDATE wide SET name = 'r';" # drains, then parks on row 1300
 sleep 0.5
 send 2 "COMMIT;"
@@ -461,9 +470,9 @@ sync_session 1
 if [ "$(grep -c "UPDATE 2500" "$D/out1" || true)" = "$((R0 + 1))" ]; then
     ok "full-table UPDATE restarted past the held row and applied once"
 else bad "full-table UPDATE did not report UPDATE 2500 exactly once"; fi
-if grep -q "40001" "$D/out1"; then
-    bad "the mid-drain restart surfaced a serialization abort"
-else ok "no serialization abort during the mid-drain restart"; fi
+if [ "$(grep -c "40001" "$D/out1" || true)" = "$A0" ]; then
+    ok "no serialization abort during the mid-drain restart"
+else bad "the mid-drain restart surfaced a serialization abort"; fi
 if [ "$(v "SELECT name FROM wide WHERE id = 9999;")" = "r" ]; then
     ok "the restart re-read the concurrent commit"
 else bad "the restarted UPDATE missed the concurrent commit"; fi
