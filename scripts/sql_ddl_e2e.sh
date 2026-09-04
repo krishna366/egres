@@ -118,7 +118,8 @@ expect "DELETE with index live" "DELETE 1" psql "$E" -X -c "DELETE FROM items WH
 expect "SELECT after churn" "(3 rows)" psql "$E" -X -c "SELECT id FROM items WHERE color = 'blue';"
 
 # Bitmap-path semantics: own-txn pending postings, key moves in bulk,
-# = NULL, and indexed UPDATE/DELETE (lock-through-bitmap).
+# NULL (3VL `= NULL` vs IS NULL through the index's NULL key), and
+# indexed UPDATE/DELETE (lock-through-bitmap).
 expect "own pending INSERT visible via index" "(4 rows)" psql "$E" -X <<'PSQL'
 BEGIN;
 INSERT INTO items VALUES (6,'blue');
@@ -131,8 +132,11 @@ expect "moved rows found under the new key" "(3 rows)" psql "$E" -X -c "SELECT i
 expect "old key is empty" "(0 rows)" psql "$E" -X -c "SELECT id FROM items WHERE color = 'blue';"
 expect "move the rows back" "UPDATE 3" psql "$E" -X -c "UPDATE items SET color = 'blue' WHERE color = 'cyan';"
 expect "NULL cell inserted" "INSERT 0 1" psql "$E" -X -c "INSERT INTO items VALUES (7, NULL);"
-expect "= NULL matches via the index" "(1 row)" psql "$E" -X -c "SELECT id FROM items WHERE color = NULL;"
-expect "DELETE routed via the index" "DELETE 1" psql "$E" -X -c "DELETE FROM items WHERE color = NULL;"
+expect "= NULL matches nothing" "(0 rows)" psql "$E" -X -c "SELECT id FROM items WHERE color = NULL;"
+expect "IS NULL routed via the index" "(1 row)" psql "$E" -X -c "SELECT id FROM items WHERE color IS NULL;"
+expect "IS NOT NULL scans" "(3 rows)" psql "$E" -X -c "SELECT id FROM items WHERE color IS NOT NULL;"
+expect "DELETE = NULL is 0" "DELETE 0" psql "$E" -X -c "DELETE FROM items WHERE color = NULL;"
+expect "DELETE IS NULL routed via the index" "DELETE 1" psql "$E" -X -c "DELETE FROM items WHERE color IS NULL;"
 
 # DROP INDEX and its rejections.
 expect "DROP TABLE of an index name" "use DROP INDEX" psql "$E" -X -c "DROP TABLE items_color;"
@@ -166,6 +170,30 @@ BEGIN;
 SELECT id FROM rt WHERE d = 'p';
 \! psql "host=127.0.0.1 port=3210 dbname=egres sslmode=disable" -X -c "UPDATE rt SET d='s' WHERE id = 1;" >/dev/null
 UPDATE rt SET d = 't' WHERE id = 1;
+COMMIT;
+PSQL
+# Boolean WHERE: an indexed conjunct drives the read wherever it sits
+# in the AND (the unindexed one is a residual, not a scan); an OR with
+# an unindexed disjunct must scan.
+expect "AND with an indexed conjunct routes" "UPDATE 1" psql "$E" -X <<'PSQL'
+BEGIN;
+SELECT id FROM rt WHERE c = 'x' AND d = 's';
+\! psql "host=127.0.0.1 port=3210 dbname=egres sslmode=disable" -X -c "UPDATE rt SET d='q3' WHERE id = 2;" >/dev/null
+UPDATE rt SET d = 'r2' WHERE id = 2;
+COMMIT;
+PSQL
+expect "indexed conjunct routes from second position" "UPDATE 1" psql "$E" -X <<'PSQL'
+BEGIN;
+SELECT id FROM rt WHERE d = 's' AND c = 'x';
+\! psql "host=127.0.0.1 port=3210 dbname=egres sslmode=disable" -X -c "UPDATE rt SET d='q4' WHERE id = 2;" >/dev/null
+UPDATE rt SET d = 'r3' WHERE id = 2;
+COMMIT;
+PSQL
+expect "OR with an unindexed disjunct scans" "could not serialize" psql "$E" -X <<'PSQL'
+BEGIN;
+SELECT id FROM rt WHERE c = 'x' OR d = 'zz';
+\! psql "host=127.0.0.1 port=3210 dbname=egres sslmode=disable" -X -c "UPDATE rt SET d='s2' WHERE id = 1;" >/dev/null
+UPDATE rt SET d = 't2' WHERE id = 1;
 COMMIT;
 PSQL
 expect "DROP TABLE rt" "DROP TABLE" psql "$E" -X -c "DROP TABLE rt;"

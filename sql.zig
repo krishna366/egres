@@ -20,9 +20,11 @@
 //! ddl:    CREATE/DROP DATABASE, TABLE, INDEX — manifest and catalog
 //!         choreography, including CREATE INDEX's online backfill.
 //! dml:    INSERT / SELECT / DELETE / UPDATE statement bodies.
-//! scanner: WHERE resolution (the planner) and the row pipeline every
+//! pred:   Pred — a WHERE bound to its table (columns, typed literals)
+//!         and its SQL three-valued evaluation per row.
+//! scanner: source selection (the planner) and the row pipeline every
 //!         statement reads through — table scan, egid lookups, unique
-//!         index lookup, posting bitmap.
+//!         index lookup, posting bitmap — filtered by the Pred.
 
 const std = @import("std");
 
@@ -38,6 +40,7 @@ pub const oracle = @import("sql/oracle.zig");
 pub const server = @import("sql/server.zig");
 pub const ddl = @import("sql/ddl.zig");
 pub const dml = @import("sql/dml.zig");
+pub const pred = @import("sql/pred.zig");
 pub const scanner = @import("sql/scanner.zig");
 
 pub const Server = server.Server;

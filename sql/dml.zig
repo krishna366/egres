@@ -13,6 +13,7 @@ const zdb = @import("zdb");
 
 const _parse = @import("parse.zig");
 const _key = @import("key.zig");
+const _pred = @import("pred.zig");
 const _row = @import("row.zig");
 const _scanner = @import("scanner.zig");
 const _schema = @import("schema.zig");
@@ -26,8 +27,8 @@ const RowEmitter = _scanner.RowEmitter;
 const Scanner = _scanner.Scanner;
 const SetVal = _scanner.SetVal;
 const String = _value.String;
-const litToValue = _scanner.litToValue;
-const resolveFilter = _scanner.resolveFilter;
+const litToValue = _parse.litToValue;
+const resolveSource = _scanner.resolveSource;
 const rewriteRowBytes = _scanner.rewriteRowBytes;
 const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
@@ -230,7 +231,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
     // Open AFTER the intent locks — see insert's comment.
-    const t = self.srv.openTable(ns, table_id) catch |err| {
+    const tbl = self.srv.openTable(ns, table_id) catch |err| {
         log.err("select from '{s}': load schema: {s}", .{ sel.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
@@ -239,9 +240,9 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // like any other column (Table.column).
     var cols: std.ArrayList(*const _table.Column) = .empty;
     switch (sel.projection) {
-        .star => for (t.columns) |*c| try cols.append(arloc, c),
+        .star => for (tbl.columns) |*c| try cols.append(arloc, c),
         .columns => |names| for (names) |nm| {
-            const c = t.column(nm) orelse
+            const c = tbl.column(nm) orelse
                 return replyErrorCode(
                     state,
                     pgwire.sqlstate.undefined_column,
@@ -264,7 +265,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
 
     var emitter = RowEmitter{
         .state = state,
-        .t = t,
+        .t = tbl,
         .outs = cols.items,
     };
 
@@ -274,20 +275,17 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // lock-all shape with "act" = emission.
     var sc = Scanner{
         .a = arloc,
-        .t = t,
+        .t = tbl,
         .mode = if (sel.for_update)
             .copy_value
         else
             .{ .emit_value = &emitter },
         .lock = sel.for_update,
     };
-    if (sel.filter) |f| {
-        switch ((try resolveFilter(state, arloc, t, f)) orelse return) {
-            .egids => |es| sc.source = .{ .egids = es },
-            .index_eq => |ix| sc.source = .{ .index_eq = ix },
-            .index_bitmap => |ix| sc.source = .{ .index_bitmap = ix },
-            .cell => |c| sc.cell_filter = c,
-        }
+    if (sel.where) |where| {
+        const p = (try _pred.bind(state, arloc, tbl, where)) orelse return;
+        sc.residual = p;
+        sc.source = try resolveSource(arloc, tbl, p);
     }
     sc.run(eng, ns, table_id, tx) catch |err|
         return replyRunErr(state, "select from", sel.table, err);
@@ -348,13 +346,10 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         .mode = if (tbl.indexes.len > 0) .copy_value else .no_value,
         .lock = true,
     };
-    if (del.filter) |f| {
-        switch ((try resolveFilter(state, arloc, tbl, f)) orelse return) {
-            .egids => |es| sc.source = .{ .egids = es },
-            .index_eq => |ix| sc.source = .{ .index_eq = ix },
-            .index_bitmap => |ix| sc.source = .{ .index_bitmap = ix },
-            .cell => |c| sc.cell_filter = c,
-        }
+    if (del.where) |where| {
+        const p = (try _pred.bind(state, arloc, tbl, where)) orelse return;
+        sc.residual = p;
+        sc.source = try resolveSource(arloc, tbl, p);
     }
     sc.run(eng, ns, table_id, tx) catch |err|
         return replyRunErr(state, "delete from", del.table, err);
@@ -440,11 +435,11 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
     // Open AFTER the intent locks — see insert's comment.
-    const t = self.srv.openTable(ns, table_id) catch |err| {
+    const tbl = self.srv.openTable(ns, table_id) catch |err| {
         log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
-    const posting_idx = try bitmapIndexes(arloc, t);
+    const posting_idx = try bitmapIndexes(arloc, tbl);
 
     // A SET on an indexed column moves each matched row's egid
     // from its old posting to a statement-constant new one (the
@@ -462,7 +457,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // been updated and what their new value is.
     const set_cols = try arloc.alloc(SetVal, up.sets.len);
     for (up.sets, set_cols) |clause, *sv| {
-        const col = t.column(clause.column) orelse
+        const col = tbl.column(clause.column) orelse
             return replyErrorCode(
                 state,
                 pgwire.sqlstate.undefined_column,
@@ -507,17 +502,14 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // happens post-lock.
     var sc = Scanner{
         .a = arloc,
-        .t = t,
+        .t = tbl,
         .mode = .copy_value,
         .lock = true,
     };
-    if (up.filter) |f| {
-        switch ((try resolveFilter(state, arloc, t, f)) orelse return) {
-            .egids => |es| sc.source = .{ .egids = es },
-            .index_eq => |ix| sc.source = .{ .index_eq = ix },
-            .index_bitmap => |ix| sc.source = .{ .index_bitmap = ix },
-            .cell => |c| sc.cell_filter = c,
-        }
+    if (up.where) |where| {
+        const p = (try _pred.bind(state, arloc, tbl, where)) orelse return;
+        sc.residual = p;
+        sc.source = try resolveSource(arloc, tbl, p);
     }
     sc.run(eng, ns, table_id, tx) catch |err|
         return replyRunErr(state, "update", up.table, err);
@@ -539,7 +531,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     for (sc.items.items) |item| {
         const egid = _key.decodeEgid(item.key.primary).?;
         for (moved_cols.items) |mv| {
-            const cell = t.read(item, mv.index.column);
+            const cell = tbl.read(item, mv.index.column);
             const old_key = _key.encodeIndexKey(arloc, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
@@ -553,7 +545,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         }
         const rewritten = try rewriteRowBytes(
             arloc,
-            &t.ps,
+            &tbl.ps,
             set_cols,
             &dec,
             item.value,
@@ -571,7 +563,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
 
 /// litToValue plus the client-facing error mapping shared by INSERT
 /// and UPDATE. null = the error reply was already sent (the
-/// resolveFilter convention).
+/// pred.bind convention).
 fn coerceLiteral(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,
@@ -607,16 +599,16 @@ fn lessThanBytes(_: void, x: []const u8, y: []const u8) bool {
 }
 
 /// The indexes maintained as roaring postings — every non-unique index
-/// of `t`, at most one per column (CREATE INDEX rejects seconds). Their
+/// of `tbl`, at most one per column (CREATE INDEX rejects seconds). Their
 /// entries are commuting deltas (Txn.putPosting); unique indexes (the
 /// pkey) keep their single-egid lock-then-check path. Pointers into
-/// t.indexes, in a stable order callers zip parallel slices against.
+/// tbl.indexes, in a stable order callers zip parallel slices against.
 fn bitmapIndexes(
     a: std.mem.Allocator,
-    t: *const _table.Table,
+    tbl: *const _table.Table,
 ) ![]const *const _table.Index {
     var list: std.ArrayList(*const _table.Index) = .empty;
-    for (t.indexes) |*idx| {
+    for (tbl.indexes) |*idx| {
         if (idx.unique) continue;
         try list.append(a, idx);
     }

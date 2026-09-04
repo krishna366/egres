@@ -1,119 +1,98 @@
-//! The SQL read machinery: WHERE resolution (resolveFilter — the
+//! The SQL read machinery: source selection (resolveSource — the
 //! planner) and the Scanner that feeds every statement its rows
 //! (snapshot scan, egid point lookups, unique-index lookup, posting
-//! bitmap), plus the RowEmitter that projects matches onto the wire
-//! and UPDATE's pure row rewrite.
+//! bitmap) filtered through its predicate (pred.zig), plus the
+//! RowEmitter that projects matches onto the wire and UPDATE's pure
+//! row rewrite.
 
 const std = @import("std");
 const engine = @import("engine");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 
-const _parse = @import("parse.zig");
 const _key = @import("key.zig");
+const _pred = @import("pred.zig");
 const _row = @import("row.zig");
 const _schema = @import("schema.zig");
 const _table = @import("table.zig");
 const _txn = @import("txn.zig");
 const _value = @import("value.zig");
-const _server = @import("server.zig");
 
 const log = std.log.scoped(.sql);
-const replyErrorCode = _server.replyErrorCode;
+const Pred = _pred.Pred;
 
-/// A resolved `column = value` filter: the column + the target value.
-pub const CellFilter = struct { col: *const _table.Column, val: _value.Value };
 /// A resolved index point lookup: which index tree + the memcomparable key.
 pub const IndexLookup = struct { index_table_id: u32, key: []const u8 };
 
-/// A resolved WHERE `col = value`: the `egid` pseudo-column becomes a
-/// point-id list (one entry today; IN-lists later); an INDEXED column
-/// becomes an index lookup (unique: the one row under the key;
-/// non-unique: the key's posting bitmap — every matching row); any
-/// other payload column becomes a per-row cell compare. Feeds Scanner's
-/// source / cell_filter.
-const ResolvedFilter = union(enum) {
-    egids: []const u64,
-    index_eq: IndexLookup,
-    index_bitmap: IndexLookup,
-    cell: CellFilter,
-};
+/// Pick where the statement's rows come from. The FIRST indexable
+/// top-level AND term drives the read: `egid = N` is a point lookup;
+/// `col = v` on a valid indexed column an index read (unique: the one
+/// row under the key; non-unique: the key's posting bitmap — every
+/// matching row); `col IS NULL` on a valid non-unique index the bitmap
+/// under the NULL tag key. Anything else scans the table. Choosing is
+/// only about which rows are READ — the whole predicate is re-checked
+/// per row (Scanner.residual), so a term the source already decided
+/// costs one more cell compare, never a wrong answer. A comparison
+/// against NULL can never be true (3VL), so the source is empty and
+/// nothing is read or recorded. `a` (the statement arena) backs the
+/// encoded keys.
+pub fn resolveSource(
+    arloc: std.mem.Allocator,
+    tbl: *const _table.Table,
+    p: *const Pred,
+) !Scanner.Source {
+    var pick: ?Scanner.Source = null;
+    for (p.topLevelAnds()) |*c| {
+        switch (c.*) {
+            .eq => |cmp| {
+                // If query asks for col == null, then just return empty set,
+                // even if we are holding a legit pick.
+                if (cmp.val == .null_value) return .{ .egids = &.{} };
 
-/// Resolve a parsed `col = literal` filter against `t`. `a` (the statement
-/// arena) backs the coerced compare value. On an unknown column, a bad egid,
-/// or an uncoercible literal the SQL error is already sent and null returned
-/// — the statement is over. Only OOM propagates as an error.
-pub fn resolveFilter(
-    state: *pgwire.ConnState,
+                if (pick != null) continue;
+                if (cmp.col.isEgid()) {
+                    pick = .{ .egids = try arloc.dupe(u64, &.{cmp.val.uint8}) };
+                } else {
+                    pick = try indexSource(arloc, tbl, cmp.col, cmp.val);
+                }
+            },
+            .is_null => |nt| {
+                if (nt.negate or pick != null) continue;
+                // A unique index holds no NULL entries; only a posting
+                // bitmap can answer IS NULL.
+                if (try indexSource(arloc, tbl, nt.col, .null_value)) |s| {
+                    if (s == .index_bitmap) pick = s;
+                }
+            },
+            .and_, .or_, .not => {},
+        }
+    }
+    return pick orelse .table;
+}
+
+/// The index read answering `col = val`, or null when the column has
+/// no valid index or the value has no memcomparable encoding
+/// (interval) — then the rows are found by scanning. NULL encodes (its
+/// own tag-byte key). A mid-backfill index (catalog.IndexDef.valid =
+/// false) is maintained by DML but must not be read yet.
+fn indexSource(
     a: std.mem.Allocator,
     tbl: *const _table.Table,
-    filter: _parse.Filter,
-) !?ResolvedFilter {
-    const bad_value = pgwire.sqlstate.invalid_text_representation;
-    const fcol = tbl.column(filter.column) orelse {
-        try replyErrorCode(
-            state,
-            pgwire.sqlstate.undefined_column,
-            "column does not exist",
-        );
-        return null;
-    };
-    const val = litToValue(a, filter.literal, fcol.ty) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => {
-            try replyErrorCode(state, bad_value, "invalid value in WHERE");
-            return null;
-        },
-    };
-    // The egid IS the row key: a point lookup, never a cell compare.
-    // The column is uint8, so a negative literal already failed to
-    // parse above; only zero (never a row) needs rejecting here.
-    if (fcol.isEgid()) {
-        const n = switch (val) {
-            .uint8 => |n| n,
-            else => {
-                try replyErrorCode(state, bad_value, "egid must be an integer");
-                return null;
-            },
-        };
-        if (n == 0) {
-            try replyErrorCode(
-                state,
-                bad_value,
-                "egid must be a positive integer",
-            );
-            return null;
-        }
-        return .{ .egids = try a.dupe(u64, &.{n}) };
-    }
-    // An index on this column turns the filter into an index read. An
-    // unencodable value (interval) falls back to a cell compare,
-    // preserving today's semantics. NULL encodes (its own tag-byte
-    // key), and `= NULL` matching NULL rows is deliberately consistent
-    // with the cell path's valuesEqual(null, null) — Postgres-strict IS
-    // NULL semantics are one future decision covering both paths.
-    index: for (tbl.indexes) |idx| {
-        if (idx.column != fcol) continue;
-        // Mid-backfill: DML maintains the index but reads must not
-        // trust it yet (catalog.IndexDef.valid); fall through to the
-        // cell scan.
-        if (!idx.valid) continue;
+    col: *const _table.Column,
+    val: _value.Value,
+) !?Scanner.Source {
+    for (tbl.indexes) |idx| {
+        if (idx.column != col or !idx.valid) continue;
         const ik = _key.encodeIndexKey(a, val, null) catch |err| {
             if (err == error.OutOfMemory) return err;
-            break :index;
+            return null;
         };
-        const lu = IndexLookup{
-            .index_table_id = idx.index_table_id,
-            .key = ik,
-        };
+        const lu = IndexLookup{ .index_table_id = idx.index_table_id, .key = ik };
         // Unique: the entry's value IS the one row key. Non-unique:
         // the entry is a roaring bitmap — every matching egid.
-        return if (idx.unique)
-            .{ .index_eq = lu }
-        else
-            .{ .index_bitmap = lu };
+        return if (idx.unique) .{ .index_eq = lu } else .{ .index_bitmap = lu };
     }
-    return .{ .cell = .{ .col = fcol, .val = val } };
+    return null;
 }
 
 /// Turns each row into a projected DataRow on the wire — Scanner's
@@ -146,31 +125,19 @@ pub const RowEmitter = struct {
     }
 };
 
-/// Coerce a parsed VALUES literal to a cell of column type `ty`, reusing
-/// value.parseValue by rendering non-string literals to text first (int/bool
-/// stringified into `a`, so a text-typed column can borrow it). NULL passes
-/// through; a non-literal item is `error.UnsupportedLiteral`.
-pub fn litToValue(a: std.mem.Allocator, lit: _parse.Literal, ty: _value.Type) !_value.Value {
-    const text: []const u8 = switch (lit) {
-        .null_value => return .null_value,
-        .unsupported => return error.UnsupportedLiteral,
-        .str, .float => |s| s,
-        .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
-        .bool_ => |b| if (b) "t" else "f",
-    };
-    return _value.parseValue(ty, text);
-}
-
 /// The statement scanner — the one forest.scan callback for DML. Filters
-/// each row on the single cell the WHERE names (no full-row decode),
-/// then handles the match per `mode` — streamed to the wire, or captured
-/// into `items` for a post-lock pass (duped into the statement arena;
-/// scan Items don't outlive the callback). Default ScanOptions skip
-/// tombstones, so only live rows are seen — re-running a DELETE reports 0.
+/// each row through the statement's predicate (reading only the cells
+/// it names — no full-row decode), then handles the match per `mode` —
+/// streamed to the wire, or captured into `items` for a post-lock pass
+/// (duped into the statement arena; scan Items don't outlive the
+/// callback). Default ScanOptions skip tombstones, so only live rows
+/// are seen — re-running a DELETE reports 0.
 pub const Scanner = struct {
     a: std.mem.Allocator, // statement arena — backs items
     t: *const _table.Table,
-    cell_filter: ?CellFilter = null,
+    /// The WHERE, whole — checked on every row the source yields, even
+    /// rows an index already selected (see resolveSource).
+    residual: ?*const Pred = null,
     source: Source = .table,
     mode: Mode,
     /// Lock every matched row (exclusive, held to txn end) before run()
@@ -193,9 +160,9 @@ pub const Scanner = struct {
     items: std.ArrayList(zdb.kv.Item) = .empty,
     err: ?anyerror = null,
 
-    /// Where the statement's rows come from.
-    const Source = union(enum) {
-        /// Snapshot scan of the whole table; cell_filter prunes rows.
+    /// Where the statement's rows come from (chosen by resolveSource).
+    pub const Source = union(enum) {
+        /// Snapshot scan of the whole table; residual prunes rows.
         table,
         /// Point lookups by row id — `WHERE egid = N` today (one
         /// entry), IN-lists later. With `lock` set, each key is locked
@@ -240,10 +207,10 @@ pub const Scanner = struct {
     };
 
     fn collect(self: *Scanner, item: zdb.kv.Item) !void {
-        // Filter on the ONE cell it names — no full-row decode here.
-        if (self.cell_filter) |cf| {
-            if (!_value.valuesEqual(self.t.read(item, cf.col), cf.val))
-                return;
+        // Only the cells the predicate names are read — no full-row
+        // decode here. Unknown (a NULL on either side) rejects like false.
+        if (self.residual) |p| {
+            if (!_pred.matches(self.t, item, p)) return;
         }
         const captured: zdb.kv.Item = switch (self.mode) {
             .emit_value => |em| return em.emit(item),

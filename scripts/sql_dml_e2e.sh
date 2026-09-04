@@ -68,6 +68,17 @@ expect "negative egid rejected (uint8 parse)" "invalid value" q "SELECT name FRO
 expect "WHERE on payload column" "b" v "SELECT name FROM t WHERE id = 2;"
 expect "SELECT egid, id, name" "(2 rows)" q "SELECT egid, id, name FROM t;"
 
+# --- boolean WHERE: AND / OR / NOT, precedence, egid conjunct --------------
+expect "AND" "a" v "SELECT name FROM t WHERE id = 1 AND name = 'a';"
+expect "AND no match" "(0 rows)" q "SELECT name FROM t WHERE id = 1 AND name = 'b';"
+expect "OR" "(2 rows)" q "SELECT name FROM t WHERE id = 1 OR name = 'b';"
+expect "NOT" "b" v "SELECT name FROM t WHERE NOT id = 1;"
+expect "AND binds tighter than OR" "(2 rows)" q "SELECT name FROM t WHERE id = 2 OR id = 1 AND name = 'a';"
+expect "parentheses override" "(0 rows)" q "SELECT name FROM t WHERE (id = 2 OR id = 1) AND name = 'zz';"
+expect "egid conjunct drives a point read" "b" v "SELECT name FROM t WHERE egid = 2 AND id = 2;"
+expect "egid conjunct, false residual" "(0 rows)" q "SELECT name FROM t WHERE egid = 2 AND id = 1;"
+expect "unsupported operator rejected" "column = value" q "SELECT name FROM t WHERE id > 1;"
+
 # egid is a hidden system column: not in SELECT *.
 star_out=$(q "SELECT * FROM t;" 2>&1)
 if grep -q "egid" <<<"$star_out"; then bad "egid leaked into SELECT *"; else ok "egid excluded from SELECT *"; fi
@@ -75,6 +86,14 @@ if grep -q "egid" <<<"$star_out"; then bad "egid leaked into SELECT *"; else ok 
 # --- omitted column defaults NULL; egid auto-allocates ---------------------
 expect "INSERT partial cols" "INSERT 0 1" q "INSERT INTO t (name) VALUES ('c');"
 expect "auto egid 3 = c" "c" v "SELECT name FROM t WHERE egid = 3;"
+
+# --- SQL three-valued logic: NULL is unknown, only TRUE matches ------------
+expect "= NULL matches nothing" "(0 rows)" q "SELECT name FROM t WHERE id = NULL;"
+expect "NOT (= NULL) is still unknown" "(0 rows)" q "SELECT name FROM t WHERE NOT id = NULL;"
+expect "IS NULL" "c" v "SELECT name FROM t WHERE id IS NULL;"
+expect "IS NOT NULL" "(2 rows)" q "SELECT name FROM t WHERE id IS NOT NULL;"
+expect "unknown OR true is true" "c" v "SELECT name FROM t WHERE id = NULL OR name = 'c';"
+expect "unknown AND true is unknown" "(0 rows)" q "SELECT name FROM t WHERE id = 5 AND name = 'c';"
 
 # --- egid is read-only at insert time --------------------------------------
 expect "cannot insert egid" "not supported" q "INSERT INTO t (egid, name) VALUES (100, 'x');"
@@ -98,6 +117,9 @@ expect "multi-SET" "UPDATE 1" q "UPDATE t SET id = 20, name = 'b3' WHERE egid = 
 expect "multi-SET visible" "b3" v "SELECT name FROM t WHERE id = 20;"
 expect "UPDATE by column" "UPDATE 1" q "UPDATE t SET id = 30 WHERE name = 'c';"
 expect "scan-update visible" "c" v "SELECT name FROM t WHERE id = 30;"
+expect "UPDATE with AND" "UPDATE 1" q "UPDATE t SET id = 31 WHERE id = 30 AND name = 'c';"
+expect "UPDATE with OR" "UPDATE 2" q "UPDATE t SET id = 32 WHERE id = 31 OR egid = 1;"
+expect "UPDATE with IS NULL" "UPDATE 1" q "UPDATE t SET id = 33 WHERE id IS NULL;"
 expect "UPDATE no match is 0" "UPDATE 0" q "UPDATE t SET id = 7 WHERE name = 'zzz';"
 expect "UPDATE all rows" "UPDATE 4" q "UPDATE t SET id = 99;"
 expect "all rows updated" "(4 rows)" q "SELECT * FROM t WHERE id = 99;"
@@ -114,6 +136,8 @@ expect "deleted row invisible" "(0 rows)" q "SELECT * FROM t WHERE egid = 2;"
 expect "DELETE same egid again is 0" "DELETE 0" q "DELETE FROM t WHERE egid = 2;"
 
 # --- delete by payload column (scan path) ----------------------------------
+expect "DELETE with a false AND is 0" "DELETE 0" q "DELETE FROM t WHERE name = 'c' AND id = 5;"
+expect "DELETE with an unknown AND is 0" "DELETE 0" q "DELETE FROM t WHERE name = 'c' AND id = NULL;"
 expect "DELETE by column" "DELETE 1" q "DELETE FROM t WHERE name = 'c';"
 expect "DELETE no match is 0" "DELETE 0" q "DELETE FROM t WHERE name = 'zzz';"
 expect "survivors intact" "(2 rows)" q "SELECT * FROM t;" # a (egid 1), d (egid 4)

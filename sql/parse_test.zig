@@ -239,7 +239,7 @@ test "sql.parse: SELECT parses projection, table, and an equality filter" {
     const s1 = try parse.statement(alloc, "SELECT * FROM t;");
     try testing.expectEqualStrings("t", s1.select.table);
     try testing.expect(s1.select.projection == .star);
-    try testing.expect(s1.select.filter == null);
+    try testing.expect(s1.select.where == null);
 
     // Named columns incl. the egid pseudo-column + a WHERE filter.
     const s2 = try parse.statement(alloc, "SELECT egid, name FROM t WHERE id = 5;");
@@ -247,9 +247,69 @@ test "sql.parse: SELECT parses projection, table, and an equality filter" {
     try testing.expectEqual(@as(usize, 2), s2.select.projection.columns.len);
     try testing.expectEqualStrings("egid", s2.select.projection.columns[0]);
     try testing.expectEqualStrings("name", s2.select.projection.columns[1]);
-    const f = s2.select.filter.?;
+    const f = s2.select.where.?.eq;
     try testing.expectEqualStrings("id", f.column);
     try testing.expectEqual(@as(i64, 5), f.literal.int);
+}
+
+test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // libpg_query flattens a chain of ANDs into ONE node — the planner
+    // reads the top-level AND terms straight off it.
+    const s1 = try parse.statement(alloc, "SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3;");
+    const and3 = s1.select.where.?.and_;
+    try testing.expectEqual(@as(usize, 3), and3.len);
+    try testing.expectEqualStrings("a", and3[0].eq.column);
+    try testing.expectEqualStrings("b", and3[1].eq.column);
+    try testing.expectEqualStrings("c", and3[2].eq.column);
+    try testing.expectEqual(@as(i64, 3), and3[2].eq.literal.int);
+
+    // Nesting, parentheses, NOT — shared by DELETE.
+    const d = try parse.statement(alloc, "DELETE FROM t WHERE a = 1 OR (b = 2 AND NOT c = 'x');");
+    const or2 = d.delete.where.?.or_;
+    try testing.expectEqual(@as(usize, 2), or2.len);
+    try testing.expectEqualStrings("a", or2[0].eq.column);
+    const and2 = or2[1].and_;
+    try testing.expectEqual(@as(usize, 2), and2.len);
+    try testing.expectEqualStrings("b", and2[0].eq.column);
+    const inner = and2[1].not.*;
+    try testing.expectEqualStrings("c", inner.eq.column);
+    try testing.expectEqualStrings("x", inner.eq.literal.str);
+
+    // SQL precedence: AND binds tighter than OR.
+    const p = try parse.statement(alloc, "SELECT * FROM t WHERE a = 1 OR b = 2 AND c = 3;");
+    const top = p.select.where.?.or_;
+    try testing.expectEqual(@as(usize, 2), top.len);
+    try testing.expect(top[0] == .eq);
+    try testing.expectEqual(@as(usize, 2), top[1].and_.len);
+
+    // IS NULL / IS NOT NULL — shared by UPDATE.
+    const upd1 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE b IS NULL;");
+    try testing.expectEqualStrings("b", upd1.update.where.?.is_null.column);
+    try testing.expect(!upd1.update.where.?.is_null.negate);
+    const upd2 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE b IS NOT NULL AND c = 1;");
+    const upd2_and = upd2.update.where.?.and_;
+    try testing.expect(upd2_and[0].is_null.negate);
+    try testing.expectEqualStrings("c", upd2_and[1].eq.column);
+
+    // Rejections anywhere in the tree surface the leaf's reason.
+    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+        .{ .sql = "SELECT * FROM t WHERE a = 1 AND b > 2;", .needle = "column = value" },
+        .{ .sql = "SELECT * FROM t WHERE a = 1 OR b;", .needle = "unsupported WHERE" },
+        .{ .sql = "SELECT * FROM t WHERE NOT b;", .needle = "unsupported WHERE" },
+        .{ .sql = "SELECT * FROM t WHERE a IS DISTINCT FROM 1;", .needle = "column = value" },
+        .{ .sql = "SELECT * FROM t WHERE (a = 1) IS NULL;", .needle = "IS NULL operand" },
+        .{ .sql = "SELECT * FROM t WHERE a = 1 AND b = c;", .needle = "literal" },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
+    }
 }
 
 test "sql.parse: SELECT rejections carry a reason" {
@@ -280,24 +340,24 @@ test "sql.parse: DELETE parses table and the optional equality filter" {
     // No WHERE: delete every row.
     const d1 = try parse.statement(alloc, "DELETE FROM t;");
     try testing.expectEqualStrings("t", d1.delete.table);
-    try testing.expect(d1.delete.filter == null);
+    try testing.expect(d1.delete.where == null);
 
     // WHERE on a payload column.
     const d2 = try parse.statement(alloc, "DELETE FROM t WHERE id = 5;");
-    const f2 = d2.delete.filter.?;
+    const f2 = d2.delete.where.?.eq;
     try testing.expectEqualStrings("id", f2.column);
     try testing.expectEqual(@as(i64, 5), f2.literal.int);
 
     // WHERE on the egid pseudo-column parses as a plain column filter.
     const d3 = try parse.statement(alloc, "DELETE FROM t WHERE egid = 3;");
-    const f3 = d3.delete.filter.?;
+    const f3 = d3.delete.where.?.eq;
     try testing.expectEqualStrings("egid", f3.column);
     try testing.expectEqual(@as(i64, 3), f3.literal.int);
 
     // Qualified name keeps the last part; string literal.
     const d4 = try parse.statement(alloc, "DELETE FROM public.t WHERE name = 'x';");
     try testing.expectEqualStrings("t", d4.delete.table);
-    const f4 = d4.delete.filter.?;
+    const f4 = d4.delete.where.?.eq;
     try testing.expectEqualStrings("name", f4.column);
     try testing.expectEqualStrings("x", f4.literal.str);
 }
@@ -312,7 +372,6 @@ test "sql.parse: DELETE rejections carry a reason" {
         .{ .sql = "DELETE FROM t RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) DELETE FROM t;", .needle = "WITH" },
         .{ .sql = "DELETE FROM t WHERE a > 5;", .needle = "column = value" },
-        .{ .sql = "DELETE FROM t WHERE a = 1 AND b = 2;", .needle = "WHERE" },
         .{
             .sql = "DELETE FROM t WHERE id IN (SELECT id FROM u);",
             .needle = "WHERE",
@@ -339,7 +398,7 @@ test "sql.parse: UPDATE parses table, SET list, and the optional filter" {
         "UPDATE t SET a = 5, b = 'x', c = NULL;",
     );
     try testing.expectEqualStrings("t", up1.update.table);
-    try testing.expect(up1.update.filter == null);
+    try testing.expect(up1.update.where == null);
     try testing.expectEqual(3, up1.update.sets.len);
     try testing.expectEqualStrings("a", up1.update.sets[0].column);
     try testing.expectEqual(@as(i64, 5), up1.update.sets[0].literal.int);
@@ -352,13 +411,13 @@ test "sql.parse: UPDATE parses table, SET list, and the optional filter" {
     // omitted-zero encoding ("ival":{} still means 0).
     const up2 = try parse.statement(alloc, "UPDATE t SET a = 0 WHERE id = 7;");
     try testing.expectEqual(@as(i64, 0), up2.update.sets[0].literal.int);
-    const f2 = up2.update.filter.?;
+    const f2 = up2.update.where.?.eq;
     try testing.expectEqualStrings("id", f2.column);
     try testing.expectEqual(@as(i64, 7), f2.literal.int);
 
     // WHERE on the egid pseudo-column parses as a plain column filter.
     const up3 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE egid = 3;");
-    try testing.expectEqualStrings("egid", up3.update.filter.?.column);
+    try testing.expectEqualStrings("egid", up3.update.where.?.eq.column);
 }
 
 test "sql.parse: transaction statements parse; savepoints are rejected" {

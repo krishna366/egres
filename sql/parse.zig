@@ -76,23 +76,41 @@ pub const Projection = union(enum) {
     columns: [][]const u8,
 };
 
-/// A single `column = literal` filter (the only WHERE this slice supports).
-pub const Filter = struct {
+/// A single `column = literal` comparison — the equality leaf of a WHERE.
+pub const Eq = struct {
     column: []const u8, // borrowed
     literal: Literal,
+};
+
+/// A parsed WHERE tree. Leaves name one column; AND/OR hold their
+/// children inline (a slice is already an indirection, and children
+/// are never shared between parents); NOT is a pointer only because a
+/// union cannot contain itself by value. Everything borrows the arena.
+pub const Where = union(enum) {
+    eq: Eq,
+    is_null: NullTest,
+    and_: []const Where,
+    or_: []const Where,
+    not: *const Where,
+
+    /// `column IS NULL` (negate = false) / `column IS NOT NULL`.
+    pub const NullTest = struct {
+        column: []const u8, // borrowed
+        negate: bool,
+    };
 };
 
 pub const Select = struct {
     table: []const u8, // borrowed
     projection: Projection,
-    filter: ?Filter,
+    where: ?Where,
     /// FOR UPDATE: lock every matched row exclusively (held to txn end).
     for_update: bool = false,
 };
 
 pub const Delete = struct {
     table: []const u8, // borrowed
-    filter: ?Filter, // null = delete every row
+    where: ?Where, // null = delete every row
 };
 
 /// One SET assignment: `column = literal`.
@@ -104,7 +122,7 @@ pub const SetClause = struct {
 pub const Update = struct {
     table: []const u8, // borrowed
     sets: []SetClause, // borrowed
-    filter: ?Filter, // null = update every row
+    where: ?Where, // null = update every row
 };
 
 pub const Stmt = union(enum) {
@@ -258,7 +276,7 @@ const InsertStmtJson = struct {
     };
 };
 
-/// SELECT [cols|*] FROM t [WHERE col = const]
+/// SELECT [cols|*] FROM t [WHERE ...]
 const SelectStmtJson = struct {
     targetList: []const ResTargetNode = &.{},
     fromClause: []const FromNode = &.{},
@@ -293,18 +311,34 @@ const SelectStmtJson = struct {
         A_Star: ?struct {} = null,
     };
     const FromNode = struct { RangeVar: ?struct { relname: []const u8 = "" } = null };
+    // One WHERE node: exactly one of the three is present. The mirror
+    // is recursive through `args` (a slice, so the type has a size).
     const WhereNode = struct {
         A_Expr: ?AExpr = null,
+        BoolExpr: ?BoolExprNode = null,
+        NullTest: ?NullTestNode = null,
         const AExpr = struct {
             kind: []const u8 = "",
             name: []const NameNode = &.{},
             lexpr: ColumnRefWrap = .{},
             rexpr: struct { A_Const: InsertStmtJson.AConst = .{} } = .{},
         };
+        // AND_EXPR / OR_EXPR / NOT_EXPR. libpg_query flattens `a AND b
+        // AND c` into ONE node with three args (parse_test asserts it);
+        // NOT always carries exactly one.
+        const BoolExprNode = struct {
+            boolop: []const u8 = "",
+            args: []const WhereNode = &.{},
+        };
+        // `x IS NULL` / `x IS NOT NULL`: nulltesttype = IS_NULL | IS_NOT_NULL.
+        const NullTestNode = struct {
+            arg: ColumnRefWrap = .{},
+            nulltesttype: []const u8 = "",
+        };
     };
 };
 
-/// DELETE FROM t [WHERE col = const]. `relation` is inline (a RangeVar body,
+/// DELETE FROM t [WHERE ...]. `relation` is inline (a RangeVar body,
 /// like INSERT); the last three clauses are decoded only to reject them.
 const DeleteStmtJson = struct {
     relation: struct { relname: []const u8 = "" } = .{},
@@ -314,7 +348,7 @@ const DeleteStmtJson = struct {
     withClause: ?std.json.Value = null, // WITH ... DELETE
 };
 
-/// UPDATE t SET col = const [, ...] [WHERE col = const]. Each targetList
+/// UPDATE t SET col = const [, ...] [WHERE ...]. Each targetList
 /// entry is one SET assignment; a non-literal value (expression, DEFAULT,
 /// sub-select, multi-assign) leaves `A_Const` null → rejected. The last
 /// three clauses are decoded only to reject them.
@@ -507,9 +541,25 @@ fn literalFrom(ac: InsertStmtJson.AConst) Literal {
     return .unsupported;
 }
 
-/// A parsed WHERE: a `col = literal` filter or a rejection reason (borrowed).
+/// Coerce a parsed literal to a cell of column type `ty`, reusing
+/// value.parseValue by rendering non-string literals to text first
+/// (int/bool stringified into `a`, so a text-typed column can borrow
+/// it). NULL passes through; a non-literal item is
+/// `error.UnsupportedLiteral`.
+pub fn litToValue(a: std.mem.Allocator, lit: Literal, ty: _value.Type) !_value.Value {
+    const text: []const u8 = switch (lit) {
+        .null_value => return .null_value,
+        .unsupported => return error.UnsupportedLiteral,
+        .str, .float => |s| s,
+        .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
+        .bool_ => |b| if (b) "t" else "f",
+    };
+    return _value.parseValue(ty, text);
+}
+
+/// A parsed WHERE tree or a rejection reason (borrowed).
 const ParsedWhere = union(enum) {
-    filter: Filter,
+    where: Where,
     invalid: []const u8,
 
     fn reject(msg: []const u8) ParsedWhere {
@@ -517,35 +567,78 @@ const ParsedWhere = union(enum) {
     }
 };
 
-/// Parse the one WHERE shape this slice supports — `column = literal` —
-/// shared by SELECT and DELETE. Anything else (non-equality op, AND/OR,
-/// subquery, column-vs-column) yields a clean `.invalid` reason; only OOM
-/// propagates.
-fn parseWhere(w: SelectStmtJson.WhereNode) ParsedWhere {
-    const ae = w.A_Expr orelse
+/// The column a WHERE operand names — the last field of a qualified
+/// reference — or null when the operand is not a plain column.
+fn columnOf(ref: SelectStmtJson.ColumnRefWrap) ?[]const u8 {
+    const cr = ref.ColumnRef orelse return null;
+    if (cr.fields.len == 0) return null;
+    const last = cr.fields[cr.fields.len - 1].String orelse return null;
+    return last.sval;
+}
+
+/// Parse a WHERE tree, shared by SELECT, DELETE, and UPDATE: `column =
+/// literal` leaves, `column IS [NOT] NULL`, and AND / OR / NOT over
+/// them. Anything else (another operator, a subquery, column-vs-column,
+/// a bare boolean column) yields a clean `.invalid` reason; only OOM
+/// propagates. AND/OR children land in one arena slice, NOT's in one
+/// arena cell.
+fn parseWhere(
+    alloc: std.mem.Allocator,
+    where: SelectStmtJson.WhereNode,
+) parser.ParseError!ParsedWhere {
+    if (where.BoolExpr) |be| {
+        if (std.mem.eql(u8, be.boolop, "NOT_EXPR")) {
+            if (be.args.len != 1)
+                return ParsedWhere.reject("NOT takes exactly one operand");
+            const child = try alloc.create(Where);
+            child.* = switch (try parseWhere(alloc, be.args[0])) {
+                .where => |x| x,
+                .invalid => |msg| return .{ .invalid = msg },
+            };
+            return .{ .where = .{ .not = child } };
+        }
+        const is_and = std.mem.eql(u8, be.boolop, "AND_EXPR");
+        if (!is_and and !std.mem.eql(u8, be.boolop, "OR_EXPR"))
+            return ParsedWhere.reject("unsupported WHERE clause");
+        const kids = try alloc.alloc(Where, be.args.len);
+        for (be.args, kids) |arg, *kid| {
+            kid.* = switch (try parseWhere(alloc, arg)) {
+                .where => |x| x,
+                .invalid => |msg| return .{ .invalid = msg },
+            };
+        }
+        return .{ .where = if (is_and) .{ .and_ = kids } else .{ .or_ = kids } };
+    }
+
+    if (where.NullTest) |nt| {
+        const column = columnOf(nt.arg) orelse
+            return ParsedWhere.reject("IS NULL operand must be a column");
+        const negate = if (std.mem.eql(u8, nt.nulltesttype, "IS_NULL"))
+            false
+        else if (std.mem.eql(u8, nt.nulltesttype, "IS_NOT_NULL"))
+            true
+        else
+            return ParsedWhere.reject("unsupported WHERE clause");
+        return .{ .where = .{ .is_null = .{ .column = column, .negate = negate } } };
+    }
+
+    const ae = where.A_Expr orelse
         return ParsedWhere.reject("unsupported WHERE clause");
     if (!std.mem.eql(u8, ae.kind, "AEXPR_OP") or ae.name.len == 0 or
         !std.mem.eql(u8, ae.name[ae.name.len - 1].String.sval, "="))
         return ParsedWhere.reject(
-            "only `column = value` is supported in WHERE",
+            "only `column = value` comparisons are supported in WHERE",
         );
 
-    const lcol = ae.lexpr.ColumnRef orelse
+    const column = columnOf(ae.lexpr) orelse
         return ParsedWhere.reject("WHERE left side must be a column");
-    const lfields = lcol.fields;
-    if (lfields.len == 0 or lfields[lfields.len - 1].String == null)
-        return ParsedWhere.reject("WHERE left side must be a column");
-
     const lit = literalFrom(ae.rexpr.A_Const);
     if (lit == .unsupported)
         return ParsedWhere.reject("WHERE right side must be a literal");
-    return .{ .filter = .{
-        .column = lfields[lfields.len - 1].String.?.sval,
-        .literal = lit,
-    } };
+    return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
 }
 
-/// SELECT [cols|*] FROM one_table [WHERE col = literal]. Joins, subqueries,
+/// SELECT [cols|*] FROM one_table [WHERE ...]. Joins, subqueries,
 /// ORDER BY / GROUP BY / LIMIT / DISTINCT and expression targets are rejected.
 fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
     const ss = try fromValue(SelectStmtJson, alloc, body) orelse return .unsupported;
@@ -580,9 +673,9 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         }
     }
 
-    var filter: ?Filter = null;
-    if (ss.whereClause) |w| switch (parseWhere(w)) {
-        .filter => |f| filter = f,
+    var where: ?Where = null;
+    if (ss.whereClause) |node| switch (try parseWhere(alloc, node)) {
+        .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
 
@@ -604,7 +697,7 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
     return .{ .select = .{
         .table = rv.relname,
         .projection = if (star) .star else .{ .columns = try cols.toOwnedSlice(alloc) },
-        .filter = filter,
+        .where = where,
         .for_update = for_update,
     } };
 }
@@ -647,9 +740,9 @@ fn parseTransaction(
     return invalid("unsupported transaction statement");
 }
 
-/// DELETE FROM one_table [WHERE col = literal]. USING, RETURNING, WITH, and
-/// any non-equality WHERE are rejected with a reason. `WHERE egid = N` parses
-/// as an ordinary column filter — egid resolution stays server-side.
+/// DELETE FROM one_table [WHERE ...]. USING, RETURNING, WITH, and any
+/// WHERE shape parseWhere rejects carry a reason. `WHERE egid = N` parses
+/// as an ordinary column comparison — egid resolution stays server-side.
 fn parseDelete(
     alloc: std.mem.Allocator,
     body: std.json.Value,
@@ -664,16 +757,16 @@ fn parseDelete(
     if (ds.withClause != null)
         return invalid("WITH is not supported");
 
-    var filter: ?Filter = null;
-    if (ds.whereClause) |w| switch (parseWhere(w)) {
-        .filter => |f| filter = f,
+    var where: ?Where = null;
+    if (ds.whereClause) |node| switch (try parseWhere(alloc, node)) {
+        .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
 
-    return .{ .delete = .{ .table = ds.relation.relname, .filter = filter } };
+    return .{ .delete = .{ .table = ds.relation.relname, .where = where } };
 }
 
-/// UPDATE one_table SET col = literal [, ...] [WHERE col = literal].
+/// UPDATE one_table SET col = literal [, ...] [WHERE ...].
 /// FROM, RETURNING, WITH, non-literal SET values, and duplicate SET
 /// columns are rejected with a reason.
 fn parseUpdate(
@@ -691,9 +784,9 @@ fn parseUpdate(
         return invalid("WITH is not supported");
     if (us.targetList.len == 0) return .unsupported;
 
-    var filter: ?Filter = null;
-    if (us.whereClause) |w| switch (parseWhere(w)) {
-        .filter => |f| filter = f,
+    var where: ?Where = null;
+    if (us.whereClause) |node| switch (try parseWhere(alloc, node)) {
+        .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
 
@@ -716,7 +809,7 @@ fn parseUpdate(
     return .{ .update = .{
         .table = us.relation.relname,
         .sets = try sets.toOwnedSlice(alloc),
-        .filter = filter,
+        .where = where,
     } };
 }
 

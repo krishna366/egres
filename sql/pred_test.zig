@@ -1,0 +1,170 @@
+const std = @import("std");
+const testing = std.testing;
+const sql = @import("sql");
+const zdb = @import("zdb");
+
+const pred = sql.pred;
+const Pred = pred.Pred;
+const Value = sql.value.Value;
+const Item = zdb.kv.Item;
+
+/// (a int4, b text) assembled by hand — no catalog, no forest. Everything
+/// lives in one arena, dropped by the test.
+const Fixture = struct {
+    a: std.mem.Allocator,
+    tbl: sql.table.Table,
+
+    fn init(a: std.mem.Allocator) !Fixture {
+        const logical = [_]sql.schema.LogicalColumn{
+            .{ .column_id = 1, .name = "a", .ty = .int4 },
+            .{ .column_id = 2, .name = "b", .ty = .text },
+        };
+        const ps = try sql.schema.compile(a, .{ .columns = &logical, .current_version = 1 }, 1);
+        const columns = try a.alloc(sql.table.Column, 2);
+        columns[0] = .{ .column_id = 1, .pos = 0, .name = "a", .ty = .int4, .pkey_position = null };
+        columns[1] = .{ .column_id = 2, .pos = 1, .name = "b", .ty = .text, .pkey_position = null };
+        return .{ .a = a, .tbl = .{
+            .columns = columns,
+            .indexes = try a.alloc(sql.table.Index, 0),
+            .primary_index = null,
+            .ps = ps,
+            .version = 1,
+            .arena = std.heap.ArenaAllocator.init(a),
+        } };
+    }
+
+    fn col(self: *const Fixture, name: []const u8) *const sql.table.Column {
+        return self.tbl.column(name).?;
+    }
+
+    /// A stored row: egid in the key, `cells` marshalled under the
+    /// table's layout.
+    fn item(self: *const Fixture, egid: u64, cells: []const Value) !Item {
+        var buf: std.ArrayList(u8) = .empty;
+        const bytes = try sql.row.marshalRow(self.a, &self.tbl.ps, cells, &buf);
+        return .{
+            .key = .{
+                .namespace = 1,
+                .table_id = 16,
+                .primary = try self.a.dupe(u8, &sql.key.encodeEgid(egid)),
+                .timestamp = 1,
+            },
+            .value = bytes,
+            .meta = .{},
+        };
+    }
+};
+
+test "sql.pred: bindNode binds columns, coerces literals, and checks the egid" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try Fixture.init(a);
+    defer fx.tbl.deinit();
+
+    const stmt = try sql.parse.statement(
+        a,
+        "SELECT * FROM t WHERE a = 1 AND (b = 'x' OR NOT egid = 3) AND b IS NOT NULL;",
+    );
+    const p = try pred.bindNode(a, &fx.tbl, stmt.select.where.?);
+    const top = p.and_;
+    try testing.expectEqual(@as(usize, 3), top.len);
+    try testing.expectEqual(fx.col("a"), top[0].eq.col);
+    try testing.expectEqual(Value{ .int4 = 1 }, top[0].eq.val);
+    const or2 = top[1].or_;
+    try testing.expectEqual(fx.col("b"), or2[0].eq.col);
+    try testing.expectEqualStrings("x", or2[0].eq.val.text);
+    const inner = or2[1].not.*;
+    try testing.expect(inner.eq.col.isEgid());
+    try testing.expectEqual(Value{ .uint8 = 3 }, inner.eq.val);
+    try testing.expectEqual(fx.col("b"), top[2].is_null.col);
+    try testing.expect(top[2].is_null.negate);
+
+    // topLevelAnds: a root AND's children; a leaf is its own single term.
+    try testing.expectEqual(@as(usize, 3), p.topLevelAnds().len);
+    const leaf = top[0];
+    try testing.expectEqual(@as(usize, 1), leaf.topLevelAnds().len);
+    try testing.expectEqual(&leaf, &leaf.topLevelAnds()[0]);
+
+    // Errors, wherever they sit in the tree.
+    const cases = [_]struct { sql: []const u8, err: pred.BindError }{
+        .{ .sql = "SELECT * FROM t WHERE a = 1 AND nope = 2;", .err = error.UndefinedColumn },
+        .{ .sql = "SELECT * FROM t WHERE NOT a = 'zz';", .err = error.InvalidValue },
+        .{ .sql = "SELECT * FROM t WHERE egid = 0;", .err = error.EgidZero },
+        .{ .sql = "SELECT * FROM t WHERE egid = -1;", .err = error.InvalidValue },
+        .{ .sql = "SELECT * FROM t WHERE nope IS NULL;", .err = error.UndefinedColumn },
+    };
+    for (cases) |case| {
+        const s = try sql.parse.statement(a, case.sql);
+        try testing.expectError(case.err, pred.bindNode(a, &fx.tbl, s.select.where.?));
+    }
+}
+
+test "sql.pred: eval follows SQL three-valued logic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try Fixture.init(a);
+    defer fx.tbl.deinit();
+
+    const r1 = try fx.item(1, &.{ .{ .int4 = 1 }, .{ .text = "x" } });
+    const r2 = try fx.item(2, &.{ .null_value, .{ .text = "x" } });
+    const r3 = try fx.item(3, &.{ .{ .int4 = 2 }, .null_value });
+
+    const a_eq_1 = Pred{ .eq = .{ .col = fx.col("a"), .val = .{ .int4 = 1 } } };
+    const a_eq_2 = Pred{ .eq = .{ .col = fx.col("a"), .val = .{ .int4 = 2 } } };
+    const a_eq_null = Pred{ .eq = .{ .col = fx.col("a"), .val = .null_value } };
+    const b_eq_x = Pred{ .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } } };
+    const b_is_null = Pred{ .is_null = .{ .col = fx.col("b"), .negate = false } };
+    const b_not_null = Pred{ .is_null = .{ .col = fx.col("b"), .negate = true } };
+    const egid_3 = Pred{ .eq = .{ .col = fx.col("egid"), .val = .{ .uint8 = 3 } } };
+
+    const T: ?bool = true;
+    const F: ?bool = false;
+    const U: ?bool = null;
+    const tbl = &fx.tbl;
+
+    // A leaf: true, unknown (NULL cell), false.
+    try testing.expectEqual(T, pred.eval(tbl, r1, &a_eq_1));
+    try testing.expectEqual(U, pred.eval(tbl, r2, &a_eq_1));
+    try testing.expectEqual(F, pred.eval(tbl, r3, &a_eq_1));
+    // `= NULL` is unknown for every row, NULL cell or not.
+    try testing.expectEqual(U, pred.eval(tbl, r1, &a_eq_null));
+    try testing.expectEqual(U, pred.eval(tbl, r2, &a_eq_null));
+    // IS [NOT] NULL is exact, never unknown.
+    try testing.expectEqual(F, pred.eval(tbl, r1, &b_is_null));
+    try testing.expectEqual(T, pred.eval(tbl, r3, &b_is_null));
+    try testing.expectEqual(T, pred.eval(tbl, r1, &b_not_null));
+    try testing.expectEqual(F, pred.eval(tbl, r3, &b_not_null));
+    // The egid pseudo-column reads from the key.
+    try testing.expectEqual(F, pred.eval(tbl, r1, &egid_3));
+    try testing.expectEqual(T, pred.eval(tbl, r3, &egid_3));
+
+    // NOT keeps unknown unknown.
+    const not_a1 = Pred{ .not = &a_eq_1 };
+    try testing.expectEqual(F, pred.eval(tbl, r1, &not_a1));
+    try testing.expectEqual(U, pred.eval(tbl, r2, &not_a1));
+    try testing.expectEqual(T, pred.eval(tbl, r3, &not_a1));
+    const not_a_null = Pred{ .not = &a_eq_null };
+    try testing.expectEqual(U, pred.eval(tbl, r1, &not_a_null));
+
+    // AND: false dominates unknown; unknown dominates true.
+    const and_ = Pred{ .and_ = &.{ a_eq_1, b_eq_x } };
+    try testing.expectEqual(T, pred.eval(tbl, r1, &and_));
+    try testing.expectEqual(U, pred.eval(tbl, r2, &and_)); // unknown AND true
+    try testing.expectEqual(F, pred.eval(tbl, r3, &and_)); // false AND unknown
+    // OR: true dominates unknown; unknown dominates false.
+    const or_ = Pred{ .or_ = &.{ a_eq_1, b_eq_x } };
+    try testing.expectEqual(T, pred.eval(tbl, r1, &or_));
+    try testing.expectEqual(T, pred.eval(tbl, r2, &or_)); // unknown OR true
+    try testing.expectEqual(U, pred.eval(tbl, r3, &or_)); // false OR unknown
+    const or_2 = Pred{ .or_ = &.{ a_eq_2, egid_3 } };
+    try testing.expectEqual(T, pred.eval(tbl, r3, &or_2));
+    try testing.expectEqual(F, pred.eval(tbl, r1, &or_2));
+
+    // matches: only TRUE passes — `= NULL` selects nothing.
+    try testing.expect(pred.matches(tbl, r1, &a_eq_1));
+    try testing.expect(!pred.matches(tbl, r2, &a_eq_1));
+    try testing.expect(!pred.matches(tbl, r2, &a_eq_null));
+    try testing.expect(!pred.matches(tbl, r3, &or_));
+}
