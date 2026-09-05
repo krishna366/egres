@@ -452,6 +452,27 @@ if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$((NU + 1))" ]; then
     ok "blocked writer lands after the multi-batch FOR UPDATE commits"
 else bad "blocked writer never landed"; fi
 
+# --- FOR UPDATE LIMIT n locks the n rows it returns, nothing past them -------
+send 1 "BEGIN;"
+send 1 "SELECT id FROM wide FOR UPDATE LIMIT 2;" # ids 1 and 2
+sync_session 1
+NU=$(grep -c "UPDATE 1" "$D/out2" || true)
+send 2 "UPDATE wide SET name = 'w3' WHERE id = 3;" # past the limit: no lock
+sync_session 2
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$((NU + 1))" ]; then
+    ok "a row past FOR UPDATE LIMIT stays unlocked"
+else bad "FOR UPDATE LIMIT locked a row it did not return"; fi
+send 2 "UPDATE wide SET name = 'w2' WHERE id = 2;" # returned row: parks
+sleep 0.3
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$((NU + 1))" ]; then
+    ok "a returned row is locked by FOR UPDATE LIMIT"
+else bad "FOR UPDATE LIMIT did not lock a returned row"; fi
+send 1 "COMMIT;"
+sync_session 2
+if [ "$(grep -c "UPDATE 1" "$D/out2" || true)" = "$((NU + 2))" ]; then
+    ok "blocked writer lands after FOR UPDATE LIMIT commits"
+else bad "writer blocked by FOR UPDATE LIMIT never landed"; fi
+
 # --- restart mid-drain: a full-table UPDATE parks, bumps, re-runs once -------
 # S2 holds row 1300 (mid-table). S1's UPDATE drains all 2500 rows, then
 # its lock pass parks on 1300. S2's commit changes that row's id, so

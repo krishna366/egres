@@ -15,7 +15,7 @@ const Table = sql.table.Table;
 
 const pkey_index_id: u32 = 17;
 const b_index_id: u32 = 18;
-const stream = sql.plan.Options{ .lock = false };
+const stream = sql.plan.Options{};
 
 const Fixture = struct {
     arena: std.heap.ArenaAllocator,
@@ -105,12 +105,9 @@ const Fixture = struct {
     }
 };
 
-/// The node under Materialize, or the root itself.
+/// The node under the root Materialize.
 fn source(p: *const Plan) *RowNode {
-    return switch (p.root.*) {
-        .materialize => |m| m.child,
-        else => p.root,
-    };
+    return p.root.materialize.child;
 }
 
 /// The source must be a fetch; its bitmap tree.
@@ -293,26 +290,27 @@ test "sql.plan: a mid-backfill index is not read" {
     try expectScan(&either);
 }
 
-test "sql.plan: lock materializes; keep_value reaches the source" {
+test "sql.plan: the root materializes; keep_value and limit reach it" {
     var fx = try Fixture.init();
     defer fx.deinit();
 
-    var locked = try fx.planFor("b = 2", .{ .lock = true });
-    defer locked.deinit();
-    try testing.expect(locked.root.* == .materialize);
-    const src = source(&locked);
+    var plain = try fx.planFor("b = 2", stream);
+    defer plain.deinit();
+    try testing.expect(plain.root.* == .materialize);
+    try testing.expectEqual(null, plain.root.materialize.remaining);
+    const src = source(&plain);
     try testing.expect(src.* == .fetch);
     try testing.expect(src.fetch.keep_value);
 
-    var keys_only = try fx.planFor(
-        "c = 'x'",
-        .{ .lock = true, .keep_value = false },
-    );
+    var keys_only = try fx.planFor("c = 'x'", .{ .keep_value = false });
     defer keys_only.deinit();
     try testing.expect(keys_only.root.* == .materialize);
     try testing.expect(!source(&keys_only).seq_scan.keep_value);
 
-    var streamed = try fx.planFor("b = 2", stream);
-    defer streamed.deinit();
-    try testing.expect(streamed.root.* == .fetch);
+    // LIMIT sits on the root, under which the source is bounded — so a
+    // locking statement gathers and locks only that many.
+    var capped = try fx.planFor("b = 2", .{ .limit = 5 });
+    defer capped.deinit();
+    try testing.expectEqual(@as(?usize, 5), capped.root.materialize.remaining);
+    try testing.expect(source(&capped).* == .fetch);
 }

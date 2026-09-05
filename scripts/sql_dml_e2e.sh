@@ -181,6 +181,20 @@ expect "WHERE past batch 1" "r3000" v "SELECT name FROM big WHERE id = 3000;"
 expect "UPDATE 5000 rows" "UPDATE 5000" q "UPDATE big SET name = 'u';"
 expect "all rewritten" "(5000 rows)" q "SELECT id FROM big WHERE name = 'u';"
 expect "FOR UPDATE 5000 rows" "(5000 rows)" q "SELECT id FROM big FOR UPDATE;"
+
+# --- LIMIT: bounds the source, crosses a batch, composes with the rest -----
+expect "LIMIT 3" "(3 rows)" q "SELECT id FROM big LIMIT 3;"
+expect "LIMIT past batch 1" "(1500 rows)" q "SELECT id FROM big LIMIT 1500;"
+expect "LIMIT 0" "(0 rows)" q "SELECT id FROM big LIMIT 0;"
+expect "LIMIT ALL" "(5000 rows)" q "SELECT id FROM big LIMIT ALL;"
+expect "LIMIT with WHERE" "(2 rows)" \
+    q "SELECT id FROM big WHERE name = 'u' LIMIT 2;"
+expect "LIMIT above the result" "(1 row)" \
+    q "SELECT id FROM big WHERE id = 7 LIMIT 5;"
+expect "FOR UPDATE LIMIT" "(2 rows)" q "SELECT id FROM big FOR UPDATE LIMIT 2;"
+expect "negative LIMIT rejected" "negative" q "SELECT id FROM big LIMIT -1;"
+expect "OFFSET rejected" "OFFSET" q "SELECT id FROM big LIMIT 1 OFFSET 1;"
+
 expect "DELETE 5000 rows" "DELETE 5000" q "DELETE FROM big;"
 expect "big is empty" "(0 rows)" q "SELECT id FROM big;"
 

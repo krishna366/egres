@@ -106,6 +106,8 @@ pub const Select = struct {
     where: ?Where,
     /// FOR UPDATE: lock every matched row exclusively (held to txn end).
     for_update: bool = false,
+    /// LIMIT n: stop after n rows. null = every row (LIMIT ALL too).
+    limit: ?usize = null,
 };
 
 pub const Delete = struct {
@@ -282,13 +284,19 @@ const SelectStmtJson = struct {
     fromClause: []const FromNode = &.{},
     whereClause: ?WhereNode = null,
     lockingClause: []const LockingNode = &.{},
+    // LIMIT n: a literal (A_Const null ⇒ a parameter or expression);
+    // LIMIT ALL arrives as a NULL constant. limitOption tells COUNT
+    // from FETCH ... WITH TIES.
+    limitCount: ?LimitNode = null,
+    limitOption: []const u8 = "",
     // Clauses this slice doesn't support — presence ⇒ rejection.
     sortClause: []const std.json.Value = &.{},
     groupClause: []const std.json.Value = &.{},
     distinctClause: []const std.json.Value = &.{},
     havingClause: ?std.json.Value = null,
-    limitCount: ?std.json.Value = null,
     limitOffset: ?std.json.Value = null,
+
+    const LimitNode = struct { A_Const: ?InsertStmtJson.AConst = null };
 
     // FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED. Unlike zero-valued
     // ints (omitted), enum strings are always emitted: plain FOR UPDATE
@@ -638,14 +646,35 @@ fn parseWhere(
     return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
 }
 
-/// SELECT [cols|*] FROM one_table [WHERE ...]. Joins, subqueries,
-/// ORDER BY / GROUP BY / LIMIT / DISTINCT and expression targets are rejected.
+/// SELECT [cols|*] FROM one_table [WHERE ...] [FOR UPDATE] [LIMIT n].
+/// Joins, subqueries, ORDER BY / GROUP BY / OFFSET / DISTINCT and
+/// expression targets are rejected.
 fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
     const ss = try fromValue(SelectStmtJson, alloc, body) orelse return .unsupported;
 
     if (ss.sortClause.len > 0 or ss.groupClause.len > 0 or ss.distinctClause.len > 0 or
-        ss.havingClause != null or ss.limitCount != null or ss.limitOffset != null)
-        return invalid("ORDER BY / GROUP BY / LIMIT / DISTINCT are not supported");
+        ss.havingClause != null or ss.limitOffset != null)
+        return invalid(
+            "ORDER BY / GROUP BY / OFFSET / DISTINCT are not supported",
+        );
+
+    // LIMIT: an integer literal, or ALL (a NULL constant: no limit).
+    // A parameter, an expression, or WITH TIES is refused (the vendored
+    // grammar rejects WITH TIES itself today; the check is for one that
+    // does not, so it can never pass as a plain LIMIT).
+    var limit: ?usize = null;
+    if (ss.limitCount) |lc| {
+        if (std.mem.eql(u8, ss.limitOption, "LIMIT_OPTION_WITH_TIES"))
+            return invalid("FETCH ... WITH TIES is not supported");
+        const ac = lc.A_Const orelse
+            return invalid("only an integer literal LIMIT is supported");
+        if (!ac.isnull) {
+            const iv = ac.ival orelse
+                return invalid("only an integer literal LIMIT is supported");
+            if (iv.ival < 0) return invalid("LIMIT must not be negative");
+            limit = @intCast(iv.ival);
+        }
+    }
 
     if (ss.fromClause.len != 1)
         return invalid("SELECT must read exactly one table");
@@ -699,6 +728,7 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         .projection = if (star) .star else .{ .columns = try cols.toOwnedSlice(alloc) },
         .where = where,
         .for_update = for_update,
+        .limit = limit,
     } };
 }
 

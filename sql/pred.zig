@@ -132,11 +132,11 @@ pub fn eval(tbl: *const _table.Table, item: zdb.kv.Item, p: *const Pred) ?bool {
     switch (p.*) {
         .eq => |c| {
             if (c.val == .null_value) return null;
-            const cell = tbl.read(item, c.col);
+            const cell = tbl.parseCol(item, c.col);
             if (cell == .null_value) return null;
             return _value.valuesEqual(cell, c.val);
         },
-        .is_null => |n| return (tbl.read(item, n.col) == .null_value) != n.negate,
+        .is_null => |n| return (tbl.parseCol(item, n.col) == .null_value) != n.negate,
         .and_ => |kids| {
             var unknown = false;
             for (kids) |*kid| {

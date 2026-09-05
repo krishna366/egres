@@ -31,10 +31,11 @@ pub const ExecCtx = struct {
     tx: *Txn,
     tbl: *const _table.Table,
     table_id: u32,
-    /// Take row locks — on the OUTPUT, by Materialize after its drain,
-    /// so a row a filter discarded is never locked and sources never
-    /// lock at all. lockRow may raise Restart, so a locking plan never
-    /// streams.
+    /// Take row locks — on the OUTPUT: Materialize gathers every row
+    /// and locks them after its drain, so a row a filter discarded is
+    /// never locked and sources never lock at all. lockRow may raise
+    /// Restart, so nothing reaches the wire before the last lock.
+    /// Without this Materialize streams.
     lock: bool,
 };
 
@@ -59,8 +60,8 @@ pub const Batch = struct {
     rows: std.ArrayList(Item),
     sel: Selection = Selection.initEmpty(),
     bytes: std.ArrayList(u8),
-    /// How many rows a fill may place — row_cap unless the consumer
-    /// lowers it (a LIMIT, a portal honouring Execute's max_rows).
+    /// How many rows a fill may place. The plan root (Materialize)
+    /// sets it before every fill: the cap, or what a LIMIT has left.
     /// `reset` leaves it alone; sources read it through `full`.
     row_limit: usize = row_cap,
     /// Set when `append` turned a row away for lack of bytes: the fill
@@ -553,13 +554,41 @@ pub const Filter = struct {
     }
 };
 
-/// Drain fully, then lock, then act: the DML write bodies call `rows`
-/// before their first tx.put; FOR UPDATE streams the same rows back
-/// through `next` after the locks.
+/// The root of every plan. Bounds the result (LIMIT) and, when the
+/// statement locks (ctx.lock), gathers and locks every row before the
+/// first one goes out: the DML write bodies take that slice through
+/// gatherAndLockRows before their first tx.put, and FOR UPDATE's
+/// emission drives `next` over it. Without the lock a `next` is one
+/// bounded fill of the child, passed straight through — no copy, no
+/// gather.
 pub const Materialize = struct {
     child: *RowNode,
+    /// Rows still to produce; null = unbounded.
+    remaining: ?usize = null,
     rows: ?[]const Item = null,
     pos: usize = 0,
+
+    /// One fill of the child. This root is the one writer of the
+    /// batch's row_limit, set before every fill: the cap, or under a
+    /// LIMIT what remains, so a source places no more than that. A
+    /// filter above a source can only clear bits, so selected ≤ placed
+    /// ≤ remaining and the count stays exact either way (the filter
+    /// merely underfills). Nothing left → false without touching the
+    /// child: LIMIT 0 opens no cursor and records no read.
+    fn fill(self: *Materialize, ctx: *ExecCtx, batch: *Batch) anyerror!bool {
+        const remaining = self.remaining orelse {
+            batch.row_limit = row_cap;
+            return self.child.next(ctx, batch);
+        };
+        if (remaining == 0) {
+            batch.reset();
+            return false;
+        }
+        batch.row_limit = @min(row_cap, remaining);
+        const more = try self.child.next(ctx, batch);
+        self.remaining = remaining - batch.sel.count();
+        return more;
+    }
 
     /// Every selected row of the child, copied into the statement arena
     /// (keys and whatever values the source kept), in the order the
@@ -579,7 +608,7 @@ pub const Materialize = struct {
         if (self.rows) |rows| return rows;
 
         var lrows: std.ArrayList(Item) = .empty;
-        while (try self.child.next(ctx, batch)) {
+        while (try self.fill(ctx, batch)) {
             var it = batch.selected();
             while (it.next()) |row| {
                 try lrows.append(ctx.arloc, try row.dupe(ctx.arloc));
@@ -609,13 +638,16 @@ pub const Materialize = struct {
         return std.mem.order(u8, a.primary, b.primary) == .lt;
     }
 
-    /// Serve the captured rows back a batch at a time, by reference:
-    /// they already live in the arena, so nothing is copied.
+    /// Streaming: the child's next fill, bounded. Locking: the gathered
+    /// rows a batch at a time, by reference — they already live in the
+    /// arena, so nothing is copied; the first call does the gather.
     pub fn next(
         self: *Materialize,
         ctx: *ExecCtx,
         batch: *Batch,
     ) anyerror!bool {
+        if (!ctx.lock) return self.fill(ctx, batch);
+
         const rows = try self.gatherAndLockRows(ctx, batch);
         batch.reset();
 

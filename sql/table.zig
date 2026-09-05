@@ -42,7 +42,7 @@ comptime {
 pub const Column = struct {
     column_id: u32,
     /// Slot in `columns`, in `ps.columns`, in a row decoded with the empty
-    /// projection (row.unmarshalRow / readCell), and in INSERT's values —
+    /// projection (row.unmarshalRow / parseCol), and in INSERT's values —
     /// all four are the live columns in column_id order. Minted once, in
     /// loadTableSchema, where the parallel-arrays invariant is asserted.
     pos: usize,
@@ -123,10 +123,10 @@ pub const Table = struct {
 
     /// One column's value out of a stored row: the egid from the key,
     /// any other cell by a null-bit test plus one O(1) read
-    /// (row.readCell) — no full-row decode.
-    pub fn read(self: *const Table, item: Item, col: *const Column) _value.Value {
+    /// (row.parseCol) — no full-row decode.
+    pub fn parseCol(self: *const Table, item: Item, col: *const Column) _value.Value {
         if (col.isEgid()) return .{ .uint8 = _key.decodeEgid(item.key.primary).? };
-        return _row.readCell(&self.ps, item.value, col.pos);
+        return _row.parseCol(&self.ps, item.value, self.ps.columns[col.pos]);
     }
 };
 

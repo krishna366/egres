@@ -564,7 +564,7 @@ fn backfillIndex(
             const egid = _key.decodeEgid(item.key.primary) orelse
                 return true; // not row-shaped: nothing to index
             ctx.rows += 1;
-            const cell = ctx.t.read(item, ctx.col);
+            const cell = ctx.t.parseCol(item, ctx.col);
             const ik = _key.encodeIndexKey(ctx.a, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,

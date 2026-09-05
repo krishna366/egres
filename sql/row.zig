@@ -86,7 +86,7 @@ pub fn unmarshalRow(
     // straight from ps.columns (no per-id lookup).
     if (projection.len == 0) {
         try row.cells.resize(alloc, ps.columns.len);
-        for (ps.columns, row.cells.items) |col, *slot| slot.* = decodeColumn(ps, buffer, col);
+        for (ps.columns, row.cells.items) |col, *slot| slot.* = parseCol(ps, buffer, col);
         return;
     }
 
@@ -101,7 +101,7 @@ pub fn unmarshalRow(
         prev = column_id;
         while (j < ps.columns.len and ps.columns[j].column_id < column_id) j += 1;
         slot.* = if (j < ps.columns.len and ps.columns[j].column_id == column_id)
-            decodeColumn(ps, buffer, ps.columns[j])
+            parseCol(ps, buffer, ps.columns[j])
         else
             .null_value;
     }
@@ -116,7 +116,7 @@ pub const SetVal = struct { pos: usize, val: Value };
 /// new row into `buf`, and return its bytes (a view into buf). Pure —
 /// no txn state touched. The WHERE was already applied to these same
 /// bytes when the row was found, so there is nothing to re-verify.
-pub fn updateRowBytes(
+pub fn rewriteRowBytes(
     alloc: std.mem.Allocator,
     ps: *const PhysicalSchema,
     sets: []const SetVal,
@@ -131,16 +131,12 @@ pub fn updateRowBytes(
     return marshalRow(alloc, ps, dec.items(), buf);
 }
 
-/// Decode ONE column — by its index into `ps.columns` — without touching
-/// the rest of the row: a null-bit test plus one fixed-offset read or
-/// varlen-directory slice, O(1) either way. Filters use this to reject a
-/// row before paying for the full unmarshalRow.
-pub fn readCell(
-    ps: *const PhysicalSchema,
-    buffer: []const u8,
-    idx: usize,
-) Value {
-    return decodeColumn(ps, buffer, ps.columns[idx]);
+/// Decode ONE column without touching the rest of the row: a null-bit
+/// test, then one fixed-offset read or varlen-directory slice — O(1)
+/// either way. Filters use this to reject a row before paying for the
+/// full unmarshalRow.
+pub inline fn parseCol(ps: *const PhysicalSchema, buffer: []const u8, col: ColumnLayout) Value {
+    return if (isNull(buffer, col)) .null_value else readValue(ps, buffer, col);
 }
 
 // --- internals --------------------------------------------------------------
@@ -156,11 +152,6 @@ inline fn setNull(buffer: []u8, col: ColumnLayout) void {
 inline fn writeDirEntry(buffer: []u8, ps: *const PhysicalSchema, col: ColumnLayout, end: u32) void {
     const slot = ps.var_offset_array_start + col.var_offset_index * 4;
     std.mem.writeInt(u32, buffer[slot..][0..4], end, .little);
-}
-
-/// Decode one column: a set null bit → null_value, else its typed Value.
-inline fn decodeColumn(ps: *const PhysicalSchema, buffer: []const u8, col: ColumnLayout) Value {
-    return if (isNull(buffer, col)) .null_value else readValue(ps, buffer, col);
 }
 
 /// Read a present (non-null) column into a typed Value. O(1).

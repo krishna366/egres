@@ -387,7 +387,7 @@ test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
                 const egid = sql.key.decodeEgid(r.key.primary).?;
                 try testing.expect(egid > last);
                 last = egid;
-                const a_val = fx.tbl.read(r, fx.col("a"));
+                const a_val = fx.tbl.parseCol(r, fx.col("a"));
                 try testing.expectEqual(Value{ .int4 = @intCast(egid) }, a_val);
             }
         }
@@ -410,7 +410,7 @@ test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
             var it = b.selected();
             while (it.next()) |r| : (total += 1) {
                 try testing.expect(!withinBytes(&b, r.value));
-                const b_val = fx.tbl.read(r, fx.col("b"));
+                const b_val = fx.tbl.parseCol(r, fx.col("b"));
                 try testing.expectEqualStrings("x", b_val.text);
             }
         }
@@ -442,9 +442,9 @@ test "sql.exec: seq_scan: borrowed values outlive the blocks the walk left" {
     while (it.next()) |r| {
         try testing.expect(!withinBytes(&b, r.value));
         const egid = sql.key.decodeEgid(r.key.primary).?;
-        const a_val = fx.tbl.read(r, fx.col("a"));
+        const a_val = fx.tbl.parseCol(r, fx.col("a"));
         try testing.expectEqual(Value{ .int4 = @intCast(egid) }, a_val);
-        const b_val = fx.tbl.read(r, fx.col("b"));
+        const b_val = fx.tbl.parseCol(r, fx.col("b"));
         try testing.expectEqual(@as(usize, 1024), b_val.text.len);
         try testing.expectEqual(@as(u8, 'w'), b_val.text[1023]);
     }
@@ -541,7 +541,7 @@ test "sql.exec: filter clears bits and copies nothing" {
         try testing.expect(b.sel.count() < b.numRows());
         var it = b.selected();
         while (it.next()) |r| : (total += 1) {
-            const b_val = fx.tbl.read(r, fx.col("b"));
+            const b_val = fx.tbl.parseCol(r, fx.col("b"));
             try testing.expectEqualStrings("y", b_val.text);
         }
     }
@@ -572,12 +572,12 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
         const egid = sql.key.decodeEgid(r.key.primary).?;
         try testing.expect(egid > last);
         last = egid;
-        const a_val = fx.tbl.read(r, fx.col("a"));
+        const a_val = fx.tbl.parseCol(r, fx.col("a"));
         try testing.expectEqual(Value{ .int4 = @intCast(egid) }, a_val);
     }
     // The copies outlive the batch: refill it and the rows still read.
     b.reset();
-    const first = fx.tbl.read(rows[0], fx.col("a"));
+    const first = fx.tbl.parseCol(rows[0], fx.col("a"));
     try testing.expectEqual(Value{ .int4 = 2 }, first);
 
     // Second call is idempotent; next() streams the capture in batches
@@ -629,4 +629,88 @@ test "sql.exec: materialize over a fetch locks the output rows only" {
         const egid = sql.key.decodeEgid(r.key.primary).?;
         try testing.expect(egid % 2 == 0);
     }
+}
+
+test "sql.exec: materialize without lock streams the child, bounded" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // LIMIT 1500 across two fills: a full batch, then exactly the rest
+    // — the source is never asked past row 1500.
+    var scan = RowNode{ .seq_scan = .{} };
+    var capped = RowNode{ .materialize = .{
+        .child = &scan,
+        .remaining = 1500,
+    } };
+    defer capped.deinit();
+    try testing.expect(try capped.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, exec.row_cap), b.numRows());
+    try testing.expect(try capped.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, 476), b.numRows());
+    try testing.expectEqual(@as(u64, 1025), firstEgid(&b));
+    try testing.expect(!try capped.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, 0), b.numRows());
+
+    // LIMIT 0 never touches the child: no cursor, no scan recorded.
+    var scan2 = RowNode{ .seq_scan = .{} };
+    var none = RowNode{ .materialize = .{ .child = &scan2, .remaining = 0 } };
+    defer none.deinit();
+    try testing.expect(!try none.next(&ctx, &b));
+    try testing.expect(scan2.seq_scan.cursor == null);
+
+    // Unbounded, on the same batch the LIMIT left at 476: the root
+    // sets the bound before every fill, so the batches are full again
+    // and the scan's rows pass straight through — keys in the batch's
+    // bytes, nothing gathered, nothing locked.
+    var scan3 = RowNode{ .seq_scan = .{} };
+    var node = RowNode{ .materialize = .{ .child = &scan3 } };
+    defer node.deinit();
+    var total: usize = 0;
+    var batches: usize = 0;
+    while (try node.next(&ctx, &b)) : (batches += 1) {
+        try testing.expect(b.bytes.items.len > 0);
+        if (batches < 2)
+            try testing.expectEqual(@as(usize, exec.row_cap), b.numRows());
+        total += b.sel.count();
+    }
+    try testing.expectEqual(@as(usize, 2500), total);
+    try testing.expectEqual(@as(usize, 3), batches);
+    try testing.expectEqual(@as(usize, 0), tx.held.items.len);
+    try testing.expect(node.materialize.rows == null);
+}
+
+test "sql.exec: materialize with lock and a limit locks the limited rows" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, true);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // FOR UPDATE ... LIMIT 100 over the 1250 matches: the gather stops
+    // at 100, so 100 rows are locked — the first 100 even egids — and
+    // next() streams exactly those back.
+    const pred = Pred{
+        .eq = .{ .col = fx.col("b"), .val = .{ .text = "x" } },
+    };
+    var scan = RowNode{ .seq_scan = .{ .pred = &pred } };
+    var node = RowNode{ .materialize = .{ .child = &scan, .remaining = 100 } };
+    defer node.deinit();
+
+    const rows = try node.materialize.gatherAndLockRows(&ctx, &b);
+    try testing.expectEqual(@as(usize, 100), rows.len);
+    try testing.expectEqual(@as(usize, 100), tx.held.items.len);
+    for (rows, 1..) |r, i| {
+        const egid = sql.key.decodeEgid(r.key.primary).?;
+        try testing.expectEqual(@as(u64, 2 * i), egid);
+    }
+    try testing.expect(try node.next(&ctx, &b));
+    try testing.expectEqual(@as(usize, 100), b.sel.count());
+    try testing.expect(!try node.next(&ctx, &b));
 }

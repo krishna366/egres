@@ -30,7 +30,7 @@ const Pred = _pred.Pred;
 const SetVal = _row.SetVal;
 const String = _value.String;
 const litToValue = _parse.litToValue;
-const updateRowBytes = _row.updateRowBytes;
+const rewriteRowBytes = _row.rewriteRowBytes;
 const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
 const replyErrorCode = _server.replyErrorCode;
@@ -259,23 +259,20 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         .type_oid = _value.pgTypeOid(c.ty),
         .format_code = 0,
     };
-    // FOR UPDATE sends NOTHING until every lock is held: lockRow may
-    // Restart the statement, and bytes already on the wire (the row
-    // description, emitted rows) would repeat on the re-run.
-    if (!sel.for_update) try state.sendRowDescription(fields);
-
     var emitter = RowEmitter{
         .state = state,
         .tbl = tbl,
         .outs = cols.items,
     };
 
-    // Plain SELECT streams each batch to the wire; FOR UPDATE gathers
-    // the matches (values included) to lock every one BEFORE the
-    // first byte is sent — the UPDATE/DELETE lock-all shape with
-    // "act" = emission.
+    // One loop for both kinds of plan. Plain SELECT streams each fill
+    // to the wire; under FOR UPDATE the root's first `next` gathers
+    // every match (values included) and locks every one — none
+    // committed above read_ts (that lockRow would have bumped →
+    // restarted), so the rows it then serves are the newest versions,
+    // frozen by our locks.
     var plan = (try planFor(state, arloc, tbl, sel.where, .{
-        .lock = sel.for_update,
+        .limit = sel.limit,
     })) orelse return;
     defer plan.deinit();
     var ctx = ExecCtx{
@@ -286,27 +283,24 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         .lock = sel.for_update,
     };
     const batch = try self.batch();
-    if (sel.for_update) {
-        // gatherAndLockRows returns with every match locked: none committed
-        // above read_ts (that lockRow would have bumped → restarted),
-        // so the gathered values are the newest versions, frozen by
-        // our locks — emit them now.
-        const rows = plan.root.materialize.gatherAndLockRows( //
-            &ctx, batch) catch |err|
+    // The row description goes out after the first fill — after
+    // whatever the root had to do to produce it. For a locking plan
+    // that is the whole gather and every lock, so nothing reaches the
+    // wire before the last lockRow and a Restart re-runs a statement
+    // that has sent nothing. An empty result still gets its description.
+    var first = true;
+    while (true) {
+        // An executor error is a read failure — replied; an emit
+        // error is a wire error — surfaced to the serve loop.
+        const more = plan.root.next(&ctx, batch) catch |err|
             return replyRunErr(state, "select from", sel.table, err);
-
-        try state.sendRowDescription(fields);
-        for (rows) |row| try emitter.emit(row);
-    } else {
-        while (true) {
-            // An executor error is a read failure — replied; an emit
-            // error is a wire error — surfaced to the serve loop.
-            const more = plan.root.next(&ctx, batch) catch |err|
-                return replyRunErr(state, "select from", sel.table, err);
-            if (!more) break;
-            var it = batch.selected();
-            while (it.next()) |row| try emitter.emit(row);
+        if (first) {
+            try state.sendRowDescription(fields);
+            first = false;
         }
+        if (!more) break;
+        var it = batch.selected();
+        while (it.next()) |row| try emitter.emit(row);
     }
 
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "SELECT {d}", .{emitter.count}));
@@ -340,7 +334,6 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     // are tombstoned from the gathered rows.
     const posting_idx = try bitmapIndexes(arloc, tbl);
     var plan = (try planFor(state, arloc, tbl, del.where, .{
-        .lock = true,
         // Indexed tables keep the old bytes so every index entry —
         // the PK's (PK value → egid) and each posting's remove —
         // can be derived from the row being tombstoned.
@@ -368,7 +361,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         const index_keys = try arloc.alloc([]const u8, rows.len);
 
         for (rows, index_keys) |item, *ik| {
-            const pkv = tbl.read(item, pk.column);
+            const pkv = tbl.parseCol(item, pk.column);
             ik.* = _key.encodeIndexKey(arloc, pkv, null) catch |err|
                 switch (err) {
                     error.OutOfMemory => return err,
@@ -396,7 +389,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     for (rows) |item| {
         const egid = _key.decodeEgid(item.key.primary).?;
         for (posting_idx) |ix| {
-            const cell = tbl.read(item, ix.column);
+            const cell = tbl.parseCol(item, ix.column);
             const old_key = _key.encodeIndexKey(arloc, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
@@ -501,9 +494,8 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // Materialize gathers each match's PRE-image and locks every
     // one; the rewrite (and any posting moves, whose old keys come
     // from that pre-image) happens post-lock.
-    var plan = (try planFor(state, arloc, tbl, up.where, .{
-        .lock = true,
-    })) orelse return;
+    var plan = (try planFor(state, arloc, tbl, up.where, .{})) orelse
+        return;
     defer plan.deinit();
     var ctx = ExecCtx{
         .arloc = arloc,
@@ -530,7 +522,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     for (rows) |item| {
         const egid = _key.decodeEgid(item.key.primary).?;
         for (moved_cols.items) |mv| {
-            const cell = tbl.read(item, mv.index.column);
+            const cell = tbl.parseCol(item, mv.index.column);
             const old_key = _key.encodeIndexKey(arloc, cell, null) catch |err|
                 switch (err) {
                     error.Unencodable => unreachable,
@@ -544,7 +536,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
             try tx.putPosting(mv.index.index_table_id, //
                 mv.new_key, egid, .add);
         }
-        const rewritten = try updateRowBytes(arloc, //
+        const rewritten = try rewriteRowBytes(arloc, //
             &tbl.ps, set_cols, &dec, item.value, &rbuf);
         try tx.put(table_id, item.key.primary, rewritten, .{});
     }
@@ -573,7 +565,7 @@ pub const RowEmitter = struct {
     pub fn emit(self: *RowEmitter, item: zdb.kv.Item) !void {
         var dw = try self.state.beginDataRow(@intCast(self.outs.len));
         for (self.outs) |col| {
-            const v = self.tbl.read(item, col);
+            const v = self.tbl.parseCol(item, col);
             if (v == .null_value) {
                 try dw.writeNull();
             } else {

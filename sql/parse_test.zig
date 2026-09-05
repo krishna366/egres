@@ -312,6 +312,28 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
     }
 }
 
+test "sql.parse: LIMIT takes an integer literal; ALL and NULL mean none" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cases = [_]struct { sql: []const u8, limit: ?usize }{
+        .{ .sql = "SELECT * FROM t;", .limit = null },
+        .{ .sql = "SELECT * FROM t LIMIT 3;", .limit = 3 },
+        .{ .sql = "SELECT * FROM t LIMIT 0;", .limit = 0 },
+        .{ .sql = "SELECT * FROM t WHERE a = 1 LIMIT 2;", .limit = 2 },
+        .{ .sql = "SELECT * FROM t FOR UPDATE LIMIT 5;", .limit = 5 },
+        .{ .sql = "SELECT * FROM t FETCH FIRST 4 ROWS ONLY;", .limit = 4 },
+        .{ .sql = "SELECT * FROM t LIMIT ALL;", .limit = null },
+        .{ .sql = "SELECT * FROM t LIMIT NULL;", .limit = null },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .select);
+        try testing.expectEqual(case.limit, stmt.select.limit);
+    }
+}
+
 test "sql.parse: SELECT rejections carry a reason" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -319,7 +341,13 @@ test "sql.parse: SELECT rejections carry a reason" {
     const alloc = arena.allocator();
     const cases = [_]struct { sql: []const u8, needle: []const u8 }{
         .{ .sql = "SELECT * FROM t ORDER BY a;", .needle = "ORDER BY" },
-        .{ .sql = "SELECT * FROM t LIMIT 3;", .needle = "LIMIT" },
+        .{ .sql = "SELECT * FROM t LIMIT 3 OFFSET 1;", .needle = "OFFSET" },
+        .{ .sql = "SELECT * FROM t LIMIT -1;", .needle = "negative" },
+        .{ .sql = "SELECT * FROM t LIMIT 1 + 1;", .needle = "integer literal" },
+        .{ .sql = "SELECT * FROM t LIMIT $1;", .needle = "integer literal" },
+        .{ .sql = "SELECT * FROM t LIMIT 1.5;", .needle = "integer literal" },
+        // FETCH ... WITH TIES is refused too, but the vendored grammar
+        // already rejects the syntax, so it cannot be reached here.
         .{ .sql = "SELECT * FROM a, b;", .needle = "one table" },
         .{ .sql = "SELECT count(*) FROM t;", .needle = "column references" },
         .{ .sql = "SELECT * FROM t WHERE a > 5;", .needle = "column = value" },

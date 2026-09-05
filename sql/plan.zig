@@ -1,5 +1,5 @@
 //! The planner: the one place that chooses index vs. scan. A bound
-//! Pred (pred.zig) in, a tree of exec nodes out — `[materialize →]
+//! Pred (pred.zig) in, a tree of exec nodes out — `materialize →
 //! (seq_scan | fetch(bitmap))` — with the WHOLE predicate re-checked
 //! on the source, so a bitmap only has to be a SUPERSET of the rows
 //! and no remainder is ever computed. Files form a DAG: plan → exec →
@@ -23,18 +23,18 @@ const zroar = zdb.zroar;
 const Error = std.mem.Allocator.Error;
 
 pub const Options = struct {
-    /// Gather → lock every row → act: Materialize sits over the source
-    /// and the write bodies (and FOR UPDATE) take the rows from it.
-    /// Without it the plan streams (plain SELECT).
-    lock: bool,
     /// Copy row values into the batch; false only for a key-only
     /// consumer (unindexed DELETE).
     keep_value: bool = true,
+    /// LIMIT: stop after this many rows. Under a locking statement
+    /// that is how many rows are gathered and locked.
+    limit: ?usize = null,
 };
 
 pub const Plan = struct {
-    /// Materialize over the source when the statement locks, else the
-    /// source itself: a seq_scan, or a fetch over the bitmap tree.
+    /// Always a Materialize — the root that bounds the result and, for
+    /// a locking statement (ExecCtx.lock), gathers and locks it — over
+    /// the source: a seq_scan, or a fetch over the bitmap tree.
     root: *RowNode,
 
     /// Frees the tree's resources; the nodes' memory belongs to the
@@ -59,26 +59,23 @@ pub fn plan(
     if (pred) |p| bitmap = try bitmapFor(arloc, tbl, p);
     errdefer if (bitmap) |*bm| bm.deinit();
 
-    var root = try arloc.create(RowNode);
+    const src = try arloc.create(RowNode);
     if (bitmap) |bm| {
         const bnode = try arloc.create(BitmapNode);
         bnode.* = bm;
-        root.* = .{ .fetch = .{
+        src.* = .{ .fetch = .{
             .bnode = bnode,
             .pred = pred,
             .keep_value = opts.keep_value,
         } };
     } else {
-        root.* = .{ .seq_scan = .{
+        src.* = .{ .seq_scan = .{
             .pred = pred,
             .keep_value = opts.keep_value,
         } };
     }
-    if (opts.lock) {
-        const mat = try arloc.create(RowNode);
-        mat.* = .{ .materialize = .{ .child = root } };
-        root = mat;
-    }
+    const root = try arloc.create(RowNode);
+    root.* = .{ .materialize = .{ .child = src, .remaining = opts.limit } };
     return .{ .root = root };
 }
 
