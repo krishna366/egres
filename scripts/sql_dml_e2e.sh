@@ -124,8 +124,66 @@ expect "UPDATE no match is 0" "UPDATE 0" q "UPDATE t SET id = 7 WHERE name = 'zz
 expect "UPDATE all rows" "UPDATE 4" q "UPDATE t SET id = 99;"
 expect "all rows updated" "(4 rows)" q "SELECT * FROM t WHERE id = 99;"
 
+# --- update: SET expressions, evaluated per row on the pre-image ------------
+# Own table so the legs above and below keep their state. `n` is
+# indexed: an arithmetic SET must move the row between postings.
+q "CREATE TABLE ex (n int4, s text, m int4, f float8);" >/dev/null
+q "CREATE INDEX ex_n ON ex (n);" >/dev/null
+q "INSERT INTO ex VALUES (1, 'a', 10, 1.5), (2, 'b', 20, 2.5),
+    (3, NULL, NULL, NULL);" >/dev/null
+expect "SET n = n + 1 (all rows)" "UPDATE 3" q "UPDATE ex SET n = n + 1;"
+expect "increment via index (old key gone)" "(0 rows)" \
+    q "SELECT * FROM ex WHERE n = 1;"
+expect "increment via index (new key)" "a" v "SELECT s FROM ex WHERE n = 2;"
+expect "SET n = n * 2 + 1" "UPDATE 1" \
+    q "UPDATE ex SET n = n * 2 + 1 WHERE s = 'a';"
+expect "arithmetic visible" "5" v "SELECT n FROM ex WHERE s = 'a';"
+expect "SET n = -n" "UPDATE 1" q "UPDATE ex SET n = -n WHERE s = 'a';"
+expect "negation visible (negative index key)" "a" \
+    v "SELECT s FROM ex WHERE n = -5;"
+expect "SET m = egid * 10" "UPDATE 3" q "UPDATE ex SET m = egid * 10;"
+expect "egid operand visible" "20" v "SELECT m FROM ex WHERE s = 'b';"
+expect "SET m = m / 3 (integer division)" "UPDATE 1" \
+    q "UPDATE ex SET m = m / 3 WHERE s = 'b';"
+expect "integer division visible" "6" v "SELECT m FROM ex WHERE s = 'b';"
+expect "SET f = f * 2" "UPDATE 1" q "UPDATE ex SET f = f * 2 WHERE s = 'b';"
+expect "float arithmetic visible" "5" v "SELECT f FROM ex WHERE s = 'b';"
+expect "SET on a NULL cell stays NULL" "UPDATE 1" \
+    q "UPDATE ex SET f = f + 1 WHERE n = 4;"
+expect "NULL result visible" "(1 row)" \
+    q "SELECT * FROM ex WHERE n = 4 AND f IS NULL;"
+expect "SET swap reads the pre-image" "UPDATE 1" \
+    q "UPDATE ex SET n = m, m = n WHERE s = 'b';"
+expect "swap: n took m" "6" v "SELECT n FROM ex WHERE s = 'b';"
+expect "swap: m took n" "3" v "SELECT m FROM ex WHERE s = 'b';"
+expect "SET s = s || '!'" "UPDATE 1" \
+    q "UPDATE ex SET s = s || '!' WHERE n = -5;"
+expect "concat visible by value" "a!" v "SELECT s FROM ex WHERE s = 'a!';"
+expect "SET wrapped concat" "UPDATE 1" \
+    q "UPDATE ex SET s = 'p-' || s || '-s' WHERE n = -5;"
+expect "wrapped concat visible" "p-a!-s" v "SELECT s FROM ex WHERE n = -5;"
+expect "SET s = s || NULL" "UPDATE 1" \
+    q "UPDATE ex SET s = s || NULL WHERE n = -5;"
+expect "NULL concat visible" "(1 row)" \
+    q "SELECT * FROM ex WHERE n = -5 AND s IS NULL;"
+expect "SET column copy" "UPDATE 1" q "UPDATE ex SET n = m WHERE s = 'b';"
+expect "copy visible" "3" v "SELECT n FROM ex WHERE s = 'b';"
+expect "division by zero" "division by zero" \
+    q "UPDATE ex SET n = n / 0 WHERE s = 'b';"
+expect "integer overflow" "out of range" \
+    q "UPDATE ex SET n = n + 2147483647 WHERE s = 'b';"
+expect "no + on text" "operator does not exist" q "UPDATE ex SET s = s + 1;"
+expect "no || with a number" "operator does not exist" \
+    q "UPDATE ex SET s = s || n;"
+expect "float into int refused" "does not match" q "UPDATE ex SET n = n * 1.5;"
+expect "text into int refused" "does not match" q "UPDATE ex SET n = s;"
+expect "function in SET rejected" "SET value" q "UPDATE ex SET n = now();"
+expect "unknown column in SET expr" "does not exist" \
+    q "UPDATE ex SET n = zz + 1;"
+expect "failed statements changed nothing" "3" \
+    v "SELECT n FROM ex WHERE s = 'b';"
+
 # --- update rejections / errors --------------------------------------------
-expect "UPDATE expression rejected" "literal" q "UPDATE t SET id = id + 1;"
 expect "UPDATE egid rejected" "egid" q "UPDATE t SET egid = 9 WHERE egid = 1;"
 expect "UPDATE unknown table" "does not exist" q "UPDATE nope SET id = 1;"
 expect "UPDATE unknown column" "does not exist" q "UPDATE t SET bogus = 1;"

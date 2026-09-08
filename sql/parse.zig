@@ -115,10 +115,25 @@ pub const Delete = struct {
     where: ?Where, // null = delete every row
 };
 
-/// One SET assignment: `column = literal`.
+/// A SET value as the grammar built it: precedence and parentheses
+/// are already in the tree's shape, and a minus before a number is
+/// already folded into a negative literal (gram.y's doNegate), so
+/// `-col` is the only unary form — it parses as `0 - col`; `+x` is
+/// `x`. Everything borrows the arena; children are pointers only
+/// because a union cannot hold itself by value.
+pub const Expr = union(enum) {
+    literal: Literal,
+    column: []const u8, // borrowed
+    binop: BinOp,
+
+    pub const Op = enum { add, sub, mul, div, mod, concat };
+    pub const BinOp = struct { op: Op, lhs: *const Expr, rhs: *const Expr };
+};
+
+/// One SET assignment: `column = expr`.
 pub const SetClause = struct {
     column: []const u8, // borrowed
-    literal: Literal,
+    value: Expr,
 };
 
 pub const Update = struct {
@@ -356,10 +371,26 @@ const DeleteStmtJson = struct {
     withClause: ?std.json.Value = null, // WITH ... DELETE
 };
 
-/// UPDATE t SET col = const [, ...] [WHERE ...]. Each targetList
-/// entry is one SET assignment; a non-literal value (expression, DEFAULT,
-/// sub-select, multi-assign) leaves `A_Const` null → rejected. The last
-/// three clauses are decoded only to reject them.
+/// One value-expression node: exactly one of the three is present.
+/// Any other node kind (FuncCall, TypeCast, ParamRef, SubLink,
+/// SetToDefault, MultiAssignRef) leaves all three null → rejected.
+/// Recursive through pointers: std.json allocates a `*T` field.
+const ExprNode = struct {
+    A_Const: ?InsertStmtJson.AConst = null,
+    ColumnRef: ?SelectStmtJson.ColumnRef = null,
+    A_Expr: ?AExpr = null,
+
+    const AExpr = struct {
+        kind: []const u8 = "",
+        name: []const NameNode = &.{},
+        lexpr: ?*const ExprNode = null, // absent: unary `-x` / `+x`
+        rexpr: ?*const ExprNode = null,
+    };
+};
+
+/// UPDATE t SET col = expr [, ...] [WHERE ...]. Each targetList entry
+/// is one SET assignment. The last three clauses are decoded only to
+/// reject them.
 const UpdateStmtJson = struct {
     relation: struct { relname: []const u8 = "" } = .{},
     targetList: []const ResTargetNode = &.{},
@@ -371,7 +402,7 @@ const UpdateStmtJson = struct {
     const ResTargetNode = struct { ResTarget: ResTarget = .{} };
     const ResTarget = struct {
         name: []const u8 = "",
-        val: struct { A_Const: ?InsertStmtJson.AConst = null } = .{},
+        val: ExprNode = .{},
     };
 };
 
@@ -646,6 +677,82 @@ fn parseWhere(
     return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
 }
 
+/// A parsed SET expression or a rejection reason (borrowed).
+const ParsedExpr = union(enum) {
+    expr: Expr,
+    invalid: []const u8,
+
+    fn reject(msg: []const u8) ParsedExpr {
+        return .{ .invalid = msg };
+    }
+};
+
+/// The operator an A_Expr names, or null for one SET does not do.
+fn opFrom(name: []const u8) ?Expr.Op {
+    if (std.mem.eql(u8, name, "||")) return .concat;
+    if (name.len != 1) return null;
+    return switch (name[0]) {
+        '+' => .add,
+        '-' => .sub,
+        '*' => .mul,
+        '/' => .div,
+        '%' => .mod,
+        else => null,
+    };
+}
+
+/// Parse a SET value: a literal, a column, or `+ - * / % ||` over
+/// them, recursively. Anything else (a function, a cast, a
+/// parameter, a subquery, DEFAULT, another operator) yields a clean
+/// `.invalid` reason; only OOM propagates. Each child lands in one
+/// arena cell.
+fn parseExpr(
+    arloc: std.mem.Allocator,
+    node: ExprNode,
+) parser.ParseError!ParsedExpr {
+    if (node.A_Const) |ac| {
+        const lit = literalFrom(ac);
+        if (lit == .unsupported)
+            return ParsedExpr.reject("unsupported literal in SET");
+        return .{ .expr = .{ .literal = lit } };
+    }
+    if (node.ColumnRef != null) {
+        const column = columnOf(.{ .ColumnRef = node.ColumnRef }) orelse
+            return ParsedExpr.reject("unsupported column reference in SET");
+        return .{ .expr = .{ .column = column } };
+    }
+    const ae = node.A_Expr orelse return ParsedExpr.reject(
+        "SET value must be a literal, a column, or an operator " ++
+            "expression over them",
+    );
+    const bad_op = "only + - * / % || are supported in SET";
+    if (!std.mem.eql(u8, ae.kind, "AEXPR_OP") or ae.name.len == 0)
+        return ParsedExpr.reject(bad_op);
+    const op = opFrom(ae.name[ae.name.len - 1].String.sval) orelse
+        return ParsedExpr.reject(bad_op);
+
+    const rhs_node = ae.rexpr orelse return ParsedExpr.reject(bad_op);
+    const rhs = try arloc.create(Expr);
+    rhs.* = switch (try parseExpr(arloc, rhs_node.*)) {
+        .expr => |e| e,
+        .invalid => |msg| return .{ .invalid = msg },
+    };
+    const lhs = try arloc.create(Expr);
+    if (ae.lexpr) |lhs_node| {
+        lhs.* = switch (try parseExpr(arloc, lhs_node.*)) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+    } else switch (op) {
+        // Unary: `-x` is `0 - x`, `+x` is `x`. (`-1` never gets
+        // here — the grammar folds it into the literal.)
+        .sub => lhs.* = .{ .literal = .{ .int = 0 } },
+        .add => return .{ .expr = rhs.* },
+        else => return ParsedExpr.reject(bad_op),
+    }
+    return .{ .expr = .{ .binop = .{ .op = op, .lhs = lhs, .rhs = rhs } } };
+}
+
 /// SELECT [cols|*] FROM one_table [WHERE ...] [FOR UPDATE] [LIMIT n].
 /// Joins, subqueries, ORDER BY / GROUP BY / OFFSET / DISTINCT and
 /// expression targets are rejected.
@@ -796,9 +903,9 @@ fn parseDelete(
     return .{ .delete = .{ .table = ds.relation.relname, .where = where } };
 }
 
-/// UPDATE one_table SET col = literal [, ...] [WHERE ...].
-/// FROM, RETURNING, WITH, non-literal SET values, and duplicate SET
-/// columns are rejected with a reason.
+/// UPDATE one_table SET col = expr [, ...] [WHERE ...]. FROM,
+/// RETURNING, WITH, SET values parseExpr does not take, and duplicate
+/// SET columns are rejected with a reason.
 fn parseUpdate(
     alloc: std.mem.Allocator,
     body: std.json.Value,
@@ -824,16 +931,15 @@ fn parseUpdate(
     for (us.targetList) |tn| {
         const rt = tn.ResTarget;
         if (rt.name.len == 0) return .unsupported;
-        const ac = rt.val.A_Const orelse
-            return invalid("SET value must be a literal");
         for (sets.items) |s| {
             if (std.mem.eql(u8, s.column, rt.name))
                 return invalid("duplicate column in SET");
         }
-        const lit = literalFrom(ac);
-        if (lit == .unsupported)
-            return invalid("SET value must be a literal");
-        try sets.append(alloc, .{ .column = rt.name, .literal = lit });
+        const value = switch (try parseExpr(alloc, rt.val)) {
+            .expr => |e| e,
+            .invalid => |msg| return .{ .invalid = msg },
+        };
+        try sets.append(alloc, .{ .column = rt.name, .value = value });
     }
 
     return .{ .update = .{

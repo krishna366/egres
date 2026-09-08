@@ -65,6 +65,34 @@ pub const Type = enum {
         return self.fixedWidth() == null;
     }
 
+    /// Every integer width, signed or not.
+    pub inline fn isInteger(self: Type) bool {
+        return switch (self) {
+            .int2, .int4, .int8, .uint2, .uint4, .uint8 => true,
+            else => false,
+        };
+    }
+
+    pub inline fn isFloat(self: Type) bool {
+        return self == .float4 or self == .float8;
+    }
+
+    /// The types SET arithmetic computes over (expr.zig).
+    pub inline fn isNumeric(self: Type) bool {
+        return self.isInteger() or self.isFloat();
+    }
+
+    /// Whether a value of this type may be assigned to a column of
+    /// `to` by SET: the same type; any integer into any number (the
+    /// width is range-checked on assignment); a float into a float.
+    /// A float into an integer column is refused (PG would round).
+    pub fn assignableTo(self: Type, to: Type) bool {
+        if (self == to) return true;
+        if (self.isInteger()) return to.isNumeric();
+        if (self.isFloat()) return to.isFloat();
+        return false;
+    }
+
     /// Resolve a DDL type name to a storage Type, or null if unsupported.
     /// libpg_query normalizes pg_catalog spellings to internal names before
     /// we see them (int/integer→int4, bigint→int8, real→float4, boolean→
@@ -112,6 +140,15 @@ pub const Value = union(enum) {
     uuid: [16]u8,
     text: []const u8,
     bytea: []const u8,
+
+    /// The cell's type, or null for SQL NULL. Every non-null tag is
+    /// named exactly as its Type.
+    pub fn ty(self: Value) ?Type {
+        return switch (self) {
+            .null_value => null,
+            inline else => |_, tag| @field(Type, @tagName(tag)),
+        };
+    }
 };
 
 /// A decoded (possibly projected) row: one Value per requested column, in
@@ -120,26 +157,34 @@ pub const Value = union(enum) {
 /// of reallocated per row. A struct (not a bare slice) so row operations
 /// (iteration, formatting, re-projection) can hang off it later.
 pub const Row = struct {
-    /// Backing store, reused across decodes. External code reads via the
-    /// accessors below; the codec resizes and fills it.
-    cells: std.ArrayList(Value) = .empty,
+    /// The cell values, reused across decodes. External code reads via
+    /// the accessors below; the codec resizes and fills it.
+    values: std.ArrayList(Value) = .empty,
 
     pub inline fn len(self: Row) usize {
-        return self.cells.items.len;
+        return self.values.items.len;
     }
 
     pub inline fn at(self: Row, index: usize) Value {
-        return self.cells.items[index];
+        return self.values.items[index];
     }
 
-    pub inline fn items(self: Row) []const Value {
-        return self.cells.items;
+    /// The cells as a slice, in projection order.
+    pub inline fn cells(self: Row) []const Value {
+        return self.values.items;
     }
 
-    /// Free the backing store. Borrowed text/bytea payloads point into the
+    /// Overwrite one cell — an UPDATE's SET on a decoded pre-image.
+    /// The next unmarshalRow refills every cell, so the reused list is
+    /// free to take it.
+    pub inline fn set(self: *Row, index: usize, value: Value) void {
+        self.values.items[index] = value;
+    }
+
+    /// Free the backing list. Borrowed text/bytea payloads point into the
     /// source row buffer and are not owned, so only the cell array is freed.
     pub fn deinit(self: *Row, alloc: std.mem.Allocator) void {
-        self.cells.deinit(alloc);
+        self.values.deinit(alloc);
     }
 };
 

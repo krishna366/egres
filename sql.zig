@@ -22,6 +22,8 @@
 //! dml:    INSERT / SELECT / DELETE / UPDATE statement bodies.
 //! pred:   Pred — a WHERE bound to its table (columns, typed literals)
 //!         and its SQL three-valued evaluation per row.
+//! expr:   SetNode — a SET value bound to its table (arithmetic and
+//!         `||` over columns and literals) and its per-row evaluation.
 //! exec:   the pull executor — RowNodes exchanging one Batch (rows
 //!         copied once at the source + a survivor bit set) and
 //!         BitmapNodes turning index reads into egid sets.
@@ -45,6 +47,7 @@ pub const dml = @import("sql/dml.zig");
 pub const exec = @import("sql/exec.zig");
 pub const plan = @import("sql/plan.zig");
 pub const pred = @import("sql/pred.zig");
+pub const expr = @import("sql/expr.zig");
 
 pub const Server = server.Server;
 pub const default_database = server.default_database;

@@ -13,6 +13,7 @@ const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 
 const _exec = @import("exec.zig");
+const _expr = @import("expr.zig");
 const _parse = @import("parse.zig");
 const _key = @import("key.zig");
 const _plan = @import("plan.zig");
@@ -27,10 +28,9 @@ const _server = @import("server.zig");
 const ExecCtx = _exec.ExecCtx;
 const Handler = _server.Handler;
 const Pred = _pred.Pred;
-const SetVal = _row.SetVal;
+const SetNode = _expr.SetNode;
 const String = _value.String;
 const litToValue = _parse.litToValue;
-const rewriteRowBytes = _row.rewriteRowBytes;
 const log = std.log.scoped(.sql);
 const replyError = _server.replyError;
 const replyErrorCode = _server.replyErrorCode;
@@ -137,14 +137,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         if (bitmap_idxs.len > 0) {
             prow.bitmap_keys = try arloc.alloc(String, bitmap_idxs.len);
             for (bitmap_idxs, prow.bitmap_keys) |ix, *bm_key| {
-                bm_key.* = _key.encodeIndexKey(
-                    arloc,
-                    values[ix.column.pos],
-                    null,
-                ) catch |err| switch (err) {
-                    error.Unencodable => unreachable,
-                    else => return err,
-                };
+                bm_key.* = try postingKey(arloc, values[ix.column.pos]);
             }
         }
         // marshalRow reuses `buf`; dupe out before the next row clobbers it.
@@ -390,11 +383,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         const egid = _key.decodeEgid(item.key.primary).?;
         for (posting_idx) |ix| {
             const cell = tbl.parseCol(item, ix.column);
-            const old_key = _key.encodeIndexKey(arloc, cell, null) catch |err|
-                switch (err) {
-                    error.Unencodable => unreachable,
-                    else => return err,
-                };
+            const old_key = try postingKey(arloc, cell);
             try tx.putPosting(ix.index_table_id, old_key, egid, .remove);
         }
     }
@@ -435,22 +424,20 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     };
     const posting_idx = try bitmapIndexes(arloc, tbl);
 
-    // A SET on an indexed column moves each matched row's egid
-    // from its old posting to a statement-constant new one (the
-    // SET value is one literal for every row): the index (whose
-    // column reads the old key out of the pre-image) plus the
-    // encoded new key. Parse rejects duplicate SET columns, so
-    // one entry per column.
-    const MovedCol = struct {
-        index: *const _table.Index,
-        new_key: String,
+    // One SET clause, bound: the expression, its target column, the
+    // column's non-unique index if it has one (at most one per
+    // column), and the value computed for the row in hand. A changed
+    // value on an indexed column moves the row's egid between
+    // postings, the old key read out of the pre-image, the new one
+    // per row (`col = col + 1`). Parse rejects duplicate SET columns.
+    const Set = struct {
+        node: *const SetNode,
+        target: *const _table.Column,
+        index: ?*const _table.Index,
+        val: _value.Value = .null_value,
     };
-    var moved_cols: std.ArrayList(MovedCol) = .empty;
-
-    // sets is used to create the updated row. It tells us which cols have
-    // been updated and what their new value is.
-    const set_cols = try arloc.alloc(SetVal, up.sets.len);
-    for (up.sets, set_cols) |clause, *sv| {
+    const sets = try arloc.alloc(Set, up.sets.len);
+    for (up.sets, sets) |clause, *set| {
         const col = tbl.column(clause.column) orelse
             return replyErrorCode(
                 state,
@@ -471,22 +458,12 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
                 pgwire.sqlstate.feature_not_supported,
                 "PRIMARY KEY column cannot be updated",
             );
-        const val =
-            (try coerceLiteral(state, arloc, clause.literal, col.ty)) orelse
-            return;
-        sv.* = .{ .pos = col.pos, .val = val };
-
+        const node = try _expr.bind(state, arloc, tbl, col, clause.value);
+        var index: ?*const _table.Index = null;
         for (posting_idx) |ix| {
-            if (ix.column != col) continue;
-            try moved_cols.append(arloc, .{
-                .index = ix,
-                .new_key = _key.encodeIndexKey(arloc, val, null) catch |err|
-                    switch (err) {
-                        error.Unencodable => unreachable,
-                        else => return err,
-                    },
-            });
+            if (ix.column == col) index = ix;
         }
+        set.* = .{ .node = node orelse return, .target = col, .index = index };
     }
 
     // Plan the WHERE: an egid or indexed term drives point reads,
@@ -497,6 +474,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     var plan = (try planFor(state, arloc, tbl, up.where, .{})) orelse
         return;
     defer plan.deinit();
+
     var ctx = ExecCtx{
         .arloc = arloc,
         .tx = tx,
@@ -510,34 +488,39 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         return replyRunErr(state, "update", up.table, err);
     // Past gatherAndLockRows' locks no candidate committed above read_ts —
     // the gathered pre-images are the newest versions, frozen by our
-    // locks. Move each row's egid between postings when an indexed
-    // column changed (equal keys move nothing — commuting deltas,
-    // NO locks per docs/transactions.md; all locking is done, so
-    // no Restart can strand these), then rewrite and buffer the
-    // row.
-    var dec: _value.Row = .{};
+    // locks. Per row: evaluate every SET against the pre-image (so
+    // `SET a = b, b = a` swaps), move the egid between postings where
+    // an indexed column changed (equal keys move nothing — commuting
+    // deltas, NO locks per docs/transactions.md; all locking is done,
+    // so no Restart can strand these), then overlay the values on the
+    // decoded pre-image, marshal, and buffer the row. An eval error
+    // here ends the statement with the buffered puts discarded
+    // (endImplicit / the failed block).
+    var row: _value.Row = .{};
     // Reused across items: marshalRow resets it, and tx.put
     // copies the bytes into the txn arena before returning.
     var rbuf: std.ArrayList(u8) = .empty;
     for (rows) |item| {
         const egid = _key.decodeEgid(item.key.primary).?;
-        for (moved_cols.items) |mv| {
-            const cell = tbl.parseCol(item, mv.index.column);
-            const old_key = _key.encodeIndexKey(arloc, cell, null) catch |err|
-                switch (err) {
-                    error.Unencodable => unreachable,
-                    else => return err,
-                };
+        for (sets) |*set| {
+            set.val = set.node.eval(arloc, tbl, item, set.target) catch |err|
+                return replyEvalErr(state, err);
+            const ix = set.index orelse continue;
+            const old_cell = tbl.parseCol(item, ix.column);
+            const old_key = try postingKey(arloc, old_cell);
+            const new_key = try postingKey(arloc, set.val);
             // If old_key and new_key match, there's no change. Skip.
-            if (std.mem.eql(u8, old_key, mv.new_key)) continue;
+            if (std.mem.eql(u8, old_key, new_key)) continue;
 
-            try tx.putPosting(mv.index.index_table_id, //
-                old_key, egid, .remove);
-            try tx.putPosting(mv.index.index_table_id, //
-                mv.new_key, egid, .add);
+            try tx.putPosting(ix.index_table_id, old_key, egid, .remove);
+            try tx.putPosting(ix.index_table_id, new_key, egid, .add);
         }
-        const rewritten = try rewriteRowBytes(arloc, //
-            &tbl.ps, set_cols, &dec, item.value, &rbuf);
+        // The decoded cells borrow item.value, which the arena keeps
+        // alive through the marshal.
+        const ps = &tbl.ps;
+        try _row.unmarshalRow(arloc, ps, item.value, &.{}, &row);
+        for (sets) |set| row.set(set.target.pos, set.val);
+        const rewritten = try _row.marshalRow(arloc, ps, row.cells(), &rbuf);
         try tx.put(table_id, item.key.primary, rewritten, .{});
     }
     const n = rows.len;
@@ -621,6 +604,39 @@ fn coerceLiteral(
             );
             return null;
         },
+    };
+}
+
+/// Map an eval failure (expr.eval: arithmetic on one row's SET
+/// values) onto the wire.
+fn replyEvalErr(state: *pgwire.ConnState, err: _expr.EvalError) !void {
+    return switch (err) {
+        error.OutOfMemory => err,
+        error.IntOutOfRange => replyErrorCode(
+            state,
+            pgwire.sqlstate.numeric_value_out_of_range,
+            "integer out of range",
+        ),
+        error.FloatOutOfRange => replyErrorCode(
+            state,
+            pgwire.sqlstate.numeric_value_out_of_range,
+            "value out of range: overflow",
+        ),
+        error.DivisionByZero => replyErrorCode(
+            state,
+            pgwire.sqlstate.division_by_zero,
+            "division by zero",
+        ),
+    };
+}
+
+/// The posting key of one cell of a non-unique indexed column. Every
+/// type CREATE INDEX accepts encodes (it rejects interval), so
+/// Unencodable cannot happen here.
+fn postingKey(arloc: std.mem.Allocator, cell: _value.Value) !String {
+    return _key.encodeIndexKey(arloc, cell, null) catch |err| switch (err) {
+        error.Unencodable => unreachable,
+        else => return err,
     };
 }
 

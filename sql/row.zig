@@ -85,18 +85,20 @@ pub fn unmarshalRow(
     // Empty projection = SELECT *: every column, in column_id order. Decode
     // straight from ps.columns (no per-id lookup).
     if (projection.len == 0) {
-        try row.cells.resize(alloc, ps.columns.len);
-        for (ps.columns, row.cells.items) |col, *slot| slot.* = parseCol(ps, buffer, col);
+        try row.values.resize(alloc, ps.columns.len);
+        for (ps.columns, row.values.items) |col, *slot| {
+            slot.* = parseCol(ps, buffer, col);
+        }
         return;
     }
 
     // Merge-walk: both projection and ps.columns are column_id-sorted, so the
     // ps.columns cursor `j` only advances. A match parks j on the column (not
     // past it), so a duplicate id in projection re-matches it.
-    try row.cells.resize(alloc, projection.len);
+    try row.values.resize(alloc, projection.len);
     var j: usize = 0;
     var prev: u32 = 0;
-    for (projection, row.cells.items) |column_id, *slot| {
+    for (projection, row.values.items) |column_id, *slot| {
         std.debug.assert(column_id >= prev); // projection must be sorted ascending
         prev = column_id;
         while (j < ps.columns.len and ps.columns[j].column_id < column_id) j += 1;
@@ -105,30 +107,6 @@ pub fn unmarshalRow(
         else
             .null_value;
     }
-}
-
-/// One resolved SET assignment: the column's slot (Column.pos) + its
-/// typed replacement value.
-pub const SetVal = struct { pos: usize, val: Value };
-
-/// UPDATE's rewrite: decode `src` (its cells borrow from src — the call
-/// must finish while src is alive), overlay the SET values, marshal the
-/// new row into `buf`, and return its bytes (a view into buf). Pure —
-/// no txn state touched. The WHERE was already applied to these same
-/// bytes when the row was found, so there is nothing to re-verify.
-pub fn rewriteRowBytes(
-    alloc: std.mem.Allocator,
-    ps: *const PhysicalSchema,
-    sets: []const SetVal,
-    dec: *Row,
-    src: []const u8,
-    buf: *std.ArrayList(u8),
-) ![]const u8 {
-    try unmarshalRow(alloc, ps, src, &.{}, dec);
-    // Overlaying into the codec's backing store is fine: the next
-    // unmarshalRow refills every cell.
-    for (sets) |sv| dec.cells.items[sv.pos] = sv.val;
-    return marshalRow(alloc, ps, dec.items(), buf);
 }
 
 /// Decode ONE column without touching the rest of the row: a null-bit

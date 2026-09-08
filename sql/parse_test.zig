@@ -429,16 +429,16 @@ test "sql.parse: UPDATE parses table, SET list, and the optional filter" {
     try testing.expect(up1.update.where == null);
     try testing.expectEqual(3, up1.update.sets.len);
     try testing.expectEqualStrings("a", up1.update.sets[0].column);
-    try testing.expectEqual(@as(i64, 5), up1.update.sets[0].literal.int);
+    try testing.expectEqual(@as(i64, 5), up1.update.sets[0].value.literal.int);
     try testing.expectEqualStrings("b", up1.update.sets[1].column);
-    try testing.expectEqualStrings("x", up1.update.sets[1].literal.str);
+    try testing.expectEqualStrings("x", up1.update.sets[1].value.literal.str);
     try testing.expectEqualStrings("c", up1.update.sets[2].column);
-    try testing.expect(up1.update.sets[2].literal == .null_value);
+    try testing.expect(up1.update.sets[2].value.literal == .null_value);
 
     // WHERE on a payload column; SET int 0 exercises libpg_query's
     // omitted-zero encoding ("ival":{} still means 0).
     const up2 = try parse.statement(alloc, "UPDATE t SET a = 0 WHERE id = 7;");
-    try testing.expectEqual(@as(i64, 0), up2.update.sets[0].literal.int);
+    try testing.expectEqual(@as(i64, 0), up2.update.sets[0].value.literal.int);
     const f2 = up2.update.where.?.eq;
     try testing.expectEqualStrings("id", f2.column);
     try testing.expectEqual(@as(i64, 7), f2.literal.int);
@@ -446,6 +446,73 @@ test "sql.parse: UPDATE parses table, SET list, and the optional filter" {
     // WHERE on the egid pseudo-column parses as a plain column filter.
     const up3 = try parse.statement(alloc, "UPDATE t SET a = 1 WHERE egid = 3;");
     try testing.expectEqualStrings("egid", up3.update.where.?.eq.column);
+}
+
+/// The first SET value of an UPDATE that must parse.
+fn setValue(arloc: std.mem.Allocator, text: []const u8) !parse.Expr {
+    const stmt = try parse.statement(arloc, text);
+    return stmt.update.sets[0].value;
+}
+
+test "sql.parse: SET expressions keep the grammar's operator tree" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+    const Op = parse.Expr.Op;
+
+    // `a + 1`: an operator over a column and a literal.
+    const s1 = try setValue(arloc, "UPDATE t SET a = a + 1;");
+    try testing.expectEqual(Op.add, s1.binop.op);
+    try testing.expectEqualStrings("a", s1.binop.lhs.column);
+    try testing.expectEqual(@as(i64, 1), s1.binop.rhs.literal.int);
+
+    // Precedence and parentheses are the tree's shape: `a * 2 + 1` is
+    // add(mul(a, 2), 1); `(a + 1) * 2` is mul(add(a, 1), 2).
+    const s2 = try setValue(arloc, "UPDATE t SET a = a * 2 + 1;");
+    try testing.expectEqual(Op.add, s2.binop.op);
+    try testing.expectEqual(Op.mul, s2.binop.lhs.binop.op);
+    try testing.expectEqualStrings("a", s2.binop.lhs.binop.lhs.column);
+    try testing.expectEqual(@as(i64, 2), s2.binop.lhs.binop.rhs.literal.int);
+    try testing.expectEqual(@as(i64, 1), s2.binop.rhs.literal.int);
+    const s3 = try setValue(arloc, "UPDATE t SET a = (a + 1) * 2;");
+    try testing.expectEqual(Op.mul, s3.binop.op);
+    try testing.expectEqual(Op.add, s3.binop.lhs.binop.op);
+    try testing.expectEqual(@as(i64, 2), s3.binop.rhs.literal.int);
+
+    // Unary minus on a column is `0 - a`; on a number the grammar
+    // folds it into the literal, even behind another operator. `+a`
+    // is `a`.
+    const s4 = try setValue(arloc, "UPDATE t SET a = -a;");
+    try testing.expectEqual(Op.sub, s4.binop.op);
+    try testing.expectEqual(@as(i64, 0), s4.binop.lhs.literal.int);
+    try testing.expectEqualStrings("a", s4.binop.rhs.column);
+    const s5 = try setValue(arloc, "UPDATE t SET a = -1;");
+    try testing.expectEqual(@as(i64, -1), s5.literal.int);
+    const s6 = try setValue(arloc, "UPDATE t SET a = a - -1;");
+    try testing.expectEqual(Op.sub, s6.binop.op);
+    try testing.expectEqual(@as(i64, -1), s6.binop.rhs.literal.int);
+    const s7 = try setValue(arloc, "UPDATE t SET a = +a;");
+    try testing.expectEqualStrings("a", s7.column);
+
+    // A bare column; `/` and `%` at one precedence level, left to
+    // right; a float literal stays text.
+    const s8 = try setValue(arloc, "UPDATE t SET a = b;");
+    try testing.expectEqualStrings("b", s8.column);
+    const s9 = try setValue(arloc, "UPDATE t SET a = a / 2 % 1.5;");
+    try testing.expectEqual(Op.mod, s9.binop.op);
+    try testing.expectEqual(Op.div, s9.binop.lhs.binop.op);
+    try testing.expectEqualStrings("1.5", s9.binop.rhs.literal.float);
+
+    // `||` is left-associative: `'p' || b || 's'` is
+    // concat(concat('p', b), 's').
+    const s10 = try setValue(arloc, "UPDATE t SET b = 'p' || b || 's';");
+    try testing.expectEqual(Op.concat, s10.binop.op);
+    try testing.expectEqualStrings("s", s10.binop.rhs.literal.str);
+    const inner = s10.binop.lhs.binop;
+    try testing.expectEqual(Op.concat, inner.op);
+    try testing.expectEqualStrings("p", inner.lhs.literal.str);
+    try testing.expectEqualStrings("b", inner.rhs.column);
 }
 
 test "sql.parse: transaction statements parse; savepoints are rejected" {
@@ -480,10 +547,13 @@ test "sql.parse: UPDATE rejections carry a reason" {
         .{ .sql = "UPDATE t SET a = 1 FROM u;", .needle = "FROM" },
         .{ .sql = "UPDATE t SET a = 1 RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) UPDATE t SET a = 1;", .needle = "WITH" },
-        .{ .sql = "UPDATE t SET a = b;", .needle = "literal" },
-        .{ .sql = "UPDATE t SET a = a + 1;", .needle = "literal" },
-        .{ .sql = "UPDATE t SET a = DEFAULT;", .needle = "literal" },
-        .{ .sql = "UPDATE t SET a = 1, a = 2;", .needle = "duplicate" },
+        .{ .sql = "UPDATE t SET a = DEFAULT;", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = now();", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = '1'::int;", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET (a, b) = (1, 2);", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = a AND b;", .needle = "SET value" },
+        .{ .sql = "UPDATE t SET a = a ^ 2;", .needle = "supported" },
+        .{ .sql = "UPDATE t SET a = a + 1, a = 2;", .needle = "duplicate" },
         .{ .sql = "UPDATE t SET a = 1 WHERE b > 5;", .needle = "column = value" },
     };
     for (cases) |case| {
