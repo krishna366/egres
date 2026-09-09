@@ -881,11 +881,15 @@ pub const Tree = struct {
     /// heap, plus the iters' own scratch (key_buf etc.) — comes from it.
     /// The caller keeps the arena alive for the merge's lifetime and frees
     /// it at end-of-scope; `merge.deinit()` only releases table refs.
+    /// `min_ts`: a table whose newest version (`TableIndex.max_version`)
+    /// is at or below it holds nothing the scan wants and is not opened
+    /// (Forest.ScanOptions.min_ts); 0 opens every overlapping table.
     pub fn openMerge(
         self: *Tree,
         allocator: std.mem.Allocator,
         range: KeyRange,
         priority: vfs.Priority,
+        min_ts: u64,
         extras: []const Iterator,
     ) !MergeIterator {
         // Build iters into a list. Until we hand them off to merge,
@@ -911,12 +915,20 @@ pub const Tree = struct {
 
             if (level_idx == 0) {
                 for (overlapping) |e| {
+                    if (e.table.index.max_version <= min_ts) continue;
                     try iters.append(allocator, .{ .table = TableIterator.init(allocator, e.table, priority) });
                 }
             } else {
-                const subs = try allocator.alloc(TableIterator, overlapping.len);
-                for (overlapping, 0..) |e, j| subs[j] = TableIterator.init(allocator, e.table, priority);
-                try iters.append(allocator, .{ .concat = ConcatIterator.init(subs) });
+                var subs: std.ArrayList(TableIterator) = .empty;
+                for (overlapping) |e| {
+                    if (e.table.index.max_version <= min_ts) continue;
+                    const tbl = e.table;
+                    const sub = TableIterator.init(allocator, tbl, priority);
+                    try subs.append(allocator, sub);
+                }
+                if (subs.items.len == 0) continue;
+                const concat = ConcatIterator.init(subs.items);
+                try iters.append(allocator, .{ .concat = concat });
             }
         }
 
@@ -1854,7 +1866,7 @@ pub const Tree = struct {
     /// run — and a rolled-up terminal there would already be missing
     /// the backfilled rows. The check reads applied state, so every
     /// node skips (or installs) identically; the DDL session verifies
-    /// via Forest.bottomTableCount after the apply and fails CREATE
+    /// via Forest.bottomLevelHas after the apply and fails CREATE
     /// INDEX loudly on a skip.
     pub fn applyBackfill(self: *Tree, changes: []const _manifest.SSTableChange) !void {
         if (changes.len == 0) return;

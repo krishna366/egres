@@ -116,7 +116,7 @@ test "sql.catalog: an index descriptor round-trips through an index row" {
         .index_table_id = 17,
         .column_id = 1,
         .unique = true,
-        .valid = false, // exercise the non-default half of the flag
+        .valid_ts = catalog.IndexDef.building, // the non-default value
     };
     const vals = catalog.encodeIndex(def);
     const bytes = try sql.marshalRow(alloc, &ips, &vals, &buf);

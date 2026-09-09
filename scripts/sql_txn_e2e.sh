@@ -352,9 +352,53 @@ q "DELETE FROM pk WHERE id = 1;" >/dev/null
 if q "INSERT INTO pk VALUES (1, 'a2');" | grep -q "INSERT 0 1"; then
     ok "re-INSERT of a deleted PK succeeds"
 else bad "re-INSERT after delete rejected — stale index entry"; fi
-if { q "UPDATE pk SET id = 99 WHERE id = 3;" 2>&1 || true; } | grep -q "cannot be updated"; then
-    ok "UPDATE of the PK column rejected"
-else bad "UPDATE of the PK column not rejected"; fi
+# UPDATE of the PK column moves the index entry: the new key is found
+# through the index, the old key is free again. Rows: 1, 3, 4, 5.
+if q "UPDATE pk SET id = 99 WHERE id = 3;" | grep -q "UPDATE 1"; then
+    ok "UPDATE of the PK column moves the key"
+else bad "UPDATE of the PK column failed"; fi
+if [ "$(v "SELECT name FROM pk WHERE id = 99;")" = "c" ]; then
+    ok "the moved PK is found through the index"
+else bad "moved PK not found: $(v "SELECT name FROM pk WHERE id = 99;")"; fi
+if q "INSERT INTO pk VALUES (3, 'c2');" | grep -q "INSERT 0 1"; then
+    ok "the old PK value is free after the move"
+else bad "old PK value still taken after the move"; fi
+q "DELETE FROM pk WHERE id = 3;" >/dev/null
+# Onto an occupied key → 23505; two rows onto one value → 23505.
+if { q "UPDATE pk SET id = 4 WHERE id = 99;" 2>&1 || true; } |
+    grep -q "duplicate key"; then
+    ok "UPDATE onto an occupied PK rejected"
+else bad "UPDATE onto an occupied PK not rejected"; fi
+if { q "UPDATE pk SET id = 7 WHERE id = 4 OR id = 5;" 2>&1 || true; } |
+    grep -q "duplicate key"; then
+    ok "two rows UPDATEd onto one PK value rejected"
+else bad "two rows onto one PK value not rejected"; fi
+if [ "$(v "SELECT name FROM pk WHERE id = 99;")" = "c" ]; then
+    ok "a failed UPDATE changed nothing"
+else bad "failed UPDATE left changes"; fi
+# A run of rows each moving onto the next one's key works in one
+# statement: every key is locked first, and each key's write is decided
+# from what the whole statement does to it. Rows 4, 5 → 5, 6.
+if q "UPDATE pk SET id = id + 1 WHERE id = 4 OR id = 5;" |
+    grep -q "UPDATE 2"; then
+    ok "PK keys shift in one statement"
+else bad "PK shift failed"; fi
+if [ "$(v "SELECT name FROM pk WHERE id = 6;")" = "e" ] &&
+    [ "$(v "SELECT name FROM pk WHERE id = 5;")" = "d" ] &&
+    [ -z "$(v "SELECT name FROM pk WHERE id = 4;")" ]; then
+    ok "every shifted key is found through the index"
+else bad "shifted keys wrong: $(v "SELECT id, name FROM pk;" | tr '\n' ' ')"; fi
+q "UPDATE pk SET id = id - 1 WHERE id = 5 OR id = 6;" >/dev/null # back to 4, 5
+# NULL into the PK column, literal or computed → 23502.
+if { q "UPDATE pk SET id = NULL WHERE id = 99;" 2>&1 || true; } |
+    grep -q "not-null constraint"; then
+    ok "UPDATE PK to NULL rejected"
+else bad "UPDATE PK to NULL not rejected"; fi
+if { q "UPDATE pk SET id = NULL + 1 WHERE id = 99;" 2>&1 || true; } |
+    grep -q "not-null constraint"; then
+    ok "UPDATE PK to a computed NULL rejected"
+else bad "UPDATE PK to a computed NULL not rejected"; fi
+q "UPDATE pk SET id = 3 WHERE id = 99;" >/dev/null # back to 3
 
 # Concurrent insert of one key: the loser parks on the index-key lock, then
 # 23505 once the winner commits.
@@ -500,6 +544,119 @@ else bad "the restarted UPDATE missed the concurrent commit"; fi
 if q "SELECT id FROM wide WHERE name = 'r';" | grep -q "(2500 rows)"; then
     ok "every row carries the restarted UPDATE's value"
 else bad "rows missing the restarted UPDATE's value"; fi
+
+# --- old snapshot vs a freshly built index: scan, never misread ------------
+# S1's BEGIN fixes its read_ts, and a first scan (of ANOTHER table: a
+# statement on `snap` would hold its intent and park the CREATE INDEX
+# barrier behind this open txn) makes any later bump a 40001. S2 then
+# builds an index on `color` — its backfilled entries sit at the
+# build's snapshot ts, above S1's — and inserts a row. S1's read of
+# `snap` must not use the index (it would find no entries): it scans
+# and returns the pre-index rows, with the concurrent insert invisible
+# to its snapshot, and no 40001, since readers never bump. After
+# COMMIT a fresh snapshot reads through the index.
+q "CREATE TABLE snap (id int4, color text);" >/dev/null
+q "INSERT INTO snap VALUES (7001, 'blue'), (7002, 'red');" >/dev/null
+send 1 "BEGIN;"
+send 1 "SELECT id FROM wide WHERE id = 1;"
+sync_session 1
+q "CREATE INDEX snap_color ON snap (color);" >/dev/null
+q "INSERT INTO snap VALUES (7003, 'blue');" >/dev/null
+A0=$(grep -c "40001" "$D/out1" || true)
+OLD0=$(grep -c "^7001$" "$D/out1" || true) # ids > wide's, but count
+NEW0=$(grep -c "^7003$" "$D/out1" || true) # relative all the same
+send 1 "SELECT id FROM snap WHERE color = 'blue';"
+send 1 "COMMIT;"
+sync_session 1
+if [ "$(grep -c "^7001$" "$D/out1" || true)" = "$((OLD0 + 1))" ] &&
+    [ "$(grep -c "^7003$" "$D/out1" || true)" = "$NEW0" ]; then
+    ok "old snapshot scans past the new index and sees its own rows"
+else bad "old snapshot misread: $(tail -4 "$D/out1" | tr '\n' ' ')"; fi
+if [ "$(grep -c "40001" "$D/out1" || true)" = "$A0" ]; then
+    ok "a reader is never bumped by an index build"
+else bad "the index build aborted a reader with 40001"; fi
+send 1 "SELECT id FROM snap WHERE color = 'blue';"
+sync_session 1
+if [ "$(grep -c "^7003$" "$D/out1" || true)" = "$((NEW0 + 1))" ]; then
+    ok "a fresh snapshot reads through the new index"
+else bad "fresh snapshot missed the indexed row"; fi
+
+# --- user unique index: the pk cases' shape, plus the old-snapshot writer --
+q "CREATE TABLE uu (id int4 PRIMARY KEY, email text);" >/dev/null
+q "INSERT INTO uu VALUES (1, 'a@x'), (2, 'b@x');" >/dev/null
+q "CREATE UNIQUE INDEX uu_email ON uu (email);" >/dev/null
+if { q "INSERT INTO uu VALUES (3, 'a@x');" 2>&1 || true; } |
+    grep -q "duplicate key"; then
+    ok "sequential duplicate on a user unique index rejected"
+else bad "sequential duplicate on a user unique index not rejected"; fi
+if { q "INSERT INTO uu VALUES (3, 'c@x'), (4, 'c@x');" 2>&1 || true; } |
+    grep -q "duplicate key"; then
+    ok "in-statement duplicate on a user unique index rejected"
+else bad "in-statement duplicate on a user unique index not rejected"; fi
+# Concurrent insert of one value: the loser parks on the key lock,
+# then 23505 once the winner commits.
+UDUP0=$(grep -c "23505" "$D/out2" || true)
+send 1 "BEGIN;"
+send 1 "INSERT INTO uu VALUES (3, 'c@x');"
+sync_session 1
+send 2 "INSERT INTO uu VALUES (4, 'c@x');" # parks on the key lock
+sleep 0.3
+if [ "$(grep -c "23505" "$D/out2")" = "$UDUP0" ]; then
+    ok "concurrent same-value insert blocks on the unique key lock"
+else bad "second inserter was not blocked by the unique key lock"; fi
+send 1 "COMMIT;"
+sync_session 2
+if [ "$(grep -c "23505" "$D/out2")" -gt "$UDUP0" ]; then
+    ok "loser gets 23505 once the winner commits (user unique)"
+else bad "loser did not get 23505 (user unique)"; fi
+q "DELETE FROM uu WHERE id = 3;" >/dev/null
+if q "INSERT INTO uu VALUES (4, 'c@x');" | grep -q "INSERT 0 1"; then
+    ok "DELETE frees the unique value"
+else bad "unique value still taken after DELETE"; fi
+
+# Old snapshot, writer: S1's txn predates a unique index S2 builds. An
+# INSERT of a value the build indexed must see the backfilled entries,
+# so S1 is bumped to the index's valid_ts: 23505 when nothing was read
+# before, 40001 when a prior read makes the bump unsafe. A reader in
+# the same position scans and is never bumped.
+q "CREATE TABLE us (id int4 PRIMARY KEY, v text);" >/dev/null
+q "INSERT INTO us VALUES (1, 'p'), (2, 'q');" >/dev/null
+UA0=$(grep -c "40001" "$D/out1" || true)
+UD0=$(grep -c "23505" "$D/out1" || true)
+send 1 "BEGIN;"
+sync_session 1
+q "CREATE UNIQUE INDEX us_v ON us (v);" >/dev/null
+send 1 "INSERT INTO us VALUES (3, 'p');"
+send 1 "ROLLBACK;"
+sync_session 1
+if [ "$(grep -c "23505" "$D/out1")" = "$((UD0 + 1))" ] &&
+    [ "$(grep -c "40001" "$D/out1")" = "$UA0" ]; then
+    ok "old-snapshot writer is bumped to the new unique index: 23505"
+else bad "old-snapshot writer: $(tail -3 "$D/out1" | tr '\n' ' ')"; fi
+send 1 "BEGIN;"
+send 1 "SELECT id FROM wide WHERE id = 1;" # a prior read: no bump allowed
+sync_session 1
+q "DROP INDEX us_v;" >/dev/null
+q "CREATE UNIQUE INDEX us_v ON us (v);" >/dev/null # built after the snapshot
+send 1 "INSERT INTO us VALUES (3, 'p');"
+send 1 "ROLLBACK;"
+sync_session 1
+if [ "$(grep -c "40001" "$D/out1")" = "$((UA0 + 1))" ]; then
+    ok "old-snapshot writer with a prior read gets 40001"
+else bad "writer with a prior read: $(tail -3 "$D/out1" | tr '\n' ' ')"; fi
+UP0=$(grep -c "^1$" "$D/out1" || true)
+send 1 "BEGIN;"
+send 1 "SELECT id FROM wide WHERE id = 1;"
+sync_session 1
+q "DROP INDEX us_v;" >/dev/null
+q "CREATE UNIQUE INDEX us_v ON us (v);" >/dev/null
+send 1 "SELECT id FROM us WHERE v = 'p';" # scans: the index is too new
+send 1 "COMMIT;"
+sync_session 1
+if [ "$(grep -c "^1$" "$D/out1")" = "$((UP0 + 2))" ] &&
+    [ "$(grep -c "40001" "$D/out1")" = "$((UA0 + 1))" ]; then
+    ok "old-snapshot reader scans past the new unique index, no 40001"
+else bad "old-snapshot reader: $(tail -4 "$D/out1" | tr '\n' ' ')"; fi
 
 # --- disconnect mid-txn: rollback + lock release (t is dropped; use t2) ------
 send 1 "BEGIN;"

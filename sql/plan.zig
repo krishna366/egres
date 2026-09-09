@@ -23,6 +23,10 @@ const zroar = zdb.zroar;
 const Error = std.mem.Allocator.Error;
 
 pub const Options = struct {
+    /// The statement's snapshot. An index is read only when it is
+    /// complete at this ts (`Index.valid_ts <= read_ts`); otherwise its
+    /// backfilled entries would be invisible, so the rows are scanned.
+    read_ts: u64,
     /// Copy row values into the batch; false only for a key-only
     /// consumer (unindexed DELETE).
     keep_value: bool = true,
@@ -56,7 +60,7 @@ pub fn plan(
     opts: Options,
 ) !Plan {
     var bitmap: ?BitmapNode = null;
-    if (pred) |p| bitmap = try bitmapFor(arloc, tbl, p);
+    if (pred) |p| bitmap = try bitmapFor(arloc, tbl, opts.read_ts, p);
     errdefer if (bitmap) |*bm| bm.deinit();
 
     const src = try arloc.create(RowNode);
@@ -93,37 +97,41 @@ pub fn plan(
 fn bitmapFor(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
+    read_ts: u64,
     p: *const Pred,
 ) Error!?BitmapNode {
     switch (p.*) {
         .eq => |cmp| {
             if (cmp.val == .null_value) return try emptySet(arloc);
             if (cmp.col.isEgid()) return try oneEgid(arloc, cmp.val.uint8);
-            const idx = validIndex(tbl, cmp.col) orelse return null;
+            const idx = validIndex(tbl, cmp.col, read_ts) orelse return null;
             return try lookup(arloc, idx, cmp.val);
         },
         .is_null => |nt| {
             if (nt.negate) return null;
             // A unique index holds no NULL entries; only a posting
             // bitmap can answer IS NULL.
-            const idx = validIndex(tbl, nt.col) orelse return null;
+            const idx = validIndex(tbl, nt.col, read_ts) orelse return null;
             if (idx.unique) return null;
             return try lookup(arloc, idx, .null_value);
         },
-        .and_ => |kids| return try andOf(arloc, tbl, kids),
-        .or_ => |kids| return try orOf(arloc, tbl, kids),
+        .and_ => |kids| return try andOf(arloc, tbl, read_ts, kids),
+        .or_ => |kids| return try orOf(arloc, tbl, read_ts, kids),
         .not => return null,
     }
 }
 
-/// The valid index on `col`, if any. A mid-backfill index (valid =
-/// false) is maintained by DML but must not be read yet.
+/// The index on `col` that is complete at `read_ts`, if any. An index
+/// still being built, or built from a snapshot after read_ts, is
+/// maintained by DML but must not be read: its backfilled entries sit
+/// at ts = valid_ts, invisible to an older snapshot.
 fn validIndex(
     tbl: *const _table.Table,
     col: *const _table.Column,
+    read_ts: u64,
 ) ?*const _table.Index {
     for (tbl.indexes) |*idx| {
-        if (idx.column == col and idx.valid) return idx;
+        if (idx.column == col and idx.valid_ts <= read_ts) return idx;
     }
     return null;
 }
@@ -173,13 +181,14 @@ fn isEmptySet(node: BitmapNode) bool {
 fn andOf(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
+    read_ts: u64,
     kids: []const Pred,
 ) Error!?BitmapNode {
     var nodes: std.ArrayList(BitmapNode) = .empty;
     errdefer deinitNodes(arloc, &nodes);
 
     for (kids) |*kid| {
-        var node = (try bitmapFor(arloc, tbl, kid)) orelse continue;
+        var node = (try bitmapFor(arloc, tbl, read_ts, kid)) orelse continue;
         errdefer node.deinit();
         if (isEmptySet(node)) {
             deinitNodes(arloc, &nodes);
@@ -197,12 +206,13 @@ fn andOf(
 fn orOf(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
+    read_ts: u64,
     kids: []const Pred,
 ) Error!?BitmapNode {
     var nodes: std.ArrayList(BitmapNode) = .empty;
     errdefer deinitNodes(arloc, &nodes);
     for (kids) |*kid| {
-        var node = (try bitmapFor(arloc, tbl, kid)) orelse {
+        var node = (try bitmapFor(arloc, tbl, read_ts, kid)) orelse {
             deinitNodes(arloc, &nodes);
             return null;
         };

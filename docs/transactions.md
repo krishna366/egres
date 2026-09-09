@@ -127,10 +127,20 @@ removed when the queue drains.
 
 ### Lock classes — lock what conflicts, delta what commutes
 
-- **Unique-constraint keys** (pkey index, future UNIQUE indexes):
-  exclusive lock + lock-THEN-check. The existence check runs while
-  holding the very lock any competing inserter of the same pkey queues
-  on — that ordering is what makes `duplicate key` deterministic.
+- **Unique index keys** (the pkey index and every UNIQUE index —
+  one maintenance path, sql/dml.zig's index section): exclusive lock
+  + lock-THEN-check. A statement collects every index mutation of
+  every row it writes, locks the unique keys in (index table, key)
+  order, then probes and writes; the existence check runs while
+  holding the very lock any competing inserter of the same value
+  queues on — that ordering is what makes `duplicate key`
+  deterministic. What the statement does to one key is decided
+  from all its rows at once, so `UPDATE t SET pk = pk + 1` moves a
+  run of keys in one statement without a false duplicate. The lock
+  order for every writer is rows first (the gather), then unique
+  keys; INSERT takes keys only. A writer's read_ts is bumped to a
+  freshly built unique index's `valid_ts` before it probes, so the
+  backfilled entries are visible to the probe.
 - **Row data keys** (egid): fresh egids are never contended on insert;
   updates/deletes of an existing row lock its data key — the per-row
   serialization point. Locking readers (FOR UPDATE, and UPDATE/DELETE
@@ -151,11 +161,18 @@ removed when the queue drains.
   the write-side gate; reads materialize a zroar bitmap via
   `Forest.getBitmap`; compaction folds chains into a synthetic
   full-bitmap state (`VersionTracker` in zdb/tree.zig owns the fold,
-  triggers in config.zig `rollup_*`). The SQL layer only needs to emit deltas and
-  call getBitmap when CREATE INDEX lands.
+  triggers in config.zig `rollup_*`). The SQL layer emits the deltas
+  through the same per-statement index maintenance as unique keys
+  and reads them with getBitmap.
   Soundness invariant: everything about a single row is serialized by
   that row's locks; cross-row index deltas only ever commute (add/remove
   of the SAME egid cannot race because the row lock orders them).
+- **What a statement reads:** the committed state at read_ts plus the
+  pending writes of its own transaction's EARLIER statements — never
+  its own. `INSERT 5; SELECT` shows the row and `DELETE pk 5; INSERT 5`
+  finds the pending tombstone, so lookups and scans merge the pending
+  set in; but every read a statement makes (its row gather, its unique
+  probes) precedes its first write, so it can never meet its own.
 
 ### Deadlocks
 
@@ -214,18 +231,24 @@ not a format migration:
 
 ## Deferred
 
-- **Versioned storage (key@commit_ts)** — the one real cliff ahead.
-  INSERT-only transactions are correct without it, but snapshot-
-  consistent SELECT is not: a scan concurrent with an apply can see half
-  of another transaction's rows, and a read_ts reader cannot ignore
-  newer writes. Badger's answer: suffix keys with commit_ts, readers
-  seek (key, read_ts). A real zdb format change (version-aware
-  compaction/GC — also where dropped-table tombstone GC lands). Design
-  key codecs knowing an 8-byte ts suffix is coming.
-- **Table-level intent locks**: ddl_mu serializes DDL against DDL, but
-  nothing stops DROP TABLE landing mid-transaction under a writer.
+- **Version garbage collection.** Versioned storage itself is
+  implemented: every key carries its commit timestamp, a read at
+  read_ts returns the newest version at or below it, a tombstone
+  hides the key from later readers, and compaction folds version
+  chains (`VersionTracker`, zdb/tree.zig). What is deferred is
+  discarding versions nobody can read any more: the read horizon
+  (`Forest.setGlobalMinRead`, the oldest read_ts any open
+  transaction may still use) has no production caller, so no
+  version is ever dropped, and the catalog rows of dropped tables
+  stay behind as unreachable garbage. Advancing it needs the
+  minimum read_ts across every session's open transaction, and a
+  reader below the horizon is refused (`ReadBelowMinRead`), so an
+  idle interactive transaction pins it.
 - Follower / lease reads (this design is leader-only).
-- SELECT FOR UPDATE and other explicit pessimistic reads.
+- Lock timeouts: a DDL barrier (CREATE INDEX, DROP TABLE) waits
+  behind an idle interactive transaction holding the table intent
+  for as long as that transaction stays open.
+- Deferrable unique constraints; `NULLS NOT DISTINCT`.
 
 ## Implementation order
 

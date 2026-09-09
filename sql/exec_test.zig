@@ -89,7 +89,6 @@ const Fixture = struct {
         const tbl = Table{
             .columns = columns,
             .indexes = try a.alloc(sql.table.Index, 0),
-            .primary_index = null,
             .ps = ps,
             .version = 1,
             .arena = std.heap.ArenaAllocator.init(testing.allocator),

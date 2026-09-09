@@ -56,9 +56,12 @@ expect "duplicate CREATE errors" "already exists" psql "$E" -X -c "CREATE TABLE 
 expect "IF NOT EXISTS is quiet" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE IF NOT EXISTS t (id int);"
 
 # --- semantic rejections carry reasons + 0A000 ------------------------------
-expect "NOT NULL rejected" "PRIMARY KEY column constraints" psql "$E" -X -c "CREATE TABLE u (a int NOT NULL);"
+expect "NOT NULL rejected" "column constraints" \
+    psql "$E" -X -c "CREATE TABLE u (a int NOT NULL);"
 expect "serial rejected by name" "serial" psql "$E" -X -c "CREATE TABLE u (a serial);"
 expect "composite pkey rejected" "table-level" psql "$E" -X -c "CREATE TABLE u (a int, b int, PRIMARY KEY (a, b));"
+expect "interval pkey rejected" "interval columns" \
+    psql "$E" -X -c "CREATE TABLE u (a interval PRIMARY KEY);"
 
 # --- drop / missing / IF EXISTS / id never reused ---------------------------
 expect "DROP TABLE" "DROP TABLE" psql "$E" -X -c "DROP TABLE t;"
@@ -105,7 +108,10 @@ expect "CREATE INDEX backfills" "CREATE INDEX" psql "$E" -X -c "CREATE INDEX ite
 expect "duplicate index name" "already exists" psql "$E" -X -c "CREATE INDEX items_color ON items (color);"
 expect "IF NOT EXISTS is quiet (index)" "CREATE INDEX" psql "$E" -X -c "CREATE INDEX IF NOT EXISTS items_color ON items (color);"
 expect "second index on the column" "already indexed" psql "$E" -X -c "CREATE INDEX another ON items (color);"
-expect "UNIQUE index rejected" "UNIQUE" psql "$E" -X -c "CREATE UNIQUE INDEX u ON items (color);"
+expect "second index on the column, unique" "already indexed" \
+    psql "$E" -X -c "CREATE UNIQUE INDEX u ON items (color);"
+expect "index on the PK column" "already indexed" \
+    psql "$E" -X -c "CREATE INDEX i_id ON items (id);"
 expect "index on missing column" "column does not exist" psql "$E" -X -c "CREATE INDEX i2 ON items (nope);"
 expect "index on missing table" "table does not exist" psql "$E" -X -c "CREATE INDEX i3 ON nope (a);"
 
@@ -147,6 +153,58 @@ expect "DROP INDEX missing errors" "does not exist" psql "$E" -X -c "DROP INDEX 
 expect "DROP INDEX IF EXISTS quiet" "DROP INDEX" psql "$E" -X -c "DROP INDEX IF EXISTS items_color;"
 expect "SELECT after drop still answers" "(3 rows)" psql "$E" -X -c "SELECT id FROM items WHERE color = 'blue';"
 expect "re-CREATE freed index name" "CREATE INDEX" psql "$E" -X -c "CREATE INDEX items_color ON items (color);"
+
+# --- UNIQUE indexes: the column constraint, CREATE UNIQUE INDEX, DROP ------
+# A UNIQUE column gets its own index "<table>_<column>_key" with the
+# table; a user index built over a populated table enforces from the
+# reply on; a build over duplicates fails and frees its name and
+# column; a user unique index drops like any other, the PK's does not.
+expect "CREATE TABLE uq" "CREATE TABLE" psql "$E" -X \
+    -c "CREATE TABLE uq (id int PRIMARY KEY, email text, code int4 UNIQUE);"
+expect "UNIQUE column index name taken" "already exists" \
+    psql "$E" -X -c "CREATE TABLE uq_code_key (a int);"
+expect "INSERT uq rows" "INSERT 0 2" \
+    psql "$E" -X -c "INSERT INTO uq VALUES (1,'a@x',10),(2,'b@x',20);"
+expect "UNIQUE column enforced" "duplicate key" \
+    psql "$E" -X -c "INSERT INTO uq VALUES (3,'c@x',10);"
+expect "UNIQUE column routes equality" "(1 row)" \
+    psql "$E" -X -c "SELECT id FROM uq WHERE code = 20;"
+expect "CREATE UNIQUE INDEX over rows" "CREATE INDEX" \
+    psql "$E" -X -c "CREATE UNIQUE INDEX uq_email ON uq (email);"
+expect "built unique index enforced" "duplicate key" \
+    psql "$E" -X -c "INSERT INTO uq VALUES (3,'a@x',30);"
+expect "built unique index routes equality" "(1 row)" \
+    psql "$E" -X -c "SELECT id FROM uq WHERE email = 'b@x';"
+expect "two NULLs under a unique index" "INSERT 0 2" \
+    psql "$E" -X -c "INSERT INTO uq VALUES (4,NULL,40),(5,NULL,50);"
+expect "NULL into the PK column" "not-null" \
+    psql "$E" -X -c "INSERT INTO uq VALUES (NULL,'z@x',60);"
+expect "DROP a user unique index" "DROP INDEX" \
+    psql "$E" -X -c "DROP INDEX uq_email;"
+expect "dropped unique index no longer enforces" "INSERT 0 1" \
+    psql "$E" -X -c "INSERT INTO uq VALUES (6,'a@x',60);"
+expect "DROP the UNIQUE column's index" "DROP INDEX" \
+    psql "$E" -X -c "DROP INDEX uq_code_key;"
+expect "dropped column index no longer enforces" "INSERT 0 1" \
+    psql "$E" -X -c "INSERT INTO uq VALUES (7,'d@x',10);"
+expect "CREATE TABLE dup" "CREATE TABLE" \
+    psql "$E" -X -c "CREATE TABLE dup (id int PRIMARY KEY, v int4);"
+expect "INSERT duplicate values" "INSERT 0 3" \
+    psql "$E" -X -c "INSERT INTO dup VALUES (1,5),(2,5),(3,6);"
+expect "unique build over duplicates fails" "could not create unique index" \
+    psql "$E" -X -c "CREATE UNIQUE INDEX dup_v ON dup (v);"
+expect "failed build freed the name and column" "CREATE INDEX" \
+    psql "$E" -X -c "CREATE INDEX dup_v ON dup (v);"
+expect "the posting index answers" "(2 rows)" \
+    psql "$E" -X -c "SELECT id FROM dup WHERE v = 5;"
+expect "CREATE TABLE em" "CREATE TABLE" \
+    psql "$E" -X -c "CREATE TABLE em (a int4, b text);"
+expect "CREATE UNIQUE INDEX on an empty table" "CREATE INDEX" \
+    psql "$E" -X -c "CREATE UNIQUE INDEX em_a ON em (a);"
+expect "INSERT under the empty-built index" "INSERT 0 1" \
+    psql "$E" -X -c "INSERT INTO em VALUES (1,'x');"
+expect "empty-built index enforced" "duplicate key" \
+    psql "$E" -X -c "INSERT INTO em VALUES (1,'y');"
 
 # --- routing: prove indexed equality does NOT scan --------------------------
 # SI discriminator: a statement that RAN A SCAN poisons any later

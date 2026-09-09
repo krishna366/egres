@@ -15,7 +15,11 @@ const Table = sql.table.Table;
 
 const pkey_index_id: u32 = 17;
 const b_index_id: u32 = 18;
-const stream = sql.plan.Options{};
+/// The fixture's indexes are complete from ts 10; a snapshot at 50
+/// reads both.
+const read_ts: u64 = 50;
+const built_ts: u64 = 10;
+const stream = sql.plan.Options{ .read_ts = read_ts };
 
 const Fixture = struct {
     arena: std.heap.ArenaAllocator,
@@ -62,19 +66,18 @@ const Fixture = struct {
         indexes[0] = .{
             .index_table_id = pkey_index_id,
             .unique = true,
-            .valid = true,
+            .valid_ts = built_ts,
             .column = &columns[0],
         };
         indexes[1] = .{
             .index_table_id = b_index_id,
             .unique = false,
-            .valid = true,
+            .valid_ts = built_ts,
             .column = &columns[1],
         };
         return .{ .arena = arena, .tbl = .{
             .columns = columns,
             .indexes = indexes,
-            .primary_index = &indexes[0],
             .ps = ps,
             .version = 1,
             .arena = std.heap.ArenaAllocator.init(testing.allocator),
@@ -278,7 +281,7 @@ test "sql.plan: IS NULL reads a posting index, never a unique one" {
 test "sql.plan: a mid-backfill index is not read" {
     var fx = try Fixture.init();
     defer fx.deinit();
-    fx.tbl.indexes[1].valid = false;
+    fx.tbl.indexes[1].valid_ts = sql.catalog.IndexDef.building;
 
     var on_b = try fx.planFor("b = 2", stream);
     defer on_b.deinit();
@@ -288,6 +291,34 @@ test "sql.plan: a mid-backfill index is not read" {
     var either = try fx.planFor("a = 1 OR b = 2", stream);
     defer either.deinit();
     try expectScan(&either);
+}
+
+test "sql.plan: an index is read only by a snapshot at or after its build" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const older = sql.plan.Options{ .read_ts = built_ts - 1 };
+
+    // A snapshot older than the build cannot see the backfilled
+    // entries: it scans, whichever index it is.
+    var before = try fx.planFor("b = 2", older);
+    defer before.deinit();
+    try expectScan(&before);
+    var pk_before = try fx.planFor("a = 1", older);
+    defer pk_before.deinit();
+    try expectScan(&pk_before);
+
+    // An index made with its table (valid from 0) serves any snapshot.
+    fx.tbl.indexes[0].valid_ts = 0;
+    var pk_old = try fx.planFor("a = 1", older);
+    defer pk_old.deinit();
+    const k1 = try int4Key(a, 1);
+    try expectLookup(try bitmapOf(&pk_old), pkey_index_id, true, k1);
+
+    // Exactly at the build's ts the entries are visible.
+    var at = try fx.planFor("b = 2", .{ .read_ts = built_ts });
+    defer at.deinit();
+    try expectLookup(try bitmapOf(&at), b_index_id, false, try int4Key(a, 2));
 }
 
 test "sql.plan: the root materializes; keep_value and limit reach it" {
@@ -302,14 +333,17 @@ test "sql.plan: the root materializes; keep_value and limit reach it" {
     try testing.expect(src.* == .fetch);
     try testing.expect(src.fetch.keep_value);
 
-    var keys_only = try fx.planFor("c = 'x'", .{ .keep_value = false });
+    var keys_only = try fx.planFor("c = 'x'", .{
+        .read_ts = read_ts,
+        .keep_value = false,
+    });
     defer keys_only.deinit();
     try testing.expect(keys_only.root.* == .materialize);
     try testing.expect(!source(&keys_only).seq_scan.keep_value);
 
     // LIMIT sits on the root, under which the source is bounded — so a
     // locking statement gathers and locks only that many.
-    var capped = try fx.planFor("b = 2", .{ .limit = 5 });
+    var capped = try fx.planFor("b = 2", .{ .read_ts = read_ts, .limit = 5 });
     defer capped.deinit();
     try testing.expectEqual(@as(?usize, 5), capped.root.materialize.remaining);
     try testing.expect(source(&capped).* == .fetch);

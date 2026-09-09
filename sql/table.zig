@@ -79,8 +79,40 @@ pub const egid_column = Column{
 pub const Index = struct {
     index_table_id: u32,
     unique: bool,
-    valid: bool,
+    /// The timestamp from which the index is complete (catalog.IndexDef).
+    /// A statement reads the index only when its read_ts is at or above
+    /// it; a writer bumps its read_ts to it before probing.
+    valid_ts: u64,
     column: *const Column,
+
+    /// Whether the backfill is still running: no statement reads the
+    /// index, and no writer bumps to its `valid_ts`.
+    pub inline fn isBuilding(self: *const Index) bool {
+        return self.valid_ts == _catalog.IndexDef.building;
+    }
+
+    /// The index keys one cell contributes: none for NULL under a
+    /// unique index (NULLS DISTINCT), else exactly one — the cell's
+    /// memcomparable encoding; NULL under a non-unique index keys on
+    /// the tag_null byte. A slice rather than one key on purpose: a
+    /// later index kind (trigram, full text, a cell covering) returns
+    /// many from this same call, and every maintenance loop already
+    /// runs over the slice. Unencodable is unreachable: DDL refuses
+    /// interval columns for every index.
+    pub fn keys(
+        self: *const Index,
+        arloc: std.mem.Allocator,
+        cell: _value.Value,
+    ) error{OutOfMemory}![]const _value.String {
+        if (self.unique and cell == .null_value) return &.{};
+        const one = try arloc.alloc(_value.String, 1);
+        one[0] = _key.encodeIndexKey(arloc, cell, null) catch |err|
+            switch (err) {
+                error.Unencodable => unreachable,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        return one;
+    }
 };
 
 /// A user table as the SQL layer sees it: its live columns (logical schema)
@@ -91,11 +123,10 @@ pub const Index = struct {
 pub const Table = struct {
     /// The user columns — what SELECT * and positional INSERT walk.
     columns: []Column,
-    /// Every index of this table, columns resolved.
+    /// Every index of this table, columns resolved. The PRIMARY KEY's
+    /// is the unique one on the column with `pkey_position` set; DML
+    /// treats it like any other unique index.
     indexes: []Index,
-    /// The PRIMARY KEY's index — the one on the column with `pkey_position`
-    /// set — or null for a table without one.
-    primary_index: ?*const Index,
     ps: _schema.PhysicalSchema,
     version: u16,
     arena: std.heap.ArenaAllocator,
@@ -262,18 +293,14 @@ pub fn loadTableSchema(
         idx.* = .{
             .index_table_id = def.index_table_id,
             .unique = def.unique,
-            .valid = def.valid,
+            .valid_ts = def.valid_ts,
             .column = col,
         };
     }
-    const pkey: ?*const Index = for (indexes) |*idx| {
-        if (idx.column.pkey_position != null) break idx;
-    } else null;
 
     return .{
         .columns = columns,
         .indexes = indexes,
-        .primary_index = pkey,
         .ps = ps,
         .version = logical.current_version,
         .arena = arena,

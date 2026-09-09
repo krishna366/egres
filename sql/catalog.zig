@@ -167,8 +167,8 @@ pub fn decodeKey(k: []const u8) Error!Key {
 
 // -----------------------------------------------------------------------------
 // Index catalog (table 2): one row per index. Value = the index descriptor
-// (which base table, which column, unique?); key = (base_table_id,
-// index_table_id) big-endian.
+// (which base table, which column, unique?, valid from when?); key =
+// (base_table_id, index_table_id) big-endian.
 // -----------------------------------------------------------------------------
 
 /// The index catalog's columns, by stable column_id — also the cell order
@@ -178,12 +178,13 @@ pub const IndexField = enum(u32) {
     index_table_id = 2,
     column_id = 3,
     unique = 4,
-    valid = 5,
+    valid_ts = 5,
 };
 
 /// The fixed schema of the index catalog, compiled into the binary. ids are
-/// uint4, `unique`/`valid` are bools. Single-column today; a composite
-/// index will widen `column_id` into an ordered list cell.
+/// uint4, `unique` a bool, `valid_ts` a uint8 HLC timestamp. Single-column
+/// today; a composite index will widen `column_id` into an ordered list
+/// cell.
 pub const index_logical_schema: LogicalSchema = .{
     .current_version = 1,
     .columns = &.{
@@ -191,20 +192,33 @@ pub const index_logical_schema: LogicalSchema = .{
         .{ .column_id = @intFromEnum(IndexField.index_table_id), .name = "index_table_id", .ty = .uint4 },
         .{ .column_id = @intFromEnum(IndexField.column_id), .name = "column_id", .ty = .uint4 },
         .{ .column_id = @intFromEnum(IndexField.unique), .name = "unique", .ty = .bool_ },
-        .{ .column_id = @intFromEnum(IndexField.valid), .name = "valid", .ty = .bool_ },
+        .{
+            .column_id = @intFromEnum(IndexField.valid_ts),
+            .name = "valid_ts",
+            .ty = .uint8,
+        },
     },
 };
 
 /// A decoded index catalog row: one index of `base_table_id`, stored in its
-/// own tree (`index_table_id`), keyed on `column_id`'s value. `valid` is
-/// Postgres's indisvalid: false while CREATE INDEX's online backfill runs —
-/// DML maintains the index, reads skip it. Flipped true at install.
+/// own tree (`index_table_id`), keyed on `column_id`'s value. `valid_ts`
+/// is the timestamp from which the index is complete: a statement whose
+/// read_ts is below it does not read the index (its backfilled entries,
+/// installed at ts = valid_ts, would be invisible), and a writer's
+/// read_ts is bumped to it before a unique probe. `building` while the
+/// backfill runs; the backfill's snapshot ts once built; 0 for an index
+/// made with its table, which no row precedes.
 pub const IndexDef = struct {
     base_table_id: u32,
     index_table_id: u32,
     column_id: u32,
     unique: bool,
-    valid: bool = true,
+    valid_ts: u64 = 0,
+
+    /// The `valid_ts` of an index whose backfill has not finished: no
+    /// read_ts reaches it, so no statement reads the index, while every
+    /// writer maintains it.
+    pub const building: u64 = std.math.maxInt(u64);
 };
 
 /// Build the index catalog row cells (column_id order) for `def`. Pass
@@ -215,7 +229,7 @@ pub fn encodeIndex(def: IndexDef) [5]Value {
         .{ .uint4 = def.index_table_id },
         .{ .uint4 = def.column_id },
         .{ .bool_ = def.unique },
-        .{ .bool_ = def.valid },
+        .{ .uint8 = def.valid_ts },
     };
 }
 
@@ -223,14 +237,14 @@ pub fn encodeIndex(def: IndexDef) [5]Value {
 pub fn decodeIndex(r: *const Row) Error!IndexDef {
     if (r.len() != 5) return error.CorruptCatalogRow;
     if (r.at(0) != .uint4 or r.at(1) != .uint4 or
-        r.at(2) != .uint4 or r.at(3) != .bool_ or r.at(4) != .bool_)
+        r.at(2) != .uint4 or r.at(3) != .bool_ or r.at(4) != .uint8)
         return error.CorruptCatalogRow;
     return .{
         .base_table_id = r.at(0).uint4,
         .index_table_id = r.at(1).uint4,
         .column_id = r.at(2).uint4,
         .unique = r.at(3).bool_,
-        .valid = r.at(4).bool_,
+        .valid_ts = r.at(4).uint8,
     };
 }
 

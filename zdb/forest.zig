@@ -752,15 +752,35 @@ pub const Forest = struct {
         });
     }
 
-    /// Number of tables in `table_id`'s bottom level — CREATE INDEX's
-    /// post-install verification (applyBackfill skips, deterministically
-    /// on every node, when the bottom level was not empty).
-    pub fn bottomTableCount(self: *Forest, ns: u64, table_id: u32) !usize {
+    /// Whether every CREATE in `changes` is now a table of `table_id`'s
+    /// bottom level — CREATE INDEX's post-install verification.
+    /// applyBackfill skips, deterministically on every node, when the
+    /// bottom level was not empty; a table count cannot tell a skip
+    /// from an install (either way the level is non-empty after), so
+    /// the proposed sst ids are looked for by name.
+    pub fn bottomLevelHas(
+        self: *Forest,
+        ns: u64,
+        table_id: u32,
+        changes: []const _manifest.SSTableChange,
+    ) !bool {
+        // The proposed ids as a set (a few files), built before the
+        // tree lock; then one pass over the level counting the ones it
+        // holds. Ids are unique on both sides, so a full count means
+        // every file is present.
+        var wanted = try zroar.Bitmap.init(self.allocator);
+        defer wanted.deinit();
+        for (changes) |c| _ = try wanted.set(c.sst_id);
+
         const tree = try self.singleTree(ns, table_id);
         defer tree.release();
         const held = tree.mu.hold(.shared, @src());
         defer held.release();
-        return tree.levels[tree.levels.len - 1].tableCount(held);
+        var found: usize = 0;
+        for (tree.levels[tree.levels.len - 1].entries(held)) |e| {
+            if (wanted.contains(e.id)) found += 1;
+        }
+        return found == changes.len;
     }
 
     /// The ONE tree of an un-split table — backfill's addressing mode:
@@ -975,6 +995,15 @@ pub const Forest = struct {
         ///
         /// Must be at or above `global_min_read`, like any other read.
         read_ts: u64 = std.math.maxInt(u64),
+        /// Only what changed after this timestamp: versions at or below it
+        /// are skipped, so a key is emitted only when its newest visible
+        /// version is above it, and an SST whose every version is at or
+        /// below it (`TableIndex.max_version`) is not opened at all. The
+        /// default, 0, skips nothing. With `include_deleted`, a key deleted
+        /// after `min_ts` is emitted as its tombstone — the shape of a
+        /// "what changed since" pass (CREATE INDEX's merge of the rows
+        /// written during its backfill). Memtables are always opened.
+        min_ts: u64 = 0,
         /// I/O priority for the SST reads this scan issues (see vfs). `.p0` is
         /// the foreground/interactive class every current caller wants;
         /// background sweeps should pick a lower one so they queue behind
@@ -1254,7 +1283,13 @@ pub const Forest = struct {
                 // deinit is fine.) The txn's pending skiplist rides in as
                 // src 0 — the merge's equal-key tie-break.
                 const srcs = try self.forest.memtables.getIterators(a, self.opts.pending);
-                self.merge = try tree.openMerge(a, visit_range, self.opts.priority, srcs);
+                self.merge = try tree.openMerge(
+                    a,
+                    visit_range,
+                    self.opts.priority,
+                    self.opts.min_ts,
+                    srcs,
+                );
                 break :blk visit_range;
             };
 
@@ -1277,6 +1312,14 @@ pub const Forest = struct {
                 // key that is still live at read_ts; and before the
                 // version cap, so invisible versions don't consume it.
                 if (item.key.timestamp > self.opts.read_ts) {
+                    try merge.next();
+                    continue;
+                }
+                // Unchanged since min_ts, as far as this scan is concerned:
+                // versions arrive newest first, so a key whose newest
+                // visible version fails this never starts, and one that
+                // changed emits only what changed.
+                if (item.key.timestamp <= self.opts.min_ts) {
                     try merge.next();
                     continue;
                 }

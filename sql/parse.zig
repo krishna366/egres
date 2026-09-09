@@ -21,11 +21,14 @@ const _value = @import("value.zig");
 
 const String = _value.String;
 
-/// One parsed `name type [PRIMARY KEY]` column. `name` is borrowed.
+/// One parsed `name type [PRIMARY KEY | UNIQUE]` column. `name` is
+/// borrowed. A PRIMARY KEY column is unique too, but `unique` marks
+/// only a bare UNIQUE constraint: the PK gets its own index.
 pub const ColumnDef = struct {
     name: []const u8,
     ty: _value.Type,
     pkey: bool = false,
+    unique: bool = false,
 };
 
 pub const CreateTable = struct {
@@ -43,6 +46,7 @@ pub const CreateIndex = struct {
     name: ?String, // borrowed; null = derive "{table}_{column}_idx"
     table: String, // borrowed
     column: String, // borrowed
+    unique: bool = false,
     if_not_exists: bool = false,
 };
 
@@ -417,8 +421,8 @@ fn fromValue(comptime T: type, alloc: std.mem.Allocator, body: std.json.Value) p
 }
 
 /// CREATE TABLE. Only bare `name type` columns with an optional
-/// single-column PRIMARY KEY parse; any other constraint (NOT NULL, UNIQUE,
-/// FK, DEFAULT, table-level) is a clean `.invalid`.
+/// single-column PRIMARY KEY or UNIQUE parse; any other constraint (NOT
+/// NULL, FK, DEFAULT, table-level) is a clean `.invalid`.
 fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
     const cs = try fromValue(CreateStmtJson, alloc, body) orelse return .unsupported;
 
@@ -443,18 +447,32 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
             return invalidFmt(alloc, "unsupported type \"{s}\"", .{tyname});
 
         var pkey = false;
+        var unique = false;
         for (cd.constraints) |con| {
-            if (!std.mem.eql(u8, con.Constraint.contype, "CONSTR_PRIMARY"))
-                return invalid("only PRIMARY KEY column constraints are supported");
-            pkey = true;
+            const contype = con.Constraint.contype;
+            if (std.mem.eql(u8, contype, "CONSTR_PRIMARY")) {
+                pkey = true;
+            } else if (std.mem.eql(u8, contype, "CONSTR_UNIQUE")) {
+                unique = true;
+            } else {
+                return invalid(
+                    "only PRIMARY KEY and UNIQUE column constraints are supported",
+                );
+            }
         }
         if (pkey) {
             if (pkey_seen)
                 return invalid("multiple PRIMARY KEY columns are not supported");
             pkey_seen = true;
+            unique = false; // the PK index already enforces it
         }
 
-        try columns.append(alloc, .{ .name = cd.colname, .ty = ty, .pkey = pkey });
+        try columns.append(alloc, .{
+            .name = cd.colname,
+            .ty = ty,
+            .pkey = pkey,
+            .unique = unique,
+        });
     }
 
     return .{ .create_table = .{
@@ -497,8 +515,8 @@ fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseEr
     } };
 }
 
-/// CREATE INDEX. v1: a single plain column, non-unique, whole-table,
-/// default btree — every narrowing (UNIQUE, CONCURRENTLY, partial,
+/// CREATE [UNIQUE] INDEX. v1: a single plain column, whole-table,
+/// default btree — every narrowing (CONCURRENTLY, partial,
 /// multi-column, expression, INCLUDE, TABLESPACE, other access
 /// methods, DESC / NULLS FIRST ordering) is a clean `.invalid`.
 /// ASC / NULLS LAST are accepted: they are this index's semantics
@@ -506,7 +524,6 @@ fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseEr
 fn parseCreateIndex(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
     const is = try fromValue(IndexStmtJson, alloc, body) orelse return .unsupported;
 
-    if (is.unique) return invalid("UNIQUE indexes are not supported");
     if (is.concurrent)
         return invalid("CREATE INDEX CONCURRENTLY is not supported");
     if (is.whereClause != null)
@@ -534,6 +551,7 @@ fn parseCreateIndex(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
         .name = if (is.idxname.len > 0) is.idxname else null,
         .table = is.relation.relname,
         .column = elem.name,
+        .unique = is.unique,
         .if_not_exists = is.if_not_exists,
     } };
 }

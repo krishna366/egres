@@ -40,7 +40,6 @@ const Fixture = struct {
         return .{ .arloc = arloc, .tbl = .{
             .columns = columns,
             .indexes = try arloc.alloc(sql.table.Index, 0),
-            .primary_index = null,
             .ps = ps,
             .version = 1,
             .arena = std.heap.ArenaAllocator.init(arloc),

@@ -17,8 +17,10 @@
 //!         per-database txn machinery, and the per-connection Handler
 //!         (session state, statement dispatch, DML restart driver,
 //!         transaction lifetime).
-//! ddl:    CREATE/DROP DATABASE, TABLE, INDEX — manifest and catalog
-//!         choreography, including CREATE INDEX's online backfill.
+//! ddl:    CREATE/DROP DATABASE and TABLE — manifest and catalog
+//!         choreography.
+//! index_ddl: CREATE/DROP INDEX, with CREATE INDEX's online backfill
+//!         for posting and unique indexes.
 //! dml:    INSERT / SELECT / DELETE / UPDATE statement bodies.
 //! pred:   Pred — a WHERE bound to its table (columns, typed literals)
 //!         and its SQL three-valued evaluation per row.
@@ -43,6 +45,7 @@ pub const txn = @import("sql/txn.zig");
 pub const oracle = @import("sql/oracle.zig");
 pub const server = @import("sql/server.zig");
 pub const ddl = @import("sql/ddl.zig");
+pub const index_ddl = @import("sql/index_ddl.zig");
 pub const dml = @import("sql/dml.zig");
 pub const exec = @import("sql/exec.zig");
 pub const plan = @import("sql/plan.zig");

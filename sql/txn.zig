@@ -224,13 +224,22 @@ pub const Txn = struct {
             .primary = primary,
         }).identityHash();
         if (!try self.lockKey(h, .exclusive)) return;
+        return self.bumpTo(self.oracle.commitTs(h));
+    }
 
-        const commit_ts = self.oracle.commitTs(h);
-        if (commit_ts <= self.read_ts) return;
-
+    /// Advance read_ts to `ts` so the statement can see state applied
+    /// at that ts (a row's newest version under a fresh lock, an index
+    /// completed at `Index.valid_ts`). No-op when already at or above
+    /// it. Otherwise legal only if everything already read stays valid
+    /// at the new snapshot — prior statements' reads are checked as
+    /// lockRow describes, Conflict if any moved — and then the current
+    /// statement is re-run from nothing: Restart. Needs no lock: `ts`
+    /// names locally applied state, which cannot regress.
+    pub fn bumpTo(self: *Txn, ts: u64) error{ Conflict, Restart }!void {
+        if (ts <= self.read_ts) return;
         if (self.prev.aboveReadTs(self.oracle, self.read_ts))
             return error.Conflict;
-        self.read_ts = commit_ts;
+        self.read_ts = ts;
         return error.Restart;
     }
 

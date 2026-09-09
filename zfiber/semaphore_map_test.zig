@@ -39,6 +39,32 @@ test "SemaphoreMap: uncontended acquire/release reclaims the entry" {
     try std.testing.expectEqual(2, sm.pool.items.len);
 }
 
+test "SemaphoreMap: tryRelease releases a held key, else is a no-op" {
+    var sm = try SemaphoreMap.init(gpa);
+    defer sm.deinit();
+
+    // Not held at all, and held by someone else: no-ops.
+    try std.testing.expect(!sm.tryRelease(1, 1));
+    try std.testing.expect(try sm.acquire(1, 2, .shared));
+    try std.testing.expect(!sm.tryRelease(1, 1));
+    try std.testing.expectEqual(1, sm.entries.count());
+
+    // Held: released, and the entry drains like a plain release.
+    try std.testing.expect(sm.tryRelease(1, 2));
+    try std.testing.expectEqual(0, sm.entries.count());
+    try std.testing.expect(!sm.tryRelease(1, 2));
+
+    // The barrier pattern: take, drop, retake, then one deferred
+    // tryRelease covers both the retaken and the never-retaken case.
+    try std.testing.expect(try sm.acquire(5, 3, .exclusive));
+    sm.release(5, 3);
+    try std.testing.expect(try sm.acquire(5, 3, .exclusive));
+    try std.testing.expect(!try sm.acquire(5, 3, .exclusive)); // re-entrant
+    try std.testing.expect(sm.tryRelease(5, 3));
+    try std.testing.expect(!sm.tryRelease(5, 3));
+    try std.testing.expectEqual(0, sm.entries.count());
+}
+
 test "SemaphoreMap: re-entrant acquire by the holder is a no-op" {
     var sm = try SemaphoreMap.init(gpa);
     defer sm.deinit();

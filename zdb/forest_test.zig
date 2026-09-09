@@ -1401,6 +1401,104 @@ test "scan: read_ts reports the world as of that timestamp" {
     try std.testing.expectEqualStrings("b1", g.value);
 }
 
+test "scan: min_ts emits only what changed after it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    const Lease = struct {
+        fn call(_: *anyopaque, _: u64) anyerror!void {}
+    };
+    var lease_ctx: u8 = 0;
+    f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
+    try f.newMemtable(1, 1);
+
+    // Three SST generations plus a memtable: the base at @10 (an SST
+    // whose max_version is 10, below every min_ts used here), the
+    // changes at @20 (a rewritten, b deleted, d inserted), and e at
+    // @30 still in the memtable.
+    const Put = struct {
+        p: []const u8,
+        ts: u64,
+        v: []const u8,
+        m: zdb.kv.Meta,
+    };
+    const put = struct {
+        fn one(forest: *Forest, r: Put) !void {
+            try forest.put(&[_]zdb.kv.Item{.{
+                .key = .{
+                    .namespace = 1,
+                    .table_id = 0,
+                    .primary = r.p,
+                    .timestamp = r.ts,
+                },
+                .value = r.v,
+                .meta = r.m,
+            }});
+        }
+    }.one;
+    try put(f, .{ .p = "a", .ts = 10, .v = "a1", .m = .{} });
+    try put(f, .{ .p = "b", .ts = 10, .v = "b1", .m = .{} });
+    try put(f, .{ .p = "c", .ts = 10, .v = "c1", .m = .{} });
+    try roar.flush(f, alloc, 2);
+    try put(f, .{ .p = "a", .ts = 20, .v = "a2", .m = .{} });
+    try put(f, .{ .p = "b", .ts = 20, .v = "", .m = .{ .kind = .deleted } });
+    try put(f, .{ .p = "d", .ts = 20, .v = "d1", .m = .{} });
+    try roar.flush(f, alloc, 3);
+    try put(f, .{ .p = "e", .ts = 30, .v = "e1", .m = .{} });
+
+    // Changed after 10: a (rewritten), b (its tombstone, with
+    // include_deleted), d and e (inserted). c is unchanged and absent.
+    // a's @10 version is not emitted even when asked for more
+    // versions: it is at or below min_ts, and its SST is not opened.
+    {
+        var col = ScanCollector{ .alloc = alloc };
+        defer col.deinit();
+        const n = try runScan(alloc, f, .{
+            .min_ts = 10,
+            .include_deleted = true,
+            .num_versions = 3,
+        }, &col);
+        try std.testing.expectEqual(@as(u64, 4), n);
+        try std.testing.expectEqualStrings("a", col.got.items[0].key.primary);
+        try std.testing.expectEqualStrings("a2", col.got.items[0].value);
+        try std.testing.expectEqualStrings("b", col.got.items[1].key.primary);
+        try std.testing.expect(col.got.items[1].meta.isDeleted());
+        try std.testing.expectEqualStrings("d1", col.got.items[2].value);
+        try std.testing.expectEqualStrings("e1", col.got.items[3].value);
+    }
+    // Without include_deleted the deletion is a change with nothing
+    // to show, as for any scan.
+    {
+        var col = ScanCollector{ .alloc = alloc };
+        defer col.deinit();
+        const n = try runScan(alloc, f, .{ .min_ts = 10 }, &col);
+        try std.testing.expectEqual(@as(u64, 3), n);
+        try std.testing.expectEqualStrings("a2", col.got.items[0].value);
+        try std.testing.expectEqualStrings("d1", col.got.items[1].value);
+        try std.testing.expectEqualStrings("e1", col.got.items[2].value);
+    }
+    // min_ts and read_ts bound the window from both sides.
+    {
+        var col = ScanCollector{ .alloc = alloc };
+        defer col.deinit();
+        const n = try runScan(alloc, f, .{ .min_ts = 20, .read_ts = 25 }, &col);
+        try std.testing.expectEqual(@as(u64, 0), n);
+    }
+    {
+        var col = ScanCollector{ .alloc = alloc };
+        defer col.deinit();
+        const n = try runScan(alloc, f, .{ .min_ts = 20 }, &col);
+        try std.testing.expectEqual(@as(u64, 1), n);
+        try std.testing.expectEqualStrings("e1", col.got.items[0].value);
+    }
+}
+
 test "scan: versions above read_ts do not consume num_versions" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2219,7 +2317,7 @@ test "forest: index backfill installs bottom states below live deltas" {
     const tree = f.getTree(1, zdb.kv.makeTreeId(0, 0)).?;
     defer tree.release();
     try tree.applyBackfill(changes.items);
-    try std.testing.expectEqual(1, try f.bottomTableCount(1, 0));
+    try std.testing.expect(try f.bottomLevelHas(1, 0, changes.items));
 
     // Post-snapshot DML: a delta strictly above the states.
     try roar.putDelta(f, alloc, "blue", 600, &.{5}, &.{});
@@ -2237,6 +2335,9 @@ test "forest: index backfill installs bottom states below live deltas" {
     var again = try f.buildBottomTable(alloc, 1, 0, &items);
     defer again.deinit(alloc);
     try tree.applyBackfill(again.items);
-    try std.testing.expectEqual(1, try f.bottomTableCount(1, 0));
+    // The first install's files are there, the second's are not —
+    // which a table count could not tell apart.
+    try std.testing.expect(try f.bottomLevelHas(1, 0, changes.items));
+    try std.testing.expect(!try f.bottomLevelHas(1, 0, again.items));
     try roar.expectBitmap(f, alloc, "blue", 700, &.{ 1, 3, 5 });
 }

@@ -1,9 +1,10 @@
 //! The four DML statement bodies — INSERT, SELECT, DELETE, UPDATE.
 //! Each resolves its table and WHERE, plans the read (plan.zig) and
-//! runs it (exec.zig) for the rows it acts on, maintains the PK index
-//! entry and any posting deltas, and buffers the result into the
-//! statement's txn. The restart loop that re-runs these on a read_ts
-//! bump lives in server.runDml.
+//! runs it (exec.zig) for the rows it acts on, maintains every index
+//! (one path for unique entries and postings — see the index
+//! maintenance section), and buffers the result into the statement's
+//! txn. The restart loop that re-runs these on a read_ts bump lives
+//! in server.runDml.
 //!
 //! Free functions over `*Handler` — see the note in ddl.zig.
 
@@ -27,6 +28,7 @@ const _server = @import("server.zig");
 
 const ExecCtx = _exec.ExecCtx;
 const Handler = _server.Handler;
+const PostingOp = _txn.Txn.PostingOp;
 const Pred = _pred.Pred;
 const SetNode = _expr.SetNode;
 const String = _value.String;
@@ -55,6 +57,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         log.err("insert into '{s}': load schema: {s}", .{ ins.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
+    if (!try bumpToIndexes(state, tx, tbl)) return;
 
     // The column each VALUES position writes (its cell in `values` is
     // Column.pos). Positional insert is the live columns themselves;
@@ -81,30 +84,15 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(eng.allocator);
 
-    // One VALUES row, fully derived in Phase 0 — parse + marshal +
-    // encode every key BEFORE any lock or write: a Restart re-runs
-    // the whole statement, so nothing may be buffered until every
-    // PK lock is held (§Phase 1). `values` is reused per row, so
-    // anything derived from a row's cells is captured here.
-    const Row = struct {
-        bytes: String = "", // marshaled row value
-        pkey: String = "", // PK index key, when t.pkey != null
-        /// Per posting index (same order as `posting_idx`): the
-        /// key this row lands under. Always present — NULL cells
-        /// key on the NULL tag byte, and unencodable column types
-        /// (interval) never carry an index (rejected at CREATE
-        /// INDEX).
-        bitmap_keys: []String = &.{},
-
-        fn lessByPkey(rows: []@This(), x: usize, y: usize) bool {
-            return std.mem.lessThan(u8, rows[x].pkey, rows[y].pkey);
-        }
-    };
+    // Phase 1: every VALUES row parsed, marshalled and its index keys
+    // collected BEFORE any lock or write — a Restart re-runs the whole
+    // statement, so nothing may be buffered until every key lock is
+    // held. `values` is reused per row, so anything derived from a
+    // row's cells is captured here.
     const num_rows = ins.rows.len;
-    const bitmap_idxs = try bitmapIndexes(arloc, tbl);
-    const rows = try arloc.alloc(Row, num_rows);
-    for (ins.rows, rows) |row_lits, *prow| {
-        prow.* = .{};
+    const row_bytes = try arloc.alloc(String, num_rows);
+    var keys: std.ArrayList(IndexKey) = .empty;
+    for (ins.rows, row_bytes, 0..) |row_lits, *bytes, ri| {
         if (row_lits.len != target_cols.len)
             return replyErrorCode(state, pgwire.sqlstate.syntax_error, "INSERT has the wrong number of values");
 
@@ -116,94 +104,42 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
                 return;
         }
 
-        if (tbl.primary_index) |pk| {
-            const val = values[pk.column.pos];
-            if (val == .null_value)
-                return replyErrorCode(
-                    state,
-                    pgwire.sqlstate.not_null_violation,
-                    "null value in primary key column violates not-null constraint",
-                );
-            prow.pkey = _key.encodeIndexKey(arloc, val, null) catch |err|
-                switch (err) {
-                    error.OutOfMemory => return err,
-                    error.Unencodable => return replyErrorCode(
-                        state,
-                        pgwire.sqlstate.feature_not_supported,
-                        "PRIMARY KEY on this column type is not supported",
-                    ),
-                };
-        }
-        if (bitmap_idxs.len > 0) {
-            prow.bitmap_keys = try arloc.alloc(String, bitmap_idxs.len);
-            for (bitmap_idxs, prow.bitmap_keys) |ix, *bm_key| {
-                bm_key.* = try postingKey(arloc, values[ix.column.pos]);
-            }
+        for (tbl.indexes) |*idx| {
+            const cell = values[idx.column.pos];
+            if (cell == .null_value and idx.column.pkey_position != null)
+                return replyPkeyNull(state);
+            // A building index gets no entries from DML: nothing reads
+            // it yet, and its build merges in every row written
+            // meanwhile (index_ddl.zig).
+            if (idx.isBuilding()) continue;
+            try collectKeys(arloc, &keys, idx, cell, ri, .add);
         }
         // marshalRow reuses `buf`; dupe out before the next row clobbers it.
-        const bytes = try _row.marshalRow(eng.allocator, &tbl.ps, values, &buf);
-        prow.bytes = try arloc.dupe(u8, bytes);
+        const ps = &tbl.ps;
+        const marshalled = try _row.marshalRow(eng.allocator, ps, values, &buf);
+        bytes.* = try arloc.dupe(u8, marshalled);
     }
 
-    // Phase 1 (PK tables): reject duplicates, then lock every PK index
-    // key — all before any write. Sorted order gives deadlock-free
-    // multi-row locking AND an adjacency check for an in-statement
-    // duplicate. lockRow may Restart (bump) / Conflict / Deadlock; on
-    // Restart the driver re-runs from Phase 0 with nothing buffered.
-    if (tbl.primary_index) |pk| {
-        const row_order = try arloc.alloc(usize, num_rows);
-        for (row_order, 0..) |*o, j| o.* = j;
-        std.mem.sort(usize, row_order, rows, Row.lessByPkey);
+    if (!try lockIndexKeys(state, tx, keys.items)) return;
 
-        for (1..num_rows) |j| {
-            if (std.mem.eql(u8, rows[row_order[j - 1]].pkey, rows[row_order[j]].pkey))
-                return replyErrorCode(state, pgwire.sqlstate.unique_violation, "duplicate key value violates unique constraint");
-        }
-        for (row_order) |j| tx.lockRow(pk.index_table_id, rows[j].pkey) catch |err|
-            return replyLockErr(state, err);
-        // Post-lock, read_ts covers the key's newest commit: a live
-        // index entry means the PK value already exists.
-        for (row_order) |j| {
-            const found = tx.lookup(.{
-                .namespace = ns,
-                .table_id = pk.index_table_id,
-                .primary = rows[j].pkey,
-                .timestamp = tx.read_ts,
-            }) catch |err| {
-                log.err("insert into '{s}': pk probe: {s}", .{ ins.table, @errorName(err) });
-                return replyError(state, "insert failed");
-            };
-            if (found) |f| {
-                f.release();
-                return replyErrorCode(state, pgwire.sqlstate.unique_violation, "duplicate key value violates unique constraint");
-            }
-        }
-    }
-
-    // Phase 2: every lock is held — allocate egids and buffer each row
-    // and its index entries. No Restart can occur here (puts don't
+    // Phase 2: every lock is held — allocate egids and buffer each row,
+    // then the index entries. No Restart can occur here (puts don't
     // bump). The whole VALUES list commits atomically as one .data
     // entry; an implicit txn waits for apply so an immediate SELECT
     // on this session sees the rows.
-    for (rows) |prow| {
-        const egid = self.srv.allocEgid(ns, table_id) catch |err| switch (err) {
+    const egids = try arloc.alloc(u64, num_rows);
+    for (row_bytes, egids) |bytes, *egid| {
+        egid.* = self.srv.allocEgid(ns, table_id) catch |err| switch (err) {
             error.NotLeader => return replyError(state, "not the leader"),
             else => {
                 log.err("insert into '{s}': alloc egid: {s}", .{ ins.table, @errorName(err) });
                 return replyError(state, "row id allocation failed");
             },
         };
-        const ekey = _key.encodeEgid(egid);
-        try tx.put(table_id, &ekey, prow.bytes, .{});
-        // The index entry's value is the row key: the same 8 BE bytes.
-        if (tbl.primary_index) |pk|
-            try tx.put(pk.index_table_id, prow.pkey, &ekey, .{});
-        // Non-unique indexes: commuting posting deltas, NO locks —
-        // the row lock (here, a fresh egid) serializes add/remove
-        // of one egid (docs/transactions.md, lock classes).
-        for (bitmap_idxs, prow.bitmap_keys) |ix, posting_key|
-            try tx.putPosting(ix.index_table_id, posting_key, egid, .add);
+        const ekey = _key.encodeEgid(egid.*);
+        try tx.put(table_id, &ekey, bytes, .{});
     }
+    if (!try applyIndexKeys(state, tx, keys.items, egids)) return;
 
     if (tx.implicit) {
         if (!try self.commitOrReply(state, arloc, tx, "insert", ins.table)) return;
@@ -265,6 +201,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // restarted), so the rows it then serves are the newest versions,
     // frozen by our locks.
     var plan = (try planFor(state, arloc, tbl, sel.where, .{
+        .read_ts = tx.read_ts,
         .limit = sel.limit,
     })) orelse return;
     defer plan.deinit();
@@ -320,16 +257,17 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
         logDeleteErr(del.table, "load schema", err);
         return replyError(state, "failed to load table schema");
     };
+    if (!try bumpToIndexes(state, tx, tbl)) return;
 
     // Plan the WHERE: an egid or indexed term drives point reads,
     // anything else scans; no WHERE → tombstone every live row.
     // Materialize gathers the matches and locks every one; then they
     // are tombstoned from the gathered rows.
-    const posting_idx = try bitmapIndexes(arloc, tbl);
     var plan = (try planFor(state, arloc, tbl, del.where, .{
+        .read_ts = tx.read_ts,
         // Indexed tables keep the old bytes so every index entry —
-        // the PK's (PK value → egid) and each posting's remove —
-        // can be derived from the row being tombstoned.
+        // a unique key's tombstone, a posting's remove — can be
+        // derived from the row being tombstoned.
         .keep_value = tbl.indexes.len > 0,
     })) orelse return;
     defer plan.deinit();
@@ -346,51 +284,27 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     const rows = mat.gatherAndLockRows(&ctx, batch) catch |err|
         return replyRunErr(state, "delete from", del.table, err);
 
-    // Lock and tombstone each gathered row's PK index entry BEFORE the
-    // row tombstones: the index-key lock serializes against a concurrent
-    // re-insert of the same key (whose fresh entry a late tombstone would
-    // otherwise shadow). Locking may Restart — safe, nothing buffered yet.
-    if (tbl.primary_index) |pk| {
-        const index_keys = try arloc.alloc([]const u8, rows.len);
-
-        for (rows, index_keys) |item, *ik| {
-            const pkv = tbl.parseCol(item, pk.column);
-            ik.* = _key.encodeIndexKey(arloc, pkv, null) catch |err|
-                switch (err) {
-                    error.OutOfMemory => return err,
-                    error.Unencodable => {
-                        logDeleteErr(del.table, "encode pk", err);
-                        return replyError(state, "delete failed");
-                    },
-                };
-        }
-        // The item↔key pairing is not needed past this point, so sort the
-        // keys themselves (lock order = the deadlock-avoidance order).
-        std.mem.sort([]const u8, index_keys, {}, lessThanBytes);
-        for (index_keys) |ik| {
-            tx.lockRow(pk.index_table_id, ik) catch |err|
-                return replyLockErr(state, err);
-        }
-        for (index_keys) |ik|
-            try tx.put(pk.index_table_id, ik, "", .{ .kind = .deleted });
-    }
-
-    // Non-unique indexes: remove each row's egid from its postings
-    // — commuting deltas, NO locks (docs/transactions.md, lock
-    // classes). All locking is done (gatherAndLockRows' row locks, the PK
-    // block above), so no Restart can strand these.
-    for (rows) |item| {
-        const egid = _key.decodeEgid(item.key.primary).?;
-        for (posting_idx) |ix| {
-            const cell = tbl.parseCol(item, ix.column);
-            const old_key = try postingKey(arloc, cell);
-            try tx.putPosting(ix.index_table_id, old_key, egid, .remove);
+    // Every index entry of every gathered row is removed: collect
+    // them from the pre-images, lock the unique keys (a unique key's
+    // lock serializes against a concurrent re-insert of the same
+    // value, whose fresh entry a late tombstone would otherwise
+    // shadow; locking may Restart — safe, nothing buffered yet), then
+    // write them, then the row tombstones. Past gatherAndLockRows'
+    // locks no candidate committed above read_ts — the gathered rows
+    // are the newest versions, frozen by our locks, so they are
+    // tombstoned directly with no re-read.
+    var keys: std.ArrayList(IndexKey) = .empty;
+    const egids = try arloc.alloc(u64, rows.len);
+    for (rows, egids, 0..) |item, *egid, ri| {
+        egid.* = _key.decodeEgid(item.key.primary).?;
+        for (tbl.indexes) |*idx| {
+            if (idx.isBuilding()) continue; // see insert
+            const cell = tbl.parseCol(item, idx.column);
+            try collectKeys(arloc, &keys, idx, cell, ri, .remove);
         }
     }
-
-    // Past gatherAndLockRows' locks no candidate committed above read_ts —
-    // the gathered rows are the newest versions, frozen by our locks,
-    // so they are tombstoned directly with no re-read.
+    if (!try lockIndexKeys(state, tx, keys.items)) return;
+    if (!try applyIndexKeys(state, tx, keys.items, egids)) return;
     for (rows) |item|
         try tx.put(table_id, item.key.primary, "", .{ .kind = .deleted });
     const n = rows.len;
@@ -422,14 +336,14 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
-    const posting_idx = try bitmapIndexes(arloc, tbl);
+    if (!try bumpToIndexes(state, tx, tbl)) return;
 
     // One SET clause, bound: the expression, its target column, the
-    // column's non-unique index if it has one (at most one per
+    // column's index if it has one (of either kind; at most one per
     // column), and the value computed for the row in hand. A changed
-    // value on an indexed column moves the row's egid between
-    // postings, the old key read out of the pre-image, the new one
-    // per row (`col = col + 1`). Parse rejects duplicate SET columns.
+    // value on an indexed column moves the row's entry, the old key
+    // read out of the pre-image, the new one per row (`col = col +
+    // 1`). Parse rejects duplicate SET columns.
     const Set = struct {
         node: *const SetNode,
         target: *const _table.Column,
@@ -450,18 +364,11 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
                 pgwire.sqlstate.feature_not_supported,
                 "egid cannot be updated",
             );
-        // A changed PK would move the row's index entry; not supported
-        // this arc (the index stays valid only while the key is fixed).
-        if (col.pkey_position != null)
-            return replyErrorCode(
-                state,
-                pgwire.sqlstate.feature_not_supported,
-                "PRIMARY KEY column cannot be updated",
-            );
         const node = try _expr.bind(state, arloc, tbl, col, clause.value);
         var index: ?*const _table.Index = null;
-        for (posting_idx) |ix| {
-            if (ix.column == col) index = ix;
+        for (tbl.indexes) |*idx| {
+            if (idx.isBuilding()) continue; // see insert
+            if (idx.column == col) index = idx;
         }
         set.* = .{ .node = node orelse return, .target = col, .index = index };
     }
@@ -469,10 +376,11 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // Plan the WHERE: an egid or indexed term drives point reads,
     // anything else scans; no WHERE → rewrite every live row.
     // Materialize gathers each match's PRE-image and locks every
-    // one; the rewrite (and any posting moves, whose old keys come
+    // one; the rewrite (and any index moves, whose old keys come
     // from that pre-image) happens post-lock.
-    var plan = (try planFor(state, arloc, tbl, up.where, .{})) orelse
-        return;
+    var plan = (try planFor(state, arloc, tbl, up.where, .{
+        .read_ts = tx.read_ts,
+    })) orelse return;
     defer plan.deinit();
 
     var ctx = ExecCtx{
@@ -488,41 +396,60 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         return replyRunErr(state, "update", up.table, err);
     // Past gatherAndLockRows' locks no candidate committed above read_ts —
     // the gathered pre-images are the newest versions, frozen by our
-    // locks. Per row: evaluate every SET against the pre-image (so
-    // `SET a = b, b = a` swaps), move the egid between postings where
-    // an indexed column changed (equal keys move nothing — commuting
-    // deltas, NO locks per docs/transactions.md; all locking is done,
-    // so no Restart can strand these), then overlay the values on the
-    // decoded pre-image, marshal, and buffer the row. An eval error
-    // here ends the statement with the buffered puts discarded
-    // (endImplicit / the failed block).
+    // locks. Per row, before any key lock: evaluate every SET against
+    // the pre-image (so `SET a = b, b = a` swaps); on an indexed
+    // column diff the pre-image's keys against the new value's — keys
+    // only in the old set are removed, only in the new set added, the
+    // rest untouched; then overlay the values on the decoded
+    // pre-image and marshal the post-image. An eval error here ends
+    // the statement before any key is locked. Then the unique keys
+    // are locked, the index entries written, and the rows put.
+    var keys: std.ArrayList(IndexKey) = .empty;
+    const egids = try arloc.alloc(u64, rows.len);
+    const rewritten = try arloc.alloc(String, rows.len);
     var row: _value.Row = .{};
-    // Reused across items: marshalRow resets it, and tx.put
-    // copies the bytes into the txn arena before returning.
-    var rbuf: std.ArrayList(u8) = .empty;
-    for (rows) |item| {
-        const egid = _key.decodeEgid(item.key.primary).?;
+    var rbuf: std.ArrayList(u8) = .empty; // reused: marshalRow resets it
+    for (rows, egids, rewritten, 0..) |item, *egid, *bytes, ri| {
+        egid.* = _key.decodeEgid(item.key.primary).?;
         for (sets) |*set| {
             set.val = set.node.eval(arloc, tbl, item, set.target) catch |err|
                 return replyEvalErr(state, err);
-            const ix = set.index orelse continue;
-            const old_cell = tbl.parseCol(item, ix.column);
-            const old_key = try postingKey(arloc, old_cell);
-            const new_key = try postingKey(arloc, set.val);
-            // If old_key and new_key match, there's no change. Skip.
-            if (std.mem.eql(u8, old_key, new_key)) continue;
-
-            try tx.putPosting(ix.index_table_id, old_key, egid, .remove);
-            try tx.putPosting(ix.index_table_id, new_key, egid, .add);
+            if (set.val == .null_value and set.target.pkey_position != null)
+                return replyPkeyNull(state);
+            const idx = set.index orelse continue;
+            const old = try idx.keys(arloc, tbl.parseCol(item, idx.column));
+            const new = try idx.keys(arloc, set.val);
+            for (old) |key| {
+                if (containsKey(new, key)) continue;
+                try keys.append(arloc, .{
+                    .idx = idx,
+                    .key = key,
+                    .row = ri,
+                    .op = .remove,
+                });
+            }
+            for (new) |key| {
+                if (containsKey(old, key)) continue;
+                try keys.append(arloc, .{
+                    .idx = idx,
+                    .key = key,
+                    .row = ri,
+                    .op = .add,
+                });
+            }
         }
         // The decoded cells borrow item.value, which the arena keeps
         // alive through the marshal.
         const ps = &tbl.ps;
         try _row.unmarshalRow(arloc, ps, item.value, &.{}, &row);
         for (sets) |set| row.set(set.target.pos, set.val);
-        const rewritten = try _row.marshalRow(arloc, ps, row.cells(), &rbuf);
-        try tx.put(table_id, item.key.primary, rewritten, .{});
+        const marshalled = try _row.marshalRow(arloc, ps, row.cells(), &rbuf);
+        bytes.* = try arloc.dupe(u8, marshalled);
     }
+    if (!try lockIndexKeys(state, tx, keys.items)) return;
+    if (!try applyIndexKeys(state, tx, keys.items, egids)) return;
+    for (rows, rewritten) |item, bytes|
+        try tx.put(table_id, item.key.primary, bytes, .{});
     const n = rows.len;
 
     if (tx.implicit) {
@@ -560,6 +487,32 @@ pub const RowEmitter = struct {
         self.count += 1;
     }
 };
+
+/// Advance a writer's read_ts to every built unique index's
+/// `valid_ts`, so its uniqueness probes see everything the build
+/// wrote. Called right after openTable, before any planning or row
+/// work, so a Restart discards nothing. A no-op for an implicit txn
+/// (its read_ts is the applied ts at newTxn) and for any txn that
+/// began after the build; an index still building is skipped — the
+/// writer neither maintains nor probes it, and its build merges the
+/// rows written meanwhile (index_ddl.zig). Readers never bump: the
+/// planner scans instead of using an index newer than the snapshot.
+/// Returns false when an error was replied (Conflict → 40001); a
+/// Restart propagates to the statement driver.
+fn bumpToIndexes(
+    state: *pgwire.ConnState,
+    tx: *_txn.Txn,
+    tbl: *const _table.Table,
+) !bool {
+    for (tbl.indexes) |*idx| {
+        if (!idx.unique or idx.isBuilding()) continue;
+        tx.bumpTo(idx.valid_ts) catch |err| {
+            try replyLockErr(state, err);
+            return false;
+        };
+    }
+    return true;
+}
 
 /// Bind the WHERE (null: every row) and plan it. null = bind already
 /// sent the error reply (the pred.bind convention).
@@ -630,38 +583,202 @@ fn replyEvalErr(state: *pgwire.ConnState, err: _expr.EvalError) !void {
     };
 }
 
-/// The posting key of one cell of a non-unique indexed column. Every
-/// type CREATE INDEX accepts encodes (it rejects interval), so
-/// Unencodable cannot happen here.
-fn postingKey(arloc: std.mem.Allocator, cell: _value.Value) !String {
-    return _key.encodeIndexKey(arloc, cell, null) catch |err| switch (err) {
-        error.Unencodable => unreachable,
-        else => return err,
-    };
-}
+// --- index maintenance, shared by INSERT, DELETE and UPDATE -----------
+//
+// A statement collects every index mutation it will make — over all
+// its rows and all of `tbl.indexes` — BEFORE any index-key lock, then
+// locks the unique keys in sorted order, then writes. A lock may
+// Restart the statement, so nothing is buffered until every lock is
+// held; and a statement never reads its own writes: every read it
+// makes (the row gather, the unique probes) precedes its first write.
+// What a probe sees is the committed state at read_ts plus the pending
+// writes of this transaction's EARLIER statements, which it must:
+// `DELETE pk 5; INSERT 5` finds the pending tombstone, `INSERT 5;
+// INSERT 5` the pending put. Lock order for every writer: rows first
+// (Materialize), then index keys (IndexKey.lessThan).
 
-/// Order row indices by their encoded PK index key (memcomparable, so byte
-/// order is value order) — used to lock a multi-row INSERT deadlock-free and
-/// to spot an in-statement duplicate as an adjacent pair.
-fn lessThanBytes(_: void, x: []const u8, y: []const u8) bool {
-    return std.mem.lessThan(u8, x, y);
-}
+/// One index mutation: the entry `key` of `idx` for the statement's
+/// row at `row` (whose egid INSERT knows only at write time), added or
+/// removed. Sorted by (index table, key) — the lock order — the
+/// entries for one unique key sit together, which is how
+/// applyIndexKeys decides what the whole statement does to it.
+const IndexKey = struct {
+    idx: *const _table.Index,
+    key: String,
+    row: usize,
+    op: PostingOp,
 
-/// The indexes maintained as roaring postings — every non-unique index
-/// of `tbl`, at most one per column (CREATE INDEX rejects seconds). Their
-/// entries are commuting deltas (Txn.putPosting); unique indexes (the
-/// pkey) keep their single-egid lock-then-check path. Pointers into
-/// tbl.indexes, in a stable order callers zip parallel slices against.
-fn bitmapIndexes(
-    a: std.mem.Allocator,
-    tbl: *const _table.Table,
-) ![]const *const _table.Index {
-    var list: std.ArrayList(*const _table.Index) = .empty;
-    for (tbl.indexes) |*idx| {
-        if (idx.unique) continue;
-        try list.append(a, idx);
+    fn lessThan(_: void, x: IndexKey, y: IndexKey) bool {
+        const xt = x.idx.index_table_id;
+        const yt = y.idx.index_table_id;
+        if (xt != yt) return xt < yt;
+        return std.mem.lessThan(u8, x.key, y.key);
     }
-    return list.toOwnedSlice(a);
+
+    fn sameKey(x: IndexKey, y: IndexKey) bool {
+        return x.idx == y.idx and std.mem.eql(u8, x.key, y.key);
+    }
+};
+
+/// Append one `op` entry for every key `cell` contributes to `idx`.
+fn collectKeys(
+    arloc: std.mem.Allocator,
+    keys: *std.ArrayList(IndexKey),
+    idx: *const _table.Index,
+    cell: _value.Value,
+    row: usize,
+    op: PostingOp,
+) !void {
+    for (try idx.keys(arloc, cell)) |key| {
+        try keys.append(arloc, .{
+            .idx = idx,
+            .key = key,
+            .row = row,
+            .op = op,
+        });
+    }
+}
+
+/// Whether `key` is one of `keys` — the diff of a row's old keys
+/// against its new ones. A scan: the slices hold 0 or 1 keys today; a
+/// sorted merge once an index kind emits hundreds.
+fn containsKey(keys: []const String, key: String) bool {
+    for (keys) |k| if (std.mem.eql(u8, k, key)) return true;
+    return false;
+}
+
+/// Sort the statement's index mutations into lock order and lock every
+/// unique key, all before any write (lockRow may Restart). Non-unique
+/// entries are sorted with the rest but never locked: posting deltas
+/// commute. false = an error was replied.
+fn lockIndexKeys(
+    state: *pgwire.ConnState,
+    tx: *_txn.Txn,
+    keys: []IndexKey,
+) !bool {
+    std.mem.sort(IndexKey, keys, {}, IndexKey.lessThan);
+    for (keys) |ik| {
+        if (!ik.idx.unique) continue;
+        tx.lockRow(ik.idx.index_table_id, ik.key) catch |err| {
+            try replyLockErr(state, err);
+            return false;
+        };
+    }
+    return true;
+}
+
+/// Write the statement's index mutations (sorted, every lock held).
+/// A non-unique entry is a posting delta, written as it is. A unique
+/// key gets ONE write, decided from its group of equal entries, i.e.
+/// from what the whole statement does to it: more than one add is two
+/// rows given the same value → 23505; no add is a tombstone; one add
+/// with no remove probes the index, found → 23505, else puts; one add
+/// with a remove is a move between two of this statement's rows — the
+/// put alone, no probe, since the committed occupant is the row moving
+/// away, its pre-image locked and newest. `egids[ik.row]` is each
+/// entry's row id. false = replied.
+fn applyIndexKeys(
+    state: *pgwire.ConnState,
+    tx: *_txn.Txn,
+    keys: []const IndexKey,
+    egids: []const u64,
+) !bool {
+    for (keys) |ik| {
+        if (ik.idx.unique) {
+            continue;
+        }
+        const table_id = ik.idx.index_table_id;
+        try tx.putPosting(table_id, ik.key, egids[ik.row], ik.op);
+    }
+
+    var i: usize = 0;
+    while (i < keys.len) {
+        const first = keys[i];
+        const end = groupEnd(keys, i);
+        defer i = end;
+        if (!first.idx.unique) continue;
+        const table_id = first.idx.index_table_id;
+
+        var adds: usize = 0;
+        var removes: usize = 0;
+        var egid: u64 = 0;
+        for (keys[i..end]) |ik| switch (ik.op) {
+            .add => {
+                adds += 1;
+                egid = egids[ik.row];
+            },
+            .remove => removes += 1,
+            .noop => unreachable,
+        };
+
+        if (adds >= 2) return replyUniqueViolation(state);
+        if (adds == 0) {
+            try tx.put(table_id, first.key, "", .{ .kind = .deleted });
+            continue;
+        }
+        if (removes == 0) { // and adds == 1
+            if (!try probeUnique(state, tx, table_id, first.key)) return false;
+        }
+        const ekey = _key.encodeEgid(egid);
+        try tx.put(table_id, first.key, &ekey, .{});
+    }
+    return true;
+}
+
+/// Where the run of entries sharing keys[i]'s index and key ends.
+fn groupEnd(keys: []const IndexKey, i: usize) usize {
+    var end = i + 1;
+    while (end < keys.len and keys[end].sameKey(keys[i])) end += 1;
+    return end;
+}
+
+/// Whether a unique index key is free. Post-lock, read_ts covers the
+/// key's newest commit, so a live entry means the value exists. Only a
+/// unique index table may be looked up: a non-unique one's pending
+/// posting ops sit in `writes` keyed with timestamp = egid. false =
+/// replied (23505, or an internal read failure).
+fn probeUnique(
+    state: *pgwire.ConnState,
+    tx: *_txn.Txn,
+    index_table_id: u32,
+    key: String,
+) !bool {
+    const found = tx.lookup(.{
+        .namespace = tx.ns,
+        .table_id = index_table_id,
+        .primary = key,
+        .timestamp = tx.read_ts,
+    }) catch |err| {
+        log.err("unique probe index={d}: {s}", .{
+            index_table_id,
+            @errorName(err),
+        });
+        try replyError(state, "unique index probe failed");
+        return false;
+    };
+    const f = found orelse return true;
+    f.release();
+    return replyUniqueViolation(state);
+}
+
+/// Reply 23505; false, for the `!bool` helpers' "replied" convention.
+fn replyUniqueViolation(state: *pgwire.ConnState) !bool {
+    try replyErrorCode(
+        state,
+        pgwire.sqlstate.unique_violation,
+        "duplicate key value violates unique constraint",
+    );
+    return false;
+}
+
+/// NULL into the PRIMARY KEY column, by INSERT or UPDATE: 23502. Any
+/// other unique index takes NULL as "no entry" (NULLS DISTINCT).
+fn replyPkeyNull(state: *pgwire.ConnState) !void {
+    return replyErrorCode(
+        state,
+        pgwire.sqlstate.not_null_violation,
+        "null value in primary key column violates not-null constraint",
+    );
 }
 
 fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {

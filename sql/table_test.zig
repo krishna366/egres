@@ -77,6 +77,7 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
             .index_table_id = pkey_index_id,
             .column_id = 1,
             .unique = true,
+            .valid_ts = 7,
         };
         const cells = catalog.encodeIndex(def);
         const bytes = try row.marshalRow(alloc, &index_ps, &cells, &buf);
@@ -104,6 +105,8 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     try testing.expectEqual(@as(usize, 1), t.indexes.len);
     try testing.expectEqual(pkey_index_id, t.indexes[0].index_table_id);
     try testing.expect(t.indexes[0].unique);
+    try testing.expectEqual(@as(u64, 7), t.indexes[0].valid_ts);
+    try testing.expect(!t.indexes[0].isBuilding());
 
     // scanIndexKeys classifies both directions: the index knows its
     // base; the base lists its index.
@@ -117,12 +120,34 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     try testing.expectEqual(null, as_base.base_table_id);
     try testing.expectEqual(1, as_base.table_ids.items.len);
     try testing.expectEqual(pkey_index_id, as_base.table_ids.items[0]);
-    // The index resolved its column to the live one; pkey is that index.
+    // The index resolved its column to the live one — the PK column.
     try testing.expectEqual(&t.columns[0], t.indexes[0].column);
-    try testing.expect(t.primary_index != null);
-    try testing.expectEqual(&t.indexes[0], t.primary_index.?);
-    try testing.expectEqual(@as(usize, 0), t.primary_index.?.column.pos);
-    try testing.expectEqual(pkey_index_id, t.primary_index.?.index_table_id);
+    try testing.expect(t.indexes[0].column.pkey_position != null);
+
+    // Index.keys: a value yields its one encoded key; NULL yields none
+    // under a unique index (NULLS DISTINCT).
+    const one = try t.indexes[0].keys(alloc, .{ .int4 = 7 });
+    defer alloc.free(one); // after the key it holds (defers run in reverse)
+    defer alloc.free(one[0]);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    const want = try sql.key.encodeIndexKey(alloc, .{ .int4 = 7 }, null);
+    defer alloc.free(want);
+    try testing.expectEqualSlices(u8, want, one[0]);
+    const none = try t.indexes[0].keys(alloc, .null_value);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    // A non-unique index keys NULL on the NULL tag byte.
+    const posting = sql.table.Index{
+        .index_table_id = 99,
+        .unique = false,
+        .valid_ts = 0,
+        .column = &t.columns[1],
+    };
+    const tag = try posting.keys(alloc, .null_value);
+    defer alloc.free(tag);
+    defer alloc.free(tag[0]);
+    const null_key = try sql.key.encodeIndexKey(alloc, .null_value, null);
+    defer alloc.free(null_key);
+    try testing.expectEqualSlices(u8, null_key, tag[0]);
 
     try testing.expectEqualStrings("id", t.columns[0].name);
     try testing.expectEqual(Type.int4, t.columns[0].ty);

@@ -46,6 +46,18 @@ test "sql.parse: CREATE TABLE parses columns, types, and the primary key" {
     try testing.expectEqualStrings("name", cols[1].name);
     try testing.expectEqual(sql.Type.text, cols[1].ty);
     try testing.expect(!cols[1].pkey);
+    try testing.expect(!cols[0].unique and !cols[1].unique);
+
+    // UNIQUE marks a column; on the PRIMARY KEY column it is absorbed
+    // (the PK index already enforces it).
+    const uq = try parse.statement(
+        alloc,
+        "CREATE TABLE t (id int PRIMARY KEY UNIQUE, email text UNIQUE);",
+    );
+    try testing.expect(uq.create_table.columns[0].pkey);
+    try testing.expect(!uq.create_table.columns[0].unique);
+    try testing.expect(!uq.create_table.columns[1].pkey);
+    try testing.expect(uq.create_table.columns[1].unique);
 
     // IF NOT EXISTS + schema-qualified name + our unsigned custom type.
     const ine = try parse.statement(alloc, "CREATE TABLE IF NOT EXISTS public.u (a uint4);");
@@ -64,7 +76,7 @@ test "sql.parse: CREATE TABLE semantic rejections carry a reason" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cases = [_]struct { sql: []const u8, needle: []const u8 }{
-        .{ .sql = "CREATE TABLE t (a int NOT NULL);", .needle = "PRIMARY KEY" },
+        .{ .sql = "CREATE TABLE t (a int NOT NULL);", .needle = "and UNIQUE" },
         .{ .sql = "CREATE TABLE t (a serial);", .needle = "serial" },
         .{ .sql = "CREATE TABLE t (a int, b int, PRIMARY KEY (a, b));", .needle = "table-level" },
         .{ .sql = "CREATE TABLE t (a int primary key, b int primary key);", .needle = "multiple PRIMARY KEY" },
@@ -129,6 +141,11 @@ test "sql.parse: CREATE INDEX variants" {
         "CREATE INDEX i ON t (color ASC NULLS LAST);",
     );
     try testing.expectEqualStrings("color", ord.create_index.column);
+    try testing.expect(!ord.create_index.unique);
+
+    const uq = try parse.statement(alloc, "CREATE UNIQUE INDEX u ON t (a);");
+    try testing.expect(uq.create_index.unique);
+    try testing.expectEqualStrings("u", uq.create_index.name.?);
 }
 
 test "sql.parse: CREATE INDEX rejections carry a reason" {
@@ -137,7 +154,6 @@ test "sql.parse: CREATE INDEX rejections carry a reason" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cases = [_]struct { sql: []const u8, needle: []const u8 }{
-        .{ .sql = "CREATE UNIQUE INDEX i ON t (a);", .needle = "UNIQUE" },
         .{
             .sql = "CREATE INDEX CONCURRENTLY i ON t (a);",
             .needle = "CONCURRENTLY",

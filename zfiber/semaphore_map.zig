@@ -273,23 +273,32 @@ pub const SemaphoreMap = struct {
     /// Release `owner_id`'s hold on `key`. Frees the entry when nothing
     /// holds or waits on it; otherwise the RWMutex hands off (writer
     /// first, else all readers). Releasing a key the owner doesn't hold
-    /// is a caller bookkeeping bug.
+    /// is a caller bookkeeping bug (one release per acquire that
+    /// returned true), so it panics; a caller that legitimately may or
+    /// may not hold the key uses `tryRelease`.
     pub fn release(self: *SemaphoreMap, key: u64, owner_id: u64) void {
+        if (!self.tryRelease(key, owner_id))
+            std.debug.panic(
+                "SemaphoreMap.release: owner {d} does not hold key {x}",
+                .{ owner_id, key },
+            );
+    }
+
+    /// `release` for a caller that may not hold `key`: releases and
+    /// returns true when it does, else a no-op returning false. For a
+    /// hold that is taken and dropped more than once over its life (a
+    /// DDL barrier retaken for the finish, and by its failure path),
+    /// where the map is the one place that knows the current state.
+    pub fn tryRelease(self: *SemaphoreMap, key: u64, owner_id: u64) bool {
         self.mu.lock(@src());
         const kv = self.entries.getEntry(key) orelse {
             self.mu.unlock();
-            std.debug.panic(
-                "SemaphoreMap.release: key {x} not held",
-                .{key},
-            );
+            return false;
         };
         const e = kv.value_ptr.*;
         const mode = removeOwner(&e.holders, owner_id) orelse {
             self.mu.unlock();
-            std.debug.panic(
-                "SemaphoreMap.release: owner {d} is not a holder",
-                .{owner_id},
-            );
+            return false;
         };
         if (e.holders.items.len == 0 and e.waiters.items.len == 0) {
             // We hold `mu` and just proved the entry drained, so drop it
@@ -300,10 +309,11 @@ pub const SemaphoreMap = struct {
             self.entries.removeByPtr(kv.key_ptr);
             self.recycle(e);
             self.mu.unlock();
-            return;
+            return true;
         }
         self.mu.unlock();
         e.unlock(mode);
+        return true;
     }
 
     /// The entry for `key`, pulled from the pool (or created) on first

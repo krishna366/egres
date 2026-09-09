@@ -187,6 +187,29 @@ test "txn: fresh lock on a newer-committed row bumps and restarts" {
     try testing.expectEqual(1, tx.held.items.len);
 }
 
+test "txn: bumpTo — no-op at or below read_ts, else Restart or Conflict" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+
+    // Already covered: nothing happens.
+    try tx.bumpTo(read_ts - 1);
+    try tx.bumpTo(read_ts);
+    try testing.expectEqual(read_ts, tx.read_ts);
+
+    // Above the snapshot with nothing read before: Restart at the ts.
+    try testing.expectError(error.Restart, tx.bumpTo(600));
+    try testing.expectEqual(600, tx.read_ts);
+
+    // A prior statement's scan makes a further bump a Conflict, and
+    // read_ts stays.
+    tx.recordScan();
+    try tx.beginStatement();
+    try testing.expectError(error.Conflict, tx.bumpTo(700));
+    try testing.expectEqual(600, tx.read_ts);
+}
+
 test "txn: bump after a prior statement's scan is a conflict" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();
