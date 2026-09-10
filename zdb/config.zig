@@ -64,7 +64,7 @@ pub const Config = struct {
     // in one multi-GiB compaction that blocks the loop for minutes.
     l0_compaction_max_bytes: u64 = 1 << 30, // 1 GiB
 
-    // Roaring posting rollup (zdb/tree.zig's VersionTracker).
+    // Roaring posting rollup (zdb/compaction.zig's VersionTracker).
     // Compaction folds a
     // version run whose newest item is a roaring delta into one full
     // bitmap state, so reads stop at their first hit instead of
@@ -94,12 +94,14 @@ pub const Config = struct {
     rollup_max_deltas: u32 = 32,
 
     pub fn validate(self: Config) Error!void {
-        // Badger semantics: exactly one compactor causes pathological level behavior.
+        // Badger semantics: exactly one compactor causes pathological level
+        // behavior.
         if (self.num_compactors == 1) return error.InvalidNumCompactors;
         if (self.memtable_size == 0) return error.InvalidMemtableSize;
         if (self.num_memtables == 0) return error.InvalidNumMemtables;
         if (self.block_size == 0) return error.InvalidBlockSize;
         if (self.max_levels == 0) return error.InvalidMaxLevels;
-        if (self.in_memory and self.dir.len != 0) return error.InvalidDirForInMemory;
+        if (self.in_memory and
+            self.dir.len != 0) return error.InvalidDirForInMemory;
     }
 };

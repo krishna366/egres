@@ -13,7 +13,7 @@
 //! This module owns only the write-side format concerns: what a
 //! delta record is and `validateDelta`, the gate every record passes
 //! before being proposed. Everything runtime — chain collection,
-//! pinning, classification, and THE fold — lives in zdb/tree.zig's
+//! pinning, classification, and THE fold — lives in zdb/compaction.zig's
 //! VersionTracker, the one per-primary state machine (the fold is
 //! `foldBufferedToBitmap`, shared by compaction and reads; that sharing is
 //! what makes "rollup is read-invariant" testable).

@@ -2,7 +2,8 @@ const schema = @import("schema");
 
 // Port of badger/fb/flatbuffer.fbs:
 // - table BlockOffset { key:[ubyte]; offset:uint; len:uint; }
-// - table TableIndex { offsets:[BlockOffset]; bloom_filter:[ubyte]; max_version:uint64; ... }
+// - table TableIndex { offsets:[BlockOffset]; bloom_filter:[ubyte];
+//   max_version:uint64; ... }
 pub const BlockIndex = schema.Table(.{
     .{ .id = 1, .name = "key", .ty = schema.Bytes },
     .{ .id = 2, .name = "offset", .ty = schema.U32 },
@@ -18,8 +19,8 @@ pub const BinaryFuseFilter = schema.Table(.{
     .{ .id = 6, .name = "fingerprints", .ty = schema.Array(schema.U16) },
 });
 
-// Tags chosen to match `u/compress.zig::Codec` so @enumFromInt(@intFromEnum(...))
-// is identity at the wire boundary.
+// Tags chosen to match `u/compress.zig::Codec` so
+// @enumFromInt(@intFromEnum(...)) is identity at the wire boundary.
 pub const Compression = schema.EnumDef(.{
     .{ .name = "none", .tag = 0 },
     .{ .name = "zstd", .tag = 1 },
@@ -58,7 +59,8 @@ pub const Op = schema.EnumDef(.{
 // a create_tree (future). Empty everywhere else (splits, drops, legacy admin
 // namespaces).
 pub const TreeChange = schema.Table(.{
-    .{ .id = 1, .name = "op", .ty = schema.Enum(Op) }, // 0=CREATE, 1=DELETE, 2=UPDATE
+    // 0=CREATE, 1=DELETE, 2=UPDATE
+    .{ .id = 1, .name = "op", .ty = schema.Enum(Op) },
     .{ .id = 2, .name = "namespace_id", .ty = schema.U64 },
     .{ .id = 3, .name = "tree_id", .ty = schema.U64 },
     .{ .id = 4, .name = "left_key", .ty = schema.Bytes },
@@ -69,18 +71,20 @@ pub const TreeChange = schema.Table(.{
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a
 // level. `sst_id` is the on-disk SST identifier (file_ids.allocate), NOT a SQL
 // table id — the SQL table is the tree, derivable from tree_id. One tree holds
-// many SSTs; one SST can belong to many trees (shared after a split/clone, freed
-// when its refcount hits 0). `namespace_id` + `tree_id` locate the owning tree —
-// a single flush spans many namespaces, so the namespace can't be implied by the
-// batch.
+// many SSTs; one SST can belong to many trees (shared after a split/clone,
+// freed when its refcount hits 0). `namespace_id` + `tree_id` locate the owning
+// tree — a single flush spans many namespaces, so the namespace can't be
+// implied by the batch.
 pub const SSTableChange = schema.Table(.{
     .{ .id = 1, .name = "op", .ty = schema.Enum(Op) }, // 0=CREATE, 1=DELETE
     .{ .id = 2, .name = "level", .ty = schema.U32 }, // 0 for DELETE
     .{ .id = 3, .name = "sst_id", .ty = schema.U64 }, // on-disk SST id
     .{ .id = 4, .name = "tree_id", .ty = schema.U64 },
     .{ .id = 5, .name = "namespace_id", .ty = schema.U64 },
-    .{ .id = 6, .name = "checksum", .ty = schema.U32 }, // CRC32 of SST file (CREATE only)
-    .{ .id = 7, .name = "size", .ty = schema.U64 }, // file size in bytes (CREATE only)
+    // CRC32 of SST file (CREATE only)
+    .{ .id = 6, .name = "checksum", .ty = schema.U32 },
+    // file size in bytes (CREATE only)
+    .{ .id = 7, .name = "size", .ty = schema.U64 },
 });
 
 // Per-namespace manifest state, persisted ONLY inside a snapshot (a
@@ -117,9 +121,12 @@ pub const ManifestChange = schema.Table(.{
     .{ .id = 1, .name = "tree_changes", .ty = schema.Array(TreeChange) },
     .{ .id = 2, .name = "sstable_changes", .ty = schema.Array(SSTableChange) },
     .{ .id = 3, .name = "cmd", .ty = schema.Enum(Command) },
-    .{ .id = 4, .name = "memtable_id", .ty = schema.U64 }, // for flush: which memtable was flushed
-    .{ .id = 5, .name = "namespaces", .ty = schema.Array(Namespace) }, // snapshot only
-    .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 }, // snapshot only: global namespace counter
+    // for flush: which memtable was flushed
+    .{ .id = 4, .name = "memtable_id", .ty = schema.U64 },
+    // snapshot only
+    .{ .id = 5, .name = "namespaces", .ty = schema.Array(Namespace) },
+    // snapshot only: global namespace counter
+    .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 },
 });
 
 /// A single key-value write. `key` is a FULL marshaled zdb key
@@ -138,7 +145,7 @@ pub const KeyValue = schema.Table(.{
 
 /// The value layout for Meta{ .kind = .delta, .encoding = .roaring }:
 /// egids to add to / remove from the posting bitmap, layered on the
-/// versions below it (zdb/tree.zig's VersionTracker owns the fold,
+/// versions below it (zdb/compaction.zig's VersionTracker owns the fold,
 /// zdb/validate.zig the write-side gate).
 pub const RoaringDelta = schema.Table(.{
     .{ .id = 1, .name = "adds", .ty = schema.Array(schema.U64) },

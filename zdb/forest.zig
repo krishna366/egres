@@ -4,7 +4,7 @@ const fiber = @import("zfiber");
 const utils = @import("utils");
 const _config = @import("config.zig");
 const _manifest = @import("manifest.zig");
-const _level = @import("level.zig");
+const _read = @import("read.zig");
 const _table = @import("table.zig");
 const vfs = @import("vfs");
 const _tree = @import("tree.zig");
@@ -19,7 +19,6 @@ const TableKey = @import("kv.zig").TableKey;
 const makeTreeId = @import("kv.zig").makeTreeId;
 const treeTableId = @import("kv.zig").treeTableId;
 const treeSplitId = @import("kv.zig").treeSplitId;
-const KeyRange = _level.KeyRange;
 const Tree = _tree.Tree;
 const TableCache = _tree.TableCache;
 const Table = _table.Table;
@@ -27,7 +26,6 @@ const Item = _table.table.Item;
 const SkipList = _skl.SkipList;
 const Builder = _table.builder.Builder;
 const merge_iterator = _table.merge_iterator;
-const Pin = merge_iterator.Pin;
 
 // ---------------------------------------------------------------------------
 // TableTrees
@@ -35,8 +33,8 @@ const Pin = merge_iterator.Pin;
 
 /// TableTrees holds the LSM trees of a single `{namespace, table_id}` table
 /// and maps a key to the tree that owns it. A table is one tree until it
-/// grows past `tree_split_size`, then splits at the primary-key median into more
-/// trees; entries are kept sorted by range.left so we can binary-search.
+/// grows past `tree_split_size`, then splits at the primary-key median into
+/// more trees; entries are kept sorted by range.left so we can binary-search.
 pub const TableTrees = struct {
     pub const Lock = fiber.RWMutex(.untracked);
 
@@ -81,7 +79,11 @@ pub const TableTrees = struct {
 
     /// Remove the tree with `tree_id`, returning it (or null if absent) —
     /// with the list's ref, which the caller releases once outside `mu`.
-    pub fn removeTree(self: *TableTrees, held: Lock.Exclusive, tree_id: u64) ?*Tree {
+    pub fn removeTree(
+        self: *TableTrees,
+        held: Lock.Exclusive,
+        tree_id: u64,
+    ) ?*Tree {
         self.mu.assertHeld(held);
         var i: usize = self.entries.items.len;
         while (i > 0) {
@@ -95,7 +97,11 @@ pub const TableTrees = struct {
 
     /// The tree with `tree_id`, or null. One table's trees (one until it
     /// splits), so effectively O(1).
-    pub fn byId(self: *const TableTrees, held: Lock.Shared, tree_id: u64) ?*Tree {
+    pub fn byId(
+        self: *const TableTrees,
+        held: Lock.Shared,
+        tree_id: u64,
+    ) ?*Tree {
         self.mu.assertHeld(held);
         for (self.entries.items) |tree| {
             if (tree.tree_id == tree_id) return tree;
@@ -153,7 +159,11 @@ pub const TableTrees = struct {
     }
 
     /// Find the tree that owns this key, or null if none.
-    pub fn lookup(self: *const TableTrees, held: Lock.Shared, search_key: Key) ?*Tree {
+    pub fn lookup(
+        self: *const TableTrees,
+        held: Lock.Shared,
+        search_key: Key,
+    ) ?*Tree {
         self.mu.assertHeld(held);
         if (self.entries.items.len == 1) return self.entries.items[0];
         if (self.entries.items.len == 0) return null;
@@ -162,7 +172,9 @@ pub const TableTrees = struct {
         var hi: usize = self.entries.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.entries.items[mid].key_range.left.order(search_key) != .gt) {
+            if (self.entries.items[mid].key_range.left.order(
+                search_key,
+            ) != .gt) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -171,7 +183,9 @@ pub const TableTrees = struct {
         if (lo == 0) return null;
         const candidate = self.entries.items[lo - 1];
         if (candidate.key_range.inf) return candidate;
-        if (candidate.key_range.right.primary.len > 0 and search_key.order(candidate.key_range.right) == .gt) {
+        if (candidate.key_range.right.primary.len > 0 and
+            search_key.order(candidate.key_range.right) == .gt)
+        {
             return null;
         }
         return candidate;
@@ -278,7 +292,11 @@ pub const Memtables = struct {
 
     /// Look up a key across current and immutable memtables.
     /// Returns a duped Item owned by the caller.
-    pub fn get(self: *Memtables, allocator: std.mem.Allocator, search_key: Key) !?Item {
+    pub fn get(
+        self: *Memtables,
+        allocator: std.mem.Allocator,
+        search_key: Key,
+    ) !?Item {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
 
@@ -294,9 +312,10 @@ pub const Memtables = struct {
         return null;
     }
 
-    /// Freeze the current memtable: move it to immutables, create a new current.
-    /// `log_index` is the apply index of the Raft `newMemtable` entry; it pins
-    /// the snapshot horizon (`snapshot.index <= oldest.created_at_log_index - 1`).
+    /// Freeze the current memtable: move it to immutables, create a new
+    /// current. `log_index` is the apply index of the Raft `newMemtable` entry;
+    /// it pins the snapshot horizon (`snapshot.index <=
+    /// oldest.created_at_log_index - 1`).
     ///
     /// Special case: the id=0 placeholder (created by `Forest.open` before any
     /// real `newMemtable` has been applied) is *discarded*, not frozen — it
@@ -329,9 +348,9 @@ pub const Memtables = struct {
         return self.current.created_at_log_index;
     }
 
-    /// Drop any phantom immutables whose id is strictly less than `expected_id`,
-    /// then pop+release the oldest IFF its id equals `expected_id`. No-op when
-    /// the matched memtable isn't found.
+    /// Drop any phantom immutables whose id is strictly less than
+    /// `expected_id`, then pop+release the oldest IFF its id equals
+    /// `expected_id`. No-op when the matched memtable isn't found.
     ///
     /// Used by `applyFlush`. Three cases reflect leader/follower divergence
     /// during recovery replay:
@@ -353,24 +372,33 @@ pub const Memtables = struct {
         // Newest-first storage: the oldest sits at the END, so both
         // the phantom sweep and the pop are cheap tail removals.
         while (self.immutables.items.len > 0 and
-            self.immutables.items[self.immutables.items.len - 1].id < expected_id)
+            self.immutables.items[self.immutables.items.len - 1].id <
+                expected_id)
         {
             const phantom = self.immutables.pop().?;
             log.info(
-                "popOldestIfMatches: releasing phantom immutable id={d} (expected_id={d})",
+                "popOldestIfMatches: releasing phantom immutable id={d} " ++
+                    "(expected_id={d})",
                 .{ phantom.id, expected_id },
             );
             phantom.release();
         }
 
         if (self.immutables.items.len == 0) {
-            log.info("popOldestIfMatches: skipping pop, immutables empty (expected_id={d})", .{expected_id});
+            log.info(
+                "popOldestIfMatches: skipping pop, immutables empty " ++
+                    "(expected_id={d})",
+                .{expected_id},
+            );
             return;
         }
-        const oldest_id = self.immutables.items[self.immutables.items.len - 1].id;
+        const oldest_id =
+            self.immutables.items[self.immutables.items.len - 1].id;
         if (oldest_id != expected_id) {
             log.info(
-                "popOldestIfMatches: skipping pop, oldest.id={d} > expected_id={d} (recovery: pre-snap flush, memtable not re-created locally)",
+                "popOldestIfMatches: skipping pop, oldest.id={d} > " ++
+                    "expected_id={d} (recovery: pre-snap flush, memtable " ++
+                    "not re-created locally)",
                 .{ oldest_id, expected_id },
             );
             return;
@@ -429,6 +457,47 @@ pub const Forest = struct {
     /// 0 means "nothing is droppable", the safe default: no timestamp is
     /// below it, so no read is rejected and no row is ever dropped.
     global_min_read: std.atomic.Value(u64),
+
+    // Read paths, from read.zig.
+    pub const get = _read.get;
+    pub const getRaw = _read.getRaw;
+    pub const getBitmap = _read.getBitmap;
+    pub const ScanOptions = _read.ScanOptions;
+    pub const scan = _read.scan;
+    pub const openCursor = _read.openCursor;
+    pub const Cursor = _read.Cursor;
+    pub const maxKey = _read.maxKey;
+    pub const StatsScope = _read.StatsScope;
+    pub const StatsOpts = _read.StatsOpts;
+    pub const writeStats = _read.writeStats;
+    pub const writeForestStats = _read.writeForestStats;
+    pub const writeTreeStats = _read.writeTreeStats;
+    pub const writeNamespaceStats = _read.writeNamespaceStats;
+    pub const writeBytes = _read.writeBytes;
+
+    // Building and applying manifest changes, from manifest.zig.
+    pub const installTree = _manifest.installTree;
+    pub const collectMissingFileIds = _manifest.collectMissingFileIds;
+    pub const openTablesFromManifest = _manifest.openTablesFromManifest;
+    pub const createTree = _manifest.createTree;
+    pub const buildNamespaceCreate = _manifest.buildNamespaceCreate;
+    pub const CreateNamespaceResult = _manifest.CreateNamespaceResult;
+    pub const buildCreateNamespace = _manifest.buildCreateNamespace;
+    pub const lookupNamespace = _manifest.lookupNamespace;
+    pub const lookupTable = _manifest.lookupTable;
+    pub const applyNamespaceCreate = _manifest.applyNamespaceCreate;
+    pub const buildCreateTree = _manifest.buildCreateTree;
+    pub const CreateTablesResult = _manifest.CreateTablesResult;
+    pub const buildCreateTables = _manifest.buildCreateTables;
+    pub const applyCreateTree = _manifest.applyCreateTree;
+    pub const buildDropTables = _manifest.buildDropTables;
+    pub const applyDropTree = _manifest.applyDropTree;
+    pub const applyTreeDeletes = _manifest.applyTreeDeletes;
+    pub const buildDropNamespace = _manifest.buildDropNamespace;
+    pub const applyDropNamespace = _manifest.applyDropNamespace;
+    pub const buildSplit = _manifest.buildSplit;
+    pub const applySplit = _manifest.applySplit;
+    pub const splitTreeForTests = _manifest.splitTreeForTests;
 
     /// Open a forest with empty in-memory state. Persistent state is restored
     /// later via `installManifest` (called by recovery if a Raft snapshot is
@@ -519,8 +588,8 @@ pub const Forest = struct {
     }
 
     /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen
-    /// memtable, routes each key to its tree, builds one L0 SST per tree,
-    /// and returns the manifest changes. The caller proposes these through Raft.
+    /// memtable, routes each key to its tree, builds one L0 SST per tree, and
+    /// returns the manifest changes. The caller proposes these through Raft.
     pub const FlushResult = struct {
         changes: std.ArrayList(_manifest.SSTableChange),
         memtable_id: u64,
@@ -555,7 +624,10 @@ pub const Forest = struct {
         // Route each key to a tree and add to the appropriate builder.
         while (iter.itemRef()) |item| {
             const tk = blk: {
-                const trees = self.getTable(item.key.namespace, item.key.table_id) orelse {
+                const trees = self.getTable(
+                    item.key.namespace,
+                    item.key.table_id,
+                ) orelse {
                     try iter.next();
                     continue;
                 };
@@ -564,7 +636,10 @@ pub const Forest = struct {
                     continue;
                 };
                 defer tree.release();
-                break :blk TreeKey{ .namespace = item.key.namespace, .tree_id = tree.tree_id };
+                break :blk TreeKey{
+                    .namespace = item.key.namespace,
+                    .tree_id = tree.tree_id,
+                };
             };
 
             const bld = if (builders.get(tk)) |b| b else blk: {
@@ -599,7 +674,11 @@ pub const Forest = struct {
             }
 
             const file_id = try self.file_ids.allocate();
-            const path = try _fi.sstPath(self.allocator, self.opts.dir, file_id);
+            const path = try _fi.sstPath(
+                self.allocator,
+                self.opts.dir,
+                file_id,
+            );
 
             try g.spawn(.{}, writeAndSyncTable, .{
                 self.allocator, tb, path, file_id, tk, 0, &flush_err,
@@ -639,11 +718,21 @@ pub const Forest = struct {
         var mtb = tb;
         defer mtb.deinit();
 
-        vfs.writeAndSync(path, mtb.bytes, .{ .mode = .direct }, .p0) catch |err| {
+        vfs.writeAndSync(
+            path,
+            mtb.bytes,
+            .{ .mode = .direct },
+            .p0,
+        ) catch |err| {
             err_out.set(err);
             return null;
         };
-        return _manifest.createSSTableChange(file_id, tk.namespace, tk.tree_id, lvl);
+        return _manifest.createSSTableChange(
+            file_id,
+            tk.namespace,
+            tk.tree_id,
+            lvl,
+        );
     }
 
     /// Build BOTTOM-level SSTs for (`ns`, `table_id`) from
@@ -797,10 +886,14 @@ pub const Forest = struct {
         return TableTrees.retain(listed[0]).?;
     }
 
-    /// applyFlush is Phase B: commits the manifest changes from a memtable flush
-    /// and updates in-memory levels. Called on all nodes after Raft commit.
-    /// Also removes the flushed memtable from the immutable list.
-    pub fn applyFlush(self: *Forest, changes: []const _manifest.SSTableChange, memtable_id: u64) !void {
+    /// applyFlush is Phase B: commits the manifest changes from a memtable
+    /// flush and updates in-memory levels. Called on all nodes after Raft
+    /// commit. Also removes the flushed memtable from the immutable list.
+    pub fn applyFlush(
+        self: *Forest,
+        changes: []const _manifest.SSTableChange,
+        memtable_id: u64,
+    ) !void {
         if (changes.len > 0) {
             try self.ms.commit(changes, &.{});
         }
@@ -812,7 +905,10 @@ pub const Forest = struct {
         defer needed.deinit(self.allocator);
         for (changes) |c| {
             std.debug.assert(c.op == .create); // flush only creates
-            try needed.append(self.allocator, .{ .id = c.sst_id, .level = c.level });
+            try needed.append(self.allocator, .{
+                .id = c.sst_id,
+                .level = c.level,
+            });
         }
         try self.table_cache.loadTables(needed.items);
 
@@ -820,7 +916,10 @@ pub const Forest = struct {
         // needed in the same order they were built, so indices align.
         for (changes, needed.items) |c, n| {
             std.debug.assert(c.sst_id == n.id);
-            const tree = self.getTree(c.namespace_id, c.tree_id) orelse continue;
+            const tree = self.getTree(
+                c.namespace_id,
+                c.tree_id,
+            ) orelse continue;
             defer tree.release();
             {
                 const held = tree.mu.hold(.exclusive, @src());
@@ -829,7 +928,10 @@ pub const Forest = struct {
             }
 
             // Metrics: one per-tree flush output + bytes written to L0.
-            try _metrics.g().flushes.incr(.{ .namespace_id = c.namespace_id, .tree_id = c.tree_id });
+            try _metrics.g().flushes.incr(.{
+                .namespace_id = c.namespace_id,
+                .tree_id = c.tree_id,
+            });
             try _metrics.g().bytes_written.incrBy(.{
                 .source = "flush",
                 .namespace_id = c.namespace_id,
@@ -849,7 +951,10 @@ pub const Forest = struct {
         var seen_trees = std.AutoHashMap(TreeKey, void).init(self.allocator);
         defer seen_trees.deinit();
         for (changes) |c| {
-            const tk = TreeKey{ .namespace = c.namespace_id, .tree_id = c.tree_id };
+            const tk = TreeKey{
+                .namespace = c.namespace_id,
+                .tree_id = c.tree_id,
+            };
             if (!seen_trees.contains(tk)) {
                 try seen_trees.put(tk, {});
                 if (self.getTree(tk.namespace, tk.tree_id)) |tree| {
@@ -857,952 +962,6 @@ pub const Forest = struct {
                     try tree.updateCompactCandidate();
                 }
             }
-        }
-    }
-
-    /// Get a value by key. Checks memtables first (current, then immutables
-    /// newest-to-oldest), then routes to the correct tree.
-    /// Returned Item is owned by the caller; call item.free(allocator) when done.
-    ///
-    /// A key deleted at or below `search_key.timestamp` reads as absent: the
-    /// tombstone wins the lookup and is reported as null. Rejects reads below
-    /// `global_min_read`, whose versions may already have been compacted away.
-    pub fn get(self: *Forest, allocator: std.mem.Allocator, search_key: Key, priority: vfs.Priority) !?Item {
-        if (search_key.timestamp < self.globalMinRead()) {
-            return error.ReadBelowMinRead;
-        }
-
-        const found = try self.getRaw(allocator, search_key, priority);
-        // Every layer stops at its first hit, and versions sort newest-first,
-        // so `found` is the newest version at or below the read timestamp. If
-        // that version is a tombstone, the key is deleted as of this read —
-        // older versions behind it are shadowed and must not surface.
-        if (found) |item| {
-            if (item.meta.isDeleted()) {
-                item.free(allocator);
-                return null;
-            }
-        }
-        return found;
-    }
-
-    /// get without the tombstone filter or the horizon check: returns the
-    /// winning version verbatim, tombstone or not. For callers that need to
-    /// see deletions as data (compaction diagnostics, tests, repair tools)
-    /// rather than as absence.
-    pub fn getRaw(self: *Forest, allocator: std.mem.Allocator, search_key: Key, priority: vfs.Priority) !?Item {
-        if (try self.memtables.get(allocator, search_key)) |item| {
-            return item;
-        }
-
-        const trees = self.getTable(search_key.namespace, search_key.table_id) orelse return null;
-        const tree = trees.getTreeByKey(search_key) orelse return null;
-        defer tree.release();
-        return tree.get(search_key, priority);
-    }
-
-    /// The posting bitmap for `search_key`'s primary as of
-    /// `search_key.timestamp` (the read_ts — same convention as `get`).
-    /// A lazy top-down walk via Tree.rollupBitmap: one merge over the
-    /// memtable sources, then the owning tree's levels, stopping at
-    /// the first terminal (a state or a tombstone). After compaction
-    /// rollup the newest version is usually already a state, so the
-    /// walk rarely descends past the level that holds it.
-    ///
-    /// An absent key, a tombstoned key, and an empty posting all return
-    /// an EMPTY bitmap — an index reader cannot distinguish them and
-    /// should not try. The bitmap is owned by `allocator`; deinit it.
-    ///
-    /// Fails with CorruptPosting on undecodable delta bytes and
-    /// NotRoaring if the chain contains a non-roaring version —
-    /// getBitmap is only meaningful on keys written as roaring postings.
-    pub fn getBitmap(
-        self: *Forest,
-        allocator: std.mem.Allocator,
-        search_key: Key,
-        priority: vfs.Priority,
-    ) !zroar.Bitmap {
-        if (search_key.timestamp < self.globalMinRead()) {
-            return error.ReadBelowMinRead;
-        }
-
-        // Memtable sources BEFORE the tree lookup: data flushed in
-        // between is then visible in both our held snapshot and L0,
-        // and rollupBitmap's descending bound skips the L0 duplicate.
-        // The reverse order could miss it in both. getIterators
-        // acquires refs, so the arenas outlive a concurrent flush.
-        // One sorted merge over them (rather than sequential drains):
-        // memtable seeks cost no I/O, and the merge is indifferent to
-        // source order and cross-memtable ordering subtleties.
-        const srcs = try self.memtables.getIterators(allocator, null);
-        var mems_itr = merge_iterator.MergeIterator.init(allocator, srcs);
-        defer {
-            mems_itr.deinit(); // releases each source's skiplist ref
-            allocator.free(srcs);
-        }
-
-        const trees = self.getTable(
-            search_key.namespace,
-            search_key.table_id,
-        ) orelse return zroar.Bitmap.init(allocator);
-        const t = trees.getTreeByKey(search_key) orelse return zroar.Bitmap.init(allocator);
-        defer t.release();
-
-        const bm = try t.rollupBitmap(
-            allocator,
-            search_key,
-            priority,
-            &mems_itr,
-            0,
-        );
-        return bm orelse zroar.Bitmap.init(allocator);
-    }
-
-    /// How much of a key's version history a scan should surface.
-    ///
-    /// The merge iterator hands us every version of every primary, newest
-    /// first; these decide which of them reach the callback. The defaults
-    /// make a scan agree with `get`: the current value of each live key, and
-    /// nothing for a deleted one.
-    pub const ScanOptions = struct {
-        /// Stop after handing this many items to the callback. Bounds what the
-        /// caller RECEIVES, not what the scan walks past: versions skipped by
-        /// the filters below are free. 0 returns nothing. The default is
-        /// unbounded — the whole range.
-        max_rows: u64 = std.math.maxInt(u64),
-        /// Max versions to emit per primary, newest first. 1 (the default) is
-        /// "just the current value". Clamped up to 1 — there's no use for a
-        /// scan that returns zero versions of every key, and `max_rows = 0`
-        /// already says "return nothing".
-        num_versions: u32 = 1,
-        /// When false, a primary stops emitting at its first tombstone: the
-        /// tombstone is not emitted, and neither is anything older than it,
-        /// regardless of `num_versions`. That is what makes a deleted key look
-        /// absent.
-        ///
-        /// When true, tombstones are emitted like any other version and older
-        /// versions behind them keep coming, up to `num_versions`. For callers
-        /// that need deletions as data — replication, repair, debugging.
-        include_deleted: bool = false,
-        /// Report the world as of this timestamp: versions above it are not
-        /// visible and are skipped as though they had not been written. The
-        /// default, maxInt, means "latest".
-        ///
-        /// This is the same view `get` gives for one key, so a scan at
-        /// `read_ts` and a `get` at `read_ts` agree — including on deletion: a
-        /// tombstone ABOVE read_ts hasn't happened yet from here, so it does
-        /// not hide the key, and the live version under it is what surfaces.
-        ///
-        /// Must be at or above `global_min_read`, like any other read.
-        read_ts: u64 = std.math.maxInt(u64),
-        /// Only what changed after this timestamp: versions at or below it
-        /// are skipped, so a key is emitted only when its newest visible
-        /// version is above it, and an SST whose every version is at or
-        /// below it (`TableIndex.max_version`) is not opened at all. The
-        /// default, 0, skips nothing. With `include_deleted`, a key deleted
-        /// after `min_ts` is emitted as its tombstone — the shape of a
-        /// "what changed since" pass (CREATE INDEX's merge of the rows
-        /// written during its backfill). Memtables are always opened.
-        min_ts: u64 = 0,
-        /// I/O priority for the SST reads this scan issues (see vfs). `.p0` is
-        /// the foreground/interactive class every current caller wants;
-        /// background sweeps should pick a lower one so they queue behind
-        /// user-facing reads.
-        priority: vfs.Priority = .p0,
-        /// A transaction's private pending-write skiplist, merged in as
-        /// the highest-priority source (src 0) so the txn sees its own
-        /// uncommitted writes. Its entries carry ts = read_ts, which the
-        /// visibility filter admits and which wins equal-key ties against
-        /// committed versions (lower src wins in the merge). null = none.
-        pending: ?*_skl.SkipList = null,
-        /// Cursor only. Off: an item's value is a borrow valid until the
-        /// following `next`. On: the cursor holds the storage behind
-        /// every value it hands out until `Cursor.releasePins`, so a
-        /// caller can keep a whole batch of borrows instead of copying
-        /// them. Costs one refcount pair per block or memtable arena
-        /// walked, and keeps those blocks resident until released.
-        pin_values: bool = false,
-    };
-
-    /// Forward scan over a table-limited `scan_range` — a KeyRange run through
-    /// `KeyRange.limitToTable`, so its bounds are full keys confined to one
-    /// `(namespace, table_id)` (which ride the `left` bound). That confinement
-    /// keeps the scan from spilling across the namespace-wide memtable into an
-    /// adjacent table.
-    ///
-    /// `opts` carries everything else: how many items to return, the view
-    /// (as-of timestamp, versions per key, deletions as data or absence), and
-    /// the read priority — see `ScanOptions`. The defaults emit every live
-    /// key's current value once and hide deleted keys, matching `get`.
-    ///
-    /// `scan_range`'s own timestamps only position the seek — `opts.read_ts`
-    /// is what decides visibility.
-    ///
-    /// A loop over a `Cursor`: the callback sees each item the cursor hands
-    /// out, in order, and stops the scan by returning false. Returns how many
-    /// items reached the callback (the one it said false to included). The
-    /// item is a borrow — see `Cursor.next`. Instantiated per ctx type, but
-    /// the walk itself lives in `Cursor` and compiles once.
-    pub fn scan(
-        self: *Forest,
-        allocator: std.mem.Allocator,
-        scan_range: KeyRange,
-        opts: ScanOptions,
-        ctx: anytype,
-        comptime cb: fn (@TypeOf(ctx), Item) anyerror!bool,
-    ) !u64 {
-        var cur = try self.openCursor(allocator, scan_range, opts);
-        defer cur.deinit();
-        while (try cur.next()) |item| {
-            if (!try cb(ctx, item)) break;
-        }
-        return cur.emitted;
-    }
-
-    /// Open a `Cursor` over `scan_range` — the walk `scan` does, handed out
-    /// one item per `next` so the caller sets the pace. Same arguments and
-    /// guards as `scan`: a `read_ts` below `globalMinRead` is refused here,
-    /// except when `max_rows` is 0, which opens an already-exhausted cursor
-    /// without looking. Nothing is read or pinned until the first `next`.
-    pub fn openCursor(
-        self: *Forest,
-        allocator: std.mem.Allocator,
-        scan_range: KeyRange,
-        opts: ScanOptions,
-    ) !Cursor {
-        if (opts.max_rows != 0 and opts.read_ts < self.globalMinRead()) {
-            return error.ReadBelowMinRead;
-        }
-        return .{
-            .forest = self,
-            .allocator = allocator,
-            .arena = std.heap.ArenaAllocator.init(allocator),
-            .key_range = scan_range,
-            .opts = opts,
-            .want_versions = @max(opts.num_versions, 1),
-            // The range is already table-limited; ns + table_id ride its left bound.
-            .ns = scan_range.left.namespace,
-            .table_id = scan_range.left.table_id,
-        };
-    }
-
-    /// A scan as a pull handle: `next` returns the next visible item, null
-    /// once the range is exhausted. Same walk, filters, and options as
-    /// `scan` — that function is a loop over one of these. What the cursor
-    /// adds is pacing: a caller can take some items, return to whoever
-    /// called it, and come back later, with the open tree's merge iterator
-    /// and its refs (SST tables, memtable arenas, the pending skiplist)
-    /// held in between. Holding across a wait is safe — the refs keep that
-    /// storage alive even if a flush or compaction has since replaced it in
-    /// the manifest — so the cost is residency, not correctness.
-    ///
-    /// One tree at a time: look up the tree owning `key_range.left`,
-    /// snapshot its range, open a merge over the intersection (with a fresh
-    /// memtable iter snapshot), drain it, then move `key_range.left` past
-    /// the snapshotted right boundary and re-look-up. Re-looking-up per hop
-    /// keeps the scan safe against splits firing mid-scan. Per-hop memtable
-    /// snapshots also pick up newly-flushed data.
-    ///
-    /// One fiber drives a cursor. `deinit` on every path — an abandoned
-    /// cursor pins its tables until then.
-    pub const Cursor = struct {
-        forest: *Forest,
-        allocator: std.mem.Allocator,
-        /// Per-cursor arena: memtable iterator slices and each visited
-        /// tree's duped range live exactly as long as the cursor (the tree
-        /// ref is released once the hop's merge is open, and a split
-        /// retires the tree, so the range cannot borrow from it).
-        arena: std.heap.ArenaAllocator,
-        /// The window still to visit: the scan's range at open, its left
-        /// bound advanced past each drained tree's snapshotted right edge.
-        key_range: KeyRange,
-        opts: ScanOptions,
-        /// `opts.num_versions` clamped up to 1 (see ScanOptions).
-        want_versions: u32,
-        ns: u64,
-        table_id: u32,
-        /// The open tree's merge; null between trees (a hop is pending)
-        /// and once `done`.
-        merge: ?merge_iterator.MergeIterator = null,
-        /// The open tree's range as snapshotted at its hop (tree.key_range
-        /// stays in sync with the manifest via applySplit).
-        tree_range: KeyRange = .{},
-        /// The merge is parked on an item the caller already has. Advancing
-        /// right after the hand-out would overwrite the key buffer and could
-        /// drop the block the value lives in, so the step past it is owed to
-        /// the following `next`. False only before the first hand-out from a
-        /// freshly opened tree.
-        next_pending: bool = false,
-        /// With `opts.pin_values`: a hold on the storage behind every
-        /// value handed out since the last `releasePins` — one entry per
-        /// block or memtable arena, since consecutive items share one —
-        /// so those borrows stay valid past the following `next`.
-        pins: std.ArrayList(Pin) = .empty,
-        /// No tree left to visit.
-        done: bool = false,
-        /// Per-primary emit state. A primary's versions arrive contiguously,
-        /// newest first, so this only ever tracks one run at a time.
-        ///
-        /// The state deliberately spans tree hops rather than resetting per
-        /// tree: a primary can't straddle two trees (findSplitKey pins the
-        /// split above every version of its key), so a hop always lands on
-        /// a new primary anyway — and if that ever stops holding, carrying
-        /// the state is the behaviour that stays correct.
-        ///
-        /// `cur_primary` owns its bytes: item.key.primary points into the
-        /// block iterator's key_buf, which the next merge.next() overwrites.
-        /// Empty doubles as "no run yet" — a stored primary is never empty
-        /// (an empty primary is the open-bound sentinel, and Key.marshalTo
-        /// encodes it as zero bytes), so the first item can never compare
-        /// equal to it.
-        cur_primary: std.ArrayList(u8) = .empty,
-        versions_emitted: u32 = 0,
-        skip_versions: bool = false,
-        /// Items handed out so far — what `scan` returns. Bounded by
-        /// `opts.max_rows`; versions the filters skip are free.
-        emitted: u64 = 0,
-
-        /// Releases the open merge (table + skiplist refs) and the cursor's
-        /// memory. Safe after exhaustion, and after an error from `next`.
-        pub fn deinit(self: *Cursor) void {
-            for (self.pins.items) |pin| pin.release();
-            self.pins.deinit(self.allocator);
-            if (self.merge) |*m| m.deinit();
-            self.merge = null;
-            self.cur_primary.deinit(self.allocator);
-            self.arena.deinit();
-        }
-
-        /// The next item the options admit, or null when the scan is done
-        /// (`max_rows` reached, or the range walked to its end). Null is
-        /// sticky.
-        ///
-        /// The returned Item is a BORROW valid until the following `next`
-        /// or `deinit`: its key points into a source's key buffer, its
-        /// value into a block or arena the source holds a ref on, and the
-        /// advance overwrites the one and may release the other. Copy what
-        /// must outlive the call — except the value under
-        /// `opts.pin_values`, which stays valid until `releasePins`.
-        pub fn next(self: *Cursor) !?Item {
-            while (self.emitted < self.opts.max_rows) {
-                if (self.merge == null) {
-                    if (self.done) return null;
-
-                    try self.openNextTree();
-                    if (self.merge == null) return null; // nothing covers key_range.left
-                }
-                const merge = &self.merge.?;
-                if (self.next_pending) {
-                    self.next_pending = false;
-                    try merge.next();
-                }
-                if (try self.nextVisible(merge)) |item| {
-                    // The merge stays parked on `item` so the borrow holds;
-                    // the step past it is owed to the next call.
-                    self.next_pending = true;
-                    if (self.opts.pin_values) try self.pinCurrent(merge);
-                    return item;
-                }
-
-                // This tree is drained: close it and move the window past
-                // its snapshotted right edge. Empty primary = unbounded
-                // right (rightmost tree) → done.
-                merge.deinit();
-                self.merge = null;
-                if (self.tree_range.right.primary.len == 0) {
-                    self.done = true;
-                    return null;
-                }
-                self.key_range.left = self.tree_range.right;
-            }
-            return null;
-        }
-
-        /// Hold the storage behind the parked item's value, unless the
-        /// last pin already covers it (Pin's doc has the stability
-        /// guarantee a hold gives).
-        fn pinCurrent(
-            self: *Cursor,
-            merge: *const merge_iterator.MergeIterator,
-        ) !void {
-            const pin = merge.currentPin().?;
-            const covered = self.pins.items.len > 0 and
-                std.meta.eql(self.pins.getLast(), pin);
-            if (!covered) try self.pins.append(self.allocator, pin.acquire());
-        }
-
-        /// The caller is done with the values handed out so far: drop
-        /// their holds — except the item most recently handed out, which
-        /// the merge is still parked on and the caller may still be
-        /// holding; it stays pinned. No-op unless `opts.pin_values`.
-        pub fn releasePins(self: *Cursor) void {
-            for (self.pins.items) |pin| pin.release();
-            self.pins.clearRetainingCapacity();
-            if (self.opts.pin_values and self.next_pending) {
-                // That item's own pin sat in the list, so the capacity
-                // retained covers this one.
-                const pin = self.merge.?.currentPin().?;
-                self.pins.appendAssumeCapacity(pin.acquire());
-            }
-        }
-
-        /// Look up the tree owning `key_range.left`, snapshot its range, and
-        /// open a merge over its intersection with the window. Redoing the
-        /// lookup per hop keeps the scan safe against splits firing between
-        /// hops — we always take whichever tree currently covers the next
-        /// key. Leaves `merge` null and sets `done` when no tree does. An
-        /// empty intersection just opens an empty merge; `next` then hops
-        /// or finishes as usual.
-        ///
-        /// The tree is held by ref (`TableTrees.getTree`) across the range
-        /// snapshot and the table selection. A split never mutates a live
-        /// tree — it installs fresh objects and retires this one, which
-        /// stays whole for us — so the range copied and the tables pinned
-        /// describe the same instant, and a later split just moves tables
-        /// we already hold. The ref is released before the seek, the part
-        /// that reads blocks.
-        fn openNextTree(self: *Cursor) !void {
-            const a = self.arena.allocator();
-
-            const visit_range = blk: {
-                const trees = self.forest.getTable(self.ns, self.table_id) orelse {
-                    self.done = true;
-                    return;
-                };
-                const tree = trees.getTreeByKey(self.key_range.left) orelse {
-                    self.done = true;
-                    return;
-                };
-                defer tree.release();
-                self.tree_range = try tree.key_range.dupe(a);
-                const visit_range = self.key_range.intersect(self.tree_range);
-
-                // Memtable iters come from the cursor arena so they live
-                // exactly as long as the merge. (Memtables.getIterators
-                // returns a fresh slice; freeing it through the arena at
-                // deinit is fine.) The txn's pending skiplist rides in as
-                // src 0 — the merge's equal-key tie-break.
-                const srcs = try self.forest.memtables.getIterators(a, self.opts.pending);
-                self.merge = try tree.openMerge(
-                    a,
-                    visit_range,
-                    self.opts.priority,
-                    self.opts.min_ts,
-                    srcs,
-                );
-                break :blk visit_range;
-            };
-
-            // Position the sources. On error the merge stays set, so
-            // `deinit` still releases everything it pinned.
-            try self.merge.?.seekRange(visit_range.left, visit_range.right);
-            // A hop only happens after the previous merge was drained, and
-            // draining begins by paying the owed advance — so none is owed.
-            std.debug.assert(!self.next_pending);
-        }
-
-        /// Walk the open merge to the next item the options admit and
-        /// return it, leaving the merge positioned ON it. Null when this
-        /// tree is drained.
-        fn nextVisible(self: *Cursor, merge: *merge_iterator.MergeIterator) !?Item {
-            while (merge.itemRef()) |item| {
-                // Not written yet, as far as this scan is concerned.
-                // Filtered before everything below on purpose: before the
-                // tombstone rule, so a delete above read_ts can't hide a
-                // key that is still live at read_ts; and before the
-                // version cap, so invisible versions don't consume it.
-                if (item.key.timestamp > self.opts.read_ts) {
-                    try merge.next();
-                    continue;
-                }
-                // Unchanged since min_ts, as far as this scan is concerned:
-                // versions arrive newest first, so a key whose newest
-                // visible version fails this never starts, and one that
-                // changed emits only what changed.
-                if (item.key.timestamp <= self.opts.min_ts) {
-                    try merge.next();
-                    continue;
-                }
-
-                if (!item.key.equalPrimary(.{ .primary = self.cur_primary.items })) {
-                    self.cur_primary.clearRetainingCapacity();
-                    try self.cur_primary.appendSlice(self.allocator, item.key.primary);
-                    self.versions_emitted = 0;
-                    self.skip_versions = false;
-                }
-
-                // Skipped versions don't count against max_rows — that
-                // bounds what the caller receives, not what we walk past.
-                if (self.skip_versions or self.versions_emitted >= self.want_versions) {
-                    // TODO: Add a nextKey in underlying iterators.
-                    try merge.next();
-                    continue;
-                }
-
-                if (item.meta.isDeleted() and !self.opts.include_deleted) {
-                    // Deleted as of this version: suppress the tombstone
-                    // and everything older behind it.
-                    self.skip_versions = true;
-                    try merge.next();
-                    continue;
-                }
-
-                self.emitted += 1;
-                self.versions_emitted += 1;
-                return item;
-            }
-            return null;
-        }
-    };
-
-    /// The largest stored key for (namespace, table_id), or null if the table
-    /// has no keys. Assumes a monotonically-increasing row id (SQL's egid), so
-    /// the max lives in the rightmost tree and, within it, the rightmost SST of
-    /// each level: last-by-id in L0 (newest flush = highest ids) or last-by-
-    /// smallest in L≥1 (highest range). Step 1 takes the max of those SSTs'
-    /// in-memory `biggest` keys — O(#levels), no I/O. Step 2 scans from that
-    /// floor and keeps the highest key: the SSTs top out at floor, so anything
-    /// beyond it is an unflushed memtable row. If the scan surfaces nothing
-    /// higher, the floor stands. The returned Key's `primary` is owned by
-    /// `allocator` (free it). Callers derive a table's next id from it without
-    /// persisting a counter — so the max is the largest STORED key, deleted
-    /// or not: the memtable scan counts tombstones (include_deleted) and step
-    /// 1's SST `biggest` is physical, so a deleted current-max still seeds the
-    /// next id past itself and an id is never re-minted onto a tombstoned row.
-    pub fn maxKey(self: *Forest, allocator: std.mem.Allocator, ns: u64, table_id: u32) !?Key {
-        // Step 1: floor = max `biggest` over the rightmost SST of each level in
-        // the rightmost tree. Owned by `allocator`, or null if no SSTs.
-        var floor: ?Key = null;
-        errdefer if (floor) |f| f.free(allocator);
-        {
-            const trees = self.getTable(ns, table_id) orelse return null;
-            const tree = trees.getRightmostTree() orelse return null;
-            defer tree.release();
-            var best_sst: Key = .{};
-            const held = tree.mu.hold(.shared, @src());
-            defer held.release();
-            for (tree.levels) |*lv| {
-                const items = lv.entries(held);
-                if (items.len == 0) continue;
-
-                const b = items[items.len - 1].table.biggest; // rightmost
-                if (b.primary.len == 0) continue;
-
-                if (best_sst.primary.len == 0 or b.orderWithoutTs(best_sst) == .gt) best_sst = b;
-            }
-            // Dupe out from under the tables — they may close once locks drop.
-            if (best_sst.primary.len > 0) floor = try best_sst.dupe(allocator);
-        }
-
-        // Step 2: scan from floor (or the table start if there's no floor) and
-        // keep the highest key. `best` is a single reused buffer holding the
-        // latest (thus, at end, the largest) key's marshaled bytes — no
-        // per-row alloc churn. `floor` backs the left bound, so it outlives the
-        // scan.
-        const Ctx = struct {
-            allocator: std.mem.Allocator,
-            best: std.ArrayList(u8) = .empty,
-            fn emit(c: *@This(), item: Item) anyerror!bool {
-                c.best.clearRetainingCapacity();
-                _ = try item.key.marshalTo(c.allocator, &c.best);
-                return true;
-            }
-        };
-        var ctx = Ctx{ .allocator = allocator };
-        defer ctx.best.deinit(allocator);
-        // [floor, table end): floor (if any) is an in-table key we keep; no
-        // floor limits to the table start. limitToTable confines the memtable.
-        // include_deleted: a tombstoned max is still a stored key, so it must
-        // count — else its id gets re-minted onto a deleted row (see doc).
-        const scan_range = (KeyRange{ .left = floor orelse Key{} }).limitToTable(ns, table_id);
-        _ = try self.scan(
-            allocator,
-            scan_range,
-            .{ .include_deleted = true },
-            &ctx,
-            Ctx.emit,
-        );
-
-        // A memtable row above floor wins; otherwise floor stands (or null if
-        // the table had no SSTs and no rows).
-        if (ctx.best.items.len > 0) {
-            const k = try Key.initAlloc(allocator, ctx.best.items);
-            if (floor) |f| f.free(allocator);
-            return k;
-        }
-        return floor;
-    }
-
-    /// installTree opens the in-memory Tree for the given id and adds it to its
-    /// table's TableTrees (keyed by the high 32 bits of tree_id). Tree.open
-    /// reads the tree's key range from the manifest, so the caller must have
-    /// already committed the TreeChange. The open — which loads the tree's
-    /// SSTs, file I/O — holds nothing; the publish is the map's own insert
-    /// plus one list append under the table's lock, and the tree is
-    /// invisible until that append.
-    fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
-        const tree = try Tree.open(self.allocator, self.opts, namespace_id, tree_id, &self.ms, &self.table_cache);
-        errdefer tree.release();
-
-        const tbl_trees = try self.getOrCreateTable(namespace_id, treeTableId(tree_id));
-        const held = tbl_trees.mu.hold(.exclusive, @src());
-        defer held.release();
-        try tbl_trees.addTree(held, tree);
-    }
-
-    /// Walk every tree's level table list and append the file_ids of any SST
-    /// not currently on disk. The returned slice is owned by the caller.
-    pub fn collectMissingFileIds(self: *Forest, allocator: std.mem.Allocator) ![]u64 {
-        // The ids come out under the manifest lock; the disk check (a stat
-        // per file) runs after it is released.
-        const listed = try self.ms.listedFileIds(allocator);
-        defer allocator.free(listed);
-        var out: std.ArrayList(u64) = .empty;
-        errdefer out.deinit(allocator);
-        for (listed) |fid| {
-            if (!self.hasFile(fid)) try out.append(allocator, fid);
-        }
-        return out.toOwnedSlice(allocator);
-    }
-
-    /// Walk `self.ms.trees` and install each tree (Tree + TableTrees entries).
-    /// Used after `ForestState.restoreFrom(snapshot.data)` at recovery — the
-    /// manifest already names every tree and table, but the in-memory Tree
-    /// objects and TableTrees need to be rebuilt from it. Tree ids are
-    /// derived (table_id<<32 | split_id), so there is no counter to advance.
-    ///
-    /// File ids are NOT scanned here: each node's local counter is
-    /// restored from HardState's `max_file_id` via `forest.file_ids.bind`,
-    /// which is independent of (and immune to) ids in other nodes'
-    /// namespaces that show up in the manifest.
-    pub fn openTablesFromManifest(self: *Forest) !void {
-        // installTree opens each Tree (which dupes its key range from the
-        // manifest), so we only need the keys here.
-        const keys = try self.ms.treeKeys(self.allocator, null);
-        defer self.allocator.free(keys);
-        for (keys) |tk| try self.installTree(tk.namespace, tk.tree_id);
-    }
-
-    /// Create a new tree for the given namespace, table, and key range.
-    /// Single-node path (no Raft) — used by tests. Returns the new tree_id,
-    /// derived from the table's next free split index.
-    pub fn createTree(self: *Forest, namespace_id: u64, table_id: u32, range: KeyRange) !u64 {
-        const tree_id = self.nextTreeId(namespace_id, table_id);
-
-        const left_raw = try range.left.marshal(self.allocator);
-        defer self.allocator.free(left_raw);
-        const right_raw = try range.right.marshal(self.allocator);
-        defer self.allocator.free(right_raw);
-
-        try self.ms.commit(&.{}, &.{_manifest.createTreeChange(tree_id, namespace_id, left_raw, right_raw)});
-        try self.installTree(namespace_id, tree_id);
-        return tree_id;
-    }
-
-    /// buildNamespaceCreate is Phase A of the Raft-replicated namespace create:
-    /// returns a ManifestChange with one TreeChange per system table
-    /// (manifest.namespace_system_table_ids) — the namespace's default
-    /// (raw-KV) table (table_id 0, tree_id 0, carrying the namespace's `name`:
-    /// a SQL database name; empty for unnamed namespaces) and its SQL
-    /// catalogs — all with an infinite range (empty left+right). No state
-    /// mutates, so a failed propose costs nothing. Caller owns the returned
-    /// slice; `name` must outlive the change (it is marshalled at propose).
-    ///
-    /// Errors with `NamespaceAlreadyExists` if `namespace_id`'s default table
-    /// already exists, `NameExists` if another namespace holds `name`.
-    pub fn buildNamespaceCreate(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, name: []const u8) !_manifest.ManifestChange {
-        std.debug.assert(namespace_id > 0);
-        if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
-        if (self.ms.lookupNamespace(name)) |_| return error.NameExists;
-
-        // One tree per system table: the default (raw-KV) table plus the SQL
-        // catalogs, born with the namespace — catalog rows must never race
-        // tree creation, because buildFlush silently drops keys whose
-        // (ns, table_id) has no tree.
-        const ids = _manifest.namespace_system_table_ids;
-        const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.len);
-        for (ids, tree_changes) |table_id, *tc|
-            tc.* = _manifest.createTreeChange(makeTreeId(table_id, 0), namespace_id, "", "");
-        // table_id 0 carries the namespace's name.
-        tree_changes[0].name = @constCast(name);
-
-        return .{
-            .tree_changes = tree_changes,
-            .sstable_changes = &.{},
-            .cmd = .create_ns,
-            .memtable_id = 0,
-        };
-    }
-
-    /// Result of buildCreateNamespace: the allocated namespace id plus the
-    /// ns_create ManifestChange carrying the database name.
-    pub const CreateNamespaceResult = struct {
-        namespace: u64,
-        change: _manifest.ManifestChange,
-    };
-
-    /// buildCreateNamespace is the allocating namespace create (SQL: CREATE
-    /// DATABASE `name`): reserve the next namespace id and build its ns_create
-    /// change. applyNamespaceCreate advances the same counter and records the
-    /// name on every node, so a re-elected leader never re-issues a namespace
-    /// and name → namespace resolution is manifest state everywhere. Caller
-    /// owns `change.tree_changes`.
-    pub fn buildCreateNamespace(self: *Forest, alloc: std.mem.Allocator, name: []const u8) !CreateNamespaceResult {
-        const namespace = self.ms.nextNamespace();
-        return .{
-            .namespace = namespace,
-            .change = try self.buildNamespaceCreate(alloc, namespace, name),
-        };
-    }
-
-    /// Resolve a database name to its namespace id (manifest state, current
-    /// on every node via the apply path).
-    pub fn lookupNamespace(self: *Forest, name: []const u8) ?u64 {
-        return self.ms.lookupNamespace(name);
-    }
-
-    /// Resolve a table name to its table_id within a namespace (manifest
-    /// state, current on every node via the apply path).
-    pub fn lookupTable(self: *Forest, namespace_id: u64, name: []const u8) ?u32 {
-        return self.ms.lookupTable(namespace_id, name);
-    }
-
-    /// applyNamespaceCreate is Phase B: commits each TreeChange to the manifest,
-    /// installs the in-memory Tree + namespace route, records the namespace's
-    /// name, and advances the global namespace counter (idempotent — keeps a
-    /// re-elected leader current). Called on all nodes after Raft commit
-    /// (create_ns).
-    ///
-    /// Skips any TreeChange whose tree already exists (re-apply).
-    pub fn applyNamespaceCreate(self: *Forest, mc: _manifest.ManifestChange) !void {
-        for (mc.tree_changes) |tc| {
-            if (tc.op != .create) continue; // only CREATE for ns_create
-            self.ms.advanceNamespace(tc.namespace_id);
-            try self.ms.registerNamespaceName(tc.namespace_id, tc.name);
-            // Per-tree, not per-namespace: an ns_create carries the default
-            // AND catalog trees — checking only table 0 would skip the rest.
-            if (self.hasTree(tc.namespace_id, tc.tree_id)) {
-                std.log.warn("applyNamespaceCreate: ns={d} tree_id={d} already exists, skipping", .{ tc.namespace_id, tc.tree_id });
-                continue;
-            }
-            try self.ms.commit(&.{}, &.{tc});
-            // Empty left/right encodes the infinite range; each tree lands in
-            // its table derived from the tree_id (0 = raw-KV, 1 = catalog).
-            try self.installTree(tc.namespace_id, tc.tree_id);
-        }
-    }
-
-    /// buildCreateTree is Phase A of a per-table tree create: derive the tree_id
-    /// for a NEW table (Key.table_id) in an existing namespace — a fresh
-    /// table starts at split 0, so tree_id = (table_id << 32). The tree is
-    /// infinite-range *within* its table — routing isolates by
-    /// (namespace, table_id), so no key-range bound is needed. No state mutates,
-    /// so a failed propose costs nothing. create_tree. Caller owns the returned slice.
-    pub fn buildCreateTree(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_id: u32) !_manifest.ManifestChange {
-        const tree_id = self.nextTreeId(namespace_id, table_id);
-        const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
-        tree_changes[0] = _manifest.createTreeChange(tree_id, namespace_id, "", "");
-        return .{
-            .tree_changes = tree_changes,
-            .sstable_changes = &.{},
-            .cmd = .create_tree,
-            .memtable_id = 0,
-        };
-    }
-
-    /// Result of buildCreateTables: one allocated table_id per requested name
-    /// (same order) plus the single create_tree ManifestChange creating them
-    /// all. Caller owns `table_ids` and `change.tree_changes`.
-    pub const CreateTablesResult = struct {
-        table_ids: []u32,
-        change: _manifest.ManifestChange,
-    };
-
-    /// buildCreateTables creates N sibling tables in ONE change — a
-    /// SQL table plus its index tables, so they commit atomically. Each
-    /// name gets its own freshly allocated table_id (at split 0) and a create
-    /// TreeChange carrying that name; apply registers every name → table_id on
-    /// all nodes and advances the id counter past each. A non-empty name
-    /// already taken in the namespace errors `NameExists` (sound while the
-    /// caller serializes DDL); an empty name registers nothing (system trees).
-    /// `names` must be pairwise distinct — an intra-batch duplicate is the
-    /// caller's bug (the second would install unnamed). Caller owns both
-    /// returned slices; each name must outlive the change (marshalled at
-    /// propose).
-    pub fn buildCreateTables(
-        self: *Forest,
-        alloc: std.mem.Allocator,
-        namespace_id: u64,
-        names: []const []const u8,
-    ) !CreateTablesResult {
-        for (names) |name|
-            if (name.len > 0 and self.ms.lookupTable(namespace_id, name) != null)
-                return error.NameExists;
-
-        const table_ids = try alloc.alloc(u32, names.len);
-        errdefer alloc.free(table_ids);
-        const tree_changes = try alloc.alloc(_manifest.TreeChange, names.len);
-        errdefer alloc.free(tree_changes);
-
-        for (names, 0..) |name, i| {
-            const table_id = try self.ms.nextTableId(namespace_id);
-            table_ids[i] = table_id;
-            const tree_id = self.nextTreeId(namespace_id, table_id);
-            tree_changes[i] = _manifest.createTreeChange(tree_id, namespace_id, "", "");
-            tree_changes[i].name = @constCast(name);
-        }
-        return .{
-            .table_ids = table_ids,
-            .change = .{
-                .tree_changes = tree_changes,
-                .sstable_changes = &.{},
-                .cmd = .create_tree,
-                .memtable_id = 0,
-            },
-        };
-    }
-
-    /// applyCreateTree is Phase B: commit each TreeChange and install an empty
-    /// infinite-range tree in its (namespace, table_id) table, registering the
-    /// namespace/table if absent. Also advances the namespace's table_id
-    /// counter past the created table (idempotent; this is what keeps a
-    /// re-elected leader's allocator current). Idempotent on (namespace,
-    /// tree_id). Called on all nodes after Raft commit (create_tree).
-    pub fn applyCreateTree(self: *Forest, mc: _manifest.ManifestChange) !void {
-        for (mc.tree_changes) |tc| {
-            if (tc.op != .create) continue;
-            try self.ms.advanceTableId(tc.namespace_id, treeTableId(tc.tree_id));
-            // Before the idempotency skip, like advanceTableId: a re-apply
-            // (WAL replay over snapshot-restored state) re-registers as a
-            // no-op.
-            try self.ms.registerTableName(tc.namespace_id, treeTableId(tc.tree_id), tc.name);
-            if (self.hasTree(tc.namespace_id, tc.tree_id)) continue; // already applied
-            try self.ms.commit(&.{}, &.{tc});
-            try self.installTree(tc.namespace_id, tc.tree_id);
-        }
-    }
-
-    /// buildDropTables is Phase A of DROP TABLE: emit a delete change for
-    /// every tree of every given table_id — a table can span >1 tree after
-    /// splits, and a SQL table drops alongside its index tables in one atomic
-    /// change. table_id counters are NOT rewound (ids are never reused, since
-    /// a dropped SST may still be clone-shared). drop_tree. Returns an empty
-    /// change set if none of the tables have trees. Caller owns the slice.
-    ///
-    /// The dropped tables' rows in the namespace's CATALOG trees are NOT
-    /// touched — with their names gone and table_ids never reused they are
-    /// unreachable garbage. TODO: issue tombstones for them.
-    pub fn buildDropTables(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, table_ids: []const u32) !_manifest.ManifestChange {
-        var ids: std.ArrayList(u64) = .empty;
-        defer ids.deinit(alloc);
-        for (table_ids) |table_id|
-            if (self.getTable(namespace_id, table_id)) |trees| {
-                const held = trees.mu.hold(.shared, @src());
-                defer held.release();
-                for (trees.list(held)) |e| try ids.append(alloc, e.tree_id);
-            };
-
-        const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.items.len);
-        for (ids.items, 0..) |tree_id, i| {
-            tree_changes[i] = _manifest.deleteTreeChange(tree_id, namespace_id);
-        }
-        return .{
-            .tree_changes = tree_changes,
-            .sstable_changes = &.{},
-            .cmd = .drop_tree,
-            .memtable_id = 0,
-        };
-    }
-
-    /// applyDropTree is Phase B of DROP: for each delete change, remove the route
-    /// entry (dropping the table once empty), tear down the in-memory tree
-    /// (Tree.close releases its level refs on its SSTs — SSTs shared with another
-    /// tree survive via refcount), and remove the tree from the manifest.
-    /// Idempotent. drop_tree.
-    ///
-    /// NOTE: dropped SST *files* are not eagerly unlinked from disk (Tree.close
-    /// detaches, and the table cache holds its own ref). The data is immediately
-    /// unqueryable (route + manifest gone); physical reclaim of orphaned SSTs is
-    /// left to snapshot GC — a follow-up.
-    pub fn applyDropTree(self: *Forest, mc: _manifest.ManifestChange) !void {
-        try self.applyTreeDeletes(mc);
-        // Forget each dropped table's name (first delete of a multi-tree
-        // table removes it; the rest are no-ops). drop_ns doesn't
-        // come here — dropNamespace frees the whole map.
-        for (mc.tree_changes) |tc| {
-            if (tc.op != .delete) continue;
-            self.ms.dropTable(tc.namespace_id, treeTableId(tc.tree_id));
-        }
-    }
-
-    /// The delete-changes walk shared by applyDropTree and applyDropNamespace.
-    /// Runs on the apply loop, like every other create and drop.
-    fn applyTreeDeletes(self: *Forest, mc: _manifest.ManifestChange) !void {
-        for (mc.tree_changes) |tc| {
-            if (tc.op != .delete) continue;
-
-            // Remove the tree from its table (derived from the tree_id's
-            // high 32 bits) and tear it down (releases its level refs on its
-            // SSTs). Drop the table once it has no trees left.
-            // The tree leaves the list under the table lock, so no reader can
-            // find it from here on; dropping the list's ref then closes it
-            // as soon as the readers that already hold it let go. The
-            // TableTrees itself stays in the map, empty: table ids are never
-            // reused, and a reader may still be holding its pointer.
-            if (self.getTable(tc.namespace_id, treeTableId(tc.tree_id))) |trees| {
-                const gone = blk: {
-                    const held = trees.mu.hold(.exclusive, @src());
-                    defer held.release();
-                    break :blk trees.removeTree(held, tc.tree_id);
-                };
-                if (gone) |tree| tree.release();
-            }
-
-            // Remove from the manifest (frees the TreeState + its table set).
-            try self.ms.commit(&.{}, &.{tc});
-        }
-    }
-
-    /// buildDropNamespace is Phase A of DROP DATABASE: emit a delete change for
-    /// every tree in every table of the namespace — the default table, system
-    /// tables (catalog etc.), and user tables alike. drop_ns. Namespace ids are
-    /// never reused, so no counter rewind is needed; applyDropNamespace forgets
-    /// the counter entirely. Returns an empty change set for an unknown
-    /// namespace (idempotent). Caller owns the returned slice.
-    pub fn buildDropNamespace(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64) !_manifest.ManifestChange {
-        var changes: std.ArrayList(_manifest.TreeChange) = .empty;
-        defer changes.deinit(alloc);
-        {
-            var it = self.tables.iterator();
-            defer it.deinit();
-            while (it.next()) |kv| {
-                if (kv.key_ptr.namespace != namespace_id) continue;
-                const trees = kv.value_ptr.*;
-                const held = trees.mu.hold(.shared, @src());
-                defer held.release();
-                for (trees.list(held)) |e| {
-                    try changes.append(alloc, _manifest.deleteTreeChange(e.tree_id, namespace_id));
-                }
-            }
-        }
-        return .{
-            .tree_changes = try changes.toOwnedSlice(alloc),
-            .sstable_changes = &.{},
-            .cmd = .drop_ns,
-            .memtable_id = 0,
-        };
-    }
-
-    /// applyDropNamespace is Phase B of DROP DATABASE: tear down every tree of
-    /// the namespace (same per-tree semantics as applyDropTree — SSTs shared via
-    /// refcount survive; physical reclaim is snapshot GC's job), then forget the
-    /// namespace's manifest state (table_id counter + name, freeing the name
-    /// for re-CREATE). Leftover memtable entries for the namespace are dropped
-    /// at flush (buildFlush skips items with no route). Idempotent. drop_ns.
-    pub fn applyDropNamespace(self: *Forest, mc: _manifest.ManifestChange) !void {
-        try self.applyTreeDeletes(mc);
-        if (mc.tree_changes.len > 0) {
-            self.ms.dropNamespace(mc.tree_changes[0].namespace_id);
         }
     }
 
@@ -1839,7 +998,10 @@ pub const Forest = struct {
             const held = trees.mu.hold(.shared, @src());
             defer held.release();
             for (trees.list(held)) |tree| {
-                const tk = TreeKey{ .namespace = tree.namespace, .tree_id = tree.tree_id };
+                const tk = TreeKey{
+                    .namespace = tree.namespace,
+                    .tree_id = tree.tree_id,
+                };
                 if (skip) |s| if (s.contains(tk)) continue;
                 const th = tree.mu.hold(.shared, @src());
                 defer th.release();
@@ -1890,236 +1052,13 @@ pub const Forest = struct {
         return true;
     }
 
-    // -----------------------------------------------------------------------
-    // Stats dump
-    // -----------------------------------------------------------------------
-
-    /// What slice of the forest the caller wants to see. Default is a
-    /// top-level summary that aggregates across all trees.
-    pub const StatsScope = union(enum) {
-        forest,
-        tree: TreeKey,
-        namespace: u64,
-    };
-
-    pub const StatsOpts = struct {
-        scope: StatsScope = .forest,
-    };
-
-    /// writeStats produces a hierarchical, human-readable text dump of
-    /// current LSM state to `w`. Unlike the Prometheus metrics endpoint,
-    /// this is for ops drill-down: per-tree shape, per-level sizes,
-    /// pending compactions. Snapshot is best-effort — locks are taken
-    /// briefly per section, so a concurrent flush/compaction may show
-    /// itself half-applied. Acceptable for a debug endpoint.
-    pub fn writeStats(self: *Forest, w: *std.Io.Writer, opts: StatsOpts) !void {
-        switch (opts.scope) {
-            .forest => try self.writeForestStats(w),
-            .tree => |id| try self.writeTreeStats(w, id),
-            .namespace => |ns| try self.writeNamespaceStats(w, ns),
-        }
-    }
-
-    fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
-        const mt = self.memtables.stats();
-        try w.print("forest:\n", .{});
-        try w.print("  memtables: active=", .{});
-        try writeBytes(w, mt.active_bytes);
-        try w.print(" immutable={d} (", .{mt.immutable_count});
-        try writeBytes(w, mt.immutable_bytes);
-        try w.print(" pending flush)\n", .{});
-        try w.print("  flush_pending: {d}\n", .{mt.immutable_count});
-
-        // Per-level aggregate (sum + max-with-tree).
-        const max_levels = self.opts.max_levels;
-        const Agg = struct {
-            tables_total: u64 = 0,
-            tables_max: u64 = 0,
-            tables_max_tree: u64 = 0,
-            bytes_total: u64 = 0,
-            bytes_max: u64 = 0,
-            bytes_max_tree: u64 = 0,
-        };
-        const aggs = try self.allocator.alloc(Agg, max_levels);
-        defer self.allocator.free(aggs);
-        for (aggs) |*a| a.* = .{};
-
-        // Per-level "compactions wanted" rollup.
-        const Wanted = struct {
-            count: u64 = 0,
-            score_max: f64 = 0,
-            score_max_tree: u64 = 0,
-        };
-        const wanted = try self.allocator.alloc(Wanted, max_levels);
-        defer self.allocator.free(wanted);
-        for (wanted) |*x| x.* = .{};
-
-        // Largest tree (sum across levels).
-        var largest_tree_id: u64 = 0;
-        var largest_tree_size: i64 = 0;
-        var tree_count: usize = 0;
-
-        // Walk under the map lock, each table's lock shared while its list
-        // is read, but only briefly: collect the numbers we need, release.
-        // Each level access takes its own lock inside numTables/getTotalSize.
-        {
-            var tables_it = self.tables.iterator();
-            defer tables_it.deinit();
-            while (tables_it.next()) |kv| {
-                const trees = kv.value_ptr.*;
-                const held = trees.mu.hold(.shared, @src());
-                defer held.release();
-                for (trees.list(held)) |tree| {
-                    tree_count += 1;
-                    const tree_id = tree.tree_id;
-
-                    const th = tree.mu.hold(.shared, @src());
-                    defer th.release();
-                    var tree_total: i64 = 0;
-                    for (tree.levels, 0..) |*lv, idx| {
-                        if (idx >= max_levels) break;
-                        const tcount: u64 = @intCast(lv.numTables(th));
-                        const tbytes: u64 = @intCast(lv.getTotalSize(th));
-                        tree_total += @intCast(tbytes);
-
-                        aggs[idx].tables_total += tcount;
-                        if (tcount > aggs[idx].tables_max) {
-                            aggs[idx].tables_max = tcount;
-                            aggs[idx].tables_max_tree = tree_id;
-                        }
-                        aggs[idx].bytes_total += tbytes;
-                        if (tbytes > aggs[idx].bytes_max) {
-                            aggs[idx].bytes_max = tbytes;
-                            aggs[idx].bytes_max_tree = tree_id;
-                        }
-                    }
-                    if (tree_total > largest_tree_size) {
-                        largest_tree_size = tree_total;
-                        largest_tree_id = tree_id;
-                    }
-
-                    if (tree.compact_candidate) |c| {
-                        if (c.level < max_levels) {
-                            wanted[c.level].count += 1;
-                            if (c.score > wanted[c.level].score_max) {
-                                wanted[c.level].score_max = c.score;
-                                wanted[c.level].score_max_tree = tree_id;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        try w.print("  trees: {d}\n", .{tree_count});
-        try w.print("  largest_tree: id={d} size=", .{largest_tree_id});
-        try writeBytes(w, @intCast(largest_tree_size));
-        try w.print("\n\n", .{});
-
-        try w.print("  level summary (across all trees):\n", .{});
-        for (aggs, 0..) |a, idx| {
-            // Skip levels that have nothing — shows max_levels=7 dumps cleanly.
-            if (a.tables_total == 0 and a.bytes_total == 0) continue;
-            try w.print("    L{d}: tables={d} (max={d} in tree {d})  bytes=", .{
-                idx, a.tables_total, a.tables_max, a.tables_max_tree,
-            });
-            try writeBytes(w, a.bytes_total);
-            try w.print(" (max=", .{});
-            try writeBytes(w, a.bytes_max);
-            try w.print(" in tree {d})\n", .{a.bytes_max_tree});
-        }
-
-        var any_wanted = false;
-        for (wanted) |x| if (x.count > 0) {
-            any_wanted = true;
-            break;
-        };
-        if (any_wanted) {
-            try w.print("\n  compactions wanted:\n", .{});
-            for (wanted, 0..) |x, idx| {
-                if (x.count == 0) continue;
-                try w.print("    L{d}: trees={d} score_max={d:.2} (tree {d})\n", .{
-                    idx, x.count, x.score_max, x.score_max_tree,
-                });
-            }
-        }
-    }
-
-    fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tk: TreeKey) !void {
-        const tree = self.getTree(tk.namespace, tk.tree_id) orelse {
-            try w.print("tree id={d}: not found\n", .{tk.tree_id});
-            return;
-        };
-        defer tree.release();
-
-        // Numbers first, under the lock; printing after — the writer may be
-        // a socket, and a slow client must not hold up installs into this
-        // tree.
-        const LevelStat = struct { tables: usize, bytes: u64 };
-        const per_level = try self.allocator.alloc(LevelStat, tree.levels.len);
-        defer self.allocator.free(per_level);
-        const total: i64, const candidate: ?_tree.CompactCandidate = blk: {
-            const held = tree.mu.hold(.shared, @src());
-            defer held.release();
-            for (tree.levels, per_level) |*lv, *st| {
-                st.* = .{ .tables = lv.numTables(held), .bytes = @intCast(lv.getTotalSize(held)) };
-            }
-            break :blk .{ tree.totalSize(held), tree.compact_candidate };
-        };
-
-        try w.print("tree id={d} namespace={d} size=", .{ tk.tree_id, tk.namespace });
-        try writeBytes(w, @intCast(total));
-        try w.print("\n", .{});
-
-        for (per_level, 0..) |st, idx| {
-            if (st.tables == 0 and st.bytes == 0) continue;
-            try w.print("  L{d}: {d} tables, ", .{ idx, st.tables });
-            try writeBytes(w, st.bytes);
-            try w.print("\n", .{});
-        }
-        if (candidate) |c| {
-            try w.print("  compact_candidate: L{d} score={d:.2}\n", .{ c.level, c.score });
-        }
-    }
-
-    fn writeNamespaceStats(self: *Forest, w: *std.Io.Writer, ns_id: u64) !void {
-        try w.print("namespace={d}:\n", .{ns_id});
-        var any = false;
-        // Tree keys come out under the manifest lock (the map they live in
-        // is the apply loop's to rehash); writeTreeStats then takes each
-        // tree's own lock.
-        const keys = try self.ms.treeKeys(self.allocator, ns_id);
-        defer self.allocator.free(keys);
-        for (keys) |tk| {
-            any = true;
-            try writeTreeStats(self, w, tk);
-        }
-        if (!any) try w.print("  (no trees)\n", .{});
-    }
-
-    /// Pretty-print a byte count: KiB / MiB / GiB / TiB. Two decimal places
-    /// of precision past the smallest meaningful unit.
-    fn writeBytes(w: *std.Io.Writer, b: u64) !void {
-        const kib: u64 = 1024;
-        const mib: u64 = 1024 * kib;
-        const gib: u64 = 1024 * mib;
-        const tib: u64 = 1024 * gib;
-        if (b >= tib) {
-            try w.print("{d:.2}TiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(tib))});
-        } else if (b >= gib) {
-            try w.print("{d:.2}GiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(gib))});
-        } else if (b >= mib) {
-            try w.print("{d:.2}MiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(mib))});
-        } else if (b >= kib) {
-            try w.print("{d:.2}KiB", .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(kib))});
-        } else {
-            try w.print("{d}B", .{b});
-        }
-    }
-
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = _fi.sstPath(self.allocator, self.opts.dir, file_id) catch return false;
+        const path = _fi.sstPath(
+            self.allocator,
+            self.opts.dir,
+            file_id,
+        ) catch return false;
         defer self.allocator.free(path);
         vfs.access(path) catch return false;
         return true;
@@ -2129,7 +1068,8 @@ pub const Forest = struct {
     /// Skips the write when the file is already cached, or already on disk with
     /// a matching size — file_id → content is deterministic in this system, and
     /// a size match is a strong signal the bytes are correct (no cross-ID
-    /// collisions possible). If a size mismatch is detected, we log and rewrite.
+    /// collisions possible). If a size mismatch is detected, we log and
+    /// rewrite.
     pub fn writeFile(self: *Forest, file_id: u64, data: []const u8) void {
         const fe = std.log.scoped(.file_event);
         if (self.table_cache.contains(file_id)) {
@@ -2137,25 +1077,43 @@ pub const Forest = struct {
             return;
         }
 
-        const path = _fi.sstPath(self.allocator, self.opts.dir, file_id) catch return;
+        const path = _fi.sstPath(
+            self.allocator,
+            self.opts.dir,
+            file_id,
+        ) catch return;
         defer self.allocator.free(path);
 
-        // Probe existence + size via vfs (no allocation, just open + getEndPos).
-        const existing_size: ?u64 = if (vfs.g().openFile(self.allocator, path, .{})) |fh| blk: {
+        // Probe existence + size via vfs (no allocation, just open +
+        // getEndPos).
+        const existing_size: ?u64 = if (vfs.g().openFile(
+            self.allocator,
+            path,
+            .{},
+        )) |fh| blk: {
             defer fh.close();
             break :blk fh.file_size;
         } else |_| null;
 
-        const size_matches = existing_size != null and existing_size.? == data.len;
+        const size_matches = existing_size != null and
+            existing_size.? == data.len;
         if (existing_size != null and !size_matches) {
-            log.warn("writeFile: size mismatch for {d} ({d} on disk vs {d}), rewriting", .{
-                file_id, existing_size.?, data.len,
-            });
+            log.warn(
+                "writeFile: size mismatch for {d} ({d} on disk vs {d}), " ++
+                    "rewriting",
+                .{ file_id, existing_size.?, data.len },
+            );
         }
 
         if (!size_matches) {
-            const fh = vfs.g().createFile(path, .{ .mode = .direct, .flags = .{ .truncate = true } }) catch |err| {
-                log.err("writeFile: createFile failed for {d}: {s}", .{ file_id, @errorName(err) });
+            const fh = vfs.g().createFile(path, .{
+                .mode = .direct,
+                .flags = .{ .truncate = true },
+            }) catch |err| {
+                log.err(
+                    "writeFile: createFile failed for {d}: {s}",
+                    .{ file_id, @errorName(err) },
+                );
                 return;
             };
             // `data` is a slice into a network frame (see node.zig p1_recv), so
@@ -2165,36 +1123,63 @@ pub const Forest = struct {
             // non-aligned length means a corrupt/unexpected file — log and bail
             // rather than reshape it.
             if (data.len % vfs.page_size != 0) {
-                log.err("writeFile: file {d} length {d} not page-aligned; refusing O_DIRECT write", .{ file_id, data.len });
+                log.err(
+                    "writeFile: file {d} length {d} not page-aligned; " ++
+                        "refusing O_DIRECT write",
+                    .{ file_id, data.len },
+                );
                 fh.close();
                 return;
             }
-            const buf = self.allocator.alignedAlloc(u8, vfs.page_alignment, data.len) catch |err| {
-                log.err("writeFile: bounce alloc failed for {d}: {s}", .{ file_id, @errorName(err) });
+            const buf = self.allocator.alignedAlloc(
+                u8,
+                vfs.page_alignment,
+                data.len,
+            ) catch |err| {
+                log.err(
+                    "writeFile: bounce alloc failed for {d}: {s}",
+                    .{ file_id, @errorName(err) },
+                );
                 fh.close();
                 return;
             };
             defer self.allocator.free(buf);
             @memcpy(buf, data);
             fh.write(buf, 0, .p1) catch |err| {
-                log.err("writeFile: write failed for {d}: {s}", .{ file_id, @errorName(err) });
+                log.err(
+                    "writeFile: write failed for {d}: {s}",
+                    .{ file_id, @errorName(err) },
+                );
                 fh.close();
                 return;
             };
             fh.sync() catch {};
             fh.close();
-            fe.info("event=write_file file_id={d} path=wrote bytes={d}", .{ file_id, data.len });
+            fe.info(
+                "event=write_file file_id={d} path=wrote bytes={d}",
+                .{ file_id, data.len },
+            );
         } else {
-            fe.info("event=write_file file_id={d} path=disk_hit bytes={d}", .{ file_id, data.len });
+            fe.info(
+                "event=write_file file_id={d} path=disk_hit bytes={d}",
+                .{ file_id, data.len },
+            );
         }
 
-        // Pre-open the table into the cache so it's ready when compaction needs it.
+        // Pre-open the table into the cache so it's ready when compaction needs
+        // it.
         const t = Table.open(self.allocator, path, .p1) catch |err| {
-            log.err("writeFile: Table.open failed for {d}: {s}", .{ file_id, @errorName(err) });
+            log.err(
+                "writeFile: Table.open failed for {d}: {s}",
+                .{ file_id, @errorName(err) },
+            );
             return;
         };
         const adopted = self.table_cache.own(file_id, t) catch |err| blk: {
-            log.err("writeFile: table_cache.own failed for {d}: {s}", .{ file_id, @errorName(err) });
+            log.err(
+                "writeFile: table_cache.own failed for {d}: {s}",
+                .{ file_id, @errorName(err) },
+            );
             break :blk false;
         };
         // The open-time ref is ours to drop: the cache holds its own once it
@@ -2205,158 +1190,26 @@ pub const Forest = struct {
     }
 
     /// Read an SST file from disk. Caller owns the returned slice.
-    pub fn readFile(self: *Forest, allocator: std.mem.Allocator, file_id: u64) ?[]const u8 {
-        const path = _fi.sstPath(self.allocator, self.opts.dir, file_id) catch return null;
+    pub fn readFile(
+        self: *Forest,
+        allocator: std.mem.Allocator,
+        file_id: u64,
+    ) ?[]const u8 {
+        const path = _fi.sstPath(
+            self.allocator,
+            self.opts.dir,
+            file_id,
+        ) catch return null;
         defer self.allocator.free(path);
         const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
         defer handle.close();
-        const result = handle.readAligned(allocator, 0, @intCast(handle.file_size), .p1) catch return null;
+        const result = handle.readAligned(
+            allocator,
+            0,
+            @intCast(handle.file_size),
+            .p1,
+        ) catch return null;
         return result.data;
-    }
-
-    /// buildSplit is Phase A: finds the split key, classifies tables, and returns
-    /// a ManifestChange with the table and tree changes. All allocations go on
-    /// the provided allocator (typically an arena). The caller proposes the
-    /// ManifestChange through Raft. The new half stays in the parent's table
-    /// table, so its tree_id is the table's next free split index.
-    pub fn buildSplit(self: *Forest, alloc: std.mem.Allocator, namespace_id: u64, tree_id: u64) !?_manifest.ManifestChange {
-        std.debug.assert(namespace_id > 0);
-        const left_tree = self.getTree(namespace_id, tree_id) orelse return null;
-        defer left_tree.release();
-
-        // Find split key from the lowest level in old tree.
-        const split_key = try left_tree.findSplitKey(alloc);
-        if (split_key.len() == 0) {
-            return null;
-        }
-
-        // The old tree's bounds, copied out under the manifest lock: this
-        // runs on the split-propose fiber while the apply loop may commit
-        // (rehashing the map, freeing a dropped tree's keys).
-        const old_range = try self.ms.treeRange(alloc, .{ .namespace = namespace_id, .tree_id = tree_id }) orelse return null;
-        const new_tree_id = self.nextTreeId(namespace_id, treeTableId(tree_id));
-
-        // Classify tables per level and build manifest changes.
-        var table_changes: std.ArrayList(_manifest.SSTableChange) = .empty;
-
-        const held = left_tree.mu.hold(.shared, @src());
-        defer held.release();
-        for (left_tree.levels, 0..) |*llv, llv_idx| {
-            for (llv.entries(held)) |tbe| {
-                if (tbe.table.smallest.order(split_key) != .lt) { // .eq or .gt
-                    // Right-only: remove from old tree, add to new tree.
-                    try table_changes.append(alloc, _manifest.deleteSSTableChange(
-                        tbe.id,
-                        namespace_id,
-                        tree_id,
-                        @intCast(llv_idx),
-                    ));
-                    try table_changes.append(alloc, _manifest.createSSTableChange(
-                        tbe.id,
-                        namespace_id,
-                        new_tree_id,
-                        @intCast(llv_idx),
-                    ));
-                } else if (tbe.table.biggest.order(split_key) != .lt) { // .eq or .gt
-                    // order: smallest key < split key <= biggest key
-                    // Therefore, the split key falls within the table.
-                    // Shared: keep in old tree, also add to new tree.
-                    try table_changes.append(alloc, _manifest.createSSTableChange(tbe.id, namespace_id, new_tree_id, @intCast(llv_idx)));
-                }
-                // Left-only: no manifest change needed.
-            }
-        }
-
-        const left_left_raw_key = try old_range.left.marshal(alloc);
-        const right_right_raw_key = try old_range.right.marshal(alloc);
-        const split_raw = try split_key.marshal(alloc);
-
-        const tree_changes = try alloc.alloc(_manifest.TreeChange, 2);
-        tree_changes[0] = _manifest.updateTreeChange(tree_id, namespace_id, left_left_raw_key, split_raw);
-        tree_changes[1] = _manifest.createTreeChange(new_tree_id, namespace_id, split_raw, right_right_raw_key);
-
-        return .{
-            .sstable_changes = try table_changes.toOwnedSlice(alloc),
-            .tree_changes = tree_changes,
-            .cmd = .tree_split,
-        };
-    }
-
-    /// applySplit is Phase B: commits the manifest changes, opens FRESH tree
-    /// objects for both halves from the post-commit manifest — the left
-    /// keeps its id with the narrowed range and only its tables, the right
-    /// is new — swaps them into the table's list, and retires the old
-    /// object. The old one is never mutated: whoever still holds a ref on
-    /// it (a reader mid-selection, a proposer) keeps seeing its full range
-    /// and full table set until they let go, which is what makes a split
-    /// safe against readers without any of them taking a lock across their
-    /// use of a tree. Called on all nodes after Raft commit. The new tree_id
-    /// is derived deterministically (table's next split index), so there is
-    /// no counter for a new leader to re-issue.
-    pub fn applySplit(self: *Forest, mc: _manifest.ManifestChange) !void {
-        // Commit MANIFEST so we can recover from a crash.
-        try self.ms.commit(mc.sstable_changes, mc.tree_changes);
-
-        // Find the old tree_id (UPDATE) and new tree_id (CREATE) from tree_changes.
-        // Both changes carry the same namespace (a split stays within one).
-        var old_tree_id: u64 = 0;
-        var new_tree_id: u64 = 0;
-        var namespace_id: u64 = 0;
-        for (mc.tree_changes) |tc| {
-            if (tc.op == .update) { // UPDATE
-                old_tree_id = tc.tree_id;
-            } else if (tc.op == .create) { // CREATE
-                new_tree_id = tc.tree_id;
-            }
-            namespace_id = tc.namespace_id;
-        }
-
-        // Both halves are opened from the post-commit manifest while the old
-        // object still lists every table, so loadTables finds the shared
-        // ones in the cache with ref > 0. Their key ranges come from the
-        // manifest too: the left's right edge is the split key.
-        // Refs start at 1, so releasing a half that never gets published
-        // closes and frees it.
-        const left = try Tree.open(self.allocator, self.opts, namespace_id, old_tree_id, &self.ms, &self.table_cache);
-        errdefer left.release();
-        const right = try Tree.open(self.allocator, self.opts, namespace_id, new_tree_id, &self.ms, &self.table_cache);
-        errdefer right.release();
-
-        // Fresh candidates against the post-split state. Without this the
-        // left half would carry the old tree's `{needs_split=true}` verdict
-        // even though half its tables just moved out, and the next
-        // levels-loop iteration would fire another split.
-        try left.updateCompactCandidate();
-        try right.updateCompactCandidate();
-
-        // The swap: both halves in, the old object out, under one exclusive
-        // hold of the table's lock (same table — a split shares the high
-        // 32 bits of the tree_id). Capacity is reserved first so the two
-        // adds cannot fail between the old tree leaving and them landing.
-        std.debug.assert(treeTableId(new_tree_id) == treeTableId(old_tree_id));
-        const trees = self.getTable(namespace_id, treeTableId(old_tree_id)) orelse {
-            left.release();
-            right.release();
-            return;
-        };
-        const old = blk: {
-            const held = trees.mu.hold(.exclusive, @src());
-            defer held.release();
-            if (trees.byId(held.shared(), old_tree_id) == null) { // gone (dropped) — nothing to split
-                left.release();
-                right.release();
-                return;
-            }
-            try trees.entries.ensureUnusedCapacity(trees.allocator, 2);
-            const old = trees.removeTree(held, old_tree_id).?;
-            trees.addTree(held, left) catch unreachable; // capacity reserved above
-            trees.addTree(held, right) catch unreachable;
-            break :blk old;
-        };
-
-        // The list's ref on the old object. Readers that still hold it keep
-        // its full range and tables; the last of them closes it.
-        old.release();
     }
 
     // -----------------------------------------
@@ -2378,13 +1231,19 @@ pub const Forest = struct {
     /// tree_id): find the table (high 32 bits of tree_id), scan its trees.
     /// Returned with a ref for the caller — `tree.release()` when done.
     pub fn getTree(self: *Forest, namespace_id: u64, tree_id: u64) ?*Tree {
-        const trees = self.getTable(namespace_id, treeTableId(tree_id)) orelse return null;
+        const trees = self.getTable(
+            namespace_id,
+            treeTableId(tree_id),
+        ) orelse return null;
         return trees.getTreeById(tree_id);
     }
 
     /// True iff the tree is currently listed (idempotency checks).
     pub fn hasTree(self: *Forest, namespace_id: u64, tree_id: u64) bool {
-        const trees = self.getTable(namespace_id, treeTableId(tree_id)) orelse return false;
+        const trees = self.getTable(
+            namespace_id,
+            treeTableId(tree_id),
+        ) orelse return false;
         const held = trees.mu.hold(.shared, @src());
         defer held.release();
         return trees.byId(held, tree_id) != null;
@@ -2399,7 +1258,7 @@ pub const Forest = struct {
     /// can still race a publish already in flight — they are a raft round
     /// trip apart, which no local lock covers — and the apply-side
     /// `hasTree` check absorbs the duplicate.
-    fn nextTreeId(self: *Forest, namespace_id: u64, table_id: u32) u64 {
+    pub fn nextTreeId(self: *Forest, namespace_id: u64, table_id: u32) u64 {
         var max_tree_id: u64 = makeTreeId(table_id, 0); // table's first tree_id
         if (self.getTable(namespace_id, table_id)) |trees| {
             const held = trees.mu.hold(.shared, @src());
@@ -2415,8 +1274,15 @@ pub const Forest = struct {
     /// Returns null if the table was never created. No lock: the map guards
     /// itself and a TableTrees is never freed, so the pointer stays good —
     /// though a dropped table's is empty (`hasTrees`).
-    fn getTable(self: *Forest, namespace_id: u64, table_id: u32) ?*TableTrees {
-        return self.tables.get(.{ .namespace = namespace_id, .table_id = table_id });
+    pub fn getTable(
+        self: *Forest,
+        namespace_id: u64,
+        table_id: u32,
+    ) ?*TableTrees {
+        return self.tables.get(.{
+            .namespace = namespace_id,
+            .table_id = table_id,
+        });
     }
 
     /// True iff a table exists for (namespace, table_id), i.e. has trees.
@@ -2427,7 +1293,11 @@ pub const Forest = struct {
         return trees.hasTrees();
     }
 
-    fn getOrCreateTable(self: *Forest, namespace_id: u64, table_id: u32) !*TableTrees {
+    pub fn getOrCreateTable(
+        self: *Forest,
+        namespace_id: u64,
+        table_id: u32,
+    ) !*TableTrees {
         const key = TableKey{ .namespace = namespace_id, .table_id = table_id };
         if (self.tables.get(key)) |trees| return trees;
 
@@ -2440,18 +1310,5 @@ pub const Forest = struct {
             self.allocator.destroy(fresh);
         }
         return stored;
-    }
-
-    /// splitTreeForTests splits the given tree at the median key of its
-    /// bottommost level, locally, without going through Raft. **Test-only**
-    /// — production must propose splits through the manifest pipeline so
-    /// all nodes apply the same split deterministically; see
-    /// `proposeSplit` in the engine. Takes the locks it needs itself, like
-    /// applySplit on the apply path.
-    pub fn splitTreeForTests(self: *Forest, namespace_id: u64, tree_id: u64) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const mc = try self.buildSplit(arena.allocator(), namespace_id, tree_id) orelse return;
-        try self.applySplit(mc);
     }
 };
