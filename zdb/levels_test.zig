@@ -134,11 +134,11 @@ fn destroyTable(t: *Table) void {
 test "levels: handler L0 sort" {
     const alloc = std.testing.allocator;
 
-    var tb3 = try buildTable(alloc, &.{.{ .key = "c", .ts = 0, .val = "v" }});
+    var tb3 = try buildTable(alloc, &.{.{ .key = "c", .ts = 1, .val = "v" }});
     defer tb3.deinit();
-    var tb1 = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "v" }});
+    var tb1 = try buildTable(alloc, &.{.{ .key = "a", .ts = 1, .val = "v" }});
     defer tb1.deinit();
-    var tb2 = try buildTable(alloc, &.{.{ .key = "b", .ts = 0, .val = "v" }});
+    var tb2 = try buildTable(alloc, &.{.{ .key = "b", .ts = 1, .val = "v" }});
     defer tb2.deinit();
 
     const t3 = try openTableOwned(alloc, &tb3);
@@ -175,11 +175,11 @@ test "levels: handler L1 sort" {
     const alloc = std.testing.allocator;
 
     // Three tables at L1 with non-overlapping key ranges (added out of order).
-    var tbc = try buildTable(alloc, &.{.{ .key = "c", .ts = 0, .val = "vc" }});
+    var tbc = try buildTable(alloc, &.{.{ .key = "c", .ts = 1, .val = "vc" }});
     defer tbc.deinit();
-    var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "va" }});
+    var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 1, .val = "va" }});
     defer tba.deinit();
-    var tbb = try buildTable(alloc, &.{.{ .key = "b", .ts = 0, .val = "vb" }});
+    var tbb = try buildTable(alloc, &.{.{ .key = "b", .ts = 1, .val = "vb" }});
     defer tbb.deinit();
 
     const tc = try openTableOwned(alloc, &tbc);
@@ -231,8 +231,8 @@ test "levels: overlapping tables L1" {
     var tbs: [5]_table.builder.TableBuffer = undefined;
     for (ranges, 0..) |r, i| {
         tbs[i] = try buildTable(alloc, &.{
-            .{ .key = r[0], .ts = 0, .val = "v" },
-            .{ .key = r[1], .ts = 0, .val = "v" },
+            .{ .key = r[0], .ts = 1, .val = "v" },
+            .{ .key = r[1], .ts = 1, .val = "v" },
         });
         tables[i] = try openTableOwned(alloc, &tbs[i]);
     }
@@ -272,11 +272,11 @@ test "levels: overlapping tables L1" {
 test "levels: overlapping tables L0" {
     const alloc = std.testing.allocator;
 
-    var tb1 = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "v" }});
+    var tb1 = try buildTable(alloc, &.{.{ .key = "a", .ts = 1, .val = "v" }});
     defer tb1.deinit();
-    var tb2 = try buildTable(alloc, &.{.{ .key = "b", .ts = 0, .val = "v" }});
+    var tb2 = try buildTable(alloc, &.{.{ .key = "b", .ts = 1, .val = "v" }});
     defer tb2.deinit();
-    var tb3 = try buildTable(alloc, &.{.{ .key = "c", .ts = 0, .val = "v" }});
+    var tb3 = try buildTable(alloc, &.{.{ .key = "c", .ts = 1, .val = "v" }});
     defer tb3.deinit();
 
     const t1 = try openTableOwned(alloc, &tb1);
@@ -354,11 +354,11 @@ test "levels: get L0 newest wins" {
 test "levels: get L1 hit" {
     const alloc = std.testing.allocator;
 
-    var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "va" }});
+    var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 1, .val = "va" }});
     defer tba.deinit();
-    var tbb = try buildTable(alloc, &.{.{ .key = "b", .ts = 0, .val = "vb" }});
+    var tbb = try buildTable(alloc, &.{.{ .key = "b", .ts = 1, .val = "vb" }});
     defer tbb.deinit();
-    var tbc = try buildTable(alloc, &.{.{ .key = "c", .ts = 0, .val = "vc" }});
+    var tbc = try buildTable(alloc, &.{.{ .key = "c", .ts = 1, .val = "vc" }});
     defer tbc.deinit();
 
     const ta = try openTableOwned(alloc, &tba);
@@ -380,7 +380,11 @@ test "levels: get L1 hit" {
     try level.addEntry(held, 2, tb);
     try level.addEntry(held, 3, tc);
 
-    const item = try level.get(held.shared(), .{ .primary = "b", .timestamp = 0 }, .p0);
+    const item = try level.get(
+        held.shared(),
+        .{ .primary = "b", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    );
     try std.testing.expect(item != null);
     defer {
         alloc.free(item.?.key.primary);
@@ -396,7 +400,7 @@ test "levels: get L1 hit" {
 test "levels: get miss" {
     const alloc = std.testing.allocator;
 
-    var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "va" }});
+    var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 1, .val = "va" }});
     defer tba.deinit();
     const ta = try openTableOwned(alloc, &tba);
     defer destroyTable(ta);
@@ -411,7 +415,11 @@ test "levels: get miss" {
     defer level.deinit();
     try level.addEntry(held, 1, ta);
 
-    const item = try level.get(held.shared(), .{ .primary = "z", .timestamp = 0 }, .p0);
+    const item = try level.get(
+        held.shared(),
+        .{ .primary = "z", .timestamp = std.math.maxInt(u64) },
+        .p0,
+    );
     try std.testing.expect(item == null);
 }
 
@@ -429,9 +437,13 @@ test "levels: open" {
 
     // Write SST 1 at L0, SST 2 at L1.
     {
-        var tb1 = try buildTable(alloc, &.{.{ .key = "a", .ts = 0, .val = "va" }});
+        var tb1 = try buildTable(alloc, &.{
+            .{ .key = "a", .ts = 1, .val = "va" },
+        });
         defer tb1.deinit();
-        var tb2 = try buildTable(alloc, &.{.{ .key = "b", .ts = 0, .val = "vb" }});
+        var tb2 = try buildTable(alloc, &.{
+            .{ .key = "b", .ts = 1, .val = "vb" },
+        });
         defer tb2.deinit();
 
         const p1 = try zdb.file_ids.sstPath(alloc, dir_path, 1);
@@ -499,8 +511,8 @@ test "levels: pick compact level" {
 
     // Manually plant a large table in L1.
     var tb = try buildTable(alloc, &.{
-        .{ .key = "a", .ts = 0, .val = "va" },
-        .{ .key = "b", .ts = 0, .val = "vb" },
+        .{ .key = "a", .ts = 1, .val = "va" },
+        .{ .key = "b", .ts = 1, .val = "vb" },
     });
     defer tb.deinit();
     const t = try openTableOwned(alloc, &tb);
@@ -541,7 +553,9 @@ test "levels: doCompact L0 L1" {
     defer ms.deinit();
 
     for (l0_data) |d| {
-        var tb = try buildTable(alloc, &.{.{ .key = d.key, .ts = 0, .val = d.val }});
+        var tb = try buildTable(alloc, &.{
+            .{ .key = d.key, .ts = 1, .val = d.val },
+        });
         defer tb.deinit();
         const path = try zdb.file_ids.sstPath(alloc, dir_path, d.id);
         defer alloc.free(path);
@@ -603,7 +617,9 @@ test "levels: doCompact L0 L1 with dest overlap" {
 
     // L0 table 1: {aa→vaa}
     {
-        var tb = try buildTable(alloc, &.{.{ .key = "aa", .ts = 0, .val = "vaa" }});
+        var tb = try buildTable(alloc, &.{
+            .{ .key = "aa", .ts = 1, .val = "vaa" },
+        });
         defer tb.deinit();
         const p = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(p);
@@ -611,7 +627,9 @@ test "levels: doCompact L0 L1 with dest overlap" {
     }
     // L0 table 2: {cc→vcc}
     {
-        var tb = try buildTable(alloc, &.{.{ .key = "cc", .ts = 0, .val = "vcc" }});
+        var tb = try buildTable(alloc, &.{
+            .{ .key = "cc", .ts = 1, .val = "vcc" },
+        });
         defer tb.deinit();
         const p = try zdb.file_ids.sstPath(alloc, dir_path, 2);
         defer alloc.free(p);
@@ -620,8 +638,8 @@ test "levels: doCompact L0 L1 with dest overlap" {
     // L1 table 3: {bb→vbb, dd→vdd} — key range [bb..dd] overlaps [aa..cc].
     {
         var tb = try buildTable(alloc, &.{
-            .{ .key = "bb", .ts = 0, .val = "vbb" },
-            .{ .key = "dd", .ts = 0, .val = "vdd" },
+            .{ .key = "bb", .ts = 1, .val = "vbb" },
+            .{ .key = "dd", .ts = 1, .val = "vdd" },
         });
         defer tb.deinit();
         const p = try zdb.file_ids.sstPath(alloc, dir_path, 3);
@@ -691,15 +709,17 @@ test "levels: doCompact L1 L2" {
 
     {
         var tb1 = try buildTable(alloc, &.{
-            .{ .key = "aa", .ts = 0, .val = "vaa" },
-            .{ .key = "bb", .ts = 0, .val = "vbb" },
+            .{ .key = "aa", .ts = 1, .val = "vaa" },
+            .{ .key = "bb", .ts = 1, .val = "vbb" },
         });
         defer tb1.deinit();
         const p1 = try zdb.file_ids.sstPath(alloc, dir_path, 1);
         defer alloc.free(p1);
         try vfs.writeFile(p1, tb1.bytes);
 
-        var tb2 = try buildTable(alloc, &.{.{ .key = "cc", .ts = 0, .val = "vcc" }});
+        var tb2 = try buildTable(alloc, &.{
+            .{ .key = "cc", .ts = 1, .val = "vcc" },
+        });
         defer tb2.deinit();
         const p2 = try zdb.file_ids.sstPath(alloc, dir_path, 2);
         defer alloc.free(p2);
@@ -1287,7 +1307,6 @@ fn foldAt(
         alloc,
         .{ .primary = primary, .timestamp = read_ts },
         .p0,
-        null,
         0,
     );
     return bm orelse zroar.Bitmap.init(alloc);

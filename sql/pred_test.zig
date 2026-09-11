@@ -124,46 +124,46 @@ test "sql.pred: eval follows SQL three-valued logic" {
     const tbl = &fx.tbl;
 
     // A leaf: true, unknown (NULL cell), false.
-    try testing.expectEqual(T, pred.eval(tbl, r1, &a_eq_1));
-    try testing.expectEqual(U, pred.eval(tbl, r2, &a_eq_1));
-    try testing.expectEqual(F, pred.eval(tbl, r3, &a_eq_1));
+    try testing.expectEqual(T, a_eq_1.eval(tbl, r1));
+    try testing.expectEqual(U, a_eq_1.eval(tbl, r2));
+    try testing.expectEqual(F, a_eq_1.eval(tbl, r3));
     // `= NULL` is unknown for every row, NULL cell or not.
-    try testing.expectEqual(U, pred.eval(tbl, r1, &a_eq_null));
-    try testing.expectEqual(U, pred.eval(tbl, r2, &a_eq_null));
+    try testing.expectEqual(U, a_eq_null.eval(tbl, r1));
+    try testing.expectEqual(U, a_eq_null.eval(tbl, r2));
     // IS [NOT] NULL is exact, never unknown.
-    try testing.expectEqual(F, pred.eval(tbl, r1, &b_is_null));
-    try testing.expectEqual(T, pred.eval(tbl, r3, &b_is_null));
-    try testing.expectEqual(T, pred.eval(tbl, r1, &b_not_null));
-    try testing.expectEqual(F, pred.eval(tbl, r3, &b_not_null));
+    try testing.expectEqual(F, b_is_null.eval(tbl, r1));
+    try testing.expectEqual(T, b_is_null.eval(tbl, r3));
+    try testing.expectEqual(T, b_not_null.eval(tbl, r1));
+    try testing.expectEqual(F, b_not_null.eval(tbl, r3));
     // The egid pseudo-column reads from the key.
-    try testing.expectEqual(F, pred.eval(tbl, r1, &egid_3));
-    try testing.expectEqual(T, pred.eval(tbl, r3, &egid_3));
+    try testing.expectEqual(F, egid_3.eval(tbl, r1));
+    try testing.expectEqual(T, egid_3.eval(tbl, r3));
 
     // NOT keeps unknown unknown.
     const not_a1 = Pred{ .not = &a_eq_1 };
-    try testing.expectEqual(F, pred.eval(tbl, r1, &not_a1));
-    try testing.expectEqual(U, pred.eval(tbl, r2, &not_a1));
-    try testing.expectEqual(T, pred.eval(tbl, r3, &not_a1));
+    try testing.expectEqual(F, not_a1.eval(tbl, r1));
+    try testing.expectEqual(U, not_a1.eval(tbl, r2));
+    try testing.expectEqual(T, not_a1.eval(tbl, r3));
     const not_a_null = Pred{ .not = &a_eq_null };
-    try testing.expectEqual(U, pred.eval(tbl, r1, &not_a_null));
+    try testing.expectEqual(U, not_a_null.eval(tbl, r1));
 
     // AND: false dominates unknown; unknown dominates true.
     const and_ = Pred{ .and_ = &.{ a_eq_1, b_eq_x } };
-    try testing.expectEqual(T, pred.eval(tbl, r1, &and_));
-    try testing.expectEqual(U, pred.eval(tbl, r2, &and_)); // unknown AND true
-    try testing.expectEqual(F, pred.eval(tbl, r3, &and_)); // false AND unknown
+    try testing.expectEqual(T, and_.eval(tbl, r1));
+    try testing.expectEqual(U, and_.eval(tbl, r2)); // unknown AND true
+    try testing.expectEqual(F, and_.eval(tbl, r3)); // false AND unknown
     // OR: true dominates unknown; unknown dominates false.
     const or_ = Pred{ .or_ = &.{ a_eq_1, b_eq_x } };
-    try testing.expectEqual(T, pred.eval(tbl, r1, &or_));
-    try testing.expectEqual(T, pred.eval(tbl, r2, &or_)); // unknown OR true
-    try testing.expectEqual(U, pred.eval(tbl, r3, &or_)); // false OR unknown
+    try testing.expectEqual(T, or_.eval(tbl, r1));
+    try testing.expectEqual(T, or_.eval(tbl, r2)); // unknown OR true
+    try testing.expectEqual(U, or_.eval(tbl, r3)); // false OR unknown
     const or_2 = Pred{ .or_ = &.{ a_eq_2, egid_3 } };
-    try testing.expectEqual(T, pred.eval(tbl, r3, &or_2));
-    try testing.expectEqual(F, pred.eval(tbl, r1, &or_2));
+    try testing.expectEqual(T, or_2.eval(tbl, r3));
+    try testing.expectEqual(F, or_2.eval(tbl, r1));
 
     // matches: only TRUE passes — `= NULL` selects nothing.
-    try testing.expect(pred.matches(tbl, r1, &a_eq_1));
-    try testing.expect(!pred.matches(tbl, r2, &a_eq_1));
-    try testing.expect(!pred.matches(tbl, r2, &a_eq_null));
-    try testing.expect(!pred.matches(tbl, r3, &or_));
+    try testing.expect(a_eq_1.matches(tbl, r1));
+    try testing.expect(!a_eq_1.matches(tbl, r2));
+    try testing.expect(!a_eq_null.matches(tbl, r2));
+    try testing.expect(!or_.matches(tbl, r3));
 }

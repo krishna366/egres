@@ -422,6 +422,9 @@ pub fn ShardedCache(comptime K: type) type {
 
         allocator: Allocator,
         shards: []Shard,
+        /// `get` outcomes, for the stats dump.
+        hits: std.atomic.Value(u64) = .init(0),
+        misses: std.atomic.Value(u64) = .init(0),
 
         pub fn init(alloc: Allocator, total_capacity: usize, shard_count: usize) !Self {
             std.debug.assert(shard_count > 0);
@@ -454,7 +457,10 @@ pub fn ShardedCache(comptime K: type) type {
             const s = self.pickShard(key);
             s.lock.lockShared(@src());
             defer s.lock.unlockShared();
-            return s.cache.get(key);
+            const val = s.cache.get(key);
+            const counter = if (val != null) &self.hits else &self.misses;
+            _ = counter.fetchAdd(1, .monotonic);
+            return val;
         }
 
         /// See `Cache.put` for ownership semantics.
@@ -463,6 +469,16 @@ pub fn ShardedCache(comptime K: type) type {
             s.lock.lock(@src());
             defer s.lock.unlock();
             return s.cache.put(key, val);
+        }
+
+        /// The bytes the small queues hold in all: what a burst of new
+        /// entries can be admitted without evicting its own earlier
+        /// entries before they are touched (a new entry sits in S until
+        /// its first hit). A prefetch sizes its batch by this.
+        pub fn admissionBudget(self: *const Self) usize {
+            var total: usize = 0;
+            for (self.shards) |*s| total += s.cache.s_cap_bytes;
+            return total;
         }
 
         /// Approximate total count across shards.

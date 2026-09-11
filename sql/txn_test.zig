@@ -86,7 +86,16 @@ fn rowKey(primary: []const u8, ts: u64) Key {
     return .{ .namespace = ns, .table_id = tid, .primary = primary, .timestamp = ts };
 }
 
-test "txn: lookup reads pending first, then the forest at the key's ts" {
+/// A one-key multiGet of `tid`: the row, duped with the test
+/// allocator (free with `Item.free`), or null when absent.
+fn lookupOne(tx: *Txn, primary: []const u8) !?zdb.kv.Item {
+    var res = try tx.multiGet(tid, &.{primary});
+    defer res.deinit();
+    const found = res.item(primary) orelse return null;
+    return try found.dupe(testing.allocator);
+}
+
+test "txn: multiGet reads pending first, then the forest at read_ts" {
     var fx = try Fixture.setup(&.{
         .{ .key = rowKey("k1", 100), .value = "old", .meta = .{} },
     });
@@ -94,28 +103,24 @@ test "txn: lookup reads pending first, then the forest at the key's ts" {
     var tx = fx.txn();
     defer tx.deinit();
 
-    // Nothing pending: the committed row, owned by the caller.
+    // Nothing pending: the committed row.
     {
-        const found = (try tx.lookup(rowKey("k1", read_ts))) orelse
+        const found = (try lookupOne(&tx, "k1")) orelse
             return error.TestExpectedRow;
-        defer found.release();
-        try testing.expect(found.owned);
-        try testing.expectEqualSlices(u8, "old", found.item.value);
+        defer found.free(testing.allocator);
+        try testing.expectEqualSlices(u8, "old", found.value);
+        try testing.expectEqual(100, found.key.timestamp);
     }
-    // Absent key: null either view.
-    try testing.expectEqual(null, try tx.lookup(rowKey("nope", read_ts)));
+    // Absent key: null.
+    try testing.expectEqual(null, try lookupOne(&tx, "nope"));
 
-    // Pending write shadows the committed row at both views; the item
-    // borrows from the txn arena (release is a no-op).
+    // A pending write shadows the committed row; it sits at read_ts.
     try tx.put(tid, "k1", "new", .{});
-    inline for (.{ read_ts, std.math.maxInt(u64) }) |ts| {
-        const found = (try tx.lookup(rowKey("k1", ts))) orelse
-            return error.TestExpectedRow;
-        defer found.release();
-        try testing.expect(!found.owned);
-        try testing.expectEqualSlices(u8, "new", found.item.value);
-        try testing.expectEqual(read_ts, found.item.key.timestamp);
-    }
+    const found = (try lookupOne(&tx, "k1")) orelse
+        return error.TestExpectedRow;
+    defer found.free(testing.allocator);
+    try testing.expectEqualSlices(u8, "new", found.value);
+    try testing.expectEqual(read_ts, found.key.timestamp);
 }
 
 test "txn: pending tombstone hides the committed row, no resurrection" {
@@ -129,7 +134,7 @@ test "txn: pending tombstone hides the committed row, no resurrection" {
     try tx.put(tid, "k1", "", .{ .kind = .deleted });
     // The pending tombstone answers "absent" — the forest fallback must
     // NOT run, or the committed "old" would resurrect.
-    try testing.expectEqual(null, try tx.lookup(rowKey("k1", std.math.maxInt(u64))));
+    try testing.expectEqual(null, try lookupOne(&tx, "k1"));
 }
 
 test "txn: same-key re-put is last-write-wins" {
@@ -230,7 +235,7 @@ test "txn: bump revalidates prior point reads" {
     defer tx.deinit();
 
     // Statement 1 point-reads k1 (absent — still recorded).
-    try testing.expectEqual(null, try tx.lookup(rowKey("k1", read_ts)));
+    try testing.expectEqual(null, try lookupOne(&tx, "k1"));
     try tx.beginStatement();
 
     // k1 then commits above our snapshot; a bump for r1 must notice
@@ -247,7 +252,7 @@ test "txn: bump with clean prior reads succeeds" {
     defer tx.deinit();
 
     // Statement 1 point-reads k2; nothing ever commits to it.
-    try testing.expectEqual(null, try tx.lookup(rowKey("k2", read_ts)));
+    try testing.expectEqual(null, try lookupOne(&tx, "k2"));
     try tx.beginStatement();
 
     try fx.commit("r1", 600);
@@ -303,10 +308,10 @@ test "txn: restartStatement rewinds the statement's read tracking" {
     var tx = fx.txn();
     defer tx.deinit();
 
-    _ = try tx.lookup(rowKey("a", read_ts));
+    try testing.expectEqual(null, try lookupOne(&tx, "a"));
     try tx.beginStatement();
-    _ = try tx.lookup(rowKey("b", read_ts));
-    _ = try tx.lookup(rowKey("c", read_ts));
+    try testing.expectEqual(null, try lookupOne(&tx, "b"));
+    try testing.expectEqual(null, try lookupOne(&tx, "c"));
     tx.recordScan();
     // 'a' settled into prev at beginStatement; 'b'/'c' are cur.
     try testing.expectEqual(1, tx.prev.reads.items.len);

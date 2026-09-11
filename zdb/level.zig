@@ -47,20 +47,11 @@ pub const KeyRange = struct {
     /// The range spanning one key's versions at or below its timestamp.
     /// Left keeps `key.timestamp` — ts sorts descending, so a seek
     /// lands directly on the newest version visible at that ts, never
-    /// touching newer ones (pass maxInt for every version). Right sits
-    /// at ts=0: exclusive, and unreachable in practice (no version
-    /// commits at HLC 0), which closes the range without allocating a
-    /// successor primary. Borrows `key.primary`.
+    /// touching newer ones (pass maxInt for every version). Right is
+    /// `Key.end`: exclusive, at ts 0, which closes the range without
+    /// allocating a successor primary. Borrows `key.primary`.
     pub fn versionsAt(key: Key) KeyRange {
-        return .{
-            .left = key,
-            .right = .{
-                .namespace = key.namespace,
-                .table_id = key.table_id,
-                .primary = key.primary,
-                .timestamp = 0,
-            },
-        };
+        return .{ .left = key, .right = key.end() };
     }
 
     /// Deep copy: dupes the underlying primary bytes for both bounds

@@ -14,8 +14,10 @@ const zdb = @import("zdb");
 const zen = zdb.buffers;
 const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
+const Forest = zdb.forest.Forest;
 const Meta = zdb.kv.Meta;
 const Oracle = @import("oracle.zig").Oracle;
+const String = @import("value.zig").String;
 
 /// One statement-generation's read tracking: the point-read identity
 /// hashes it accumulated and whether it ran a scan. A Txn holds two —
@@ -414,49 +416,37 @@ pub const Txn = struct {
         }
     }
 
-    /// A found row and how to let it go: committed rows are owned
-    /// (release frees them), pending rows borrow from the txn arena
-    /// (release is a no-op).
-    pub const Found = struct {
-        item: Item,
-        owned: bool,
-        alloc: std.mem.Allocator,
-
-        pub fn release(self: Found) void {
-            if (self.owned) self.item.free(self.alloc);
-        }
-    };
-
-    /// The row `key` names as this txn sees it: the txn's own pending
-    /// write first — a pending tombstone means absent with NO forest
-    /// fallback (that would resurrect the shadowed version) — else the
-    /// forest at key.timestamp. Callers read at read_ts, never latest:
-    /// after a lock's bump check, read_ts already covers the newest
-    /// committed version of any key this txn writes. Pending entries
-    /// sit at-or-below read_ts, so lookups see them. null = absent.
-    /// Scans get the same overlay by merging `writes` in as a source.
+    /// The rows `keys` name in `table_id` as this txn sees them, in one
+    /// batch (Forest.multiGet): the txn's own pending writes first — a
+    /// pending tombstone means absent with NO forest fallback (that
+    /// would resurrect the shadowed version) — else the forest at
+    /// read_ts. Callers read at read_ts, never latest: after a lock's
+    /// bump check, read_ts already covers the newest committed version
+    /// of any key this txn writes. Pending entries sit at-or-below
+    /// read_ts, so the batch sees them. Scans get the same overlay by
+    /// merging `writes` in as a source. The result borrows `keys` and
+    /// holds its pins until `deinit`; `item(key)` is null for an
+    /// absent row.
     ///
-    /// Every lookup is recorded in `reads` — absent keys included
-    /// (their absence shaped results, and a later commit of one is a
-    /// conflict like any other). Reads of keys this txn write-locks are
+    /// Every key is recorded in `reads` — absent keys included (their
+    /// absence shaped results, and a later commit of one is a conflict
+    /// like any other). Reads of keys this txn write-locks are
     /// recorded too: their floor is frozen at-or-below read_ts by our
     /// own lock, so revalidation can never falsely abort on them.
-    pub fn lookup(self: *Txn, key: Key) !?Found {
-        std.debug.assert(key.namespace == self.ns);
-        try self.recordRead(key);
-        if (self.writes) |w| {
-            if (w.get(key)) |item| {
-                if (item.meta.isDeleted()) return null;
-                return .{
-                    .item = item,
-                    .owned = false,
-                    .alloc = self.allocator,
-                };
-            }
-        }
-        const item = (try self.forest.get(self.allocator, key, .p0)) orelse
-            return null;
-        return .{ .item = item, .owned = true, .alloc = self.allocator };
+    pub fn multiGet(
+        self: *Txn,
+        table_id: u32,
+        keys: []const String,
+    ) !Forest.MultiGet {
+        for (keys) |key| try self.recordRead(.{
+            .namespace = self.ns,
+            .table_id = table_id,
+            .primary = key,
+        });
+        return self.forest.multiGet(self.allocator, self.ns, table_id, keys, .{
+            .read_ts = self.read_ts,
+            .pending = self.writes,
+        });
     }
 
     /// The pending write set as wire kvs in key order — the commit

@@ -41,16 +41,20 @@ pub const Pin = union(enum) {
     }
 };
 
-/// Iterator is a tagged union that lets MergeIterator accept a TableIterator
-/// (single SST), ConcatIterator (multiple non-overlapping SSTs), or a
-/// memtable scan (`skl.Iterator`). All three expose the same
-/// `seekRange` / `itemRef` / `next` / `deinit` shape.
+/// Iterator is a tagged union over every source shape: a TableIterator
+/// (single SST), a ConcatIterator (multiple non-overlapping SSTs), a
+/// memtable scan (`skl.Iterator`), or a MergeIterator over other
+/// sources. All expose the same `seekRange` / `itemRef` / `next` /
+/// `currentPin` / `deinit` shape, so a reader can take one `*Iterator`
+/// whatever is behind it.
 pub const Iterator = union(enum) {
     table: _table.TableIterator,
     concat: ConcatIterator,
     skiplist: _skl.Iterator,
+    merge: MergeIterator,
 
-    pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
+    // `Error`, not inferred: a merge's seek calls back into this one.
+    pub fn seekRange(self: *Iterator, start: Key, end: Key) Error!void {
         switch (self.*) {
             inline else => |*it| try it.seekRange(start, end),
         }
@@ -72,6 +76,7 @@ pub const Iterator = union(enum) {
                 if (s.current == null) return null;
                 return .{ .skiplist = s.skiplist };
             },
+            .merge => |*m| return m.currentPin(),
         }
     }
 
@@ -150,7 +155,7 @@ pub const MergeIterator = struct {
         };
     }
 
-    pub fn seekRange(self: *MergeIterator, start: Key, end: Key) !void {
+    pub fn seekRange(self: *MergeIterator, start: Key, end: Key) Error!void {
         std.debug.assert(self.iters.len <= std.math.maxInt(Src));
         if (self.heap.len == 0 and self.iters.len > 0) {
             self.items = try self.allocator.alloc(_table.Item, self.iters.len);
@@ -178,7 +183,7 @@ pub const MergeIterator = struct {
         return self.iters[self.heap[0]].currentPin();
     }
 
-    pub fn itemRef(self: *MergeIterator) ?_table.Item {
+    pub fn itemRef(self: *const MergeIterator) ?_table.Item {
         if (self.heap_len == 0) return null;
         return self.items[self.heap[0]];
     }

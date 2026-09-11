@@ -518,6 +518,43 @@ test "sql.exec: fetch: no row locks of its own, held row across batches" {
     try testing.expectEqual(@as(usize, 0), tx.held.items.len);
 }
 
+test "sql.exec: fetch: a bitmap wider than one chunk, with a residual" {
+    var fx = try Fixture.setup(&alternatingRows);
+    defer fx.teardown();
+    var tx = fx.txn();
+    defer tx.deinit();
+    var ctx = fx.ctx(&tx, false);
+    var b = try Batch.init(testing.allocator);
+    defer b.deinit();
+
+    // Every egid, so the fetch reads three chunks (1024 + 1024 + 452),
+    // and a residual that keeps the odd ones.
+    var bm = try zroar.Bitmap.init(testing.allocator);
+    for (1..2501) |egid| _ = try bm.set(egid);
+    var leaf = BitmapNode{ .egids = bm };
+    const pred = Pred{
+        .eq = .{ .col = fx.col("b"), .val = .{ .text = "y" } },
+    };
+    var node = RowNode{ .fetch = .{ .bnode = &leaf, .pred = &pred } };
+    defer node.deinit();
+
+    var total: usize = 0;
+    var last: u64 = 0;
+    while (try node.next(&ctx, &b)) {
+        var it = b.selected();
+        while (it.next()) |r| : (total += 1) {
+            const egid = sql.key.decodeEgid(r.key.primary).?;
+            try testing.expect(egid > last);
+            try testing.expect(egid % 2 == 1);
+            last = egid;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1250), total);
+    try testing.expectEqual(@as(u64, 2499), last);
+    // Every key of the bitmap was recorded as a read.
+    try testing.expectEqual(@as(usize, 2500), tx.cur.reads.items.len);
+}
+
 test "sql.exec: filter clears bits and copies nothing" {
     var fx = try Fixture.setup(&alternatingRows);
     defer fx.teardown();

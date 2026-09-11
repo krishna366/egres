@@ -283,6 +283,7 @@ fn makeModules(
     sql.addImport("engine", engine);
     sql.addImport("zdb", zdb);
     sql.addImport("zfiber", fiber);
+    sql.addImport("utils", utils);
 
     return .{
         .zio = zio,

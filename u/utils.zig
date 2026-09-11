@@ -4,6 +4,11 @@ const builtin = @import("builtin");
 pub const compression = @import("compress.zig");
 pub const hlc = @import("hlc.zig");
 pub const bench = @import("bench.zig");
+pub const host = @import("host.zig");
+
+/// A borrowed byte string: a name, row bytes, an encoded key. The
+/// same type as []const u8; it reads better in a slice of them.
+pub const String = []const u8;
 pub const context = fiber.context;
 pub const GuardAllocator = @import("guard_allocator.zig").GuardAllocator;
 

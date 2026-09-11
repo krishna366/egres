@@ -12,6 +12,7 @@ const _key = @import("key.zig");
 const _pred = @import("pred.zig");
 const _table = @import("table.zig");
 const _txn = @import("txn.zig");
+const String = @import("value.zig").String;
 
 const log = std.log.scoped(.sql);
 const Forest = zdb.forest.Forest;
@@ -293,15 +294,11 @@ pub const BitmapNode = union(enum) {
         var bm = try zroar.Bitmap.init(ctx.tx.allocator);
         errdefer bm.deinit();
 
-        const entry = (try ctx.tx.lookup(.{
-            .namespace = ctx.tx.ns,
-            .table_id = lu.index_table_id,
-            .primary = lu.key,
-            .timestamp = ctx.tx.read_ts,
-        })) orelse return bm;
-        defer entry.release();
+        var res = try ctx.tx.multiGet(lu.index_table_id, &.{lu.key});
+        defer res.deinit();
+        const entry = res.item(lu.key) orelse return bm;
 
-        const egid = _key.decodeEgid(entry.item.value) orelse
+        const egid = _key.decodeEgid(entry.value) orelse
             return error.CorruptIndexEntry;
         _ = try bm.set(egid);
         return bm;
@@ -413,7 +410,7 @@ pub const SeqScan = struct {
                 break;
             };
             if (self.pred) |pred| {
-                if (!_pred.matches(ctx.tbl, item, pred)) continue;
+                if (!pred.matches(ctx.tbl, item)) continue;
             }
 
             if (!try b.append(item, mode)) {
@@ -430,9 +427,13 @@ pub const SeqScan = struct {
     }
 };
 
-/// Point lookups of every egid a BitmapNode names, egid-ascending —
-/// the same order a table scan yields. Takes no locks: row locks are
-/// Materialize's, on the output.
+/// The rows of every egid a BitmapNode names, egid-ascending — the
+/// same order a table scan yields — read a chunk at a time through
+/// Txn.multiGet: up to one batch fill of egids per call, so a run of
+/// egids in one block costs one block visit. A chunk's rows are
+/// borrows under the batch result's pins, copied into the batch as
+/// they fit; a chunk's unconsumed tail stays pinned until the next
+/// fill. Takes no locks: row locks are Materialize's, on the output.
 pub const Fetch = struct {
     bnode: *BitmapNode,
     pred: ?*const Pred = null,
@@ -443,9 +444,13 @@ pub const Fetch = struct {
     /// first next.
     bm: ?zroar.Bitmap = null,
     it: ?zroar.Iterator = null,
-    /// A fetched row that did not fit — held (owned or borrowed from the
-    /// pending skiplist) until the next fill, then appended and released.
-    held: ?Txn.Found = null,
+    /// The chunk in hand: its keys (slices into `key_bytes`, both
+    /// statement-arena buffers of one batch fill's capacity), the
+    /// batch result, and the next key to place.
+    keys: []String = &.{},
+    key_bytes: []u8 = &.{},
+    res: ?Forest.MultiGet = null,
+    chunk_pos: usize = 0,
     from_index: bool = false,
     done: bool = false,
 
@@ -458,71 +463,80 @@ pub const Fetch = struct {
 
             self.it = self.bm.?.iterator();
             self.from_index = self.bnode.fromIndex(); // For debug assert
-        }
-
-        if (self.held) |held| {
-            const ok = try batch.append(held.item, self.valueMode());
-            std.debug.assert(ok);
-            held.release();
-            self.held = null;
+            self.key_bytes = try ctx.arloc.alloc(u8, row_cap * 8);
+            self.keys = try ctx.arloc.alloc(String, row_cap);
         }
 
         while (!batch.full()) {
-            const egid = self.it.?.next() orelse {
-                self.done = true;
-                break;
-            };
-            // TODO: Might be worth Fetch having an arena, where forest.get can
-            // dupe the item. So, we can avoid a second copy here.
-            const found = (try self.lookupEgid(ctx, egid)) orelse continue;
-            if (self.pred) |p| if (!_pred.matches(ctx.tbl, found.item, p)) {
-                found.release();
+            if (self.res == null) {
+                if (!try self.nextChunk(ctx, batch.row_limit)) {
+                    self.done = true;
+                    break;
+                }
+            }
+            if (self.chunk_pos == self.keys.len) {
+                self.res.?.deinit();
+                self.res = null;
+                continue;
+            }
+            const key = self.keys[self.chunk_pos];
+            const row = self.res.?.item(key) orelse {
+                self.missing(ctx, key);
+                self.chunk_pos += 1;
                 continue;
             };
-            if (!try batch.append(found.item, self.valueMode())) {
-                self.held = found;
-                break;
-            }
-            found.release();
+            if (self.pred) |p| if (!p.matches(ctx.tbl, row)) {
+                self.chunk_pos += 1;
+                continue;
+            };
+            // A row that does not fit ends the fill and is offered
+            // again by the next one (an empty batch admits any row).
+            if (!try batch.append(row, self.valueMode())) break;
+            self.chunk_pos += 1;
         }
         return batch.numRows() > 0;
     }
 
-    /// One base row by egid, at read_ts. An absent row is a legit empty
-    /// result when a literal named it, but CORRUPTION when an index did
-    /// (rows and entries commit atomically) — logged loudly, then still
-    /// skipped so the statement answers from the rows that do exist.
-    fn lookupEgid(self: *const Fetch, ctx: *ExecCtx, egid: u64) !?Txn.Found {
-        const k = _key.encodeEgid(egid);
-        const found = (try ctx.tx.lookup(.{
-            .namespace = ctx.tx.ns,
-            .table_id = ctx.table_id,
-            .primary = &k,
-            .timestamp = ctx.tx.read_ts,
-        })) orelse {
-            if (self.from_index) log.err(
-                "corrupt index entry: an index names egid={d}, " ++
-                    "no such row in table={d}",
-                .{ egid, ctx.table_id },
-            );
-            return null;
-        };
-        return found;
+    /// Pull up to `limit` egids from the bitmap into the chunk buffers
+    /// and read them in one batch. false = the bitmap is exhausted.
+    fn nextChunk(self: *Fetch, ctx: *ExecCtx, limit: usize) !bool {
+        var n: usize = 0;
+        while (n < @min(limit, row_cap)) : (n += 1) {
+            const egid = self.it.?.next() orelse break;
+            const key = self.key_bytes[n * 8 ..][0..8];
+            key.* = _key.encodeEgid(egid);
+            self.keys[n] = key;
+        }
+        if (n == 0) return false;
+        self.keys.len = n;
+        self.res = try ctx.tx.multiGet(ctx.table_id, self.keys);
+        self.chunk_pos = 0;
+        return true;
     }
 
-    /// A Found's bytes are already a copy `get` made, and they go with
-    /// its release — so the batch copies them once more. Holding the
-    /// Founds instead saves only that memcpy against a µs-scale lookup
-    /// (tried 2026-09-04, reverted); the real fix is a sorted multi-get
-    /// walk that pins like SeqScan's cursor (the plan's stage C).
+    /// An absent row is a legit empty result when a literal named it,
+    /// but CORRUPTION when an index did (rows and entries commit
+    /// atomically) — logged loudly, then still skipped so the
+    /// statement answers from the rows that do exist.
+    fn missing(self: *const Fetch, ctx: *ExecCtx, key: []const u8) void {
+        if (!self.from_index) return;
+        log.err(
+            "corrupt index entry: an index names egid={d}, " ++
+                "no such row in table={d}",
+            .{ _key.decodeEgid(key).?, ctx.table_id },
+        );
+    }
+
+    /// The batch copies each row once, out of the pinned block or
+    /// arena the result borrows it from.
     fn valueMode(self: *const Fetch) Batch.ValueMode {
         return if (self.keep_value) .copy else .none;
     }
 
     /// Also frees the bitmap tree: the planner built it for this node.
     pub fn deinit(self: *Fetch) void {
-        if (self.held) |found| found.release();
-        self.held = null;
+        if (self.res) |*res| res.deinit();
+        self.res = null;
         if (self.bm) |*bm| bm.deinit();
         self.bm = null;
         self.it = null;
@@ -546,7 +560,7 @@ pub const Filter = struct {
             var it = batch.sel.iterator(.{});
             while (it.next()) |i| {
                 const row = batch.rows.items[i];
-                if (!_pred.matches(ctx.tbl, row, self.pred)) batch.sel.unset(i);
+                if (!self.pred.matches(ctx.tbl, row)) batch.sel.unset(i);
             }
             if (batch.sel.count() > 0) return true;
         }

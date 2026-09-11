@@ -71,6 +71,25 @@ const DataCfg = struct {
     };
 };
 
+/// `--cache` — the memory Egres may hold in caches. `total_mb` is the
+/// budget for all of them; `block_mb` the share for SST blocks, today
+/// the only user. Both default to auto: total = a quarter of the memory
+/// this process may use (host RAM, or the cgroup limit under Docker and
+/// Kubernetes), never below 64 MiB; block = all of total.
+const CacheCfg = struct {
+    total_mb: u64 = 0,
+    block_mb: u64 = 0,
+
+    pub const docs = .{
+        .self = "Cache memory. The budget is a cap, not a reservation: " ++
+            "memory is used as blocks are read.",
+        .total_mb = "All cache memory, in MiB. 0 = a quarter of host RAM " ++
+            "or of the cgroup limit, at least 64. Set it explicitly when " ++
+            "several nodes share one host.",
+        .block_mb = "The SST block cache's share of total_mb. 0 = all of it.",
+    };
+};
+
 /// `--store` — the shared object store that distributes SST files across
 /// nodes (upload before propose; download at apply). Required for any
 /// multi-node cluster: a seeded node refuses to start without one, and a
@@ -264,6 +283,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const live_raft = try flags.g().register("raft", RaftCfg);
     const live_data = try flags.g().register("data", DataCfg);
     const live_store = try flags.g().register("store", StoreCfg);
+    const live_cache = try flags.g().register("cache", CacheCfg);
     const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
 
     // --help is terminal; handle after registration so writeHelpAll has
@@ -292,6 +312,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const raft_cfg = live_raft.snapshot();
     const data_cfg = live_data.snapshot();
     const store_cfg = live_store.snapshot();
+    const cache_cfg = live_cache.snapshot();
     if (raft_cfg.id == 0 or data_cfg.dir.len == 0) {
         std.log.err("--raft requires id (>0); --data requires dir", .{});
         usage(allocator);
@@ -411,6 +432,45 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     defer deinitWithLog("node", node);
 
     log.info("raft node initialized id={d}", .{raft_cfg.id});
+
+    // The SST block cache, created before the forest so it outlives every
+    // open table. With blocks cached decompressed here, tables open
+    // O_DIRECT: the page cache would otherwise hold the same data twice.
+    const mem = utils.host.memory();
+    const total_bytes: u64 = if (cache_cfg.total_mb > 0)
+        cache_cfg.total_mb << 20
+    else
+        @max(mem.bytes / 4, 64 << 20);
+    const block_bytes: u64 = if (cache_cfg.block_mb > 0)
+        cache_cfg.block_mb << 20
+    else
+        total_bytes;
+    if (block_bytes > total_bytes) {
+        std.log.err("--cache block_mb exceeds total_mb", .{});
+        std.process.exit(1);
+    }
+    var block_cache = try zdb.cache.ShardedCache(u128).init(
+        allocator,
+        @intCast(block_bytes),
+        16,
+    );
+    defer block_cache.deinit();
+    zdb.table.table.block_cache = &block_cache;
+    zdb.table.table.read_mode = .direct;
+    defer {
+        zdb.table.table.block_cache = null;
+        zdb.table.table.read_mode = .default;
+    }
+    log.info(
+        "block cache {d} MiB of {d} MiB cache total (host memory {d} MiB " ++
+            "via {s}); sst reads direct",
+        .{
+            block_bytes >> 20,
+            total_bytes >> 20,
+            mem.bytes >> 20,
+            mem.source,
+        },
+    );
 
     // Open zdb forest.
     log.info("opening forest at {s}", .{data_cfg.dir});

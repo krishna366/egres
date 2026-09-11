@@ -5,6 +5,7 @@ const utils = @import("utils");
 const _config = @import("config.zig");
 const _manifest = @import("manifest.zig");
 const _read = @import("read.zig");
+const _stats = @import("stats.zig");
 const _table = @import("table.zig");
 const vfs = @import("vfs");
 const _tree = @import("tree.zig");
@@ -290,28 +291,6 @@ pub const Memtables = struct {
         };
     }
 
-    /// Look up a key across current and immutable memtables.
-    /// Returns a duped Item owned by the caller.
-    pub fn get(
-        self: *Memtables,
-        allocator: std.mem.Allocator,
-        search_key: Key,
-    ) !?Item {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-
-        if (self.current.get(search_key)) |item| {
-            return try item.dupe(allocator);
-        }
-        // Immutables are stored newest-first.
-        for (self.immutables.items) |imm| {
-            if (imm.get(search_key)) |item| {
-                return try item.dupe(allocator);
-            }
-        }
-        return null;
-    }
-
     /// Freeze the current memtable: move it to immutables, create a new
     /// current. `log_index` is the apply index of the Raft `newMemtable` entry;
     /// it pins the snapshot horizon (`snapshot.index <=
@@ -467,13 +446,17 @@ pub const Forest = struct {
     pub const openCursor = _read.openCursor;
     pub const Cursor = _read.Cursor;
     pub const maxKey = _read.maxKey;
-    pub const StatsScope = _read.StatsScope;
-    pub const StatsOpts = _read.StatsOpts;
-    pub const writeStats = _read.writeStats;
-    pub const writeForestStats = _read.writeForestStats;
-    pub const writeTreeStats = _read.writeTreeStats;
-    pub const writeNamespaceStats = _read.writeNamespaceStats;
-    pub const writeBytes = _read.writeBytes;
+    pub const MultiGet = _read.MultiGet;
+    pub const multiGet = _read.multiGet;
+
+    // The stats dump, from stats.zig.
+    pub const StatsScope = _stats.StatsScope;
+    pub const StatsOpts = _stats.StatsOpts;
+    pub const writeStats = _stats.writeStats;
+    pub const writeForestStats = _stats.writeForestStats;
+    pub const writeTreeStats = _stats.writeTreeStats;
+    pub const writeNamespaceStats = _stats.writeNamespaceStats;
+    pub const writeBytes = _stats.writeBytes;
 
     // Building and applying manifest changes, from manifest.zig.
     pub const installTree = _manifest.installTree;

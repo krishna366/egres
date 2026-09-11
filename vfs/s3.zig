@@ -41,7 +41,6 @@ pub const S3Config = struct {
     prefix: []const u8 = "",
 };
 
-
 pub const S3Store = struct {
     a: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,

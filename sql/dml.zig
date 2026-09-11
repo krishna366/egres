@@ -675,8 +675,11 @@ fn lockIndexKeys(
 /// with no remove probes the index, found → 23505, else puts; one add
 /// with a remove is a move between two of this statement's rows — the
 /// put alone, no probe, since the committed occupant is the row moving
-/// away, its pre-image locked and newest. `egids[ik.row]` is each
-/// entry's row id. false = replied.
+/// away, its pre-image locked and newest. The probed puts are written
+/// after the probe, which reads the pending skiplist and must not
+/// find this statement's own entry there; the probes go out in one
+/// batch per index table. `egids[ik.row]` is each entry's row id.
+/// false = replied.
 fn applyIndexKeys(
     state: *pgwire.ConnState,
     tx: *_txn.Txn,
@@ -691,6 +694,10 @@ fn applyIndexKeys(
         try tx.putPosting(table_id, ik.key, egids[ik.row], ik.op);
     }
 
+    // The lone puts, in key order, so one index table's probes are
+    // one run.
+    var probes: std.ArrayList(IndexKey) = .empty;
+    defer probes.deinit(tx.allocator);
     var i: usize = 0;
     while (i < keys.len) {
         const first = keys[i];
@@ -698,29 +705,24 @@ fn applyIndexKeys(
         defer i = end;
         if (!first.idx.unique) continue;
         const table_id = first.idx.index_table_id;
-
-        var adds: usize = 0;
-        var removes: usize = 0;
-        var egid: u64 = 0;
-        for (keys[i..end]) |ik| switch (ik.op) {
-            .add => {
-                adds += 1;
-                egid = egids[ik.row];
-            },
-            .remove => removes += 1,
-            .noop => unreachable,
-        };
-
-        if (adds >= 2) return replyUniqueViolation(state);
-        if (adds == 0) {
+        const group = groupOps(keys[i..end], egids);
+        if (group.adds >= 2) return replyUniqueViolation(state);
+        if (group.adds == 0) {
             try tx.put(table_id, first.key, "", .{ .kind = .deleted });
             continue;
         }
-        if (removes == 0) { // and adds == 1
-            if (!try probeUnique(state, tx, table_id, first.key)) return false;
+        if (group.removes == 0) {
+            try probes.append(tx.allocator, first);
+            continue;
         }
-        const ekey = _key.encodeEgid(egid);
+        const ekey = _key.encodeEgid(group.egid);
         try tx.put(table_id, first.key, &ekey, .{});
+    }
+
+    if (!try probeUnique(state, tx, probes.items)) return false;
+    for (probes.items) |ik| {
+        const ekey = _key.encodeEgid(egids[ik.row]);
+        try tx.put(ik.idx.index_table_id, ik.key, &ekey, .{});
     }
     return true;
 }
@@ -732,33 +734,64 @@ fn groupEnd(keys: []const IndexKey, i: usize) usize {
     return end;
 }
 
-/// Whether a unique index key is free. Post-lock, read_ts covers the
-/// key's newest commit, so a live entry means the value exists. Only a
-/// unique index table may be looked up: a non-unique one's pending
-/// posting ops sit in `writes` keyed with timestamp = egid. false =
-/// replied (23505, or an internal read failure).
+/// What one unique key's group does: how many rows add it, how many
+/// remove it, and the egid of the (last) adding row.
+fn groupOps(
+    group: []const IndexKey,
+    egids: []const u64,
+) struct { adds: usize, removes: usize, egid: u64 } {
+    var adds: usize = 0;
+    var removes: usize = 0;
+    var egid: u64 = 0;
+    for (group) |ik| switch (ik.op) {
+        .add => {
+            adds += 1;
+            egid = egids[ik.row];
+        },
+        .remove => removes += 1,
+        .noop => unreachable,
+    };
+    return .{ .adds = adds, .removes = removes, .egid = egid };
+}
+
+/// Whether every probed unique key is free: one batch read per index
+/// table over `probes`, entries in sorted order. Post-lock, read_ts
+/// covers each key's newest commit, so a live entry means the value
+/// exists. Only a unique index table may be read this way: a
+/// non-unique one's pending posting ops sit in `writes` keyed with
+/// timestamp = egid. false = replied (23505, or an internal read
+/// failure).
 fn probeUnique(
     state: *pgwire.ConnState,
     tx: *_txn.Txn,
-    index_table_id: u32,
-    key: String,
+    probes: []const IndexKey,
 ) !bool {
-    const found = tx.lookup(.{
-        .namespace = tx.ns,
-        .table_id = index_table_id,
-        .primary = key,
-        .timestamp = tx.read_ts,
-    }) catch |err| {
-        log.err("unique probe index={d}: {s}", .{
-            index_table_id,
-            @errorName(err),
-        });
-        try replyError(state, "unique index probe failed");
-        return false;
-    };
-    const f = found orelse return true;
-    f.release();
-    return replyUniqueViolation(state);
+    var names: std.ArrayList(String) = .empty;
+    defer names.deinit(tx.allocator);
+    var i: usize = 0;
+    while (i < probes.len) {
+        const index_table_id = probes[i].idx.index_table_id;
+        names.clearRetainingCapacity();
+
+        while (i < probes.len and
+            probes[i].idx.index_table_id == index_table_id) : (i += 1)
+        {
+            try names.append(tx.allocator, probes[i].key);
+        }
+        var res = tx.multiGet(index_table_id, names.items) catch |err| {
+            log.err("unique probe index={d}: {s}", .{
+                index_table_id,
+                @errorName(err),
+            });
+            try replyError(state, "unique index probe failed");
+            return false;
+        };
+        defer res.deinit();
+        for (names.items) |key| {
+            if (res.item(key) != null) return replyUniqueViolation(state);
+        }
+    }
+    return true;
 }
 
 /// Reply 23505; false, for the `!bool` helpers' "replied" convention.

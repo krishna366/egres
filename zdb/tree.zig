@@ -1,6 +1,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 const _config = @import("config.zig");
 const _manifest = @import("manifest.zig");
 const _level_handler = @import("level.zig");
@@ -30,7 +31,7 @@ const log = std.log.scoped(.zdb_tree);
 pub const Targets = _compaction.Targets;
 pub const CompactCandidate = _compaction.CompactCandidate;
 pub const split_priority_score = _compaction.split_priority_score;
-const VersionTracker = _compaction.VersionTracker;
+const MultiGet = @import("read.zig").MultiGet;
 
 // ---------------------------------------------------------------------------
 // TableCache
@@ -430,42 +431,28 @@ pub const Tree = struct {
         self.mu.deinit();
     }
 
-    /// get checks each level from L0 upward and returns the first matching
-    /// item, or null if the key is absent. The returned item's key and value
+    /// get checks each level from L0 upward and returns the newest
+    /// version at or below `search_key.timestamp`, tombstone included,
+    /// or null if the key is absent. A one-key row MultiGet over this
+    /// tree alone (no memtables). The returned item's key and value
     /// are duplicated with self.allocator; the caller must free them.
-    ///
-    /// Two phases: under one shared hold of `mu`, pin every table that
-    /// could hold the key, across all levels, in read order; then release
-    /// and read them in that order, first hit wins. The pins keep the
-    /// tables readable through any install that lands in between, and the
-    /// lock is never held across a block read.
     pub fn get(self: *Tree, search_key: Key, priority: vfs.Priority) !?Item {
-        var list: std.ArrayList(TableEntry) = .empty;
-        errdefer {
-            for (list.items) |e| e.table.decrRef();
-            list.deinit(self.allocator);
-        }
-        {
-            const held = self.mu.hold(.shared, @src());
-            defer held.release();
-            for (self.levels) |*lv| try lv.acquireTables(
-                held,
-                self.allocator,
-                search_key,
-                &list,
-            );
-        }
-        const tables = try list.toOwnedSlice(self.allocator);
-        defer Level.releaseTables(self.allocator, tables);
-        for (tables) |e| {
-            if (try Level.readKey(
-                self.allocator,
-                e.table,
-                search_key,
-                priority,
-            )) |item| return item;
-        }
-        return null;
+        const keys = [_]String{search_key.primary};
+        var mg = try MultiGet.init(
+            self.allocator,
+            search_key.namespace,
+            search_key.table_id,
+            &keys,
+            .{
+                .read_ts = search_key.timestamp,
+                .priority = priority,
+                .include_deleted = true,
+            },
+        );
+        defer mg.deinit();
+        try mg.walkTree(self, mg.pending.items, 0);
+        const found = mg.item(search_key.primary) orelse return null;
+        return try found.dupe(self.allocator);
     }
 
     /// Build a merge iterator over this tree's data overlapping `range`,
@@ -701,62 +688,11 @@ pub const Tree = struct {
         return key;
     }
 
-    /// Drain one source's versions of `seek`'s primary into `rollup`,
-    /// newest first, admitting only timestamps at or below `bound`.
-    /// Each admitted version lowers `bound` beneath itself, so the
-    /// NEXT source starts strictly below everything consumed so far —
-    /// that is what keeps the sequential walk correct if a concurrent
-    /// flush/compaction re-surfaces already-consumed versions at a
-    /// lower source mid-walk (they arrive above the bound, skipped).
-    /// `it` is anything with the iterator surface (seekRange/itemRef/
-    /// next/currentPin): a single `Iterator` or a MergeIterator.
-    ///
-    /// Kept versions land in the tracker's buffer — pinned, never
-    /// copied; the tracker owns the pin lifecycle.
-    fn drainSource(
-        vt: *VersionTracker,
-        it: anytype,
-        seek: Key,
-        bound: *u64,
-    ) !VersionTracker.RoaringChain {
-        var start = seek;
-        start.timestamp = bound.*;
-        // Both bounds carry ns/table_id/primary, so the window can
-        // only yield this primary's versions — load-bearing for the
-        // namespace-wide memtable sources.
-        try it.seekRange(start, KeyRange.versionsAt(seek).right);
-        while (it.itemRef()) |item| {
-            std.debug.assert(item.key.equalPrimary(seek));
-            if (item.key.timestamp > bound.*) {
-                try it.next();
-                continue;
-            }
-            const ts = item.key.timestamp;
-            switch (try vt.roaringBuffer(item, it.currentPin())) {
-                .more => {
-                    // Real HLC timestamps are never 0: no wrap.
-                    std.debug.assert(ts > 0);
-                    bound.* = ts - 1;
-                    try it.next();
-                },
-                .done => return .done,
-                .foreign => return .foreign,
-            }
-        }
-        // Source exhausted with the chain still open: more input
-        // wanted from the next source down.
-        return .more;
-    }
-
     /// Fold one primary's roaring version chain into a bitmap by
-    /// walking sources top-down, LAZILY: the optional `extra` source
-    /// first (Forest.getBitmap passes one MergeIterator over all
-    /// memtable sources — merged rather than sequential because
-    /// memtable seeks are free of I/O and a sorted merge is immune to
-    /// their ordering subtleties), then this tree's levels from
-    /// `from_level` down, stopping at the first terminal without
-    /// touching anything beneath it. L0 tables are probed via their
-    /// binary-fuse filter before any I/O.
+    /// walking this tree's levels top-down from `from_level`, LAZILY:
+    /// stopping at the first terminal without touching anything
+    /// beneath it. A one-key posting MultiGet over the tree alone; the
+    /// memtables are not read.
     ///
     /// `seek.timestamp` is the read timestamp: only versions at or
     /// below it participate. Returns null when no version exists in
@@ -764,16 +700,15 @@ pub const Tree = struct {
     /// from empty is the caller's call). The bitmap and the fold
     /// allocate from `allocator`.
     ///
-    /// Both readers use this: Forest.getBitmap (memtable extra,
-    /// from_level=0, the reader's ts) and compaction read-below (no
-    /// extra, from_level=dest+1, ts = oldest buffered ts − 1 so the
-    /// walk starts strictly beneath the chain the compaction already
-    /// buffered). Soundness of walking sources sequentially rests on
+    /// Compaction's read-below is the caller (from_level=dest+1,
+    /// ts = oldest buffered ts − 1 so the walk starts strictly beneath
+    /// the chain the compaction already buffered). Soundness of
+    /// walking sources sequentially rests on
     /// the level-ordering invariant — for any primary, every version
     /// at level i is newer than every version at level j > i
     /// (compaction merges src ∪ overlapping-dest into dest and never
-    /// splits a primary's run across output files) — plus
-    /// `drainSource`'s descending-bound guard for mid-walk shuffles.
+    /// splits a primary's run across output files) — plus the node's
+    /// descending maxTs guard for mid-walk shuffles.
     ///
     /// CorruptPosting / NotRoaring mean the chain cannot be folded;
     /// compaction degrades to verbatim emission, reads surface it.
@@ -782,67 +717,20 @@ pub const Tree = struct {
         allocator: std.mem.Allocator,
         seek: Key,
         priority: vfs.Priority,
-        extra: ?*MergeIterator,
         from_level: usize,
     ) !?zroar.Bitmap {
-        // Read-mode tracker: pure collection, no retention state and
-        // no emitter — resolution here is just the fold.
-        var vt = VersionTracker.init(allocator, 0, false);
-        defer vt.deinit();
-
-        var bound = seek.timestamp;
-        var status: VersionTracker.RoaringChain = .more;
-
-        if (extra) |ex| {
-            status = try drainSource(&vt, ex, seek, &bound);
-        }
-
-        var lvl = from_level;
-        while (status == .more and lvl < self.opts.max_levels) : (lvl += 1) {
-            var probe = seek;
-            probe.timestamp = bound;
-            const tables = blk: {
-                const held = self.mu.hold(.shared, @src());
-                defer held.release();
-                break :blk try self.levels[lvl].overlappingTables(
-                    held,
-                    self.allocator,
-                    KeyRange.versionsAt(probe),
-                );
-            };
-            defer Level.releaseTables(self.allocator, tables);
-
-            // Newest first within a level: L0 sorts by id ascending
-            // (newest last), so walk in reverse. Point ranges select
-            // at most one table on L≥1.
-            var ri = tables.len;
-            while (status == .more and ri > 0) {
-                ri -= 1;
-                const e = tables[ri];
-                if (!e.table.containsKey(probe)) continue;
-
-                var it: Iterator = .{
-                    .table = TableIterator.init(
-                        self.allocator,
-                        e.table,
-                        priority,
-                    ),
-                };
-                defer it.deinit();
-                status = try drainSource(&vt, &it, seek, &bound);
-            }
-        }
-
-        switch (status) {
-            .foreign => return error.NotRoaring,
-            .done => return try vt.foldBufferedToBitmap(allocator, null),
-            // Deltas (or nothing at all) through the whole window:
-            // no terminal exists for this posting here.
-            .more => {
-                if (vt.buffered.items.len == 0) return null;
-                return try vt.foldBufferedToBitmap(allocator, null);
-            },
-        }
+        const keys = [_]String{seek.primary};
+        var mg = try MultiGet.init(
+            allocator,
+            seek.namespace,
+            seek.table_id,
+            &keys,
+            .{ .read_ts = seek.timestamp, .priority = priority },
+        );
+        defer mg.deinit();
+        try mg.walkTree(self, mg.pending.items, from_level);
+        if (!mg.hasVersions(seek.primary)) return null;
+        return try mg.bitmap(allocator, seek.primary);
     }
 
     /// applyCompaction is Phase B: commits the manifest changes and updates the

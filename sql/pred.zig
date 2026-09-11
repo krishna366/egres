@@ -43,6 +43,62 @@ pub const Pred = union(enum) {
             else => self[0..1],
         };
     }
+
+    /// SQL three-valued logic: null = unknown. `eq` is unknown when
+    /// either side is NULL; IS [NOT] NULL is never unknown; AND / OR /
+    /// NOT follow Kleene. Reads only the cells the tree names
+    /// (Table.read — a null-bit test plus one O(1) read each; no
+    /// full-row decode).
+    pub fn eval(
+        self: *const Pred,
+        tbl: *const _table.Table,
+        item: zdb.kv.Item,
+    ) ?bool {
+        switch (self.*) {
+            .eq => |c| {
+                if (c.val == .null_value) return null;
+                const cell = tbl.parseCol(item, c.col);
+                if (cell == .null_value) return null;
+                return _value.valuesEqual(cell, c.val);
+            },
+            .is_null => |n| {
+                const is_null = tbl.parseCol(item, n.col) == .null_value;
+                return is_null != n.negate;
+            },
+            .and_ => |kids| {
+                var unknown = false;
+                for (kids) |*kid| {
+                    if (kid.eval(tbl, item)) |b| {
+                        if (!b) return false;
+                    } else unknown = true;
+                }
+                return if (unknown) null else true;
+            },
+            .or_ => |kids| {
+                var unknown = false;
+                for (kids) |*kid| {
+                    if (kid.eval(tbl, item)) |b| {
+                        if (b) return true;
+                    } else unknown = true;
+                }
+                return if (unknown) null else false;
+            },
+            .not => |child| {
+                const b = child.eval(tbl, item) orelse return null;
+                return !b;
+            },
+        }
+    }
+
+    /// A row matches only when the predicate is TRUE — unknown rejects,
+    /// so `WHERE col = NULL` matches nothing.
+    pub fn matches(
+        self: *const Pred,
+        tbl: *const _table.Table,
+        item: zdb.kv.Item,
+    ) bool {
+        return self.eval(tbl, item) orelse false;
+    }
 };
 
 pub const BindError = error{
@@ -122,48 +178,4 @@ pub fn bind(
         return null;
     };
     return p;
-}
-
-/// SQL three-valued logic: null = unknown. `eq` is unknown when either
-/// side is NULL; IS [NOT] NULL is never unknown; AND / OR / NOT follow
-/// Kleene. Reads only the cells the tree names (Table.read — a null-bit
-/// test plus one O(1) read each; no full-row decode).
-pub fn eval(tbl: *const _table.Table, item: zdb.kv.Item, p: *const Pred) ?bool {
-    switch (p.*) {
-        .eq => |c| {
-            if (c.val == .null_value) return null;
-            const cell = tbl.parseCol(item, c.col);
-            if (cell == .null_value) return null;
-            return _value.valuesEqual(cell, c.val);
-        },
-        .is_null => |n| return (tbl.parseCol(item, n.col) == .null_value) != n.negate,
-        .and_ => |kids| {
-            var unknown = false;
-            for (kids) |*kid| {
-                if (eval(tbl, item, kid)) |b| {
-                    if (!b) return false;
-                } else unknown = true;
-            }
-            return if (unknown) null else true;
-        },
-        .or_ => |kids| {
-            var unknown = false;
-            for (kids) |*kid| {
-                if (eval(tbl, item, kid)) |b| {
-                    if (b) return true;
-                } else unknown = true;
-            }
-            return if (unknown) null else false;
-        },
-        .not => |child| {
-            const b = eval(tbl, item, child) orelse return null;
-            return !b;
-        },
-    }
-}
-
-/// A row matches only when the predicate is TRUE — unknown rejects,
-/// so `WHERE col = NULL` matches nothing.
-pub fn matches(tbl: *const _table.Table, item: zdb.kv.Item, p: *const Pred) bool {
-    return eval(tbl, item, p) orelse false;
 }

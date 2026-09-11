@@ -20,6 +20,12 @@ const _fi = @import("../file_ids.zig");
 /// zero collision risk across the node_id-namespaced file_id space.
 pub var block_cache: ?*_cache.ShardedCache(u128) = null;
 
+/// How `Table.open` opens SST files. `.direct` goes with a block cache:
+/// blocks are cached decompressed there, so the page cache would hold
+/// the same data twice. The default keeps tests and tools on buffered
+/// reads.
+pub var read_mode: vfs.Mode = .default;
+
 pub const Error = _idx.Error || _buffers.Error || compress.Error ||
     std.mem.Allocator.Error || error{
     ChecksumMismatch,
@@ -62,11 +68,13 @@ pub const Table = struct {
         return self.handle.file_size;
     }
 
-    /// open opens an SST file through the global VFS instance (vfs.g).
-    /// The file loading mode is determined by vfs.g(); readAligned
-    /// transparently handles mmap, direct, and memory-backed file handles.
+    /// open opens an SST file through the global VFS instance (vfs.g),
+    /// in `read_mode`; readAligned transparently handles mmap, direct,
+    /// and memory-backed file handles.
     pub fn open(allocator: std.mem.Allocator, path: []const u8, priority: vfs.Priority) !*Table {
-        const handle = try vfs.g().openFile(allocator, path, .{});
+        const handle = try vfs.g().openFile(allocator, path, .{
+            .mode = read_mode,
+        });
         const t = try initFromHandle(allocator, handle, priority);
         errdefer t.decrRef();
         t.file_id = _fi.fromPath(path);
@@ -226,10 +234,13 @@ pub const Table = struct {
     }
 
     pub fn containsKey(self: *const Table, key: Key) bool {
-        if (self.binary_fuse) |bf| {
-            const h = key.bloomHash();
-            return bf.contain(h);
-        }
+        return self.containsHash(key.bloomHash());
+    }
+
+    /// `containsKey` for a caller that hashed the key once
+    /// (Key.bloomHash) and probes many tables with it.
+    pub fn containsHash(self: *const Table, hash: u64) bool {
+        if (self.binary_fuse) |bf| return bf.contain(hash);
         return true;
     }
 
@@ -242,18 +253,60 @@ pub const Table = struct {
         return self.index.blocks[block_idx].key;
     }
 
+    /// The block a seek for `target` lands in: the last block whose base
+    /// key is at or below it, block 0 when every base key is above, null
+    /// for an empty table. The block `TableIterator.seekForward` opens,
+    /// so a prefetch of it makes that seek a cache hit.
+    pub fn blockFor(self: *const Table, target: Key) ?usize {
+        const blocks = self.index.blocks;
+        if (blocks.len == 0) return null;
+        // First block whose base key > target.
+        const Base = _buffers.BlockIndexStruct;
+        const above = utils.search(Base, blocks, target, struct {
+            fn f(sk: Key, b: Base) bool {
+                return Key.init(b.key).order(sk) == .gt;
+            }
+        }.f);
+        return if (above > 0) above - 1 else 0;
+    }
+
+    /// The block cache key: file_id in the high 64 bits, block_idx in
+    /// the low 64 — no hashing, no collision. 0 = "skip cache" (file_id
+    /// 0 is the in-memory / non-SST marker).
+    fn cacheKey(self: *const Table, block_idx: usize) u128 {
+        if (self.file_id == 0) return 0;
+        return (@as(u128, self.file_id) << 64) | @as(u128, block_idx);
+    }
+
+    /// Decompress and checksum one block's raw bytes into a ref-counted
+    /// Value; the one ref is the caller's.
+    fn decodeBlock(self: *const Table, raw: []const u8) Error!*_cache.Value {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+        const sz = try compress.decompress(
+            self.allocator,
+            self.codec,
+            raw,
+            &out,
+        );
+        // Block must contain at least the leading u64 hash (see zbuf.hash).
+        if (sz < 8) return error.CorruptTable;
+        std.debug.assert(out.items.len == sz);
+
+        const stored_checksum = try _idx.readU64LE(out.items, 0);
+        const got_checksum = zbuf.hash(out.items[8..]);
+        if (stored_checksum != got_checksum) return error.ChecksumMismatch;
+
+        const owned_data = try out.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned_data);
+        return _cache.Value.init(self.allocator, owned_data) catch
+            return error.OutOfMemory;
+    }
+
     pub fn readBlock(self: *const Table, block_idx: usize, priority: vfs.Priority) Error!*_cache.Value {
         if (block_idx >= self.index.blocks.len) return error.CorruptTable;
 
-        // file_id in high 64 bits, block_idx in low 64 bits — no hashing,
-        // no collision possible. 0 = "skip cache" sentinel (file_id 0 is
-        // the in-memory / non-SST marker).
-        const fid: u64 = self.file_id;
-        const cache_key: u128 = if (fid != 0)
-            (@as(u128, fid) << 64) | @as(u128, block_idx)
-        else
-            0;
-
+        const cache_key = self.cacheKey(block_idx);
         if (block_cache != null and cache_key != 0) {
             if (block_cache.?.get(cache_key)) |val| return val; // incrRef'd by get.
         }
@@ -270,24 +323,7 @@ pub const Table = struct {
         ) catch return error.CorruptTable;
         defer result.free();
 
-        // Decompress (temporary)
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.allocator);
-        const sz = try compress.decompress(self.allocator, self.codec, result.data, &out);
-        // Block must contain at least the leading u64 hash (see zbuf.hash).
-        if (sz < 8) return error.CorruptTable;
-        std.debug.assert(out.items.len == sz);
-
-        const stored_checksum = try _idx.readU64LE(out.items, 0);
-        const got_checksum = zbuf.hash(out.items[8..]);
-        if (stored_checksum != got_checksum) return error.ChecksumMismatch;
-
-        // Create ref-counted Value with owned copy
-        const owned_data = try out.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(owned_data);
-
-        // val has ref=1
-        const val = _cache.Value.init(self.allocator, owned_data) catch return error.OutOfMemory;
+        const val = try self.decodeBlock(result.data);
         errdefer val.decrRef();
 
         // Cache insert (best-effort); put incrRefs on success → ref=2
@@ -296,6 +332,65 @@ pub const Table = struct {
         }
 
         return val; // caller holds ref (1 if not cached, or 1+cache_ref if cached)
+    }
+
+    /// Read the blocks of `idxs` (ascending, no repeats) that `cache` does
+    /// not hold, in one io_uring submission, and insert them into it, so
+    /// the seeks that follow hit. Returns how many were read. The batch
+    /// is capped at half the cache's admission budget, estimated by the
+    /// table's mean decompressed block size: a new entry sits in the
+    /// small queue until its first hit, and a burst past that budget
+    /// would evict its own earlier blocks before their seeks. Blocks
+    /// past the cap are left to the seeks, in key order. A no-op for a
+    /// table with no cache key or whose file is mapped or in memory
+    /// (no I/O to batch).
+    pub fn prefetchBlocks(
+        self: *const Table,
+        cache: *_cache.ShardedCache(u128),
+        allocator: std.mem.Allocator,
+        idxs: []const usize,
+        priority: vfs.Priority,
+    ) Error!usize {
+        if (self.file_id == 0) return 0;
+        if (self.handle.mapped != null or self.handle.owned_buf != null) {
+            return 0;
+        }
+        const blocks = self.index.blocks;
+        if (blocks.len == 0) return 0;
+        const per_block = @max(self.index.uncompressed_size / blocks.len, 1);
+        const max_blocks = cache.admissionBudget() / 2 / per_block;
+        if (max_blocks == 0) return 0;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const arloc = arena.allocator();
+        var reqs: std.ArrayList(vfs.FileHandle.ReadRequest) = .empty;
+        var wanted: std.ArrayList(usize) = .empty;
+        for (idxs) |idx| {
+            if (wanted.items.len == max_blocks) break;
+            if (idx >= blocks.len) return error.CorruptTable;
+            if (cache.get(self.cacheKey(idx))) |val| {
+                val.decrRef();
+                continue;
+            }
+            const bi = blocks[idx];
+            if (bi.len < 4) return error.CorruptTable;
+            try reqs.append(arloc, .{
+                .offset = @intCast(bi.offset),
+                .len = bi.len,
+            });
+            try wanted.append(arloc, idx);
+        }
+        if (reqs.items.len == 0) return 0;
+
+        self.handle.batchRead(&arena, reqs.items, priority) catch
+            return error.CorruptTable;
+        for (reqs.items, wanted.items) |req, idx| {
+            const val = try self.decodeBlock(req.data);
+            defer val.decrRef(); // the cache holds its own ref
+            cache.put(self.cacheKey(idx), val) catch {};
+        }
+        return wanted.items.len;
     }
 };
 
@@ -491,6 +586,17 @@ pub const BlockIterator = struct {
     /// seek, then probes compare raw bytes and only the landing entry is
     /// materialized.
     pub fn seekGe(self: *BlockIterator, target_key: []const u8) Error!void {
+        return self.seekGeFrom(target_key, 0);
+    }
+
+    /// `seekGe` over the entries from `from` on: a caller that knows the
+    /// target is at or past its current entry narrows the search to
+    /// what follows.
+    pub fn seekGeFrom(
+        self: *BlockIterator,
+        target_key: []const u8,
+        from: usize,
+    ) Error!void {
         // This binary search is only possible because we're diffing keys
         // against the base key and not against the previous key.
         if (target_key.len == 0) return self.setIdx(0);
@@ -502,7 +608,7 @@ pub const BlockIterator = struct {
         const shared = std.mem.findDiff(u8, target_key, self.base_key) orelse
             @min(target_key.len, self.base_key.len);
 
-        var lo: usize = 0;
+        var lo: usize = from;
         var hi: usize = self.layout.entry_count;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
@@ -592,7 +698,8 @@ pub const TableIterator = struct {
     current_block: ?*_cache.Value = null,
     valid: bool,
     priority: vfs.Priority,
-    end_key: ?Key = null, // exclusive upper bound; owned (duped)
+    /// Exclusive upper bound, borrowed from the caller of `seekRange`.
+    end_key: ?Key = null,
     end_bpos: usize = 0, // block index where end_key lives
     /// Reusable scratch for the marshaled seek target — BlockIterator's
     /// binary search compares against raw bytes, so we build them once
@@ -613,7 +720,6 @@ pub const TableIterator = struct {
     }
 
     pub fn deinit(self: *TableIterator) void {
-        if (self.end_key) |ek| ek.free(self.allocator);
         self.seek_buf.deinit(self.allocator);
         self.table.decrRef();
         if (self.bi) |*bi| bi.deinit();
@@ -622,10 +728,10 @@ pub const TableIterator = struct {
 
     /// Seek to the first entry >= start, stopping before any entry with key >= end.
     /// Empty start means seek to first; empty end means no upper bound.
-    /// Dupes end so it remains valid for the lifetime of this iterator.
+    /// `end` is borrowed, checked on every `next`: its primary must
+    /// outlive the iterator's use of it, as the skiplist iterator's must.
     pub fn seekRange(self: *TableIterator, start: Key, end: Key) !void {
         // Set up end bound.
-        if (self.end_key) |ek| ek.free(self.allocator);
         self.end_key = null;
 
         if (end.len() > 0) {
@@ -636,7 +742,7 @@ pub const TableIterator = struct {
             }
             if (end.order(self.table.biggest) != .gt) {
                 // The end key is within this table's key range.
-                self.end_key = try end.dupe(self.allocator);
+                self.end_key = end;
                 // Find the block containing end_key: last block with base key <= end.
                 const blocks = self.table.index.blocks;
                 const ei = utils.search(_buffers.BlockIndexStruct, blocks, end, struct {
@@ -672,25 +778,24 @@ pub const TableIterator = struct {
     fn seekForward(self: *TableIterator, target: Key) Error!void {
         self.valid = false;
         const blocks = self.table.index.blocks;
-        if (blocks.len == 0) return;
-
-        // First block whose base key > target.
-        const bi_idx = utils.search(_buffers.BlockIndexStruct, blocks, target, struct {
-            fn f(sk: Key, b: _buffers.BlockIndexStruct) bool {
-                return Key.init(b.key).order(sk) == .gt;
-            }
-        }.f);
-
-        // The block we want is idx-1 (last block with base key <= target),
-        // or 0 if all base keys are > target.
-        const lo = if (bi_idx > 0) bi_idx - 1 else 0;
+        const lo = self.table.blockFor(target) orelse return;
 
         // Marshal once; the in-block search compares against these bytes.
         self.seek_buf.clearRetainingCapacity();
         const traw = try target.marshalTo(self.allocator, &self.seek_buf);
 
-        try self.setBlock(lo);
-        try self.bi.?.seekGe(traw);
+        // The block is still open from the last seek: search it in
+        // place, with no cache lookup and no iterator rebuild, and from
+        // the current entry on when the target is not behind it.
+        var from: usize = 0;
+        if (self.bi != null and self.bpos == lo) {
+            if (self.bi.?.itemRef()) |cur| {
+                if (cur.key.order(target) != .gt) from = self.bi.?.entry_idx;
+            }
+        } else {
+            try self.setBlock(lo);
+        }
+        try self.bi.?.seekGeFrom(traw, from);
         if (self.bi.?.is_valid) {
             self.valid = true;
             return;

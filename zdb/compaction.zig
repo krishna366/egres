@@ -16,7 +16,7 @@ const _table = @import("table.zig");
 const vfs = @import("vfs");
 const _metrics = @import("metrics.zig");
 const _fi = @import("file_ids.zig");
-const DeltaReader = @import("buffers.gen.zig").RoaringDeltaReader;
+const _read = @import("read.zig");
 const zroar = @import("zroar");
 const _tree = @import("tree.zig");
 
@@ -315,7 +315,6 @@ pub const VersionTracker = struct {
                 alloc,
                 t.bufferedKey(oldest - 1),
                 e.prio,
-                null,
                 e.dest + 1,
             ) catch |err| switch (err) {
                 // The chain below can't be folded (mixed or corrupt):
@@ -391,19 +390,11 @@ pub const VersionTracker = struct {
     ) !zroar.Bitmap {
         const items = t.buffered.items;
 
-        var bm: zroar.Bitmap = blk: {
-            if (t.have_state) {
-                const term = items[items.len - 1];
-                if (term.meta.isDeleted())
-                    break :blk try zroar.Bitmap.init(alloc);
-                break :blk try zroar.Bitmap.fromBufferCopy(
-                    alloc,
-                    term.value,
-                );
-            }
-            if (external) |eb| break :blk try eb.clone();
-            break :blk try zroar.Bitmap.init(alloc);
-        };
+        const terminal: ?Item = if (t.have_state)
+            t.bufferedItem(items[items.len - 1])
+        else
+            null;
+        var bm = try _read.baseBitmap(alloc, terminal, external);
         errdefer bm.deinit();
 
         // The deltas are everything but a trailing terminal, newest
@@ -411,15 +402,7 @@ pub const VersionTracker = struct {
         var i = t.nDeltas();
         while (i > 0) {
             i -= 1;
-            const r = DeltaReader.init(items[i].value, 0) catch
-                return error.CorruptPosting;
-            r.verify() catch return error.CorruptPosting;
-            var j: u32 = 0;
-            while (j < r.removesLen()) : (j += 1)
-                _ = bm.remove(r.removesAt(j) catch unreachable);
-            j = 0;
-            while (j < r.addsLen()) : (j += 1)
-                _ = try bm.set(r.addsAt(j) catch unreachable);
+            try _read.applyDelta(&bm, items[i].value);
         }
         return bm;
     }

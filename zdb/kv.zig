@@ -322,4 +322,17 @@ pub const Key = struct {
     pub fn equalPrimary(self: Key, other: Key) bool {
         return std.mem.eql(u8, self.primary, other.primary);
     }
+
+    /// The exclusive end of this key's run of versions: the same
+    /// primary at timestamp 0. Versions sort newest first, so every
+    /// version lies before it, and no version is ever written at HLC 0,
+    /// so nothing of this key is excluded. Borrows `primary`.
+    pub fn end(self: Key) Key {
+        return .{
+            .namespace = self.namespace,
+            .table_id = self.table_id,
+            .primary = self.primary,
+            .timestamp = 0,
+        };
+    }
 };

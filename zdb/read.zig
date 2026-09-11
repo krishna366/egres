@@ -1,28 +1,105 @@
-//! Forest's read paths: point lookups (`get`, `getRaw`, `getBitmap`), the
-//! range scan and its `Cursor`, `maxKey`, and the human-readable stats
-//! dump. Every function here takes a `*Forest` and leaves it unchanged;
-//! `Forest` aliases each declaration back in, so callers keep using
-//! method syntax.
+//! Forest's read paths: point lookups (`get`, `getRaw`, `getBitmap`),
+//! the batch they are one-key calls of (`MultiGet`, `multiGet`), and
+//! the range scan with its `Cursor` and `maxKey`. Every function here
+//! takes a `*Forest` and leaves it unchanged; `Forest` aliases each
+//! declaration back in, so callers keep using method syntax.
 
 const std = @import("std");
 const vfs = @import("vfs");
 const zroar = @import("zroar");
+const utils = @import("utils");
+const String = utils.String;
 const _level = @import("level.zig");
 const _table = @import("table.zig");
 const _tree = @import("tree.zig");
 const _skl = @import("skl/skiplist.zig");
+const DeltaReader = @import("buffers.gen.zig").RoaringDeltaReader;
 
 const Forest = @import("forest.zig").Forest;
 const Key = @import("kv.zig").Key;
-const TreeKey = @import("kv.zig").TreeKey;
+const Meta = @import("kv.zig").Meta;
 const KeyRange = _level.KeyRange;
+const Level = _level.Level;
 const Item = _table.table.Item;
+const Table = _table.Table;
+const TableIterator = _table.TableIterator;
+const Tree = _tree.Tree;
 const merge_iterator = _table.merge_iterator;
+const Iterator = merge_iterator.Iterator;
+const MergeIterator = merge_iterator.MergeIterator;
 const Pin = merge_iterator.Pin;
 
-/// Get a value by key. Checks memtables first (current, then immutables
-/// newest-to-oldest), then routes to the correct tree.
-/// Returned Item is owned by the caller; call item.free(allocator) when done.
+/// Many keys of one table at one read_ts, resolved together (see
+/// `MultiGet`). The result owns its pins: read it through `item` /
+/// `bitmap`, then `deinit`. `keys` need not be sorted; they are
+/// borrowed until then. Rejects a read_ts below `global_min_read`,
+/// whose versions may already have been compacted away.
+pub fn multiGet(
+    self: *Forest,
+    allocator: std.mem.Allocator,
+    ns: u64,
+    table_id: u32,
+    keys: []const String,
+    opts: MultiGet.Options,
+) !MultiGet {
+    if (opts.read_ts < self.globalMinRead()) {
+        return error.ReadBelowMinRead;
+    }
+    var mg = try MultiGet.init(allocator, ns, table_id, keys, opts);
+    errdefer mg.deinit();
+    try fillMultiGet(self, &mg);
+    return mg;
+}
+
+/// The walk: the memtables (with the txn's pending writes, when
+/// given) through one merge, then each tree's levels for the keys
+/// still pending. Memtable refs are taken BEFORE the tree lookup:
+/// data flushed in between is then visible in both, and the node's
+/// maxTs skips the L0 duplicate. The reverse order could miss it in
+/// both.
+fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
+    const alloc = mg.allocator;
+    {
+        const srcs = try self.memtables.getIterators(alloc, mg.opts.pending);
+        var merge: Iterator = .{ .merge = MergeIterator.init(alloc, srcs) };
+        defer {
+            merge.deinit(); // releases each source's skiplist ref
+            alloc.free(srcs);
+        }
+        try mg.drainMerge(&merge);
+    }
+
+    // Keys ascend, so a tree covers a contiguous run of the pending
+    // nodes; the run ends at the first node another tree owns.
+    const trees = self.getTable(mg.ns, mg.table_id) orelse return;
+    const pend = mg.pending.items;
+    var i: usize = 0;
+    while (i < pend.len) {
+        const first = mg.keyAt(pend[i], mg.opts.read_ts);
+        const tree = trees.getTreeByKey(first) orelse {
+            i += 1;
+            continue;
+        };
+        defer tree.release();
+
+        var j = i + 1;
+        while (j < pend.len) : (j += 1) {
+            const key = mg.keyAt(pend[j], mg.opts.read_ts);
+            const owner = trees.getTreeByKey(key) orelse break;
+            defer owner.release();
+
+            if (owner.tree_id != tree.tree_id) break;
+        }
+        try mg.walkTree(tree, pend[i..j], 0);
+        i = j;
+    }
+    MultiGet.compactPending(&mg.pending);
+}
+
+/// Get a value by key: the newest version at or below
+/// `search_key.timestamp`, from the memtables (current, then
+/// immutables newest-to-oldest) or the owning tree. Returned Item is
+/// owned by the caller; call item.free(allocator) when done.
 ///
 /// A key deleted at or below `search_key.timestamp` reads as absent: the
 /// tombstone wins the lookup and is reported as null. Rejects reads below
@@ -36,19 +113,7 @@ pub fn get(
     if (search_key.timestamp < self.globalMinRead()) {
         return error.ReadBelowMinRead;
     }
-
-    const found = try self.getRaw(allocator, search_key, priority);
-    // Every layer stops at its first hit, and versions sort newest-first,
-    // so `found` is the newest version at or below the read timestamp. If
-    // that version is a tombstone, the key is deleted as of this read —
-    // older versions behind it are shadowed and must not surface.
-    if (found) |item| {
-        if (item.meta.isDeleted()) {
-            item.free(allocator);
-            return null;
-        }
-    }
-    return found;
+    return getOne(self, allocator, search_key, priority, false);
 }
 
 /// get without the tombstone filter or the horizon check: returns the
@@ -61,26 +126,41 @@ pub fn getRaw(
     search_key: Key,
     priority: vfs.Priority,
 ) !?Item {
-    if (try self.memtables.get(allocator, search_key)) |item| {
-        return item;
-    }
+    return getOne(self, allocator, search_key, priority, true);
+}
 
-    const trees = self.getTable(
+/// A one-key row MultiGet, its item duped out with `allocator`.
+fn getOne(
+    self: *Forest,
+    allocator: std.mem.Allocator,
+    search_key: Key,
+    priority: vfs.Priority,
+    include_deleted: bool,
+) !?Item {
+    const keys = [_]String{search_key.primary};
+    var mg = try MultiGet.init(
+        allocator,
         search_key.namespace,
         search_key.table_id,
-    ) orelse return null;
-    const tree = trees.getTreeByKey(search_key) orelse return null;
-    defer tree.release();
-    return tree.get(search_key, priority);
+        &keys,
+        .{
+            .read_ts = search_key.timestamp,
+            .priority = priority,
+            .include_deleted = include_deleted,
+        },
+    );
+    defer mg.deinit();
+    try fillMultiGet(self, &mg);
+    const found = mg.item(search_key.primary) orelse return null;
+    return try found.dupe(allocator);
 }
 
 /// The posting bitmap for `search_key`'s primary as of
 /// `search_key.timestamp` (the read_ts — same convention as `get`).
-/// A lazy top-down walk via Tree.rollupBitmap: one merge over the
-/// memtable sources, then the owning tree's levels, stopping at
-/// the first terminal (a state or a tombstone). After compaction
-/// rollup the newest version is usually already a state, so the
-/// walk rarely descends past the level that holds it.
+/// A one-key posting MultiGet: the memtables, then the owning tree's
+/// levels, stopping at the first terminal (a state or a tombstone).
+/// After compaction rollup the newest version is usually already a
+/// state, so the walk rarely descends past the level that holds it.
 ///
 /// An absent key, a tombstoned key, and an empty posting all return
 /// an EMPTY bitmap — an index reader cannot distinguish them and
@@ -98,38 +178,471 @@ pub fn getBitmap(
     if (search_key.timestamp < self.globalMinRead()) {
         return error.ReadBelowMinRead;
     }
-
-    // Memtable sources BEFORE the tree lookup: data flushed in
-    // between is then visible in both our held snapshot and L0,
-    // and rollupBitmap's descending bound skips the L0 duplicate.
-    // The reverse order could miss it in both. getIterators
-    // acquires refs, so the arenas outlive a concurrent flush.
-    // One sorted merge over them (rather than sequential drains):
-    // memtable seeks cost no I/O, and the merge is indifferent to
-    // source order and cross-memtable ordering subtleties.
-    const srcs = try self.memtables.getIterators(allocator, null);
-    var mems_itr = merge_iterator.MergeIterator.init(allocator, srcs);
-    defer {
-        mems_itr.deinit(); // releases each source's skiplist ref
-        allocator.free(srcs);
-    }
-
-    const trees = self.getTable(
+    const keys = [_]String{search_key.primary};
+    var mg = try MultiGet.init(
+        allocator,
         search_key.namespace,
         search_key.table_id,
-    ) orelse return zroar.Bitmap.init(allocator);
-    const t = trees.getTreeByKey(search_key) orelse
-        return zroar.Bitmap.init(allocator);
-    defer t.release();
-
-    const bm = try t.rollupBitmap(
-        allocator,
-        search_key,
-        priority,
-        &mems_itr,
-        0,
+        &keys,
+        .{ .read_ts = search_key.timestamp, .priority = priority },
     );
-    return bm orelse zroar.Bitmap.init(allocator);
+    defer mg.deinit();
+    try fillMultiGet(self, &mg);
+    return mg.bitmap(allocator, search_key.primary);
+}
+
+/// Many keys of one table, resolved together: for each, its versions
+/// at or below read_ts, newest first, down to the first that is not
+/// a delta (a state or a tombstone), which closes the chain. A row is
+/// one version; a posting is its deltas over a state, folded into a
+/// bitmap by `bitmap`. The keys are kept as nodes sorted by key (duplicates
+/// collapse), so a table's share of them is one contiguous slice
+/// found by binary search and consecutive keys land in the same
+/// block. The sources are walked newest first — the txn's pending
+/// writes and the memtables through one merge (`drainMerge`), then
+/// each tree's levels from the top (`walkTree`) — and at every level
+/// only the tables whose range and bloom filter admit a key that is
+/// still pending are probed. A key leaves `pending` as soon as its
+/// versions settle it, so lower levels cost only what is still open.
+/// Versions are borrowed under pins, never copied. The key slices are
+/// borrowed from the caller for the MultiGet's lifetime; the nodes
+/// and versions come from one arena, and `deinit` releases every pin.
+pub const MultiGet = struct {
+    /// The caller's allocator: iterators and the per-level table
+    /// slices, which come and go during the walk.
+    allocator: std.mem.Allocator,
+    /// Nodes, versions and the pending list: freed together.
+    arena: std.heap.ArenaAllocator,
+    opts: Options,
+    ns: u64,
+    table_id: u32,
+    nodes: []Node,
+    /// The nodes not yet done, in key order. Rebuilt from itself
+    /// after every source, so each source sees only what the ones
+    /// above it left open; empty ends the walk.
+    pending: std.ArrayList(*Node),
+    /// Scratch for `probeTable`: the nodes one table is seeked for,
+    /// and the blocks those seeks land in.
+    accepted: std.ArrayList(*Node) = .empty,
+    blocks: std.ArrayList(usize) = .empty,
+
+    pub const Options = struct {
+        /// Versions above this are not visible. Must be at or above
+        /// `Forest.globalMinRead` for the entry points that check it.
+        read_ts: u64 = std.math.maxInt(u64),
+        priority: vfs.Priority = .p0,
+        /// Rows only: a txn's private writes, the first source (src 0
+        /// of the memtable merge, as in ScanOptions.pending), so a
+        /// pending write wins over every committed version and a
+        /// pending tombstone reads as absent with no fallback. Not
+        /// for postings: their pending ops are per-egid entries the
+        /// sql layer overlays itself (Txn.overlayPostings).
+        pending: ?*_skl.SkipList = null,
+        /// Rows only: hand back a tombstone version as an item
+        /// (getRaw).
+        include_deleted: bool = false,
+    };
+
+    /// One version of a key as found in a source, borrowed: `value`
+    /// points into the block or arena `pin` holds. Prepended as
+    /// found, and sources are walked newest first, so a node's list
+    /// reads OLDEST first: the head is the state or tombstone when
+    /// one was found, the rest are the deltas in the order a fold
+    /// applies them.
+    pub const Version = struct {
+        ts: u64,
+        meta: Meta,
+        value: []const u8,
+        pin: Pin,
+        next: ?*Version,
+    };
+
+    /// One key of the batch and the versions found for it so far.
+    pub const Node = struct {
+        key: []const u8,
+        /// bloomHash(key), once per key: every table probe reuses it.
+        hash: u64,
+        /// Oldest taken first (see Version). Null until a source has
+        /// one.
+        head: ?*Version = null,
+
+        /// Versions above this are not wanted from the next source:
+        /// the head's ts - 1 once something was taken, so the next
+        /// source down starts strictly below what was consumed (a
+        /// version that re-surfaces at a lower source after a flush
+        /// or compaction arrives above it and is skipped); read_ts
+        /// before that.
+        pub fn maxTs(self: *const Node, read_ts: u64) u64 {
+            const head = self.head orelse return read_ts;
+            // Real HLC timestamps are never 0: no wrap.
+            std.debug.assert(head.ts > 0);
+            return head.ts - 1;
+        }
+
+        /// Nothing more is wanted: the head is a state or a tombstone,
+        /// which closes the chain. A delta keeps it open.
+        pub fn done(self: *const Node) bool {
+            const head = self.head orelse return false;
+            return !head.meta.isDelta();
+        }
+
+        fn lessByKey(_: void, a: Node, b: Node) bool {
+            return std.mem.order(u8, a.key, b.key) == .lt;
+        }
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ns: u64,
+        table_id: u32,
+        keys: []const String,
+        opts: Options,
+    ) !MultiGet {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arloc = arena.allocator();
+
+        const all = try arloc.alloc(Node, keys.len);
+        for (keys, all) |key, *node| {
+            node.* = .{
+                .key = key,
+                .hash = (Key{ .primary = key }).bloomHash(),
+            };
+        }
+        std.mem.sort(Node, all, {}, Node.lessByKey);
+        // Collapse duplicates: the sort made them adjacent.
+        var kept: usize = 0;
+        for (all) |node| {
+            if (kept > 0 and std.mem.eql(u8, all[kept - 1].key, node.key)) {
+                continue;
+            }
+            all[kept] = node;
+            kept += 1;
+        }
+        const nodes = all[0..kept];
+
+        var pending: std.ArrayList(*Node) = .empty;
+        try pending.ensureTotalCapacityPrecise(arloc, nodes.len);
+        for (nodes) |*node| pending.appendAssumeCapacity(node);
+
+        return .{
+            .allocator = allocator,
+            .arena = arena,
+            .opts = opts,
+            .ns = ns,
+            .table_id = table_id,
+            .nodes = nodes,
+            .pending = pending,
+        };
+    }
+
+    /// Drops every pin and every borrow handed out.
+    pub fn deinit(self: *MultiGet) void {
+        for (self.nodes) |node| {
+            var cur = node.head;
+            while (cur) |ver| : (cur = ver.next) ver.pin.release();
+        }
+        self.arena.deinit();
+    }
+
+    /// Row result: the newest version of `key` at or below read_ts,
+    /// null if absent or deleted (unless include_deleted). Its key is
+    /// `key` at that version's timestamp, its value a borrow valid
+    /// until deinit. `key` must be one of the batch's keys. A row's
+    /// chain is one version; for a chain of deltas this is the newest
+    /// delta, the version `get` has always returned.
+    pub fn item(self: *const MultiGet, key: []const u8) ?Item {
+        const node = self.find(key);
+        var ver = node.head orelse return null;
+        while (ver.next) |next| ver = next;
+        if (ver.meta.isDeleted() and !self.opts.include_deleted) return null;
+        return .{
+            .key = self.keyAt(node, ver.ts),
+            .value = ver.value,
+            .meta = ver.meta,
+        };
+    }
+
+    /// Posting result: the chain of `key` folded into a bitmap owned
+    /// by `alloc`. Absent, tombstoned and empty all fold to an empty
+    /// bitmap. `key` must be one of the batch's keys. Fails with
+    /// NotRoaring when a version of the chain is not roaring (a
+    /// tombstone's encoding is not looked at, as in compaction), and
+    /// CorruptPosting on undecodable delta bytes.
+    pub fn bitmap(
+        self: *const MultiGet,
+        alloc: std.mem.Allocator,
+        key: []const u8,
+    ) !zroar.Bitmap {
+        // Pending posting ops are the sql layer's to overlay.
+        std.debug.assert(self.opts.pending == null);
+        const node = self.find(key);
+        var cur = node.head;
+        var terminal: ?Item = null;
+        if (cur) |head| {
+            // A tombstone's encoding is not looked at, as in compaction.
+            if (!head.meta.isDeleted() and !head.meta.isRoaring()) {
+                return error.NotRoaring;
+            }
+            // A state or a tombstone is the base the deltas fold onto.
+            // A delta at the head means the chain has no base here and
+            // folds from empty.
+            if (!head.meta.isDelta()) {
+                terminal = .{
+                    .key = self.keyAt(node, head.ts),
+                    .value = head.value,
+                    .meta = head.meta,
+                };
+                cur = head.next;
+            }
+        }
+        var bm = try baseBitmap(alloc, terminal, null);
+        errdefer bm.deinit();
+
+        while (cur) |ver| : (cur = ver.next) {
+            if (!ver.meta.isRoaring()) return error.NotRoaring;
+            try applyDelta(&bm, ver.value);
+        }
+        return bm;
+    }
+
+    /// Whether `key`'s chain has any version at all (rollupBitmap's
+    /// null result).
+    pub fn hasVersions(self: *const MultiGet, key: []const u8) bool {
+        return self.find(key).head != null;
+    }
+
+    /// The node of a key that was passed to init.
+    fn find(self: *const MultiGet, key: []const u8) *Node {
+        const idx = utils.search(Node, self.nodes, key, struct {
+            fn f(k: []const u8, node: Node) bool {
+                return std.mem.order(u8, node.key, k) != .lt;
+            }
+        }.f);
+        std.debug.assert(idx < self.nodes.len);
+        std.debug.assert(std.mem.eql(u8, self.nodes[idx].key, key));
+        return &self.nodes[idx];
+    }
+
+    /// `node`'s key as a full Key at `ts`.
+    pub fn keyAt(self: *const MultiGet, node: *const Node, ts: u64) Key {
+        return .{
+            .namespace = self.ns,
+            .table_id = self.table_id,
+            .primary = node.key,
+            .timestamp = ts,
+        };
+    }
+
+    /// Drop the nodes that are done from `pending`.
+    pub fn compactPending(pending: *std.ArrayList(*Node)) void {
+        var kept: usize = 0;
+        for (pending.items) |node| {
+            if (node.done()) continue;
+            pending.items[kept] = node;
+            kept += 1;
+        }
+        pending.items.len = kept;
+    }
+
+    /// One merge over the sources above the trees (the txn's pending
+    /// writes and the memtables), seeked once per pending node.
+    /// Memtable seeks cost no I/O, and the merge settles the order
+    /// across memtables.
+    pub fn drainMerge(self: *MultiGet, merge: *Iterator) !void {
+        for (self.pending.items) |node| try self.takeVersions(node, merge);
+        compactPending(&self.pending);
+    }
+
+    /// The level loop over one tree for `run`, pending nodes in key
+    /// order that this tree covers. Per level from `from_level`,
+    /// under one shared hold of `tree.mu`, pin the tables that can
+    /// hold the nodes still open: on L0 every table, since their
+    /// ranges overlap, walked newest to oldest; deeper, the tables
+    /// overlapping [first open, last open]. Then per table, with the
+    /// hold released, probe its share (see `probeTable`). A level
+    /// with nothing open ends the walk.
+    pub fn walkTree(
+        self: *MultiGet,
+        tree: *Tree,
+        run: []const *Node,
+        from_level: usize,
+    ) !void {
+        const arloc = self.arena.allocator();
+        var pending: std.ArrayList(*Node) = .empty;
+        try pending.appendSlice(arloc, run);
+
+        var lvl = from_level;
+        while (lvl < tree.opts.max_levels) : (lvl += 1) {
+            compactPending(&pending);
+            const open = pending.items;
+            if (open.len == 0) return;
+
+            const range = KeyRange{
+                .left = self.keyAt(open[0], std.math.maxInt(u64)),
+                .right = self.keyAt(open[open.len - 1], 0),
+            };
+            const tables = blk: {
+                const held = tree.mu.hold(.shared, @src());
+                defer held.release();
+                break :blk try tree.levels[lvl].overlappingTables(
+                    held,
+                    self.allocator,
+                    range,
+                );
+            };
+            defer Level.releaseTables(self.allocator, tables);
+
+            if (lvl == 0) {
+                // L0 sorts by id ascending (newest last): walk in
+                // reverse so the newest table settles a key first.
+                var ri = tables.len;
+                while (ri > 0) {
+                    ri -= 1;
+                    try self.probeTable(tables[ri].table, open);
+                }
+            } else {
+                for (tables) |e| try self.probeTable(e.table, open);
+            }
+        }
+    }
+
+    /// One table's share of the open nodes: those inside
+    /// [smallest, biggest] (a binary search on the list) whose hash
+    /// the table's filter accepts, skipping any a newer L0 table
+    /// settled this level. None → the table is not opened. Else the
+    /// blocks their seeks land in are prefetched, and one iterator is
+    /// seeked per node in key order, so a run of keys in one block is
+    /// one in-block search each.
+    fn probeTable(
+        self: *MultiGet,
+        tbl: *Table,
+        nodes: []const *Node,
+    ) !void {
+        const lo = utils.search(*Node, nodes, tbl.smallest.primary, struct {
+            fn f(smallest: []const u8, node: *Node) bool {
+                return std.mem.order(u8, node.key, smallest) != .lt;
+            }
+        }.f);
+        const hi = utils.search(*Node, nodes, tbl.biggest.primary, struct {
+            fn f(biggest: []const u8, node: *Node) bool {
+                return std.mem.order(u8, node.key, biggest) == .gt;
+            }
+        }.f);
+
+        const arloc = self.arena.allocator();
+        self.accepted.clearRetainingCapacity();
+        for (nodes[lo..hi]) |node| {
+            if (node.done()) continue;
+            if (!tbl.containsHash(node.hash)) continue;
+            try self.accepted.append(arloc, node);
+        }
+        if (self.accepted.items.len == 0) return;
+        try self.prefetch(tbl);
+
+        var it: Iterator = .{ .table = TableIterator.init(
+            self.allocator,
+            tbl,
+            self.opts.priority,
+        ) };
+        defer it.deinit();
+        for (self.accepted.items) |node| {
+            try self.takeVersions(node, &it);
+        }
+    }
+
+    /// Before a table's seeks: the blocks they will land in, read in
+    /// one batch into the block cache when there is one, so each seek
+    /// then hits. Keys ascend, so the block indices do too and a repeat
+    /// is the previous entry.
+    fn prefetch(self: *MultiGet, tbl: *Table) !void {
+        const cache = _table.table.block_cache orelse return;
+        const arloc = self.arena.allocator();
+        self.blocks.clearRetainingCapacity();
+        for (self.accepted.items) |node| {
+            const at = self.keyAt(node, node.maxTs(self.opts.read_ts));
+            const idx = tbl.blockFor(at) orelse return;
+            if (self.blocks.items.len > 0 and self.blocks.getLast() == idx) {
+                continue;
+            }
+            try self.blocks.append(arloc, idx);
+        }
+        _ = try tbl.prefetchBlocks(
+            cache,
+            self.allocator,
+            self.blocks.items,
+            self.opts.priority,
+        );
+    }
+
+    /// Take `node`'s versions from one positioned source, newest
+    /// first, until the node is done or the source has no more of
+    /// them: the seek is bounded to the key's own run of versions
+    /// (`Key.end`), which is load-bearing for the memtable merge, whose
+    /// sources span the namespace.
+    fn takeVersions(self: *MultiGet, node: *Node, it: *Iterator) !void {
+        const read_ts = self.opts.read_ts;
+        const start = self.keyAt(node, node.maxTs(read_ts));
+
+        try it.seekRange(start, start.end());
+        while (it.itemRef()) |found| {
+            // The seek starts at the key at maxTs and versions sort
+            // newest first, so nothing newer can be yielded.
+            std.debug.assert(found.key.equalPrimary(start));
+            std.debug.assert(found.key.timestamp <= node.maxTs(read_ts));
+            try self.take(node, found, it.currentPin().?);
+            if (node.done()) return;
+            try it.next();
+        }
+    }
+
+    /// Prepend one version, pinned.
+    fn take(self: *MultiGet, node: *Node, found: Item, pin: Pin) !void {
+        const ver = try self.arena.allocator().create(Version);
+        ver.* = .{
+            .ts = found.key.timestamp,
+            .meta = found.meta,
+            .value = found.value,
+            .pin = pin.acquire(),
+            .next = node.head,
+        };
+        node.head = ver;
+    }
+};
+
+/// The bitmap a roaring chain folds from: empty for a tombstone
+/// terminal, the state's bitmap for a state terminal (copied: SST
+/// values sit at arbitrary offsets, so zroar's aligned zero-copy path
+/// is not usable), else `external` cloned (compaction's read-below),
+/// else empty. Reads (`MultiGet.bitmap`) and compaction
+/// (`VersionTracker.foldBufferedToBitmap`) both fold through this
+/// and `applyDelta`, which is what keeps rollup read-invariant.
+pub fn baseBitmap(
+    alloc: std.mem.Allocator,
+    terminal: ?Item,
+    external: ?*const zroar.Bitmap,
+) !zroar.Bitmap {
+    if (terminal) |term| {
+        if (term.meta.isDeleted()) return zroar.Bitmap.init(alloc);
+        return zroar.Bitmap.fromBufferCopy(alloc, term.value);
+    }
+    if (external) |eb| return eb.clone();
+    return zroar.Bitmap.init(alloc);
+}
+
+/// Apply one roaring delta: removes, then adds. The bytes get an O(1)
+/// structural check — without it a truncated element region decodes
+/// as an empty list — but content contracts were enforced at write
+/// time (validateDelta). Deltas are applied oldest to newest.
+pub fn applyDelta(bm: *zroar.Bitmap, delta: []const u8) !void {
+    const r = DeltaReader.init(delta, 0) catch return error.CorruptPosting;
+    r.verify() catch return error.CorruptPosting;
+    var j: u32 = 0;
+    while (j < r.removesLen()) : (j += 1)
+        _ = bm.remove(r.removesAt(j) catch unreachable);
+    j = 0;
+    while (j < r.addsLen()) : (j += 1)
+        _ = try bm.set(r.addsAt(j) catch unreachable);
 }
 
 /// How much of a key's version history a scan should surface.
@@ -625,252 +1138,4 @@ pub fn maxKey(
         return k;
     }
     return floor;
-}
-
-// -----------------------------------------------------------------------
-// Stats dump
-// -----------------------------------------------------------------------
-
-/// What slice of the forest the caller wants to see. Default is a
-/// top-level summary that aggregates across all trees.
-pub const StatsScope = union(enum) {
-    forest,
-    tree: TreeKey,
-    namespace: u64,
-};
-
-pub const StatsOpts = struct {
-    scope: StatsScope = .forest,
-};
-
-/// writeStats produces a hierarchical, human-readable text dump of
-/// current LSM state to `w`. Unlike the Prometheus metrics endpoint,
-/// this is for ops drill-down: per-tree shape, per-level sizes,
-/// pending compactions. Snapshot is best-effort — locks are taken
-/// briefly per section, so a concurrent flush/compaction may show
-/// itself half-applied. Acceptable for a debug endpoint.
-pub fn writeStats(self: *Forest, w: *std.Io.Writer, opts: StatsOpts) !void {
-    switch (opts.scope) {
-        .forest => try self.writeForestStats(w),
-        .tree => |id| try self.writeTreeStats(w, id),
-        .namespace => |ns| try self.writeNamespaceStats(w, ns),
-    }
-}
-
-pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
-    const mt = self.memtables.stats();
-    try w.print("forest:\n", .{});
-    try w.print("  memtables: active=", .{});
-    try writeBytes(w, mt.active_bytes);
-    try w.print(" immutable={d} (", .{mt.immutable_count});
-    try writeBytes(w, mt.immutable_bytes);
-    try w.print(" pending flush)\n", .{});
-    try w.print("  flush_pending: {d}\n", .{mt.immutable_count});
-
-    // Per-level aggregate (sum + max-with-tree).
-    const max_levels = self.opts.max_levels;
-    const Agg = struct {
-        tables_total: u64 = 0,
-        tables_max: u64 = 0,
-        tables_max_tree: u64 = 0,
-        bytes_total: u64 = 0,
-        bytes_max: u64 = 0,
-        bytes_max_tree: u64 = 0,
-    };
-    const aggs = try self.allocator.alloc(Agg, max_levels);
-    defer self.allocator.free(aggs);
-    for (aggs) |*a| a.* = .{};
-
-    // Per-level "compactions wanted" rollup.
-    const Wanted = struct {
-        count: u64 = 0,
-        score_max: f64 = 0,
-        score_max_tree: u64 = 0,
-    };
-    const wanted = try self.allocator.alloc(Wanted, max_levels);
-    defer self.allocator.free(wanted);
-    for (wanted) |*x| x.* = .{};
-
-    // Largest tree (sum across levels).
-    var largest_tree_id: u64 = 0;
-    var largest_tree_size: i64 = 0;
-    var tree_count: usize = 0;
-
-    // Walk under the map lock, each table's lock shared while its list
-    // is read, but only briefly: collect the numbers we need, release.
-    // Each level access takes its own lock inside numTables/getTotalSize.
-    {
-        var tables_it = self.tables.iterator();
-        defer tables_it.deinit();
-        while (tables_it.next()) |kv| {
-            const trees = kv.value_ptr.*;
-            const held = trees.mu.hold(.shared, @src());
-            defer held.release();
-            for (trees.list(held)) |tree| {
-                tree_count += 1;
-                const tree_id = tree.tree_id;
-
-                const th = tree.mu.hold(.shared, @src());
-                defer th.release();
-                var tree_total: i64 = 0;
-                for (tree.levels, 0..) |*lv, idx| {
-                    if (idx >= max_levels) break;
-                    const tcount: u64 = @intCast(lv.numTables(th));
-                    const tbytes: u64 = @intCast(lv.getTotalSize(th));
-                    tree_total += @intCast(tbytes);
-
-                    aggs[idx].tables_total += tcount;
-                    if (tcount > aggs[idx].tables_max) {
-                        aggs[idx].tables_max = tcount;
-                        aggs[idx].tables_max_tree = tree_id;
-                    }
-                    aggs[idx].bytes_total += tbytes;
-                    if (tbytes > aggs[idx].bytes_max) {
-                        aggs[idx].bytes_max = tbytes;
-                        aggs[idx].bytes_max_tree = tree_id;
-                    }
-                }
-                if (tree_total > largest_tree_size) {
-                    largest_tree_size = tree_total;
-                    largest_tree_id = tree_id;
-                }
-
-                if (tree.compact_candidate) |c| {
-                    if (c.level < max_levels) {
-                        wanted[c.level].count += 1;
-                        if (c.score > wanted[c.level].score_max) {
-                            wanted[c.level].score_max = c.score;
-                            wanted[c.level].score_max_tree = tree_id;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    try w.print("  trees: {d}\n", .{tree_count});
-    try w.print("  largest_tree: id={d} size=", .{largest_tree_id});
-    try writeBytes(w, @intCast(largest_tree_size));
-    try w.print("\n\n", .{});
-
-    try w.print("  level summary (across all trees):\n", .{});
-    for (aggs, 0..) |a, idx| {
-        // Skip levels that have nothing — shows max_levels=7 dumps cleanly.
-        if (a.tables_total == 0 and a.bytes_total == 0) continue;
-        try w.print("    L{d}: tables={d} (max={d} in tree {d})  bytes=", .{
-            idx, a.tables_total, a.tables_max, a.tables_max_tree,
-        });
-        try writeBytes(w, a.bytes_total);
-        try w.print(" (max=", .{});
-        try writeBytes(w, a.bytes_max);
-        try w.print(" in tree {d})\n", .{a.bytes_max_tree});
-    }
-
-    var any_wanted = false;
-    for (wanted) |x| if (x.count > 0) {
-        any_wanted = true;
-        break;
-    };
-    if (any_wanted) {
-        try w.print("\n  compactions wanted:\n", .{});
-        for (wanted, 0..) |x, idx| {
-            if (x.count == 0) continue;
-            try w.print("    L{d}: trees={d} score_max={d:.2} (tree {d})\n", .{
-                idx, x.count, x.score_max, x.score_max_tree,
-            });
-        }
-    }
-}
-
-pub fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tk: TreeKey) !void {
-    const tree = self.getTree(tk.namespace, tk.tree_id) orelse {
-        try w.print("tree id={d}: not found\n", .{tk.tree_id});
-        return;
-    };
-    defer tree.release();
-
-    // Numbers first, under the lock; printing after — the writer may be
-    // a socket, and a slow client must not hold up installs into this
-    // tree.
-    const LevelStat = struct { tables: usize, bytes: u64 };
-    const per_level = try self.allocator.alloc(LevelStat, tree.levels.len);
-    defer self.allocator.free(per_level);
-    const total: i64, const candidate: ?_tree.CompactCandidate = blk: {
-        const held = tree.mu.hold(.shared, @src());
-        defer held.release();
-        for (tree.levels, per_level) |*lv, *st| {
-            st.* = .{
-                .tables = lv.numTables(held),
-                .bytes = @intCast(lv.getTotalSize(held)),
-            };
-        }
-        break :blk .{ tree.totalSize(held), tree.compact_candidate };
-    };
-
-    try w.print(
-        "tree id={d} namespace={d} size=",
-        .{ tk.tree_id, tk.namespace },
-    );
-    try writeBytes(w, @intCast(total));
-    try w.print("\n", .{});
-
-    for (per_level, 0..) |st, idx| {
-        if (st.tables == 0 and st.bytes == 0) continue;
-        try w.print("  L{d}: {d} tables, ", .{ idx, st.tables });
-        try writeBytes(w, st.bytes);
-        try w.print("\n", .{});
-    }
-    if (candidate) |c| {
-        try w.print(
-            "  compact_candidate: L{d} score={d:.2}\n",
-            .{ c.level, c.score },
-        );
-    }
-}
-
-pub fn writeNamespaceStats(self: *Forest, w: *std.Io.Writer, ns_id: u64) !void {
-    try w.print("namespace={d}:\n", .{ns_id});
-    var any = false;
-    // Tree keys come out under the manifest lock (the map they live in
-    // is the apply loop's to rehash); writeTreeStats then takes each
-    // tree's own lock.
-    const keys = try self.ms.treeKeys(self.allocator, ns_id);
-    defer self.allocator.free(keys);
-    for (keys) |tk| {
-        any = true;
-        try writeTreeStats(self, w, tk);
-    }
-    if (!any) try w.print("  (no trees)\n", .{});
-}
-
-/// Pretty-print a byte count: KiB / MiB / GiB / TiB. Two decimal places
-/// of precision past the smallest meaningful unit.
-pub fn writeBytes(w: *std.Io.Writer, b: u64) !void {
-    const kib: u64 = 1024;
-    const mib: u64 = 1024 * kib;
-    const gib: u64 = 1024 * mib;
-    const tib: u64 = 1024 * gib;
-    if (b >= tib) {
-        try w.print(
-            "{d:.2}TiB",
-            .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(tib))},
-        );
-    } else if (b >= gib) {
-        try w.print(
-            "{d:.2}GiB",
-            .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(gib))},
-        );
-    } else if (b >= mib) {
-        try w.print(
-            "{d:.2}MiB",
-            .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(mib))},
-        );
-    } else if (b >= kib) {
-        try w.print(
-            "{d:.2}KiB",
-            .{@as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(kib))},
-        );
-    } else {
-        try w.print("{d}B", .{b});
-    }
 }
