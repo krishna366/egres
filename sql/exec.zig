@@ -124,7 +124,8 @@ pub const Batch = struct {
     pub fn append(self: *Batch, item: Item, mode: ValueMode) !bool {
         if (self.full()) return false;
 
-        const vlen = if (mode == .copy) item.value.len else 0;
+        const src = item.newest();
+        const vlen = if (mode == .copy) src.value.len else 0;
         const need = item.key.primary.len + vlen;
         if (self.bytes.items.len + need > self.bytes.capacity) {
             if (self.numRows() > 0) {
@@ -143,10 +144,10 @@ pub const Batch = struct {
         switch (mode) {
             .copy => {
                 const vstart = self.bytes.items.len;
-                self.bytes.appendSliceAssumeCapacity(item.value);
-                value = self.bytes.items[vstart..][0..item.value.len];
+                self.bytes.appendSliceAssumeCapacity(src.value);
+                value = self.bytes.items[vstart..][0..src.value.len];
             },
-            .borrow => value = item.value,
+            .borrow => value = src.value,
             .none => {},
         }
 
@@ -156,10 +157,12 @@ pub const Batch = struct {
                 .namespace = item.key.namespace,
                 .table_id = item.key.table_id,
                 .primary = primary,
-                .timestamp = item.key.timestamp,
             },
-            .value = value,
-            .meta = item.meta,
+            .versions = .{ .one = .{
+                .ts = src.ts,
+                .meta = src.meta,
+                .value = value,
+            } },
         });
         return true;
     }
@@ -298,7 +301,7 @@ pub const BitmapNode = union(enum) {
         defer res.deinit();
         const entry = res.item(lu.key) orelse return bm;
 
-        const egid = _key.decodeEgid(entry.value) orelse
+        const egid = _key.decodeEgid(entry.newest().value) orelse
             return error.CorruptIndexEntry;
         _ = try bm.set(egid);
         return bm;
@@ -315,10 +318,12 @@ pub const BitmapNode = union(enum) {
             .namespace = ctx.tx.ns,
             .table_id = lu.index_table_id,
             .primary = lu.key,
-            .timestamp = ctx.tx.read_ts,
         };
         try ctx.tx.recordRead(pk);
-        var bm = try ctx.tx.forest.getBitmap(ctx.tx.allocator, pk, .p0);
+        var bm = try ctx.tx.forest.getBitmap(ctx.tx.allocator, .{
+            .key = pk,
+            .read_ts = ctx.tx.read_ts,
+        });
         errdefer bm.deinit();
 
         try ctx.tx.overlayPostings(lu.index_table_id, lu.key, &bm);
@@ -380,7 +385,7 @@ pub const SeqScan = struct {
 
     pub fn next(self: *SeqScan, ctx: *ExecCtx, b: *Batch) !bool {
         // The previous batch is consumed: let its values go.
-        if (self.cursor) |*c| c.releasePins();
+        if (self.cursor) |*c| try c.releasePins();
         b.reset();
         if (self.done) return false;
 

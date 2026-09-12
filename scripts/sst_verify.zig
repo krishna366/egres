@@ -35,10 +35,23 @@ fn verifyOne(allocator: std.mem.Allocator, path: String) bool {
     var have_prev = false;
 
     while (it.itemRef()) |item| {
+        // Entries ascend strictly by key, one entry per key.
         if (have_prev) {
             const prev = Key.init(prev_buf.items);
             if (item.key.order(prev) != .gt) {
                 std.debug.print("FAIL {s} fid={d} bad_order_at={d}\n", .{ base, fid, keys });
+                return false;
+            }
+        }
+        // An entry's versions descend strictly in timestamp.
+        const vers = item.versions.slice();
+        var vi: usize = 1;
+        while (vi < vers.len) : (vi += 1) {
+            if (vers[vi].ts >= vers[vi - 1].ts) {
+                std.debug.print(
+                    "FAIL {s} fid={d} bad_version_order_at={d}\n",
+                    .{ base, fid, keys },
+                );
                 return false;
             }
         }

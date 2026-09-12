@@ -960,17 +960,23 @@ pub const AdminServer = struct {
         const search_key = Key{
             .namespace = req.ns,
             .primary = req.key,
-            .timestamp = search_ts,
         };
-        const result = self.engine.forest.get(self.engine.allocator, search_key, .p0) catch |err| {
+        const result = self.engine.forest.get(self.engine.allocator, .{
+            .key = search_key,
+            .read_ts = search_ts,
+        }) catch |err| {
             log.err("forest.get failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, "get failed");
             return;
         };
         if (result) |item| {
             defer item.free(self.engine.allocator);
-            log.debug("GET found: ts={d} value_len={d}", .{ item.key.timestamp, item.value.len });
-            try proto.writeFound(stream, item.key.timestamp, item.value);
+            const ver = item.newest();
+            log.debug(
+                "GET found: ts={d} value_len={d}",
+                .{ ver.ts, ver.value.len },
+            );
+            try proto.writeFound(stream, ver.ts, ver.value);
         } else {
             log.debug("GET miss", .{});
             try proto.writeNotFound(stream);
@@ -989,20 +995,16 @@ pub const AdminServer = struct {
         }
         const read_ts: u64 = if (req.read_ts == 0) std.math.maxInt(u64) else req.read_ts;
 
-        // Scan range = [start, end). Both bounds use ts=maxInt so the
-        // primary-key compare comes first and same-primary versions
-        // sort newest-first inside the bound. Visibility is decided by
-        // read_ts, not by these bounds. An empty primary on either side
-        // means "open."
+        // Scan range = [start, end). The bounds name primaries;
+        // visibility is decided by read_ts, not by them. An empty
+        // primary on either side means "open."
         const scan_start = Key{
             .namespace = req.ns,
             .primary = req.start_key,
-            .timestamp = std.math.maxInt(u64),
         };
         const scan_end: Key = if (req.end_key.len == 0) .{} else .{
             .namespace = req.ns,
             .primary = req.end_key,
-            .timestamp = std.math.maxInt(u64),
         };
         // Admin scans the raw-KV table (table_id 0); limitToTable confines it
         // to (req.ns, 0) across the namespace-wide memtable.
@@ -1027,13 +1029,17 @@ pub const AdminServer = struct {
                 // Memtables are forest-wide; an item with a different
                 // namespace means we've walked off the end of ours.
                 if (item.key.namespace != c.ns) return false;
-                try proto.writeScanItem(
-                    c.w,
-                    c.mode,
-                    item.key.timestamp,
-                    item.key.primary,
-                    item.value,
-                );
+                // One line per version, so num_versions keeps its
+                // meaning for the client.
+                for (item.versions.slice()) |ver| {
+                    try proto.writeScanItem(
+                        c.w,
+                        c.mode,
+                        ver.ts,
+                        item.key.primary,
+                        ver.value,
+                    );
+                }
                 return true;
             }
         };

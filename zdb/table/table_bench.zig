@@ -80,7 +80,7 @@ fn buildStriped(
     while (i < n) : (i += 1) {
         var kb: [16]u8 = undefined;
         const p = try keyAt(&kb, stripe + i * stride);
-        try b.add(.{ .primary = p, .timestamp = 1 }, val);
+        try b.add(.{ .primary = p }, 1, val);
     }
     return b.finish();
 }
@@ -134,13 +134,13 @@ fn benchMergeScan(b: *Bench) !void {
         for (tables, 0..) |t, j| {
             iters[j] = .{ .table = TableIterator.init(a, t, .p0) };
         }
-        var m = merge.MergeIterator.init(a, iters[0..]);
+        var m = try merge.MergeIterator.init(a, iters[0..]);
         defer m.deinit();
 
         try m.seekRange(.{}, .{});
         var count: usize = 0;
         while (m.itemRef()) |item| : (count += 1) {
-            b.addBytes(item.key.primary.len + item.value.len);
+            b.addBytes(item.key.primary.len + item.newest().value.len);
             try m.next();
         }
         if (count != num_tables * keys_per_table) return error.ShortScan;
@@ -164,7 +164,7 @@ fn benchPointSeeks(b: *Bench) !void {
         j = (j + 40503) % single_keys;
         var kb: [16]u8 = undefined;
         const p = try keyAt(&kb, j);
-        try it.seekRange(.{ .primary = p, .timestamp = 1 }, .{});
+        try it.seekRange(.{ .primary = p }, .{});
         if (it.itemRef() != null) hits += 1;
     }
     std.mem.doNotOptimizeAway(hits);
@@ -187,11 +187,8 @@ fn benchBlockSeekGe(b: *Bench) !void {
 
     // Spread targets over the block: entry 0's key is the base key, and
     // keys here are dense, so index = first + offset.
-    const first = try std.fmt.parseInt(
-        usize,
-        Key.init(base_raw).primary[1..],
-        10,
-    );
+    const base_key = Key.init(base_raw);
+    const first = try std.fmt.parseInt(usize, base_key.primary[1..], 10);
     const num_targets: usize = 64;
     const step = @max(1, bi.layout.entry_count / num_targets);
 
@@ -201,8 +198,7 @@ fn benchBlockSeekGe(b: *Bench) !void {
     for (&targets, 0..) |*raw, k| {
         var kb: [16]u8 = undefined;
         const p = try keyAt(&kb, first + k * step);
-        const key = Key{ .primary = p, .timestamp = 1 };
-        raw.* = try key.marshal(a);
+        raw.* = try (Key{ .primary = p }).marshal(a);
     }
     defer for (targets) |raw| a.free(raw);
 
@@ -291,7 +287,7 @@ fn benchFullScan(b: *Bench) !void {
         try it.seekRange(.{}, .{});
         var count: usize = 0;
         while (it.itemRef()) |item| : (count += 1) {
-            b.addBytes(item.key.primary.len + item.value.len);
+            b.addBytes(item.key.primary.len + item.newest().value.len);
             try it.next();
         }
         if (count != single_keys) return error.ShortScan;

@@ -129,14 +129,13 @@ pub const ManifestChange = schema.Table(.{
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 },
 });
 
-/// A single key-value write. `key` is a FULL marshaled zdb key
-/// [ns:u64 BE][table_id:u32 BE][primary][ts:u64 BE] — self-describing, so
-/// one Mutations entry can span tables. The timestamp on the wire is
-/// whatever the writer held (a transaction's read_ts); apply always
-/// rewrites it to the enclosing `LogEntry.timestamp`, the commit HLC
-/// shared by the whole batch. `meta` is zdb.Meta packed into a byte (see
-/// zdb/kv.zig); 0 is Meta.raw, so a writer that never sets it produces a
-/// plain put.
+/// A single key-value write. `key` is a marshaled zdb key
+/// [ns:u64 BE][table_id:u32 BE][primary] — self-describing, so one
+/// Mutations entry can span tables. It carries no timestamp: apply
+/// stamps every write with the enclosing `LogEntry.timestamp`, the
+/// commit HLC shared by the whole batch. `meta` is zdb.Meta packed into
+/// a byte (see zdb/kv.zig); 0 is Meta.raw, so a writer that never sets
+/// it produces a plain put.
 pub const KeyValue = schema.Table(.{
     .{ .id = 1, .name = "key", .ty = schema.Bytes },
     .{ .id = 2, .name = "value", .ty = schema.Bytes },

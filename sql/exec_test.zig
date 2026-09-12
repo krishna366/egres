@@ -188,10 +188,8 @@ fn row(
             .namespace = ns,
             .table_id = tid,
             .primary = try a.dupe(u8, &sql.key.encodeEgid(egid)),
-            .timestamp = 100,
         },
-        .value = bytes,
-        .meta = .{},
+        .versions = .{ .one = .{ .ts = 100, .meta = .{}, .value = bytes } },
     };
 }
 
@@ -223,16 +221,15 @@ fn wideRows(a: std.mem.Allocator, tbl: *const Table) anyerror![]const Item {
     return items;
 }
 
+/// A one-version row whose value is the caller's storage, pinned.
 fn tinyItem(primary: *const [8]u8, value: String) Item {
     return .{
         .key = .{
             .namespace = ns,
             .table_id = tid,
             .primary = primary,
-            .timestamp = 1,
         },
-        .value = value,
-        .meta = .{},
+        .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = value } },
     };
 }
 
@@ -257,7 +254,9 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     // Row cap: 1024 tiny rows in, the 1025th refused, every slice resolves.
     var keys: [exec.row_cap][8]u8 = undefined;
     for (&keys, 1..) |*k, egid| k.* = sql.key.encodeEgid(egid);
-    for (&keys) |*k| try testing.expect(try b.append(tinyItem(k, "v"), .copy));
+    for (&keys) |*k| {
+        try testing.expect(try b.append(tinyItem(k, "v"), .copy));
+    }
     try testing.expect(b.full());
     try testing.expect(!try b.append(tinyItem(&keys[0], "v"), .copy));
     try testing.expectEqual(@as(usize, exec.row_cap), b.sel.count());
@@ -266,7 +265,7 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     var it = b.selected();
     while (it.next()) |r| : (n += 1) {
         try testing.expectEqual(n + 1, sql.key.decodeEgid(r.key.primary).?);
-        try testing.expectEqualStrings("v", r.value);
+        try testing.expectEqualStrings("v", r.newest().value);
     }
     try testing.expectEqual(@as(usize, exec.row_cap), n);
 
@@ -293,12 +292,13 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     // keeps the value slice as given — the caller's storage, pinned.
     try testing.expect(try b.append(tinyItem(&keys[0], &big), .none));
     try testing.expectEqual(@as(usize, 8), b.bytes.items.len);
-    try testing.expectEqualStrings("", b.rows.items[0].value);
+    try testing.expectEqualStrings("", b.rows.items[0].newest().value);
     b.reset();
     try testing.expect(try b.append(tinyItem(&keys[0], &big), .borrow));
     try testing.expectEqual(@as(usize, 8), b.bytes.items.len);
-    try testing.expectEqual(@as([*]const u8, &big), b.rows.items[0].value.ptr);
-    try testing.expectEqual(big.len, b.rows.items[0].value.len);
+    const kept = b.rows.items[0].newest().value;
+    try testing.expectEqual(@as([*]const u8, &big), kept.ptr);
+    try testing.expectEqual(big.len, kept.len);
 
     // One oversized row is admitted into an EMPTY batch by growing.
     b.reset();
@@ -308,7 +308,7 @@ test "sql.exec: Batch row cap, byte cap, growth only when empty" {
     try testing.expect(try b.append(tinyItem(&keys[0], huge), .copy));
     try testing.expectEqual(@as(usize, 1), b.numRows());
     try testing.expect(b.bytes.capacity > cap0);
-    try testing.expectEqualSlices(u8, huge, b.rows.items[0].value);
+    try testing.expectEqualSlices(u8, huge, b.rows.items[0].newest().value);
 }
 
 test "sql.exec: BitmapNode and_/or_/egids algebra" {
@@ -409,7 +409,7 @@ test "sql.exec: seq_scan: full ascending batches; pred skips without copying" {
             try testing.expectEqual(b.numRows() * 8, b.bytes.items.len);
             var it = b.selected();
             while (it.next()) |r| : (total += 1) {
-                try testing.expect(!withinBytes(&b, r.value));
+                try testing.expect(!withinBytes(&b, r.newest().value));
                 const b_val = fx.tbl.parseCol(r, fx.col("b"));
                 try testing.expectEqualStrings("x", b_val.text);
             }
@@ -440,7 +440,7 @@ test "sql.exec: seq_scan: borrowed values outlive the blocks the walk left" {
     try testing.expect(pins.items.len >= 2);
     var it = b.selected();
     while (it.next()) |r| {
-        try testing.expect(!withinBytes(&b, r.value));
+        try testing.expect(!withinBytes(&b, r.newest().value));
         const egid = sql.key.decodeEgid(r.key.primary).?;
         const a_val = fx.tbl.parseCol(r, fx.col("a"));
         try testing.expectEqual(Value{ .int4 = @intCast(egid) }, a_val);

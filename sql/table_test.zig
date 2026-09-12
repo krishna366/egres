@@ -63,10 +63,12 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
                 .namespace = ns,
                 .table_id = catalog.table_id,
                 .primary = try a.dupe(u8, &key),
-                .timestamp = 1,
             },
-            .value = try a.dupe(u8, bytes),
-            .meta = .{},
+            .versions = .{ .one = .{
+                .ts = 1,
+                .meta = .{},
+                .value = try a.dupe(u8, bytes),
+            } },
         });
     }
 
@@ -87,10 +89,12 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
                 .namespace = ns,
                 .table_id = catalog.index_table_id,
                 .primary = try a.dupe(u8, &ikey),
-                .timestamp = 1,
             },
-            .value = try a.dupe(u8, bytes),
-            .meta = .{},
+            .versions = .{ .one = .{
+                .ts = 1,
+                .meta = .{},
+                .value = try a.dupe(u8, bytes),
+            } },
         });
     }
     try f.put(items.items);

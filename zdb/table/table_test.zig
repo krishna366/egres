@@ -4,6 +4,9 @@ const String = utils.String;
 const zdb = @import("zdb");
 const zbuf = @import("zbuf").zbuf;
 const Key = zdb.kv.Key;
+const Item = zdb.kv.Item;
+const Meta = zdb.kv.Meta;
+const Version = zdb.kv.Version;
 const vfs = zdb.vfs;
 
 const Builder = zdb.table.builder.Builder;
@@ -51,7 +54,7 @@ fn buildRangeTable(
         var val_buf: [20]u8 = undefined;
         const val = try std.fmt.bufPrint(&val_buf, "{d}", .{i});
 
-        try b.add(.{ .primary = key_no_ts }, val);
+        try b.add(.{ .primary = key_no_ts }, 0, val);
     }
     return b.finish();
 }
@@ -74,7 +77,7 @@ fn buildTestTable(
         var val_buf: [20]u8 = undefined;
         const val = try std.fmt.bufPrint(&val_buf, "{d}", .{i});
 
-        try b.add(.{ .primary = key_no_ts }, val);
+        try b.add(.{ .primary = key_no_ts }, 0, val);
     }
     return b.finish();
 }
@@ -96,7 +99,7 @@ test "builder.finish output is page-aligned for any payload size" {
         while (i < n) : (i += 1) {
             var key_buf: [32]u8 = undefined;
             const k = try std.fmt.bufPrint(&key_buf, "k{d:0>10}", .{i});
-            try b.add(.{ .primary = k }, "v");
+            try b.add(.{ .primary = k }, 0, "v");
         }
         var tb = try b.finish();
         defer tb.deinit();
@@ -114,10 +117,12 @@ test "table builder/reader roundtrip and seek" {
     var b = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b.deinit();
 
-    try b.add(.{ .primary = "a", .timestamp = 9 }, "va9");
-    try b.add(.{ .primary = "a", .timestamp = 7 }, "va7");
-    try b.add(.{ .primary = "b", .timestamp = 3 }, "vb3");
-    try b.add(.{ .primary = "c", .timestamp = 1 }, "vc1");
+    try b.addItem(.{ .key = .{ .primary = "a" }, .versions = .{ .many = &.{
+        .{ .ts = 9, .meta = .{}, .value = "va9" },
+        .{ .ts = 7, .meta = .{}, .value = "va7" },
+    } } });
+    try b.add(.{ .primary = "b" }, 3, "vb3");
+    try b.add(.{ .primary = "c" }, 1, "vc1");
 
     var tb = try b.finish();
     defer tb.deinit();
@@ -132,10 +137,10 @@ test "table builder/reader roundtrip and seek" {
     var it = TableIterator.init(std.testing.allocator, r, .p0);
     defer it.deinit();
     try it.seekRange(.{}, .{});
-    try std.testing.expectEqualStrings("va9", it.itemRef().?.value);
+    try std.testing.expectEqualStrings("va9", it.itemRef().?.newest().value);
 
-    try it.seekRange(.{ .primary = "b", .timestamp = 3 }, .{});
-    try std.testing.expectEqualStrings("vb3", it.itemRef().?.value);
+    try it.seekRange(.{ .primary = "b" }, .{});
+    try std.testing.expectEqualStrings("vb3", it.itemRef().?.newest().value);
 }
 
 // seekGe compares stored keys in place, against the base key plus a diff,
@@ -148,11 +153,13 @@ test "seekGe: prefix-length and version ordering" {
 
     var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer b.deinit();
-    try b.add(.{ .primary = "a", .timestamp = 5 }, "a5");
-    try b.add(.{ .primary = "ab", .timestamp = 9 }, "ab9");
-    try b.add(.{ .primary = "ab", .timestamp = 3 }, "ab3");
-    try b.add(.{ .primary = "abc", .timestamp = 1 }, "abc1");
-    try b.add(.{ .primary = "b", .timestamp = 7 }, "b7");
+    try b.add(.{ .primary = "a" }, 5, "a5");
+    try b.addItem(.{ .key = .{ .primary = "ab" }, .versions = .{ .many = &.{
+        .{ .ts = 9, .meta = .{}, .value = "ab9" },
+        .{ .ts = 3, .meta = .{}, .value = "ab3" },
+    } } });
+    try b.add(.{ .primary = "abc" }, 1, "abc1");
+    try b.add(.{ .primary = "b" }, 7, "b7");
 
     var tb = try b.finish();
     defer tb.deinit();
@@ -165,36 +172,40 @@ test "seekGe: prefix-length and version ordering" {
     var it = TableIterator.init(alloc, t, .p0);
     defer it.deinit();
 
-    // Stored order is the seek order.
-    const want = [_]String{ "a5", "ab9", "ab3", "abc1", "b7" };
+    // Stored order is the seek order, one item per key.
+    const want = [_]String{ "a5", "ab9", "abc1", "b7" };
     try it.seekRange(.{}, .{});
     for (want) |v| {
-        try std.testing.expectEqualStrings(v, it.itemRef().?.value);
+        try std.testing.expectEqualStrings(v, it.itemRef().?.newest().value);
         try it.next();
     }
     try std.testing.expect(it.itemRef() == null);
 
-    const max_ts = std.math.maxInt(u64);
     const cases = [_]struct { k: Key, want: String }{
-        // Newest version of a primary comes first.
-        .{ .k = .{ .primary = "ab", .timestamp = max_ts }, .want = "ab9" },
-        // A read below the newest lands on the next version down.
-        .{ .k = .{ .primary = "ab", .timestamp = 5 }, .want = "ab3" },
-        .{ .k = .{ .primary = "ab", .timestamp = 3 }, .want = "ab3" },
+        // A seek names a primary and lands on its newest version.
+        .{ .k = .{ .primary = "ab" }, .want = "ab9" },
         // Shorter primary sorts before its own extensions.
-        .{ .k = .{ .primary = "a", .timestamp = max_ts }, .want = "a5" },
-        .{ .k = .{ .primary = "abc", .timestamp = max_ts }, .want = "abc1" },
+        .{ .k = .{ .primary = "a" }, .want = "a5" },
+        .{ .k = .{ .primary = "abc" }, .want = "abc1" },
         // Absent keys land on the next one that exists.
-        .{ .k = .{ .primary = "aa", .timestamp = max_ts }, .want = "ab9" },
-        .{ .k = .{ .primary = "az", .timestamp = max_ts }, .want = "b7" },
+        .{ .k = .{ .primary = "aa" }, .want = "ab9" },
+        .{ .k = .{ .primary = "az" }, .want = "b7" },
     };
     for (cases) |c| {
         try it.seekRange(c.k, .{});
-        try std.testing.expectEqualStrings(c.want, it.itemRef().?.value);
+        const got = it.itemRef().?.newest().value;
+        try std.testing.expectEqualStrings(c.want, got);
     }
 
+    // A key's item carries its older versions after the newest one.
+    try it.seekRange(.{ .primary = "ab" }, .{});
+    const ab = it.itemRef().?;
+    try std.testing.expectEqualStrings("ab3", ab.versions.slice()[1].value);
+    try it.next();
+    try std.testing.expectEqualStrings("abc1", it.itemRef().?.newest().value);
+
     // Past every key: nothing left.
-    try it.seekRange(.{ .primary = "c", .timestamp = max_ts }, .{});
+    try it.seekRange(.{ .primary = "c" }, .{});
     try std.testing.expect(it.itemRef() == null);
 }
 
@@ -208,7 +219,7 @@ test "table binary fuse contains keys" {
     var key_buf: [16]u8 = undefined;
     for (0..n) |i| {
         const key = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
-        try b.add(.{ .primary = key, .timestamp = @intCast(i + 1) }, "v");
+        try b.add(.{ .primary = key }, @intCast(i + 1), "v");
     }
 
     var tb = try b.finish();
@@ -240,7 +251,7 @@ test "table binary fuse large keyset contains sampled keys" {
     while (i < n) : (i += 1) {
         var key_buf: [16]u8 = undefined;
         const primary = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
-        try b.add(.{ .primary = primary }, "v");
+        try b.add(.{ .primary = primary }, 0, "v");
     }
 
     var tb = try b.finish();
@@ -279,8 +290,8 @@ test "table checksum mismatch is detected" {
     var b = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b.deinit();
 
-    try b.add(.{ .primary = "k1", .timestamp = 1 }, "v1");
-    try b.add(.{ .primary = "k2", .timestamp = 1 }, "v2");
+    try b.add(.{ .primary = "k1" }, 1, "v1");
+    try b.add(.{ .primary = "k2" }, 1, "v2");
 
     var tb = try b.finish();
     defer tb.deinit();
@@ -299,15 +310,15 @@ test "table checksum mismatch is detected" {
 test "merge iterator merges sorted streams" {
     var b1 = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b1.deinit();
-    try b1.add(.{ .primary = "a", .timestamp = 5 }, "a5");
-    try b1.add(.{ .primary = "c", .timestamp = 1 }, "c1");
+    try b1.add(.{ .primary = "a" }, 5, "a5");
+    try b1.add(.{ .primary = "c" }, 1, "c1");
     var t1 = try b1.finish();
     defer t1.deinit();
 
     var b2 = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
     defer b2.deinit();
-    try b2.add(.{ .primary = "b", .timestamp = 4 }, "b4");
-    try b2.add(.{ .primary = "d", .timestamp = 1 }, "d1");
+    try b2.add(.{ .primary = "b" }, 4, "b4");
+    try b2.add(.{ .primary = "d" }, 1, "d1");
     var t2 = try b2.finish();
     defer t2.deinit();
 
@@ -320,19 +331,253 @@ test "merge iterator merges sorted streams" {
         .{ .table = TableIterator.init(std.testing.allocator, r1, .p0) },
         .{ .table = TableIterator.init(std.testing.allocator, r2, .p0) },
     };
-    var m = zdb.table.merge_iterator.MergeIterator.init(std.testing.allocator, iters[0..]);
+    const MergeIterator = zdb.table.merge_iterator.MergeIterator;
+    var m = try MergeIterator.init(std.testing.allocator, iters[0..]);
     defer m.deinit();
 
     try m.seekRange(.{}, .{});
-    try std.testing.expectEqualStrings("a5", m.itemRef().?.value);
+    try std.testing.expectEqualStrings("a5", m.itemRef().?.newest().value);
     try m.next();
-    try std.testing.expectEqualStrings("b4", m.itemRef().?.value);
+    try std.testing.expectEqualStrings("b4", m.itemRef().?.newest().value);
     try m.next();
-    try std.testing.expectEqualStrings("c1", m.itemRef().?.value);
+    try std.testing.expectEqualStrings("c1", m.itemRef().?.newest().value);
     try m.next();
-    try std.testing.expectEqualStrings("d1", m.itemRef().?.value);
+    try std.testing.expectEqualStrings("d1", m.itemRef().?.newest().value);
     try m.next();
     try std.testing.expect(m.itemRef() == null);
+}
+
+test "merge iterator gathers one primary from every source" {
+    const alloc = std.testing.allocator;
+    // Three tables holding versions of "k" with interleaved timestamps;
+    // t1 and t2 both hold a version at 10.
+    var b1 = Builder.init(alloc, .{ .target_block_size = 256 });
+    defer b1.deinit();
+    try b1.addItem(.{ .key = .{ .primary = "k" }, .versions = .{ .many = &.{
+        .{ .ts = 30, .meta = .{}, .value = "k30" },
+        .{ .ts = 10, .meta = .{}, .value = "k10" },
+    } } });
+    try b1.add(.{ .primary = "z" }, 5, "z5");
+    var t1 = try b1.finish();
+    defer t1.deinit();
+
+    var b2 = Builder.init(alloc, .{ .target_block_size = 256 });
+    defer b2.deinit();
+    try b2.addItem(.{ .key = .{ .primary = "k" }, .versions = .{ .many = &.{
+        .{ .ts = 20, .meta = .{}, .value = "k20" },
+        .{ .ts = 10, .meta = .{}, .value = "k10-dup" },
+    } } });
+    var t2 = try b2.finish();
+    defer t2.deinit();
+
+    var b3 = Builder.init(alloc, .{ .target_block_size = 256 });
+    defer b3.deinit();
+    try b3.add(.{ .primary = "a" }, 1, "a1");
+    try b3.add(.{ .primary = "k" }, 25, "k25");
+    var t3 = try b3.finish();
+    defer t3.deinit();
+
+    const r1 = try Table.openHandle(alloc, try fromBuf(alloc, t1.bytes), .p0);
+    defer destroyTable(r1);
+    const r2 = try Table.openHandle(alloc, try fromBuf(alloc, t2.bytes), .p0);
+    defer destroyTable(r2);
+    const r3 = try Table.openHandle(alloc, try fromBuf(alloc, t3.bytes), .p0);
+    defer destroyTable(r3);
+
+    var iters = [_]zdb.table.merge_iterator.Iterator{
+        .{ .table = TableIterator.init(alloc, r1, .p0) },
+        .{ .table = TableIterator.init(alloc, r2, .p0) },
+        .{ .table = TableIterator.init(alloc, r3, .p0) },
+    };
+    var m = try zdb.table.merge_iterator.MergeIterator.init(alloc, iters[0..]);
+    defer m.deinit();
+
+    try m.seekRange(.{}, .{});
+    const a = m.itemRef().?;
+    try std.testing.expectEqualStrings("a", a.key.primary);
+    try std.testing.expectEqual(@as(usize, 1), a.versions.len());
+    try std.testing.expectEqual(@as(usize, 1), m.currentPins().len);
+
+    // k: every version of it, timestamp descending, drawn from all
+    // three sources; the duplicate at 10 comes from the lower source.
+    try m.next();
+    const k = m.itemRef().?;
+    try std.testing.expectEqualStrings("k", k.key.primary);
+    const want_ts = [_]u64{ 30, 25, 20, 10 };
+    const want_val = [_][]const u8{ "k30", "k25", "k20", "k10" };
+    const k_vers = k.versions.slice();
+    try std.testing.expectEqual(want_ts.len, k_vers.len);
+    for (k_vers, want_ts, want_val) |ver, ts, val| {
+        try std.testing.expectEqual(ts, ver.ts);
+        try std.testing.expectEqualStrings(val, ver.value);
+    }
+    // One pin per contributing block; the item stays valid while the
+    // merge is parked on it.
+    try std.testing.expectEqual(@as(usize, 3), m.currentPins().len);
+
+    try m.next();
+    const z = m.itemRef().?;
+    try std.testing.expectEqualStrings("z5", z.newest().value);
+    try std.testing.expectEqual(@as(usize, 1), m.currentPins().len);
+    try m.next();
+    try std.testing.expect(m.itemRef() == null);
+    try std.testing.expectEqual(@as(usize, 0), m.currentPins().len);
+
+    // A seek at k lands on the whole of k; an end bound at z excludes z.
+    try m.seekRange(.{ .primary = "k" }, .{ .primary = "z" });
+    try std.testing.expectEqual(@as(usize, 4), m.itemRef().?.versions.len());
+    try m.next();
+    try std.testing.expect(m.itemRef() == null);
+}
+
+/// A table with every item of `items`, in one 4 KiB-block builder.
+fn buildItems(alloc: std.mem.Allocator, items: []const Item) !*Table {
+    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    defer b.deinit();
+    for (items) |item| try b.addItem(item);
+    var tb = try b.finish();
+    defer tb.deinit();
+    return Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+}
+
+test "packed: one entry holds every version of a key" {
+    const alloc = std.testing.allocator;
+    var many: [40]Version = undefined;
+    for (&many, 0..) |*ver, i| {
+        ver.* = .{ .ts = 1000 - i, .meta = .{}, .value = "m" };
+    }
+    const tombstone: Meta = .{ .kind = .deleted };
+    const items = [_]Item{
+        .{ .key = .{ .primary = "one" }, .versions = .{
+            .one = .{ .ts = 7, .meta = .{}, .value = "v7" },
+        } },
+        .{ .key = .{ .primary = "three" }, .versions = .{ .many = &.{
+            .{ .ts = 30, .meta = .{ .kind = .delta }, .value = "d30" },
+            .{ .ts = 20, .meta = tombstone, .value = "" },
+            .{ .ts = 10, .meta = .{}, .value = "s10" },
+        } } },
+        .{ .key = .{ .primary = "two" }, .versions = .{ .many = &.{
+            .{ .ts = 5, .meta = .{}, .value = "v5" },
+            .{ .ts = 1, .meta = tombstone, .value = "" },
+        } } },
+        .{ .key = .{ .primary = "zmany" }, .versions = .{ .many = &many } },
+    };
+    const t = try buildItems(alloc, &items);
+    defer destroyTable(t);
+    try std.testing.expectEqual(@as(u32, 46), t.index.key_count);
+    try std.testing.expectEqual(@as(u64, 1000), t.index.max_version);
+
+    var it = TableIterator.init(alloc, t, .p0);
+    defer it.deinit();
+    try it.seekRange(.{}, .{});
+    for (items) |want| {
+        const got = it.itemRef().?;
+        try std.testing.expectEqualStrings(want.key.primary, got.key.primary);
+        try std.testing.expectEqual(want.versions.len(), got.versions.len());
+        for (want.versions.slice(), got.versions.slice()) |w, g| {
+            try std.testing.expectEqual(w.ts, g.ts);
+            try std.testing.expectEqual(w.meta, g.meta);
+            try std.testing.expectEqualStrings(w.value, g.value);
+        }
+        try it.next();
+    }
+    try std.testing.expect(it.itemRef() == null);
+
+    // A seek between keys lands on the next one; an end bound at a key
+    // excludes it.
+    try it.seekRange(.{ .primary = "th" }, .{ .primary = "two" });
+    try std.testing.expectEqualStrings("three", it.itemRef().?.key.primary);
+    try it.next();
+    try std.testing.expect(it.itemRef() == null);
+}
+
+test "packed: a chain past the block target is still one entry" {
+    const alloc = std.testing.allocator;
+    var vers: [64]Version = undefined;
+    const wide = try alloc.alloc(u8, 256);
+    defer alloc.free(wide);
+    @memset(wide, 'w');
+    for (&vers, 0..) |*ver, i| {
+        ver.* = .{ .ts = 100 - i, .meta = .{}, .value = wide };
+    }
+    var b = Builder.init(alloc, .{ .target_block_size = 1024 });
+    defer b.deinit();
+    try b.add(.{ .primary = "a" }, 1, "a");
+    try b.addItem(.{
+        .key = .{ .primary = "chain" },
+        .versions = .{ .many = &vers },
+    });
+    try b.add(.{ .primary = "z" }, 1, "z");
+    var tb = try b.finish();
+    defer tb.deinit();
+    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(t);
+
+    var it = TableIterator.init(alloc, t, .p0);
+    defer it.deinit();
+    try it.seekRange(.{ .primary = "chain" }, .{});
+    const got = it.itemRef().?;
+    try std.testing.expectEqual(@as(usize, 64), got.versions.len());
+    try std.testing.expectEqualStrings(wide, got.versions.slice()[63].value);
+    try it.next();
+    try std.testing.expectEqualStrings("z", it.itemRef().?.key.primary);
+}
+
+test "packed: version order and key order are enforced" {
+    const alloc = std.testing.allocator;
+    var b = Builder.init(alloc, .{});
+    defer b.deinit();
+    // Equal timestamps within an item.
+    try std.testing.expectError(error.KeyOrderViolation, b.addItem(.{
+        .key = .{ .primary = "a" },
+        .versions = .{ .many = &.{
+            .{ .ts = 5, .meta = .{}, .value = "x" },
+            .{ .ts = 5, .meta = .{}, .value = "y" },
+        } },
+    }));
+    // A rising timestamp within an item.
+    try std.testing.expectError(error.KeyOrderViolation, b.addItem(.{
+        .key = .{ .primary = "a" },
+        .versions = .{ .many = &.{
+            .{ .ts = 5, .meta = .{}, .value = "x" },
+            .{ .ts = 6, .meta = .{}, .value = "y" },
+        } },
+    }));
+    try b.add(.{ .primary = "a" }, 5, "x");
+    // The same key twice, and a key below the last.
+    try std.testing.expectError(
+        error.KeyOrderViolation,
+        b.add(.{ .primary = "a" }, 4, "x"),
+    );
+    try std.testing.expectError(
+        error.KeyOrderViolation,
+        b.add(.{ .primary = "0" }, 9, "x"),
+    );
+}
+
+test "packed: n versions cost at most 4 + 13n bytes over one" {
+    const alloc = std.testing.allocator;
+    // Two tables with the same key set; in the second the key holds n
+    // versions of the same bytes as the single one, so the difference
+    // is the packed header alone.
+    const n: usize = 10;
+    var vers: [n]Version = undefined;
+    for (&vers, 0..) |*ver, i| {
+        ver.* = .{ .ts = 100 - i, .meta = .{}, .value = "" };
+    }
+    const one = [_]Item{
+        .{ .key = .{ .primary = "k" }, .versions = .{ .one = vers[0] } },
+    };
+    const all = [_]Item{
+        .{ .key = .{ .primary = "k" }, .versions = .{ .many = &vers } },
+    };
+    const t1 = try buildItems(alloc, &one);
+    defer destroyTable(t1);
+    const tn = try buildItems(alloc, &all);
+    defer destroyTable(tn);
+    const grew = tn.index.uncompressed_size - t1.index.uncompressed_size;
+    try std.testing.expect(grew <= Builder.ver_hdr_len * (n - 1));
+    try std.testing.expect(grew >= Builder.ver_hdr_len * (n - 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +604,8 @@ test "table iterator: forward scan" {
 
             var val_buf: [20]u8 = undefined;
             const expected_val = try std.fmt.bufPrint(&val_buf, "{d}", .{count});
-            try std.testing.expectEqualStrings(expected_val, entry.value);
+            const got = entry.newest().value;
+            try std.testing.expectEqualStrings(expected_val, got);
 
             try it.next();
         }
@@ -384,7 +630,7 @@ test "seek to first" {
 
         try it.seekRange(.{}, .{});
         const entry = it.itemRef() orelse return error.UnexpectedNull;
-        try std.testing.expectEqualStrings("0", entry.value);
+        try std.testing.expectEqualStrings("0", entry.newest().value);
         try std.testing.expectEqualStrings("key0000", entry.key.primary);
     }
 }
@@ -415,7 +661,7 @@ test "seek: various targets" {
     };
 
     for (cases) |c| {
-        try it.seekRange(.{ .primary = c.in, .timestamp = 0 }, .{});
+        try it.seekRange(.{ .primary = c.in }, .{});
         if (!c.valid) {
             try std.testing.expect(it.itemRef() == null);
             continue;
@@ -464,7 +710,7 @@ test "table: seek and iterate to end" {
     defer it.deinit();
 
     // Seek to key1010, iterate to end — should visit keys 1010..9999.
-    try it.seekRange(.{ .primary = "key1010", .timestamp = 0 }, .{});
+    try it.seekRange(.{ .primary = "key1010" }, .{});
     var kid: usize = 1010;
     while (it.itemRef()) |entry| : (kid += 1) {
         var buf: [32]u8 = undefined;
@@ -475,11 +721,11 @@ test "table: seek and iterate to end" {
     try std.testing.expectEqual(@as(usize, 10000), kid);
 
     // Seek past end → invalid.
-    try it.seekRange(.{ .primary = "key99999", .timestamp = 0 }, .{});
+    try it.seekRange(.{ .primary = "key99999" }, .{});
     try std.testing.expect(it.itemRef() == null);
 
     // Seek before start → first key.
-    try it.seekRange(.{ .primary = "aaa", .timestamp = 0 }, .{});
+    try it.seekRange(.{ .primary = "aaa" }, .{});
     const first = it.itemRef() orelse return error.UnexpectedNull;
     try std.testing.expectEqualStrings("key0000", first.key.primary);
 }
@@ -498,7 +744,7 @@ test "table: max_version" {
     while (i < n) : (i += 1) {
         var buf: [32]u8 = undefined;
         const key_str = try std.fmt.bufPrint(&buf, "foo:{d:0>4}", .{i});
-        try b.add(.{ .primary = key_str, .timestamp = i + 1 }, "");
+        try b.add(.{ .primary = key_str }, i + 1, "");
     }
 
     var tb = try b.finish();
@@ -544,7 +790,11 @@ test "table: big values" {
         var buf: [16]u8 = undefined;
         const key_str = try std.fmt.bufPrint(&buf, "{d:0>4}", .{i});
         @memset(big_val, @intCast(i % 256));
-        try b.add(.{ .primary = key_str, .timestamp = @as(u64, @intCast(i + 1)) }, big_val);
+        try b.add(
+            .{ .primary = key_str },
+            @as(u64, @intCast(i + 1)),
+            big_val,
+        );
     }
 
     var tb = try b.finish();
@@ -560,9 +810,10 @@ test "table: big values" {
 
     var count: usize = 0;
     while (it.itemRef()) |entry| : (count += 1) {
-        try std.testing.expectEqual(value_size, entry.value.len);
+        try std.testing.expectEqual(value_size, entry.newest().value.len);
         // Verify fill byte matches the key index.
-        try std.testing.expectEqual(@as(u8, @intCast(count % 256)), entry.value[0]);
+        const fill = entry.newest().value[0];
+        try std.testing.expectEqual(@as(u8, @intCast(count % 256)), fill);
         try it.next();
     }
     try std.testing.expectEqual(n, count);
@@ -824,10 +1075,14 @@ test "table: meta round-trips through builder and iterator" {
         else
             try std.fmt.bufPrint(&val_buf, "v{d}", .{i});
 
+        // addItem copies during the call, so a temporary slice is fine.
         try b.addItem(.{
-            .key = .{ .primary = key_str, .timestamp = 1 },
-            .value = val,
-            .meta = metaFor(i),
+            .key = .{ .primary = key_str },
+            .versions = .{ .one = .{
+                .ts = 1,
+                .meta = metaFor(i),
+                .value = val,
+            } },
         });
     }
 
@@ -842,8 +1097,11 @@ test "table: meta round-trips through builder and iterator" {
 
     var count: usize = 0;
     while (it.itemRef()) |item| {
-        try std.testing.expectEqual(metaFor(count), item.meta);
-        if (count % 3 == 0) try std.testing.expectEqual(@as(usize, 0), item.value.len);
+        const ver = item.newest();
+        try std.testing.expectEqual(metaFor(count), ver.meta);
+        if (count % 3 == 0) {
+            try std.testing.expectEqual(@as(usize, 0), ver.value.len);
+        }
         count += 1;
         try it.next();
     }
@@ -861,9 +1119,12 @@ test "table: meta survives random access via seekGe" {
         var key_buf: [32]u8 = undefined;
         const key_str = try std.fmt.bufPrint(&key_buf, "k:{d:0>4}", .{i});
         try b.addItem(.{
-            .key = .{ .primary = key_str, .timestamp = 1 },
-            .value = "x",
-            .meta = metaFor(i),
+            .key = .{ .primary = key_str },
+            .versions = .{ .one = .{
+                .ts = 1,
+                .meta = metaFor(i),
+                .value = "x",
+            } },
         });
     }
 
@@ -880,11 +1141,11 @@ test "table: meta survives random access via seekGe" {
 
         var it = TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
-        try it.seekRange(.{ .primary = key_str, .timestamp = 1 }, .{});
+        try it.seekRange(.{ .primary = key_str }, .{});
 
         const item = it.itemRef() orelse return error.TestExpectedItem;
         try std.testing.expectEqualStrings(key_str, item.key.primary);
-        try std.testing.expectEqual(metaFor(target), item.meta);
+        try std.testing.expectEqual(metaFor(target), item.newest().meta);
     }
 }
 

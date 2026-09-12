@@ -148,11 +148,11 @@ test "sql.index_ddl: v1 inverts into sorted items, one per key" {
     try testing.expectEqual(@as(usize, 2), items.len);
     const key4 = (try fx.keys(4))[0];
     try testing.expectEqualSlices(u8, key4, items[0].key.primary);
-    try testing.expectEqual(read_ts, items[0].key.timestamp);
-    try testing.expect(items[0].meta.isRoaring());
+    try testing.expectEqual(read_ts, items[0].newest().ts);
+    try testing.expect(items[0].newest().meta.isRoaring());
     var bm = try zdb.zroar.Bitmap.fromBuffer(
         testing.allocator,
-        @alignCast(items[1].value),
+        @alignCast(items[1].newest().value),
         .borrow,
     );
     defer bm.deinit();
@@ -169,8 +169,9 @@ test "sql.index_ddl: a unique v1 with two rows on one key is a duplicate" {
     try rows.setV1(2, try fx.keys(4));
     const items = try rows.items(ns, index_tid, read_ts);
     try testing.expectEqual(@as(usize, 2), items.len);
-    try testing.expect(!items[0].meta.isRoaring());
-    try testing.expectEqual(@as(u64, 2), sql.key.decodeEgid(items[0].value).?);
+    try testing.expect(!items[0].newest().meta.isRoaring());
+    const egid = sql.key.decodeEgid(items[0].newest().value).?;
+    try testing.expectEqual(@as(u64, 2), egid);
 
     try rows.setV1(3, try fx.keys(5));
     try testing.expectError(

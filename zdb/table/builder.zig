@@ -1,6 +1,7 @@
 const std = @import("std");
 const Key = @import("../kv.zig").Key;
 const Item = @import("../kv.zig").Item;
+const Version = @import("../kv.zig").Version;
 const _idx = @import("index.zig");
 const _buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
@@ -33,11 +34,21 @@ const log = std.log.scoped(.table_builder);
 // Note that we only store the start offset of each entry i, not the end, because
 // the end offset of entry i = the start offset of entry i+1.
 //
-// Each entry is stored as such:
+// Each entry is one key with every version of it, stored as such:
 // | ----------------------------------------------------------------------|
 // | -- u16 key overlap with base -- | -- u16 key diff length from base -- |
-// | -- u8 meta -- | -- key diff bytes -- | -- value bytes -------------- |
+// | -- key diff bytes -- | -- packed versions ------------------------- |
 // | ----------------------------------------------------------------------|
+//
+// The packed versions are, newest first:
+// | -- u32 count -- | count x { u64 ts, u8 meta, u32 off } -- | -- bytes -- |
+// where version i's value is bytes[off_i .. off_(i+1)), the last one's
+// runs to the end, and off_0 is 0. A tombstone is a version with no bytes.
+// The headers are fixed width, so the version at or below a read
+// timestamp is a binary search, and a value is a slice into the block.
+// The header is decoded field by field (readInt at 4 + 13 i): a Zig packed
+// struct rounds to its backing integer and an extern struct pads to its
+// alignment, so neither gives the 13-byte stride.
 //
 // Notes:
 // - Everything needed to locate anything sits at the FRONT, in a header of
@@ -60,16 +71,18 @@ const log = std.log.scoped(.table_builder);
 //   whatever the layout. Separation only pays where it lets you avoid
 //   LOADING bytes, which within one block it never does.
 //
+// - An entry's stored key is the marshaled key ([ns u64 BE][tid u32 BE]
+//   [primary], see kv.zig); a version's timestamp lives in its packed
+//   header. Entries ascend by key, which is bytewise order.
+//
 // - Keys are prefix-compressed against the block base key (first key in block),
 //   not against the previous key. This is useful because it allows us random
 //   access to any idx on the block entry, and derive its key.
 //
-// - meta (kv.zig:Meta) lives in the 5-byte fixed header, NOT as a prefix on
-//   the value bytes. The value's length is implicit — it runs to the next
-//   entry's offset — so a byte inside the value region would have no length
-//   guaranteeing it's there, and an empty value would stop being a zero-byte
-//   region. In the header it's covered by the reader's single `off + 5` bounds
-//   check, before any value math.
+// - An entry's value length is implicit — it runs to the next entry's
+//   offset — so the packed versions carry their own count and offsets up
+//   front, where the reader's bounds checks cover them before any value
+//   math.
 //
 // - entry_off_* values point to entry starts within the entries region.
 // - Checksums are xxhash3 u64 (zbuf.hash) over the uncompressed block bytes
@@ -200,6 +213,7 @@ pub const Builder = struct {
         self.stale_data_size = 0;
     }
 
+    /// The key of the last entry written.
     pub fn lastKey(self: *Builder) Key {
         if (self.last_key.items.len == 0) return .{};
         return Key.init(self.last_key.items);
@@ -216,13 +230,23 @@ pub const Builder = struct {
     /// Convenience for callers with nothing to say about the row: raw
     /// encoding, no flags. Production writers use addItem, so meta travels
     /// with the row it describes.
-    pub fn add(self: *Builder, key: Key, value: String) Error!void {
-        return self.addItem(.{ .key = key, .value = value, .meta = .{} });
+    pub fn add(self: *Builder, key: Key, ts: u64, value: String) Error!void {
+        return self.addItem(.{
+            .key = key,
+            .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = value } },
+        });
     }
 
+    /// Bytes of packed-version header per version: u64 ts, u8 meta,
+    /// u32 off.
+    pub const ver_hdr_len: usize = 13;
+
+    /// Write `item` as one entry: its key, then its versions packed
+    /// newest first. Keys must arrive strictly ascending, one item per
+    /// key; an item's versions must descend strictly in timestamp.
     pub fn addItem(self: *Builder, item: Item) Error!void {
         const key = item.key;
-        const value = item.value;
+        const vers = item.versions.slice();
 
         // A real row, never a bound sentinel: an empty primary marshals to
         // zero bytes (Key.marshalTo), which would leave last_key empty and
@@ -230,19 +254,25 @@ pub const Builder = struct {
         // comparison further down.
         std.debug.assert(key.len() > 0);
         if (key.len() > std.math.maxInt(u16)) return error.KeyTooLarge;
-        if (value.len > std.math.maxInt(u32)) return error.ValueTooLarge;
+
+        var prev_ts: ?u64 = null;
+        var packed_len = 4 + ver_hdr_len * vers.len;
+        for (vers) |ver| {
+            if (prev_ts) |pt| {
+                if (ver.ts >= pt) return error.KeyOrderViolation;
+            }
+            prev_ts = ver.ts;
+            packed_len += ver.value.len;
+        }
+        // Every offset is a u32 into the bytes region.
+        if (packed_len > std.math.maxInt(u32)) return error.ValueTooLarge;
 
         if (self.last_key.items.len > 0) {
-            const last = self.lastKey();
-            if (key.order(last) != .gt) {
+            if (key.order(self.lastKey()) != .gt) {
                 return error.KeyOrderViolation;
             }
-            if (!key.equalPrimary(last)) {
-                try self.bf_hashes.append(self.allocator, key.bloomHash());
-            }
-        } else {
-            try self.bf_hashes.append(self.allocator, key.bloomHash());
         }
+        try self.bf_hashes.append(self.allocator, key.bloomHash());
 
         // Marshal into last_key scratch buffer for prefix compression.
         self.last_key.clearRetainingCapacity();
@@ -259,9 +289,9 @@ pub const Builder = struct {
             std.mem.findDiff(u8, base, entry_key) orelse unreachable;
 
         // Estimate the encoded size for this entry:
-        // 2 bytes overlap + 2 bytes diff_len + 1 byte meta + key diff + value.
-        const entry_sz = @as(usize, 5) + (entry_key.len - fit_overlap) +
-            value.len;
+        // 2 bytes overlap + 2 bytes diff_len + key diff + packed versions.
+        const entry_sz = @as(usize, 4) + (entry_key.len - fit_overlap) +
+            packed_len;
         if (self.shouldFinishBlock(entry_sz)) {
             try self.finishBlock();
         }
@@ -288,19 +318,41 @@ pub const Builder = struct {
         );
 
         // Per-entry encoding:
-        //   [u16 overlap][u16 diff_len][u8 meta][diff bytes][value bytes]
-        // Value boundary is derived from the next entry offset (or end of
-        // entries region), which is why meta sits in the fixed header rather
-        // than in front of the value. See the layout notes at the top.
-        try appendU16(&self.cur_entries, self.allocator, @intCast(overlap));
-        try appendU16(&self.cur_entries, self.allocator, @intCast(diff.len));
-        try self.cur_entries.append(self.allocator, item.meta.toByte());
-        try self.cur_entries.appendSlice(self.allocator, diff);
-        try self.cur_entries.appendSlice(self.allocator, value);
+        //   [u16 overlap][u16 diff_len][diff bytes][packed versions]
+        // The entry's end is the next entry's offset (or the end of the
+        // entries region). See the layout notes at the top.
+        const out = &self.cur_entries;
+        try out.ensureUnusedCapacity(self.allocator, 4 + diff.len + packed_len);
+        try appendU16(out, self.allocator, @intCast(overlap));
+        try appendU16(out, self.allocator, @intCast(diff.len));
+        try out.appendSlice(self.allocator, diff);
+        try self.appendVersions(vers);
 
-        if (self.key_count == std.math.maxInt(u32)) return error.IntegerOverflow;
-        self.key_count += 1;
-        if (key.timestamp > self.max_version) self.max_version = key.timestamp;
+        // Newest first, so the item's max is its first version.
+        self.max_version = @max(self.max_version, item.newest().ts);
+        const n: u32 = @intCast(vers.len);
+        if (self.key_count > std.math.maxInt(u32) - n) {
+            return error.IntegerOverflow;
+        }
+        self.key_count += n;
+    }
+
+    /// Append `versions` packed, per the layout at the top: the count,
+    /// one fixed header per version with its offset into the bytes that
+    /// follow, then the bytes.
+    fn appendVersions(self: *Builder, versions: []const Version) Error!void {
+        const out = &self.cur_entries;
+        try appendU32(out, self.allocator, @intCast(versions.len));
+        var off: u32 = 0;
+        for (versions) |ver| {
+            try appendU64(out, self.allocator, ver.ts);
+            try out.append(self.allocator, ver.meta.toByte());
+            try appendU32(out, self.allocator, off);
+            off += @intCast(ver.value.len);
+        }
+        for (versions) |ver| {
+            try out.appendSlice(self.allocator, ver.value);
+        }
     }
 
     pub fn finish(self: *Builder) Error!TableBuffer {

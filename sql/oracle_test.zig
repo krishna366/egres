@@ -7,26 +7,22 @@ const zdb = @import("zdb");
 const Oracle = sql.oracle.Oracle;
 
 // Test keys share one (ns, table); `h(p)` is the identity hash that
-// `updateItems` records for `item(p, ts)`.
-fn item(primary: String, ts: u64) zdb.kv.Item {
-    return .{
-        .key = .{
-            .namespace = 7,
-            .table_id = 16,
-            .primary = primary,
-            .timestamp = ts,
-        },
-        .value = "",
-        .meta = .{},
-    };
+// `updateItems` records for a commit of `p`.
+fn key(primary: String) zdb.kv.Key {
+    return .{ .namespace = 7, .table_id = 16, .primary = primary };
+}
+
+/// Record a commit of `primary` at `ts`, the way apply does — a
+/// one-item, one-version run through updateItems.
+fn commit(o: *Oracle, primary: String, ts: u64) !void {
+    try o.updateItems(&.{.{
+        .key = key(primary),
+        .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = "" } },
+    }});
 }
 
 fn h(primary: String) u64 {
-    return (zdb.kv.Key{
-        .namespace = 7,
-        .table_id = 16,
-        .primary = primary,
-    }).identityHash();
+    return key(primary).identityHash();
 }
 
 test "oracle: unknown keys answer the horizon; updates answer exactly" {
@@ -36,14 +32,14 @@ test "oracle: unknown keys answer the horizon; updates answer exactly" {
     // Empty oracle: nothing ever committed — horizon 0 for any key.
     try testing.expectEqual(0, o.commitTs(h("a")));
 
-    try o.updateItems(&.{item("a", 100)});
+    try commit(&o, "a", 100);
     try testing.expectEqual(100, o.commitTs(h("a")));
     try testing.expectEqual(0, o.commitTs(h("b")));
 
     // Per-key max-fold: an older ts never regresses a newer one.
-    try o.updateItems(&.{item("a", 90)});
+    try commit(&o, "a", 90);
     try testing.expectEqual(100, o.commitTs(h("a")));
-    try o.updateItems(&.{item("a", 150)});
+    try commit(&o, "a", 150);
     try testing.expectEqual(150, o.commitTs(h("a")));
 }
 
@@ -51,7 +47,7 @@ test "oracle: entries survive one rotation and die at the second" {
     var o = Oracle.init(testing.allocator);
     defer o.deinit();
 
-    try o.updateItems(&.{item("a", 100)});
+    try commit(&o, "a", 100);
     o.rotate(); // h("a") now in `previous`
     try testing.expectEqual(100, o.commitTs(h("a")));
 
@@ -67,9 +63,9 @@ test "oracle: a re-committed key reads from current, not previous" {
     var o = Oracle.init(testing.allocator);
     defer o.deinit();
 
-    try o.updateItems(&.{item("a", 100)});
+    try commit(&o, "a", 100);
     o.rotate();
-    try o.updateItems(&.{item("a", 150)}); // lives in both generations now
+    try commit(&o, "a", 150); // lives in both generations now
     try testing.expectEqual(150, o.commitTs(h("a")));
 
     o.rotate(); // drops the generation holding the 100 copy
@@ -85,9 +81,15 @@ test "oracle: maxCommitTs over a read set" {
 
     // One batched apply records the whole write set under a single hold.
     try o.updateItems(&.{
-        item("k1", 100),
-        item("k2", 300),
-        item("k3", 200),
+        .{ .key = key("k1"), .versions = .{
+            .one = .{ .ts = 100, .meta = .{}, .value = "" },
+        } },
+        .{ .key = key("k2"), .versions = .{
+            .one = .{ .ts = 300, .meta = .{}, .value = "" },
+        } },
+        .{ .key = key("k3"), .versions = .{
+            .one = .{ .ts = 200, .meta = .{}, .value = "" },
+        } },
     });
 
     try testing.expectEqual(0, o.maxCommitTs(&.{}));

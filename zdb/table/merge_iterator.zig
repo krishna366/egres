@@ -2,22 +2,24 @@ const std = @import("std");
 const _table = @import("table.zig");
 const _cache = @import("../cache.zig");
 const Key = @import("../kv.zig").Key;
+const Version = @import("../kv.zig").Version;
 const _skl = @import("../skl/skiplist.zig");
 const utils = @import("utils");
 
 pub const Error = _table.Error;
 
-/// A refcounted hold on the storage backing an iterator item's value:
+/// A refcounted hold on the storage backing an iterator item's values:
 /// a decompressed block (SST sources) or a memtable's skiplist arena.
-/// Every positioned source is pinnable — `Iterator.currentPin` /
-/// `MergeIterator.currentPin` return null only when there is no item.
-/// `hold` takes the ref and returns the pin for append-style use;
-/// `release` drops it (the skiplist arena outlives its Memtables slot
-/// while held; a block outlives cache eviction while held).
+/// Every positioned source is pinnable — `Iterator.currentPins` is
+/// empty only when there is no item, and a merged item names one pin
+/// per source it drew from. `acquire` takes the ref and returns the pin
+/// for append-style use; `release` drops it (the skiplist arena
+/// outlives its Memtables slot while held; a block outlives cache
+/// eviction while held).
 ///
 /// A held slice is stable AND immutable, even against the active
 /// memtable: skiplist arenas are append-only — an overwrite dupes new
-/// bytes and swaps the node pointer, never touching old bytes (see
+/// bytes and publishes a new version node, never touching old bytes (see
 /// SkipList.putItem) — and blocks are immutable by construction. So
 /// borrowing until a fold completes carries exactly the guarantees
 /// copying at capture time had.
@@ -45,7 +47,7 @@ pub const Pin = union(enum) {
 /// (single SST), a ConcatIterator (multiple non-overlapping SSTs), a
 /// memtable scan (`skl.Iterator`), or a MergeIterator over other
 /// sources. All expose the same `seekRange` / `itemRef` / `next` /
-/// `currentPin` / `deinit` shape, so a reader can take one `*Iterator`
+/// `currentPins` / `deinit` shape, so a reader can take one `*Iterator`
 /// whatever is behind it.
 pub const Iterator = union(enum) {
     table: _table.TableIterator,
@@ -60,23 +62,28 @@ pub const Iterator = union(enum) {
         }
     }
 
-    /// The pinnable storage backing itemRef()'s value; null only when
-    /// the source holds no item.
-    pub fn currentPin(self: *const Iterator) ?Pin {
+    /// The pins on the storage backing itemRef()'s values; empty only
+    /// when the source holds no item. A leaf source has one pin and
+    /// returns it through `buf`; a merge returns its own list, one pin
+    /// per source the item drew from.
+    pub fn currentPins(self: *Iterator, buf: *[1]Pin) []const Pin {
         switch (self.*) {
             .table => |*t| {
-                const b = t.currentBlock() orelse return null;
-                return .{ .block = b };
+                const b = t.currentBlock() orelse return &.{};
+                buf[0] = .{ .block = b };
+                return buf[0..1];
             },
             .concat => |*c| {
-                const b = c.currentBlock() orelse return null;
-                return .{ .block = b };
+                const b = c.currentBlock() orelse return &.{};
+                buf[0] = .{ .block = b };
+                return buf[0..1];
             },
             .skiplist => |*s| {
-                if (s.current == null) return null;
-                return .{ .skiplist = s.skiplist };
+                if (s.node == null) return &.{};
+                buf[0] = .{ .skiplist = s.skiplist };
+                return buf[0..1];
             },
-            .merge => |*m| return m.currentPin(),
+            .merge => |*m| return m.currentPins(),
         }
     }
 
@@ -99,127 +106,205 @@ pub const Iterator = union(enum) {
     }
 };
 
-/// Heap slot: a source index. A merge has one source per memtable plus
-/// one per overlapping L0 table plus one per deeper level, so u16 is
-/// three orders of magnitude of headroom; seekRange asserts the bound.
-const Src = u16;
-
+/// One item per key, drawn from every source that holds it.
+///
+/// `live` is the sources that still hold an item, sorted by that item's
+/// key (ties by the source's position among the inputs, so a txn's
+/// pending writes, source 0, come first). The sources holding the
+/// smallest key are therefore the first `n_cur` entries, and the item
+/// is built from them: one source's versions as they are, or several
+/// sources' versions sorted by timestamp descending with a repeated
+/// timestamp dropped (a version a flushed memtable and its L0 table
+/// both hold, or a txn's pending write over the committed version it
+/// read; the lower source wins). Source order is not timestamp order —
+/// L0 tables arrive oldest first, and a txn's pending version can be
+/// older than committed memtable versions — which is why the versions
+/// are sorted. `next` takes those sources out, advances them, and puts
+/// each back at its place with a scan from the front: a source in the
+/// middle of a run of keys costs one compare, one that jumped past the
+/// others costs as many as it passed.
+///
+/// Nothing is held: the item's key and values point into the sources,
+/// which keep their blocks and arenas pinned until they are advanced,
+/// so the item is valid until the following `next`, `seekRange` or
+/// `deinit`. `currentPins` names those pins for a caller that keeps a
+/// value longer.
 pub const MergeIterator = struct {
-    allocator: std.mem.Allocator,
-    iters: []Iterator, // caller-owned slice
-    /// Each source's current item, indexed BY SOURCE and refreshed once
-    /// per advance. Comparisons read keys from here instead of
-    /// dispatching through the Iterator union and re-parsing the bytes
-    /// every time. An item stays valid exactly until its own source
-    /// advances (its key points into that source's key_buf or arena, its
-    /// value into a block the source holds a ref on) — which is when we
-    /// overwrite it.
-    items: []_table.Item = &.{},
-    /// Min-heap (by winsOver) of the sources that still hold an item.
-    /// Source indices rather than the items themselves: sift swaps stay
-    /// 2 bytes wide and the live heap sits in a single cache line.
-    heap: []Src = &.{},
-    heap_len: usize = 0,
+    /// One input: its iterator, its current item (refreshed on every
+    /// advance, null once exhausted), and its position among the inputs
+    /// as given to `init`, the tie-break between equal keys.
+    const Source = struct {
+        it: Iterator,
+        item: ?_table.Item = null,
+        prio: usize,
+    };
 
-    pub fn init(allocator: std.mem.Allocator, iters: []Iterator) MergeIterator {
-        return .{ .allocator = allocator, .iters = iters };
+    allocator: std.mem.Allocator,
+    /// Every input, for the merge's lifetime: a source that ran out
+    /// leaves `live` but comes back on the next `seekRange`.
+    srcs: []*Source,
+    /// The sources holding an item, sorted by (key, prio).
+    live: std.ArrayList(*Source) = .empty,
+    /// How many sources at the front of `live` hold the current key.
+    n_cur: usize = 0,
+    /// The current item: the first source's own item, or its key over
+    /// `vers` when the key is shared.
+    cur: ?_table.Item = null,
+    vers: std.ArrayList(Version) = .empty,
+    /// Scratch for `currentPins`.
+    pins: std.ArrayList(Pin) = .empty,
+
+    /// Takes the iterators over: `deinit` releases them. `iters` itself
+    /// stays the caller's; on error nothing was taken.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        iters: []const Iterator,
+    ) !MergeIterator {
+        const srcs = try allocator.alloc(*Source, iters.len);
+        errdefer allocator.free(srcs);
+        var made: usize = 0;
+        errdefer for (srcs[0..made]) |src| allocator.destroy(src);
+        for (srcs, iters, 0..) |*slot, it, prio| {
+            const src = try allocator.create(Source);
+            src.* = .{ .it = it, .prio = prio };
+            slot.* = src;
+            made += 1;
+        }
+        var self: MergeIterator = .{ .allocator = allocator, .srcs = srcs };
+        errdefer self.live.deinit(allocator);
+        try self.live.ensureTotalCapacity(allocator, iters.len);
+        // One pin per source at most.
+        try self.pins.ensureTotalCapacity(allocator, iters.len);
+        return self;
     }
 
     pub fn deinit(self: *MergeIterator) void {
-        if (self.items.len > 0) self.allocator.free(self.items);
-        if (self.heap.len > 0) self.allocator.free(self.heap);
-        for (self.iters) |*it| it.deinit();
+        for (self.srcs) |src| {
+            src.it.deinit();
+            self.allocator.destroy(src);
+        }
+        self.allocator.free(self.srcs);
+        self.live.deinit(self.allocator);
+        self.vers.deinit(self.allocator);
+        self.pins.deinit(self.allocator);
     }
 
-    /// True when source `a` should reach the caller before source `b`.
-    ///
-    /// Every source in one merge shares a single (namespace, table_id):
-    /// scans run on table-limited ranges (KeyRange.limitToTable) and a
-    /// compaction merge never leaves its tree. Those fields are equal by
-    /// construction, so orderPrimary skips them; the asserts catch a
-    /// future caller that breaks the assumption.
-    ///
-    /// Equal full keys fall back to source index for a deterministic
-    /// order; they are NOT collapsed. A key present in two sources
-    /// surfaces once per source — compaction's keys_in accounting reads
-    /// a missing one as iterator loss.
-    fn winsOver(self: *const MergeIterator, a: Src, b: Src) bool {
-        const ka = self.items[a].key;
-        const kb = self.items[b].key;
-        std.debug.assert(ka.namespace == kb.namespace);
-        std.debug.assert(ka.table_id == kb.table_id);
-        return switch (ka.orderPrimary(kb)) {
+    /// The order of `live`: by key (the full key, since a MultiGet seek
+    /// over the memtables has no end bound and its sources can settle on
+    /// keys of different tables or namespaces), then by prio. The first
+    /// parameter is the context std.sort passes; there is none.
+    fn earlier(_: void, a: *Source, b: *Source) bool {
+        return switch (a.item.?.key.order(b.item.?.key)) {
             .lt => true,
             .gt => false,
-            .eq => a < b,
+            .eq => a.prio < b.prio,
         };
     }
 
     pub fn seekRange(self: *MergeIterator, start: Key, end: Key) Error!void {
-        std.debug.assert(self.iters.len <= std.math.maxInt(Src));
-        if (self.heap.len == 0 and self.iters.len > 0) {
-            self.items = try self.allocator.alloc(_table.Item, self.iters.len);
-            self.heap = try self.allocator.alloc(Src, self.iters.len);
+        self.live.clearRetainingCapacity();
+        for (self.srcs) |src| {
+            try src.it.seekRange(start, end);
+            src.item = src.it.itemRef();
+            if (src.item != null) self.live.appendAssumeCapacity(src);
         }
-        self.heap_len = 0;
-        for (self.iters, 0..) |*it, i| {
-            try it.seekRange(start, end);
-            self.items[i] = it.itemRef() orelse continue;
-            self.heap[self.heap_len] = @intCast(i);
-            self.heap_len += 1;
-        }
-        // Floyd heapify: O(n), against O(n log n) for n separate pushes.
-        var i = self.heap_len / 2;
-        while (i > 0) {
-            i -= 1;
-            self.siftDown(i);
-        }
+        std.mem.sortUnstable(*Source, self.live.items, {}, earlier);
+        try self.build();
     }
 
-    /// The pinnable storage backing itemRef()'s value; null only when
-    /// the merge is exhausted.
-    pub fn currentPin(self: *const MergeIterator) ?Pin {
-        if (self.heap_len == 0) return null;
-        return self.iters[self.heap[0]].currentPin();
+    /// The pins on the storage backing itemRef()'s values, one per
+    /// source the item was built from; empty when the merge is
+    /// exhausted. The pins stay borrowed: the sources hold them.
+    pub fn currentPins(self: *MergeIterator) []const Pin {
+        self.pins.clearRetainingCapacity();
+        for (self.live.items[0..self.n_cur]) |src| {
+            var buf: [1]Pin = undefined;
+            for (src.it.currentPins(&buf)) |pin| {
+                const covered = self.pins.items.len > 0 and
+                    std.meta.eql(self.pins.getLast(), pin);
+                if (!covered) self.pins.appendAssumeCapacity(pin);
+            }
+        }
+        return self.pins.items;
     }
 
     pub fn itemRef(self: *const MergeIterator) ?_table.Item {
-        if (self.heap_len == 0) return null;
-        return self.items[self.heap[0]];
+        return self.cur;
     }
 
+    /// Step to the next key: advance the sources the item was built
+    /// from, move each to its place, and build again. The sources are
+    /// the first `n_cur` entries, and each pass handles the one at the
+    /// front: the ones not yet advanced still hold the smallest key, so
+    /// the advanced one lands behind them, and the next pass finds the
+    /// next of them at the front.
     pub fn next(self: *MergeIterator) Error!void {
-        if (self.heap_len == 0) return;
-
-        const src = self.heap[0];
-        try self.iters[src].next();
-
-        if (self.iters[src].itemRef()) |item| {
-            // Replace-top rather than pop + push: the source that just
-            // advanced often still wins (runs from one source are the
-            // common case), so one sift replaces two.
-            self.items[src] = item;
-        } else {
-            self.heap_len -= 1;
-            if (self.heap_len == 0) return;
-            self.heap[0] = self.heap[self.heap_len];
+        if (self.cur == null) return;
+        for (0..self.n_cur) |_| {
+            const src = self.live.items[0];
+            try src.it.next();
+            src.item = src.it.itemRef();
+            if (src.item == null) {
+                _ = self.live.orderedRemove(0);
+                continue;
+            }
+            // Its place among the rest: past every source that sorts
+            // before it. One compare and no move when it still holds
+            // the smallest key.
+            var pos: usize = 0;
+            for (self.live.items[1..]) |other| {
+                if (!earlier({}, other, src)) break;
+                pos += 1;
+            }
+            const items = self.live.items;
+            std.mem.copyForwards(*Source, items[0..pos], items[1 .. pos + 1]);
+            items[pos] = src;
         }
-        self.siftDown(0);
+        try self.build();
     }
 
-    fn siftDown(self: *MergeIterator, start: usize) void {
-        var i = start;
-        while (true) {
-            const l = 2 * i + 1;
-            if (l >= self.heap_len) return; // also the single-source exit
-            var c = l;
-            const r = l + 1;
-            if (r < self.heap_len and
-                self.winsOver(self.heap[r], self.heap[l])) c = r;
-            if (!self.winsOver(self.heap[c], self.heap[i])) return;
-            std.mem.swap(Src, &self.heap[c], &self.heap[i]);
-            i = c;
+    /// Build the item from the sources at the front of `live`, the ones
+    /// holding the smallest key.
+    fn build(self: *MergeIterator) Error!void {
+        self.n_cur = 0;
+        self.cur = null;
+        if (self.live.items.len == 0) return;
+
+        const first = self.live.items[0].item.?;
+        self.n_cur = 1;
+        while (self.n_cur < self.live.items.len) : (self.n_cur += 1) {
+            const item = self.live.items[self.n_cur].item.?;
+            if (item.key.order(first.key) != .eq) break;
         }
+        if (self.n_cur == 1) {
+            self.cur = first;
+            return;
+        }
+
+        // The sources are in prio order, so a stable sort keeps the
+        // lower source's copy of an equal timestamp for the dedup to
+        // keep.
+        self.vers.clearRetainingCapacity();
+        for (self.live.items[0..self.n_cur]) |src| {
+            const vers = src.item.?.versions.slice();
+            try self.vers.appendSlice(self.allocator, vers);
+        }
+        std.mem.sort(Version, self.vers.items, {}, newerFirst);
+        var kept: usize = 1;
+        for (self.vers.items[1..]) |ver| {
+            if (ver.ts == self.vers.items[kept - 1].ts) continue;
+            self.vers.items[kept] = ver;
+            kept += 1;
+        }
+        self.vers.items.len = kept;
+        self.cur = .{
+            .key = first.key,
+            .versions = .{ .many = self.vers.items },
+        };
+    }
+
+    fn newerFirst(_: void, a: Version, b: Version) bool {
+        return a.ts > b.ts;
     }
 };
 

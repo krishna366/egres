@@ -13,8 +13,10 @@ const String = utils.String;
 /// need to reject.
 ///
 /// 1: [u64 crc][u32 entry_count][u32 entry_off × n][entries region]
-///    entries region contains entries in this format:
-///    [u16 key_overlap][u16 key_diff_len][u8 meta][key diff][value]
+///    entries region contains one entry per key in this format:
+///    [u16 key_overlap][u16 key_diff_len][key diff][packed versions]
+///    packed versions, newest first:
+///    [u32 count][count × { u64 ts, u8 meta, u32 off }][bytes]
 ///
 pub const format_version: u32 = 1;
 

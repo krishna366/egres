@@ -8,6 +8,7 @@ const fiber = @import("zfiber");
 const Table = _table.Table;
 const TableIterator = _table.TableIterator;
 const Item = _table.table.Item;
+const Lookup = @import("read.zig").Lookup;
 
 pub const Error = _table.table.Error;
 
@@ -33,25 +34,22 @@ pub const KeyRange = struct {
     /// kept. So a scan over the namespace-wide memtable stays within the table
     /// instead of grafting one key's primary onto another.
     pub fn limitToTable(self: KeyRange, ns: u64, table_id: u32) KeyRange {
-        const mt = std.math.maxInt(u64);
         return self.intersect(.{
-            .left = .{ .namespace = ns, .table_id = table_id, .primary = &table_lo, .timestamp = mt },
-            .right = .{ .namespace = ns, .table_id = table_id +| 1, .primary = &table_lo, .timestamp = mt },
+            .left = .{
+                .namespace = ns,
+                .table_id = table_id,
+                .primary = &table_lo,
+            },
+            .right = .{
+                .namespace = ns,
+                .table_id = table_id +| 1,
+                .primary = &table_lo,
+            },
         });
     }
 
     pub fn isEmpty(self: KeyRange) bool {
         return self.left.primary.len == 0 and self.right.primary.len == 0 and !self.inf;
-    }
-
-    /// The range spanning one key's versions at or below its timestamp.
-    /// Left keeps `key.timestamp` — ts sorts descending, so a seek
-    /// lands directly on the newest version visible at that ts, never
-    /// touching newer ones (pass maxInt for every version). Right is
-    /// `Key.end`: exclusive, at ts 0, which closes the range without
-    /// allocating a successor primary. Borrows `key.primary`.
-    pub fn versionsAt(key: Key) KeyRange {
-        return .{ .left = key, .right = key.end() };
     }
 
     /// Deep copy: dupes the underlying primary bytes for both bounds
@@ -281,14 +279,9 @@ pub const Level = struct {
     /// range overlaps kr. The caller must free the slice when done.
     /// L0: always all tables; L≥1: binary search on both ends.
     ///
-    /// Bounds compare on the PRIMARY only (orderWithoutTs). A full Key.order
-    /// would be wrong here: it sorts timestamps descending, so a table whose
-    /// smallest key is an older version of kr.right's primary compares as
-    /// "starts after kr.right" and gets excluded — even though it holds that
-    /// very primary. Callers use this to answer "which tables could hold keys
-    /// in this primary range", and every one of them (compaction src/dest
-    /// selection, openMerge) needs every version of a boundary primary, not
-    /// the subset that happens to sort inside a versioned bound.
+    /// Both bounds are inclusive and name primaries, so a table holding
+    /// any version of a boundary primary is returned. That is what every
+    /// caller (compaction src/dest selection, openMerge) needs.
     ///
     /// The returned tables are pinned, so the caller can release the lock
     /// and read them after.
@@ -303,7 +296,7 @@ pub const Level = struct {
             // First table where kr.left <= biggest (could overlap on the left).
             const left = utils.search(TableEntry, items, kr.left, struct {
                 fn f(kl: Key, e: TableEntry) bool {
-                    return kl.orderWithoutTs(e.table.biggest) != .gt;
+                    return kl.order(e.table.biggest) != .gt;
                 }
             }.f);
             // First table where kr.right < smallest (no longer overlapping).
@@ -316,7 +309,7 @@ pub const Level = struct {
             else
                 utils.search(TableEntry, items, kr.right, struct {
                     fn f(right_key: Key, e: TableEntry) bool {
-                        return right_key.orderWithoutTs(e.table.smallest) == .lt;
+                        return right_key.order(e.table.smallest) == .lt;
                     }
                 }.f);
             break :blk items[left..right];
@@ -384,46 +377,50 @@ pub const Level = struct {
 
         const e = self.tables.items[lo];
 
-        // Verify the key can actually be in this table. Compare without considering timestamp.
-        // A table whose smallest primary is greater than the search primary cannot contain the
-        // key at any timestamp. Note that full Key.order includes reversed timestamp which
-        // would give wrong results when the search key uses timestamp = maxInt as a "find any
-        // version" sentinel. So, we don't use "order". Instead use "orderWithoutTs".
-        if (e.table.smallest.orderWithoutTs(search_key) == .gt) return;
+        // Verify the key can actually be in this table: a table whose
+        // smallest primary is greater than the search primary cannot hold
+        // the key at any timestamp.
+        if (e.table.smallest.order(search_key) == .gt) return;
         if (!e.table.containsKey(search_key)) return;
 
         try out.append(allocator, e);
         e.table.incrRef();
     }
 
-    /// Seek `search_key` in one pinned table: the item on a hit (owned —
-    /// primary and value duped with `allocator`), null on a miss. No lock:
-    /// the pin keeps the table readable.
-    pub fn readKey(allocator: std.mem.Allocator, t: *Table, search_key: Key, priority: vfs.Priority) Error!?Item {
-        var it = TableIterator.init(allocator, t, priority);
+    /// Seek `lookup.key` in one pinned table: its newest version at or
+    /// below `lookup.read_ts` (owned — primary and value duped with
+    /// `allocator`), null on a miss. No lock: the pin keeps the table
+    /// readable.
+    pub fn readKey(
+        allocator: std.mem.Allocator,
+        t: *Table,
+        lookup: Lookup,
+    ) Error!?Item {
+        var it = TableIterator.init(allocator, t, lookup.priority);
         defer it.deinit();
 
-        try it.seekRange(search_key, .{});
+        try it.seekRange(lookup.key, .{});
         const found = it.itemRef() orelse return null;
-        if (!search_key.equalPrimary(found.key)) return null;
-
-        return try found.dupe(allocator);
+        if (found.key.order(lookup.key) != .eq) return null;
+        const vis = found.visibleAt(lookup.read_ts) orelse return null;
+        return try vis.dupe(allocator);
     }
 
     /// `acquireTables` then `readKey` over this one level, under the
     /// caller's hold for both. `Tree.get` is the production path: it pins
     /// across every level under one hold and reads after releasing.
-    pub fn get(self: *Level, held: Lock.Shared, search_key: Key, priority: vfs.Priority) !?Item {
+    pub fn get(self: *Level, held: Lock.Shared, lookup: Lookup) !?Item {
         var list: std.ArrayList(TableEntry) = .empty;
         errdefer {
             for (list.items) |e| e.table.decrRef();
             list.deinit(self.allocator);
         }
-        try self.acquireTables(held, self.allocator, search_key, &list);
+        try self.acquireTables(held, self.allocator, lookup.key, &list);
         const tables = try list.toOwnedSlice(self.allocator);
         defer releaseTables(self.allocator, tables);
         for (tables) |e| {
-            if (try readKey(self.allocator, e.table, search_key, priority)) |item| return item;
+            const found = try readKey(self.allocator, e.table, lookup);
+            if (found) |item| return item;
         }
         return null;
     }

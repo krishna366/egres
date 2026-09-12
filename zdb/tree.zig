@@ -32,6 +32,7 @@ pub const Targets = _compaction.Targets;
 pub const CompactCandidate = _compaction.CompactCandidate;
 pub const split_priority_score = _compaction.split_priority_score;
 const MultiGet = @import("read.zig").MultiGet;
+const Lookup = @import("read.zig").Lookup;
 
 // ---------------------------------------------------------------------------
 // TableCache
@@ -432,26 +433,26 @@ pub const Tree = struct {
     }
 
     /// get checks each level from L0 upward and returns the newest
-    /// version at or below `search_key.timestamp`, tombstone included,
-    /// or null if the key is absent. A one-key row MultiGet over this
-    /// tree alone (no memtables). The returned item's key and value
-    /// are duplicated with self.allocator; the caller must free them.
-    pub fn get(self: *Tree, search_key: Key, priority: vfs.Priority) !?Item {
-        const keys = [_]String{search_key.primary};
+    /// version at or below `lookup.read_ts`, tombstone included, or null
+    /// if the key is absent. A one-key row MultiGet over this tree alone
+    /// (no memtables). The returned item's key and value are duplicated
+    /// with self.allocator; the caller must free them.
+    pub fn get(self: *Tree, lookup: Lookup) !?Item {
+        const keys = [_]String{lookup.key.primary};
         var mg = try MultiGet.init(
             self.allocator,
-            search_key.namespace,
-            search_key.table_id,
+            lookup.key.namespace,
+            lookup.key.table_id,
             &keys,
             .{
-                .read_ts = search_key.timestamp,
-                .priority = priority,
+                .read_ts = lookup.read_ts,
+                .priority = lookup.priority,
                 .include_deleted = true,
             },
         );
         defer mg.deinit();
         try mg.walkTree(self, mg.pending.items, 0);
-        const found = mg.item(search_key.primary) orelse return null;
+        const found = mg.item(lookup.key.primary) orelse return null;
         return try found.dupe(self.allocator);
     }
 
@@ -556,8 +557,9 @@ pub const Tree = struct {
         }
 
         // merge.deinit now owns iter cleanup.
+        const merge = try MergeIterator.init(allocator, iters.items);
         transferred = true;
-        return MergeIterator.init(allocator, iters.items);
+        return merge;
     }
 
     /// One level's table count, under a hold of its own — for stats and
@@ -679,12 +681,10 @@ pub const Tree = struct {
 
         const chosen = best_key orelse return .{};
         // Re-dupe into the caller's allocator (arena dies on return).
-        // Bump timestamp so every (primary, ts) version of the chosen
-        // key sorts AFTER the split key — they all go to the right
-        // tree, no primary gets split across trees.
-        var key = try chosen.dupe(allocator);
+        // Tree bounds name primaries, so every version of the split key
+        // goes to the right tree: no primary is split across trees.
+        const key = try chosen.dupe(allocator);
         std.debug.assert(key.len() > 0);
-        key.timestamp = std.math.maxInt(u64);
         return key;
     }
 
@@ -694,8 +694,8 @@ pub const Tree = struct {
     /// beneath it. A one-key posting MultiGet over the tree alone; the
     /// memtables are not read.
     ///
-    /// `seek.timestamp` is the read timestamp: only versions at or
-    /// below it participate. Returns null when no version exists in
+    /// `lookup.read_ts` bounds the walk: only versions at or below it
+    /// participate. Returns null when no version exists in
     /// the walked window (the posting has no history here — folding
     /// from empty is the caller's call). The bitmap and the fold
     /// allocate from `allocator`.
@@ -715,22 +715,21 @@ pub const Tree = struct {
     pub fn rollupBitmap(
         self: *Tree,
         allocator: std.mem.Allocator,
-        seek: Key,
-        priority: vfs.Priority,
+        lookup: Lookup,
         from_level: usize,
     ) !?zroar.Bitmap {
-        const keys = [_]String{seek.primary};
+        const keys = [_]String{lookup.key.primary};
         var mg = try MultiGet.init(
             allocator,
-            seek.namespace,
-            seek.table_id,
+            lookup.key.namespace,
+            lookup.key.table_id,
             &keys,
-            .{ .read_ts = seek.timestamp, .priority = priority },
+            .{ .read_ts = lookup.read_ts, .priority = lookup.priority },
         );
         defer mg.deinit();
         try mg.walkTree(self, mg.pending.items, from_level);
-        if (!mg.hasVersions(seek.primary)) return null;
-        return try mg.bitmap(allocator, seek.primary);
+        if (!mg.hasVersions(lookup.key.primary)) return null;
+        return try mg.bitmap(allocator, lookup.key.primary);
     }
 
     /// applyCompaction is Phase B: commits the manifest changes and updates the

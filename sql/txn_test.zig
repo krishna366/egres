@@ -77,14 +77,15 @@ const Fixture = struct {
     /// Record a commit of `primary` at `ts` in the oracle, the way apply
     /// does — a one-item run through updateItems.
     fn commit(self: *Fixture, primary: String, ts: u64) !void {
-        try self.oracle.updateItems(&.{
-            .{ .key = rowKey(primary, ts), .value = "", .meta = .{} },
-        });
+        try self.oracle.updateItems(&.{.{
+            .key = rowKey(primary),
+            .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = "" } },
+        }});
     }
 };
 
-fn rowKey(primary: String, ts: u64) Key {
-    return .{ .namespace = ns, .table_id = tid, .primary = primary, .timestamp = ts };
+fn rowKey(primary: String) Key {
+    return .{ .namespace = ns, .table_id = tid, .primary = primary };
 }
 
 /// A one-key multiGet of `tid`: the row, duped with the test
@@ -97,9 +98,14 @@ fn lookupOne(tx: *Txn, primary: String) !?zdb.kv.Item {
 }
 
 test "txn: multiGet reads pending first, then the forest at read_ts" {
-    var fx = try Fixture.setup(&.{
-        .{ .key = rowKey("k1", 100), .value = "old", .meta = .{} },
-    });
+    var fx = try Fixture.setup(&.{.{
+        .key = rowKey("k1"),
+        .versions = .{ .one = .{
+            .ts = 100,
+            .meta = .{},
+            .value = "old",
+        } },
+    }});
     defer fx.teardown();
     var tx = fx.txn();
     defer tx.deinit();
@@ -109,8 +115,8 @@ test "txn: multiGet reads pending first, then the forest at read_ts" {
         const found = (try lookupOne(&tx, "k1")) orelse
             return error.TestExpectedRow;
         defer found.free(testing.allocator);
-        try testing.expectEqualSlices(u8, "old", found.value);
-        try testing.expectEqual(100, found.key.timestamp);
+        try testing.expectEqualSlices(u8, "old", found.newest().value);
+        try testing.expectEqual(100, found.newest().ts);
     }
     // Absent key: null.
     try testing.expectEqual(null, try lookupOne(&tx, "nope"));
@@ -120,14 +126,19 @@ test "txn: multiGet reads pending first, then the forest at read_ts" {
     const found = (try lookupOne(&tx, "k1")) orelse
         return error.TestExpectedRow;
     defer found.free(testing.allocator);
-    try testing.expectEqualSlices(u8, "new", found.value);
-    try testing.expectEqual(read_ts, found.key.timestamp);
+    try testing.expectEqualSlices(u8, "new", found.newest().value);
+    try testing.expectEqual(read_ts, found.newest().ts);
 }
 
 test "txn: pending tombstone hides the committed row, no resurrection" {
-    var fx = try Fixture.setup(&.{
-        .{ .key = rowKey("k1", 100), .value = "old", .meta = .{} },
-    });
+    var fx = try Fixture.setup(&.{.{
+        .key = rowKey("k1"),
+        .versions = .{ .one = .{
+            .ts = 100,
+            .meta = .{},
+            .value = "old",
+        } },
+    }});
     defer fx.teardown();
     var tx = fx.txn();
     defer tx.deinit();
@@ -268,7 +279,6 @@ test "txn: bump revalidates a recorded posting read by its index key" {
         .namespace = ns,
         .table_id = itid,
         .primary = "blue",
-        .timestamp = read_ts,
     };
 
     // Statement 1 read the "blue" posting — the index-bitmap path
@@ -293,11 +303,10 @@ test "txn: bump revalidates a recorded posting read by its index key" {
         try tx.recordRead(blue);
         try tx.beginStatement();
 
-        var stale = blue;
-        stale.timestamp = 550;
-        try fx.oracle.updateItems(&.{
-            .{ .key = stale, .value = "", .meta = .{} },
-        });
+        try fx.oracle.updateItems(&.{.{
+            .key = blue,
+            .versions = .{ .one = .{ .ts = 550, .meta = .{}, .value = "" } },
+        }});
         try fx.commit("r1", 600);
         try testing.expectError(error.Conflict, tx.lockRow(tid, "r1"));
     }
@@ -338,7 +347,7 @@ test "txn: wireKvs dedups a key re-put across a bump" {
     try tx.put(tid, "k1", "v2", .{});
 
     // Two pending versions (ts 500 and 600) — the wire payload carries
-    // only the txn's final state.
+    // only the txn's final state, under one timestamp-free key.
     const kvs = try tx.wireKvs(testing.allocator);
     defer {
         for (kvs) |kv| testing.allocator.free(kv.key);
@@ -346,7 +355,7 @@ test "txn: wireKvs dedups a key re-put across a bump" {
     }
     try testing.expectEqual(1, kvs.len);
     try testing.expectEqualSlices(u8, "v2", kvs[0].value);
-    try testing.expectEqual(600, Key.init(kvs[0].key).timestamp);
+    try testing.expectEqualSlices(u8, "k1", Key.init(kvs[0].key).primary);
 }
 
 test "txn: lockTable coexists with row locks and is re-entrant" {
@@ -411,7 +420,7 @@ test "txn: posting ops flatten to one ascending delta per index key" {
 
     const blue = Key.init(kvs[1].key);
     try testing.expectEqualSlices(u8, "blue", blue.primary);
-    try testing.expectEqual(read_ts, blue.timestamp);
+    try testing.expectEqual(itid, blue.table_id);
     const bm = Meta.fromByte(kvs[1].meta);
     try testing.expect(bm.isRoaring() and bm.isDelta());
     try zdb.validate.validateDelta(kvs[1].value);
@@ -480,19 +489,17 @@ test "txn: flattened postings fold through the forest into a bitmap" {
     }
 
     var bm = try fx.forest.getBitmap(testing.allocator, .{
-        .namespace = ns,
-        .table_id = itid,
-        .primary = "blue",
-        .timestamp = 800,
-    }, .p0);
+        .key = .{ .namespace = ns, .table_id = itid, .primary = "blue" },
+        .read_ts = 800,
+    });
     defer bm.deinit();
     try testing.expectEqual(3, bm.getCardinality());
     for ([_]u64{ 2, 6, 8 }) |egid| try testing.expect(bm.contains(egid));
     try testing.expect(!bm.contains(4));
 }
 
-/// Commit a txn's wire kvs into the forest the way apply does:
-/// rewrite every key's ts to the commit HLC, then forest.put.
+/// Commit a txn's wire kvs into the forest the way apply does: stamp
+/// every write with the commit HLC, then forest.put.
 fn putWire(
     arena: *std.heap.ArenaAllocator,
     fx: *Fixture,
@@ -503,12 +510,13 @@ fn putWire(
     const kvs = try tx.wireKvs(a);
     var items: std.ArrayList(zdb.kv.Item) = .empty;
     for (kvs) |kv| {
-        var k = Key.init(kv.key);
-        k.timestamp = commit_ts;
         try items.append(a, .{
-            .key = k,
-            .value = kv.value,
-            .meta = Meta.fromByte(kv.meta),
+            .key = Key.init(kv.key),
+            .versions = .{ .one = .{
+                .ts = commit_ts,
+                .meta = Meta.fromByte(kv.meta),
+                .value = kv.value,
+            } },
         });
     }
     try fx.forest.put(items.items);
@@ -541,11 +549,9 @@ test "txn: overlayPostings applies pending ops onto a committed bitmap" {
     try tx.putPosting(itid, "red", 5, .add);
 
     var bm = try fx.forest.getBitmap(testing.allocator, .{
-        .namespace = ns,
-        .table_id = itid,
-        .primary = "blue",
-        .timestamp = read_ts,
-    }, .p0);
+        .key = .{ .namespace = ns, .table_id = itid, .primary = "blue" },
+        .read_ts = read_ts,
+    });
     defer bm.deinit();
     try tx.overlayPostings(itid, "blue", &bm);
 
@@ -577,7 +583,7 @@ test "txn: wireKvs emits key order regardless of insert order" {
     }
     try testing.expectEqual(4, kvs.len);
     // (tid, "a") < (tid, "b") < (tid, "c") < (tid+1, "a"): table_id
-    // orders before primary, and every wire key carries read_ts.
+    // orders before primary.
     const expect_primary = [_]String{ "a", "b", "c", "a" };
     const expect_tid = [_]u32{ tid, tid, tid, tid + 1 };
     for (kvs, expect_primary, expect_tid) |kv, p, t| {
@@ -585,6 +591,5 @@ test "txn: wireKvs emits key order regardless of insert order" {
         try testing.expectEqual(ns, k.namespace);
         try testing.expectEqual(t, k.table_id);
         try testing.expectEqualSlices(u8, p, k.primary);
-        try testing.expectEqual(read_ts, k.timestamp);
     }
 }

@@ -47,11 +47,11 @@ pub const Kind = enum(u2) {
 /// message when kind=delta — folded at read (Forest.getBitmap) and rolled up
 /// into synthetic states by compaction (Tree.zig Emitter).
 ///
-/// Meta belongs to a row (an Item), never to a Key. A Key doubles as a bare
-/// position in keyspace — tree boundaries, iterator bounds, block base keys —
-/// where "is this a tombstone" has no meaning. Keeping meta off Key is what
-/// stops e.g. Tree.findSplitKey from minting a boundary that claims to be
-/// deleted.
+/// Meta belongs to a version of a row (a Version), never to a Key. A Key
+/// doubles as a bare position in keyspace — tree boundaries, iterator
+/// bounds, block base keys — where "is this a tombstone" has no meaning.
+/// Keeping meta off Key is what stops e.g. Tree.findSplitKey from minting a
+/// boundary that claims to be deleted.
 ///
 /// Zig packs LSB-first (u/hlc.zig relies on the same), so the bit positions
 /// below are the on-disk positions. They are frozen: zdb/kv_test.zig asserts
@@ -89,52 +89,148 @@ pub const Meta = packed struct(u8) {
     }
 };
 
-/// One row: where it lives (key), what it holds (value), and what's true about
-/// it (meta).
-pub const Item = struct {
-    key: Key,
-    value: String,
+/// One version of a row: when it was committed (ts), what it holds
+/// (value), and what's true about it (meta).
+pub const Version = struct {
+    ts: u64,
     // No default. Every construction site is a place where silently defaulting
     // to .raw would drop a row's metadata, so let the compiler catch a new one.
     meta: Meta,
+    value: String,
+};
 
-    pub fn dupe(self: Item, allocator: std.mem.Allocator) !Item {
-        const primary = try allocator.dupe(u8, self.key.primary);
-        errdefer allocator.free(primary);
+/// A row's versions, newest first. One version sits inline, so a
+/// writer's item needs no array behind it; several are a slice into
+/// storage the producer owns (an iterator's buffer, or a `dupe`).
+pub const Versions = union(enum) {
+    one: Version,
+    many: []const Version,
 
-        const v = try allocator.dupe(u8, self.value);
-        return .{
-            .key = .{
-                .namespace = self.key.namespace,
-                .table_id = self.key.table_id,
-                .primary = primary,
-                .timestamp = self.key.timestamp,
-            },
-            .value = v,
-            .meta = self.meta,
+    /// Every version, newest first; never empty. Borrows `self`, so
+    /// the item must outlive the slice: call it on a named item, not
+    /// on a temporary.
+    pub fn slice(self: *const Versions) []const Version {
+        return switch (self.*) {
+            .one => |*ver| @as(*const [1]Version, ver)[0..],
+            .many => |vers| vers,
         };
     }
 
-    /// `dupe` without the value bytes (the copy keeps `value = ""`).
-    /// For callers that only need the key — e.g. DELETE's match
-    /// collection, which locks and tombstones by primary and never
-    /// reads the row back.
-    pub fn dupeNoValue(self: Item, allocator: std.mem.Allocator) !Item {
-        return .{
-            .key = .{
-                .namespace = self.key.namespace,
-                .table_id = self.key.table_id,
-                .primary = try allocator.dupe(u8, self.key.primary),
-                .timestamp = self.key.timestamp,
-            },
-            .value = "",
-            .meta = self.meta,
+    pub fn len(self: Versions) usize {
+        return switch (self) {
+            .one => 1,
+            .many => |vers| vers.len,
         };
+    }
+};
+
+/// One primary and its versions, newest first. `key` says where the
+/// row lives (namespace, table_id, primary); `versions` is never
+/// empty. A version's stamp is `versions[i].ts`.
+///
+/// An item from an iterator is a borrow: the versions live in the
+/// iterator's buffer and the values in a block or arena it pins, both
+/// valid until the following `next`. `dupe` for anything kept longer.
+pub const Item = struct {
+    key: Key,
+    versions: Versions,
+
+    pub fn newest(self: Item) Version {
+        return switch (self.versions) {
+            .one => |ver| ver,
+            .many => |vers| vers[0],
+        };
+    }
+
+    /// The versions at or below `ts`: the suffix from the first version
+    /// with `ts <=` it. Null when every version is newer. A walk from
+    /// the newest, not a binary search: reads are almost always at or
+    /// near the newest version, so the first compare usually decides.
+    pub fn visibleAt(self: Item, ts: u64) ?Item {
+        switch (self.versions) {
+            .one => |ver| return if (ver.ts <= ts) self else null,
+            .many => |vers| {
+                for (vers, 0..) |ver, i| {
+                    if (ver.ts <= ts) {
+                        return .{
+                            .key = self.key,
+                            .versions = .{ .many = vers[i..] },
+                        };
+                    }
+                }
+                return null;
+            },
+        }
+    }
+
+    /// The chain a read folds: the versions down to and including the
+    /// first that is not a delta (a state or a tombstone), or every
+    /// version when none is.
+    pub fn chain(self: Item) Item {
+        const vers = switch (self.versions) {
+            .one => return self,
+            .many => |vers| vers,
+        };
+        for (vers, 0..) |ver, i| {
+            if (!ver.meta.isDelta()) {
+                return .{
+                    .key = self.key,
+                    .versions = .{ .many = vers[0 .. i + 1] },
+                };
+            }
+        }
+        return self;
+    }
+
+    /// A copy owned by `allocator`: the primary, every value, and the
+    /// versions slice when there are several. Release with `free`.
+    pub fn dupe(self: Item, allocator: std.mem.Allocator) !Item {
+        const primary = try allocator.dupe(u8, self.key.primary);
+        errdefer allocator.free(primary);
+        const key: Key = .{
+            .namespace = self.key.namespace,
+            .table_id = self.key.table_id,
+            .primary = primary,
+        };
+
+        switch (self.versions) {
+            .one => |ver| {
+                const value = try allocator.dupe(u8, ver.value);
+                return .{ .key = key, .versions = .{ .one = .{
+                    .ts = ver.ts,
+                    .meta = ver.meta,
+                    .value = value,
+                } } };
+            },
+            .many => |src| {
+                const vers = try allocator.alloc(Version, src.len);
+                var duped: usize = 0;
+                errdefer {
+                    for (vers[0..duped]) |ver| allocator.free(ver.value);
+                    allocator.free(vers);
+                }
+                for (src, vers) |from, *to| {
+                    to.* = .{
+                        .ts = from.ts,
+                        .meta = from.meta,
+                        .value = try allocator.dupe(u8, from.value),
+                    };
+                    duped += 1;
+                }
+                return .{ .key = key, .versions = .{ .many = vers } };
+            },
+        }
     }
 
     pub fn free(self: Item, allocator: std.mem.Allocator) void {
         allocator.free(self.key.primary);
-        allocator.free(self.value);
+        switch (self.versions) {
+            .one => |ver| allocator.free(ver.value),
+            .many => |vers| {
+                for (vers) |ver| allocator.free(ver.value);
+                allocator.free(vers);
+            },
+        }
     }
 };
 
@@ -195,21 +291,20 @@ pub const Key = struct {
     namespace: u64 = 0,
     table_id: u32 = 0,
     primary: String = "",
-    timestamp: u64 = 0,
 
-    /// Parse a marshaled key: [ns:u64 BE][tid:u32 BE][primary][ts:u64 BE].
-    /// For keys without the full prefix/suffix, construct Key directly via
+    /// Parse a marshaled key: [ns:u64 BE][tid:u32 BE][primary]. A key
+    /// names a row, not a version: a version's timestamp lives in
+    /// Version.ts, and reads take their as-of timestamp separately.
+    /// For keys without the prefix, construct Key directly via
     /// Key{ .primary = ... }.
     pub fn init(raw: String) Key {
         if (raw.len == 0) {
             return .{};
         }
-        const ts_idx = raw.len - 8;
         return .{
             .namespace = std.mem.readInt(u64, raw[0..8], .big),
             .table_id = std.mem.readInt(u32, raw[8..12], .big),
-            .primary = raw[12..ts_idx],
-            .timestamp = std.mem.readInt(u64, raw[ts_idx..][0..8], .big),
+            .primary = raw[12..],
         };
     }
 
@@ -235,27 +330,30 @@ pub const Key = struct {
         if (self.primary.len == 0) {
             return allocator.alloc(u8, 0);
         }
-        const buf = try allocator.alloc(u8, 12 + self.primary.len + 8);
+        const buf = try allocator.alloc(u8, self.len());
         self.writeTo(buf);
         return buf;
     }
 
-    pub fn marshalTo(self: Key, allocator: std.mem.Allocator, data: *std.ArrayList(u8)) !String {
+    pub fn marshalTo(
+        self: Key,
+        allocator: std.mem.Allocator,
+        data: *std.ArrayList(u8),
+    ) !String {
         if (self.primary.len == 0) {
             return allocator.alloc(u8, 0);
         }
         const start = data.items.len;
-        try data.appendNTimes(allocator, 0, 12 + self.primary.len + 8);
+        try data.appendNTimes(allocator, 0, self.len());
         const buf = data.items[start..];
         self.writeTo(buf);
         return buf;
     }
 
-    /// Identity hash over (namespace, table_id, primary) — the
-    /// timestamp is deliberately excluded: all versions of a row share
-    /// one identity. Row-lock key for fiber.SemaphoreMap (and the
-    /// future conflict oracle). Seed 0; TableKey.identityHash uses
-    /// seed 1 so the two key shapes can never collide.
+    /// Identity hash over (namespace, table_id, primary): all versions
+    /// of a row share one identity. Row-lock key for fiber.SemaphoreMap
+    /// (and the future conflict oracle). Seed 0; TableKey.identityHash
+    /// uses seed 1 so the two key shapes can never collide.
     pub fn identityHash(self: Key) u64 {
         var h = std.hash.XxHash3.init(0);
         h.update(std.mem.asBytes(&self.namespace));
@@ -264,41 +362,16 @@ pub const Key = struct {
         return h.final();
     }
 
-    // We're no longer storing timestamp with negate op. When comparing keys, we are already
-    // parsing timestamp separately, otherwise our variable length primary key could spill over
-    // into comparison, making it wrong. As such, we can just do a basic u64 comparison, instead
-    // of relying on a std.mem.order.
     fn writeTo(self: Key, buf: []u8) void {
         std.mem.writeInt(u64, buf[0..8], self.namespace, .big);
         std.mem.writeInt(u32, buf[8..12], self.table_id, .big);
         @memcpy(buf[12 .. 12 + self.primary.len], self.primary);
-        std.mem.writeInt(u64, buf[12 + self.primary.len ..][0..8], self.timestamp, .big);
     }
 
+    /// Namespace, then table_id, then primary bytes. ns and tid are
+    /// fixed-width big-endian, so this is also the bytewise order of
+    /// two marshaled keys.
     pub fn order(self: Key, other: Key) std.math.Order {
-        const ns_ord = std.math.order(self.namespace, other.namespace);
-        if (ns_ord != .eq) return ns_ord;
-        const tid_ord = std.math.order(self.table_id, other.table_id);
-        if (tid_ord != .eq) return tid_ord;
-        return self.orderPrimary(other);
-    }
-
-    /// Order within one table: primary ascending, then timestamp
-    /// DESCENDING so a key's newest version comes first. Callers that
-    /// already know both keys share a (namespace, table_id) — a merge
-    /// over one table's sources, say — skip those fields and call this.
-    /// The sole definition of the reversed-timestamp rule; `order` is
-    /// this plus the namespace/table_id prefix.
-    pub fn orderPrimary(self: Key, other: Key) std.math.Order {
-        const cmp = std.mem.order(u8, self.primary, other.primary);
-        if (cmp != .eq) return cmp;
-
-        if (self.timestamp == other.timestamp) return .eq;
-        // Reverse the order when comparing timestamp.
-        return if (self.timestamp > other.timestamp) .lt else .gt;
-    }
-
-    pub fn orderWithoutTs(self: Key, other: Key) std.math.Order {
         const ns_ord = std.math.order(self.namespace, other.namespace);
         if (ns_ord != .eq) return ns_ord;
         const tid_ord = std.math.order(self.table_id, other.table_id);
@@ -306,35 +379,23 @@ pub const Key = struct {
         return std.mem.order(u8, self.primary, other.primary);
     }
 
+    /// Length of the marshaled key; 0 for an empty primary.
     pub inline fn len(self: Key) usize {
         if (self.primary.len == 0) {
             return 0;
         }
-        return 12 + self.primary.len + 8;
+        return 12 + self.primary.len;
     }
 
-    /// Hash of the primary key only — the per-table SST bloom-filter
+    /// Hash of the primary key only: the per-table SST bloom-filter
     /// hash (namespace/table are implied by the table). NOT a row
     /// identity: use identityHash for locks and conflict tracking.
     pub fn bloomHash(self: Key) u64 {
         return std.hash.Wyhash.hash(0, self.primary);
     }
 
-    /// Same primary key, ignoring namespace/table_id/timestamp.
+    /// Same primary key, ignoring namespace/table_id.
     pub fn equalPrimary(self: Key, other: Key) bool {
         return std.mem.eql(u8, self.primary, other.primary);
-    }
-
-    /// The exclusive end of this key's run of versions: the same
-    /// primary at timestamp 0. Versions sort newest first, so every
-    /// version lies before it, and no version is ever written at HLC 0,
-    /// so nothing of this key is excluded. Borrows `primary`.
-    pub fn end(self: Key) Key {
-        return .{
-            .namespace = self.namespace,
-            .table_id = self.table_id,
-            .primary = self.primary,
-            .timestamp = 0,
-        };
     }
 };

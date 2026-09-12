@@ -438,10 +438,11 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
                 });
             }
         }
-        // The decoded cells borrow item.value, which the arena keeps
-        // alive through the marshal.
+        // The decoded cells borrow the item's value, which the arena
+        // keeps alive through the marshal.
         const ps = &tbl.ps;
-        try _row.unmarshalRow(arloc, ps, item.value, &.{}, &row);
+        const value = item.newest().value;
+        try _row.unmarshalRow(arloc, ps, value, &.{}, &row);
         for (sets) |set| row.set(set.target.pos, set.val);
         const marshalled = try _row.marshalRow(arloc, ps, row.cells(), &rbuf);
         bytes.* = try arloc.dupe(u8, marshalled);

@@ -13,21 +13,19 @@ const Meta = zdb.kv.Meta;
 test "mutations: flat multi-table round-trip" {
     const alloc = testing.allocator;
 
-    // Two tables in one namespace. Keys go on the wire fully marshaled,
-    // carrying the writer's timestamp — apply rewrites it to the entry's
-    // commit HLC, so the values here are arbitrary.
+    // Two tables in one namespace. Keys go on the wire marshaled and
+    // without a timestamp: apply stamps every write with the entry's
+    // commit HLC.
     const ka = try (Key{
         .namespace = 7,
         .table_id = 16,
         .primary = "row-a",
-        .timestamp = 111,
     }).marshal(alloc);
     defer alloc.free(ka);
     const kb = try (Key{
         .namespace = 7,
         .table_id = 17,
         .primary = "row-b",
-        .timestamp = 222,
     }).marshal(alloc);
     defer alloc.free(kb);
 

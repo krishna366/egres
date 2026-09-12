@@ -62,10 +62,12 @@ const Fixture = struct {
                 .namespace = 1,
                 .table_id = 16,
                 .primary = try self.arloc.dupe(u8, &sql.key.encodeEgid(egid)),
-                .timestamp = 1,
             },
-            .value = bytes,
-            .meta = .{},
+            .versions = .{ .one = .{
+                .ts = 1,
+                .meta = .{},
+                .value = bytes,
+            } },
         };
     }
 

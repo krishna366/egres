@@ -339,15 +339,17 @@ pub const RowIndexKeys = struct {
                 .namespace = ns,
                 .table_id = index_tid,
                 .primary = key,
-                .timestamp = ts,
             };
             if (self.unique) {
                 if (run.len > 1) return error.DuplicateKey;
                 const ekey = try self.a.dupe(u8, &_key.encodeEgid(run[0].egid));
                 try out.append(self.a, .{
                     .key = item_key,
-                    .value = ekey,
-                    .meta = .{},
+                    .versions = .{ .one = .{
+                        .ts = ts,
+                        .meta = .{},
+                        .value = ekey,
+                    } },
                 });
                 continue;
             }
@@ -356,8 +358,11 @@ pub const RowIndexKeys = struct {
             try bm.compact(); // canonical minimal buffer
             try out.append(self.a, .{
                 .key = item_key,
-                .value = bm.toBuffer(),
-                .meta = .{ .kind = .state, .encoding = .roaring },
+                .versions = .{ .one = .{
+                    .ts = ts,
+                    .meta = .{ .kind = .state, .encoding = .roaring },
+                    .value = bm.toBuffer(),
+                } },
             });
         }
         return out.items;
@@ -534,14 +539,13 @@ const IndexBuild = struct {
             self.def.base_table_id,
             self.def.index_table_id,
         );
-        const found = try eng.forest.get(eng.allocator, .{
+        const found = try eng.forest.get(eng.allocator, .{ .key = .{
             .namespace = self.ns,
             .table_id = _catalog.index_table_id,
             .primary = &ck,
-            .timestamp = std.math.maxInt(u64),
-        }, .p0) orelse return error.RowMissing;
+        } }) orelse return error.RowMissing;
         defer found.free(eng.allocator);
-        return found.key.timestamp;
+        return found.newest().ts;
     }
 
     /// The reloaded Table and this index within it.
@@ -628,10 +632,11 @@ const IndexBuild = struct {
                 const egid = _key.decodeEgid(item.key.primary) orelse
                     return true;
                 ctx.changed += 1;
-                const keys: []const String = if (item.meta.isDeleted())
-                    &.{}
-                else
-                    try ctx.build.rowKeys(ctx.at, item);
+                const keys: []const String =
+                    if (item.newest().meta.isDeleted())
+                        &.{}
+                    else
+                        try ctx.build.rowKeys(ctx.at, item);
                 try ctx.rows.setV2(egid, keys);
                 return true;
             }
@@ -844,7 +849,6 @@ fn removeIndex(
         .namespace = ns,
         .table_id = _catalog.index_table_id,
         .primary = &ck,
-        .timestamp = 0,
     }).marshal(a);
     var kvs = [_]zen.KeyValueStruct{.{
         .key = wire_key,

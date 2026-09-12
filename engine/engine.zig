@@ -151,28 +151,30 @@ pub const StorageImpl = struct {
                 var total_bytes: u64 = 0;
                 for (0..count) |i| {
                     const kv = try ms.kvsAt(@intCast(i));
-                    // Wire keys are full marshaled keys (self-describing
-                    // ns/tid). Minimum: 12-byte prefix + 1 primary byte +
-                    // 8-byte ts. A short key — or a key whose namespace
-                    // disagrees with the entry's — means an encoder bug;
-                    // skipping keeps apply deterministic across nodes
-                    // without wedging the loop on a poison entry.
-                    if (kv.key().len < 21) {
+                    // Wire keys are marshaled keys (self-describing
+                    // ns/tid), with no timestamp: the commit timestamp is
+                    // the entry's HLC. Minimum: 12-byte prefix + 1
+                    // primary byte. A short key — or a key whose
+                    // namespace disagrees with the entry's — means an
+                    // encoder bug; skipping keeps apply deterministic
+                    // across nodes without wedging the loop on a poison
+                    // entry.
+                    if (kv.key().len < 13) {
                         log.err("on_apply: short wire key at index={d} kv={d} len={d}", .{ entry.index, i, kv.key().len });
                         continue;
                     }
-                    var key = Key.init(kv.key());
+                    const key = Key.init(kv.key());
                     if (key.namespace != ns) {
                         log.err("on_apply: key ns={d} != entry ns={d} at index={d} kv={d}", .{ key.namespace, ns, entry.index, i });
                         continue;
                     }
-                    // The wire carries the writer's timestamp (a txn's
-                    // read_ts); the commit timestamp is the entry's HLC.
-                    key.timestamp = entry.timestamp;
                     items.appendAssumeCapacity(.{
                         .key = key,
-                        .value = kv.value(),
-                        .meta = Meta.fromByte(kv.meta()),
+                        .versions = .{ .one = .{
+                            .ts = entry.timestamp,
+                            .meta = Meta.fromByte(kv.meta()),
+                            .value = kv.value(),
+                        } },
                     });
                     total_bytes += kv.value().len;
                 }

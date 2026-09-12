@@ -160,7 +160,7 @@ test "forest: create tree and get" {
 fn buildAndWriteTable(alloc: std.mem.Allocator, path: String, primary: String) !void {
     var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer bld.deinit();
-    try bld.add(.{ .primary = primary }, "v");
+    try bld.add(.{ .primary = primary }, 1, "v");
     var tb = try bld.finish();
     defer tb.deinit();
     try vfs.writeFile(path, tb.bytes);
@@ -237,10 +237,16 @@ test "forest: split tree" {
 
 // Build a one-key SST carrying the full (namespace, table_id, primary) key so
 // the stored key is table-specific, and write it to disk.
-fn buildAndWriteTableKV(alloc: std.mem.Allocator, path: String, key: Key, value: String) !void {
+fn buildAndWriteTableKV(
+    alloc: std.mem.Allocator,
+    path: String,
+    key: Key,
+    ts: u64,
+    value: String,
+) !void {
     var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer bld.deinit();
-    try bld.add(key, value);
+    try bld.add(key, ts, value);
     var tb = try bld.finish();
     defer tb.deinit();
     try vfs.writeFile(path, tb.bytes);
@@ -279,8 +285,7 @@ test "forest: two-level routing isolates by table_id" {
             .namespace = 2,
             .table_id = b.tid,
             .primary = "row",
-            .timestamp = 1,
-        }, b.val);
+        }, 1, b.val);
         const changes = [_]manifest.SSTableChange{manifest.createSSTableChange(@intCast(file_id), 2, b.tree, 1)};
         {
             const t = f.getTree(2, b.tree).?;
@@ -293,19 +298,20 @@ test "forest: two-level routing isolates by table_id" {
     // table_id returns only its own value despite sharing the primary key.
     for (cases) |b| {
         const got = try f.get(alloc, .{
-            .namespace = 2,
-            .table_id = b.tid,
-            .primary = "row",
-            .timestamp = std.math.maxInt(u64),
-        }, .p0);
+            .key = .{ .namespace = 2, .table_id = b.tid, .primary = "row" },
+        });
         try std.testing.expect(got != null);
         defer got.?.free(alloc);
-        try std.testing.expectEqualStrings(b.val, got.?.value);
+        try std.testing.expectEqualStrings(b.val, got.?.newest().value);
     }
 
     // Unrouted table (table_id 3) and an absent primary both miss.
-    try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 3, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
-    try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 1, .primary = "absent", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
+    try std.testing.expect((try f.get(alloc, .{
+        .key = .{ .namespace = 2, .table_id = 3, .primary = "row" },
+    })) == null);
+    try std.testing.expect((try f.get(alloc, .{
+        .key = .{ .namespace = 2, .table_id = 1, .primary = "absent" },
+    })) == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +338,11 @@ test "forest: create_tree + drop_tree round-trip" {
     // Install one SST and confirm the row reads back through routing.
     const path = try zdb.file_ids.sstPath(alloc, dir_path, 1);
     defer alloc.free(path);
-    try buildAndWriteTableKV(alloc, path, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = 1 }, "v");
+    try buildAndWriteTableKV(alloc, path, .{
+        .namespace = 2,
+        .table_id = 100,
+        .primary = "row",
+    }, 1, "v");
     {
         const ch = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, tree_id, 1)};
         {
@@ -342,10 +352,12 @@ test "forest: create_tree + drop_tree round-trip" {
         }
     }
     {
-        const got = try f.get(alloc, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0);
+        const got = try f.get(alloc, .{
+            .key = .{ .namespace = 2, .table_id = 100, .primary = "row" },
+        });
         try std.testing.expect(got != null);
         defer got.?.free(alloc);
-        try std.testing.expectEqualStrings("v", got.?.value);
+        try std.testing.expectEqualStrings("v", got.?.newest().value);
     }
 
     // Drop the table: one tree in the table → one delete change.
@@ -356,7 +368,9 @@ test "forest: create_tree + drop_tree round-trip" {
 
     // Data is gone, the tree is gone, the table has no trees (its TableTrees
     // stays in the map, empty — ids are never reused).
-    try std.testing.expect((try f.get(alloc, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = std.math.maxInt(u64) }, .p0)) == null);
+    try std.testing.expect((try f.get(alloc, .{
+        .key = .{ .namespace = 2, .table_id = 100, .primary = "row" },
+    })) == null);
     try std.testing.expect(!f.hasTree(2, tree_id));
     try std.testing.expect(!f.hasTable(2, 100));
 }
@@ -454,7 +468,11 @@ test "forest: drop_tree keeps an SST shared with another tree" {
 
     const path = try zdb.file_ids.sstPath(alloc, dir_path, 1);
     defer alloc.free(path);
-    try buildAndWriteTableKV(alloc, path, .{ .namespace = 2, .table_id = 100, .primary = "row", .timestamp = 1 }, "shared");
+    try buildAndWriteTableKV(alloc, path, .{
+        .namespace = 2,
+        .table_id = 100,
+        .primary = "row",
+    }, 1, "shared");
     {
         const cha = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, treeA, 1)};
         const chb = [_]manifest.SSTableChange{manifest.createSSTableChange(1, 2, treeB, 1)};
@@ -804,7 +822,7 @@ test "forest: getIterators outlives a concurrent flush+pop" {
     defer mts.deinit();
     try std.testing.expectEqual(@as(usize, 1), mts.immutables.items.len);
     const m5 = mts.immutables.items[0];
-    try m5.put(.{ .namespace = 1, .primary = "alpha", .timestamp = 100 }, "v1");
+    try m5.put(.{ .namespace = 1, .primary = "alpha" }, 100, "v1");
 
     // Snapshot under the lock — each skl.Iterator.init bumps
     // refcount before getIterators returns.
@@ -817,20 +835,18 @@ test "forest: getIterators outlives a concurrent flush+pop" {
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
 
     // Iterate AFTER the pop; the snapshotted iterator for M_5 should
-    // still see the key. Use ts=maxInt because same-primary keys sort
-    // newest-first (timestamp is reverse-ordered) — seeking with ts=0
-    // would land on the *next* primary, missing alpha.
+    // still see the key. The seek key holds the primary alone, and the
+    // item at that position carries every version of it.
     var found: ?String = null;
     for (iters) |*it| {
         var copy = it.*;
         try copy.seekRange(.{
             .namespace = 1,
             .primary = "alpha",
-            .timestamp = std.math.maxInt(u64),
         }, .{});
         if (copy.itemRef()) |item| {
             if (std.mem.eql(u8, item.key.primary, "alpha")) {
-                found = item.value;
+                found = item.newest().value;
             }
         }
     }
@@ -897,9 +913,18 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
     const k5 = beKey(5);
     const k3 = beKey(3);
     try f.put(&.{
-        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k1, .timestamp = 1 }, .value = "a", .meta = .{} },
-        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k5, .timestamp = 1 }, .value = "b", .meta = .{} },
-        .{ .key = .{ .namespace = ns, .table_id = tid, .primary = &k3, .timestamp = 1 }, .value = "c", .meta = .{} },
+        .{
+            .key = .{ .namespace = ns, .table_id = tid, .primary = &k1 },
+            .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = "a" } },
+        },
+        .{
+            .key = .{ .namespace = ns, .table_id = tid, .primary = &k5 },
+            .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = "b" } },
+        },
+        .{
+            .key = .{ .namespace = ns, .table_id = tid, .primary = &k3 },
+            .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = "c" } },
+        },
     });
 
     const mk = (try f.maxKey(alloc, ns, tid)).?;
@@ -927,25 +952,27 @@ test "forest: maxKey counts a tombstoned max key" {
     const k1 = beKey(1);
     const k3 = beKey(3);
     const k5 = beKey(5);
-    const key = struct {
-        fn at(n: u64, t: u32, p: String, ts: u64) zdb.kv.Key {
-            return .{
-                .namespace = n,
-                .table_id = t,
-                .primary = p,
-                .timestamp = ts,
-            };
-        }
-    };
     try f.put(&.{
-        .{ .key = key.at(ns, tid, &k1, 1), .value = "a", .meta = .{} },
-        .{ .key = key.at(ns, tid, &k3, 1), .value = "b", .meta = .{} },
-        .{ .key = key.at(ns, tid, &k5, 1), .value = "c", .meta = .{} },
+        .{
+            .key = .{ .namespace = ns, .table_id = tid, .primary = &k1 },
+            .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = "a" } },
+        },
+        .{
+            .key = .{ .namespace = ns, .table_id = tid, .primary = &k3 },
+            .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = "b" } },
+        },
+        .{
+            .key = .{ .namespace = ns, .table_id = tid, .primary = &k5 },
+            .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = "c" } },
+        },
     });
     try f.put(&.{.{
-        .key = key.at(ns, tid, &k5, 2),
-        .value = "",
-        .meta = .{ .kind = .deleted },
+        .key = .{ .namespace = ns, .table_id = tid, .primary = &k5 },
+        .versions = .{ .one = .{
+            .ts = 2,
+            .meta = .{ .kind = .deleted },
+            .value = "",
+        } },
     }});
 
     const mk = (try f.maxKey(alloc, ns, tid)).?;
@@ -993,9 +1020,12 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     var items: [cases.len]zdb.kv.Item = undefined;
     for (cases, 0..) |c, i| {
         items[i] = .{
-            .key = .{ .namespace = 1, .table_id = 0, .primary = c.primary, .timestamp = 1 },
-            .value = "v",
-            .meta = c.meta,
+            .key = .{ .namespace = 1, .table_id = 0, .primary = c.primary },
+            .versions = .{ .one = .{
+                .ts = 1,
+                .meta = c.meta,
+                .value = "v",
+            } },
         };
     }
     try f.put(&items);
@@ -1005,13 +1035,10 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     // separately by the tombstone tests below).
     for (cases) |c| {
         const got = try f.getRaw(alloc, .{
-            .namespace = 1,
-            .table_id = 0,
-            .primary = c.primary,
-            .timestamp = std.math.maxInt(u64),
-        }, .p0) orelse return error.TestExpectedItem;
+            .key = .{ .namespace = 1, .table_id = 0, .primary = c.primary },
+        }) orelse return error.TestExpectedItem;
         defer got.free(alloc);
-        try std.testing.expectEqual(c.meta, got.meta);
+        try std.testing.expectEqual(c.meta, got.newest().meta);
     }
 
     // Freeze and flush to an L0 SST, so the next reads decode meta back out of
@@ -1023,14 +1050,11 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
 
     for (cases) |c| {
         const got = try f.getRaw(alloc, .{
-            .namespace = 1,
-            .table_id = 0,
-            .primary = c.primary,
-            .timestamp = std.math.maxInt(u64),
-        }, .p0) orelse return error.TestExpectedItem;
+            .key = .{ .namespace = 1, .table_id = 0, .primary = c.primary },
+        }) orelse return error.TestExpectedItem;
         defer got.free(alloc);
-        try std.testing.expectEqual(c.meta, got.meta);
-        try std.testing.expectEqualStrings("v", got.value);
+        try std.testing.expectEqual(c.meta, got.newest().meta);
+        try std.testing.expectEqualStrings("v", got.newest().value);
     }
 
     // Compact L0 → L1. Compaction rewrites every entry through a fresh
@@ -1048,14 +1072,11 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     // so `delete` must NOT have dropped anything (keys_in == keys_out).
     for (cases) |c| {
         const got = try f.getRaw(alloc, .{
-            .namespace = 1,
-            .table_id = 0,
-            .primary = c.primary,
-            .timestamp = std.math.maxInt(u64),
-        }, .p0) orelse return error.TestExpectedItem;
+            .key = .{ .namespace = 1, .table_id = 0, .primary = c.primary },
+        }) orelse return error.TestExpectedItem;
         defer got.free(alloc);
-        try std.testing.expectEqual(c.meta, got.meta);
-        try std.testing.expectEqualStrings("v", got.value);
+        try std.testing.expectEqual(c.meta, got.newest().meta);
+        try std.testing.expectEqualStrings("v", got.newest().value);
     }
 }
 
@@ -1077,53 +1098,44 @@ test "forest: a tombstone reads as absent" {
 
     // Write a value, then delete it at a later timestamp.
     try f.put(&[_]zdb.kv.Item{.{
-        .key = .{ .namespace = 1, .table_id = 0, .primary = "k", .timestamp = 10 },
-        .value = "v",
-        .meta = .{},
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+        .versions = .{ .one = .{ .ts = 10, .meta = .{}, .value = "v" } },
     }});
     const live = try f.get(alloc, .{
-        .namespace = 1,
-        .table_id = 0,
-        .primary = "k",
-        .timestamp = std.math.maxInt(u64),
-    }, .p0) orelse return error.TestExpectedItem;
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+    }) orelse return error.TestExpectedItem;
     live.free(alloc);
 
     try f.put(&[_]zdb.kv.Item{.{
-        .key = .{ .namespace = 1, .table_id = 0, .primary = "k", .timestamp = 20 },
-        .value = "",
-        .meta = .{ .kind = .deleted },
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+        .versions = .{ .one = .{
+            .ts = 20,
+            .meta = .{ .kind = .deleted },
+            .value = "",
+        } },
     }});
 
     // Deleted as of now.
     try std.testing.expect((try f.get(alloc, .{
-        .namespace = 1,
-        .table_id = 0,
-        .primary = "k",
-        .timestamp = std.math.maxInt(u64),
-    }, .p0)) == null);
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+    })) == null);
 
     // The tombstone is still real data underneath — get just refuses to
     // surface it.
     const raw = try f.getRaw(alloc, .{
-        .namespace = 1,
-        .table_id = 0,
-        .primary = "k",
-        .timestamp = std.math.maxInt(u64),
-    }, .p0) orelse return error.TestExpectedItem;
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+    }) orelse return error.TestExpectedItem;
     defer raw.free(alloc);
-    try std.testing.expect(raw.meta.isDeleted());
+    try std.testing.expect(raw.newest().meta.isDeleted());
 
     // Reading before the delete still sees the value: the tombstone shadows
     // older versions, it doesn't erase them.
     const before = try f.get(alloc, .{
-        .namespace = 1,
-        .table_id = 0,
-        .primary = "k",
-        .timestamp = 15,
-    }, .p0) orelse return error.TestExpectedItem;
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+        .read_ts = 15,
+    }) orelse return error.TestExpectedItem;
     defer before.free(alloc);
-    try std.testing.expectEqualStrings("v", before.value);
+    try std.testing.expectEqualStrings("v", before.newest().value);
 }
 
 test "forest: globalMinRead rejects older reads and only moves forward" {
@@ -1141,30 +1153,24 @@ test "forest: globalMinRead rejects older reads and only moves forward" {
     // Default 0 means nothing is rejected and nothing is droppable.
     try std.testing.expectEqual(@as(u64, 0), f.globalMinRead());
     try std.testing.expect((try f.get(alloc, .{
-        .namespace = 1,
-        .table_id = 0,
-        .primary = "k",
-        .timestamp = 1,
-    }, .p0)) == null);
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+        .read_ts = 1,
+    })) == null);
 
     try std.testing.expectEqual(@as(u64, 100), f.setGlobalMinRead(100));
 
     // Below the horizon: the versions may already be compacted away, so the
     // read is refused rather than answered wrongly.
     try std.testing.expectError(error.ReadBelowMinRead, f.get(alloc, .{
-        .namespace = 1,
-        .table_id = 0,
-        .primary = "k",
-        .timestamp = 99,
-    }, .p0));
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+        .read_ts = 99,
+    }));
 
     // At the horizon is allowed.
     try std.testing.expect((try f.get(alloc, .{
-        .namespace = 1,
-        .table_id = 0,
-        .primary = "k",
-        .timestamp = 100,
-    }, .p0)) == null);
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+        .read_ts = 100,
+    })) == null);
 
     // Monotonic: a stale caller can't walk it back and un-discard data that
     // a compaction already dropped.
@@ -1211,9 +1217,8 @@ fn seedVersionedForest(f: *Forest) !void {
     };
     for (rows) |r| {
         try f.put(&[_]zdb.kv.Item{.{
-            .key = .{ .namespace = 1, .table_id = 0, .primary = r.p, .timestamp = r.ts },
-            .value = r.v,
-            .meta = r.m,
+            .key = .{ .namespace = 1, .table_id = 0, .primary = r.p },
+            .versions = .{ .one = .{ .ts = r.ts, .meta = r.m, .value = r.v } },
         }});
     }
 }
@@ -1224,7 +1229,7 @@ fn runScan(
     opts: Forest.ScanOptions,
     col: *ScanCollector,
 ) !u64 {
-    const open = Key{ .namespace = 1, .table_id = 0, .primary = "", .timestamp = std.math.maxInt(u64) };
+    const open = Key{ .namespace = 1, .table_id = 0, .primary = "" };
     return f.scan(alloc, .{ .left = open, .right = open }, opts, col, ScanCollector.emit);
 }
 
@@ -1247,9 +1252,9 @@ test "scan: by default emits one version per key and hides deleted keys" {
     // tombstone is not emitted, and neither is b@10 behind it.
     try std.testing.expectEqual(@as(u64, 2), n);
     try std.testing.expectEqualStrings("a", col.got.items[0].key.primary);
-    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].newest().value);
     try std.testing.expectEqualStrings("c", col.got.items[1].key.primary);
-    try std.testing.expectEqualStrings("c1", col.got.items[1].value);
+    try std.testing.expectEqualStrings("c1", col.got.items[1].newest().value);
 }
 
 test "scan: num_versions returns extra versions but still stops at a tombstone" {
@@ -1267,15 +1272,20 @@ test "scan: num_versions returns extra versions but still stops at a tombstone" 
     defer col.deinit();
     const n = try runScan(alloc, f, .{ .num_versions = 10 }, &col);
 
-    // a@20, a@10, c@10. b is still hidden: without include_deleted, a
-    // tombstone ends the primary regardless of how many versions were asked
-    // for.
-    try std.testing.expectEqual(@as(u64, 3), n);
-    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
-    try std.testing.expectEqual(@as(u64, 20), col.got.items[0].key.timestamp);
-    try std.testing.expectEqualStrings("a1", col.got.items[1].value);
-    try std.testing.expectEqual(@as(u64, 10), col.got.items[1].key.timestamp);
-    try std.testing.expectEqualStrings("c1", col.got.items[2].value);
+    // One item per key: a with a@20 and a@10, c with c@10. b is still
+    // hidden: without include_deleted, a tombstone ends the key
+    // regardless of how many versions were asked for.
+    try std.testing.expectEqual(@as(u64, 2), n);
+    const a = col.got.items[0];
+    const a_vers = a.versions.slice();
+    try std.testing.expectEqual(@as(usize, 2), a_vers.len);
+    try std.testing.expectEqualStrings("a2", a_vers[0].value);
+    try std.testing.expectEqual(@as(u64, 20), a_vers[0].ts);
+    try std.testing.expectEqualStrings("a1", a_vers[1].value);
+    try std.testing.expectEqual(@as(u64, 10), a_vers[1].ts);
+    const c = col.got.items[1];
+    try std.testing.expectEqual(@as(usize, 1), c.versions.len());
+    try std.testing.expectEqualStrings("c1", c.newest().value);
 }
 
 test "scan: include_deleted surfaces tombstones and the versions behind them" {
@@ -1293,13 +1303,21 @@ test "scan: include_deleted surfaces tombstones and the versions behind them" {
     defer col.deinit();
     const n = try runScan(alloc, f, .{ .num_versions = 10, .include_deleted = true }, &col);
 
-    // Everything: a@20, a@10, b@20 (tombstone), b@10, c@10.
-    try std.testing.expectEqual(@as(u64, 5), n);
-    try std.testing.expectEqualStrings("b", col.got.items[2].key.primary);
-    try std.testing.expect(col.got.items[2].meta.isDeleted());
-    try std.testing.expectEqual(@as(u64, 20), col.got.items[2].key.timestamp);
-    try std.testing.expectEqualStrings("b1", col.got.items[3].value);
-    try std.testing.expectEqualStrings("c1", col.got.items[4].value);
+    // Everything, one item per key: a with a@20 and a@10, b with its
+    // tombstone at 20 and b@10 behind it, c with c@10.
+    try std.testing.expectEqual(@as(u64, 3), n);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        col.got.items[0].versions.len(),
+    );
+    const b = col.got.items[1];
+    const b_vers = b.versions.slice();
+    try std.testing.expectEqualStrings("b", b.key.primary);
+    try std.testing.expectEqual(@as(usize, 2), b_vers.len);
+    try std.testing.expect(b_vers[0].meta.isDeleted());
+    try std.testing.expectEqual(@as(u64, 20), b_vers[0].ts);
+    try std.testing.expectEqualStrings("b1", b_vers[1].value);
+    try std.testing.expectEqualStrings("c1", col.got.items[2].newest().value);
 }
 
 test "scan: num_versions caps deleted runs too" {
@@ -1320,9 +1338,9 @@ test "scan: num_versions caps deleted runs too" {
     // One version each: a@20, b@20 (the tombstone), c@10. b@10 is cut by the
     // version cap, not by the tombstone rule.
     try std.testing.expectEqual(@as(u64, 3), n);
-    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
-    try std.testing.expect(col.got.items[1].meta.isDeleted());
-    try std.testing.expectEqualStrings("c1", col.got.items[2].value);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].newest().value);
+    try std.testing.expect(col.got.items[1].newest().meta.isDeleted());
+    try std.testing.expectEqualStrings("c1", col.got.items[2].newest().value);
 }
 
 test "scan: num_versions 0 behaves as 1 rather than returning nothing" {
@@ -1359,8 +1377,8 @@ test "scan: max_rows bounds emitted items, not versions walked" {
     // the 2 keys a scan would emit, not get consumed by the skipped rows.
     const n = try runScan(alloc, f, .{ .max_rows = 2 }, &col);
     try std.testing.expectEqual(@as(u64, 2), n);
-    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
-    try std.testing.expectEqualStrings("c1", col.got.items[1].value);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].newest().value);
+    try std.testing.expectEqualStrings("c1", col.got.items[1].newest().value);
 }
 
 test "scan: read_ts reports the world as of that timestamp" {
@@ -1385,21 +1403,19 @@ test "scan: read_ts reports the world as of that timestamp" {
     // b is not deleted as of 15 and must come back live. This is the case
     // that breaks if the tombstone rule runs before the read_ts filter.
     try std.testing.expectEqual(@as(u64, 3), n);
-    try std.testing.expectEqualStrings("a1", col.got.items[0].value);
+    try std.testing.expectEqualStrings("a1", col.got.items[0].newest().value);
     try std.testing.expectEqualStrings("b", col.got.items[1].key.primary);
-    try std.testing.expectEqualStrings("b1", col.got.items[1].value);
-    try std.testing.expect(!col.got.items[1].meta.isDeleted());
-    try std.testing.expectEqualStrings("c1", col.got.items[2].value);
+    try std.testing.expectEqualStrings("b1", col.got.items[1].newest().value);
+    try std.testing.expect(!col.got.items[1].newest().meta.isDeleted());
+    try std.testing.expectEqualStrings("c1", col.got.items[2].newest().value);
 
     // The same key at the same instant via get must agree.
     const g = try f.get(alloc, .{
-        .namespace = 1,
-        .table_id = 0,
-        .primary = "b",
-        .timestamp = 15,
-    }, .p0) orelse return error.TestExpectedItem;
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "b" },
+        .read_ts = 15,
+    }) orelse return error.TestExpectedItem;
     defer g.free(alloc);
-    try std.testing.expectEqualStrings("b1", g.value);
+    try std.testing.expectEqualStrings("b1", g.newest().value);
 }
 
 test "scan: min_ts emits only what changed after it" {
@@ -1432,14 +1448,12 @@ test "scan: min_ts emits only what changed after it" {
     const put = struct {
         fn one(forest: *Forest, r: Put) !void {
             try forest.put(&[_]zdb.kv.Item{.{
-                .key = .{
-                    .namespace = 1,
-                    .table_id = 0,
-                    .primary = r.p,
-                    .timestamp = r.ts,
-                },
-                .value = r.v,
-                .meta = r.m,
+                .key = .{ .namespace = 1, .table_id = 0, .primary = r.p },
+                .versions = .{ .one = .{
+                    .ts = r.ts,
+                    .meta = r.m,
+                    .value = r.v,
+                } },
             }});
         }
     }.one;
@@ -1466,12 +1480,13 @@ test "scan: min_ts emits only what changed after it" {
             .num_versions = 3,
         }, &col);
         try std.testing.expectEqual(@as(u64, 4), n);
-        try std.testing.expectEqualStrings("a", col.got.items[0].key.primary);
-        try std.testing.expectEqualStrings("a2", col.got.items[0].value);
-        try std.testing.expectEqualStrings("b", col.got.items[1].key.primary);
-        try std.testing.expect(col.got.items[1].meta.isDeleted());
-        try std.testing.expectEqualStrings("d1", col.got.items[2].value);
-        try std.testing.expectEqualStrings("e1", col.got.items[3].value);
+        const rows = col.got.items;
+        try std.testing.expectEqualStrings("a", rows[0].key.primary);
+        try std.testing.expectEqualStrings("a2", rows[0].newest().value);
+        try std.testing.expectEqualStrings("b", rows[1].key.primary);
+        try std.testing.expect(rows[1].newest().meta.isDeleted());
+        try std.testing.expectEqualStrings("d1", rows[2].newest().value);
+        try std.testing.expectEqualStrings("e1", rows[3].newest().value);
     }
     // Without include_deleted the deletion is a change with nothing
     // to show, as for any scan.
@@ -1480,9 +1495,10 @@ test "scan: min_ts emits only what changed after it" {
         defer col.deinit();
         const n = try runScan(alloc, f, .{ .min_ts = 10 }, &col);
         try std.testing.expectEqual(@as(u64, 3), n);
-        try std.testing.expectEqualStrings("a2", col.got.items[0].value);
-        try std.testing.expectEqualStrings("d1", col.got.items[1].value);
-        try std.testing.expectEqualStrings("e1", col.got.items[2].value);
+        const rows = col.got.items;
+        try std.testing.expectEqualStrings("a2", rows[0].newest().value);
+        try std.testing.expectEqualStrings("d1", rows[1].newest().value);
+        try std.testing.expectEqualStrings("e1", rows[2].newest().value);
     }
     // min_ts and read_ts bound the window from both sides.
     {
@@ -1496,7 +1512,8 @@ test "scan: min_ts emits only what changed after it" {
         defer col.deinit();
         const n = try runScan(alloc, f, .{ .min_ts = 20 }, &col);
         try std.testing.expectEqual(@as(u64, 1), n);
-        try std.testing.expectEqualStrings("e1", col.got.items[0].value);
+        const rows = col.got.items;
+        try std.testing.expectEqualStrings("e1", rows[0].newest().value);
     }
 }
 
@@ -1517,8 +1534,8 @@ test "scan: versions above read_ts do not consume num_versions" {
     // return must be a@10 — the invisible a@20 must not have spent the quota.
     const n = try runScan(alloc, f, .{ .num_versions = 1, .read_ts = 15 }, &col);
     try std.testing.expectEqual(@as(u64, 3), n);
-    try std.testing.expectEqualStrings("a1", col.got.items[0].value);
-    try std.testing.expectEqual(@as(u64, 10), col.got.items[0].key.timestamp);
+    try std.testing.expectEqualStrings("a1", col.got.items[0].newest().value);
+    try std.testing.expectEqual(@as(u64, 10), col.got.items[0].newest().ts);
 }
 
 test "scan: read_ts at the delete sees the key as gone" {
@@ -1537,8 +1554,8 @@ test "scan: read_ts at the delete sees the key as gone" {
     // At ts=20 the tombstone IS visible, so b disappears again.
     const n = try runScan(alloc, f, .{ .read_ts = 20 }, &col);
     try std.testing.expectEqual(@as(u64, 2), n);
-    try std.testing.expectEqualStrings("a2", col.got.items[0].value);
-    try std.testing.expectEqualStrings("c1", col.got.items[1].value);
+    try std.testing.expectEqualStrings("a2", col.got.items[0].newest().value);
+    try std.testing.expectEqualStrings("c1", col.got.items[1].newest().value);
 }
 
 test "scan: rejects a read_ts below globalMinRead" {
@@ -1569,7 +1586,7 @@ test "scan: rejects a read_ts below globalMinRead" {
 
 /// The whole of one table, both bounds open.
 fn tableRange(ns: u64, table_id: u32) KeyRange {
-    const open = Key{ .namespace = ns, .table_id = table_id, .primary = "", .timestamp = std.math.maxInt(u64) };
+    const open = Key{ .namespace = ns, .table_id = table_id, .primary = "" };
     return .{ .left = open, .right = open };
 }
 
@@ -1595,9 +1612,9 @@ fn expectCursorMatchesScan(alloc: std.mem.Allocator, f: *Forest, ns: u64, table_
     try std.testing.expectEqual(via_scan.got.items.len, via_cursor.got.items.len);
     for (via_scan.got.items, via_cursor.got.items) |a, b| {
         try std.testing.expectEqualStrings(a.key.primary, b.key.primary);
-        try std.testing.expectEqual(a.key.timestamp, b.key.timestamp);
-        try std.testing.expectEqualStrings(a.value, b.value);
-        try std.testing.expectEqual(a.meta, b.meta);
+        try std.testing.expectEqual(a.newest().ts, b.newest().ts);
+        try std.testing.expectEqualStrings(a.newest().value, b.newest().value);
+        try std.testing.expectEqual(a.newest().meta, b.newest().meta);
     }
 }
 
@@ -1645,8 +1662,10 @@ test "cursor: null is sticky and emitted counts hand-outs" {
     {
         var cur = try f.openCursor(alloc, tableRange(1, 0), .{});
         defer cur.deinit();
-        try std.testing.expectEqualStrings("a2", ((try cur.next()) orelse return error.TestExpectedItem).value);
-        try std.testing.expectEqualStrings("c1", ((try cur.next()) orelse return error.TestExpectedItem).value);
+        const first = (try cur.next()) orelse return error.TestExpectedItem;
+        try std.testing.expectEqualStrings("a2", first.newest().value);
+        const second = (try cur.next()) orelse return error.TestExpectedItem;
+        try std.testing.expectEqualStrings("c1", second.newest().value);
         try std.testing.expectEqual(null, try cur.next());
         try std.testing.expectEqual(null, try cur.next());
         try std.testing.expectEqual(@as(u64, 2), cur.emitted);
@@ -1655,7 +1674,8 @@ test "cursor: null is sticky and emitted counts hand-outs" {
     {
         var cur = try f.openCursor(alloc, tableRange(1, 0), .{ .max_rows = 1 });
         defer cur.deinit();
-        try std.testing.expectEqualStrings("a2", ((try cur.next()) orelse return error.TestExpectedItem).value);
+        const first = (try cur.next()) orelse return error.TestExpectedItem;
+        try std.testing.expectEqualStrings("a2", first.newest().value);
         try std.testing.expectEqual(null, try cur.next());
         try std.testing.expectEqual(null, try cur.next());
         try std.testing.expectEqual(@as(u64, 1), cur.emitted);
@@ -1712,7 +1732,8 @@ test "cursor: deinit mid-walk releases the sources" {
     {
         var cur = try f.openCursor(alloc, tableRange(1, 0), .{ .num_versions = 10, .include_deleted = true });
         defer cur.deinit();
-        try std.testing.expectEqualStrings("a2", ((try cur.next()) orelse return error.TestExpectedItem).value);
+        const first = (try cur.next()) orelse return error.TestExpectedItem;
+        try std.testing.expectEqualStrings("a2", first.newest().value);
     }
     // And the forest is none the worse for it.
     try expectCursorMatchesScan(alloc, f, 1, 0, .{});
@@ -1739,9 +1760,8 @@ test "cursor: a flush between two next calls does not disturb the walk" {
     const values = [_]String{ "va", "vb", "vc", "vd", "ve" };
     for (primaries, values) |p, v| {
         try f.put(&[_]zdb.kv.Item{.{
-            .key = .{ .namespace = 1, .table_id = 0, .primary = p, .timestamp = 5 },
-            .value = v,
-            .meta = .{},
+            .key = .{ .namespace = 1, .table_id = 0, .primary = p },
+            .versions = .{ .one = .{ .ts = 5, .meta = .{}, .value = v } },
         }});
     }
 
@@ -1761,7 +1781,7 @@ test "cursor: a flush between two next calls does not disturb the walk" {
     try std.testing.expectEqual(@as(usize, 4), rest.got.items.len);
     for (rest.got.items, primaries[1..], values[1..]) |it, p, v| {
         try std.testing.expectEqualStrings(p, it.key.primary);
-        try std.testing.expectEqualStrings(v, it.value);
+        try std.testing.expectEqualStrings(v, it.newest().value);
     }
     try std.testing.expectEqual(@as(u64, 5), cur.emitted);
 
@@ -1774,7 +1794,7 @@ test "cursor: a flush between two next calls does not disturb the walk" {
     try std.testing.expectEqual(@as(usize, 5), again.got.items.len);
     for (again.got.items, primaries, values) |it, p, v| {
         try std.testing.expectEqualStrings(p, it.key.primary);
-        try std.testing.expectEqualStrings(v, it.value);
+        try std.testing.expectEqualStrings(v, it.newest().value);
     }
 }
 
@@ -1805,14 +1825,8 @@ test "cursor: pin_values holds handed-out values until releasePins" {
         @memset(&value, 'w');
         value[0] = @intCast(i);
         try f.put(&[_]zdb.kv.Item{.{
-            .key = .{
-                .namespace = 1,
-                .table_id = 0,
-                .primary = &k,
-                .timestamp = 5,
-            },
-            .value = &value,
-            .meta = .{},
+            .key = .{ .namespace = 1, .table_id = 0, .primary = &k },
+            .versions = .{ .one = .{ .ts = 5, .meta = .{}, .value = &value } },
         }});
     }
     const pinning = Forest.ScanOptions{ .pin_values = true };
@@ -1823,7 +1837,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
             for (out) |*slot| {
                 const it = (try cur.next()) orelse
                     return error.TestExpectedItem;
-                slot.* = it.value;
+                slot.* = it.newest().value;
             }
         }
         /// The slices still read as the rows they were, from `first` on.
@@ -1859,7 +1873,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
 
     // Release: only the parked item's storage stays held, and that item
     // (the last one handed out) still reads.
-    cur.releasePins();
+    try cur.releasePins();
     try std.testing.expectEqual(@as(usize, 1), cur.pins.items.len);
     try Walk.check(first[first.len - 1 ..], first.len - 1);
 
@@ -1870,7 +1884,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
     try Walk.check(&rest, n_rows / 2);
     try std.testing.expect(cur.pins.items.len >= 2);
     try std.testing.expect((try cur.next()) == null);
-    cur.releasePins();
+    try cur.releasePins();
     try std.testing.expectEqual(@as(usize, 0), cur.pins.items.len);
 }
 
@@ -1882,7 +1896,11 @@ fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: String) !u64 
     for (keys, 1..) |k, tbl_id| {
         const path = try zdb.file_ids.sstPath(alloc, dir_path, tbl_id);
         defer alloc.free(path);
-        try buildAndWriteTableKV(alloc, path, .{ .namespace = 42, .table_id = 0, .primary = k, .timestamp = 1 }, k);
+        try buildAndWriteTableKV(alloc, path, .{
+            .namespace = 42,
+            .table_id = 0,
+            .primary = k,
+        }, 1, k);
     }
     {
         const tree_ptr = f.getTree(42, tree_id).?;
@@ -1940,7 +1958,7 @@ test "cursor: a split applied by another fiber mid-walk loses and repeats nothin
     const keys = [_]String{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (got.got.items, keys) |it, k| {
         try std.testing.expectEqualStrings(k, it.key.primary);
-        try std.testing.expectEqualStrings(k, it.value);
+        try std.testing.expectEqualStrings(k, it.newest().value);
     }
 
     // A cursor opened after the split walks both trees.
@@ -1966,9 +1984,11 @@ test "split: a reader holding the old tree keeps its full range until it lets go
     // The old object is untouched: unbounded right edge, all ten tables.
     try std.testing.expect(old.key_range.right.primary.len == 0);
     try std.testing.expectEqual(@as(usize, 10), old.numTablesAt(3));
-    const k10 = try old.get(.{ .namespace = 42, .table_id = 0, .primary = "k10", .timestamp = std.math.maxInt(u64) }, .p0) orelse return error.TestExpectedItem;
+    const k10 = try old.get(.{
+        .key = .{ .namespace = 42, .table_id = 0, .primary = "k10" },
+    }) orelse return error.TestExpectedItem;
     defer k10.free(alloc);
-    try std.testing.expectEqualStrings("k10", k10.value);
+    try std.testing.expectEqualStrings("k10", k10.newest().value);
 
     // The listed left half is a fresh object with the narrowed range.
     const left = f.getTree(42, tree_id) orelse return error.TestExpectedTree;
@@ -2007,7 +2027,9 @@ test "cursor: hops across a split like scan does" {
     try std.testing.expectEqual(@as(usize, 10), col.got.items.len);
     try std.testing.expectEqualStrings("k01", col.got.items[0].key.primary);
     try std.testing.expectEqualStrings("k10", col.got.items[9].key.primary);
-    for (col.got.items) |it| try std.testing.expectEqualStrings(it.key.primary, it.value);
+    for (col.got.items) |it| {
+        try std.testing.expectEqualStrings(it.key.primary, it.newest().value);
+    }
     try std.testing.expect(cur.done);
 }
 
@@ -2024,12 +2046,11 @@ const roar = struct {
     const delta_meta: zdb.kv.Meta = .{ .kind = .delta, .encoding = .roaring };
     const state_meta: zdb.kv.Meta = .{ .kind = .state, .encoding = .roaring };
 
-    fn key(primary: String, ts: u64) Key {
+    fn key(primary: String) Key {
         return .{
             .namespace = 1,
             .table_id = 0,
             .primary = primary,
-            .timestamp = ts,
         };
     }
 
@@ -2048,9 +2069,12 @@ const roar = struct {
         if (rems.len > 0) try w.setRemoves(rems);
         _ = try w.finish();
         const items = [_]zdb.kv.Item{.{
-            .key = key(primary, ts),
-            .value = list.items,
-            .meta = delta_meta,
+            .key = key(primary),
+            .versions = .{ .one = .{
+                .ts = ts,
+                .meta = delta_meta,
+                .value = list.items,
+            } },
         }};
         try f.put(&items);
     }
@@ -2065,9 +2089,12 @@ const roar = struct {
         var bm = try zroar.Bitmap.fromSortedList(alloc, vals);
         defer bm.deinit();
         const items = [_]zdb.kv.Item{.{
-            .key = key(primary, ts),
-            .value = bm.toBuffer(),
-            .meta = state_meta,
+            .key = key(primary),
+            .versions = .{ .one = .{
+                .ts = ts,
+                .meta = state_meta,
+                .value = bm.toBuffer(),
+            } },
         }};
         try f.put(&items);
     }
@@ -2079,7 +2106,10 @@ const roar = struct {
         read_ts: u64,
         expected: []const u64,
     ) !void {
-        var bm = try f.getBitmap(alloc, key(primary, read_ts), .p0);
+        var bm = try f.getBitmap(alloc, .{
+            .key = key(primary),
+            .read_ts = read_ts,
+        });
         defer bm.deinit();
         try std.testing.expectEqual(expected.len, bm.getCardinality());
         for (expected) |v| try std.testing.expect(bm.contains(v));
@@ -2152,9 +2182,12 @@ test "forest: getBitmap tombstone resets, absent key is empty" {
     // delta. The tombstone terminates the fold: only t30 survives.
     try roar.putState(f, alloc, "p", 10, &.{ 1, 2, 3 });
     const del = [_]zdb.kv.Item{.{
-        .key = roar.key("p", 20),
-        .value = "",
-        .meta = .{ .kind = .deleted },
+        .key = roar.key("p"),
+        .versions = .{ .one = .{
+            .ts = 20,
+            .meta = .{ .kind = .deleted },
+            .value = "",
+        } },
     }};
     try f.put(&del);
     try roar.putDelta(f, alloc, "p", 30, &.{7}, &.{});
@@ -2224,12 +2257,12 @@ test "forest: rollup is read-invariant across flush and compactions" {
 
     // Sanity that the rollup actually happened (this test must not
     // pass vacuously): "p"'s newest version is now a synthetic state.
-    const top = try f.getRaw(alloc, roar.key("p", std.math.maxInt(u64)), .p0) orelse
+    const top = try f.getRaw(alloc, .{ .key = roar.key("p") }) orelse
         return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isState());
-    try std.testing.expect(top.meta.isRoaring());
-    try std.testing.expectEqual(@as(u64, 30), top.key.timestamp);
+    try std.testing.expect(top.newest().meta.isState());
+    try std.testing.expect(top.newest().meta.isRoaring());
+    try std.testing.expectEqual(@as(u64, 30), top.newest().ts);
 }
 
 test "forest: getBitmap rejects non-roaring chains and old reads" {
@@ -2245,33 +2278,35 @@ test "forest: getBitmap rejects non-roaring chains and old reads" {
     try f.newMemtable(1, 1);
 
     const raw = [_]zdb.kv.Item{.{
-        .key = roar.key("r", 10),
-        .value = "plain",
-        .meta = .{},
+        .key = roar.key("r"),
+        .versions = .{ .one = .{ .ts = 10, .meta = .{}, .value = "plain" } },
     }};
     try f.put(&raw);
     try std.testing.expectError(
         error.NotRoaring,
-        f.getBitmap(alloc, roar.key("r", std.math.maxInt(u64)), .p0),
+        f.getBitmap(alloc, .{ .key = roar.key("r") }),
     );
 
     // Undecodable delta bytes (only structure is checked on reads —
     // content is validated at write time) surface as corruption.
     const junk = [_]zdb.kv.Item{.{
-        .key = roar.key("c", 10),
-        .value = "junk",
-        .meta = roar.delta_meta,
+        .key = roar.key("c"),
+        .versions = .{ .one = .{
+            .ts = 10,
+            .meta = roar.delta_meta,
+            .value = "junk",
+        } },
     }};
     try f.put(&junk);
     try std.testing.expectError(
         error.CorruptPosting,
-        f.getBitmap(alloc, roar.key("c", std.math.maxInt(u64)), .p0),
+        f.getBitmap(alloc, .{ .key = roar.key("c") }),
     );
 
     _ = f.setGlobalMinRead(100);
     try std.testing.expectError(
         error.ReadBelowMinRead,
-        f.getBitmap(alloc, roar.key("r", 99), .p0),
+        f.getBitmap(alloc, .{ .key = roar.key("r"), .read_ts = 99 }),
     );
 }
 
@@ -2301,16 +2336,16 @@ test "forest: index backfill installs bottom states below live deltas" {
     var red = try zroar.Bitmap.fromSortedList(alloc, &.{2});
     defer red.deinit();
     const items = [_]zdb.kv.Item{
-        .{
-            .key = roar.key("blue", snap),
+        .{ .key = roar.key("blue"), .versions = .{ .one = .{
+            .ts = snap,
+            .meta = roar.state_meta,
             .value = blue.toBuffer(),
+        } } },
+        .{ .key = roar.key("red"), .versions = .{ .one = .{
+            .ts = snap,
             .meta = roar.state_meta,
-        },
-        .{
-            .key = roar.key("red", snap),
             .value = red.toBuffer(),
-            .meta = roar.state_meta,
-        },
+        } } },
     };
     var changes = try f.buildBottomTable(alloc, 1, 0, &items);
     defer changes.deinit(alloc);

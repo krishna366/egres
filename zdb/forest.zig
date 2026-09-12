@@ -254,10 +254,22 @@ pub const Memtables = struct {
         const extra: usize = @intFromBool(pending != null);
         const total = extra + 1 + self.immutables.items.len;
         const out = try allocator.alloc(merge_iterator.Iterator, total);
-        if (pending) |p| out[0] = .{ .skiplist = _skl.Iterator.init(p) };
-        out[extra] = .{ .skiplist = _skl.Iterator.init(self.current) };
+        errdefer allocator.free(out);
+        var made: usize = 0;
+        errdefer for (out[0..made]) |*it| it.deinit();
+        if (pending) |p| {
+            out[0] = .{ .skiplist = try _skl.Iterator.init(allocator, p) };
+            made += 1;
+        }
+        out[extra] = .{
+            .skiplist = try _skl.Iterator.init(allocator, self.current),
+        };
+        made += 1;
         for (self.immutables.items, 0..) |imm, i| {
-            out[extra + 1 + i] = .{ .skiplist = _skl.Iterator.init(imm) };
+            out[extra + 1 + i] = .{
+                .skiplist = try _skl.Iterator.init(allocator, imm),
+            };
+            made += 1;
         }
         return out;
     }
@@ -443,6 +455,7 @@ pub const Forest = struct {
     pub const getRaw = _read.getRaw;
     pub const getBitmap = _read.getBitmap;
     pub const ScanOptions = _read.ScanOptions;
+    pub const Lookup = _read.Lookup;
     pub const scan = _read.scan;
     pub const openCursor = _read.openCursor;
     pub const Cursor = _read.Cursor;
@@ -582,13 +595,14 @@ pub const Forest = struct {
     pub fn buildFlush(self: *Forest) !?FlushResult {
         const mt = self.memtables.peekOldest() orelse return null;
         defer mt.release();
-        var iter = mt.iterator();
+        var iter = try mt.iterator(self.allocator);
         defer iter.deinit();
 
         // Per-tree builders, keyed by the tree's global identity. Keys within
         // each tree are already in sorted order because the skiplist is
         // globally sorted and each tree covers a contiguous key range within
-        // its (namespace, table_id) table.
+        // its (namespace, table_id) table. An item is one key with every
+        // version of it, newest first, which is the order the builder wants.
         var builders = std.AutoHashMap(TreeKey, *Builder).init(self.allocator);
         defer {
             var bit = builders.valueIterator();

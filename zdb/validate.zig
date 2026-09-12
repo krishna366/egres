@@ -12,11 +12,11 @@
 //!
 //! This module owns only the write-side format concerns: what a
 //! delta record is and `validateDelta`, the gate every record passes
-//! before being proposed. Everything runtime — chain collection,
-//! pinning, classification, and THE fold — lives in zdb/compaction.zig's
-//! VersionTracker, the one per-primary state machine (the fold is
-//! `foldBufferedToBitmap`, shared by compaction and reads; that sharing is
-//! what makes "rollup is read-invariant" testable).
+//! before being proposed. Everything runtime — chain classification and
+//! THE fold — lives in zdb/compaction.zig's VersionTracker, which sees a
+//! primary's whole chain in one item (the fold is `foldChain`, and reads
+//! fold through the same `baseBitmap` / `applyDelta` pair; that sharing
+//! is what makes "rollup is read-invariant" testable).
 //!
 //! Both delta lists are strictly ascending and mutually disjoint —
 //! WRITER contracts, enforced at write time via `validateDelta` (the

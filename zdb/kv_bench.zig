@@ -11,10 +11,10 @@
 //!                    the struct below for why that is even legal.
 //!
 //! Keys are shaped like the SQL row keys the engine actually stores: a
-//! fixed namespace and table_id, a primary that shares a long prefix and
-//! differs near its END (egid-style ids), and two versions per primary.
-//! Adjacent pairs are compared, so about half the comparisons are decided
-//! by the primary and half fall through to the timestamp.
+//! fixed namespace and table_id, and a primary that shares a long prefix
+//! and differs near its END (egid-style ids). Adjacent pairs are
+//! compared, so every comparison walks the shared prefix before the
+//! primary decides it.
 
 const std = @import("std");
 const utils = @import("utils");
@@ -29,32 +29,18 @@ const Key = zdb.kv.Key;
 /// `[ns|tid|primary]` compares bytewise because ns and tid are
 /// fixed-width big-endian — byte order IS field order, and a length
 /// difference can only come from primary, where shorter-is-less is what
-/// std.mem.order gives. The trailing timestamp also compares bytewise,
-/// with the result INVERTED, since newer versions sort first. So the
-/// whole ordering is two memcmps and no integer parsing at all.
+/// std.mem.order gives. So the whole ordering is one memcmp and no
+/// integer parsing at all.
 const SerialKey = struct {
     raw: String,
 
     fn order(a: SerialKey, b: SerialKey) std.math.Order {
-        const ap = a.raw[0 .. a.raw.len - 8];
-        const bp = b.raw[0 .. b.raw.len - 8];
-        switch (std.mem.order(u8, ap, bp)) {
-            .eq => {},
-            else => |c| return c,
-        }
-        const at = a.raw[a.raw.len - 8 ..];
-        const bt = b.raw[b.raw.len - 8 ..];
-        return switch (std.mem.order(u8, at, bt)) {
-            .lt => .gt,
-            .gt => .lt,
-            .eq => .eq,
-        };
+        return std.mem.order(u8, a.raw, b.raw);
     }
 };
 
 const gpa = std.heap.smp_allocator;
 const num_keys: usize = 256; // small enough to stay cache-resident
-const versions: usize = 2; // versions per primary
 
 /// Marshal `num_keys` keys whose primaries are `primary_len` bytes and
 /// differ only in their last 8 — the egid-shaped case, where a compare
@@ -67,13 +53,12 @@ fn buildKeys(a: std.mem.Allocator, primary_len: usize) ![]const String {
     for (out, 0..) |*slot, i| {
         @memset(buf, 'p');
         var nb: [8]u8 = undefined;
-        _ = try std.fmt.bufPrint(&nb, "{d:0>8}", .{i / versions});
+        _ = try std.fmt.bufPrint(&nb, "{d:0>8}", .{i});
         @memcpy(buf[buf.len - 8 ..], &nb);
         const k = Key{
             .namespace = 16,
             .table_id = 17,
             .primary = buf,
-            .timestamp = 100 - @as(u64, @intCast(i % versions)),
         };
         slot.* = try k.marshal(a);
     }

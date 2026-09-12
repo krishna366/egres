@@ -5,7 +5,7 @@ const utils = @import("utils");
 const String = utils.String;
 const Key = @import("../kv.zig").Key;
 const Item = @import("../kv.zig").Item;
-const Meta = @import("../kv.zig").Meta;
+const Version = @import("../kv.zig").Version;
 
 pub const Error = error{
     OutOfMemory,
@@ -18,19 +18,37 @@ pub const SkipList = struct {
     const branch_probability = 4;
     const max_arena_size = 64 * 1024 * 1024;
 
+    /// One version of a row, immutable once published. A node's
+    /// version nodes form a chain newest first; `next` is the only
+    /// field a writer ever stores after publication, and only to
+    /// splice a new version node in behind this one.
+    pub const VersionNode = struct {
+        ver: Version,
+        next: Atomic(?*VersionNode),
+    };
+
+    /// One row: the marshaled key without a timestamp ([ns][tid]
+    /// [primary]) and its versions, a chain of version nodes from
+    /// `vhead`, newest first. Nodes sort by key. `vhead` is never null
+    /// once the node is linked in: a node is built with its first
+    /// version node.
     pub const Node = struct {
         key: String,
-        value: String,
-        // Not swapped atomically with `value` on overwrite — see `put`. The
-        // key is immutable for a node's lifetime; only these two change.
-        meta: Meta,
+        vhead: Atomic(?*VersionNode),
         next: []Atomic(?*Node),
     };
 
     // Concurrency contract:
-    // - single writer calls `put`
-    // - many readers may call `get`/iterate
+    // - single writer calls `putItem`
+    // - many readers may call `getVersion`/iterate
     // - ownership is refcounted via `acquire`/`release`
+    //
+    // Every pointer a reader follows (a node's tower slot, a node's
+    // `vhead`, a version node's `next`) is stored with release ordering
+    // after the target is fully written, and loaded with acquire, so a
+    // reader never sees a half-built node or version node. Nothing is
+    // mutated in place: an overwrite publishes a new version node and
+    // leaves the old one where a reader parked on it can still walk on.
     id: u64,
     /// Log index of the Raft entry that created this memtable (0 for the
     /// initial placeholder created at Forest.open before any replay).
@@ -45,11 +63,12 @@ pub const SkipList = struct {
     rng: std.Random.DefaultPrng,
     ref_count: Atomic(u32),
     node_count: Atomic(usize),
-    /// Live data bytes (key + value) written into this memtable. Used by
-    /// `memoryUsage`/`shouldFreeze` instead of arena capacity: the arena is
-    /// preheated to `max_arena_size`, so `queryCapacity()` reports the full
-    /// reservation even when empty — which would make an empty memtable look
-    /// "full" and trip the freeze threshold immediately.
+    /// Bytes written into this memtable: keys, nodes and their towers,
+    /// version nodes and values. Used by `memoryUsage`/`shouldFreeze` instead
+    /// of arena capacity: the arena is preheated to `max_arena_size`, so
+    /// `queryCapacity()` reports the full reservation even when empty —
+    /// which would make an empty memtable look "full" and trip the
+    /// freeze threshold immediately.
     used_bytes: Atomic(usize),
 
     pub fn init(allocator: Allocator) !*Self {
@@ -72,8 +91,7 @@ pub const SkipList = struct {
         const head = try arena.allocator().create(Node);
         head.* = .{
             .key = &[_]u8{},
-            .value = &[_]u8{},
-            .meta = .{},
+            .vhead = Atomic(?*VersionNode).init(null),
             .next = next_arr,
         };
 
@@ -122,18 +140,24 @@ pub const SkipList = struct {
         exact: bool,
     };
 
-    fn findNode(self: *Self, search_key: Key, lefties: ?*[max_height]?*Node) FindResult {
+    fn findNode(
+        self: *Self,
+        search_key: Key,
+        lefties: ?*[max_height]?*Node,
+    ) FindResult {
         var current = self.head;
         var level: i32 = @intCast(self.max_height_seen.load(.acquire) - 1);
 
         while (level >= 0) {
             const level_idx: usize = @intCast(level);
-            // This loop always stops at the last node in the level, where next.key > given key and
-            // current.key < given key. If ever next.key == given key, we'd return the node and mark
-            // it as an exact match.
-            // The lefties are useful when we want to add the node to the list.
-            // But if we find an exact match, we don't care that lefties isn't being fully filled
-            // because we're returning earlier (cmp == .eq).
+            // This loop always stops at the last node in the level, where
+            // next.key > given key and current.key < given key. If ever
+            // next.key == given key, we'd return the node and mark it as
+            // an exact match.
+            // The lefties are useful when we want to add the node to the
+            // list. But if we find an exact match, we don't care that
+            // lefties isn't being fully filled because we're returning
+            // earlier (cmp == .eq).
             while (current.next[level_idx].load(.acquire)) |next| {
                 const cmp = Key.init(next.key).order(search_key);
                 if (cmp == .gt) break;
@@ -151,74 +175,122 @@ pub const SkipList = struct {
         };
     }
 
-    /// Look up a key. Returns an Item whose slices point into arena memory.
-    /// Caller must ensure the skiplist stays alive (via acquire/release) while
-    /// using the returned Item, or dupe it.
-    pub fn get(self: *Self, key: Key) ?Item {
+    /// The newest version of `key` at or below `ts`, or null when the key
+    /// has no such version. The returned value points into arena memory:
+    /// the caller must keep the skiplist alive (via acquire/release) while
+    /// using it, or dupe it.
+    pub fn getVersion(self: *Self, key: Key, ts: u64) ?Version {
+        // An exact match compares the whole key: the memtable is global
+        // across namespaces and tables, and a miss lands on the next key.
         const result = self.findNode(key, null);
-        const node = result.node orelse return null;
-        const found = Key.init(node.key);
-        // The memtable is global across namespaces and tables, so a
-        // findNode landing on the next key ≥ search can be a same-primary key
-        // under a different (namespace, table_id). Filter all three.
-        if (found.namespace != key.namespace) return null;
-        if (found.table_id != key.table_id) return null;
-        if (!found.equalPrimary(key)) return null;
-        if (found.timestamp > key.timestamp) return null;
-
-        return .{ .key = found, .value = node.value, .meta = node.meta };
+        if (!result.exact) return null;
+        var cur = result.node.?.vhead.load(.acquire);
+        while (cur) |vnode| : (cur = vnode.next.load(.acquire)) {
+            if (vnode.ver.ts <= ts) return vnode.ver;
+        }
+        return null;
     }
 
     /// Convenience for callers with nothing to say about the row: raw
     /// encoding, no flags. The write path uses putItem.
-    pub fn put(self: *Self, key: Key, value: String) Error!void {
-        return self.putItem(.{ .key = key, .value = value, .meta = .{} });
+    pub fn put(self: *Self, key: Key, ts: u64, value: String) Error!void {
+        return self.putItem(.{
+            .key = key,
+            .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = value } },
+        });
     }
 
+    /// Write every version of `item`. A version at a timestamp the key
+    /// already holds replaces that one; any other goes into the chain at
+    /// its timestamp, whatever order versions arrive in. A txn's pending
+    /// posting ops carry the egid in the timestamp and arrive in egid
+    /// order, and a row re-put after a read_ts bump lands above its
+    /// first write, so no ordering is assumed.
     pub fn putItem(self: *Self, item: Item) Error!void {
-        const key = item.key;
-        const value = item.value;
-        const alloc = self.arena.allocator();
-
-        // Build full key for the findNode lookup. This key is allocated on arena.
-        const keyWithTs = key.marshal(alloc) catch return Error.ArenaFull;
-        const valOwn = alloc.dupe(u8, value) catch return Error.ArenaFull;
-
         var lefties = [_]?*Node{null} ** max_height;
-        const find_result = self.findNode(key, &lefties);
-        if (find_result.exact) {
-            var existing = find_result.node.?;
-            // The previous value can't really be deallocated in arena allocator.
-            // So, don't worry about it. Allocate a new one and move on.
-            existing.value = alloc.dupe(u8, value) catch return Error.ArenaFull;
-            // value and meta are two separate non-atomic stores, so a
-            // concurrent reader can see the new value with the old meta. Same
-            // exposure the value store already had on its own (it's a fat
-            // pointer), and it only arises on an exact overwrite: same key AND
-            // same timestamp, i.e. twice within one raft batch. Fixing it
-            // properly means one atomic pointer to an immutable {value, meta}
-            // record, which costs an indirection on every read.
-            existing.meta = item.meta;
-            // Old value stays resident in the arena, so memory grows by the
-            // new value's bytes even on overwrite.
-            _ = self.used_bytes.fetchAdd(value.len, .monotonic);
-            return;
+        const found = self.findNode(item.key, &lefties);
+        var vers = item.versions.slice();
+        var node: *Node = undefined;
+        if (found.exact) {
+            node = found.node.?;
+        } else {
+            node = try self.newNode(item.key, vers[0], &lefties);
+            vers = vers[1..];
         }
+        for (vers) |ver| try self.insertVersionNode(node, ver);
+    }
+
+    /// A version node for `ver`, its value copied into the arena,
+    /// unpublished.
+    fn newVersionNode(self: *Self, ver: Version) Error!*VersionNode {
+        const alloc = self.arena.allocator();
+        const val_own = alloc.dupe(u8, ver.value) catch return Error.ArenaFull;
+        const vnode = try alloc.create(VersionNode);
+        vnode.* = .{
+            .ver = .{ .ts = ver.ts, .meta = ver.meta, .value = val_own },
+            .next = Atomic(?*VersionNode).init(null),
+        };
+        const vnode_bytes = @sizeOf(VersionNode) + val_own.len;
+        _ = self.used_bytes.fetchAdd(vnode_bytes, .monotonic);
+        return vnode;
+    }
+
+    /// Splice a version node for `ver` into `node`'s chain at its
+    /// timestamp. The chain is walked to the first version node at or
+    /// below `ver.ts`: an equal one is replaced (the new version node
+    /// takes its `next`, the old one stays in the arena for any reader
+    /// parked on it), else the new version node goes in front of it.
+    /// One release store publishes it, at the predecessor's `next` or
+    /// at `vhead`.
+    fn insertVersionNode(self: *Self, node: *Node, ver: Version) Error!void {
+        const new_vnode = try self.newVersionNode(ver);
+
+        var prev: ?*VersionNode = null;
+        var cur = node.vhead.load(.acquire);
+        while (cur) |vnode| : (cur = vnode.next.load(.acquire)) {
+            if (vnode.ver.ts <= ver.ts) break;
+            prev = vnode;
+        }
+        const next: ?*VersionNode = if (cur) |vnode|
+            (if (vnode.ver.ts == ver.ts) vnode.next.load(.acquire) else vnode)
+        else
+            null;
+        new_vnode.next = Atomic(?*VersionNode).init(next);
+
+        if (prev) |p| {
+            p.next.store(new_vnode, .release);
+        } else {
+            node.vhead.store(new_vnode, .release);
+        }
+    }
+
+    /// A node for `key` holding `first` as its only version node,
+    /// linked into the tower between `lefties` and their successors.
+    /// The version node is in place before the node is published, so a
+    /// reader never sees a node without a version.
+    fn newNode(
+        self: *Self,
+        key: Key,
+        first: Version,
+        lefties: *[max_height]?*Node,
+    ) Error!*Node {
+        const alloc = self.arena.allocator();
+        const vnode = try self.newVersionNode(first);
+        const key_own = key.marshal(alloc) catch return Error.ArenaFull;
 
         const height = self.randomHeight();
         const next_arr = try alloc.alloc(Atomic(?*Node), height);
         for (next_arr) |*p| p.* = Atomic(?*Node).init(null);
         const new_node = try alloc.create(Node);
         new_node.* = .{
-            .key = keyWithTs,
-            .value = valOwn,
-            .meta = item.meta,
+            .key = key_own,
+            .vhead = Atomic(?*VersionNode).init(vnode),
             .next = next_arr,
         };
 
-        // We expect multiple readers, but only expect one writer.
-        // So, we can just do a load and store, without worrying about the value changing
-        // since we loaded it.
+        // We expect multiple readers, but only expect one writer. So, we
+        // can just do a load and store, without worrying about the value
+        // changing since we loaded it.
         if (height > self.max_height_seen.load(.acquire)) {
             self.max_height_seen.store(height, .release);
         }
@@ -237,23 +309,27 @@ pub const SkipList = struct {
         }
 
         _ = self.node_count.fetchAdd(1, .monotonic);
-        _ = self.used_bytes.fetchAdd(keyWithTs.len + valOwn.len, .monotonic);
+        const tower = height * @sizeOf(Atomic(?*Node));
+        const node_bytes = key_own.len + @sizeOf(Node) + tower;
+        _ = self.used_bytes.fetchAdd(node_bytes, .monotonic);
+        return new_node;
     }
 
-    pub fn contains(self: *Self, key: Key) bool {
-        return self.get(key) != null;
+    pub fn contains(self: *Self, key: Key, ts: u64) bool {
+        return self.getVersion(key, ts) != null;
     }
 
+    /// The number of keys, whatever their version count.
     pub fn numNodes(self: *Self) usize {
         return self.node_count.load(.monotonic);
     }
 
     pub fn memoryUsage(self: *Self) usize {
-        // Live data bytes (key + value) written, tracked on every `put`.
-        // We deliberately do NOT use `arena.queryCapacity()`: the arena is
-        // preheated to `max_arena_size`, so an empty memtable would report
-        // the full 64 MiB reservation and trip `shouldFreeze` immediately,
-        // spinning the newMemtable loop forever.
+        // Bytes written, tracked on every put. We deliberately do NOT use
+        // `arena.queryCapacity()`: the arena is preheated to
+        // `max_arena_size`, so an empty memtable would report the full
+        // 64 MiB reservation and trip `shouldFreeze` immediately, spinning
+        // the newMemtable loop forever.
         return self.used_bytes.load(.monotonic);
     }
 
@@ -261,66 +337,87 @@ pub const SkipList = struct {
         return self.arena.queryCapacity();
     }
 
-    pub fn iterator(self: *Self) Iterator {
-        return Iterator.init(self);
+    pub fn iterator(self: *Self, allocator: Allocator) !Iterator {
+        return Iterator.init(allocator, self);
     }
 };
 
 /// Forward iterator over a SkipList with a peek/advance API matching the
-/// merge iterator (see zdb/table/merge_iterator.zig). `acquire`s the
-/// underlying skiplist on init; `release`s on deinit. Safe to hand
-/// across the lifetime of a flush completion: as long as the iterator
-/// holds a ref, the arena stays mapped even after the immutable's
-/// owning slot in `Memtables` is popped.
+/// merge iterator (see zdb/table/merge_iterator.zig): one item per key,
+/// its versions newest first in a buffer the iterator owns, refilled at
+/// every position and valid until the next `next`. The values stay in
+/// the arena. `acquire`s the underlying skiplist on init; `release`s on
+/// deinit. Safe to hand across the lifetime of a flush completion: as
+/// long as the iterator holds a ref, the arena stays mapped even after
+/// the immutable's owning slot in `Memtables` is popped.
 pub const Iterator = struct {
+    allocator: Allocator,
     skiplist: *SkipList,
-    current: ?*SkipList.Node,
+    node: ?*SkipList.Node,
+    vers: std.ArrayList(Version) = .empty,
     end_key: Key = .{},
 
-    pub fn init(skiplist: *SkipList) Iterator {
+    pub fn init(allocator: Allocator, skiplist: *SkipList) !Iterator {
         skiplist.acquire();
-        return .{
+        var it: Iterator = .{
+            .allocator = allocator,
             .skiplist = skiplist,
-            .current = skiplist.head.next[0].load(.acquire),
+            .node = skiplist.head.next[0].load(.acquire),
         };
+        errdefer it.deinit();
+        try it.fill();
+        return it;
     }
 
     pub fn deinit(self: *Iterator) void {
+        self.vers.deinit(self.allocator);
         self.skiplist.release();
     }
 
-    /// Position at the first entry with key >= `start` (inclusive).
-    /// Empty `start.primary` means "first node." `end` is an
-    /// exclusive upper bound; empty means "no upper bound."
+    /// Position at the first key >= `start` (inclusive). Empty
+    /// `start.primary` means "first node." `end` is an exclusive upper
+    /// bound; empty means "no upper bound."
     pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
         self.end_key = end;
         if (start.primary.len == 0) {
-            self.current = self.skiplist.head.next[0].load(.acquire);
+            self.node = self.skiplist.head.next[0].load(.acquire);
         } else {
-            const find_result = self.skiplist.findNode(start, null);
-            self.current = find_result.node;
+            self.node = self.skiplist.findNode(start, null).node;
         }
         self.checkEnd();
+        try self.fill();
     }
 
     pub fn itemRef(self: *const Iterator) ?Item {
-        const node = self.current orelse return null;
+        const node = self.node orelse return null;
         return .{
             .key = Key.init(node.key),
-            .value = node.value,
-            .meta = node.meta,
+            .versions = .{ .many = self.vers.items },
         };
     }
 
     pub fn next(self: *Iterator) !void {
-        const node = self.current orelse return;
-        self.current = node.next[0].load(.acquire);
+        const node = self.node orelse return;
+        self.node = node.next[0].load(.acquire);
         self.checkEnd();
+        try self.fill();
     }
 
     fn checkEnd(self: *Iterator) void {
         if (self.end_key.primary.len == 0) return;
-        const node = self.current orelse return;
-        if (Key.init(node.key).order(self.end_key) != .lt) self.current = null;
+        const node = self.node orelse return;
+        if (Key.init(node.key).order(self.end_key) != .lt) self.node = null;
+    }
+
+    /// Copy the current node's chain into `vers`. A writer may publish
+    /// a version node while this walks; either the chain before or the
+    /// chain after is seen, both complete.
+    fn fill(self: *Iterator) !void {
+        self.vers.clearRetainingCapacity();
+        const node = self.node orelse return;
+        var cur = node.vhead.load(.acquire);
+        while (cur) |vnode| : (cur = vnode.next.load(.acquire)) {
+            try self.vers.append(self.allocator, vnode.ver);
+        }
     }
 };

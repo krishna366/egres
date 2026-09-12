@@ -63,12 +63,11 @@ const Fixture = struct {
         self.tmp.cleanup();
     }
 
-    fn key(primary: String, ts: u64) Key {
+    fn key(primary: String) Key {
         return .{
             .namespace = ns,
             .table_id = tid,
             .primary = primary,
-            .timestamp = ts,
         };
     }
 
@@ -89,9 +88,8 @@ const Fixture = struct {
         meta: Meta,
     ) !void {
         const items = [_]Item{.{
-            .key = key(primary, ts),
-            .value = value,
-            .meta = meta,
+            .key = key(primary),
+            .versions = .{ .one = .{ .ts = ts, .meta = meta, .value = value } },
         }};
         try self.f.put(&items);
     }
@@ -135,16 +133,19 @@ fn expectRow(
     want: ?struct { value: String, ts: u64 },
 ) !void {
     const got = mg.item(primary);
-    const single = try fx.f.get(fx.alloc, Fixture.key(primary, read_ts), .p0);
+    const single = try fx.f.get(fx.alloc, .{
+        .key = Fixture.key(primary),
+        .read_ts = read_ts,
+    });
     defer if (single) |s| s.free(fx.alloc);
     if (want) |w| {
         const it = got orelse return error.TestExpectedItem;
         try std.testing.expectEqualStrings(primary, it.key.primary);
-        try std.testing.expectEqualStrings(w.value, it.value);
-        try std.testing.expectEqual(w.ts, it.key.timestamp);
+        try std.testing.expectEqualStrings(w.value, it.newest().value);
+        try std.testing.expectEqual(w.ts, it.newest().ts);
         const s = single orelse return error.TestExpectedItem;
-        try std.testing.expectEqualStrings(w.value, s.value);
-        try std.testing.expectEqual(w.ts, s.key.timestamp);
+        try std.testing.expectEqualStrings(w.value, s.newest().value);
+        try std.testing.expectEqual(w.ts, s.newest().ts);
     } else {
         try std.testing.expect(got == null);
         try std.testing.expect(single == null);
@@ -186,14 +187,20 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
     defer pending.release();
     try pending.putItem(.{
-        .key = Fixture.key("k07", read_ts),
-        .value = "pend",
-        .meta = .{},
+        .key = Fixture.key("k07"),
+        .versions = .{ .one = .{
+            .ts = read_ts,
+            .meta = .{},
+            .value = "pend",
+        } },
     });
     try pending.putItem(.{
-        .key = Fixture.key("k08", read_ts),
-        .value = "",
-        .meta = .{ .kind = .deleted },
+        .key = Fixture.key("k08"),
+        .versions = .{ .one = .{
+            .ts = read_ts,
+            .meta = .{ .kind = .deleted },
+            .value = "",
+        } },
     });
 
     // Unsorted, with a duplicate and an absent key.
@@ -215,7 +222,8 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     try expectRow(&fx, &mg, read_ts, "k04", .{ .value = "v3", .ts = 30 });
     try expectRow(&fx, &mg, read_ts, "k05", .{ .value = "v4", .ts = 40 });
     try expectRow(&fx, &mg, read_ts, "k06", .{ .value = "v5", .ts = 50 });
-    try std.testing.expectEqualStrings("pend", mg.item("k07").?.value);
+    const pend = mg.item("k07").?.newest().value;
+    try std.testing.expectEqualStrings("pend", pend);
     try std.testing.expect(mg.item("k08") == null);
     try expectRow(&fx, &mg, read_ts, "k09", .{ .value = "v1", .ts = 10 });
     try expectRow(&fx, &mg, read_ts, "k99", null);
@@ -227,18 +235,17 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     });
     defer raw.deinit();
     const tomb = raw.item("k02") orelse return error.TestExpectedItem;
-    try std.testing.expect(tomb.meta.isDeleted());
-    try std.testing.expectEqual(@as(u64, 60), tomb.key.timestamp);
+    try std.testing.expect(tomb.newest().meta.isDeleted());
+    try std.testing.expectEqual(@as(u64, 60), tomb.newest().ts);
 }
 
 /// A key of table 7, the neighbour of `tid` in the namespace-wide
 /// memtable.
-fn otherKey(primary: String, ts: u64) Key {
+fn otherKey(primary: String) Key {
     return .{
         .namespace = ns,
         .table_id = 7,
         .primary = primary,
-        .timestamp = ts,
     };
 }
 
@@ -254,8 +261,12 @@ test "multiget: other tables in the memtables and pending writes are skipped" {
     try fx.put("a", 10, "a-t0");
     try fx.put("z", 1, "z-ts1");
     const other = [_]Item{
-        .{ .key = otherKey("a", 20), .value = "a-t7", .meta = .{} },
-        .{ .key = otherKey("b", 20), .value = "b-t7", .meta = .{} },
+        .{ .key = otherKey("a"), .versions = .{
+            .one = .{ .ts = 20, .meta = .{}, .value = "a-t7" },
+        } },
+        .{ .key = otherKey("b"), .versions = .{
+            .one = .{ .ts = 20, .meta = .{}, .value = "b-t7" },
+        } },
     };
     try fx.f.put(&other);
 
@@ -264,9 +275,12 @@ test "multiget: other tables in the memtables and pending writes are skipped" {
     const pending = try zdb.skl.SkipList.initCapacity(alloc, 0);
     defer pending.release();
     try pending.putItem(.{
-        .key = otherKey("b", 100),
-        .value = "pend-t7",
-        .meta = .{},
+        .key = otherKey("b"),
+        .versions = .{ .one = .{
+            .ts = 100,
+            .meta = .{},
+            .value = "pend-t7",
+        } },
     });
 
     var mg = try fx.f.multiGet(alloc, ns, tid, &.{ "a", "b", "z" }, .{
@@ -274,9 +288,9 @@ test "multiget: other tables in the memtables and pending writes are skipped" {
         .pending = pending,
     });
     defer mg.deinit();
-    try std.testing.expectEqualStrings("a-t0", mg.item("a").?.value);
+    try std.testing.expectEqualStrings("a-t0", mg.item("a").?.newest().value);
     try std.testing.expect(mg.item("b") == null);
-    try std.testing.expectEqualStrings("z-ts1", mg.item("z").?.value);
+    try std.testing.expectEqualStrings("z-ts1", mg.item("z").?.newest().value);
 }
 
 test "multiget: read_ts hides the versions above it" {
@@ -326,13 +340,14 @@ fn writeOneKeyTable(
     dir: String,
     file_id: u64,
     k: Key,
+    ts: u64,
     value: String,
 ) !void {
     const path = try zdb.file_ids.sstPath(alloc, dir, file_id);
     defer alloc.free(path);
     var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer bld.deinit();
-    try bld.add(k, value);
+    try bld.add(k, ts, value);
     var tb = try bld.finish();
     defer tb.deinit();
     try vfs.writeFile(path, tb.bytes);
@@ -349,7 +364,7 @@ test "multiget: keys across two trees and several bottom tables" {
         "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10",
     };
     for (keys, 1..) |k, file_id| {
-        try writeOneKeyTable(alloc, fx.dir, file_id, Fixture.key(k, 1), k);
+        try writeOneKeyTable(alloc, fx.dir, file_id, Fixture.key(k), 1, k);
     }
     {
         const tree = fx.f.getTree(ns, fx.tree_id) orelse
@@ -379,7 +394,7 @@ test "multiget: keys across two trees and several bottom tables" {
             continue;
         }
         const it = mg.item(k) orelse return error.TestExpectedItem;
-        try std.testing.expectEqualStrings(k, it.value);
+        try std.testing.expectEqualStrings(k, it.newest().value);
     }
 }
 
@@ -419,9 +434,9 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
     for ([_]String{ "r000", "r150", "r299" }) |k| {
         var it = zdb.table.TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
-        try it.seekRange(Fixture.key(k, 10), .{});
+        try it.seekRange(Fixture.key(k), .{});
         try std.testing.expect(it.itemRef() != null);
-        const want = tbl.blockFor(Fixture.key(k, 10)).?;
+        const want = tbl.blockFor(Fixture.key(k)).?;
         try std.testing.expectEqual(want, it.bpos);
     }
 
@@ -506,11 +521,10 @@ const roar = struct {
     ) !void {
         var bm = try mg.bitmap(fx.alloc, primary);
         defer bm.deinit();
-        var single = try fx.f.getBitmap(
-            fx.alloc,
-            Fixture.key(primary, read_ts),
-            .p0,
-        );
+        var single = try fx.f.getBitmap(fx.alloc, .{
+            .key = Fixture.key(primary),
+            .read_ts = read_ts,
+        });
         defer single.deinit();
         try std.testing.expectEqual(expected.len, bm.getCardinality());
         try std.testing.expectEqual(expected.len, single.getCardinality());
@@ -560,6 +574,7 @@ test "multiget: postings fold across memtable, L0, tombstones and history" {
     try fx.put("t", 10, "row");
     var row = try fx.f.multiGet(alloc, ns, tid, &.{"t"}, .{});
     defer row.deinit();
-    try std.testing.expectEqualStrings("row", row.item("t").?.value);
+    const row_val = row.item("t").?.newest().value;
+    try std.testing.expectEqualStrings("row", row_val);
     try std.testing.expectError(error.NotRoaring, row.bitmap(alloc, "t"));
 }

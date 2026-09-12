@@ -29,10 +29,9 @@ const Level = _level_handler.Level;
 const Lock = _level_handler.Lock;
 const TableEntry = _level_handler.TableEntry;
 const Key = @import("kv.zig").Key;
-const Meta = @import("kv.zig").Meta;
+const Version = @import("kv.zig").Version;
 const KeyRange = _level_handler.KeyRange;
 const MergeIterator = _table.merge_iterator.MergeIterator;
-const Pin = _table.merge_iterator.Pin;
 const ConcatIterator = _table.merge_iterator.ConcatIterator;
 const Iterator = _table.merge_iterator.Iterator;
 const Builder = _table.builder.Builder;
@@ -60,61 +59,44 @@ const LevelPriority = struct {
     adjusted: f64,
 };
 
-/// Tracks the version run for one primary during compaction — both
-/// jobs that need run awareness live here, so there is exactly ONE
-/// per-primary state machine:
+/// Decides what of one primary's versions compaction writes. The merge
+/// hands over one item per primary with every version of it, newest
+/// first, so both jobs run over a slice within one call:
 ///
-/// 1. Retention (`update`): a terminal is a complete state or
+/// 1. Retention (`retain`): a terminal is a complete state or
 ///    tombstone. Versions after the newest terminal are shadowed and
 ///    count as stale. At the bottom level, the first terminal at or
 ///    below the read horizon establishes a discard boundary. A settled
 ///    tombstone is itself unreachable and is discarded.
 ///
-/// 2. Roaring rollup (`track`): a roaring delta chain is buffered
-///    (pinned, never copied) until its terminal arrives, the primary
-///    changes, or the stream ends — then `rollupRoaring` folds it into a
-///    synthetic state (config triggers permitting) or replays it
-///    verbatim. Once anything for the primary is emitted unbuffered,
-///    the rest streams too (`no_buffer`): everything older is
-///    shadowed, and re-rolling shadowed history would regenerate a
-///    synthetic state under the live terminal on every compaction
-///    until GC collapses the chain.
+/// 2. Roaring rollup (`track`): when the item's newest version is a
+///    roaring delta, the chain down to its terminal (`Item.chain`) is
+///    folded by `rollupRoaring` into a synthetic state (config triggers
+///    permitting) or emitted verbatim. Only that head chain is ever
+///    folded: everything below its terminal is shadowed history, and
+///    re-rolling it would regenerate a synthetic state under the live
+///    terminal on every compaction until GC collapses the chain.
 ///
 /// `track` consumes and decides; the Emitter (passed per call) only
-/// knows how to emit. Emission feeds back through `update`, so the
-/// retention cursor (`primary`) trails the consumption cursor (`cur`)
-/// while a chain is buffered.
+/// knows how to emit, and runs `retain` over what it is handed.
 pub const VersionTracker = struct {
-    /// Retention verdict for one emitted item. `.stale` means kept
-    /// but shadowed — the caller charges the item's own size to the
+    /// Retention verdict for one version. `.stale` means kept but
+    /// shadowed — the caller charges the version's own size to the
     /// stale accounting.
     const Update = enum { retain, stale, discard };
-
-    /// One buffered version: a borrowed value slice plus the pin
-    /// holding its backing storage alive — never a copy.
-    const Buffered = struct {
-        ts: u64,
-        meta: Meta,
-        value: String,
-        pin: Pin,
-    };
 
     allocator: std.mem.Allocator,
     can_discard_versions: bool,
     global_min_read_ts: u64,
 
-    // Retention state (emitted-side cursor).
-    primary: std.ArrayList(u8) = .empty,
+    // Retention state, reset by `startItem`: one item is one primary.
     stale_below: u64 = 0,
     discard_below: u64 = 0,
-
-    // Rollup state (consumed-side cursor).
-    cur: std.ArrayList(u8) = .empty,
-    ns: u64 = 0,
-    tid: u32 = 0,
-    buffered: std.ArrayList(Buffered) = .empty,
-    have_state: bool = false,
-    no_buffer: bool = false,
+    /// The versions of the item being emitted that retention keeps.
+    kept: std.ArrayList(Version) = .empty,
+    /// What a rollup emits: the synthetic state, then the item's
+    /// versions below the delta it replaced.
+    rolled: std.ArrayList(Version) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -129,195 +111,129 @@ pub const VersionTracker = struct {
     }
 
     pub fn deinit(self: *VersionTracker) void {
-        self.clearBufferAndUnpin();
-        self.buffered.deinit(self.allocator);
-        self.cur.deinit(self.allocator);
-        self.primary.deinit(self.allocator);
+        self.kept.deinit(self.allocator);
+        self.rolled.deinit(self.allocator);
     }
 
-    // shouldRetain tracks if an Item should be retained, should be garbage
-    // collected (discard), or if it's stale and would be eligible for discard
-    // later.
-    fn shouldRetain(self: *VersionTracker, item: Item) !Update {
-        if (!item.key.equalPrimary(.{ .primary = self.primary.items })) {
-            self.primary.clearRetainingCapacity();
-            try self.primary.appendSlice(self.allocator, item.key.primary);
+    /// Open retention for a new item (a new primary).
+    fn startItem(self: *VersionTracker) void {
+        // stale_below is only used for tracking stale bytes in the
+        // table. discard_below is for discarding versions.
+        self.stale_below = 0;
+        self.discard_below = 0;
+    }
 
-            // stale_below is only used for tracking stale bytes in the table.
-            // discard_below is for discarding versions.
-            self.stale_below = 0;
-            self.discard_below = 0;
-        }
-
-        if (item.key.timestamp < self.discard_below) {
+    /// Whether one version of the open item is retained, discarded, or
+    /// retained but stale (eligible for discard later). Versions arrive
+    /// newest first.
+    fn retain(self: *VersionTracker, ver: Version) Update {
+        if (ver.ts < self.discard_below) {
             return .discard;
         }
-        const stale = item.key.timestamp < self.stale_below;
+        const stale = ver.ts < self.stale_below;
 
-        if (item.meta.isState() or item.meta.isDeleted()) {
+        if (ver.meta.isState() or ver.meta.isDeleted()) {
             if (self.stale_below == 0) {
-                self.stale_below = item.key.timestamp;
+                self.stale_below = ver.ts;
             }
 
             if (self.can_discard_versions and
-                item.key.timestamp <= self.global_min_read_ts)
+                ver.ts <= self.global_min_read_ts)
             {
-                self.discard_below = item.key.timestamp;
-                if (item.meta.isDeleted()) return .discard;
+                self.discard_below = ver.ts;
+                if (ver.meta.isDeleted()) return .discard;
             }
         }
 
         return if (stale) .stale else .retain;
     }
 
-    /// Every consumed item enters here, in merge order, with the pin
-    /// backing its value (merge.currentPin()). `item.value` is only
-    /// valid during this call unless pinned.
-    fn track(
+    /// Every consumed item enters here, in merge order. Its values are
+    /// valid for the whole call: the merge holds their storage until
+    /// its own `next`, which is what lets the rollup's peek below yield
+    /// for I/O with the chain still borrowed.
+    fn track(t: *VersionTracker, e: *Tree.Emitter, item: Item) !void {
+        if (foldable(e, item)) |chain| return t.rollupRoaring(e, item, chain);
+        try e.emitOne(item);
+    }
+
+    /// The chain a rollup may fold: the item's versions down to and
+    /// including the first terminal, when rollup is on, the newest
+    /// version is a roaring delta, and nothing foreign sits inside the
+    /// chain — every version is a roaring delta, or the terminal is a
+    /// tombstone (its encoding is not looked at) or a roaring state.
+    /// Null otherwise: the item is emitted verbatim. A lone state is
+    /// already rolled, raw rows are not ours, and everything below the
+    /// terminal is shadowed history that is never folded.
+    fn foldable(e: *const Tree.Emitter, item: Item) ?Item {
+        if (!e.tree.opts.rollup_enabled) return null;
+
+        const newest = item.newest();
+        if (!(newest.meta.isRoaring() and newest.meta.isDelta())) return null;
+
+        const chain = item.chain();
+        for (chain.versions.slice()) |ver| {
+            if (ver.meta.isRoaring() and ver.meta.isDelta()) continue;
+            if (ver.meta.isDeleted()) continue;
+            if (ver.meta.isRoaring() and ver.meta.isState()) continue;
+            return null;
+        }
+        return chain;
+    }
+
+    /// Whether `chain` ends in a terminal (a state or a tombstone), as
+    /// against running out of versions on a delta.
+    fn hasTerminal(chain: Item) bool {
+        const vers = chain.versions.slice();
+        return !vers[vers.len - 1].meta.isDelta();
+    }
+
+    /// Resolve `chain`, the foldable head of `item`: fold it into a
+    /// synthetic state when policy allows, else emit the item verbatim.
+    /// The synthetic state carries the newest delta's timestamp,
+    /// REPLACING that delta: readers at read_ts >= t stop there (the
+    /// point of rollup); readers below t skip it and fold the retained
+    /// chain, emitted unchanged beneath — MVCC and GC semantics are
+    /// untouched, the state is just a new terminal for `retain`. An
+    /// empty fold emits a tombstone instead: 0 bytes vs zroar's 64-byte
+    /// empty bitmap, and bottom-level GC can then drop the key outright.
+    fn rollupRoaring(
         t: *VersionTracker,
         e: *Tree.Emitter,
         item: Item,
-        pin: ?Pin,
+        chain: Item,
     ) !void {
-        if (!item.key.equalPrimary(.{ .primary = t.cur.items })) {
-            // Previous primary is over; resolve whatever it buffered.
-            try t.rollupRoaring(e);
-            try t.setPrimary(e, item);
-        }
-        if (t.shouldBuffer(item)) {
-            switch (try t.roaringBuffer(item, pin)) {
-                .more => return,
-                .done => try t.rollupRoaring(e),
-                .foreign => try t.emitBuffered(e),
-            }
-            t.no_buffer = true;
-        } else {
-            try e.emitOne(item);
-            // Everything below an unbuffered emission is shadowed by
-            // it — never buffer (or fold) shadowed history.
-            t.no_buffer = true;
-        }
-    }
-
-    /// End of stream: resolve a chain still buffered.
-    fn finishTracking(t: *VersionTracker, e: *Tree.Emitter) !void {
-        try t.rollupRoaring(e);
-    }
-
-    fn setPrimary(
-        t: *VersionTracker,
-        e: *const Tree.Emitter,
-        item: Item,
-    ) !void {
-        std.debug.assert(t.buffered.items.len == 0);
-        t.cur.clearRetainingCapacity();
-        try t.cur.appendSlice(t.allocator, item.key.primary);
-        t.ns = item.key.namespace;
-        t.tid = item.key.table_id;
-        t.no_buffer = !e.tree.opts.rollup_enabled;
-        t.have_state = false;
-    }
-
-    fn shouldBuffer(t: *const VersionTracker, item: Item) bool {
-        if (t.no_buffer) return false;
-        // An active chain classifies everything through roaringBuffer
-        // — the buffered deltas must reach the output before whatever
-        // ends the chain. A chain only OPENS on a roaring delta: a
-        // lone state is already rolled, and raw rows are not ours.
-        if (t.buffered.items.len > 0) return true;
-        return item.meta.isRoaring() and item.meta.isDelta();
-    }
-
-    pub const RoaringChain = enum {
-        /// A delta: the chain stays open.
-        more,
-        /// A terminal — state or tombstone, whose encoding nibble is
-        /// irrelevant — completed the chain.
-        done,
-        /// Non-roaring mixed into a posting chain (never expected in
-        /// practice): not the fold's to touch.
-        foreign,
-    };
-
-    /// The collection core shared by compaction (`track`) and the
-    /// read walk (Tree.rollupBitmap): buffer one pinned version of the
-    /// current chain, newest first, and classify it off the meta byte.
-    /// A positioned iterator always has a pin.
-    pub fn roaringBuffer(
-        t: *VersionTracker,
-        item: Item,
-        pin_opt: ?Pin,
-    ) !RoaringChain {
-        const pin = pin_opt.?.acquire();
-        errdefer pin.release();
-
-        try t.buffered.append(t.allocator, .{
-            .ts = item.key.timestamp,
-            .meta = item.meta,
-            .value = item.value,
-            .pin = pin,
-        });
-
-        if (item.meta.isRoaring() and item.meta.isDelta()) {
-            return .more;
-        }
-        if (item.meta.isDeleted() or
-            (item.meta.isRoaring() and item.meta.isState()))
-        {
-            t.have_state = true;
-            return .done;
-        }
-        return .foreign;
-    }
-
-    /// The buffered chain is deltas newest-first with at most one
-    /// trailing terminal — everything before that terminal is a delta.
-    fn nDeltas(t: *const VersionTracker) usize {
-        return t.buffered.items.len - @intFromBool(t.have_state);
-    }
-
-    /// Resolve the buffered chain: fold it into a synthetic state when
-    /// policy allows, else replay it verbatim. The synthetic state
-    /// carries the newest delta's timestamp, REPLACING that delta:
-    /// readers at read_ts >= t stop there (the point of rollup);
-    /// readers below t skip it and fold the retained chain, emitted
-    /// unchanged beneath — MVCC and GC semantics are untouched, the
-    /// state is just a new terminal for `update`. An empty fold emits
-    /// a tombstone instead: 0 bytes vs zroar's 64-byte empty bitmap,
-    /// and bottom-level GC can then drop the key outright.
-    fn rollupRoaring(t: *VersionTracker, e: *Tree.Emitter) !void {
-        const items = t.buffered.items;
-        if (items.len == 0) return;
-
         const opts = &e.tree.opts;
         const alloc = e.tree.allocator;
+        const have_state = hasTerminal(chain);
+        const n_deltas = chain.versions.len() - @intFromBool(have_state);
 
         // Policy: fold when the chain is long enough, and — when its
-        // base is not among the inputs (no terminal buffered) — when a
-        // trigger justifies peeking below the destination for it (see
-        // config.zig's rollup_* knobs).
-        const roll = t.nDeltas() >= opts.rollup_min_deltas and
-            (t.have_state or
+        // base is not among the inputs (no terminal in the chain) —
+        // when a trigger justifies peeking below the destination for
+        // it (see config.zig's rollup_* knobs).
+        const roll = n_deltas >= opts.rollup_min_deltas and
+            (have_state or
                 e.dest >= opts.rollup_at_level or
-                t.nDeltas() >= opts.rollup_max_deltas);
-        if (!roll) return t.emitBuffered(e);
+                n_deltas >= opts.rollup_max_deltas);
+        if (!roll) return e.emitOne(item);
 
         var external: ?zroar.Bitmap = null;
         defer if (external) |*eb| eb.deinit();
 
-        if (!t.have_state) {
-            // The oldest buffered ts bounds the peek: the base must
-            // sit strictly below the chain we hold. HLC timestamps
-            // are never 0, so the -1 cannot wrap.
-            const oldest = items[items.len - 1].ts;
+        if (!have_state) {
+            // The oldest ts in the chain bounds the peek: the base must
+            // sit strictly below the chain we hold. HLC timestamps are
+            // never 0, so the -1 cannot wrap.
+            const chain_vers = chain.versions.slice();
+            const oldest = chain_vers[chain_vers.len - 1].ts;
             std.debug.assert(oldest > 0);
 
-            external = e.tree.rollupBitmap(
-                alloc,
-                t.bufferedKey(oldest - 1),
-                e.prio,
-                e.dest + 1,
-            ) catch |err| switch (err) {
+            external = e.tree.rollupBitmap(alloc, .{
+                .key = item.key,
+                .read_ts = oldest - 1,
+                .priority = e.prio,
+            }, e.dest + 1) catch |err| switch (err) {
                 // The chain below can't be folded (mixed or corrupt):
                 // keep everything verbatim, reads keep folding.
                 error.NotRoaring, error.CorruptPosting => {
@@ -326,14 +242,15 @@ pub const VersionTracker = struct {
                             "kept verbatim",
                         .{ e.dest, e.tree.tree_id },
                     );
-                    return t.emitBuffered(e);
+                    return e.emitOne(item);
                 },
                 else => return err,
             };
         }
 
-        var bm = t.foldBufferedToBitmap(
+        var bm = foldChain(
             alloc,
+            chain,
             if (external) |*eb| eb else null,
         ) catch |err| switch (err) {
             // Undecodable delta bytes (structure only — content was
@@ -344,7 +261,7 @@ pub const VersionTracker = struct {
                         "verbatim",
                     .{e.tree.tree_id},
                 );
-                return t.emitBuffered(e);
+                return e.emitOne(item);
             },
             else => return err,
         };
@@ -352,88 +269,58 @@ pub const VersionTracker = struct {
         // Canonical minimal buffer for persistence.
         try bm.compact();
 
-        const newest = items[0];
-        if (bm.isEmpty()) {
-            try e.emitOne(.{
-                .key = t.bufferedKey(newest.ts),
-                .value = "",
-                .meta = .{ .kind = .deleted, .encoding = .roaring },
-            });
-        } else {
-            try e.emitOne(.{
-                .key = t.bufferedKey(newest.ts),
-                .value = bm.toBuffer(),
-                .meta = .{ .kind = .state, .encoding = .roaring },
-            });
-        }
+        // The bitmap's buffer lives until this returns; emitOne copies
+        // it into the builder during the call.
+        const newest = chain.newest();
+        const synthetic: Version = if (bm.isEmpty()) .{
+            .ts = newest.ts,
+            .meta = .{ .kind = .deleted, .encoding = .roaring },
+            .value = "",
+        } else .{
+            .ts = newest.ts,
+            .meta = .{ .kind = .state, .encoding = .roaring },
+            .value = bm.toBuffer(),
+        };
+        t.rolled.clearRetainingCapacity();
+        try t.rolled.append(t.allocator, synthetic);
+        try t.rolled.appendSlice(t.allocator, item.versions.slice()[1..]);
+        try e.emitOne(.{
+            .key = item.key,
+            .versions = .{ .many = t.rolled.items },
+        });
         e.stats.rollups += 1;
-        for (items[1..]) |b| try e.emitOne(t.bufferedItem(b));
-        t.clearBufferAndUnpin();
     }
 
-    /// Fold the buffered chain into a bitmap — THE fold: compaction
-    /// (`rollupRoaring`) and reads (Tree.rollupBitmap) both resolve
-    /// through here, which is what keeps rollup read-invariant.
-    /// Applies deltas oldest→newest (reverse buffer order), removes
-    /// before adds within each. Base priority: a tombstone terminal
-    /// folds from empty; a state terminal via fromBufferCopy (SST
-    /// values sit at arbitrary offsets, so zroar's aligned zero-copy
-    /// path is not usable); else `external` (compaction read-below)
-    /// or the empty set. Delta bytes get an O(1) structural check —
-    /// without it a truncated element region decodes as an empty
-    /// list — but content contracts were enforced at write time
-    /// (validateDelta). Leaves the buffer intact — compaction
-    /// still replays the retained chain after the synthetic state.
-    pub fn foldBufferedToBitmap(
-        t: *VersionTracker,
+    /// Fold `chain` into a bitmap — THE fold: compaction
+    /// (`rollupRoaring`) and reads (MultiGet.bitmap through
+    /// Tree.rollupBitmap) both resolve through `_read.baseBitmap` and
+    /// `_read.applyDelta`, which is what keeps rollup read-invariant.
+    /// Applies deltas oldest→newest (the chain is newest first),
+    /// removes before adds within each. Base priority: a tombstone
+    /// terminal folds from empty; a state terminal via fromBufferCopy
+    /// (SST values sit at arbitrary offsets, so zroar's aligned
+    /// zero-copy path is not usable); else `external` (compaction
+    /// read-below) or the empty set. Delta bytes get an O(1) structural
+    /// check — without it a truncated element region decodes as an
+    /// empty list — but content contracts were enforced at write time
+    /// (validateDelta).
+    pub fn foldChain(
         alloc: std.mem.Allocator,
+        chain: Item,
         external: ?*const zroar.Bitmap,
     ) !zroar.Bitmap {
-        const items = t.buffered.items;
-
-        const terminal: ?Item = if (t.have_state)
-            t.bufferedItem(items[items.len - 1])
-        else
-            null;
+        const vers = chain.versions.slice();
+        const have_state = hasTerminal(chain);
+        const terminal: ?Version = if (have_state) vers[vers.len - 1] else null;
         var bm = try _read.baseBitmap(alloc, terminal, external);
         errdefer bm.deinit();
 
-        // The deltas are everything but a trailing terminal, newest
-        // first — apply in reverse.
-        var i = t.nDeltas();
+        var i = vers.len - @intFromBool(have_state);
         while (i > 0) {
             i -= 1;
-            try _read.applyDelta(&bm, items[i].value);
+            try _read.applyDelta(&bm, vers[i].value);
         }
         return bm;
-    }
-
-    fn emitBuffered(t: *VersionTracker, e: *Tree.Emitter) !void {
-        for (t.buffered.items) |b| try e.emitOne(t.bufferedItem(b));
-        t.clearBufferAndUnpin();
-    }
-
-    fn bufferedKey(t: *const VersionTracker, ts: u64) Key {
-        return .{
-            .namespace = t.ns,
-            .table_id = t.tid,
-            .primary = t.cur.items,
-            .timestamp = ts,
-        };
-    }
-
-    fn bufferedItem(t: *const VersionTracker, b: Buffered) Item {
-        return .{
-            .key = t.bufferedKey(b.ts),
-            .value = b.value,
-            .meta = b.meta,
-        };
-    }
-
-    fn clearBufferAndUnpin(t: *VersionTracker) void {
-        for (t.buffered.items) |b| b.pin.release();
-        t.buffered.clearRetainingCapacity();
-        t.have_state = false;
     }
 };
 
@@ -782,57 +669,62 @@ pub const Emitter = struct {
         };
     }
 
-    /// Error paths land here with a chain still buffered; dropping
-    /// it is fine — the whole compaction output is being
-    /// abandoned. The happy path must call `finish` first: a
-    /// forgotten trailing chain surfaces loudly as lost keys in
-    /// the compact log's expected_in reconciliation.
     fn deinit(e: *Emitter) void {
         e.tracker.deinit();
     }
 
-    /// Feed one item in merge (consumption) order, with the pin
-    /// backing its value (merge.currentPin()).
-    fn push(e: *Emitter, item: Item, pin: ?Pin) !void {
-        e.stats.keys_in += 1;
-        e.stats.bytes_in += item.key.primary.len + item.value.len;
-        try e.tracker.track(e, item, pin);
-    }
-
-    /// End of stream: resolve a chain still being buffered.
-    fn finish(e: *Emitter) !void {
-        try e.tracker.finishTracking(e);
-    }
-
-    fn emitOne(e: *Emitter, item: Item) !void {
-        const nbytes = item.key.primary.len + item.value.len;
-        const ret = try e.tracker.shouldRetain(item);
-        if (ret == .discard) {
-            e.stats.dropped_bytes += nbytes;
-            return;
+    /// Feed one item — one primary with its versions — in merge
+    /// (consumption) order. Nothing is held across calls: the merge
+    /// keeps the item's storage pinned until its own `next`.
+    fn push(e: *Emitter, item: Item) !void {
+        e.stats.keys_in += item.versions.len();
+        for (item.versions.slice()) |ver| {
+            e.stats.bytes_in += item.key.primary.len + ver.value.len;
         }
+        try e.tracker.track(e, item);
+    }
+
+    /// Write the versions of `item` that retention keeps as one entry
+    /// of the output.
+    fn emitOne(e: *Emitter, item: Item) !void {
+        const t = &e.tracker;
+        t.startItem();
+        t.kept.clearRetainingCapacity();
+        var stale_bytes: usize = 0;
+        for (item.versions.slice()) |ver| {
+            const nbytes = item.key.primary.len + ver.value.len;
+            switch (t.retain(ver)) {
+                .discard => {
+                    e.stats.dropped_bytes += nbytes;
+                    continue;
+                },
+                .stale => stale_bytes += nbytes,
+                .retain => {},
+            }
+            try t.kept.append(t.allocator, ver);
+            e.stats.keys_out += 1;
+            e.stats.bytes_out += nbytes;
+        }
+        if (t.kept.items.len == 0) return;
 
         if (e.bld.table_bytes.items.len >= e.file_sz) {
-            // We are not going to break up a primary key across tables. All the
-            // versions for this key should live in the same table. This avoids
-            // a scenario where a table with a higher version key ends up
-            // getting compacted and living in a lower level. We expect that the
-            // flow of keys is from top to bottom levels, so we're expecting to
-            // find higher version keys at higher levels. This expectation is
-            // used by get fn to stop searching for key as soon as we're able to
-            // find a version >= search key.
-            if (!item.key.equalPrimary(e.bld.lastKey())) {
-                try e.tree.flushBuilderOutput(e.bld, e.group, e.file_ids);
-                e.bld.reset();
-            }
+            // An item is a whole primary, so splitting the output here
+            // never separates a primary's versions across tables. That
+            // matters: a table holding a newer version of a key could
+            // otherwise be compacted below a table holding an older
+            // one, and the read path expects newer versions at higher
+            // levels so it can stop at the first hit.
+            try e.tree.flushBuilderOutput(e.bld, e.group, e.file_ids);
+            e.bld.reset();
         }
-        try e.bld.addItem(item);
-        if (ret == .stale) {
-            e.bld.addStaleBytes(nbytes);
-            e.stats.stale_bytes += nbytes;
+        try e.bld.addItem(.{
+            .key = item.key,
+            .versions = .{ .many = t.kept.items },
+        });
+        if (stale_bytes > 0) {
+            e.bld.addStaleBytes(stale_bytes);
+            e.stats.stale_bytes += stale_bytes;
         }
-        e.stats.keys_out += 1;
-        e.stats.bytes_out += nbytes;
     }
 };
 
@@ -986,7 +878,10 @@ pub fn buildCompaction(
         .concat = ConcatIterator.init(bot_iters),
     };
 
-    var merge = MergeIterator.init(self.allocator, all_iters);
+    var merge = MergeIterator.init(self.allocator, all_iters) catch |err| {
+        for (all_iters) |*it| it.deinit();
+        return err;
+    };
     defer merge.deinit();
     try merge.seekRange(self.key_range.left, self.key_range.right);
 
@@ -1026,11 +921,9 @@ pub fn buildCompaction(
     defer emitter.deinit();
 
     while (merge.itemRef()) |item| {
-        try emitter.push(item, merge.currentPin());
+        try emitter.push(item);
         try merge.next();
     }
-    // Resolve a roaring run still buffered at end of stream.
-    try emitter.finish();
 
     // Flush any remaining data.
     try self.flushBuilderOutput(&bld, &flush_group, file_ids);

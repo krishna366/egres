@@ -63,7 +63,7 @@ pub const Oracle = struct {
 
     /// Record a run of committed items — one mu hold for the whole write
     /// set (the apply fiber records a commit at once). Each item's
-    /// timestamp is its commit ts (apply already rewrote it to the
+    /// version timestamp is its commit ts (apply stamps it with the
     /// entry's HLC); apply order makes per-key timestamps non-decreasing,
     /// and the max-fold keeps a same-window re-commit from regressing.
     pub fn updateItems(self: *Oracle, items: []const zdb.kv.Item) !void {
@@ -71,7 +71,7 @@ pub const Oracle = struct {
         defer self.mu.unlock();
         for (items) |item| {
             const h = item.key.identityHash();
-            const ts = item.key.timestamp;
+            const ts = item.newest().ts;
             const gop = try self.current.map.getOrPut(self.allocator, h);
             if (!gop.found_existing or gop.value_ptr.* < ts)
                 gop.value_ptr.* = ts;

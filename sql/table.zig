@@ -158,7 +158,8 @@ pub const Table = struct {
     /// (row.parseCol) — no full-row decode.
     pub fn parseCol(self: *const Table, item: Item, col: *const Column) _value.Value {
         if (col.isEgid()) return .{ .uint8 = _key.decodeEgid(item.key.primary).? };
-        return _row.parseCol(&self.ps, item.value, self.ps.columns[col.pos]);
+        const value = item.newest().value;
+        return _row.parseCol(&self.ps, value, self.ps.columns[col.pos]);
     }
 };
 
@@ -166,9 +167,8 @@ pub const Table = struct {
 /// catalog tree `catalog_tid`. Keys are (owner_id, member_id) BE pairs and
 /// member ids are 1-based, so the window is [owner.0, (owner+1).0) — an
 /// exclusive right edge no real key equals — with the upper bound dropped
-/// at owner_id maxInt. ts=maxInt makes the primary compare come first. The
-/// struct owns the boundary key bytes: keep it alive (and in place) for the
-/// whole scan, since range() borrows them.
+/// at owner_id maxInt. The struct owns the boundary key bytes: keep it
+/// alive (and in place) for the whole scan, since range() borrows them.
 const CatalogWindow = struct {
     ns: u64,
     catalog_tid: u32,
@@ -188,11 +188,16 @@ const CatalogWindow = struct {
 
     fn range(self: *const CatalogWindow) KeyRange {
         return (KeyRange{
-            .left = .{ .namespace = self.ns, .table_id = self.catalog_tid, .primary = &self.left, .timestamp = std.math.maxInt(u64) },
-            .right = if (self.has_upper)
-                .{ .namespace = self.ns, .table_id = self.catalog_tid, .primary = &self.right, .timestamp = std.math.maxInt(u64) }
-            else
-                .{},
+            .left = .{
+                .namespace = self.ns,
+                .table_id = self.catalog_tid,
+                .primary = &self.left,
+            },
+            .right = if (self.has_upper) .{
+                .namespace = self.ns,
+                .table_id = self.catalog_tid,
+                .primary = &self.right,
+            } else .{},
         }).limitToTable(self.ns, self.catalog_tid);
     }
 };
@@ -208,7 +213,8 @@ const LoadCtx = struct {
         // Decode all seven catalog cells (column_id order = SELECT *).
         // TODO: How do we know the version of the row, and whether the physical
         // schema corresponds to that version?
-        _row.unmarshalRow(c.a, c.catalog_ps, item.value, &.{}, &c.scratch) catch |e| {
+        const val = item.newest().value;
+        _row.unmarshalRow(c.a, c.catalog_ps, val, &.{}, &c.scratch) catch |e| {
             c.err = e;
             return false;
         };
@@ -316,7 +322,8 @@ const IndexLoadCtx = struct {
     err: ?anyerror = null,
 
     fn emit(c: *IndexLoadCtx, item: Item) anyerror!bool {
-        _row.unmarshalRow(c.a, c.ips, item.value, &.{}, &c.scratch) catch |e| {
+        const value = item.newest().value;
+        _row.unmarshalRow(c.a, c.ips, value, &.{}, &c.scratch) catch |e| {
             c.err = e;
             return false;
         };

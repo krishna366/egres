@@ -16,8 +16,8 @@ const _skl = @import("skl/skiplist.zig");
 const DeltaReader = @import("buffers.gen.zig").RoaringDeltaReader;
 
 const Forest = @import("forest.zig").Forest;
-const Key = @import("kv.zig").Key;
-const Meta = @import("kv.zig").Meta;
+const kv = @import("kv.zig");
+const Key = kv.Key;
 const KeyRange = _level.KeyRange;
 const Level = _level.Level;
 const Item = _table.table.Item;
@@ -61,11 +61,14 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
     const alloc = mg.allocator;
     {
         const srcs = try self.memtables.getIterators(alloc, mg.opts.pending);
-        var merge: Iterator = .{ .merge = MergeIterator.init(alloc, srcs) };
-        defer {
-            merge.deinit(); // releases each source's skiplist ref
-            alloc.free(srcs);
-        }
+        defer alloc.free(srcs);
+        var merge: Iterator = .{
+            .merge = MergeIterator.init(alloc, srcs) catch |err| {
+                for (srcs) |*it| it.deinit();
+                return err;
+            },
+        };
+        defer merge.deinit(); // releases each source's skiplist ref
         try mg.drainMerge(&merge);
     }
 
@@ -75,7 +78,7 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
     const pend = mg.pending.items;
     var i: usize = 0;
     while (i < pend.len) {
-        const first = mg.keyAt(pend[i], mg.opts.read_ts);
+        const first = mg.keyAt(pend[i]);
         const tree = trees.getTreeByKey(first) orelse {
             i += 1;
             continue;
@@ -84,7 +87,7 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
 
         var j = i + 1;
         while (j < pend.len) : (j += 1) {
-            const key = mg.keyAt(pend[j], mg.opts.read_ts);
+            const key = mg.keyAt(pend[j]);
             const owner = trees.getTreeByKey(key) orelse break;
             defer owner.release();
 
@@ -96,24 +99,29 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
     MultiGet.compactPending(&mg.pending);
 }
 
-/// Get a value by key: the newest version at or below
-/// `search_key.timestamp`, from the memtables (current, then
-/// immutables newest-to-oldest) or the owning tree. Returned Item is
-/// owned by the caller; call item.free(allocator) when done.
+/// One point read: the row, the timestamp it is read as of, and the
+/// I/O priority of the block reads it may issue.
+pub const Lookup = struct {
+    key: Key,
+    /// Versions above this are not visible. The default reads the
+    /// latest.
+    read_ts: u64 = std.math.maxInt(u64),
+    priority: vfs.Priority = .p0,
+};
+
+/// Get a value by key: the newest version at or below `read_ts`, from
+/// the memtables (current, then immutables newest-to-oldest) or the
+/// owning tree. Returned Item is owned by the caller; call
+/// item.free(allocator) when done.
 ///
-/// A key deleted at or below `search_key.timestamp` reads as absent: the
-/// tombstone wins the lookup and is reported as null. Rejects reads below
+/// A key deleted at or below `read_ts` reads as absent: the tombstone
+/// wins the lookup and is reported as null. Rejects reads below
 /// `global_min_read`, whose versions may already have been compacted away.
-pub fn get(
-    self: *Forest,
-    allocator: std.mem.Allocator,
-    search_key: Key,
-    priority: vfs.Priority,
-) !?Item {
-    if (search_key.timestamp < self.globalMinRead()) {
+pub fn get(self: *Forest, allocator: std.mem.Allocator, lookup: Lookup) !?Item {
+    if (lookup.read_ts < self.globalMinRead()) {
         return error.ReadBelowMinRead;
     }
-    return getOne(self, allocator, search_key, priority, false);
+    return getOne(self, allocator, lookup, false);
 }
 
 /// get without the tombstone filter or the horizon check: returns the
@@ -123,40 +131,37 @@ pub fn get(
 pub fn getRaw(
     self: *Forest,
     allocator: std.mem.Allocator,
-    search_key: Key,
-    priority: vfs.Priority,
+    lookup: Lookup,
 ) !?Item {
-    return getOne(self, allocator, search_key, priority, true);
+    return getOne(self, allocator, lookup, true);
 }
 
 /// A one-key row MultiGet, its item duped out with `allocator`.
 fn getOne(
     self: *Forest,
     allocator: std.mem.Allocator,
-    search_key: Key,
-    priority: vfs.Priority,
+    lookup: Lookup,
     include_deleted: bool,
 ) !?Item {
-    const keys = [_]String{search_key.primary};
+    const keys = [_]String{lookup.key.primary};
     var mg = try MultiGet.init(
         allocator,
-        search_key.namespace,
-        search_key.table_id,
+        lookup.key.namespace,
+        lookup.key.table_id,
         &keys,
         .{
-            .read_ts = search_key.timestamp,
-            .priority = priority,
+            .read_ts = lookup.read_ts,
+            .priority = lookup.priority,
             .include_deleted = include_deleted,
         },
     );
     defer mg.deinit();
     try fillMultiGet(self, &mg);
-    const found = mg.item(search_key.primary) orelse return null;
+    const found = mg.item(lookup.key.primary) orelse return null;
     return try found.dupe(allocator);
 }
 
-/// The posting bitmap for `search_key`'s primary as of
-/// `search_key.timestamp` (the read_ts — same convention as `get`).
+/// The posting bitmap for `lookup.key` as of `lookup.read_ts`.
 /// A one-key posting MultiGet: the memtables, then the owning tree's
 /// levels, stopping at the first terminal (a state or a tombstone).
 /// After compaction rollup the newest version is usually already a
@@ -172,23 +177,22 @@ fn getOne(
 pub fn getBitmap(
     self: *Forest,
     allocator: std.mem.Allocator,
-    search_key: Key,
-    priority: vfs.Priority,
+    lookup: Lookup,
 ) !zroar.Bitmap {
-    if (search_key.timestamp < self.globalMinRead()) {
+    if (lookup.read_ts < self.globalMinRead()) {
         return error.ReadBelowMinRead;
     }
-    const keys = [_]String{search_key.primary};
+    const keys = [_]String{lookup.key.primary};
     var mg = try MultiGet.init(
         allocator,
-        search_key.namespace,
-        search_key.table_id,
+        lookup.key.namespace,
+        lookup.key.table_id,
         &keys,
-        .{ .read_ts = search_key.timestamp, .priority = priority },
+        .{ .read_ts = lookup.read_ts, .priority = lookup.priority },
     );
     defer mg.deinit();
     try fillMultiGet(self, &mg);
-    return mg.bitmap(allocator, search_key.primary);
+    return mg.bitmap(allocator, lookup.key.primary);
 }
 
 /// Many keys of one table, resolved together: for each, its versions
@@ -243,47 +247,36 @@ pub const MultiGet = struct {
         include_deleted: bool = false,
     };
 
-    /// One version of a key as found in a source, borrowed: `value`
-    /// points into the block or arena `pin` holds. Prepended as
-    /// found, and sources are walked newest first, so a node's list
-    /// reads OLDEST first: the head is the state or tombstone when
-    /// one was found, the rest are the deltas in the order a fold
-    /// applies them.
-    pub const Version = struct {
-        ts: u64,
-        meta: Meta,
-        value: String,
-        pin: Pin,
-        next: ?*Version,
-    };
-
-    /// One key of the batch and the versions found for it so far.
+    /// One key of the batch and the versions found for it so far,
+    /// newest first: sources are walked newest first and each hands
+    /// over a newest-first slice. The values are borrowed from the
+    /// storage `pins` hold.
     pub const Node = struct {
         key: String,
         /// bloomHash(key), once per key: every table probe reuses it.
         hash: u64,
-        /// Oldest taken first (see Version). Null until a source has
-        /// one.
-        head: ?*Version = null,
+        versions: std.ArrayList(kv.Version) = .empty,
+        pins: std.ArrayList(Pin) = .empty,
 
         /// Versions above this are not wanted from the next source:
-        /// the head's ts - 1 once something was taken, so the next
-        /// source down starts strictly below what was consumed (a
+        /// the oldest taken ts - 1 once something was taken, so the
+        /// next source down starts strictly below what was consumed (a
         /// version that re-surfaces at a lower source after a flush
         /// or compaction arrives above it and is skipped); read_ts
         /// before that.
         pub fn maxTs(self: *const Node, read_ts: u64) u64 {
-            const head = self.head orelse return read_ts;
+            if (self.versions.items.len == 0) return read_ts;
+            const oldest = self.versions.getLast();
             // Real HLC timestamps are never 0: no wrap.
-            std.debug.assert(head.ts > 0);
-            return head.ts - 1;
+            std.debug.assert(oldest.ts > 0);
+            return oldest.ts - 1;
         }
 
-        /// Nothing more is wanted: the head is a state or a tombstone,
-        /// which closes the chain. A delta keeps it open.
+        /// Nothing more is wanted: the oldest taken is a state or a
+        /// tombstone, which closes the chain. A delta keeps it open.
         pub fn done(self: *const Node) bool {
-            const head = self.head orelse return false;
-            return !head.meta.isDelta();
+            if (self.versions.items.len == 0) return false;
+            return !self.versions.getLast().meta.isDelta();
         }
 
         fn lessByKey(_: void, a: Node, b: Node) bool {
@@ -339,28 +332,24 @@ pub const MultiGet = struct {
     /// Drops every pin and every borrow handed out.
     pub fn deinit(self: *MultiGet) void {
         for (self.nodes) |node| {
-            var cur = node.head;
-            while (cur) |ver| : (cur = ver.next) ver.pin.release();
+            for (node.pins.items) |pin| pin.release();
         }
         self.arena.deinit();
     }
 
-    /// Row result: the newest version of `key` at or below read_ts,
-    /// null if absent or deleted (unless include_deleted). Its key is
-    /// `key` at that version's timestamp, its value a borrow valid
-    /// until deinit. `key` must be one of the batch's keys. A row's
-    /// chain is one version; for a chain of deltas this is the newest
-    /// delta, the version `get` has always returned.
+    /// Row result: `key`'s versions at or below read_ts, newest first,
+    /// null if absent or deleted (unless include_deleted). The values
+    /// are borrows valid until deinit. `key` must be one of the batch's
+    /// keys. A row's chain is one version; a chain of deltas starts at
+    /// the newest delta, the version `get` has always returned.
     pub fn item(self: *const MultiGet, key: String) ?Item {
         const node = self.find(key);
-        var ver = node.head orelse return null;
-        while (ver.next) |next| ver = next;
-        if (ver.meta.isDeleted() and !self.opts.include_deleted) return null;
-        return .{
-            .key = self.keyAt(node, ver.ts),
-            .value = ver.value,
-            .meta = ver.meta,
-        };
+        const vers = node.versions.items;
+        if (vers.len == 0) return null;
+        if (vers[0].meta.isDeleted() and !self.opts.include_deleted) {
+            return null;
+        }
+        return .{ .key = self.keyAt(node), .versions = .{ .many = vers } };
     }
 
     /// Posting result: the chain of `key` folded into a bitmap owned
@@ -377,31 +366,32 @@ pub const MultiGet = struct {
         // Pending posting ops are the sql layer's to overlay.
         std.debug.assert(self.opts.pending == null);
         const node = self.find(key);
-        var cur = node.head;
-        var terminal: ?Item = null;
-        if (cur) |head| {
+        const vers = node.versions.items;
+        var terminal: ?kv.Version = null;
+        var deltas = vers;
+        if (vers.len > 0) {
+            const oldest = vers[vers.len - 1];
             // A tombstone's encoding is not looked at, as in compaction.
-            if (!head.meta.isDeleted() and !head.meta.isRoaring()) {
+            if (!oldest.meta.isDeleted() and !oldest.meta.isRoaring()) {
                 return error.NotRoaring;
             }
             // A state or a tombstone is the base the deltas fold onto.
-            // A delta at the head means the chain has no base here and
+            // A delta at the end means the chain has no base here and
             // folds from empty.
-            if (!head.meta.isDelta()) {
-                terminal = .{
-                    .key = self.keyAt(node, head.ts),
-                    .value = head.value,
-                    .meta = head.meta,
-                };
-                cur = head.next;
+            if (!oldest.meta.isDelta()) {
+                terminal = oldest;
+                deltas = vers[0 .. vers.len - 1];
             }
         }
         var bm = try baseBitmap(alloc, terminal, null);
         errdefer bm.deinit();
 
-        while (cur) |ver| : (cur = ver.next) {
-            if (!ver.meta.isRoaring()) return error.NotRoaring;
-            try applyDelta(&bm, ver.value);
+        // The slice is newest first; a fold applies oldest first.
+        var i = deltas.len;
+        while (i > 0) {
+            i -= 1;
+            if (!deltas[i].meta.isRoaring()) return error.NotRoaring;
+            try applyDelta(&bm, deltas[i].value);
         }
         return bm;
     }
@@ -409,7 +399,7 @@ pub const MultiGet = struct {
     /// Whether `key`'s chain has any version at all (rollupBitmap's
     /// null result).
     pub fn hasVersions(self: *const MultiGet, key: String) bool {
-        return self.find(key).head != null;
+        return self.find(key).versions.items.len > 0;
     }
 
     /// The node of a key that was passed to init.
@@ -424,13 +414,12 @@ pub const MultiGet = struct {
         return &self.nodes[idx];
     }
 
-    /// `node`'s key as a full Key at `ts`.
-    pub fn keyAt(self: *const MultiGet, node: *const Node, ts: u64) Key {
+    /// `node`'s key as a full Key.
+    pub fn keyAt(self: *const MultiGet, node: *const Node) Key {
         return .{
             .namespace = self.ns,
             .table_id = self.table_id,
             .primary = node.key,
-            .timestamp = ts,
         };
     }
 
@@ -479,8 +468,8 @@ pub const MultiGet = struct {
             if (open.len == 0) return;
 
             const range = KeyRange{
-                .left = self.keyAt(open[0], std.math.maxInt(u64)),
-                .right = self.keyAt(open[open.len - 1], 0),
+                .left = self.keyAt(open[0]),
+                .right = self.keyAt(open[open.len - 1]),
             };
             const tables = blk: {
                 const held = tree.mu.hold(.shared, @src());
@@ -560,8 +549,7 @@ pub const MultiGet = struct {
         const arloc = self.arena.allocator();
         self.blocks.clearRetainingCapacity();
         for (self.accepted.items) |node| {
-            const at = self.keyAt(node, node.maxTs(self.opts.read_ts));
-            const idx = tbl.blockFor(at) orelse return;
+            const idx = tbl.blockFor(self.keyAt(node)) orelse return;
             if (self.blocks.items.len > 0 and self.blocks.getLast() == idx) {
                 continue;
             }
@@ -575,38 +563,41 @@ pub const MultiGet = struct {
         );
     }
 
-    /// Take `node`'s versions from one positioned source, newest
-    /// first, until the node is done or the source has no more of
-    /// them: the seek is bounded to the key's own run of versions
-    /// (`Key.end`), which is load-bearing for the memtable merge, whose
-    /// sources span the namespace.
+    /// Take `node`'s versions from one positioned source, newest first,
+    /// until the node is done or the source leaves the key. The seek is
+    /// unbounded and lands on the key's newest version; of each item
+    /// the versions at or below what the node still wants are taken,
+    /// down to the first terminal. The key check ends the walk, and it
+    /// compares whole keys because the memtable merge's sources span
+    /// namespaces and tables. A source that yields one version per
+    /// item (an SST until it packs) is walked item by item; a merged
+    /// source hands the whole key over in one item.
     fn takeVersions(self: *MultiGet, node: *Node, it: *Iterator) !void {
         const read_ts = self.opts.read_ts;
-        const start = self.keyAt(node, node.maxTs(read_ts));
+        const start = self.keyAt(node);
 
-        try it.seekRange(start, start.end());
+        try it.seekRange(start, .{});
         while (it.itemRef()) |found| {
-            // The seek starts at the key at maxTs and versions sort
-            // newest first, so nothing newer can be yielded.
-            std.debug.assert(found.key.equalPrimary(start));
-            std.debug.assert(found.key.timestamp <= node.maxTs(read_ts));
-            try self.take(node, found, it.currentPin().?);
-            if (node.done()) return;
+            if (found.key.order(start) != .eq) return;
+            if (found.visibleAt(node.maxTs(read_ts))) |vis| {
+                var buf: [1]Pin = undefined;
+                try self.take(node, vis.chain(), it.currentPins(&buf));
+                if (node.done()) return;
+            }
             try it.next();
         }
     }
 
-    /// Prepend one version, pinned.
-    fn take(self: *MultiGet, node: *Node, found: Item, pin: Pin) !void {
-        const ver = try self.arena.allocator().create(Version);
-        ver.* = .{
-            .ts = found.key.timestamp,
-            .meta = found.meta,
-            .value = found.value,
-            .pin = pin.acquire(),
-            .next = node.head,
-        };
-        node.head = ver;
+    /// Append `wanted`'s versions, holding the storage behind them.
+    fn take(
+        self: *MultiGet,
+        node: *Node,
+        wanted: Item,
+        pins: []const Pin,
+    ) !void {
+        const arloc = self.arena.allocator();
+        try node.versions.appendSlice(arloc, wanted.versions.slice());
+        for (pins) |pin| try node.pins.append(arloc, pin.acquire());
     }
 };
 
@@ -615,11 +606,11 @@ pub const MultiGet = struct {
 /// values sit at arbitrary offsets, so zroar's aligned zero-copy path
 /// is not usable), else `external` cloned (compaction's read-below),
 /// else empty. Reads (`MultiGet.bitmap`) and compaction
-/// (`VersionTracker.foldBufferedToBitmap`) both fold through this
+/// (`VersionTracker.foldChain`) both fold through this
 /// and `applyDelta`, which is what keeps rollup read-invariant.
 pub fn baseBitmap(
     alloc: std.mem.Allocator,
-    terminal: ?Item,
+    terminal: ?kv.Version,
     external: ?*const zroar.Bitmap,
 ) !zroar.Bitmap {
     if (terminal) |term| {
@@ -647,19 +638,19 @@ pub fn applyDelta(bm: *zroar.Bitmap, delta: String) !void {
 
 /// How much of a key's version history a scan should surface.
 ///
-/// The merge iterator hands us every version of every primary, newest
-/// first; these decide which of them reach the callback. The defaults
-/// make a scan agree with `get`: the current value of each live key, and
-/// nothing for a deleted one.
+/// The merge iterator hands us one item per primary with every version
+/// of it, newest first; these decide which of them reach the callback.
+/// The defaults make a scan agree with `get`: the current value of each
+/// live key, and nothing for a deleted one.
 pub const ScanOptions = struct {
-    /// Stop after handing this many items to the callback. Bounds what the
-    /// caller RECEIVES, not what the scan walks past: versions skipped by
-    /// the filters below are free. 0 returns nothing. The default is
-    /// unbounded — the whole range.
+    /// Stop after handing this many items — one per key — to the
+    /// callback. Bounds what the caller RECEIVES, not what the scan walks
+    /// past: keys the filters below skip are free. 0 returns nothing. The
+    /// default is unbounded — the whole range.
     max_rows: u64 = std.math.maxInt(u64),
-    /// Max versions to emit per primary, newest first. 1 (the default) is
-    /// "just the current value". Clamped up to 1 — there's no use for a
-    /// scan that returns zero versions of every key, and `max_rows = 0`
+    /// Max versions in each emitted item, newest first. 1 (the default)
+    /// is "just the current value". Clamped up to 1 — there's no use for
+    /// a scan that returns zero versions of every key, and `max_rows = 0`
     /// already says "return nothing".
     num_versions: u32 = 1,
     /// When false, a primary stops emitting at its first tombstone: the
@@ -828,26 +819,8 @@ pub const Cursor = struct {
     pins: std.ArrayList(Pin) = .empty,
     /// No tree left to visit.
     done: bool = false,
-    /// Per-primary emit state. A primary's versions arrive contiguously,
-    /// newest first, so this only ever tracks one run at a time.
-    ///
-    /// The state deliberately spans tree hops rather than resetting per
-    /// tree: a primary can't straddle two trees (findSplitKey pins the
-    /// split above every version of its key), so a hop always lands on
-    /// a new primary anyway — and if that ever stops holding, carrying
-    /// the state is the behaviour that stays correct.
-    ///
-    /// `cur_primary` owns its bytes: item.key.primary points into the
-    /// block iterator's key_buf, which the next merge.next() overwrites.
-    /// Empty doubles as "no run yet" — a stored primary is never empty
-    /// (an empty primary is the open-bound sentinel, and Key.marshalTo
-    /// encodes it as zero bytes), so the first item can never compare
-    /// equal to it.
-    cur_primary: std.ArrayList(u8) = .empty,
-    versions_emitted: u32 = 0,
-    skip_versions: bool = false,
     /// Items handed out so far — what `scan` returns. Bounded by
-    /// `opts.max_rows`; versions the filters skip are free.
+    /// `opts.max_rows`; keys the filters skip are free.
     emitted: u64 = 0,
 
     /// Releases the open merge (table + skiplist refs) and the cursor's
@@ -857,7 +830,6 @@ pub const Cursor = struct {
         self.pins.deinit(self.allocator);
         if (self.merge) |*m| m.deinit();
         self.merge = null;
-        self.cur_primary.deinit(self.allocator);
         self.arena.deinit();
     }
 
@@ -866,11 +838,11 @@ pub const Cursor = struct {
     /// sticky.
     ///
     /// The returned Item is a BORROW valid until the following `next`
-    /// or `deinit`: its key points into a source's key buffer, its
-    /// value into a block or arena the source holds a ref on, and the
-    /// advance overwrites the one and may release the other. Copy what
-    /// must outlive the call — except the value under
-    /// `opts.pin_values`, which stays valid until `releasePins`.
+    /// or `deinit`: its key and versions point into the merge's
+    /// buffers, its values into blocks or arenas the merge holds refs
+    /// on, and the advance overwrites the ones and may release the
+    /// others. Copy what must outlive the call — except the values
+    /// under `opts.pin_values`, which stay valid until `releasePins`.
     pub fn next(self: *Cursor) !?Item {
         while (self.emitted < self.opts.max_rows) {
             if (self.merge == null) {
@@ -907,31 +879,31 @@ pub const Cursor = struct {
         return null;
     }
 
-    /// Hold the storage behind the parked item's value, unless the
-    /// last pin already covers it (Pin's doc has the stability
-    /// guarantee a hold gives).
+    /// Hold the storage behind the parked item's values, one pin per
+    /// source it drew from, unless the last pin already covers it
+    /// (Pin's doc has the stability guarantee a hold gives).
     fn pinCurrent(
         self: *Cursor,
-        merge: *const merge_iterator.MergeIterator,
+        merge: *merge_iterator.MergeIterator,
     ) !void {
-        const pin = merge.currentPin().?;
-        const covered = self.pins.items.len > 0 and
-            std.meta.eql(self.pins.getLast(), pin);
-        if (!covered) try self.pins.append(self.allocator, pin.acquire());
+        for (merge.currentPins()) |pin| {
+            const covered = self.pins.items.len > 0 and
+                std.meta.eql(self.pins.getLast(), pin);
+            if (!covered) try self.pins.append(self.allocator, pin.acquire());
+        }
     }
 
     /// The caller is done with the values handed out so far: drop
     /// their holds — except the item most recently handed out, which
     /// the merge is still parked on and the caller may still be
     /// holding; it stays pinned. No-op unless `opts.pin_values`.
-    pub fn releasePins(self: *Cursor) void {
+    pub fn releasePins(self: *Cursor) !void {
         for (self.pins.items) |pin| pin.release();
         self.pins.clearRetainingCapacity();
         if (self.opts.pin_values and self.next_pending) {
-            // That item's own pin sat in the list, so the capacity
-            // retained covers this one.
-            const pin = self.merge.?.currentPin().?;
-            self.pins.appendAssumeCapacity(pin.acquire());
+            for (self.merge.?.currentPins()) |pin| {
+                try self.pins.append(self.allocator, pin.acquire());
+            }
         }
     }
 
@@ -994,63 +966,54 @@ pub const Cursor = struct {
     }
 
     /// Walk the open merge to the next item the options admit and
-    /// return it, leaving the merge positioned ON it. Null when this
-    /// tree is drained.
+    /// return the part of it they admit, leaving the merge positioned
+    /// ON it. Null when this tree is drained.
     fn nextVisible(self: *Cursor, merge: *merge_iterator.MergeIterator) !?Item {
         while (merge.itemRef()) |item| {
-            // Not written yet, as far as this scan is concerned.
-            // Filtered before everything below on purpose: before the
-            // tombstone rule, so a delete above read_ts can't hide a
-            // key that is still live at read_ts; and before the
-            // version cap, so invisible versions don't consume it.
-            if (item.key.timestamp > self.opts.read_ts) {
-                try merge.next();
-                continue;
+            if (self.window(item)) |vis| {
+                self.emitted += 1;
+                return vis;
             }
-            // Unchanged since min_ts, as far as this scan is concerned:
-            // versions arrive newest first, so a key whose newest
-            // visible version fails this never starts, and one that
-            // changed emits only what changed.
-            if (item.key.timestamp <= self.opts.min_ts) {
-                try merge.next();
-                continue;
-            }
-
-            if (!item.key.equalPrimary(.{
-                .primary = self.cur_primary.items,
-            })) {
-                self.cur_primary.clearRetainingCapacity();
-                try self.cur_primary.appendSlice(
-                    self.allocator,
-                    item.key.primary,
-                );
-                self.versions_emitted = 0;
-                self.skip_versions = false;
-            }
-
-            // Skipped versions don't count against max_rows — that
-            // bounds what the caller receives, not what we walk past.
-            if (self.skip_versions or
-                self.versions_emitted >= self.want_versions)
-            {
-                // TODO: Add a nextKey in underlying iterators.
-                try merge.next();
-                continue;
-            }
-
-            if (item.meta.isDeleted() and !self.opts.include_deleted) {
-                // Deleted as of this version: suppress the tombstone
-                // and everything older behind it.
-                self.skip_versions = true;
-                try merge.next();
-                continue;
-            }
-
-            self.emitted += 1;
-            self.versions_emitted += 1;
-            return item;
+            try merge.next();
         }
         return null;
+    }
+
+    /// The versions of `item` this scan hands out, newest first, or
+    /// null when none is.
+    fn window(self: *const Cursor, item: Item) ?Item {
+        // Not written yet, as far as this scan is concerned: versions
+        // above read_ts go first, before the tombstone rule (a delete
+        // above read_ts must not hide a key still live at read_ts) and
+        // before the version cap (invisible versions must not consume
+        // it).
+        const vis = item.visibleAt(self.opts.read_ts) orelse return null;
+        // Unchanged since min_ts, as far as this scan is concerned: a
+        // key whose newest visible version is at or below it is not
+        // emitted at all, and one that changed emits only what changed.
+        if (vis.newest().ts <= self.opts.min_ts) return null;
+
+        const vers = switch (vis.versions) {
+            // One version, and it passed the checks above; a tombstone
+            // is hidden unless asked for.
+            .one => |ver| {
+                if (ver.meta.isDeleted() and !self.opts.include_deleted) {
+                    return null;
+                }
+                return vis;
+            },
+            .many => |vers| vers,
+        };
+        var n: usize = 0;
+        while (n < vers.len and n < self.want_versions) : (n += 1) {
+            const ver = vers[n];
+            if (ver.ts <= self.opts.min_ts) break;
+            // Deleted as of this version: the tombstone and everything
+            // older behind it are suppressed.
+            if (ver.meta.isDeleted() and !self.opts.include_deleted) break;
+        }
+        if (n == 0) return null;
+        return .{ .key = vis.key, .versions = .{ .many = vers[0..n] } };
     }
 };
 
@@ -1093,7 +1056,7 @@ pub fn maxKey(
             if (b.primary.len == 0) continue;
 
             if (best_sst.primary.len == 0 or
-                b.orderWithoutTs(best_sst) == .gt) best_sst = b;
+                b.order(best_sst) == .gt) best_sst = b;
         }
         // Dupe out from under the tables — they may close once locks drop.
         if (best_sst.primary.len > 0) floor = try best_sst.dupe(allocator);

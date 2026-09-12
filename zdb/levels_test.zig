@@ -44,12 +44,12 @@ fn buildTable(
     alloc: std.mem.Allocator,
     entries: []const struct { key: String, ts: u64, val: String },
 ) !_table.builder.TableBuffer {
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
-    defer b.deinit();
+    var metas: std.ArrayList(MetaEntry) = .empty;
+    defer metas.deinit(alloc);
     for (entries) |e| {
-        try b.add(.{ .primary = e.key, .timestamp = e.ts }, e.val);
+        try metas.append(alloc, .{ .key = e.key, .ts = e.ts, .val = e.val });
     }
-    return b.finish();
+    return buildTableMeta(alloc, metas.items);
 }
 
 /// One row for buildTableMeta. Named rather than anonymous so helpers can
@@ -63,18 +63,32 @@ const MetaEntry = struct {
 };
 
 /// buildTable, but each entry carries a Meta. Entries must already be in
-/// sort order: primary ascending, then timestamp DESCENDING.
+/// sort order: primary ascending, then timestamp DESCENDING. A run of
+/// entries with one key is written as one item, versions newest first.
 fn buildTableMeta(
     alloc: std.mem.Allocator,
     entries: []const MetaEntry,
 ) !_table.builder.TableBuffer {
     var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer b.deinit();
-    for (entries) |e| {
+    var vers: std.ArrayList(zdb.kv.Version) = .empty;
+    defer vers.deinit(alloc);
+    var i: usize = 0;
+    while (i < entries.len) {
+        const key = entries[i].key;
+        vers.clearRetainingCapacity();
+        while (i < entries.len) : (i += 1) {
+            const e = entries[i];
+            if (!std.mem.eql(u8, e.key, key)) break;
+            try vers.append(alloc, .{
+                .ts = e.ts,
+                .meta = e.meta,
+                .value = e.val,
+            });
+        }
         try b.addItem(.{
-            .key = .{ .primary = e.key, .timestamp = e.ts },
-            .value = e.val,
-            .meta = e.meta,
+            .key = .{ .primary = key },
+            .versions = .{ .many = vers.items },
         });
     }
     return b.finish();
@@ -256,9 +270,9 @@ test "levels: overlapping tables L1" {
     }
 
     // Query range c-g should overlap tables c-d, e-f, g-h → indices 1..4.
-    const ck = try (Key{ .primary = "c", .timestamp = 0 }).marshal(alloc);
+    const ck = try (Key{ .primary = "c" }).marshal(alloc);
     defer alloc.free(ck);
-    const gk = try (Key{ .primary = "g", .timestamp = 0 }).marshal(alloc);
+    const gk = try (Key{ .primary = "g" }).marshal(alloc);
     defer alloc.free(gk);
 
     const result = try level.overlappingTables(held.shared(), alloc, .{ .left = Key.init(ck), .right = Key.init(gk) });
@@ -299,7 +313,7 @@ test "levels: overlapping tables L0" {
     try level.addEntry(held, 2, t2);
     try level.addEntry(held, 3, t3);
 
-    const ck = try (Key{ .primary = "x", .timestamp = 0 }).marshal(alloc);
+    const ck = try (Key{ .primary = "x" }).marshal(alloc);
     defer alloc.free(ck);
 
     // L0 always returns all tables regardless of the query.
@@ -339,13 +353,10 @@ test "levels: get L0 newest wins" {
     try level.addEntry(held, 2, t2);
 
     // Search with max ts to find the newest version.
-    const item = try level.get(held.shared(), .{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0);
+    const item = try level.get(held.shared(), .{ .key = .{ .primary = "k" } });
     try std.testing.expect(item != null);
-    defer {
-        alloc.free(item.?.key.primary);
-        alloc.free(item.?.value);
-    }
-    try std.testing.expectEqualStrings("new", item.?.value);
+    defer item.?.free(alloc);
+    try std.testing.expectEqualStrings("new", item.?.newest().value);
 }
 
 // ---------------------------------------------------------------------------
@@ -381,17 +392,10 @@ test "levels: get L1 hit" {
     try level.addEntry(held, 2, tb);
     try level.addEntry(held, 3, tc);
 
-    const item = try level.get(
-        held.shared(),
-        .{ .primary = "b", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    );
+    const item = try level.get(held.shared(), .{ .key = .{ .primary = "b" } });
     try std.testing.expect(item != null);
-    defer {
-        alloc.free(item.?.key.primary);
-        alloc.free(item.?.value);
-    }
-    try std.testing.expectEqualStrings("vb", item.?.value);
+    defer item.?.free(alloc);
+    try std.testing.expectEqualStrings("vb", item.?.newest().value);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,11 +420,7 @@ test "levels: get miss" {
     defer level.deinit();
     try level.addEntry(held, 1, ta);
 
-    const item = try level.get(
-        held.shared(),
-        .{ .primary = "z", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    );
+    const item = try level.get(held.shared(), .{ .key = .{ .primary = "z" } });
     try std.testing.expect(item == null);
 }
 
@@ -590,13 +590,10 @@ test "levels: doCompact L0 L1" {
 
     // All three keys must be retrievable via get.
     for (l0_data) |d| {
-        const item = try tree.get(.{ .primary = d.key, .timestamp = std.math.maxInt(u64) }, .p0);
+        const item = try tree.get(.{ .key = .{ .primary = d.key } });
         try std.testing.expect(item != null);
-        defer {
-            alloc.free(item.?.key.primary);
-            alloc.free(item.?.value);
-        }
-        try std.testing.expectEqualStrings(d.val, item.?.value);
+        defer item.?.free(alloc);
+        try std.testing.expectEqualStrings(d.val, item.?.newest().value);
     }
 }
 
@@ -680,13 +677,10 @@ test "levels: doCompact L0 L1 with dest overlap" {
         .{ .key = "dd", .val = "vdd" },
     };
     for (expected) |e| {
-        const item = try tree.get(.{ .primary = e.key, .timestamp = std.math.maxInt(u64) }, .p0);
+        const item = try tree.get(.{ .key = .{ .primary = e.key } });
         try std.testing.expect(item != null);
-        defer {
-            alloc.free(item.?.key.primary);
-            alloc.free(item.?.value);
-        }
-        try std.testing.expectEqualStrings(e.val, item.?.value);
+        defer item.?.free(alloc);
+        try std.testing.expectEqualStrings(e.val, item.?.newest().value);
     }
 }
 
@@ -756,13 +750,13 @@ test "levels: doCompact L1 L2" {
         .{ .key = "cc", .val = "vcc" },
     };
     for (expected) |e| {
-        const item = try tree.get(.{ .primary = e.key, .timestamp = std.math.maxInt(u64) }, .p2);
+        const item = try tree.get(.{
+            .key = .{ .primary = e.key },
+            .priority = .p2,
+        });
         try std.testing.expect(item != null);
-        defer {
-            alloc.free(item.?.key.primary);
-            alloc.free(item.?.value);
-        }
-        try std.testing.expectEqualStrings(e.val, item.?.value);
+        defer item.?.free(alloc);
+        try std.testing.expectEqualStrings(e.val, item.?.newest().value);
     }
 }
 
@@ -813,29 +807,30 @@ test "levels: get L0 shadows L1" {
     }
     t_l0.decrRef();
 
-    // Searching with maxInt ts seeks to the very beginning of "foo" entries;
-    // L0 is checked first → the ts=5 version wins.
+    // A seek lands on "foo"'s newest version; L0 is checked first → the
+    // ts=5 version wins.
     {
-        const item = try tree.get(.{ .primary = "foo", .timestamp = std.math.maxInt(u64) }, .p1);
+        const item = try tree.get(.{
+            .key = .{ .primary = "foo" },
+            .priority = .p1,
+        });
         try std.testing.expect(item != null);
-        defer {
-            alloc.free(item.?.key.primary);
-            alloc.free(item.?.value);
-        }
-        try std.testing.expectEqualStrings("l0_val", item.?.value);
+        defer item.?.free(alloc);
+        try std.testing.expectEqualStrings("l0_val", item.?.newest().value);
     }
 
-    // Searching with ts=3: L0's ts=5 entry sorts *before* ts=3 in byte order
-    // (higher ts ↔ smaller suffix), so the L0 seek lands past it → L0 miss.
-    // L1's ts=1 entry sorts *after* ts=3, so the L1 seek lands on it → hit.
+    // Reading at ts=3: L0 holds only the ts=5 version, which readKey
+    // steps over as too new, so L0 misses. L1's ts=1 version is visible
+    // → hit.
     {
-        const item = try tree.get(.{ .primary = "foo", .timestamp = 3 }, .p2);
+        const item = try tree.get(.{
+            .key = .{ .primary = "foo" },
+            .read_ts = 3,
+            .priority = .p2,
+        });
         try std.testing.expect(item != null);
-        defer {
-            alloc.free(item.?.key.primary);
-            alloc.free(item.?.value);
-        }
-        try std.testing.expectEqualStrings("l1_val", item.?.value);
+        defer item.?.free(alloc);
+        try std.testing.expectEqualStrings("l1_val", item.?.newest().value);
     }
 }
 
@@ -862,13 +857,12 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
     defer level.deinit();
     try level.addEntry(held, 1, t);
 
-    // A src table {(a,10), (k,100), (k,90)} has smallest=(a,10) and
-    // biggest=(k,90) — biggest is the LOWEST-ts version of its largest
-    // primary, because ts sorts descending. That's the range a compaction
-    // probes dest with.
-    const left = try (Key{ .primary = "a", .timestamp = 10 }).marshal(alloc);
+    // A src table {(a,10), (k,100), (k,90)} has smallest="a" and
+    // biggest="k": the bounds name primaries, whatever versions sit
+    // under them. That's the range a compaction probes dest with.
+    const left = try (Key{ .primary = "a" }).marshal(alloc);
     defer alloc.free(left);
-    const right = try (Key{ .primary = "k", .timestamp = 90 }).marshal(alloc);
+    const right = try (Key{ .primary = "k" }).marshal(alloc);
     defer alloc.free(right);
 
     const result = try level.overlappingTables(held.shared(), alloc, .{
@@ -945,10 +939,9 @@ test "compaction: bottom level drops a tombstone below the horizon and what it s
     // more, so the tombstone and the version it shadows are both unreachable.
     try fx.tree.doCompact(0, &fx.file_ids, 200);
 
-    try std.testing.expect((try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    )) == null);
+    try std.testing.expect((try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+    })) == null);
 }
 
 test "compaction: a tombstone above the horizon is retained with the state it shadows" {
@@ -971,21 +964,21 @@ test "compaction: a tombstone above the horizon is retained with the state it sh
     // i.e. the oldest version an allowed read can still resolve to.
     try fx.tree.doCompact(0, &fx.file_ids, 50);
 
-    const got = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer got.free(alloc);
-    try std.testing.expect(got.meta.isDeleted());
-    try std.testing.expectEqual(@as(u64, 100), got.key.timestamp);
+    try std.testing.expect(got.newest().meta.isDeleted());
+    try std.testing.expectEqual(@as(u64, 100), got.newest().ts);
 
     // A read at 60 (>= horizon, so allowed) sees the pre-delete value: the
     // tombstone at 100 hasn't happened yet from there, so the shadowed state
     // is exactly what a correct MVCC read returns — and thus must survive GC.
-    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 60 }, .p0) orelse
-        return error.TestExpectedItem;
+    const mid = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 60,
+    }) orelse return error.TestExpectedItem;
     defer mid.free(alloc);
-    try std.testing.expectEqualStrings("old", mid.value);
+    try std.testing.expectEqualStrings("old", mid.newest().value);
 }
 
 test "compaction: a non-bottom level never drops tombstones" {
@@ -1008,12 +1001,10 @@ test "compaction: a non-bottom level never drops tombstones" {
     // that this compaction isn't writing into the bottom level.
     try fx.tree.doCompact(0, &fx.file_ids, 200);
 
-    const got = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer got.free(alloc);
-    try std.testing.expect(got.meta.isDeleted());
+    try std.testing.expect(got.newest().meta.isDeleted());
 }
 
 test "compaction: a put above the horizon survives a lower tombstone's drop" {
@@ -1035,21 +1026,19 @@ test "compaction: a put above the horizon survives a lower tombstone's drop" {
     try fx.tree.doCompact(0, &fx.file_ids, 200);
 
     // k@300 is above the horizon: still readable, untouched.
-    const got = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer got.free(alloc);
-    try std.testing.expectEqualStrings("new", got.value);
-    try std.testing.expect(!got.meta.isDeleted());
+    try std.testing.expectEqualStrings("new", got.newest().value);
+    try std.testing.expect(!got.newest().meta.isDeleted());
 
     // k@100 and k@50 are gone. A read at 250 used to find the tombstone and
     // report "deleted"; now it finds nothing — the same answer, which is
     // exactly why the drop was legal.
-    try std.testing.expect((try fx.tree.get(
-        .{ .primary = "k", .timestamp = 250 },
-        .p0,
-    )) == null);
+    try std.testing.expect((try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 250,
+    })) == null);
 }
 
 test "compaction: dropping one primary does not disturb its neighbours" {
@@ -1072,18 +1061,17 @@ test "compaction: dropping one primary does not disturb its neighbours" {
 
     try fx.tree.doCompact(0, &fx.file_ids, 200);
 
-    const j = try fx.tree.get(.{ .primary = "j", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+    const j = try fx.tree.get(.{ .key = .{ .primary = "j" } }) orelse
         return error.TestExpectedItem;
     defer j.free(alloc);
-    try std.testing.expectEqualStrings("jv", j.value);
-    const m = try fx.tree.get(.{ .primary = "m", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+    try std.testing.expectEqualStrings("jv", j.newest().value);
+    const m = try fx.tree.get(.{ .key = .{ .primary = "m" } }) orelse
         return error.TestExpectedItem;
     defer m.free(alloc);
-    try std.testing.expectEqualStrings("mv", m.value);
-    try std.testing.expect((try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    )) == null);
+    try std.testing.expectEqualStrings("mv", m.newest().value);
+    try std.testing.expect((try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+    })) == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,12 +1098,16 @@ test "compaction: bottom level drops shadowed versions once they reach the horiz
     // collectable. The newest value (k@500) is the current value and stays.
     try fx.tree.doCompact(0, &fx.file_ids, 600);
 
-    const got = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+    const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
     defer got.free(alloc);
-    try std.testing.expectEqualStrings("v500", got.value);
+    try std.testing.expectEqualStrings("v500", got.newest().value);
     // A read that would have landed on k@300 finds nothing — it's collected.
-    try std.testing.expect((try fx.tree.get(.{ .primary = "k", .timestamp = 400 }, .p0)) == null);
+    const below = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 400,
+    });
+    try std.testing.expect(below == null);
     // Only the newest survived → nothing shadowed remains → no stale data.
     try std.testing.expectEqual(@as(u64, 0), levelStaleBytes(&fx.tree.levels[1]));
 }
@@ -1139,14 +1131,16 @@ test "compaction: bottom level keeps a shadowed version above the horizon and co
     // rises past 300.
     try fx.tree.doCompact(0, &fx.file_ids, 200);
 
-    const newest = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+    const cur = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
-    defer newest.free(alloc);
-    try std.testing.expectEqualStrings("v500", newest.value);
-    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 350 }, .p0) orelse
-        return error.TestExpectedItem;
+    defer cur.free(alloc);
+    try std.testing.expectEqualStrings("v500", cur.newest().value);
+    const mid = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 350,
+    }) orelse return error.TestExpectedItem;
     defer mid.free(alloc);
-    try std.testing.expectEqualStrings("v300", mid.value);
+    try std.testing.expectEqualStrings("v300", mid.newest().value);
     // k@300 is shadowed by the newer full row k@500 → counted stale: primary
     // "k" (1) + value "v300" (4). Reclaimed once the horizon rises past 500.
     try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
@@ -1172,14 +1166,16 @@ test "compaction: a non-bottom level keeps everything but still counts stale" {
     try fx.tree.doCompact(0, &fx.file_ids, 600); // horizon irrelevant: not bottom
 
     // Both versions survive — a non-bottom compaction never drops.
-    const newest = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+    const cur = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
-    defer newest.free(alloc);
-    try std.testing.expectEqualStrings("v500", newest.value);
-    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 350 }, .p0) orelse
-        return error.TestExpectedItem;
+    defer cur.free(alloc);
+    try std.testing.expectEqualStrings("v500", cur.newest().value);
+    const mid = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 350,
+    }) orelse return error.TestExpectedItem;
     defer mid.free(alloc);
-    try std.testing.expectEqualStrings("v300", mid.value);
+    try std.testing.expectEqualStrings("v300", mid.newest().value);
     // The shadowed k@300 is counted stale even though nothing was dropped.
     try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
 }
@@ -1207,14 +1203,16 @@ test "compaction: a delta above the newest state is live, not stale" {
     try fx.tree.doCompact(0, &fx.file_ids, 0);
 
     // All three survive (a non-bottom compaction drops nothing).
-    const top = try fx.tree.get(.{ .primary = "k", .timestamp = std.math.maxInt(u64) }, .p0) orelse
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isDelta());
-    const base = try fx.tree.get(.{ .primary = "k", .timestamp = 250 }, .p0) orelse
-        return error.TestExpectedItem;
+    try std.testing.expect(top.newest().meta.isDelta());
+    const base = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 250,
+    }) orelse return error.TestExpectedItem;
     defer base.free(alloc);
-    try std.testing.expectEqualStrings("s200", base.value);
+    try std.testing.expectEqualStrings("s200", base.newest().value);
 
     // Only k@100 sits below the newest terminal (state@200) → stale: "k" (1) +
     // "s100" (4). The delta and its base state are NOT counted.
@@ -1304,12 +1302,10 @@ fn foldAt(
     primary: String,
     read_ts: u64,
 ) !zroar.Bitmap {
-    const bm = try tree.rollupBitmap(
-        alloc,
-        .{ .primary = primary, .timestamp = read_ts },
-        .p0,
-        0,
-    );
+    const bm = try tree.rollupBitmap(alloc, .{
+        .key = .{ .primary = primary },
+        .read_ts = read_ts,
+    }, 0);
     return bm orelse zroar.Bitmap.init(alloc);
 }
 
@@ -1340,23 +1336,23 @@ test "compaction: rollup folds a delta chain onto its in-inputs state" {
 
     // Newest version is now a synthetic state at the newest delta's
     // timestamp: {1,2} +{2,3} → {1,2,3}, then +{40}-{2} → {1,3,40}.
-    const top = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isState());
-    try std.testing.expect(top.meta.isRoaring());
-    try std.testing.expectEqual(@as(u64, 300), top.key.timestamp);
-    try expectBitmapBytes(alloc, top.value, &.{ 1, 3, 40 });
+    try std.testing.expect(top.newest().meta.isState());
+    try std.testing.expect(top.newest().meta.isRoaring());
+    try std.testing.expectEqual(@as(u64, 300), top.newest().ts);
+    try expectBitmapBytes(alloc, top.newest().value, &.{ 1, 3, 40 });
 
     // The replaced delta is gone; the older chain is retained verbatim
     // beneath the synthetic state.
-    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 250 }, .p0) orelse
-        return error.TestExpectedItem;
+    const mid = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 250,
+    }) orelse return error.TestExpectedItem;
     defer mid.free(alloc);
-    try std.testing.expect(mid.meta.isDelta());
-    try std.testing.expectEqual(@as(u64, 200), mid.key.timestamp);
+    try std.testing.expect(mid.newest().meta.isDelta());
+    try std.testing.expectEqual(@as(u64, 200), mid.newest().ts);
 
     // MVCC: an old-snapshot reader folding the retained chain gets the
     // historical bitmaps, unchanged by the rollup.
@@ -1393,21 +1389,17 @@ test "compaction: rollup leaves lone states and baseless chains alone" {
 
     try fx.tree.doCompact(0, &fx.file_ids, 0);
 
-    const a = try fx.tree.get(
-        .{ .primary = "a", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const a = try fx.tree.get(.{ .key = .{ .primary = "a" } }) orelse
+        return error.TestExpectedItem;
     defer a.free(alloc);
-    try std.testing.expect(a.meta.isState());
-    try std.testing.expectEqualSlices(u8, s100, a.value);
+    try std.testing.expect(a.newest().meta.isState());
+    try std.testing.expectEqualSlices(u8, s100, a.newest().value);
 
-    const b = try fx.tree.get(
-        .{ .primary = "b", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const b = try fx.tree.get(.{ .key = .{ .primary = "b" } }) orelse
+        return error.TestExpectedItem;
     defer b.free(alloc);
-    try std.testing.expect(b.meta.isDelta());
-    try std.testing.expectEqualSlices(u8, d200, b.value);
+    try std.testing.expect(b.newest().meta.isDelta());
+    try std.testing.expectEqualSlices(u8, d200, b.newest().value);
 }
 
 test "compaction: a mixed chain aborts the rollup and stays verbatim" {
@@ -1431,18 +1423,18 @@ test "compaction: a mixed chain aborts the rollup and stays verbatim" {
 
     try fx.tree.doCompact(0, &fx.file_ids, 0);
 
-    const top = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
-    defer top.free(alloc);
-    try std.testing.expect(top.meta.isDelta());
-    try std.testing.expectEqualSlices(u8, d300, top.value);
-
-    const under = try fx.tree.get(.{ .primary = "k", .timestamp = 250 }, .p0) orelse
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.newest().meta.isDelta());
+    try std.testing.expectEqualSlices(u8, d300, top.newest().value);
+
+    const under = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 250,
+    }) orelse return error.TestExpectedItem;
     defer under.free(alloc);
-    try std.testing.expectEqualStrings("raw-state", under.value);
+    try std.testing.expectEqualStrings("raw-state", under.newest().value);
 }
 
 test "compaction: an empty fold emits a roaring tombstone" {
@@ -1466,20 +1458,20 @@ test "compaction: an empty fold emits a roaring tombstone" {
 
     try fx.tree.doCompact(0, &fx.file_ids, 0);
 
-    const top = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isDeleted());
-    try std.testing.expectEqual(@as(usize, 0), top.value.len);
-    try std.testing.expectEqual(@as(u64, 200), top.key.timestamp);
+    try std.testing.expect(top.newest().meta.isDeleted());
+    try std.testing.expectEqual(@as(usize, 0), top.newest().value.len);
+    try std.testing.expectEqual(@as(u64, 200), top.newest().ts);
 
     // Retained history below: the old state is still readable.
-    const old = try fx.tree.get(.{ .primary = "k", .timestamp = 150 }, .p0) orelse
-        return error.TestExpectedItem;
+    const old = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 150,
+    }) orelse return error.TestExpectedItem;
     defer old.free(alloc);
-    try std.testing.expect(old.meta.isState());
+    try std.testing.expect(old.newest().meta.isState());
 }
 
 test "compaction: bottom level collapses a rolled chain below the horizon" {
@@ -1505,18 +1497,19 @@ test "compaction: bottom level collapses a rolled chain below the horizon" {
 
     try fx.tree.doCompact(0, &fx.file_ids, 300);
 
-    const top = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isState());
-    try expectBitmapBytes(alloc, top.value, &.{ 1, 5 });
+    try std.testing.expect(top.newest().meta.isState());
+    try expectBitmapBytes(alloc, top.newest().value, &.{ 1, 5 });
 
     // The chain beneath the synthetic state settled below the horizon
     // and is gone: nothing older than the state remains.
     try std.testing.expect(
-        (try fx.tree.get(.{ .primary = "k", .timestamp = 150 }, .p0)) == null,
+        (try fx.tree.get(.{
+            .key = .{ .primary = "k" },
+            .read_ts = 150,
+        })) == null,
     );
 }
 
@@ -1548,12 +1541,10 @@ test "compaction: rollup gates — min_deltas and rollup_enabled" {
         );
         defer fx.deinit();
         try fx.tree.doCompact(0, &fx.file_ids, 0);
-        const top = try fx.tree.get(
-            .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-            .p0,
-        ) orelse return error.TestExpectedItem;
+        const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+            return error.TestExpectedItem;
         defer top.free(alloc);
-        try std.testing.expect(top.meta.isDelta());
+        try std.testing.expect(top.newest().meta.isDelta());
     }
 
     // rollup_enabled=false: today's behavior, everything verbatim.
@@ -1572,13 +1563,11 @@ test "compaction: rollup gates — min_deltas and rollup_enabled" {
         );
         defer fx.deinit();
         try fx.tree.doCompact(0, &fx.file_ids, 0);
-        const top = try fx.tree.get(
-            .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-            .p0,
-        ) orelse return error.TestExpectedItem;
+        const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+            return error.TestExpectedItem;
         defer top.free(alloc);
-        try std.testing.expect(top.meta.isDelta());
-        try std.testing.expectEqualSlices(u8, d200, top.value);
+        try std.testing.expect(top.newest().meta.isDelta());
+        try std.testing.expectEqualSlices(u8, d200, top.newest().value);
     }
 }
 
@@ -1643,11 +1632,13 @@ test "compaction: shadowed delta chains are never re-rolled" {
     try fx.tree.doCompact(0, &fx.file_ids, 0);
 
     // The shadowed delta came through verbatim, not as a state.
-    const mid = try fx.tree.get(.{ .primary = "k", .timestamp = 350 }, .p0) orelse
-        return error.TestExpectedItem;
+    const mid = try fx.tree.get(.{
+        .key = .{ .primary = "k" },
+        .read_ts = 350,
+    }) orelse return error.TestExpectedItem;
     defer mid.free(alloc);
-    try std.testing.expect(mid.meta.isDelta());
-    try std.testing.expectEqualSlices(u8, d300, mid.value);
+    try std.testing.expect(mid.newest().meta.isDelta());
+    try std.testing.expectEqualSlices(u8, d300, mid.newest().value);
 }
 
 test "compaction: read-below rolls a baseless chain onto a deep state" {
@@ -1677,14 +1668,12 @@ test "compaction: read-below rolls a baseless chain onto a deep state" {
 
     try fx.tree.doCompact(1, &fx.file_ids, 0);
 
-    const top = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isState());
-    try std.testing.expectEqual(@as(u64, 300), top.key.timestamp);
-    try expectBitmapBytes(alloc, top.value, &.{ 2, 5 });
+    try std.testing.expect(top.newest().meta.isState());
+    try std.testing.expectEqual(@as(u64, 300), top.newest().ts);
+    try expectBitmapBytes(alloc, top.newest().value, &.{ 2, 5 });
 }
 
 test "compaction: max_deltas forces read-below even at L1" {
@@ -1722,14 +1711,12 @@ test "compaction: max_deltas forces read-below even at L1" {
 
     try fx.tree.doCompact(0, &fx.file_ids, 0);
 
-    const top = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isState());
-    try std.testing.expectEqual(@as(u64, 300), top.key.timestamp);
-    try expectBitmapBytes(alloc, top.value, &.{ 1, 3, 5 });
+    try std.testing.expect(top.newest().meta.isState());
+    try std.testing.expectEqual(@as(u64, 300), top.newest().ts);
+    try expectBitmapBytes(alloc, top.newest().value, &.{ 1, 3, 5 });
 }
 
 test "compaction: read-below with no state anywhere folds from empty" {
@@ -1757,13 +1744,11 @@ test "compaction: read-below with no state anywhere folds from empty" {
 
     try fx.tree.doCompact(1, &fx.file_ids, 0);
 
-    const top = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isState());
-    try expectBitmapBytes(alloc, top.value, &.{ 3, 5 });
+    try std.testing.expect(top.newest().meta.isState());
+    try expectBitmapBytes(alloc, top.newest().value, &.{ 3, 5 });
 }
 
 test "compaction: read-below declined by triggers or mixed chains" {
@@ -1795,13 +1780,11 @@ test "compaction: read-below declined by triggers or mixed chains" {
         });
         defer fx.deinit();
         try fx.tree.doCompact(1, &fx.file_ids, 0);
-        const top = try fx.tree.get(
-            .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-            .p0,
-        ) orelse return error.TestExpectedItem;
+        const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+            return error.TestExpectedItem;
         defer top.free(alloc);
-        try std.testing.expect(top.meta.isDelta());
-        try std.testing.expectEqualSlices(u8, d300, top.value);
+        try std.testing.expect(top.newest().meta.isDelta());
+        try std.testing.expectEqualSlices(u8, d300, top.newest().value);
     }
 
     // A raw (non-roaring) version below: the peek reports the chain
@@ -1822,13 +1805,11 @@ test "compaction: read-below declined by triggers or mixed chains" {
         });
         defer fx.deinit();
         try fx.tree.doCompact(1, &fx.file_ids, 0);
-        const top = try fx.tree.get(
-            .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-            .p0,
-        ) orelse return error.TestExpectedItem;
+        const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+            return error.TestExpectedItem;
         defer top.free(alloc);
-        try std.testing.expect(top.meta.isDelta());
-        try std.testing.expectEqualSlices(u8, d300, top.value);
+        try std.testing.expect(top.newest().meta.isDelta());
+        try std.testing.expectEqualSlices(u8, d300, top.newest().value);
     }
 }
 
@@ -1853,11 +1834,9 @@ test "compaction: rollup folds a chain terminated by a tombstone" {
 
     try fx.tree.doCompact(0, &fx.file_ids, 0);
 
-    const top = try fx.tree.get(
-        .{ .primary = "k", .timestamp = std.math.maxInt(u64) },
-        .p0,
-    ) orelse return error.TestExpectedItem;
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
     defer top.free(alloc);
-    try std.testing.expect(top.meta.isState());
-    try expectBitmapBytes(alloc, top.value, &.{9});
+    try std.testing.expect(top.newest().meta.isState());
+    try expectBitmapBytes(alloc, top.newest().value, &.{9});
 }
