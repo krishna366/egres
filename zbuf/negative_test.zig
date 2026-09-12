@@ -1,8 +1,9 @@
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 
-fn runGenExpectFail(alloc: std.mem.Allocator, schema_path: []const u8, expect_substr: []const u8) !void {
-    const argv = [_][]const u8{
+fn runGenExpectFail(alloc: std.mem.Allocator, schema_path: String, expect_substr: String) !void {
+    const argv = [_]String{
         "zig",
         "build",
         "zbuf",

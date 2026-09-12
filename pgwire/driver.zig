@@ -17,7 +17,7 @@
 //!
 //! The handler's surface area:
 //!
-//!  - `fn onQuery(self, state: *ConnState, sql: []const u8) !void`
+//!  - `fn onQuery(self, state: *ConnState, sql: String) !void`
 //!    Required. Drives a simple-query (Q) message. Handler emits
 //!    RowDescription (0..1) → DataRow (0..N) → CommandComplete (or
 //!    sendError on failure). Driver emits the trailing RFQ.
@@ -45,6 +45,8 @@
 
 const std = @import("std");
 const fiber = @import("zfiber");
+const utils = @import("utils");
+const String = utils.String;
 
 const _conn_state = @import("conn_state.zig");
 const _proto = @import("proto.zig");

@@ -6,6 +6,7 @@ const zbuf = @import("zbuf").zbuf;
 const _vfs = @import("vfs");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 const _meta = @import("meta.zig");
 
 // DiskWAL handles disk access and writes for the Raft write-ahead log.
@@ -94,11 +95,11 @@ pub const logFile = struct {
     write_offset: u64, // next write position (meaningful for current file)
     is_current: bool,
 
-    fn fname(fid: u64, buf: *[32]u8) Error![]const u8 {
+    fn fname(fid: u64, buf: *[32]u8) Error!String {
         return std.fmt.bufPrint(buf, "{d:0>5}" ++ log_suffix, .{fid});
     }
 
-    fn fullPath(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8) ![]u8 {
+    fn fullPath(alloc: std.mem.Allocator, dir_path: String, name: String) ![]u8 {
         return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, name });
     }
 
@@ -140,7 +141,7 @@ pub const logFile = struct {
     pub fn openRotated(
         vfs_inst: *const _vfs.VFS,
         alloc: std.mem.Allocator,
-        dir_path: []const u8,
+        dir_path: String,
         fid: u64,
     ) !logFile {
         var name_buf: [32]u8 = undefined;
@@ -179,7 +180,7 @@ pub const logFile = struct {
     pub fn openCurrent(
         vfs_inst: *const _vfs.VFS,
         alloc: std.mem.Allocator,
-        dir_path: []const u8,
+        dir_path: String,
         fid: u64,
     ) !logFile {
         var name_buf: [32]u8 = undefined;
@@ -264,7 +265,7 @@ pub const logFile = struct {
     pub fn createCurrent(
         vfs_inst: *const _vfs.VFS,
         alloc: std.mem.Allocator,
-        dir_path: []const u8,
+        dir_path: String,
         fid: u64,
     ) !logFile {
         var name_buf: [32]u8 = undefined;
@@ -375,7 +376,7 @@ pub const logFile = struct {
     pub fn appendRecordToBuffer(
         self: *logFile,
         buf: *std.ArrayList(u8),
-        entry_bytes: []const u8,
+        entry_bytes: String,
         reader: zen.LogEntryReader,
     ) !void {
         const sz = try zbuf.Frame.append(buf, self.allocator, entry_bytes);
@@ -393,7 +394,7 @@ pub const logFile = struct {
     }
 
     /// Flush a write buffer to disk in one call.
-    pub fn flushWriteBuffer(self: *logFile, buf: []const u8) !void {
+    pub fn flushWriteBuffer(self: *logFile, buf: String) !void {
         if (buf.len == 0) return;
         try self.handle.write(buf, self.write_offset - buf.len, .p0);
     }
@@ -403,9 +404,9 @@ pub const logFile = struct {
     pub fn readPayloadFromBuf(
         self: *const logFile,
         slot_index: usize,
-        buf: []const u8,
+        buf: String,
         buf_offset: u64,
-    ) ![]const u8 {
+    ) !String {
         const ent = self.getEntry(slot_index) orelse return error.InvalidLogOffset;
 
         const rec_start = ent.data_offset - @as(u32, @intCast(buf_offset));
@@ -494,7 +495,7 @@ pub const wal = struct {
         slot_idx: ?usize,
     };
 
-    pub fn parseWalFid(name: []const u8) ?u64 {
+    pub fn parseWalFid(name: String) ?u64 {
         if (!std.mem.endsWith(u8, name, log_suffix)) return null;
         const base = name[0 .. name.len - log_suffix.len];
         if (base.len == 0) return null;
@@ -506,7 +507,7 @@ pub const wal = struct {
         return if (fid == 0) null else fid;
     }
 
-    fn deleteFileByName(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8) void {
+    fn deleteFileByName(alloc: std.mem.Allocator, dir_path: String, name: String) void {
         const path = logFile.fullPath(alloc, dir_path, name) catch return;
         defer alloc.free(path);
         _vfs.deleteFile(path) catch {};
@@ -518,7 +519,7 @@ pub const wal = struct {
         deleteFileByName(self.allocator, self.dir_path, name);
     }
 
-    fn deleteFidFiles(alloc: std.mem.Allocator, dir_path: []const u8, fids: []const u64) void {
+    fn deleteFidFiles(alloc: std.mem.Allocator, dir_path: String, fids: []const u64) void {
         for (fids) |fid| {
             var name_buf: [32]u8 = undefined;
             const name = logFile.fname(fid, &name_buf) catch continue;
@@ -527,7 +528,7 @@ pub const wal = struct {
     }
 
     pub fn openPath(
-        path: []const u8,
+        path: String,
         alloc: std.mem.Allocator,
         cache_capacity: usize,
     ) !wal {
@@ -845,7 +846,7 @@ pub const wal = struct {
             }
 
             // === Pass 2: Read — bulk or individual based on density of uncached entries ===
-            var bulk_buf: ?[]const u8 = null;
+            var bulk_buf: ?String = null;
 
             if (plan.disk_bytes > 0) {
                 const span = plan.disk_end_offset - plan.disk_first_offset;
@@ -1132,7 +1133,7 @@ pub const DiskWAL = struct {
     mu: fiber.RWMutex(.tracked) = .{},
 
     pub fn openPath(
-        path: []const u8,
+        path: String,
         allocator: std.mem.Allocator,
         cache_capacity: usize,
     ) !DiskWAL {
@@ -1372,7 +1373,7 @@ pub const EntryCache = struct {
     pub const CachedEntry = struct {
         index: u64,
         term: u64,
-        bytes: []const u8, // allocator-owned
+        bytes: String, // allocator-owned
     };
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !EntryCache {
@@ -1412,7 +1413,7 @@ pub const EntryCache = struct {
         return self.buf.len > 0 and self.len == self.buf.len;
     }
 
-    pub fn append(self: *EntryCache, index: u64, term_val: u64, bytes: []const u8) !void {
+    pub fn append(self: *EntryCache, index: u64, term_val: u64, bytes: String) !void {
         if (self.buf.len == 0) return;
 
         const owned = try self.allocator.dupe(u8, bytes);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const m = @import("metrics");
 const utils = @import("utils");
+const String = utils.String;
 const fiber = @import("zfiber");
 
 // Raft-layer metrics. Same lifecycle pattern as zdb/metrics.zig: an
@@ -9,7 +10,7 @@ const fiber = @import("zfiber");
 // initGlobal still compile and run safely.
 
 pub const PhaseLabels = struct {
-    phase: []const u8,
+    phase: String,
 };
 
 // Millisecond bucket boundaries. fiber.coarseMs ticks ~every 1 ms, so any
@@ -77,7 +78,7 @@ pub const Metrics = struct {
     /// from the underlying allocator (only possible the first time a new
     /// label is seen) are swallowed — losing one sample beats taking down
     /// the leader.
-    pub fn observePhase(self: *Metrics, phase: []const u8, start_ms: i64) void {
+    pub fn observePhase(self: *Metrics, phase: String, start_ms: i64) void {
         const elapsed_ms: u64 = @intCast(fiber.coarseMs() - start_ms);
         self.propose_phase_ms.observe(.{ .phase = phase }, elapsed_ms) catch {};
     }

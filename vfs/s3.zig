@@ -15,6 +15,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 const _sigv4 = @import("sigv4.zig");
 const _lookahead = @import("lookahead.zig");
 
@@ -32,36 +33,36 @@ pub const S3Config = struct {
     /// scheme decides TLS (and the default port); the host may be a DNS
     /// name ("s3.us-east-005.backblazeb2.com"), an IPv4 literal
     /// ("127.0.0.1"), or a bracketed IPv6 literal ("[::1]").
-    endpoint: []const u8,
-    bucket: []const u8,
-    region: []const u8 = "us-east-1",
+    endpoint: String,
+    bucket: String,
+    region: String = "us-east-1",
     /// Optional key prefix inside the bucket. Unreserved URI characters
     /// only — keys are used verbatim in the request path (no
     /// percent-encoding pass).
-    prefix: []const u8 = "",
+    prefix: String = "",
 };
 
 pub const S3Store = struct {
     a: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     /// Original endpoint URL, for logs.
-    endpoint: []const u8,
-    bucket: []const u8,
-    region: []const u8,
-    prefix: []const u8,
+    endpoint: String,
+    bucket: String,
+    region: String,
+    prefix: String,
     /// Bare host name — TLS SNI + certificate verification.
-    host: []const u8,
+    host: String,
     /// Host header value (SigV4 signs it): the bare host, `:port`
     /// appended when it isn't the scheme default — servers on custom
     /// ports expect the port in Host.
-    host_header: []const u8,
+    host_header: String,
     /// Resolved once at init; every dial reuses it. Per-dial
     /// re-resolution (endpoint DNS rotation) is a recorded follow-up.
     dial_addr: fiber.net.IpAddress,
     use_tls: bool,
     // Environ-backed slices: process lifetime, never freed.
-    access_key: []const u8,
-    secret_key: []const u8,
+    access_key: String,
+    secret_key: String,
     // System trust roots, loaded once at init when use_tls.
     ca_bundle: std.crypto.Certificate.Bundle = .empty,
     ca_lock: std.Io.RwLock = .init,
@@ -210,14 +211,14 @@ pub const S3Store = struct {
         });
     }
 
-    pub fn put(self: *S3Store, name: []const u8, data: []const u8) !void {
+    pub fn put(self: *S3Store, name: String, data: String) !void {
         if (data.len > max_put_bytes) return error.ObjectTooLarge;
         var resp = try self.request("PUT", name, data, null, false);
         defer resp.deinit(self.a);
         if (resp.status != 200) return self.statusErr("PUT", name, &resp);
     }
 
-    pub fn exists(self: *S3Store, name: []const u8) !bool {
+    pub fn exists(self: *S3Store, name: String) !bool {
         var resp = try self.request("HEAD", name, null, null, false);
         defer resp.deinit(self.a);
 
@@ -228,7 +229,7 @@ pub const S3Store = struct {
         };
     }
 
-    pub fn delete(self: *S3Store, name: []const u8) !void {
+    pub fn delete(self: *S3Store, name: String) !void {
         var resp = try self.request("DELETE", name, null, null, false);
         defer resp.deinit(self.a);
         // S3 DELETE is idempotent: 204 whether or not the key existed.
@@ -239,7 +240,7 @@ pub const S3Store = struct {
     }
 
     /// HEAD for size + existence; ranged GETs happen per read().
-    pub fn head(self: *S3Store, name: []const u8) !u64 {
+    pub fn head(self: *S3Store, name: String) !u64 {
         var resp = try self.request("HEAD", name, null, null, false);
         defer resp.deinit(self.a);
 
@@ -251,7 +252,7 @@ pub const S3Store = struct {
     }
 
     /// Ranged GET of [offset, offset+len). Caller owns the bytes.
-    pub fn readRange(self: *S3Store, a: std.mem.Allocator, name: []const u8, offset: u64, len: u64) ![]u8 {
+    pub fn readRange(self: *S3Store, a: std.mem.Allocator, name: String, offset: u64, len: u64) ![]u8 {
         var resp = try self.request("GET", name, null, .{ offset, len }, true);
         errdefer resp.deinit(self.a);
         switch (resp.status) {
@@ -282,7 +283,7 @@ pub const S3Store = struct {
         return a.dupe(u8, body);
     }
 
-    fn statusErr(self: *S3Store, method: []const u8, name: []const u8, resp: *const Response) error{S3Error} {
+    fn statusErr(self: *S3Store, method: String, name: String, resp: *const Response) error{S3Error} {
         _ = self;
         log.err("s3 {s} {s}: status={d} body={s}", .{
             method, name, resp.status, if (resp.body) |b| b else "",
@@ -312,9 +313,9 @@ pub const S3Store = struct {
     /// `range` rides unsigned (SigV4 requires host + x-amz-* only).
     fn request(
         self: *S3Store,
-        method: []const u8,
-        name: []const u8,
-        body: ?[]const u8,
+        method: String,
+        name: String,
+        body: ?String,
         range: ?[2]u64,
         want_body: bool,
     ) !Response {
@@ -350,9 +351,9 @@ pub const S3Store = struct {
     fn requestOnce(
         self: *S3Store,
         conn: *Conn,
-        method: []const u8,
-        name: []const u8,
-        body: ?[]const u8,
+        method: String,
+        name: String,
+        body: ?String,
         range: ?[2]u64,
         want_body: bool,
         // Non-null → record time-to-first-byte (request flushed → first
@@ -452,7 +453,7 @@ pub const S3Store = struct {
 pub fn parseResponse(
     reader: *std.Io.Reader,
     a: std.mem.Allocator,
-    method: []const u8,
+    method: String,
     want_body: bool,
 ) !S3Store.Response {
     // Status line: "HTTP/1.1 200 OK".

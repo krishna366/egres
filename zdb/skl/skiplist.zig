@@ -2,6 +2,7 @@ const std = @import("std");
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 const utils = @import("utils");
+const String = utils.String;
 const Key = @import("../kv.zig").Key;
 const Item = @import("../kv.zig").Item;
 const Meta = @import("../kv.zig").Meta;
@@ -18,8 +19,8 @@ pub const SkipList = struct {
     const max_arena_size = 64 * 1024 * 1024;
 
     pub const Node = struct {
-        key: []const u8,
-        value: []const u8,
+        key: String,
+        value: String,
         // Not swapped atomically with `value` on overwrite — see `put`. The
         // key is immutable for a node's lifetime; only these two change.
         meta: Meta,
@@ -170,7 +171,7 @@ pub const SkipList = struct {
 
     /// Convenience for callers with nothing to say about the row: raw
     /// encoding, no flags. The write path uses putItem.
-    pub fn put(self: *Self, key: Key, value: []const u8) Error!void {
+    pub fn put(self: *Self, key: Key, value: String) Error!void {
         return self.putItem(.{ .key = key, .value = value, .meta = .{} });
     }
 

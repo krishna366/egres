@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 const zdb = @import("zdb");
 const bench = utils.bench;
 const Bench = bench.Bench;
@@ -43,7 +44,7 @@ fn destroyTable(t: *Table) void {
     allocator.destroy(t);
 }
 
-fn fromBuf(alloc: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
+fn fromBuf(alloc: std.mem.Allocator, buf: String) !vfs.FileHandle {
     const owned = try alloc.dupe(u8, buf);
     return .{
         .file_size = @intCast(owned.len),
@@ -53,7 +54,7 @@ fn fromBuf(alloc: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
     };
 }
 
-fn keyAt(buf: []u8, i: usize) ![]const u8 {
+fn keyAt(buf: []u8, i: usize) !String {
     return std.fmt.bufPrint(buf, "k{d:0>7}", .{i});
 }
 
@@ -196,7 +197,7 @@ fn benchBlockSeekGe(b: *Bench) !void {
 
     // seekGe compares against marshaled bytes, so pre-build them —
     // production marshals once per seek, not once per probe.
-    var targets: [num_targets][]const u8 = undefined;
+    var targets: [num_targets]String = undefined;
     for (&targets, 0..) |*raw, k| {
         var kb: [16]u8 = undefined;
         const p = try keyAt(&kb, first + k * step);

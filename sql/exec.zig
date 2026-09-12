@@ -139,7 +139,7 @@ pub const Batch = struct {
         self.bytes.appendSliceAssumeCapacity(item.key.primary);
         const primary = self.bytes.items[kstart..][0..item.key.primary.len];
 
-        var value: []const u8 = "";
+        var value: String = "";
         switch (mode) {
             .copy => {
                 const vstart = self.bytes.items.len;
@@ -197,7 +197,7 @@ pub const Batch = struct {
 /// is a roaring bitmap — every matching egid.
 pub const IndexLookup = struct {
     index_table_id: u32,
-    key: []const u8,
+    key: String,
     unique: bool,
 };
 
@@ -518,7 +518,7 @@ pub const Fetch = struct {
     /// but CORRUPTION when an index did (rows and entries commit
     /// atomically) — logged loudly, then still skipped so the
     /// statement answers from the rows that do exist.
-    fn missing(self: *const Fetch, ctx: *ExecCtx, key: []const u8) void {
+    fn missing(self: *const Fetch, ctx: *ExecCtx, key: String) void {
         if (!self.from_index) return;
         log.err(
             "corrupt index entry: an index names egid={d}, " ++

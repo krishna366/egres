@@ -1,8 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
 const s3 = @import("vfs").s3;
+const utils = @import("utils");
+const String = utils.String;
 
-fn parse(canned: []const u8, method: []const u8, want_body: bool) !s3.S3Store.Response {
+fn parse(canned: String, method: String, want_body: bool) !s3.S3Store.Response {
     var r = std.Io.Reader.fixed(canned);
     return s3.parseResponse(&r, testing.allocator, method, want_body);
 }

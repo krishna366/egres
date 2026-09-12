@@ -5,6 +5,7 @@ const zdb = @import("zdb");
 const m = @import("metrics");
 const flags = @import("flags");
 const utils = @import("raft").utils;
+const String = utils.String;
 const WaitGroup = utils.WaitGroup;
 const Engine = @import("engine.zig").Engine;
 
@@ -126,8 +127,8 @@ pub const RaftCmd = struct {
 
 pub const SetCmd = struct {
     ns: u32,
-    key: []const u8,
-    value: []const u8,
+    key: String,
+    value: String,
 };
 
 /// `del <ns> <key>` — write a tombstone over `key`. A delete is a write, not
@@ -136,7 +137,7 @@ pub const SetCmd = struct {
 /// level compaction finds the tombstone below `global_min_read`.
 pub const DelCmd = struct {
     ns: u32,
-    key: []const u8,
+    key: String,
 };
 
 /// Header for a batched write. The body is `count * 2` whitespace-delimited
@@ -151,7 +152,7 @@ pub const SetBatchCmd = struct {
 
 pub const GetCmd = struct {
     ns: u32,
-    key: []const u8,
+    key: String,
     /// Optional read timestamp. 0 means "serve local applied state without
     /// blocking." If > 0, the server waits until this node's apply_ts has
     /// reached read_ts (with a timeout) so the returned view includes every
@@ -172,10 +173,10 @@ pub const GetCmd = struct {
 /// as of that timestamp.
 pub const ScanCmd = struct {
     ns: u32,
-    start_key: []const u8,
+    start_key: String,
     /// Empty slice means "no upper bound" — either explicitly via the
     /// `_` token or implicitly because the caller wants to scan to EOF.
-    end_key: []const u8,
+    end_key: String,
     max_count: u64,
     mode: Mode = .kv,
     num_versions: u32 = 1,
@@ -192,7 +193,7 @@ pub const ScanCmd = struct {
 pub const ConfCmd = struct {
     action: Action,
     node_id: u64,
-    addr: []const u8 = "",
+    addr: String = "",
 
     pub const Action = enum {
         add,
@@ -212,7 +213,7 @@ pub const ConfCmd = struct {
 /// Stream is at a known boundary (just past '\n') only on success. Pair
 /// with `parseLine` so command-level parse errors can be recovered without
 /// closing the connection.
-pub fn readLine(r: *std.Io.Reader, buf: []u8) ![]const u8 {
+pub fn readLine(r: *std.Io.Reader, buf: []u8) !String {
     // takeDelimiterInclusive returns the bytes up to AND INCLUDING the
     // '\n' so the cursor advances past the delimiter. The Exclusive
     // variant leaves the '\n' in the buffer, which makes the next read
@@ -247,8 +248,8 @@ pub const max_token_size: usize = 64 * 1024;
 /// what `Engine.encodeMutations` probes for to decide whether to put a meta
 /// byte on the wire.
 pub const KV = struct {
-    key: []const u8,
-    value: []const u8,
+    key: String,
+    value: String,
     meta: zdb.kv.Meta = .{},
 };
 
@@ -377,7 +378,7 @@ pub fn readToken(r: *std.Io.Reader, buf: *std.ArrayList(u8)) !void {
     }
 }
 
-pub fn parseLine(line: []const u8) !Command {
+pub fn parseLine(line: String) !Command {
     var it = std.mem.splitScalar(u8, line, ' ');
     const cmd = it.next() orelse return error.EmptyCommand;
 
@@ -455,8 +456,8 @@ pub fn parseLine(line: []const u8) !Command {
         // `_` is the open-bound sentinel (a literal underscore would need
         // to be sent hex-encoded — not currently supported by the scan
         // parser, which takes raw text tokens like `get`).
-        const start_key: []const u8 = if (std.mem.eql(u8, start_tok, "_")) "" else start_tok;
-        const end_key: []const u8 = if (std.mem.eql(u8, end_tok, "_")) "" else end_tok;
+        const start_key: String = if (std.mem.eql(u8, start_tok, "_")) "" else start_tok;
+        const end_key: String = if (std.mem.eql(u8, end_tok, "_")) "" else end_tok;
         return .{ .scan = .{
             .ns = std.fmt.parseInt(u32, ns_str, 10) catch return error.InvalidNamespace,
             .start_key = start_key,
@@ -571,7 +572,7 @@ pub fn writeHelp(stream: fiber.net.Stream) !void {
 }
 
 /// Write an error response: "ERR <msg>\n"
-pub fn writeErr(stream: fiber.net.Stream, msg: []const u8) !void {
+pub fn writeErr(stream: fiber.net.Stream, msg: String) !void {
     try stream.writeAll("ERR ");
     try stream.writeAll(msg);
     try stream.writeAll("\n");
@@ -585,7 +586,7 @@ pub fn writeNotLeader(stream: fiber.net.Stream, leader_id: u64) !void {
 }
 
 /// Write a get-found response: "FOUND <ts> <value>\n"
-pub fn writeFound(stream: fiber.net.Stream, ts: u64, value: []const u8) !void {
+pub fn writeFound(stream: fiber.net.Stream, ts: u64, value: String) !void {
     var buf: [64]u8 = undefined;
     const hdr = std.fmt.bufPrint(&buf, "FOUND {d} ", .{ts}) catch unreachable;
     try stream.writeAll(hdr);
@@ -612,8 +613,8 @@ pub fn writeScanItem(
     w: *std.Io.Writer,
     mode: ScanCmd.Mode,
     ts: u64,
-    key: []const u8,
-    value: []const u8,
+    key: String,
+    value: String,
 ) !void {
     try w.print("ITEM {d} ", .{ts});
     try writeHex(w, key);
@@ -633,7 +634,7 @@ pub fn writeScanEnd(w: *std.Io.Writer, count: u64) !void {
     try w.print("END {d}\n", .{count});
 }
 
-fn writeHex(w: *std.Io.Writer, bytes: []const u8) !void {
+fn writeHex(w: *std.Io.Writer, bytes: String) !void {
     const hex = "0123456789abcdef";
     for (bytes) |b| {
         try w.writeByte(hex[b >> 4]);
@@ -647,7 +648,7 @@ pub const AdminServer = struct {
     engine: *Engine,
     listen_addr: fiber.net.IpAddress,
 
-    pub fn init(engine: *Engine, client_addr: []const u8) !AdminServer {
+    pub fn init(engine: *Engine, client_addr: String) !AdminServer {
         return .{
             .engine = engine,
             .listen_addr = try fiber.net.IpAddress.parseIpAndPort(client_addr),
@@ -832,7 +833,7 @@ pub const AdminServer = struct {
         stream: fiber.net.Stream,
         ns: u32,
         kv: proto.KV,
-        comptime verb: []const u8,
+        comptime verb: String,
     ) !void {
         // Reject up-front if the destination namespace has no route table.
         // Otherwise the mutation is durably committed through Raft but

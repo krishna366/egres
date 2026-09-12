@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const _value = @import("value.zig");
+const String = _value.String;
 const Type = _value.Type;
 
 /// A column as the catalog defines it, across its whole lifetime — the
@@ -27,7 +28,7 @@ pub const LogicalColumn = struct {
     column_id: u32,
     /// SQL column name. Layout-irrelevant (the physical schema is name-free);
     /// the catalog/executor resolves names → column_id through it.
-    name: []const u8,
+    name: String,
     ty: Type,
     /// First schema version in which this column exists.
     added_in_version: u16 = 1,

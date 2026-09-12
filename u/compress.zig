@@ -1,4 +1,5 @@
 const std = @import("std");
+const String = @import("utils.zig").String;
 
 // Shared compression codecs for Egres modules.
 // - .none: passthrough
@@ -32,7 +33,7 @@ const shim = @cImport({
 pub fn compress(
     alloc: std.mem.Allocator,
     codec: Codec,
-    input: []const u8,
+    input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
     return switch (codec) {
@@ -47,7 +48,7 @@ pub fn compress(
 pub fn decompress(
     alloc: std.mem.Allocator,
     codec: Codec,
-    input: []const u8,
+    input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
     return switch (codec) {
@@ -59,7 +60,7 @@ pub fn decompress(
 
 fn noneInto(
     alloc: std.mem.Allocator,
-    input: []const u8,
+    input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
     try out.appendSlice(alloc, input);
@@ -68,7 +69,7 @@ fn noneInto(
 
 fn compressZstdInto(
     alloc: std.mem.Allocator,
-    input: []const u8,
+    input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
     const bound = zstd.ZSTD_compressBound(input.len);
@@ -83,7 +84,7 @@ fn compressZstdInto(
 
 fn decompressZstdInto(
     alloc: std.mem.Allocator,
-    input: []const u8,
+    input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
     const frame_size = zstd.ZSTD_getFrameContentSize(input.ptr, input.len);
@@ -103,7 +104,7 @@ fn decompressZstdInto(
 
 fn compressLz4Into(
     alloc: std.mem.Allocator,
-    input: []const u8,
+    input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
     if (input.len > std.math.maxInt(i32)) return error.CompressionFailed;
@@ -128,7 +129,7 @@ fn compressLz4Into(
 
 fn decompressLz4Into(
     alloc: std.mem.Allocator,
-    input: []const u8,
+    input: String,
     out: *std.ArrayList(u8),
 ) Error!usize {
     if (input.len < 4) return error.CorruptFrame;
@@ -157,7 +158,7 @@ fn writeU32LE(dst: []u8, v: u32) void {
     @memcpy(dst, tmp[0..]);
 }
 
-fn readU32LE(src: []const u8) u32 {
+fn readU32LE(src: String) u32 {
     const p: *const [4]u8 = @ptrCast(src.ptr);
     return std.mem.readInt(u32, p, .little);
 }

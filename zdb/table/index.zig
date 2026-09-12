@@ -1,4 +1,6 @@
 const std = @import("std");
+const utils = @import("utils");
+const String = utils.String;
 
 /// Version of the per-entry block encoding, stored in TableIndex.format_version
 /// and checked when a table is opened. Bump this whenever the entry layout in
@@ -34,19 +36,19 @@ pub const BlockMeta = struct {
     len: u32,
 };
 
-pub fn readU16LE(buf: []const u8, off: usize) Error!u16 {
+pub fn readU16LE(buf: String, off: usize) Error!u16 {
     if (off + 2 > buf.len) return error.OutOfBounds;
     const bytes: *const [2]u8 = @ptrCast(buf[off .. off + 2].ptr);
     return std.mem.readInt(u16, bytes, .little);
 }
 
-pub fn readU32LE(buf: []const u8, off: usize) Error!u32 {
+pub fn readU32LE(buf: String, off: usize) Error!u32 {
     if (off + 4 > buf.len) return error.OutOfBounds;
     const bytes: *const [4]u8 = @ptrCast(buf[off .. off + 4].ptr);
     return std.mem.readInt(u32, bytes, .little);
 }
 
-pub fn readU64LE(buf: []const u8, off: usize) Error!u64 {
+pub fn readU64LE(buf: String, off: usize) Error!u64 {
     if (off + 8 > buf.len) return error.OutOfBounds;
     const bytes: *const [8]u8 = @ptrCast(buf[off .. off + 8].ptr);
     return std.mem.readInt(u64, bytes, .little);

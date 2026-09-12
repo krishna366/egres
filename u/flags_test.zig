@@ -1,9 +1,11 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const flags = @import("flags");
+const utils = @import("utils");
+const String = utils.String;
 
 const RaftCfg = struct {
-    name: []const u8 = "default",
+    name: String = "default",
     retries: u32 = 3,
     ratio: f64 = 0.5,
     tracing: bool = false,
@@ -20,7 +22,7 @@ const RaftCfg = struct {
 };
 
 const NetCfg = struct {
-    listen_addr: []const u8 = ":9000",
+    listen_addr: String = ":9000",
     enable_tls: bool = false,
 
     pub const docs = .{
@@ -114,8 +116,8 @@ test "_ms duration field accepts unit notation" {
 
 test "bool accepts short and long forms (case-insensitive)" {
     const alloc = std.testing.allocator;
-    const trues = [_][]const u8{ "true", "TRUE", "t", "T", "1", "yes", "y", "on", "ON" };
-    const falses = [_][]const u8{ "false", "f", "F", "0", "no", "n", "off", "OFF" };
+    const trues = [_]String{ "true", "TRUE", "t", "T", "1", "yes", "y", "on", "ON" };
+    const falses = [_]String{ "false", "f", "F", "0", "no", "n", "off", "OFF" };
     for (trues) |v| {
         const opt = try std.fmt.allocPrint(alloc, "tracing={s};", .{v});
         defer alloc.free(opt);
@@ -137,7 +139,7 @@ test "bool accepts short and long forms (case-insensitive)" {
 
 test "key name mapping accepts all reasonable variants" {
     const alloc = std.testing.allocator;
-    const variants = [_][]const u8{
+    const variants = [_]String{
         "tick-interval-ms=42;",
         "tick_interval_ms=42;",
         "Tick-Interval-MS=42;",
@@ -304,9 +306,9 @@ test "registry: parseArgv happy path" {
     const raft = try reg.register("raft", RaftCfg);
     const net = try reg.register("net", NetCfg);
 
-    var leftover: std.ArrayList([]const u8) = .empty;
+    var leftover: std.ArrayList(String) = .empty;
     defer leftover.deinit(alloc);
-    const argv = [_][]const u8{
+    const argv = [_]String{
         "--raft=retries=7;",
         "--net",
         "listen-addr=:8080;",
@@ -326,9 +328,9 @@ test "registry: parseArgv strips surviving outer quotes from payload" {
     const raft = try reg.register("raft", RaftCfg);
     const net = try reg.register("net", NetCfg);
 
-    var leftover: std.ArrayList([]const u8) = .empty;
+    var leftover: std.ArrayList(String) = .empty;
     defer leftover.deinit(alloc);
-    const argv = [_][]const u8{
+    const argv = [_]String{
         "--raft=\"retries=7; ratio=0.6\"",
         "--net",
         "'listen-addr=:8080; enable-tls=true'",
@@ -346,9 +348,9 @@ test "registry: parseArgv unknown module" {
     defer reg.deinit();
     const raft = try reg.register("raft", RaftCfg);
 
-    var leftover: std.ArrayList([]const u8) = .empty;
+    var leftover: std.ArrayList(String) = .empty;
     defer leftover.deinit(alloc);
-    const argv = [_][]const u8{ "--ghost=x=1;", "--raft=retries=2;" };
+    const argv = [_]String{ "--ghost=x=1;", "--raft=retries=2;" };
     try std.testing.expectError(error.UnknownModule, reg.parseArgv(&argv, &leftover));
     try std.testing.expectEqual(@as(u32, 3), raft.snapshot().retries);
 }

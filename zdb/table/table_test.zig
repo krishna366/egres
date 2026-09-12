@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 const zdb = @import("zdb");
 const zbuf = @import("zbuf").zbuf;
 const Key = zdb.kv.Key;
@@ -17,7 +18,7 @@ fn destroyTable(t: *Table) void {
 }
 
 /// Test helper: create an in-memory FileHandle from a buffer (dupes the data).
-fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
+fn fromBuf(allocator: std.mem.Allocator, buf: String) !vfs.FileHandle {
     const owned = try allocator.dupe(u8, buf);
     return .{
         .file_size = @intCast(owned.len),
@@ -35,7 +36,7 @@ fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
 /// at ts=0, with value "{i}". block_size controls how many entries land per block.
 fn buildRangeTable(
     allocator: std.mem.Allocator,
-    prefix: []const u8,
+    prefix: String,
     start: usize,
     end: usize,
     block_size: u32,
@@ -59,7 +60,7 @@ fn buildRangeTable(
 /// with value "{i}". block_size controls how many entries land per block.
 fn buildTestTable(
     allocator: std.mem.Allocator,
-    prefix: []const u8,
+    prefix: String,
     n: usize,
     block_size: u32,
 ) !zdb.table.builder.TableBuffer {
@@ -165,7 +166,7 @@ test "seekGe: prefix-length and version ordering" {
     defer it.deinit();
 
     // Stored order is the seek order.
-    const want = [_][]const u8{ "a5", "ab9", "ab3", "abc1", "b7" };
+    const want = [_]String{ "a5", "ab9", "ab3", "abc1", "b7" };
     try it.seekRange(.{}, .{});
     for (want) |v| {
         try std.testing.expectEqualStrings(v, it.itemRef().?.value);
@@ -174,7 +175,7 @@ test "seekGe: prefix-length and version ordering" {
     try std.testing.expect(it.itemRef() == null);
 
     const max_ts = std.math.maxInt(u64);
-    const cases = [_]struct { k: Key, want: []const u8 }{
+    const cases = [_]struct { k: Key, want: String }{
         // Newest version of a primary comes first.
         .{ .k = .{ .primary = "ab", .timestamp = max_ts }, .want = "ab9" },
         // A read below the newest lands on the next version down.
@@ -402,7 +403,7 @@ test "seek: various targets" {
     var it = TableIterator.init(alloc, tbl, .p0);
     defer it.deinit();
 
-    const Case = struct { in: []const u8, valid: bool, out: []const u8 };
+    const Case = struct { in: String, valid: bool, out: String };
     const cases = [_]Case{
         .{ .in = "abc", .valid = true, .out = "k0000" }, // before all keys
         .{ .in = "k0100", .valid = true, .out = "k0100" }, // exact hit

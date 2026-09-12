@@ -9,6 +9,7 @@ const std = @import("std");
 const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
 const utils = @import("utils");
+const String = utils.String;
 
 const log = std.log.scoped(.pgwire_shakeout);
 
@@ -23,7 +24,7 @@ const ShakeoutHandler = struct {
     pub fn onQuery(
         self: *ShakeoutHandler,
         state: *pgwire.ConnState,
-        sql: []const u8,
+        sql: String,
     ) !void {
         log.info("query: {s}", .{sql});
         try self.runQuery(state, sql);
@@ -76,7 +77,7 @@ const ShakeoutHandler = struct {
     fn runQuery(
         self: *ShakeoutHandler,
         state: *pgwire.ConnState,
-        sql: []const u8,
+        sql: String,
     ) !void {
         // Empty / whitespace-only queries get the EmptyQueryResponse
         // tag — psql sends this on bare semicolons.
@@ -130,7 +131,7 @@ const ShakeoutHandler = struct {
     }
 };
 
-fn firstKind(stmts: []std.json.Value) ?[]const u8 {
+fn firstKind(stmts: []std.json.Value) ?String {
     if (stmts.len == 0) return null;
     const obj = switch (stmts[0]) {
         .object => |o| o,

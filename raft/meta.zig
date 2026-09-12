@@ -28,6 +28,7 @@
 const std = @import("std");
 const vfs = @import("vfs");
 const utils = @import("utils");
+const String = utils.String;
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
 
@@ -56,7 +57,7 @@ pub const MetaStore = struct {
     /// Authoritative in-memory state. Updated only after the corresponding
     /// disk write has been durable.
     /// HardState is stored by value because all its fields are scalars; copy
-    /// is free. Snapshot is heap-owned because it carries `data: []const u8`
+    /// is free. Snapshot is heap-owned because it carries `data: String`
     /// (and a `conf_state` with its own peers slice) — keeping a single
     /// `*Snapshot` lets the swap path use `clone`/`destroy`, which is what
     /// the legacy metaFile did and avoids any shallow-copy ownership puzzles.
@@ -68,7 +69,7 @@ pub const MetaStore = struct {
     /// The recovery sequence number lives in `hard_state.seq`.
     active_slot: u8,
 
-    pub fn openPath(path: []const u8, alloc: std.mem.Allocator) !MetaStore {
+    pub fn openPath(path: String, alloc: std.mem.Allocator) !MetaStore {
         // Directory creation is path metadata, not data I/O — go through
         // std.Io.Dir (cheap) rather than vfs (which is bandwidth-limited
         // for data ops).
@@ -303,7 +304,7 @@ pub const MetaStore = struct {
     /// Validate a single slot's frame and decode the HardState. Returns
     /// null on any validation failure (invalid hash, length out of range,
     /// or HardState parseRoot failure).
-    fn parseSlot(slot: []const u8) ?zen.HardStateReader {
+    fn parseSlot(slot: String) ?zen.HardStateReader {
         const payload = zbuf.Frame.read(slot) catch return null;
         return zen.HardStateReader.parseRoot(payload) catch null;
     }

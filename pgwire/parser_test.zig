@@ -5,12 +5,14 @@ const std = @import("std");
 const testing = std.testing;
 const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
+const utils = @import("utils");
+const String = utils.String;
 
 const parser = pgwire.parser;
 
 /// Walk into the first statement's "stmt" wrapper and return its key
 /// (the statement-kind name libpg_query emits, e.g. "SelectStmt").
-fn firstStmtKind(tree: *const parser.ParseTree) ?[]const u8 {
+fn firstStmtKind(tree: *const parser.ParseTree) ?String {
     const stmts = tree.statements() orelse return null;
     if (stmts.len == 0) return null;
     const first = stmts[0];

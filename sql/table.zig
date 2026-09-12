@@ -12,6 +12,7 @@ const std = @import("std");
 const zdb = @import("zdb");
 
 const _value = @import("value.zig");
+const String = _value.String;
 const _schema = @import("schema.zig");
 const _row = @import("row.zig");
 const _key = @import("key.zig");
@@ -46,7 +47,7 @@ pub const Column = struct {
     /// all four are the live columns in column_id order. Minted once, in
     /// loadTableSchema, where the parallel-arrays invariant is asserted.
     pos: usize,
-    name: []const u8,
+    name: String,
     ty: _value.Type,
     pkey_position: ?u16,
 
@@ -144,7 +145,7 @@ pub const Table = struct {
     /// The live column with this name (exact match — libpg_query
     /// lowercases unquoted identifiers, matching how names are stored),
     /// the egid pseudo-column, or null. Linear scan (columns is small).
-    pub fn column(self: *const Table, name: []const u8) ?*const Column {
+    pub fn column(self: *const Table, name: String) ?*const Column {
         if (std.mem.eql(u8, name, egid_column.name)) return &egid_column;
         for (self.columns) |*c| {
             if (std.mem.eql(u8, c.name, name)) return c;

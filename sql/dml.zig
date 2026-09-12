@@ -814,7 +814,7 @@ fn replyPkeyNull(state: *pgwire.ConnState) !void {
     );
 }
 
-fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {
+fn logDeleteErr(table_name: String, what: String, err: anyerror) void {
     log.err(
         "delete from '{s}': {s}: {s}",
         .{ table_name, what, @errorName(err) },
@@ -827,8 +827,8 @@ fn logDeleteErr(table_name: []const u8, what: []const u8, err: anyerror) void {
 /// anything else is an internal read failure.
 fn replyRunErr(
     state: *pgwire.ConnState,
-    comptime verb: []const u8,
-    table_name: []const u8,
+    comptime verb: String,
+    table_name: String,
     err: anyerror,
 ) !void {
     return switch (err) {

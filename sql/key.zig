@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const _value = @import("value.zig");
+const String = _value.String;
 
 /// The 8-byte big-endian primary key for a row with this egid.
 pub fn encodeEgid(egid: u64) [8]u8 {
@@ -33,7 +34,7 @@ pub fn encodeEgid(egid: u64) [8]u8 {
 
 /// The egid a primary key encodes, or null if it isn't egid-shaped
 /// (8 bytes) — e.g. a raw-KV or catalog key.
-pub fn decodeEgid(primary: []const u8) ?u64 {
+pub fn decodeEgid(primary: String) ?u64 {
     if (primary.len != 8) return null;
     return std.mem.readInt(u64, primary[0..8], .big);
 }
@@ -56,7 +57,7 @@ pub const U64 = packed struct(u64) {
     }
 
     /// The halves `k` encodes, or null if it isn't 8 bytes.
-    pub fn decode(k: []const u8) ?U64 {
+    pub fn decode(k: String) ?U64 {
         if (k.len != 8) return null;
         return @bitCast(std.mem.readInt(u64, k[0..8], .big));
     }

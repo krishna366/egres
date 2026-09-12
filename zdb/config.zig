@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 
 pub const Error = error{
     InvalidNumCompactors,
@@ -11,7 +12,7 @@ pub const Error = error{
 };
 
 pub const Config = struct {
-    dir: []const u8 = "",
+    dir: String = "",
     in_memory: bool = false,
     read_only: bool = false,
 

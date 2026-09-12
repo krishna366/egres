@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const String = sql.value.String;
 const parse = sql.parse;
 
 test "sql.parse: CREATE/DROP DATABASE parse to typed statements" {
@@ -75,7 +76,7 @@ test "sql.parse: CREATE TABLE semantic rejections carry a reason" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+    const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "CREATE TABLE t (a int NOT NULL);", .needle = "and UNIQUE" },
         .{ .sql = "CREATE TABLE t (a serial);", .needle = "serial" },
         .{ .sql = "CREATE TABLE t (a int, b int, PRIMARY KEY (a, b));", .needle = "table-level" },
@@ -153,7 +154,7 @@ test "sql.parse: CREATE INDEX rejections carry a reason" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+    const cases = [_]struct { sql: String, needle: String }{
         .{
             .sql = "CREATE INDEX CONCURRENTLY i ON t (a);",
             .needle = "CONCURRENTLY",
@@ -233,7 +234,7 @@ test "sql.parse: INSERT rejections carry a reason" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+    const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING;", .needle = "ON CONFLICT" },
         .{ .sql = "INSERT INTO t VALUES (1) RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "INSERT INTO t SELECT * FROM u;", .needle = "VALUES" },
@@ -313,7 +314,7 @@ test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
     try testing.expectEqualStrings("c", upd2_and[1].eq.column);
 
     // Rejections anywhere in the tree surface the leaf's reason.
-    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+    const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "SELECT * FROM t WHERE a = 1 AND b > 2;", .needle = "column = value" },
         .{ .sql = "SELECT * FROM t WHERE a = 1 OR b;", .needle = "unsupported WHERE" },
         .{ .sql = "SELECT * FROM t WHERE NOT b;", .needle = "unsupported WHERE" },
@@ -333,7 +334,7 @@ test "sql.parse: LIMIT takes an integer literal; ALL and NULL mean none" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const cases = [_]struct { sql: []const u8, limit: ?usize }{
+    const cases = [_]struct { sql: String, limit: ?usize }{
         .{ .sql = "SELECT * FROM t;", .limit = null },
         .{ .sql = "SELECT * FROM t LIMIT 3;", .limit = 3 },
         .{ .sql = "SELECT * FROM t LIMIT 0;", .limit = 0 },
@@ -355,7 +356,7 @@ test "sql.parse: SELECT rejections carry a reason" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+    const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "SELECT * FROM t ORDER BY a;", .needle = "ORDER BY" },
         .{ .sql = "SELECT * FROM t LIMIT 3 OFFSET 1;", .needle = "OFFSET" },
         .{ .sql = "SELECT * FROM t LIMIT -1;", .needle = "negative" },
@@ -411,7 +412,7 @@ test "sql.parse: DELETE rejections carry a reason" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+    const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "DELETE FROM t USING u WHERE t.a = u.a;", .needle = "USING" },
         .{ .sql = "DELETE FROM t RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) DELETE FROM t;", .needle = "WITH" },
@@ -465,7 +466,7 @@ test "sql.parse: UPDATE parses table, SET list, and the optional filter" {
 }
 
 /// The first SET value of an UPDATE that must parse.
-fn setValue(arloc: std.mem.Allocator, text: []const u8) !parse.Expr {
+fn setValue(arloc: std.mem.Allocator, text: String) !parse.Expr {
     const stmt = try parse.statement(arloc, text);
     return stmt.update.sets[0].value;
 }
@@ -559,7 +560,7 @@ test "sql.parse: UPDATE rejections carry a reason" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const cases = [_]struct { sql: []const u8, needle: []const u8 }{
+    const cases = [_]struct { sql: String, needle: String }{
         .{ .sql = "UPDATE t SET a = 1 FROM u;", .needle = "FROM" },
         .{ .sql = "UPDATE t SET a = 1 RETURNING id;", .needle = "RETURNING" },
         .{ .sql = "WITH x AS (SELECT 1) UPDATE t SET a = 1;", .needle = "WITH" },

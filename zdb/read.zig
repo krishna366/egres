@@ -252,14 +252,14 @@ pub const MultiGet = struct {
     pub const Version = struct {
         ts: u64,
         meta: Meta,
-        value: []const u8,
+        value: String,
         pin: Pin,
         next: ?*Version,
     };
 
     /// One key of the batch and the versions found for it so far.
     pub const Node = struct {
-        key: []const u8,
+        key: String,
         /// bloomHash(key), once per key: every table probe reuses it.
         hash: u64,
         /// Oldest taken first (see Version). Null until a source has
@@ -351,7 +351,7 @@ pub const MultiGet = struct {
     /// until deinit. `key` must be one of the batch's keys. A row's
     /// chain is one version; for a chain of deltas this is the newest
     /// delta, the version `get` has always returned.
-    pub fn item(self: *const MultiGet, key: []const u8) ?Item {
+    pub fn item(self: *const MultiGet, key: String) ?Item {
         const node = self.find(key);
         var ver = node.head orelse return null;
         while (ver.next) |next| ver = next;
@@ -372,7 +372,7 @@ pub const MultiGet = struct {
     pub fn bitmap(
         self: *const MultiGet,
         alloc: std.mem.Allocator,
-        key: []const u8,
+        key: String,
     ) !zroar.Bitmap {
         // Pending posting ops are the sql layer's to overlay.
         std.debug.assert(self.opts.pending == null);
@@ -408,14 +408,14 @@ pub const MultiGet = struct {
 
     /// Whether `key`'s chain has any version at all (rollupBitmap's
     /// null result).
-    pub fn hasVersions(self: *const MultiGet, key: []const u8) bool {
+    pub fn hasVersions(self: *const MultiGet, key: String) bool {
         return self.find(key).head != null;
     }
 
     /// The node of a key that was passed to init.
-    fn find(self: *const MultiGet, key: []const u8) *Node {
+    fn find(self: *const MultiGet, key: String) *Node {
         const idx = utils.search(Node, self.nodes, key, struct {
-            fn f(k: []const u8, node: Node) bool {
+            fn f(k: String, node: Node) bool {
                 return std.mem.order(u8, node.key, k) != .lt;
             }
         }.f);
@@ -520,12 +520,12 @@ pub const MultiGet = struct {
         nodes: []const *Node,
     ) !void {
         const lo = utils.search(*Node, nodes, tbl.smallest.primary, struct {
-            fn f(smallest: []const u8, node: *Node) bool {
+            fn f(smallest: String, node: *Node) bool {
                 return std.mem.order(u8, node.key, smallest) != .lt;
             }
         }.f);
         const hi = utils.search(*Node, nodes, tbl.biggest.primary, struct {
-            fn f(biggest: []const u8, node: *Node) bool {
+            fn f(biggest: String, node: *Node) bool {
                 return std.mem.order(u8, node.key, biggest) == .gt;
             }
         }.f);
@@ -634,7 +634,7 @@ pub fn baseBitmap(
 /// structural check — without it a truncated element region decodes
 /// as an empty list — but content contracts were enforced at write
 /// time (validateDelta). Deltas are applied oldest to newest.
-pub fn applyDelta(bm: *zroar.Bitmap, delta: []const u8) !void {
+pub fn applyDelta(bm: *zroar.Bitmap, delta: String) !void {
     const r = DeltaReader.init(delta, 0) catch return error.CorruptPosting;
     r.verify() catch return error.CorruptPosting;
     var j: u32 = 0;

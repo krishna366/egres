@@ -258,6 +258,7 @@ fn makeModules(
 
     const pgwire = makeModule(b, target, optimize, "pgwire.zig");
     pgwire.addImport("zfiber", fiber);
+    pgwire.addImport("utils", utils);
     // pgwire.parser does @cImport("pg_query.h"). Header path lives on the
     // module; the C archive itself is linked per-executable via
     // addLibpgQuerySources.

@@ -31,6 +31,8 @@
 
 const std = @import("std");
 const _buffers = @import("buffers.gen.zig");
+const utils = @import("utils");
+const String = utils.String;
 
 const DeltaReader = _buffers.RoaringDeltaReader;
 
@@ -40,7 +42,7 @@ pub const Error = error{CorruptPosting};
 /// is proposed. Bounds-verifies the record and checks both lists are
 /// strictly ascending and mutually disjoint — content contracts,
 /// enforced once per record lifetime, never on reads.
-pub fn validateDelta(value: []const u8) Error!void {
+pub fn validateDelta(value: String) Error!void {
     const r = DeltaReader.init(value, 0) catch return Error.CorruptPosting;
     r.verify() catch return Error.CorruptPosting;
 

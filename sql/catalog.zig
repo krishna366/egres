@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const _value = @import("value.zig");
+const String = _value.String;
 const _schema = @import("schema.zig");
 const _key = @import("key.zig");
 
@@ -160,7 +161,7 @@ pub fn encodeKey(owner_table_id: u32, column_id: u32) [8]u8 {
     return (_key.U64{ .upper = owner_table_id, .lower = column_id }).encode();
 }
 
-pub fn decodeKey(k: []const u8) Error!Key {
+pub fn decodeKey(k: String) Error!Key {
     const p = _key.U64.decode(k) orelse return error.CorruptCatalogRow;
     return .{ .table_id = p.upper, .column_id = p.lower };
 }
@@ -261,7 +262,7 @@ pub fn encodeIndexKey(base_table_id: u32, index_tid: u32) [8]u8 {
 /// and index_table_id. The value-borne fields (column_id, unique) are
 /// zeroed — decodeIndex reads those. Null if `primary` isn't index-key
 /// shaped (8 bytes).
-pub fn decodeIndexKey(primary: []const u8) ?IndexDef {
+pub fn decodeIndexKey(primary: String) ?IndexDef {
     const k = decodeKey(primary) catch return null;
     return .{
         .base_table_id = k.table_id,

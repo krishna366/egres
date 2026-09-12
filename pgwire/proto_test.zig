@@ -10,6 +10,8 @@
 const std = @import("std");
 const testing = std.testing;
 const pgwire = @import("pgwire");
+const utils = @import("utils");
+const String = utils.String;
 
 const proto = pgwire.proto;
 const types = pgwire.types;
@@ -25,7 +27,7 @@ fn resetOut(aw: *std.Io.Writer.Allocating) void {
 
 // ---------- Hex helpers ----------
 
-fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+fn hexToBytes(comptime hex: String) [hex.len / 2]u8 {
     @setEvalBranchQuota(8000);
     var out: [hex.len / 2]u8 = undefined;
     var i: usize = 0;
@@ -632,7 +634,7 @@ fn frame(
     a: std.mem.Allocator,
     out: *std.ArrayList(u8),
     tag: u8,
-    body: []const u8,
+    body: String,
 ) !void {
     try out.append(a, tag);
     var lb: [4]u8 = undefined;

@@ -4,8 +4,9 @@ const skiplist = @import("zdb").skl;
 const Key = @import("zdb").kv.Key;
 const Meta = @import("zdb").kv.Meta;
 const u = @import("utils");
+const String = u.String;
 
-fn writeKey(buf: []u8, idx: usize) ![]const u8 {
+fn writeKey(buf: []u8, idx: usize) !String {
     return std.fmt.bufPrint(buf, "k{d:0>10}", .{idx});
 }
 
@@ -111,7 +112,7 @@ test "skiplist iterator ordering and seek" {
     var sl = try skiplist.SkipList.init(testing.allocator);
     defer sl.release();
 
-    const data = [_]struct { key: []const u8, ts: u64, value: []const u8 }{
+    const data = [_]struct { key: String, ts: u64, value: String }{
         .{ .key = "5", .ts = 1, .value = "50" },
         .{ .key = "2", .ts = 2, .value = "20" },
         .{ .key = "8", .ts = 3, .value = "80" },
@@ -124,7 +125,7 @@ test "skiplist iterator ordering and seek" {
     var it = sl.iterator();
     defer it.deinit();
 
-    const expected = [_][]const u8{ "1", "2", "3", "5", "8", "9" };
+    const expected = [_]String{ "1", "2", "3", "5", "8", "9" };
     for (expected) |k| {
         const e = it.itemRef().?;
         try testing.expectEqualStrings(k, e.key.primary);

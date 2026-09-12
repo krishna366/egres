@@ -1,5 +1,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
+const utils = @import("utils");
+const String = utils.String;
 
 pub const Error = error{
     MissingValue,
@@ -17,7 +19,7 @@ const whitespace = " \t\r\n";
 
 // ---------- key normalisation ----------
 
-fn normalizeKeyInto(name: []const u8, buf: []u8) []u8 {
+fn normalizeKeyInto(name: String, buf: []u8) []u8 {
     std.debug.assert(buf.len >= name.len);
     for (name, 0..) |c, i| {
         const lower = std.ascii.toLower(c);
@@ -26,7 +28,7 @@ fn normalizeKeyInto(name: []const u8, buf: []u8) []u8 {
     return buf[0..name.len];
 }
 
-fn normalizeKeyAlloc(allocator: std.mem.Allocator, name: []const u8) Error![]u8 {
+fn normalizeKeyAlloc(allocator: std.mem.Allocator, name: String) Error![]u8 {
     const out = try allocator.alloc(u8, name.len);
     _ = normalizeKeyInto(name, out);
     return out;
@@ -34,7 +36,7 @@ fn normalizeKeyAlloc(allocator: std.mem.Allocator, name: []const u8) Error![]u8 
 
 /// Comptime-evaluated canonical form of a struct field name.
 /// Returns a fixed-size array (the caller takes its address with `&`).
-fn comptimeCanonical(comptime name: []const u8) [name.len]u8 {
+fn comptimeCanonical(comptime name: String) [name.len]u8 {
     var buf: [name.len]u8 = undefined;
     for (name, 0..) |c, i| {
         const lower = std.ascii.toLower(c);
@@ -45,10 +47,10 @@ fn comptimeCanonical(comptime name: []const u8) [name.len]u8 {
 
 // ---------- value parsing ----------
 
-fn parseBool(s: []const u8) Error!bool {
+fn parseBool(s: String) Error!bool {
     const trimmed = std.mem.trim(u8, s, whitespace);
-    const true_set = [_][]const u8{ "1", "t", "true", "y", "yes", "on" };
-    const false_set = [_][]const u8{ "0", "f", "false", "n", "no", "off" };
+    const true_set = [_]String{ "1", "t", "true", "y", "yes", "on" };
+    const false_set = [_]String{ "0", "f", "false", "n", "no", "off" };
     for (true_set) |w| if (std.ascii.eqlIgnoreCase(trimmed, w)) return true;
     for (false_set) |w| if (std.ascii.eqlIgnoreCase(trimmed, w)) return false;
     return error.InvalidBool;
@@ -60,7 +62,7 @@ fn parseBool(s: []const u8) Error!bool {
 ///   - "<int>d" for days
 ///   - concatenated <number><unit> segments using ns/us/µs/ms/s/m/h
 ///   - optional leading sign
-fn parseDurationMs(raw: []const u8) Error!i64 {
+fn parseDurationMs(raw: String) Error!i64 {
     const s = std.mem.trim(u8, raw, whitespace);
     if (s.len == 0) return 0;
 
@@ -118,12 +120,12 @@ fn parseDurationMs(raw: []const u8) Error!i64 {
 
 // ---------- string tokenizer ----------
 
-const KvMap = std.StringHashMap([]const u8);
+const KvMap = std.StringHashMap(String);
 
 /// Tokenize a `k=v; k=v;` string into a map of normalized-key → raw-value.
 /// Both keys and values point into freshly-allocated memory owned by `allocator`.
 /// Caller is responsible for freeing entries (use freeKvMap).
-fn parseFlagString(allocator: std.mem.Allocator, input: []const u8) Error!KvMap {
+fn parseFlagString(allocator: std.mem.Allocator, input: String) Error!KvMap {
     var map = KvMap.init(allocator);
     errdefer freeKvMap(allocator, &map);
 
@@ -223,12 +225,12 @@ fn validateShape(comptime T: type) void {
 
 /// Returns the doc string for `field_name`. Both T and the entry are
 /// guaranteed by validateShape to exist.
-fn docFor(comptime T: type, comptime field_name: []const u8) []const u8 {
+fn docFor(comptime T: type, comptime field_name: String) String {
     return @field(T.docs, field_name);
 }
 
 /// Optional one-line module description from `T.docs.self`.
-fn selfDocFor(comptime T: type) ?[]const u8 {
+fn selfDocFor(comptime T: type) ?String {
     if (!@hasField(@TypeOf(T.docs), "self")) return null;
     return @field(T.docs, "self");
 }
@@ -237,8 +239,8 @@ fn selfDocFor(comptime T: type) ?[]const u8 {
 
 fn parseField(
     comptime FT: type,
-    comptime field_name: []const u8,
-    value: []const u8,
+    comptime field_name: String,
+    value: String,
     arena: std.mem.Allocator,
 ) Error!FT {
     const info = @typeInfo(FT);
@@ -276,7 +278,7 @@ pub fn Live(comptime T: type) type {
         current: T = .{},
         version_val: u64 = 0,
 
-        pub fn init(allocator: std.mem.Allocator, input: []const u8) Error!Self {
+        pub fn init(allocator: std.mem.Allocator, input: String) Error!Self {
             var self: Self = .{
                 .allocator = allocator,
                 .arena = std.heap.ArenaAllocator.init(allocator),
@@ -298,7 +300,7 @@ pub fn Live(comptime T: type) type {
             self.arena.deinit();
         }
 
-        pub fn update(self: *Self, input: []const u8) Error!void {
+        pub fn update(self: *Self, input: String) Error!void {
             // Parse the input outside any lock — that work touches no shared
             // state. The coerce-and-install phase runs under the exclusive
             // write lock so the arena (not thread-safe) is single-writer.
@@ -329,7 +331,7 @@ pub fn Live(comptime T: type) type {
             return self.current;
         }
 
-        fn assignByKey(target: *T, key: []const u8, value: []const u8, arena: std.mem.Allocator) Error!void {
+        fn assignByKey(target: *T, key: String, value: String, arena: std.mem.Allocator) Error!void {
             const fields = @typeInfo(T).@"struct".fields;
             inline for (fields) |f| {
                 const canonical = comptime comptimeCanonical(f.name);
@@ -352,7 +354,7 @@ pub fn Live(comptime T: type) type {
 ///       ...
 pub fn writeHelp(
     comptime T: type,
-    name: []const u8,
+    name: String,
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
 ) Error!void {
@@ -382,7 +384,7 @@ pub fn writeHelp(
     }
 }
 
-fn humanType(comptime FT: type, comptime field_name: []const u8) []const u8 {
+fn humanType(comptime FT: type, comptime field_name: String) String {
     const info = @typeInfo(FT);
     return switch (info) {
         .bool => "bool",
@@ -411,8 +413,8 @@ fn writeDefault(comptime FT: type, value: FT, out: *std.ArrayList(u8), allocator
 
 const Entry = struct {
     live_ptr: *anyopaque,
-    update_fn: *const fn (*anyopaque, []const u8) Error!void,
-    help_fn: *const fn (*anyopaque, []const u8, *std.ArrayList(u8), std.mem.Allocator) Error!void,
+    update_fn: *const fn (*anyopaque, String) Error!void,
+    help_fn: *const fn (*anyopaque, String, *std.ArrayList(u8), std.mem.Allocator) Error!void,
     deinit_fn: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
@@ -443,15 +445,15 @@ pub const Registry = struct {
     /// the caller MUST NOT call deinit() on the returned pointer.
     pub fn register(
         self: *Registry,
-        name: []const u8,
+        name: String,
         comptime T: type,
     ) Error!*Live(T) {
         const Wrappers = struct {
-            fn update(p: *anyopaque, input: []const u8) Error!void {
+            fn update(p: *anyopaque, input: String) Error!void {
                 const l: *Live(T) = @ptrCast(@alignCast(p));
                 return l.update(input);
             }
-            fn help(p: *anyopaque, module_name: []const u8, out: *std.ArrayList(u8), alloc: std.mem.Allocator) Error!void {
+            fn help(p: *anyopaque, module_name: String, out: *std.ArrayList(u8), alloc: std.mem.Allocator) Error!void {
                 _ = p;
                 return writeHelp(T, module_name, out, alloc);
             }
@@ -484,7 +486,7 @@ pub const Registry = struct {
         return live;
     }
 
-    pub fn update(self: *Registry, name: []const u8, input: []const u8) Error!void {
+    pub fn update(self: *Registry, name: String, input: String) Error!void {
         var name_buf: [256]u8 = undefined;
         if (name.len > name_buf.len) return error.UnknownModule;
         const key = normalizeKeyInto(name, &name_buf);
@@ -514,8 +516,8 @@ pub const Registry = struct {
     /// not transactional.
     pub fn parseArgv(
         self: *Registry,
-        argv: []const []const u8,
-        leftover: *std.ArrayList([]const u8),
+        argv: []const String,
+        leftover: *std.ArrayList(String),
     ) Error!void {
         var i: usize = 0;
         while (i < argv.len) : (i += 1) {
@@ -562,14 +564,14 @@ pub const Registry = struct {
         // derived from T), so we needn't hold any lock across the per-module render
         // — and dropping it first keeps the registry responsive during a long write.
         self.mu.lock(@src());
-        var names = std.ArrayList([]const u8).empty;
+        var names = std.ArrayList(String).empty;
         defer names.deinit(self.allocator);
         var it = self.entries.keyIterator();
         while (it.next()) |k| names.append(self.allocator, k.*) catch {
             self.mu.unlock();
             return error.OutOfMemory;
         };
-        std.mem.sort([]const u8, names.items, {}, lessThanSlice);
+        std.mem.sort(String, names.items, {}, lessThanSlice);
         // Build a parallel list of entries so we don't re-look-up.
         var entries = std.ArrayList(Entry).empty;
         defer entries.deinit(self.allocator);
@@ -588,7 +590,7 @@ pub const Registry = struct {
     }
 };
 
-fn lessThanSlice(_: void, a: []const u8, b: []const u8) bool {
+fn lessThanSlice(_: void, a: String, b: String) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
@@ -596,7 +598,7 @@ fn lessThanSlice(_: void, a: []const u8, b: []const u8) bool {
 /// Used for argv payloads where the shell may not have stripped them
 /// (e.g. payloads injected from config files, wrapper scripts, or test code
 /// that builds argv literally). Unmatched or absent quotes pass through.
-fn stripSurroundingQuotes(s: []const u8) []const u8 {
+fn stripSurroundingQuotes(s: String) String {
     if (s.len < 2) return s;
     const first = s[0];
     if (first != '"' and first != '\'') return s;

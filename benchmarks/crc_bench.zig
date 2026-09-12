@@ -20,6 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const utils = @import("utils");
+const String = utils.String;
 const bench = utils.bench;
 const Bench = bench.Bench;
 
@@ -37,7 +38,7 @@ inline fn crc32qStep(crc_in: u64, v: u64) u64 {
 /// Hardware path used for 8-byte chunks; std software CRC handles the 0–7
 /// byte tail (sidesteps the self-hosted x86 backend's missing crc32b
 /// encoding without changing output bits).
-fn crc32cHw(payload: []const u8) u32 {
+fn crc32cHw(payload: String) u32 {
     var crc: u64 = 0xFFFF_FFFF;
     var i: usize = 0;
     while (i + 8 <= payload.len) : (i += 8) {

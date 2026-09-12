@@ -7,6 +7,7 @@ const engine = @import("engine");
 const sql = @import("sql");
 const flags = @import("flags");
 const utils = @import("utils");
+const String = utils.String;
 // The build-selected allocator backend (see `-Dallocator` in
 // build.zig): jemalloc or mimalloc behind one adapter API, exactly one
 // linked per binary. `galloc.kind` names it at comptime.
@@ -21,7 +22,7 @@ pub const std_options = std.Options{
 /// trivial to bring up N servers on one host without spelling out
 /// per-node port assignments.
 const ListenCfg = struct {
-    host: []const u8 = "127.0.0.1",
+    host: String = "127.0.0.1",
     raft_port: u16 = 4210,
     client_port: u16 = 5210,
     sql_port: u16 = 3210,
@@ -43,7 +44,7 @@ const ListenCfg = struct {
 const RaftCfg = struct {
     id: u64 = 0,
     cluster_id: u64 = 1,
-    seeds: []const u8 = "",
+    seeds: String = "",
     tick_ms: u32 = 20,
 
     pub const docs = .{
@@ -59,8 +60,8 @@ const RaftCfg = struct {
 /// `dir` if empty (single-disk setup) but can be pointed at a faster
 /// device (e.g. NVMe) for write-ahead log throughput.
 const DataCfg = struct {
-    dir: []const u8 = "",
-    wal_dir: []const u8 = "",
+    dir: String = "",
+    wal_dir: String = "",
     memtable_size: u64 = 0,
 
     pub const docs = .{
@@ -97,12 +98,12 @@ const CacheCfg = struct {
 /// depot directory is write-once blobs only — NEVER a node's live data
 /// dir.
 const StoreCfg = struct {
-    kind: []const u8 = "",
-    path: []const u8 = "",
-    s3_endpoint: []const u8 = "",
-    s3_bucket: []const u8 = "",
-    s3_region: []const u8 = "us-east-1",
-    s3_prefix: []const u8 = "",
+    kind: String = "",
+    path: String = "",
+    s3_endpoint: String = "",
+    s3_bucket: String = "",
+    s3_region: String = "us-east-1",
+    s3_prefix: String = "",
 
     pub const docs = .{
         .self = "Shared object store for SST distribution (multi-node).",
@@ -115,8 +116,8 @@ const StoreCfg = struct {
     };
 };
 
-fn parseSeedList(text: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
-    var list = std.ArrayList([]const u8).empty;
+fn parseSeedList(text: String, allocator: std.mem.Allocator) ![]const String {
+    var list = std.ArrayList(String).empty;
     errdefer list.deinit(allocator);
     var it = std.mem.splitScalar(u8, text, ',');
     while (it.next()) |s| {
@@ -196,7 +197,7 @@ fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
     log.info("seeded genesis: database '{s}' -> ns={d}", .{ default_database, zdb.manifest.first_namespace });
 }
 
-fn deinitWithLog(comptime msg: []const u8, ptr: anytype) void {
+fn deinitWithLog(comptime msg: String, ptr: anytype) void {
     ptr.deinit();
     log.info("deinit: " ++ msg ++ " done", .{});
 }
@@ -210,10 +211,10 @@ const Args = struct {
     listen: ListenCfg,
     raft: RaftCfg,
     data: DataCfg,
-    raft_addr: []const u8,
-    client_addr: []const u8,
-    seeds: []const []const u8,
-    wal_dir: []const u8,
+    raft_addr: String,
+    client_addr: String,
+    seeds: []const String,
+    wal_dir: String,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -269,14 +270,14 @@ fn mimallocMaintenance() void {
 /// Spawned on the default lane to drive process bootstrap. Stops the
 /// runtime (unblocks `fiber_rt.run()` in `main`) whenever bootstrap
 /// returns — normal shutdown or an early error.
-fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const []const u8) void {
+fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const String) void {
     defer fiber.stop();
     bootstrap(allocator, argv) catch |err| {
         log.err("bootstrap failed: {s}", .{@errorName(err)});
     };
 }
 
-fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     flags.initGlobal(allocator);
     defer flags.deinitGlobal();
     const live_listen = try flags.g().register("listen", ListenCfg);
@@ -295,7 +296,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
         }
     }
 
-    var leftover: std.ArrayList([]const u8) = .empty;
+    var leftover: std.ArrayList(String) = .empty;
     defer leftover.deinit(allocator);
     flags.g().parseArgv(argv[1..], &leftover) catch |err| {
         std.log.err("flag parse failed: {s}", .{@errorName(err)});

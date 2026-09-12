@@ -5,6 +5,7 @@ const fiber = @import("zfiber");
 const m = @import("metrics");
 const flags = @import("flags");
 const utils = @import("raft").utils;
+const String = utils.String;
 const WaitGroup = utils.WaitGroup;
 
 /// `--snapshot` — Raft snapshot triggers and polling cadence. The leader's
@@ -108,7 +109,7 @@ pub const StorageImpl = struct {
         return self.recovery_done.load(.acquire) and self.forest.memtables.currentId() != 0;
     }
 
-    fn applyEntry(ctx: *anyopaque, entry: raft.Entry, data: []const u8) anyerror!void {
+    fn applyEntry(ctx: *anyopaque, entry: raft.Entry, data: String) anyerror!void {
         // Empty-data entries (clock ticks) have no state machine work — the
         // raft node still advances `apply_ts` after we return, so the tick's
         // timestamp becomes visible to blocked readers.
@@ -125,7 +126,7 @@ pub const StorageImpl = struct {
         return self.applyEntryInner(entry, data);
     }
 
-    fn applyEntryInner(self: *StorageImpl, entry: raft.Entry, data: []const u8) !void {
+    fn applyEntryInner(self: *StorageImpl, entry: raft.Entry, data: String) !void {
         const parsed = zdb_bufs.parseMessageWithTail(data) catch {
             log.err("on_apply: unknown entry type at index={d}", .{entry.index});
             return;
@@ -1315,7 +1316,7 @@ pub const Engine = struct {
     /// Propose an already-encoded payload through Raft and block for `wait`
     /// (commit = quorum; apply = also applied here). The one propose+wait path
     /// the encode helpers below funnel through.
-    pub fn proposeAndWait(self: *Engine, payload: []const u8, proposal_type: raft.Node.ProposalType, wait_for: Wait) !void {
+    pub fn proposeAndWait(self: *Engine, payload: String, proposal_type: raft.Node.ProposalType, wait_for: Wait) !void {
         switch (wait_for) {
             .apply => try self.node.proposeAndWaitForApply(payload, proposal_type),
             .commit => {

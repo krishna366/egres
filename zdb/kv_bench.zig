@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 const zdb = @import("zdb");
 const bench = utils.bench;
 const Bench = bench.Bench;
@@ -32,7 +33,7 @@ const Key = zdb.kv.Key;
 /// with the result INVERTED, since newer versions sort first. So the
 /// whole ordering is two memcmps and no integer parsing at all.
 const SerialKey = struct {
-    raw: []const u8,
+    raw: String,
 
     fn order(a: SerialKey, b: SerialKey) std.math.Order {
         const ap = a.raw[0 .. a.raw.len - 8];
@@ -58,8 +59,8 @@ const versions: usize = 2; // versions per primary
 /// Marshal `num_keys` keys whose primaries are `primary_len` bytes and
 /// differ only in their last 8 — the egid-shaped case, where a compare
 /// must walk the whole common prefix before deciding.
-fn buildKeys(a: std.mem.Allocator, primary_len: usize) ![]const []const u8 {
-    const out = try a.alloc([]const u8, num_keys);
+fn buildKeys(a: std.mem.Allocator, primary_len: usize) ![]const String {
+    const out = try a.alloc(String, num_keys);
     const buf = try a.alloc(u8, primary_len);
     defer a.free(buf);
 
@@ -79,7 +80,7 @@ fn buildKeys(a: std.mem.Allocator, primary_len: usize) ![]const []const u8 {
     return out;
 }
 
-fn freeKeys(a: std.mem.Allocator, keys: []const []const u8) void {
+fn freeKeys(a: std.mem.Allocator, keys: []const String) void {
     for (keys) |k| a.free(k);
     a.free(keys);
 }

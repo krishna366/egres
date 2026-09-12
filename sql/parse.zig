@@ -25,20 +25,20 @@ const String = _value.String;
 /// borrowed. A PRIMARY KEY column is unique too, but `unique` marks
 /// only a bare UNIQUE constraint: the PK gets its own index.
 pub const ColumnDef = struct {
-    name: []const u8,
+    name: String,
     ty: _value.Type,
     pkey: bool = false,
     unique: bool = false,
 };
 
 pub const CreateTable = struct {
-    name: []const u8, // table name (borrowed)
+    name: String, // table name (borrowed)
     if_not_exists: bool = false,
     columns: []ColumnDef, // borrowed (and each column name)
 };
 
 pub const DropTable = struct {
-    name: []const u8, // table name (borrowed)
+    name: String, // table name (borrowed)
     missing_ok: bool = false, // IF EXISTS
 };
 
@@ -60,16 +60,16 @@ pub const DropIndex = struct {
 /// non-literal item (DEFAULT, an expression) the executor rejects.
 pub const Literal = union(enum) {
     int: i64,
-    float: []const u8, // borrowed; libpg_query keeps floats as text
-    str: []const u8, // borrowed
+    float: String, // borrowed; libpg_query keeps floats as text
+    str: String, // borrowed
     bool_: bool,
     null_value,
     unsupported,
 };
 
 pub const Insert = struct {
-    table: []const u8, // borrowed
-    columns: ?[][]const u8, // borrowed target columns; null = positional (all columns)
+    table: String, // borrowed
+    columns: ?[]String, // borrowed target columns; null = positional (all columns)
     rows: [][]Literal, // borrowed rows of literals
 };
 
@@ -77,12 +77,12 @@ pub const Insert = struct {
 /// include the `egid` pseudo-column). Names are borrowed.
 pub const Projection = union(enum) {
     star,
-    columns: [][]const u8,
+    columns: []String,
 };
 
 /// A single `column = literal` comparison — the equality leaf of a WHERE.
 pub const Eq = struct {
-    column: []const u8, // borrowed
+    column: String, // borrowed
     literal: Literal,
 };
 
@@ -99,13 +99,13 @@ pub const Where = union(enum) {
 
     /// `column IS NULL` (negate = false) / `column IS NOT NULL`.
     pub const NullTest = struct {
-        column: []const u8, // borrowed
+        column: String, // borrowed
         negate: bool,
     };
 };
 
 pub const Select = struct {
-    table: []const u8, // borrowed
+    table: String, // borrowed
     projection: Projection,
     where: ?Where,
     /// FOR UPDATE: lock every matched row exclusively (held to txn end).
@@ -115,7 +115,7 @@ pub const Select = struct {
 };
 
 pub const Delete = struct {
-    table: []const u8, // borrowed
+    table: String, // borrowed
     where: ?Where, // null = delete every row
 };
 
@@ -127,7 +127,7 @@ pub const Delete = struct {
 /// because a union cannot hold itself by value.
 pub const Expr = union(enum) {
     literal: Literal,
-    column: []const u8, // borrowed
+    column: String, // borrowed
     binop: BinOp,
 
     pub const Op = enum { add, sub, mul, div, mod, concat };
@@ -136,19 +136,19 @@ pub const Expr = union(enum) {
 
 /// One SET assignment: `column = expr`.
 pub const SetClause = struct {
-    column: []const u8, // borrowed
+    column: String, // borrowed
     value: Expr,
 };
 
 pub const Update = struct {
-    table: []const u8, // borrowed
+    table: String, // borrowed
     sets: []SetClause, // borrowed
     where: ?Where, // null = update every row
 };
 
 pub const Stmt = union(enum) {
-    create_database: []const u8, // database name (borrowed)
-    drop_database: []const u8, // database name (borrowed)
+    create_database: String, // database name (borrowed)
+    drop_database: String, // database name (borrowed)
     create_table: CreateTable,
     drop_table: DropTable,
     create_index: CreateIndex,
@@ -160,11 +160,11 @@ pub const Stmt = union(enum) {
     begin_txn,
     commit_txn,
     rollback_txn,
-    invalid: []const u8, // recognized but rejected; reason
+    invalid: String, // recognized but rejected; reason
     unsupported,
 };
 
-pub fn statement(alloc: std.mem.Allocator, sql: []const u8) parser.ParseError!Stmt {
+pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     // `alloc` must be an arena: parse allocates the whole libpg_query JSON
     // tree into it, and the returned Stmt borrows strings straight out
     // of that tree. Nothing is freed here — the caller drops the arena.
@@ -214,11 +214,11 @@ pub fn statement(alloc: std.mem.Allocator, sql: []const u8) parser.ParseError!St
 /// One part of a (possibly qualified) name: `public.t` arrives as
 /// [{"String": {"sval": "public"}}, {"String": {"sval": "t"}}] — the LAST
 /// part is the object itself.
-const NameNode = struct { String: struct { sval: []const u8 = "" } = .{} };
+const NameNode = struct { String: struct { sval: String = "" } = .{} };
 
 /// CREATE TABLE t (id int PRIMARY KEY, name text)
 const CreateStmtJson = struct {
-    relation: struct { relname: []const u8 = "" } = .{},
+    relation: struct { relname: String = "" } = .{},
     if_not_exists: bool = false,
     tableElts: []const TableElt = &.{},
 
@@ -228,13 +228,13 @@ const CreateStmtJson = struct {
         Constraint: std.json.Value,
     };
     const ColumnDefJson = struct {
-        colname: []const u8 = "",
+        colname: String = "",
         /// `int` arrives pg_catalog-qualified: names = [pg_catalog, int4].
         typeName: struct { names: []const NameNode = &.{} } = .{},
         constraints: []const ConstraintNode = &.{},
     };
     const ConstraintNode = struct {
-        Constraint: struct { contype: []const u8 = "" } = .{},
+        Constraint: struct { contype: String = "" } = .{},
     };
 };
 
@@ -272,13 +272,13 @@ const IndexStmtJson = struct {
 
 /// INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')
 const InsertStmtJson = struct {
-    relation: struct { relname: []const u8 = "" } = .{},
+    relation: struct { relname: String = "" } = .{},
     cols: []const ResTargetNode = &.{}, // empty = positional
     selectStmt: ?SelectWrap = null,
     onConflictClause: ?std.json.Value = null, // presence ⇒ ON CONFLICT
     returningList: []const std.json.Value = &.{}, // non-empty ⇒ RETURNING
 
-    const ResTargetNode = struct { ResTarget: struct { name: []const u8 = "" } = .{} };
+    const ResTargetNode = struct { ResTarget: struct { name: String = "" } = .{} };
     // INSERT ... VALUES nests rows under a SelectStmt with `valuesLists`;
     // INSERT ... SELECT has a SelectStmt WITHOUT valuesLists (→ rejected).
     const SelectWrap = struct { SelectStmt: SelectValues = .{} };
@@ -290,8 +290,8 @@ const InsertStmtJson = struct {
     // still means integer 0).
     pub const AConst = struct {
         ival: ?struct { ival: i64 = 0 } = null,
-        fval: ?struct { fval: []const u8 = "" } = null,
-        sval: ?struct { sval: []const u8 = "" } = null,
+        fval: ?struct { fval: String = "" } = null,
+        sval: ?struct { sval: String = "" } = null,
         boolval: ?struct { boolval: bool = false } = null,
         isnull: bool = false,
     };
@@ -307,7 +307,7 @@ const SelectStmtJson = struct {
     // LIMIT ALL arrives as a NULL constant. limitOption tells COUNT
     // from FETCH ... WITH TIES.
     limitCount: ?LimitNode = null,
-    limitOption: []const u8 = "",
+    limitOption: String = "",
     // Clauses this slice doesn't support — presence ⇒ rejection.
     sortClause: []const std.json.Value = &.{},
     groupClause: []const std.json.Value = &.{},
@@ -322,8 +322,8 @@ const SelectStmtJson = struct {
     // arrives as strength="LCS_FORUPDATE", waitPolicy="LockWaitBlock".
     const LockingNode = struct {
         LockingClause: ?struct {
-            strength: []const u8 = "",
-            waitPolicy: []const u8 = "",
+            strength: String = "",
+            waitPolicy: String = "",
             lockedRels: []const std.json.Value = &.{},
         } = null,
     };
@@ -334,10 +334,10 @@ const SelectStmtJson = struct {
     const ColumnRefWrap = struct { ColumnRef: ?ColumnRef = null };
     const ColumnRef = struct { fields: []const FieldNode = &.{} };
     const FieldNode = struct {
-        String: ?struct { sval: []const u8 = "" } = null,
+        String: ?struct { sval: String = "" } = null,
         A_Star: ?struct {} = null,
     };
-    const FromNode = struct { RangeVar: ?struct { relname: []const u8 = "" } = null };
+    const FromNode = struct { RangeVar: ?struct { relname: String = "" } = null };
     // One WHERE node: exactly one of the three is present. The mirror
     // is recursive through `args` (a slice, so the type has a size).
     const WhereNode = struct {
@@ -345,7 +345,7 @@ const SelectStmtJson = struct {
         BoolExpr: ?BoolExprNode = null,
         NullTest: ?NullTestNode = null,
         const AExpr = struct {
-            kind: []const u8 = "",
+            kind: String = "",
             name: []const NameNode = &.{},
             lexpr: ColumnRefWrap = .{},
             rexpr: struct { A_Const: InsertStmtJson.AConst = .{} } = .{},
@@ -354,13 +354,13 @@ const SelectStmtJson = struct {
         // AND c` into ONE node with three args (parse_test asserts it);
         // NOT always carries exactly one.
         const BoolExprNode = struct {
-            boolop: []const u8 = "",
+            boolop: String = "",
             args: []const WhereNode = &.{},
         };
         // `x IS NULL` / `x IS NOT NULL`: nulltesttype = IS_NULL | IS_NOT_NULL.
         const NullTestNode = struct {
             arg: ColumnRefWrap = .{},
-            nulltesttype: []const u8 = "",
+            nulltesttype: String = "",
         };
     };
 };
@@ -368,7 +368,7 @@ const SelectStmtJson = struct {
 /// DELETE FROM t [WHERE ...]. `relation` is inline (a RangeVar body,
 /// like INSERT); the last three clauses are decoded only to reject them.
 const DeleteStmtJson = struct {
-    relation: struct { relname: []const u8 = "" } = .{},
+    relation: struct { relname: String = "" } = .{},
     whereClause: ?SelectStmtJson.WhereNode = null,
     usingClause: []const std.json.Value = &.{}, // DELETE ... USING
     returningList: []const std.json.Value = &.{}, // RETURNING
@@ -385,7 +385,7 @@ const ExprNode = struct {
     A_Expr: ?AExpr = null,
 
     const AExpr = struct {
-        kind: []const u8 = "",
+        kind: String = "",
         name: []const NameNode = &.{},
         lexpr: ?*const ExprNode = null, // absent: unary `-x` / `+x`
         rexpr: ?*const ExprNode = null,
@@ -396,7 +396,7 @@ const ExprNode = struct {
 /// is one SET assignment. The last three clauses are decoded only to
 /// reject them.
 const UpdateStmtJson = struct {
-    relation: struct { relname: []const u8 = "" } = .{},
+    relation: struct { relname: String = "" } = .{},
     targetList: []const ResTargetNode = &.{},
     whereClause: ?SelectStmtJson.WhereNode = null,
     fromClause: []const std.json.Value = &.{}, // UPDATE ... FROM
@@ -405,7 +405,7 @@ const UpdateStmtJson = struct {
 
     const ResTargetNode = struct { ResTarget: ResTarget = .{} };
     const ResTarget = struct {
-        name: []const u8 = "",
+        name: String = "",
         val: ExprNode = .{},
     };
 };
@@ -568,9 +568,9 @@ fn parseInsert(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
     if (sel.SelectStmt.valuesLists.len == 0)
         return invalid("only INSERT ... VALUES is supported");
 
-    var columns: ?[][]const u8 = null;
+    var columns: ?[]String = null;
     if (is.cols.len > 0) {
-        const cols = try alloc.alloc([]const u8, is.cols.len);
+        const cols = try alloc.alloc(String, is.cols.len);
         for (is.cols, cols) |ct, *dst| dst.* = ct.ResTarget.name;
         columns = cols;
     }
@@ -604,7 +604,7 @@ fn literalFrom(ac: InsertStmtJson.AConst) Literal {
 /// it). NULL passes through; a non-literal item is
 /// `error.UnsupportedLiteral`.
 pub fn litToValue(a: std.mem.Allocator, lit: Literal, ty: _value.Type) !_value.Value {
-    const text: []const u8 = switch (lit) {
+    const text: String = switch (lit) {
         .null_value => return .null_value,
         .unsupported => return error.UnsupportedLiteral,
         .str, .float => |s| s,
@@ -617,16 +617,16 @@ pub fn litToValue(a: std.mem.Allocator, lit: Literal, ty: _value.Type) !_value.V
 /// A parsed WHERE tree or a rejection reason (borrowed).
 const ParsedWhere = union(enum) {
     where: Where,
-    invalid: []const u8,
+    invalid: String,
 
-    fn reject(msg: []const u8) ParsedWhere {
+    fn reject(msg: String) ParsedWhere {
         return .{ .invalid = msg };
     }
 };
 
 /// The column a WHERE operand names — the last field of a qualified
 /// reference — or null when the operand is not a plain column.
-fn columnOf(ref: SelectStmtJson.ColumnRefWrap) ?[]const u8 {
+fn columnOf(ref: SelectStmtJson.ColumnRefWrap) ?String {
     const cr = ref.ColumnRef orelse return null;
     if (cr.fields.len == 0) return null;
     const last = cr.fields[cr.fields.len - 1].String orelse return null;
@@ -698,15 +698,15 @@ fn parseWhere(
 /// A parsed SET expression or a rejection reason (borrowed).
 const ParsedExpr = union(enum) {
     expr: Expr,
-    invalid: []const u8,
+    invalid: String,
 
-    fn reject(msg: []const u8) ParsedExpr {
+    fn reject(msg: String) ParsedExpr {
         return .{ .invalid = msg };
     }
 };
 
 /// The operator an A_Expr names, or null for one SET does not do.
-fn opFrom(name: []const u8) ?Expr.Op {
+fn opFrom(name: String) ?Expr.Op {
     if (std.mem.eql(u8, name, "||")) return .concat;
     if (name.len != 1) return null;
     return switch (name[0]) {
@@ -817,7 +817,7 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         }
     }
 
-    var cols: std.ArrayList([]const u8) = .empty;
+    var cols: std.ArrayList(String) = .empty;
     if (!star) {
         for (ss.targetList) |tn| {
             const fields = tn.ResTarget.val.ColumnRef.?.fields;
@@ -859,14 +859,14 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
 
 /// Reject a recognized statement with a static client-facing reason —
 /// borrowed straight from .rodata, so no allocation.
-fn invalid(msg: []const u8) Stmt {
+fn invalid(msg: String) Stmt {
     return .{ .invalid = msg };
 }
 
 /// Reject with a formatted reason, allocated into the parse arena.
 fn invalidFmt(
     alloc: std.mem.Allocator,
-    comptime fmt: []const u8,
+    comptime fmt: String,
     args: anytype,
 ) parser.ParseError!Stmt {
     return .{ .invalid = try std.fmt.allocPrint(alloc, fmt, args) };
@@ -877,7 +877,7 @@ fn invalidFmt(
 /// default must be begin. Transaction modes (ISOLATION LEVEL …) are
 /// ignored; savepoints and two-phase commit are rejected with a reason.
 const TransactionStmtJson = struct {
-    kind: []const u8 = "TRANS_STMT_BEGIN",
+    kind: String = "TRANS_STMT_BEGIN",
 };
 
 fn parseTransaction(
@@ -974,7 +974,7 @@ fn asObject(v: std.json.Value) ?std.json.ObjectMap {
     };
 }
 
-fn asString(v: std.json.Value) ?[]const u8 {
+fn asString(v: std.json.Value) ?String {
     return switch (v) {
         .string => |s| s,
         else => null,

@@ -144,7 +144,7 @@ pub const Server = struct {
     databases: std.AutoHashMap(u64, *Database),
     next_txn_id: std.atomic.Value(u64) = .init(1),
 
-    pub fn init(eng: *engine.Engine, addr: []const u8) !Server {
+    pub fn init(eng: *engine.Engine, addr: String) !Server {
         return .{
             .engine = eng,
             .listen_addr = try fiber.net.IpAddress.parseIpAndPort(addr),
@@ -442,7 +442,7 @@ pub const Handler = struct {
         return true;
     }
 
-    pub fn onQuery(self: *Handler, state: *pgwire.ConnState, sql_text: []const u8) !void {
+    pub fn onQuery(self: *Handler, state: *pgwire.ConnState, sql_text: String) !void {
         state.error_sent = false;
         // Any statement error inside an open block aborts the txn: locks
         // release NOW (a deadlock victim must not keep its cycle alive
@@ -721,8 +721,8 @@ pub const Handler = struct {
         state: *pgwire.ConnState,
         a: std.mem.Allocator,
         tx: *_txn.Txn,
-        comptime verb: []const u8,
-        table_name: []const u8,
+        comptime verb: String,
+        table_name: String,
     ) !bool {
         self.commitTxn(a, tx) catch |err| switch (err) {
             error.LeaderChanged => {
@@ -769,13 +769,13 @@ pub fn replyLockErr(state: *pgwire.ConnState, err: anyerror) !void {
 }
 
 /// One resolved SET assignment: the cell's decode-order index + its typed
-pub fn replyError(state: *pgwire.ConnState, msg: []const u8) !void {
+pub fn replyError(state: *pgwire.ConnState, msg: String) !void {
     try state.sendError(.{
         .code = pgwire.sqlstate.internal_error,
         .message = msg,
     });
 }
 
-pub fn replyErrorCode(state: *pgwire.ConnState, code: [5]u8, msg: []const u8) !void {
+pub fn replyErrorCode(state: *pgwire.ConnState, code: [5]u8, msg: String) !void {
     try state.sendError(.{ .code = code, .message = msg });
 }

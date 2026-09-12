@@ -6,6 +6,8 @@
 //! (Range, Content-Length, Connection) legally rides unsigned.
 
 const std = @import("std");
+const utils = @import("utils");
+const String = utils.String;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -13,7 +15,7 @@ pub const hash_hex_len = Sha256.digest_length * 2;
 
 /// Hex sha256 of a payload. The well-known empty-payload digest
 /// (e3b0c442...) falls out of data="".
-pub fn hashHex(data: []const u8) [hash_hex_len]u8 {
+pub fn hashHex(data: String) [hash_hex_len]u8 {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(data, &digest, .{});
     var out: [hash_hex_len]u8 = undefined;
@@ -45,7 +47,7 @@ pub const AmzDate = struct {
     }
 
     /// The YYYYMMDD prefix (credential scope date).
-    pub fn date(self: *const AmzDate) []const u8 {
+    pub fn date(self: *const AmzDate) String {
         return self.stamp[0..8];
     }
 };
@@ -57,13 +59,13 @@ pub const AmzDate = struct {
 /// Caller owns the returned slice.
 pub fn authorization(
     a: std.mem.Allocator,
-    access_key: []const u8,
-    secret_key: []const u8,
-    region: []const u8,
-    method: []const u8,
-    path: []const u8,
-    host: []const u8,
-    payload_hash: []const u8,
+    access_key: String,
+    secret_key: String,
+    region: String,
+    method: String,
+    path: String,
+    host: String,
+    payload_hash: String,
     amz: *const AmzDate,
 ) ![]u8 {
     const canonical = try std.fmt.allocPrint(a,
@@ -94,7 +96,7 @@ const signed_headers = "host;x-amz-content-sha256;x-amz-date";
 /// The HMAC signing chain over `string_to_sign`, hex-encoded. `svc` is a
 /// parameter (not the s3 const) so tests can run AWS's published
 /// test-suite vectors, which use service name "service".
-pub fn signature(secret_key: []const u8, date: []const u8, region: []const u8, svc: []const u8, string_to_sign: []const u8) [64]u8 {
+pub fn signature(secret_key: String, date: String, region: String, svc: String, string_to_sign: String) [64]u8 {
     var key: [HmacSha256.mac_length]u8 = undefined;
     {
         var buf: [4 + 64]u8 = undefined; // "AWS4" ++ secret (secrets are ≤ 40B)

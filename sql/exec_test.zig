@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const fiber = @import("zfiber");
 const sql = @import("sql");
+const String = sql.value.String;
 const utils = @import("utils");
 const zdb = @import("zdb");
 
@@ -166,7 +167,7 @@ const Fixture = struct {
         };
     }
 
-    fn col(self: *const Fixture, name: []const u8) *const sql.table.Column {
+    fn col(self: *const Fixture, name: String) *const sql.table.Column {
         return self.tbl.column(name).?;
     }
 };
@@ -177,7 +178,7 @@ fn row(
     tbl: *const Table,
     egid: u64,
     a_val: i32,
-    b_val: []const u8,
+    b_val: String,
 ) !Item {
     var buf: std.ArrayList(u8) = .empty;
     const cells = [_]Value{ .{ .int4 = a_val }, .{ .text = b_val } };
@@ -205,7 +206,7 @@ fn alternatingRows(
 ) anyerror![]const Item {
     const items = try a.alloc(Item, 2500);
     for (items, 1..) |*it, egid| {
-        const b_val: []const u8 = if (egid % 2 == 0) "x" else "y";
+        const b_val: String = if (egid % 2 == 0) "x" else "y";
         it.* = try row(a, tbl, egid, @intCast(egid), b_val);
     }
     return items;
@@ -222,7 +223,7 @@ fn wideRows(a: std.mem.Allocator, tbl: *const Table) anyerror![]const Item {
     return items;
 }
 
-fn tinyItem(primary: *const [8]u8, value: []const u8) Item {
+fn tinyItem(primary: *const [8]u8, value: String) Item {
     return .{
         .key = .{
             .namespace = ns,
@@ -240,7 +241,7 @@ fn firstEgid(b: *const Batch) u64 {
 }
 
 /// Does `slice` lie inside the batch's own byte buffer?
-fn withinBytes(b: *const Batch, slice: []const u8) bool {
+fn withinBytes(b: *const Batch, slice: String) bool {
     const start = @intFromPtr(b.bytes.items.ptr);
     const end = start + b.bytes.capacity;
     const p = @intFromPtr(slice.ptr);

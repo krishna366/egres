@@ -12,6 +12,7 @@ const zdb = @import("zdb");
 const _parse = @import("parse.zig");
 const _table = @import("table.zig");
 const _value = @import("value.zig");
+const String = _value.String;
 const _server = @import("server.zig");
 
 const replyErrorCode = _server.replyErrorCode;
@@ -190,7 +191,7 @@ fn literalValue(
 /// An integer too wide for int4 arrives as float TEXT; it stays an
 /// integer when it parses as one (as parseValue does for a root
 /// literal).
-fn numberFromText(text: []const u8) BindError!Value {
+fn numberFromText(text: String) BindError!Value {
     if (std.fmt.parseInt(i64, text, 10)) |n| return .{ .int8 = n } else |_| {}
     const f = std.fmt.parseFloat(f64, text) catch return error.InvalidValue;
     return .{ .float8 = f };
@@ -270,7 +271,7 @@ pub const EvalError = error{
 
 /// What a subtree evaluates to before assignment. Integers of every
 /// width compute as i128, floats as f64.
-const Scalar = union(enum) { int: i128, float: f64, text: []const u8 };
+const Scalar = union(enum) { int: i128, float: f64, text: String };
 
 /// A cell as an operand; null = SQL NULL. Only the types bind admits
 /// reach here.

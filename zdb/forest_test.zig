@@ -1,6 +1,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 const zdb = @import("zdb");
 const vfs = zdb.vfs;
 
@@ -156,7 +157,7 @@ test "forest: create tree and get" {
 // ---------------------------------------------------------------------------
 
 // Helper: build a minimal SST table containing one key and write it to disk.
-fn buildAndWriteTable(alloc: std.mem.Allocator, path: []const u8, primary: []const u8) !void {
+fn buildAndWriteTable(alloc: std.mem.Allocator, path: String, primary: String) !void {
     var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer bld.deinit();
     try bld.add(.{ .primary = primary }, "v");
@@ -183,7 +184,7 @@ test "forest: split tree" {
     const tree_id = try f.createTree(42, 0, .{ .inf = true });
     try std.testing.expectEqual(@as(u64, 0), tree_id);
 
-    const table_keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
+    const table_keys = [_]String{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (table_keys, 1..) |key, tbl_id| {
         const path = try zdb.file_ids.sstPath(alloc, dir_path, tbl_id);
         defer alloc.free(path);
@@ -236,7 +237,7 @@ test "forest: split tree" {
 
 // Build a one-key SST carrying the full (namespace, table_id, primary) key so
 // the stored key is table-specific, and write it to disk.
-fn buildAndWriteTableKV(alloc: std.mem.Allocator, path: []const u8, key: Key, value: []const u8) !void {
+fn buildAndWriteTableKV(alloc: std.mem.Allocator, path: String, key: Key, value: String) !void {
     var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer bld.deinit();
     try bld.add(key, value);
@@ -265,7 +266,7 @@ test "forest: two-level routing isolates by table_id" {
     try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 3 }) == null);
 
     // One SST per table: same primary, distinct value, installed at L1.
-    const Case = struct { tid: u32, tree: u64, val: []const u8 };
+    const Case = struct { tid: u32, tree: u64, val: String };
     const cases = [_]Case{
         .{ .tid = 0, .tree = t0, .val = "v0" },
         .{ .tid = 1, .tree = t1, .val = "v1" },
@@ -819,7 +820,7 @@ test "forest: getIterators outlives a concurrent flush+pop" {
     // still see the key. Use ts=maxInt because same-primary keys sort
     // newest-first (timestamp is reverse-ordered) — seeking with ts=0
     // would land on the *next* primary, missing alpha.
-    var found: ?[]const u8 = null;
+    var found: ?String = null;
     for (iters) |*it| {
         var copy = it.*;
         try copy.seekRange(.{
@@ -927,7 +928,7 @@ test "forest: maxKey counts a tombstoned max key" {
     const k3 = beKey(3);
     const k5 = beKey(5);
     const key = struct {
-        fn at(n: u64, t: u32, p: []const u8, ts: u64) zdb.kv.Key {
+        fn at(n: u64, t: u32, p: String, ts: u64) zdb.kv.Key {
             return .{
                 .namespace = n,
                 .table_id = t,
@@ -982,7 +983,7 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     // instead of flushed. Swap in a real memtable before writing.
     try f.newMemtable(1, 1);
 
-    const cases = [_]struct { primary: []const u8, meta: zdb.kv.Meta }{
+    const cases = [_]struct { primary: String, meta: zdb.kv.Meta }{
         .{ .primary = "a", .meta = .{ .kind = .deleted } },
         .{ .primary = "b", .meta = .{ .encoding = .roaring } },
         .{ .primary = "c", .meta = .{ .kind = .deleted, .encoding = .roaring } },
@@ -1201,7 +1202,7 @@ fn seedVersionedForest(f: *Forest) !void {
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1, 1);
 
-    const rows = [_]struct { p: []const u8, ts: u64, v: []const u8, m: zdb.kv.Meta }{
+    const rows = [_]struct { p: String, ts: u64, v: String, m: zdb.kv.Meta }{
         .{ .p = "a", .ts = 10, .v = "a1", .m = .{} },
         .{ .p = "a", .ts = 20, .v = "a2", .m = .{} },
         .{ .p = "b", .ts = 10, .v = "b1", .m = .{} },
@@ -1423,9 +1424,9 @@ test "scan: min_ts emits only what changed after it" {
     // changes at @20 (a rewritten, b deleted, d inserted), and e at
     // @30 still in the memtable.
     const Put = struct {
-        p: []const u8,
+        p: String,
         ts: u64,
-        v: []const u8,
+        v: String,
         m: zdb.kv.Meta,
     };
     const put = struct {
@@ -1734,8 +1735,8 @@ test "cursor: a flush between two next calls does not disturb the walk" {
     f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
     try f.newMemtable(1, 1);
 
-    const primaries = [_][]const u8{ "a", "b", "c", "d", "e" };
-    const values = [_][]const u8{ "va", "vb", "vc", "vd", "ve" };
+    const primaries = [_]String{ "a", "b", "c", "d", "e" };
+    const values = [_]String{ "va", "vb", "vc", "vd", "ve" };
     for (primaries, values) |p, v| {
         try f.put(&[_]zdb.kv.Item{.{
             .key = .{ .namespace = 1, .table_id = 0, .primary = p, .timestamp = 5 },
@@ -1818,7 +1819,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
 
     const Walk = struct {
         /// Hand out `out.len` items, keeping only their value slices.
-        fn take(cur: *Forest.Cursor, out: [][]const u8) !void {
+        fn take(cur: *Forest.Cursor, out: []String) !void {
             for (out) |*slot| {
                 const it = (try cur.next()) orelse
                     return error.TestExpectedItem;
@@ -1826,7 +1827,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
             }
         }
         /// The slices still read as the rows they were, from `first` on.
-        fn check(vals: []const []const u8, first: usize) !void {
+        fn check(vals: []const String, first: usize) !void {
             for (vals, first..) |v, i| {
                 try std.testing.expectEqual(@as(usize, 1024), v.len);
                 try std.testing.expectEqual(@as(u8, @intCast(i)), v[0]);
@@ -1839,7 +1840,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
     {
         var cur = try f.openCursor(alloc, tableRange(1, 0), pinning);
         defer cur.deinit();
-        var vals: [n_rows][]const u8 = undefined;
+        var vals: [n_rows]String = undefined;
         try Walk.take(&cur, &vals);
         try std.testing.expectEqual(@as(usize, 1), cur.pins.items.len);
         try Walk.check(&vals, 0);
@@ -1851,7 +1852,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
     // moved past by the time the walk pauses — the pins keep them.
     var cur = try f.openCursor(alloc, tableRange(1, 0), pinning);
     defer cur.deinit();
-    var first: [n_rows / 2][]const u8 = undefined;
+    var first: [n_rows / 2]String = undefined;
     try Walk.take(&cur, &first);
     try std.testing.expect(cur.pins.items.len >= 2);
     try Walk.check(&first, 0);
@@ -1864,7 +1865,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
 
     // The rest pins afresh; once the walk is over nothing is parked, so
     // a release leaves nothing held.
-    var rest: [n_rows / 2][]const u8 = undefined;
+    var rest: [n_rows / 2]String = undefined;
     try Walk.take(&cur, &rest);
     try Walk.check(&rest, n_rows / 2);
     try std.testing.expect(cur.pins.items.len >= 2);
@@ -1875,9 +1876,9 @@ test "cursor: pin_values holds handed-out values until releasePins" {
 
 /// Ten one-key L3 SSTs k01..k10 in (namespace 42, table 0), value = the
 /// key, in one tree. Returns its id.
-fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !u64 {
+fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: String) !u64 {
     const tree_id = try f.createTree(42, 0, .{ .inf = true });
-    const keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
+    const keys = [_]String{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (keys, 1..) |k, tbl_id| {
         const path = try zdb.file_ids.sstPath(alloc, dir_path, tbl_id);
         defer alloc.free(path);
@@ -1895,7 +1896,7 @@ fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !
 
 /// `seedTenKeyTable`, then a split: two trees, the boundary somewhere in
 /// the middle.
-fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest, dir_path: []const u8) !void {
+fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest, dir_path: String) !void {
     const tree_id = try seedTenKeyTable(alloc, f, dir_path);
     try f.splitTreeForTests(42, tree_id);
     try std.testing.expectEqual(@as(usize, 2), treeCount(f));
@@ -1936,7 +1937,7 @@ test "cursor: a split applied by another fiber mid-walk loses and repeats nothin
     try drainCursor(&cur, &got);
     try std.testing.expectEqual(@as(usize, 10), got.got.items.len);
     try std.testing.expectEqual(@as(u64, 10), cur.emitted);
-    const keys = [_][]const u8{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
+    const keys = [_]String{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (got.got.items, keys) |it, k| {
         try std.testing.expectEqualStrings(k, it.key.primary);
         try std.testing.expectEqualStrings(k, it.value);
@@ -2023,7 +2024,7 @@ const roar = struct {
     const delta_meta: zdb.kv.Meta = .{ .kind = .delta, .encoding = .roaring };
     const state_meta: zdb.kv.Meta = .{ .kind = .state, .encoding = .roaring };
 
-    fn key(primary: []const u8, ts: u64) Key {
+    fn key(primary: String, ts: u64) Key {
         return .{
             .namespace = 1,
             .table_id = 0,
@@ -2035,7 +2036,7 @@ const roar = struct {
     fn putDelta(
         f: *Forest,
         alloc: std.mem.Allocator,
-        primary: []const u8,
+        primary: String,
         ts: u64,
         adds: []const u64,
         rems: []const u64,
@@ -2057,7 +2058,7 @@ const roar = struct {
     fn putState(
         f: *Forest,
         alloc: std.mem.Allocator,
-        primary: []const u8,
+        primary: String,
         ts: u64,
         vals: []const u64,
     ) !void {
@@ -2074,7 +2075,7 @@ const roar = struct {
     fn expectBitmap(
         f: *Forest,
         alloc: std.mem.Allocator,
-        primary: []const u8,
+        primary: String,
         read_ts: u64,
         expected: []const u64,
     ) !void {
@@ -2194,7 +2195,7 @@ test "forest: rollup is read-invariant across flush and compactions" {
     // The oracle: every (key, read_ts) answer, captured while the
     // whole history is still in the memtable. Rollup may reshape the
     // physical chain at will; these answers must never change.
-    const Case = struct { key: []const u8, ts: u64, want: []const u64 };
+    const Case = struct { key: String, ts: u64, want: []const u64 };
     const cases = [_]Case{
         .{ .key = "p", .ts = 5, .want = &.{} },
         .{ .key = "p", .ts = 10, .want = &.{ 1, 2 } },

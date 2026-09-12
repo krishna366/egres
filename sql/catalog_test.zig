@@ -1,11 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const String = sql.value.String;
 const catalog = sql.catalog;
 const Type = sql.Type;
 const LogicalColumn = sql.LogicalColumn;
 
-fn col(id: u32, name: []const u8, ty: Type, added: u16, dropped: ?u16) LogicalColumn {
+fn col(id: u32, name: String, ty: Type, added: u16, dropped: ?u16) LogicalColumn {
     return .{
         .column_id = id,
         .name = name,

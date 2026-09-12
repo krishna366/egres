@@ -9,6 +9,8 @@ const makeTreeId = @import("kv.zig").makeTreeId;
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
 const fiber = @import("zfiber");
+const utils = @import("utils");
+const String = utils.String;
 const Forest = @import("forest.zig").Forest;
 const Tree = @import("tree.zig").Tree;
 /// This file, so the Forest functions below keep their `_manifest.` prefix.
@@ -97,7 +99,7 @@ pub const ForestState = struct {
         /// Database name (SQL: CREATE DATABASE), owned by the map. Empty for
         /// unnamed namespaces (legacy admin KV path) — those never resolve
         /// by name.
-        name: []const u8 = "",
+        name: String = "",
         /// SQL table name → table_id for this namespace's tables. Keys are
         /// allocator-owned dupes. Registered on create_tree apply (the
         /// TreeChange carries the name), unregistered on drop_tree apply;
@@ -192,7 +194,7 @@ pub const ForestState = struct {
     pub fn registerNamespaceName(
         self: *ForestState,
         namespace: u64,
-        name: []const u8,
+        name: String,
     ) !void {
         if (name.len == 0) return;
 
@@ -219,7 +221,7 @@ pub const ForestState = struct {
     }
 
     /// Resolve a database name to its namespace.
-    pub fn lookupNamespace(self: *ForestState, name: []const u8) ?u64 {
+    pub fn lookupNamespace(self: *ForestState, name: String) ?u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.names.get(name);
@@ -234,7 +236,7 @@ pub const ForestState = struct {
         self: *ForestState,
         namespace: u64,
         table_id: u32,
-        name: []const u8,
+        name: String,
     ) !void {
         if (name.len == 0) return;
 
@@ -263,7 +265,7 @@ pub const ForestState = struct {
     pub fn lookupTable(
         self: *ForestState,
         namespace: u64,
-        name: []const u8,
+        name: String,
     ) ?u32 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
@@ -519,7 +521,7 @@ pub const ForestState = struct {
         // Reverse map (ns, table_id) → table name, so a tree's CREATE change
         // below can carry its table's name — the same vehicle the live
         // create_tree apply uses (TreeChange.name).
-        var tnames = std.AutoHashMap(TableKey, []const u8).init(a);
+        var tnames = std.AutoHashMap(TableKey, String).init(a);
         var nit = self.namespaces.iterator();
         while (nit.next()) |kv| {
             var tit = kv.value_ptr.tables.iterator();
@@ -595,7 +597,7 @@ pub const ForestState = struct {
     /// lifts: nothing else touches the manifest meanwhile. Two phases —
     /// the map rebuild under an exclusive hold, then the name registry
     /// through the same one-shot calls the apply path uses.
-    pub fn restoreFrom(self: *ForestState, bytes: []const u8) !void {
+    pub fn restoreFrom(self: *ForestState, bytes: String) !void {
         const reader = try _zen.ManifestChangeReader.parseRoot(bytes);
         {
             const held = self.mu.hold(.exclusive, @src());
@@ -730,8 +732,8 @@ pub fn deleteSSTableChange(
 pub fn createTreeChange(
     tree_id: u64,
     namespace_id: u64,
-    left_key: []const u8,
-    right_key: []const u8,
+    left_key: String,
+    right_key: String,
 ) TreeChange {
     return .{
         .op = .create,
@@ -749,8 +751,8 @@ pub fn deleteTreeChange(tree_id: u64, namespace_id: u64) TreeChange {
 pub fn updateTreeChange(
     tree_id: u64,
     namespace_id: u64,
-    left_key: []const u8,
-    right_key: []const u8,
+    left_key: String,
+    right_key: String,
 ) TreeChange {
     return .{
         .op = .update,
@@ -871,7 +873,7 @@ pub fn buildNamespaceCreate(
     self: *Forest,
     alloc: std.mem.Allocator,
     namespace_id: u64,
-    name: []const u8,
+    name: String,
 ) !_manifest.ManifestChange {
     std.debug.assert(namespace_id > 0);
     if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
@@ -917,7 +919,7 @@ pub const CreateNamespaceResult = struct {
 pub fn buildCreateNamespace(
     self: *Forest,
     alloc: std.mem.Allocator,
-    name: []const u8,
+    name: String,
 ) !CreateNamespaceResult {
     const namespace = self.ms.nextNamespace();
     return .{
@@ -928,13 +930,13 @@ pub fn buildCreateNamespace(
 
 /// Resolve a database name to its namespace id (manifest state, current
 /// on every node via the apply path).
-pub fn lookupNamespace(self: *Forest, name: []const u8) ?u64 {
+pub fn lookupNamespace(self: *Forest, name: String) ?u64 {
     return self.ms.lookupNamespace(name);
 }
 
 /// Resolve a table name to its table_id within a namespace (manifest
 /// state, current on every node via the apply path).
-pub fn lookupTable(self: *Forest, namespace_id: u64, name: []const u8) ?u32 {
+pub fn lookupTable(self: *Forest, namespace_id: u64, name: String) ?u32 {
     return self.ms.lookupTable(namespace_id, name);
 }
 
@@ -1013,7 +1015,7 @@ pub fn buildCreateTables(
     self: *Forest,
     alloc: std.mem.Allocator,
     namespace_id: u64,
-    names: []const []const u8,
+    names: []const String,
 ) !CreateTablesResult {
     for (names) |name|
         if (name.len > 0 and self.ms.lookupTable(namespace_id, name) != null)

@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 const compress = utils.compression;
 
 fn makePayload(alloc: std.mem.Allocator, len: usize) ![]u8 {
@@ -19,7 +20,7 @@ fn makePayload(alloc: std.mem.Allocator, len: usize) ![]u8 {
 fn expectRoundTrip(
     alloc: std.mem.Allocator,
     codec: compress.Codec,
-    data: []const u8,
+    data: String,
 ) !void {
     var enc_buf = std.ArrayList(u8).empty;
     defer enc_buf.deinit(alloc);

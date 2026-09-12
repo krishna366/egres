@@ -1,5 +1,7 @@
 const std = @import("std");
 const zen = @import("buffers_gen");
+const utils = @import("utils");
+const String = utils.String;
 
 pub const NodeId = u64;
 
@@ -12,7 +14,7 @@ pub const EntryType = zen.EntryTypeEnum;
 pub const ConfChange = struct {
     change_type: ConfChangeType,
     node_id: NodeId,
-    addr: []const u8 = "",
+    addr: String = "",
 };
 pub const LogEntryBuffer = zen.LogEntryBuffer;
 pub const HardState = zen.HardStateStruct;
@@ -39,7 +41,7 @@ pub const ConfStatePeer = zen.ConfStatePeerStruct;
 pub const StoredEntry = struct {
     index: u64,
     term: u64,
-    bytes: []const u8 = "",
+    bytes: String = "",
 };
 
 pub const RaftLogError = error{

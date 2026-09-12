@@ -4,6 +4,7 @@ const Item = @import("../kv.zig").Item;
 const _idx = @import("index.zig");
 const _buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
+const String = utils.String;
 const compress = utils.compression;
 const _binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("vfs");
@@ -215,7 +216,7 @@ pub const Builder = struct {
     /// Convenience for callers with nothing to say about the row: raw
     /// encoding, no flags. Production writers use addItem, so meta travels
     /// with the row it describes.
-    pub fn add(self: *Builder, key: Key, value: []const u8) Error!void {
+    pub fn add(self: *Builder, key: Key, value: String) Error!void {
         return self.addItem(.{ .key = key, .value = value, .meta = .{} });
     }
 

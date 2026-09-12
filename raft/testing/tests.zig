@@ -1,6 +1,8 @@
 const std = @import("std");
 const raft = @import("raft");
 const fiber = @import("zfiber");
+const utils = @import("utils");
+const String = utils.String;
 const _cluster = @import("cluster.zig");
 const zen = raft.buffers;
 
@@ -438,7 +440,7 @@ pub fn testLogReplication() !void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var expected = std.ArrayList([]const u8).empty;
+    var expected = std.ArrayList(String).empty;
     defer expected.deinit(alloc);
 
     var i: usize = 0;

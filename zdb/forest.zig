@@ -2,6 +2,7 @@ const std = @import("std");
 const log = std.log.scoped(.forest);
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 const _config = @import("config.zig");
 const _manifest = @import("manifest.zig");
 const _read = @import("read.zig");
@@ -691,7 +692,7 @@ pub const Forest = struct {
     fn writeAndSyncTable(
         allocator: std.mem.Allocator,
         tb: _table.builder.TableBuffer,
-        path: []const u8,
+        path: String,
         file_id: u64,
         tk: TreeKey,
         lvl: u32,
@@ -1053,7 +1054,7 @@ pub const Forest = struct {
     /// a size match is a strong signal the bytes are correct (no cross-ID
     /// collisions possible). If a size mismatch is detected, we log and
     /// rewrite.
-    pub fn writeFile(self: *Forest, file_id: u64, data: []const u8) void {
+    pub fn writeFile(self: *Forest, file_id: u64, data: String) void {
         const fe = std.log.scoped(.file_event);
         if (self.table_cache.contains(file_id)) {
             fe.info("event=write_file file_id={d} path=cache_hit", .{file_id});
@@ -1177,7 +1178,7 @@ pub const Forest = struct {
         self: *Forest,
         allocator: std.mem.Allocator,
         file_id: u64,
-    ) ?[]const u8 {
+    ) ?String {
         const path = _fi.sstPath(
             self.allocator,
             self.opts.dir,

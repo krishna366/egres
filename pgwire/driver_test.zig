@@ -10,6 +10,8 @@ const std = @import("std");
 const testing = std.testing;
 const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
+const utils = @import("utils");
+const String = utils.String;
 
 const Channel = fiber.Channel;
 const IpAddress = fiber.net.IpAddress;
@@ -37,7 +39,7 @@ const StubHandler = struct {
     pub fn onQuery(
         self: *StubHandler,
         state: *pgwire.ConnState,
-        sql: []const u8,
+        sql: String,
     ) !void {
         self.call_count += 1;
         self.last_sql.clearRetainingCapacity();
@@ -85,7 +87,7 @@ fn buildStartup(buf: *std.ArrayList(u8), a: std.mem.Allocator) !void {
 fn buildQuery(
     buf: *std.ArrayList(u8),
     a: std.mem.Allocator,
-    sql: []const u8,
+    sql: String,
 ) !void {
     const total: u32 = @intCast(4 + sql.len + 1);
     try buf.append(a, 'Q');
@@ -202,7 +204,7 @@ fn clientFn(ctx: *TestCtx) anyerror!void {
 /// Assert that `needle` appears in `hay` as a subsequence — every
 /// element of `needle` is found in `hay` in order, but other tags may
 /// be interleaved.
-fn expectContainsInOrder(hay: []const u8, needle: []const u8) !void {
+fn expectContainsInOrder(hay: String, needle: String) !void {
     var ni: usize = 0;
     for (hay) |b| {
         if (ni < needle.len and b == needle[ni]) ni += 1;

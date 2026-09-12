@@ -6,6 +6,8 @@
 //! to this table.
 
 const std = @import("std");
+const utils = @import("utils");
+const String = utils.String;
 
 pub const Oid = u32;
 
@@ -30,7 +32,7 @@ pub const oid = struct {
 /// `type_modifier = -1` means "no modifier" (e.g. for varchar(N), N is
 /// encoded here; we don't carry varchars yet).
 pub const FieldDescription = struct {
-    name: []const u8,
+    name: String,
     type_oid: Oid = oid.text,
     type_size: i16 = -1,
     type_modifier: i32 = -1,

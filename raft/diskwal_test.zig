@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 const raft = @import("raft");
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
@@ -18,7 +19,7 @@ fn makeLogEntry(
     alloc: std.mem.Allocator,
     index: u64,
     term: u64,
-    data: []const u8,
+    data: String,
 ) !zen.LogEntryBuffer {
     var writer = try zen.LogEntryWriter.init(alloc);
     defer writer.deinit();
@@ -37,7 +38,7 @@ fn appendEntry(
     log: *raft.DiskWAL,
     index: u64,
     term: u64,
-    data: []const u8,
+    data: String,
 ) !void {
     var entry = try makeLogEntry(alloc, index, term, data);
     defer entry.deinit();
@@ -118,7 +119,7 @@ fn checkLargePayload(reader: zen.LogEntryReader, index: u64, expected_len: usize
     try std.testing.expectEqual(index, got_index);
 }
 
-fn countWalFiles(path: []const u8) !usize {
+fn countWalFiles(path: String) !usize {
     var it = try vfs.iterateDir(path);
     defer it.deinit();
     var count: usize = 0;
@@ -873,7 +874,7 @@ fn makeLogEntryWithTimestamp(
     index: u64,
     term: u64,
     timestamp: u64,
-    data: []const u8,
+    data: String,
 ) !zen.LogEntryBuffer {
     var writer = try zen.LogEntryWriter.init(alloc);
     defer writer.deinit();

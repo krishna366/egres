@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const fiber = @import("zfiber");
 const sql = @import("sql");
+const String = sql.value.String;
 const utils = @import("utils");
 const zdb = @import("zdb");
 
@@ -75,20 +76,20 @@ const Fixture = struct {
 
     /// Record a commit of `primary` at `ts` in the oracle, the way apply
     /// does — a one-item run through updateItems.
-    fn commit(self: *Fixture, primary: []const u8, ts: u64) !void {
+    fn commit(self: *Fixture, primary: String, ts: u64) !void {
         try self.oracle.updateItems(&.{
             .{ .key = rowKey(primary, ts), .value = "", .meta = .{} },
         });
     }
 };
 
-fn rowKey(primary: []const u8, ts: u64) Key {
+fn rowKey(primary: String, ts: u64) Key {
     return .{ .namespace = ns, .table_id = tid, .primary = primary, .timestamp = ts };
 }
 
 /// A one-key multiGet of `tid`: the row, duped with the test
 /// allocator (free with `Item.free`), or null when absent.
-fn lookupOne(tx: *Txn, primary: []const u8) !?zdb.kv.Item {
+fn lookupOne(tx: *Txn, primary: String) !?zdb.kv.Item {
     var res = try tx.multiGet(tid, &.{primary});
     defer res.deinit();
     const found = res.item(primary) orelse return null;
@@ -577,7 +578,7 @@ test "txn: wireKvs emits key order regardless of insert order" {
     try testing.expectEqual(4, kvs.len);
     // (tid, "a") < (tid, "b") < (tid, "c") < (tid+1, "a"): table_id
     // orders before primary, and every wire key carries read_ts.
-    const expect_primary = [_][]const u8{ "a", "b", "c", "a" };
+    const expect_primary = [_]String{ "a", "b", "c", "a" };
     const expect_tid = [_]u32{ tid, tid, tid, tid + 1 };
     for (kvs, expect_primary, expect_tid) |kv, p, t| {
         const k = Key.init(kv.key);

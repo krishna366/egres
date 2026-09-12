@@ -10,6 +10,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 const _manifest = @import("manifest.zig");
 const _level_handler = @import("level.zig");
 const _table = @import("table.zig");
@@ -94,7 +95,7 @@ pub const VersionTracker = struct {
     const Buffered = struct {
         ts: u64,
         meta: Meta,
-        value: []const u8,
+        value: String,
         pin: Pin,
     };
 
@@ -1158,7 +1159,7 @@ pub fn flushBuilderOutput(
 fn syncFile(
     allocator: std.mem.Allocator,
     wh: vfs.FileHandle,
-    path: []const u8,
+    path: String,
     file_id: u64,
 ) ?FlushResult {
     defer allocator.free(path);

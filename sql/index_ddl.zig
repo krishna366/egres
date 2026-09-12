@@ -504,7 +504,7 @@ const IndexBuild = struct {
     /// Log `err`, remove the index under the barrier (retaken if
     /// released — a no-op if held), and reply: 23505 for a duplicate,
     /// else a plain failure. The name is free to retry either way.
-    fn fail(self: *IndexBuild, what: []const u8, err: anyerror) !void {
+    fn fail(self: *IndexBuild, what: String, err: anyerror) !void {
         logCreateIndexErr(self.name, what, err);
         _ = self.locks.acquire(self.tkey, self.txn_id, .exclusive) catch |e| {
             logCreateIndexErr(self.name, "remove: barrier", e);
@@ -858,14 +858,14 @@ fn removeIndex(
     try self.srv.reloadTable(ns, base_tid);
 }
 
-fn logCreateIndexErr(name: []const u8, what: []const u8, err: anyerror) void {
+fn logCreateIndexErr(name: String, what: String, err: anyerror) void {
     log.err(
         "create index '{s}': {s}: {s}",
         .{ name, what, @errorName(err) },
     );
 }
 
-fn logDropIndexErr(name: []const u8, what: []const u8, err: anyerror) void {
+fn logDropIndexErr(name: String, what: String, err: anyerror) void {
     log.err(
         "drop index '{s}': {s}: {s}",
         .{ name, what, @errorName(err) },

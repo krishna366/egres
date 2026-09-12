@@ -35,6 +35,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 
 const Config = struct {
     /// Concurrent task fibers — the load knob. The runtime ALWAYS uses all
@@ -490,12 +491,12 @@ pub fn main(init: std.process.Init) !void {
     printWorkerCpu();
 }
 
-fn parseArgs(argv: []const []const u8) Config {
+fn parseArgs(argv: []const String) Config {
     var c: Config = .{};
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
-        const val: ?[]const u8 = if (i + 1 < argv.len) argv[i + 1] else null;
+        const val: ?String = if (i + 1 < argv.len) argv[i + 1] else null;
         if (std.mem.eql(u8, a, "--conc")) {
             c.conc = @intCast(parseN(val)); // concurrent task fibers
             i += 1;
@@ -529,12 +530,12 @@ fn parseArgs(argv: []const []const u8) Config {
     return c;
 }
 
-fn parseN(val: ?[]const u8) u64 {
+fn parseN(val: ?String) u64 {
     const v = val orelse fatal("flag needs a value", .{});
     return std.fmt.parseInt(u64, v, 10) catch fatal("bad number: {s}", .{v});
 }
 
-fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+fn fatal(comptime fmt: String, args: anytype) noreturn {
     std.debug.print("timeout-stress: " ++ fmt ++ "\n", args);
     std.process.exit(2);
 }

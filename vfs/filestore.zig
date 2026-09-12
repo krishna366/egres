@@ -12,6 +12,8 @@
 
 const std = @import("std");
 const fiber = @import("zfiber");
+const utils = @import("utils");
+const String = utils.String;
 const _vfs = @import("vfs.zig");
 const _s3 = @import("s3.zig");
 const _lookahead = @import("lookahead.zig");
@@ -26,7 +28,7 @@ pub const FileStore = union(enum) {
     dir: DirStore,
     s3: _s3.S3Store,
 
-    pub fn initDir(a: std.mem.Allocator, depot: []const u8) !FileStore {
+    pub fn initDir(a: std.mem.Allocator, depot: String) !FileStore {
         return .{ .dir = try DirStore.init(a, depot) };
     }
 
@@ -47,7 +49,7 @@ pub const FileStore = union(enum) {
     /// page-aligned and a page multiple — the dir backend writes
     /// O_DIRECT and rejects anything else (error.UnalignedPut). SST
     /// buffers satisfy this by construction.
-    pub fn put(self: *FileStore, name: []const u8, data: []const u8) !void {
+    pub fn put(self: *FileStore, name: String, data: String) !void {
         switch (self.*) {
             .none => return error.NoFileStore,
             .dir => |*d| try d.put(name, data),
@@ -68,7 +70,7 @@ pub const FileStore = union(enum) {
         }
     }
 
-    pub fn exists(self: *FileStore, name: []const u8) !bool {
+    pub fn exists(self: *FileStore, name: String) !bool {
         switch (self.*) {
             .none => return error.NoFileStore,
             .dir => |*d| return d.exists(name),
@@ -76,7 +78,7 @@ pub const FileStore = union(enum) {
         }
     }
 
-    pub fn delete(self: *FileStore, name: []const u8) !void {
+    pub fn delete(self: *FileStore, name: String) !void {
         switch (self.*) {
             .none => return error.NoFileStore,
             .dir => |*d| try d.delete(name),
@@ -85,7 +87,7 @@ pub const FileStore = union(enum) {
     }
 
     /// Open an object for ranged reads. error.FileNotFound if absent.
-    pub fn open(self: *FileStore, name: []const u8) !Object {
+    pub fn open(self: *FileStore, name: String) !Object {
         switch (self.*) {
             .none => return error.NoFileStore,
             .dir => |*d| return d.open(name),
@@ -101,7 +103,7 @@ pub const FileStore = union(enum) {
     }
 
     /// Convenience: fetch a whole object. Caller owns the bytes.
-    pub fn getAll(self: *FileStore, a: std.mem.Allocator, name: []const u8) ![]u8 {
+    pub fn getAll(self: *FileStore, a: std.mem.Allocator, name: String) ![]u8 {
         var obj = try self.open(name);
         defer obj.close();
         return obj.read(a, 0, obj.size());
@@ -162,7 +164,7 @@ pub const Object = union(enum) {
 /// connection reuse lands later.
 const S3Object = struct {
     store: *_s3.S3Store,
-    name: []const u8,
+    name: String,
     sz: u64,
 };
 
@@ -173,12 +175,12 @@ const S3Object = struct {
 /// so tmp names cannot collide across nodes.
 pub const DirStore = struct {
     a: std.mem.Allocator,
-    depot: []const u8,
+    depot: String,
     /// calibrateLookahead at startup. 0 = uncalibrated. Not consumed yet —
     /// tiered reads will size their readahead from it.
     lookahead: u64 = 0,
 
-    pub fn init(a: std.mem.Allocator, depot: []const u8) !DirStore {
+    pub fn init(a: std.mem.Allocator, depot: String) !DirStore {
         const tmp_dir = try std.fmt.allocPrint(a, "{s}/tmp", .{depot});
         defer a.free(tmp_dir);
         try _vfs.createDirPath(tmp_dir);
@@ -189,11 +191,11 @@ pub const DirStore = struct {
         self.a.free(self.depot);
     }
 
-    fn objectPath(self: *DirStore, name: []const u8) ![]u8 {
+    fn objectPath(self: *DirStore, name: String) ![]u8 {
         return std.fmt.allocPrint(self.a, "{s}/{s}", .{ self.depot, name });
     }
 
-    pub fn put(self: *DirStore, name: []const u8, data: []const u8) !void {
+    pub fn put(self: *DirStore, name: String, data: String) !void {
         // O_DIRECT requires it, and every legit caller already complies
         // (the SST builder pads + aligns its output; forest.readFile
         // returns page-aligned reads) — reject rather than bounce.
@@ -230,7 +232,7 @@ pub const DirStore = struct {
         _vfs.syncDir(self.depot);
     }
 
-    fn exists(self: *DirStore, name: []const u8) !bool {
+    fn exists(self: *DirStore, name: String) !bool {
         const path = try self.objectPath(name);
         defer self.a.free(path);
 
@@ -238,14 +240,14 @@ pub const DirStore = struct {
         return true;
     }
 
-    fn delete(self: *DirStore, name: []const u8) !void {
+    fn delete(self: *DirStore, name: String) !void {
         const path = try self.objectPath(name);
         defer self.a.free(path);
 
         try _vfs.deleteFile(path);
     }
 
-    fn open(self: *DirStore, name: []const u8) !Object {
+    fn open(self: *DirStore, name: String) !Object {
         const path = try self.objectPath(name);
         defer self.a.free(path);
 
@@ -257,7 +259,7 @@ pub const DirStore = struct {
     }
 
     /// Object size in bytes; errors if absent.
-    pub fn head(self: *DirStore, name: []const u8) !u64 {
+    pub fn head(self: *DirStore, name: String) !u64 {
         const path = try self.objectPath(name);
         defer self.a.free(path);
         return _vfs.fileSize(path);

@@ -1,13 +1,14 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const String = sql.value.String;
 const zdb = @import("zdb");
 
 const Oracle = sql.oracle.Oracle;
 
 // Test keys share one (ns, table); `h(p)` is the identity hash that
 // `updateItems` records for `item(p, ts)`.
-fn item(primary: []const u8, ts: u64) zdb.kv.Item {
+fn item(primary: String, ts: u64) zdb.kv.Item {
     return .{
         .key = .{
             .namespace = 7,
@@ -20,7 +21,7 @@ fn item(primary: []const u8, ts: u64) zdb.kv.Item {
     };
 }
 
-fn h(primary: []const u8) u64 {
+fn h(primary: String) u64 {
     return (zdb.kv.Key{
         .namespace = 7,
         .table_id = 16,

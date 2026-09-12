@@ -11,11 +11,13 @@
 //! C strings (libpq interpretation).
 //!
 //! This file deliberately exposes byte-level operations only — encoders
-//! append to an `std.ArrayList(u8)`, decoders parse from `[]const u8`.
+//! append to an `std.ArrayList(u8)`, decoders parse from `String`.
 //! Anything needing a connection state machine lives in conn_state.zig;
 //! anything touching sockets lives in driver.zig.
 
 const std = @import("std");
+const utils = @import("utils");
+const String = utils.String;
 const _types = @import("types.zig");
 
 /// Byte tag a backend may send. Names follow the protocol docs (single
@@ -83,7 +85,7 @@ pub const AuthRequest = enum(u32) {
 /// must not retain it past the next read.
 pub const Message = struct {
     tag: u8,
-    body: []const u8,
+    body: String,
 };
 
 pub const DecodeError = error{
@@ -116,7 +118,7 @@ pub const max_message_body: u32 = 16 * 1024 * 1024;
 ///
 /// Caller is responsible for advancing its read cursor by `consumed`
 /// bytes after a successful return; `body` borrows from `buf`.
-pub fn decodeMessage(buf: []const u8) DecodeError!struct {
+pub fn decodeMessage(buf: String) DecodeError!struct {
     msg: Message,
     consumed: usize,
 } {
@@ -135,9 +137,9 @@ pub fn decodeMessage(buf: []const u8) DecodeError!struct {
 
 /// Try to read a startup-class message (no tag byte). Returns the
 /// 4-byte protocol code, the body after the code, and bytes consumed.
-pub fn decodeStartup(buf: []const u8) DecodeError!struct {
+pub fn decodeStartup(buf: String) DecodeError!struct {
     code: u32,
-    body: []const u8,
+    body: String,
     consumed: usize,
 } {
     if (buf.len < 4) return error.NeedMore;
@@ -156,18 +158,18 @@ pub fn decodeStartup(buf: []const u8) DecodeError!struct {
 /// Parsed StartupMessage parameters. `params` borrows key/value slices
 /// from the input buffer — copy them out if you need to keep them.
 pub const StartupParams = struct {
-    user: ?[]const u8 = null,
-    database: ?[]const u8 = null,
-    application_name: ?[]const u8 = null,
-    client_encoding: ?[]const u8 = null,
+    user: ?String = null,
+    database: ?String = null,
+    application_name: ?String = null,
+    client_encoding: ?String = null,
 
     /// Iterator over every (key, value) pair. Use this for parameters
     /// outside the named ones we hoist into struct fields.
     pub const Iterator = struct {
-        body: []const u8,
+        body: String,
         idx: usize = 0,
 
-        pub fn next(self: *Iterator) ?struct { key: []const u8, val: []const u8 } {
+        pub fn next(self: *Iterator) ?struct { key: String, val: String } {
             if (self.idx >= self.body.len) return null;
             const key_end = std.mem.indexOfScalarPos(
                 u8,
@@ -196,7 +198,7 @@ pub const StartupParams = struct {
         }
     };
 
-    pub fn iterate(body: []const u8) Iterator {
+    pub fn iterate(body: String) Iterator {
         return .{ .body = body };
     }
 };
@@ -204,7 +206,7 @@ pub const StartupParams = struct {
 /// Decode the body of a Startup3 message. Pulls out user/database/etc.
 /// into named fields; any extra params are ignored (caller can re-walk
 /// with `StartupParams.iterate` if needed).
-pub fn parseStartupParams(body: []const u8) DecodeError!StartupParams {
+pub fn parseStartupParams(body: String) DecodeError!StartupParams {
     var out: StartupParams = .{};
     var it = StartupParams.iterate(body);
     while (it.next()) |kv| {
@@ -220,7 +222,7 @@ pub fn parseStartupParams(body: []const u8) DecodeError!StartupParams {
 
 /// Body of a frontend Query message: a single NUL-terminated SQL
 /// string. Returns the SQL bytes (without the NUL).
-pub fn parseQuery(body: []const u8) DecodeError![]const u8 {
+pub fn parseQuery(body: String) DecodeError!String {
     if (body.len == 0) return error.Truncated;
     if (body[body.len - 1] != 0) return error.MissingNul;
     return body[0 .. body.len - 1];
@@ -243,7 +245,7 @@ pub fn parseQuery(body: []const u8) DecodeError![]const u8 {
 /// without the trailing NUL. Uses `takeDelimiterInclusive` so the
 /// NUL is consumed from the stream (`takeDelimiterExclusive` leaves
 /// it pending — see std/Io/Reader.zig).
-fn readCString(r: *std.Io.Reader) DecodeError![]const u8 {
+fn readCString(r: *std.Io.Reader) DecodeError!String {
     const slice = try r.takeDelimiterInclusive(0);
     return slice[0 .. slice.len - 1];
 }
@@ -254,8 +256,8 @@ fn readCString(r: *std.Io.Reader) DecodeError![]const u8 {
 /// should infer types"; otherwise it's the explicit list the client
 /// requests.
 pub const ParseMsg = struct {
-    name: []const u8,
-    sql: []const u8,
+    name: String,
+    sql: String,
     param_oids: []const u32,
 };
 
@@ -263,7 +265,7 @@ pub const ParseMsg = struct {
 /// slice borrows from it. Caller must keep `oids_storage` alive for
 /// as long as the returned `ParseMsg.param_oids` is used.
 pub fn parseParse(
-    body: []const u8,
+    body: String,
     oids_storage: []u32,
 ) DecodeError!ParseMsg {
     var r = std.Io.Reader.fixed(body);
@@ -287,15 +289,15 @@ pub fn parseParse(
 /// One parameter value as it appears in a Bind message: NULL or a
 /// raw byte slice (whose interpretation depends on the format code,
 /// not encoded here).
-pub const BindParam = ?[]const u8;
+pub const BindParam = ?String;
 
 /// Bind('B') body decoded view. All slices borrow from the input.
 /// `param_formats.len` is 0 (text for all), 1 (the single value
 /// applied to every param), or `params.len` (per-param). Same for
 /// `result_formats` against the eventual RowDescription columns.
 pub const BindMsg = struct {
-    portal_name: []const u8,
-    statement_name: []const u8,
+    portal_name: String,
+    statement_name: String,
     param_formats: []const i16,
     params: []const BindParam,
     result_formats: []const i16,
@@ -307,7 +309,7 @@ pub const BindMsg = struct {
 /// The returned slices borrow from those scratch arrays + the input
 /// body.
 pub fn parseBind(
-    body: []const u8,
+    body: String,
     pfmt_storage: []i16,
     params_storage: []BindParam,
     rfmt_storage: []i16,
@@ -355,11 +357,11 @@ pub fn parseBind(
 
 /// Execute('E') body: portal name + max rows (0 = no limit).
 pub const ExecuteMsg = struct {
-    portal_name: []const u8,
+    portal_name: String,
     max_rows: u32,
 };
 
-pub fn parseExecute(body: []const u8) DecodeError!ExecuteMsg {
+pub fn parseExecute(body: String) DecodeError!ExecuteMsg {
     var r = std.Io.Reader.fixed(body);
     const portal = try readCString(&r);
     const max_rows = try r.takeInt(u32, .big);
@@ -374,10 +376,10 @@ pub const DescribeKind = enum(u8) {
 
 pub const DescribeMsg = struct {
     kind: DescribeKind,
-    name: []const u8,
+    name: String,
 };
 
-pub fn parseDescribe(body: []const u8) DecodeError!DescribeMsg {
+pub fn parseDescribe(body: String) DecodeError!DescribeMsg {
     var r = std.Io.Reader.fixed(body);
     const kind = try r.takeByte();
     if (kind != @intFromEnum(DescribeKind.statement) and
@@ -418,7 +420,7 @@ pub const parseClose = parseDescribe;
 
 /// Write `[tag][length=4+body.len][body]` to `out`. The length field
 /// includes itself but not the tag, per protocol.
-pub fn writeFrame(out: *std.Io.Writer, tag: BackendTag, body: []const u8) std.Io.Writer.Error!void {
+pub fn writeFrame(out: *std.Io.Writer, tag: BackendTag, body: String) std.Io.Writer.Error!void {
     try out.writeByte(@intFromEnum(tag));
     try out.writeInt(u32, @intCast(4 + body.len), .big);
     try out.writeAll(body);
@@ -431,7 +433,7 @@ pub fn writeFrameEmpty(out: *std.Io.Writer, tag: BackendTag) std.Io.Writer.Error
     try out.writeInt(u32, 4, .big);
 }
 
-fn writeCString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+fn writeCString(w: *std.Io.Writer, s: String) std.Io.Writer.Error!void {
     // Embedded NUL would split the field on the wire — receiver would
     // parse the inner NUL as the field terminator, corrupting every
     // subsequent field. UTF-8 never produces stray NULs organically,
@@ -464,8 +466,8 @@ pub fn encodeAuthenticationOk(out: *std.Io.Writer) std.Io.Writer.Error!void {
 /// libpq uses them to decide formatting.
 pub fn encodeParameterStatus(
     scratch: *std.Io.Writer.Allocating,
-    name: []const u8,
-    value: []const u8,
+    name: String,
+    value: String,
 ) !void {
     resetScratch(scratch);
     const w = &scratch.writer;
@@ -530,8 +532,8 @@ pub fn encodeRowDescription(
 /// "I forgot to consult result_formats" bug at the type level.
 pub const DataValue = union(enum) {
     null_value,
-    text: []const u8,
-    binary: []const u8,
+    text: String,
+    binary: String,
 };
 
 /// DataRow body (tag 'D'): int16(col_count) + per-col (int32 length,
@@ -598,7 +600,7 @@ pub const DataRowWriter = struct {
 /// "INSERT 0 5", etc.).
 pub fn encodeCommandComplete(
     scratch: *std.Io.Writer.Allocating,
-    tag: []const u8,
+    tag: String,
 ) !void {
     resetScratch(scratch);
     try writeCString(&scratch.writer, tag);
@@ -616,13 +618,13 @@ pub fn encodeEmptyQueryResponse(out: *std.Io.Writer) std.Io.Writer.Error!void {
 /// a final 0 byte ends the message.
 pub const ErrorField = struct {
     /// Severity: 'ERROR', 'FATAL', 'PANIC', etc.
-    severity: []const u8 = _types.severity_error,
+    severity: String = _types.severity_error,
     /// 5-char SQLSTATE.
     code: [5]u8,
-    message: []const u8,
+    message: String,
     /// Optional detail/hint/position; null if absent.
-    detail: ?[]const u8 = null,
-    hint: ?[]const u8 = null,
+    detail: ?String = null,
+    hint: ?String = null,
     /// 1-based byte position in the offending query, if known.
     position: ?i32 = null,
 };

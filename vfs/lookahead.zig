@@ -21,6 +21,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 
 const log = std.log.scoped(.lookahead);
 
@@ -233,7 +234,7 @@ pub fn probeByte(i: u64) u8 {
 }
 
 /// Verify a ranged read of the probe object against the pattern.
-pub fn verifyProbeData(off: u64, bytes: []const u8) bool {
+pub fn verifyProbeData(off: u64, bytes: String) bool {
     var failed: u32 = 0;
     for (bytes, 0..) |b, i| {
         failed += @intFromBool(b != probeByte(off + i));

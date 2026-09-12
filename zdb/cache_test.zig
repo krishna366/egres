@@ -1,6 +1,8 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const zdb = @import("zdb");
+const utils = @import("utils");
+const String = utils.String;
 const Cache = zdb.cache.Cache;
 const ShardedCache = zdb.cache.ShardedCache;
 const Value = zdb.cache.Value;
@@ -8,7 +10,7 @@ const hashKey = zdb.cache.hashKey;
 const Allocator = std.mem.Allocator;
 
 test "Cache basic put/get round-trip" {
-    var c = try Cache([]const u8).init(std.testing.allocator, 100);
+    var c = try Cache(String).init(std.testing.allocator, 100);
     defer c.deinit();
 
     const val = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "hello"));
@@ -40,7 +42,7 @@ test "Cache one-hit-wonder: evicted to ghost, not M" {
     // capacity=10 → s_cap_bytes=1, m_cap_bytes=9.
     // "kN"/"vN" entries are 4 bytes each.  S holds 1 entry before the byte
     // budget is exceeded and the next insert evicts it.
-    var c = try Cache([]const u8).init(std.testing.allocator, 10);
+    var c = try Cache(String).init(std.testing.allocator, 10);
     defer c.deinit();
 
     // k0 inserted, no get → freq stays false.
@@ -59,13 +61,13 @@ test "Cache one-hit-wonder: evicted to ghost, not M" {
     try std.testing.expectEqual(@as(?*Value, null), c.get("k0")); // evicted
     if (c.get("k1")) |v| v.decrRef(); // still present
     try std.testing.expectEqual(@as(usize, 0), c.m_len); // k0 did NOT go to M
-    const h0 = hashKey([]const u8, "k0");
+    const h0 = hashKey(String, "k0");
     try std.testing.expect(c.ghost_set.contains(h0)); // hash in ghost
 }
 
 test "Cache reused key promoted S → M" {
     // capacity=10 → s_cap_bytes=1, m_cap_bytes=9.
-    var c = try Cache([]const u8).init(std.testing.allocator, 10);
+    var c = try Cache(String).init(std.testing.allocator, 10);
     defer c.deinit();
 
     {
@@ -90,7 +92,7 @@ test "Cache reused key promoted S → M" {
 
 test "Cache ghost re-entry goes directly to M" {
     // capacity=10 → s_cap_bytes=1, m_cap_bytes=9.
-    var c = try Cache([]const u8).init(std.testing.allocator, 10);
+    var c = try Cache(String).init(std.testing.allocator, 10);
     defer c.deinit();
 
     // Evict k0 to ghost (freq=false).
@@ -121,7 +123,7 @@ test "Cache ghost re-entry goes directly to M" {
 test "Cache S FIFO eviction order" {
     // capacity=100 → s_cap_bytes=10; "kN"/"vN" entries are 4 bytes each.
     // S holds 2 entries (2×4=8 ≤ 10) but evicts when a 3rd arrives (3×4=12 > 10).
-    var c = try Cache([]const u8).init(std.testing.allocator, 100);
+    var c = try Cache(String).init(std.testing.allocator, 100);
     defer c.deinit();
 
     // Insert four keys without any gets (freq stays false throughout).
@@ -142,7 +144,7 @@ test "Cache S FIFO eviction order" {
 test "Cache M freq reset on reinsertion" {
     // capacity=10 → s_cap_bytes=1, m_cap_bytes=9.
     // "kN"/"vN" entries are 4 bytes each; M holds 2 entries (2×4=8 ≤ 9, 3×4=12 > 9).
-    var c = try Cache([]const u8).init(std.testing.allocator, 10);
+    var c = try Cache(String).init(std.testing.allocator, 10);
     defer c.deinit();
 
     // Promote k0 and k1 into M.
@@ -183,7 +185,7 @@ test "Cache M freq reset on reinsertion" {
 }
 
 test "Cache update existing key frees old value" {
-    var c = try Cache([]const u8).init(std.testing.allocator, 100);
+    var c = try Cache(String).init(std.testing.allocator, 100);
     defer c.deinit();
 
     {
@@ -233,7 +235,7 @@ test "Cache byteSize reflects inserted bytes and respects capacity" {
 }
 
 test "ShardedCache basic get/put" {
-    var sc = try ShardedCache([]const u8).init(std.testing.allocator, 200, 4);
+    var sc = try ShardedCache(String).init(std.testing.allocator, 200, 4);
     defer sc.deinit();
 
     const val = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "xval"));
@@ -252,16 +254,16 @@ test "ShardedCache concurrent puts and gets" {
     defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
-    var sc = try ShardedCache([]const u8).init(alloc, 200, 4);
+    var sc = try ShardedCache(String).init(alloc, 200, 4);
     defer sc.deinit();
 
     const Ctx = struct {
-        sc: *ShardedCache([]const u8),
+        sc: *ShardedCache(String),
         alloc: Allocator,
     };
 
     // String literals have static storage; safe to use as cache keys across threads.
-    const static_keys = [_][]const u8{ "aa", "bb", "cc", "dd", "ee", "ff" };
+    const static_keys = [_]String{ "aa", "bb", "cc", "dd", "ee", "ff" };
 
     const work = struct {
         fn run(ctx: Ctx) void {

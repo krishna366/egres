@@ -1,6 +1,7 @@
 const std = @import("std");
 const m = @import("metrics");
 const utils = @import("utils");
+const String = utils.String;
 
 // Storage-layer metrics. The `Metrics` struct is owned by the application
 // (e.g. egres), not by Forest — so multiple Forest instances (tests,
@@ -28,7 +29,7 @@ pub const CompactionLabels = struct {
 /// destination tree/level yet, so those default to 0 (sentinel "not applicable").
 /// Write amp = sum(bytes_written) / sum(bytes_written{source="user"}).
 pub const BytesWrittenLabels = struct {
-    source: []const u8,
+    source: String,
     namespace_id: u64 = 0,
     tree_id: u64 = 0,
     level: u8 = 0,

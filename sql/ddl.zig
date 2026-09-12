@@ -31,7 +31,7 @@ const replyErrorCode = _server.replyErrorCode;
 const replyLockErr = _server.replyLockErr;
 const default_database = _server.default_database;
 
-pub fn createDatabase(self: *Handler, state: *pgwire.ConnState, name: []const u8) !void {
+pub fn createDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !void {
     const eng = self.srv.engine;
     self.srv.ddl_mu.lock(@src());
     defer self.srv.ddl_mu.unlock();
@@ -54,7 +54,7 @@ pub fn createDatabase(self: *Handler, state: *pgwire.ConnState, name: []const u8
     try state.sendCommandComplete("CREATE DATABASE");
 }
 
-pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: []const u8) !void {
+pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !void {
     const eng = self.srv.engine;
     self.srv.ddl_mu.lock(@src());
     defer self.srv.ddl_mu.unlock();

@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 const zdb = @import("zdb");
 
 fn noopPersist(_: *anyopaque, _: u64) anyerror!void {}
@@ -41,7 +42,7 @@ fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
 /// Each entry is (key_no_ts, ts, value).
 fn buildTable(
     alloc: std.mem.Allocator,
-    entries: []const struct { key: []const u8, ts: u64, val: []const u8 },
+    entries: []const struct { key: String, ts: u64, val: String },
 ) !_table.builder.TableBuffer {
     var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer b.deinit();
@@ -55,9 +56,9 @@ fn buildTable(
 /// pass the same slice along — Zig gives each anonymous struct literal its
 /// own distinct type.
 const MetaEntry = struct {
-    key: []const u8,
+    key: String,
     ts: u64,
-    val: []const u8,
+    val: String,
     meta: zdb.kv.Meta = .{},
 };
 
@@ -83,7 +84,7 @@ fn buildTableMeta(
 fn installTable(
     alloc: std.mem.Allocator,
     ms: *manifest.ForestState,
-    dir_path: []const u8,
+    dir_path: String,
     tb: *_table.builder.TableBuffer,
     id: u64,
     tree_id: u64,
@@ -105,7 +106,7 @@ fn levelStaleBytes(level: *Level) u64 {
 }
 
 /// Test helper: create an in-memory FileHandle from a buffer (dupes the data).
-fn fromBuf(allocator: std.mem.Allocator, buf: []const u8) !vfs.FileHandle {
+fn fromBuf(allocator: std.mem.Allocator, buf: String) !vfs.FileHandle {
     const owned = try allocator.dupe(u8, buf);
     return .{
         .file_size = @intCast(owned.len),
@@ -219,7 +220,7 @@ test "levels: overlapping tables L1" {
     const alloc = std.testing.allocator;
 
     // 5 tables with ranges: a-b, c-d, e-f, g-h, i-j
-    const ranges = [_][2][]const u8{
+    const ranges = [_][2]String{
         .{ "a", "b" },
         .{ "c", "d" },
         .{ "e", "f" },
@@ -542,7 +543,7 @@ test "levels: doCompact L0 L1" {
     defer alloc.free(dir_path);
 
     // Write three L0 SST files with non-overlapping keys.
-    const l0_data = [_]struct { id: u64, key: []const u8, val: []const u8 }{
+    const l0_data = [_]struct { id: u64, key: String, val: String }{
         .{ .id = 1, .key = "aa", .val = "vaa" },
         .{ .id = 2, .key = "bb", .val = "vbb" },
         .{ .id = 3, .key = "cc", .val = "vcc" },
@@ -672,7 +673,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
 
     // All four keys from both levels must be present after compaction.
-    const expected = [_]struct { key: []const u8, val: []const u8 }{
+    const expected = [_]struct { key: String, val: String }{
         .{ .key = "aa", .val = "vaa" },
         .{ .key = "bb", .val = "vbb" },
         .{ .key = "cc", .val = "vcc" },
@@ -749,7 +750,7 @@ test "levels: doCompact L1 L2" {
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
     try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(2));
 
-    const expected = [_]struct { key: []const u8, val: []const u8 }{
+    const expected = [_]struct { key: String, val: String }{
         .{ .key = "aa", .val = "vaa" },
         .{ .key = "bb", .val = "vbb" },
         .{ .key = "cc", .val = "vcc" },
@@ -904,7 +905,7 @@ const TombstoneFixture = struct {
 fn setupTombstoneTree(
     alloc: std.mem.Allocator,
     fx: *TombstoneFixture,
-    dir_path: []const u8,
+    dir_path: String,
     max_levels: u8,
     entries: []const MetaEntry,
 ) !void {
@@ -1234,7 +1235,7 @@ const roaring_state: zdb.kv.Meta = .{ .kind = .state, .encoding = .roaring };
 fn setupTreeWithCfg(
     alloc: std.mem.Allocator,
     fx: *TombstoneFixture,
-    dir_path: []const u8,
+    dir_path: String,
     cfg: config.Config,
     entries: []const MetaEntry,
 ) !void {
@@ -1284,7 +1285,7 @@ fn encodeState(
 
 fn expectBitmapBytes(
     alloc: std.mem.Allocator,
-    bytes: []const u8,
+    bytes: String,
     expected: []const u64,
 ) !void {
     var bm = try zroar.Bitmap.fromBufferCopy(alloc, bytes);
@@ -1300,7 +1301,7 @@ fn expectBitmapBytes(
 fn foldAt(
     alloc: std.mem.Allocator,
     tree: *Tree,
-    primary: []const u8,
+    primary: String,
     read_ts: u64,
 ) !zroar.Bitmap {
     const bm = try tree.rollupBitmap(
@@ -1588,7 +1589,7 @@ const LevelTable = struct { level: u32, entries: []const MetaEntry };
 fn setupTreeMulti(
     alloc: std.mem.Allocator,
     fx: *TombstoneFixture,
-    dir_path: []const u8,
+    dir_path: String,
     cfg: config.Config,
     tables: []const LevelTable,
 ) !void {

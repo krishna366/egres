@@ -1,6 +1,7 @@
 const std = @import("std");
 const zdb = @import("zdb");
 const utils = @import("utils");
+const String = utils.String;
 const vfs = zdb.vfs;
 const Table = zdb.table.Table;
 const TableIterator = zdb.table.TableIterator;
@@ -9,7 +10,7 @@ const Key = zdb.kv.Key;
 /// Returns true on success, false on any failure. Prints the result line
 /// directly so we don't need to retain pointers into the table after it's
 /// dropped (smallest/biggest live in the table's index memory).
-fn verifyOne(allocator: std.mem.Allocator, path: []const u8) bool {
+fn verifyOne(allocator: std.mem.Allocator, path: String) bool {
     const base = std.fs.path.basename(path);
 
     const t = Table.open(allocator, path, .p2) catch |err| {
@@ -77,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
 
-    var paths: std.ArrayList([]const u8) = .empty;
+    var paths: std.ArrayList(String) = .empty;
     defer {
         for (paths.items) |p| allocator.free(p);
         paths.deinit(allocator);
@@ -89,8 +90,8 @@ pub fn main(init: std.process.Init) !void {
         const full = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
         try paths.append(allocator, full);
     }
-    std.mem.sort([]const u8, paths.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
+    std.mem.sort(String, paths.items, {}, struct {
+        fn lt(_: void, a: String, b: String) bool {
             return std.mem.lessThan(u8, a, b);
         }
     }.lt);

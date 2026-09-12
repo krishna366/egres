@@ -218,7 +218,7 @@ pub const Txn = struct {
     pub fn lockRow(
         self: *Txn,
         table_id: u32,
-        primary: []const u8,
+        primary: String,
     ) RowLockError!void {
         const h = (Key{
             .namespace = self.ns,
@@ -293,8 +293,8 @@ pub const Txn = struct {
     pub fn put(
         self: *Txn,
         table_id: u32,
-        primary: []const u8,
-        val: []const u8,
+        primary: String,
+        val: String,
         meta: Meta,
     ) !void {
         const w = try self.pendingWrites();
@@ -351,7 +351,7 @@ pub const Txn = struct {
     pub fn putPosting(
         self: *Txn,
         table_id: u32,
-        index_key: []const u8,
+        index_key: String,
         egid: u64,
         op: PostingOp,
     ) !void {
@@ -392,7 +392,7 @@ pub const Txn = struct {
     pub fn overlayPostings(
         self: *Txn,
         table_id: u32,
-        index_key: []const u8,
+        index_key: String,
         bm: *zdb.zroar.Bitmap,
     ) !void {
         const w = self.writes orelse return;

@@ -49,6 +49,7 @@ const Tty = struct {
 // (avoids "file exists in two modules" errors).
 const utils = @import("utils");
 const bench = utils.bench;
+const String = utils.String;
 
 // ════════════════════════════════════════════════════════════════════════
 // Why we have our own test + bench runner
@@ -174,7 +175,7 @@ pub const std_options_debug_threaded_io: ?*std.Io.Threaded = &std.testing.io_ins
 /// first_trace_addr (the panic call-site) directly to stderr via
 /// raw `write` syscall, then aborts. Resolve the address with:
 ///   addr2line -fipCe <binary> <addr>
-fn minimalPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+fn minimalPanic(msg: String, first_trace_addr: ?usize) noreturn {
     const marker = "[MINIMAL_PANIC_FIRED]\n";
     _ = std.os.linux.write(2, marker.ptr, marker.len);
     // 4 KiB so a long DOUBLE_PUSH ring dump (~800-1200 bytes) fits.
@@ -222,8 +223,8 @@ fn resolveParallel(p: u6) u6 {
 }
 
 const Args = struct {
-    filter: ?[]const u8 = null,
-    exclude: ?[]const u8 = null,
+    filter: ?String = null,
+    exclude: ?String = null,
     run_big: bool = false,
     only_bench: bool = false,
     /// `HANG:`-prefixed tests are watchdog smoke tests that intentionally
@@ -316,7 +317,7 @@ fn lookupFiberLog() ?*FiberLog {
 fn capturingLogFn(
     comptime message_level: std.log.Level,
     comptime scope: @EnumLiteral(),
-    comptime format: []const u8,
+    comptime format: String,
     args: anytype,
 ) void {
     const log = lookupFiberLog() orelse {
@@ -453,11 +454,11 @@ const RunningSet = struct {
     total: u32 = 0,
 
     const Entry = struct {
-        name: []const u8,
+        name: String,
         start_ns: i128,
     };
 
-    fn add(self: *RunningSet, name: []const u8) void {
+    fn add(self: *RunningSet, name: String) void {
         mlock(&self.mu);
         defer munlock(&self.mu);
         self.list.append(std.heap.page_allocator, .{
@@ -466,7 +467,7 @@ const RunningSet = struct {
         }) catch {};
     }
 
-    fn remove(self: *RunningSet, name: []const u8) void {
+    fn remove(self: *RunningSet, name: String) void {
         mlock(&self.mu);
         defer munlock(&self.mu);
         for (self.list.items, 0..) |t, i| {
@@ -488,7 +489,7 @@ const RunningSet = struct {
 /// File.stderr().writer path would have blocked on the runtime's io).
 /// Truncates silently if the formatted string exceeds the buffer
 /// or the syscall returns an error.
-fn rawStderrWriteAll(bytes: []const u8) void {
+fn rawStderrWriteAll(bytes: String) void {
     var written: usize = 0;
     while (written < bytes.len) {
         const rc = std.os.linux.write(2, bytes.ptr + written, bytes.len - written);
@@ -499,7 +500,7 @@ fn rawStderrWriteAll(bytes: []const u8) void {
     }
 }
 
-fn rawStderrPrint(buf: []u8, comptime fmt: []const u8, args: anytype) void {
+fn rawStderrPrint(buf: []u8, comptime fmt: String, args: anytype) void {
     const formatted = std.fmt.bufPrint(buf, fmt, args) catch buf[0..0];
     rawStderrWriteAll(formatted);
 }
@@ -694,7 +695,7 @@ fn writeColored(
     out: *std.Io.Writer,
     tty: Tty,
     color: Tty.Color,
-    comptime fmt: []const u8,
+    comptime fmt: String,
     args: anytype,
 ) void {
     tty.setColor(out, color) catch {};
@@ -706,18 +707,18 @@ fn writeColored(
 /// the leading number under 1024. Returns a slice of `buf`. Pass
 /// `per_s = true` to append "/s" (used for throughput); `false` for a
 /// raw byte total.
-fn formatBinaryBytes(buf: []u8, bytes: f64, per_s: bool) []const u8 {
-    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+fn formatBinaryBytes(buf: []u8, bytes: f64, per_s: bool) String {
+    const units = [_]String{ "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
     var v = bytes;
     var idx: usize = 0;
     while (v >= 1024.0 and idx + 1 < units.len) : (idx += 1) v /= 1024.0;
-    const suffix: []const u8 = if (per_s) "/s" else "";
+    const suffix: String = if (per_s) "/s" else "";
     return std.fmt.bufPrint(buf, "{d:.1} {s}{s}", .{ v, units[idx], suffix }) catch "??";
 }
 
 /// Format a count with a decimal SI suffix (K=1e3, M=1e6, G=1e9, T=1e12).
 /// Used for iteration counts in benchmark output.
-fn formatCount(buf: []u8, n: u64) []const u8 {
+fn formatCount(buf: []u8, n: u64) String {
     if (n < 1000) return std.fmt.bufPrint(buf, "{d}", .{n}) catch "??";
     const suffixes = [_]u8{ 'K', 'M', 'G', 'T' };
     var v = @as(f64, @floatFromInt(n)) / 1000.0;
@@ -730,8 +731,8 @@ fn formatCount(buf: []u8, n: u64) []const u8 {
 /// the leading number under 1000. Returns a slice of `buf`. Uses ASCII
 /// "us" rather than UTF-8 "µs" so byte-width padding aligns visually in
 /// monospace output (µ is 2 bytes but renders as 1 column).
-fn formatDuration(buf: []u8, ns: f64) []const u8 {
-    const units = [_][]const u8{ "ns", "us", "ms", "s " };
+fn formatDuration(buf: []u8, ns: f64) String {
+    const units = [_]String{ "ns", "us", "ms", "s " };
     var v = ns;
     var idx: usize = 0;
     while (v >= 1000.0 and idx + 1 < units.len) : (idx += 1) v /= 1000.0;
@@ -742,14 +743,14 @@ fn formatDuration(buf: []u8, ns: f64) []const u8 {
 // `.test.` infix is how the compiler distinguishes test decls from regular
 // fns/consts; it's just noise to a reader. Display as `<module_path>  <name>`
 // with the module padded to a shared width so test names line up vertically.
-fn splitModuleName(name: []const u8) struct { module: []const u8, test_name: []const u8 } {
+fn splitModuleName(name: String) struct { module: String, test_name: String } {
     if (std.mem.indexOf(u8, name, ".test.")) |p| {
         return .{ .module = name[0..p], .test_name = name[p + ".test.".len ..] };
     }
     return .{ .module = "", .test_name = name };
 }
 
-fn writeDisplayName(out: *std.Io.Writer, tty: Tty, name: []const u8) void {
+fn writeDisplayName(out: *std.Io.Writer, tty: Tty, name: String) void {
     const split = splitModuleName(name);
     if (split.module.len == 0) {
         out.writeAll(split.test_name) catch {};
@@ -885,7 +886,7 @@ fn fiberDriver(fctx: *FiberCtx) void {
 }
 
 /// True for `BENCH:`-prefixed tests (after stripping Zig's `<mod>.test.` infix).
-fn isBench(name: []const u8) bool {
+fn isBench(name: String) bool {
     const user_name = if (std.mem.indexOf(u8, name, ".test.")) |p|
         name[p + ".test.".len ..]
     else

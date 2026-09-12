@@ -3,6 +3,7 @@ const testing = std.testing;
 const fiber = @import("zfiber");
 const vfs = @import("vfs");
 const utils = @import("utils");
+const String = utils.String;
 const bandwidth = vfs.bandwidth;
 const VFS = vfs.VFS;
 const Priority = vfs.Priority;
@@ -14,16 +15,16 @@ const page_size = vfs.page_size;
 inline fn ioOf() std.Io {
     return utils.context.g().io;
 }
-fn createFileAbs(path: []const u8) !std.Io.File {
+fn createFileAbs(path: String) !std.Io.File {
     return std.Io.Dir.createFileAbsolute(ioOf(), path, .{});
 }
-fn openFileAbs(path: []const u8) !std.Io.File {
+fn openFileAbs(path: String) !std.Io.File {
     return std.Io.Dir.openFileAbsolute(ioOf(), path, .{});
 }
-fn deleteFileAbs(path: []const u8) !void {
+fn deleteFileAbs(path: String) !void {
     return std.Io.Dir.deleteFileAbsolute(ioOf(), path);
 }
-fn accessAbs(path: []const u8) !void {
+fn accessAbs(path: String) !void {
     return std.Io.Dir.accessAbsolute(ioOf(), path, .{});
 }
 inline fn nowMs() i64 {
@@ -32,7 +33,7 @@ inline fn nowMs() i64 {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn writeTempFile(path: []const u8, data: []const u8) !void {
+fn writeTempFile(path: String, data: String) !void {
     const io = ioOf();
     const file = try createFileAbs(path);
     defer file.close(io);

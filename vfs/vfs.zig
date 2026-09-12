@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 pub const bandwidth = @import("bandwidth.zig");
 pub const filestore = @import("filestore.zig");
 pub const FileStore = filestore.FileStore;
@@ -64,7 +65,7 @@ pub const IOKind = enum(u1) {
 
 pub const ReadResult = struct {
     buf: ?[]align(page_size) u8,
-    data: []const u8,
+    data: String,
     allocator: std.mem.Allocator,
 
     pub fn free(self: ReadResult) void {
@@ -153,7 +154,7 @@ pub const FileHandle = struct {
     pub const ReadRequest = struct {
         offset: u64,
         len: usize,
-        data: []const u8 = "", // filled by batchRead
+        data: String = "", // filled by batchRead
         ctx: ?*anyopaque = null, // opaque pointer for caller use
     };
 
@@ -236,7 +237,7 @@ pub const FileHandle = struct {
 
     pub fn write(
         self: FileHandle,
-        data: []const u8,
+        data: String,
         offset: u64,
         priority: Priority,
     ) !void {
@@ -330,7 +331,7 @@ pub const VFS = struct {
         return .{ .bw = limiter };
     }
 
-    pub fn openFile(self: *const VFS, allocator: std.mem.Allocator, path: []const u8, opts: FileOptions) !FileHandle {
+    pub fn openFile(self: *const VFS, allocator: std.mem.Allocator, path: String, opts: FileOptions) !FileHandle {
         switch (opts.mode) {
             .mmap => {
                 // mmap mode opens RO+default for the underlying fd; mapped
@@ -376,7 +377,7 @@ pub const VFS = struct {
         }
     }
 
-    pub fn createFile(self: *const VFS, path: []const u8, opts: FileOptions) !FileHandle {
+    pub fn createFile(self: *const VFS, path: String, opts: FileOptions) !FileHandle {
         if (opts.mode == .mmap or opts.mode == .memory) return error.InvalidMode;
 
         var open_flags: posix.O = .{ .ACCMODE = .RDWR, .CREAT = true };
@@ -417,8 +418,8 @@ pub const VFS = struct {
 /// heap buffers must use `.default` — direct-mode writes assert
 /// alignment rather than bounce.
 pub fn writeAndSync(
-    path: []const u8,
-    data: []const u8,
+    path: String,
+    data: String,
     opts: FileOptions,
     priority: Priority,
 ) !void {
@@ -443,31 +444,31 @@ pub fn writeAndSync(
 // `deleteTree`, file iteration), we wrap `std.Io.Dir` with the global
 // `io` from `utils.context`.
 
-pub fn access(path: []const u8) !void {
+pub fn access(path: String) !void {
     try fiber.Dir.cwd().access(path, .{});
 }
 
 /// Recursive mkdir-p. Wraps std.Io.Dir.createDirPath (fiber.fs doesn't have it).
-pub fn createDirPath(path: []const u8) !void {
+pub fn createDirPath(path: String) !void {
     try std.Io.Dir.cwd().createDirPath(utils.context.g().io, path);
 }
 
 /// Recursive delete. Wraps std.Io.Dir.deleteTree (fiber.fs doesn't have it).
-pub fn deleteTree(path: []const u8) !void {
+pub fn deleteTree(path: String) !void {
     try std.Io.Dir.cwd().deleteTree(utils.context.g().io, path);
 }
 
-pub fn renameFile(old_path: []const u8, new_path: []const u8) !void {
+pub fn renameFile(old_path: String, new_path: String) !void {
     try fiber.Dir.cwd().rename(old_path, fiber.Dir.cwd(), new_path);
 }
 
-pub fn deleteFile(path: []const u8) !void {
+pub fn deleteFile(path: String) !void {
     try fiber.Dir.cwd().deleteFile(path);
 }
 
 /// Best-effort directory fsync so newly created filenames are durable.
 /// Silently ignores errors (tmpfs, some network mounts don't support dir fsync).
-pub fn syncDir(path: []const u8) void {
+pub fn syncDir(path: String) void {
     const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return;
     const f = fiber.File.fromFd(fd);
     defer f.close();
@@ -485,7 +486,7 @@ pub fn syncDir(path: []const u8) void {
 /// whole-file writers want the bytes durable, not dirty page cache — the
 /// dir store renames these into place as upload targets, and a rename
 /// must never expose a name whose data could still be lost.
-pub fn writeFile(path: []const u8, data: []const u8) !void {
+pub fn writeFile(path: String, data: String) !void {
     const f = try fiber.Dir.cwd().createFile(path, .{});
     defer f.close();
     var off: u64 = 0;
@@ -496,7 +497,7 @@ pub fn writeFile(path: []const u8, data: []const u8) !void {
 }
 
 /// Open and read the whole file. Caller owns the returned buffer.
-pub fn readFile(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
+pub fn readFile(path: String, allocator: std.mem.Allocator) ![]u8 {
     const f = try fiber.Dir.cwd().openFile(path, .{});
     defer f.close();
     const info = try f.stat();
@@ -512,7 +513,7 @@ pub fn readFile(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
 }
 
 /// Stat a path for its size in bytes.
-pub fn fileSize(path: []const u8) !u64 {
+pub fn fileSize(path: String) !u64 {
     const f = try fiber.Dir.cwd().openFile(path, .{});
     defer f.close();
     return (try f.stat()).size;
@@ -540,7 +541,7 @@ pub const DirIter = struct {
     }
 };
 
-pub fn iterateDir(path: []const u8) !DirIter {
+pub fn iterateDir(path: String) !DirIter {
     const io = utils.context.g().io;
     const d = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     return .{ .inner = d, .iter = d.iterate() };
@@ -556,7 +557,7 @@ pub fn iterateDir(path: []const u8) !DirIter {
 /// so this function's signature stays stable as new flags are added.
 /// Pub for the dir store's calibration probe reads, which need O_DIRECT
 /// without a FileHandle's bandwidth accounting.
-pub fn openDirect(path: []const u8, opts: FileOptions) !posix.fd_t {
+pub fn openDirect(path: String, opts: FileOptions) !posix.fd_t {
     const direct_io = opts.mode == .direct;
     const accmode: posix.ACCMODE = if (opts.flags.writable) .RDWR else .RDONLY;
     var flags: posix.O = .{ .ACCMODE = accmode };

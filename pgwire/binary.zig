@@ -11,6 +11,8 @@
 //! mirrors.
 
 const std = @import("std");
+const utils = @import("utils");
+const String = utils.String;
 const _types = @import("types.zig");
 
 pub const DecodeError = error{
@@ -29,7 +31,7 @@ pub fn encodeBool(out: []u8, v: bool) void {
     out[0] = if (v) 1 else 0;
 }
 
-pub fn decodeBool(bytes: []const u8) DecodeError!bool {
+pub fn decodeBool(bytes: String) DecodeError!bool {
     if (bytes.len != 1) return error.BadLength;
     return switch (bytes[0]) {
         0 => false,
@@ -47,7 +49,7 @@ pub fn encodeInt2(out: []u8, v: i16) void {
     std.mem.writeInt(i16, out[0..2], v, .big);
 }
 
-pub fn decodeInt2(bytes: []const u8) DecodeError!i16 {
+pub fn decodeInt2(bytes: String) DecodeError!i16 {
     if (bytes.len != 2) return error.BadLength;
     return std.mem.readInt(i16, bytes[0..2], .big);
 }
@@ -57,7 +59,7 @@ pub fn encodeInt4(out: []u8, v: i32) void {
     std.mem.writeInt(i32, out[0..4], v, .big);
 }
 
-pub fn decodeInt4(bytes: []const u8) DecodeError!i32 {
+pub fn decodeInt4(bytes: String) DecodeError!i32 {
     if (bytes.len != 4) return error.BadLength;
     return std.mem.readInt(i32, bytes[0..4], .big);
 }
@@ -67,7 +69,7 @@ pub fn encodeInt8(out: []u8, v: i64) void {
     std.mem.writeInt(i64, out[0..8], v, .big);
 }
 
-pub fn decodeInt8(bytes: []const u8) DecodeError!i64 {
+pub fn decodeInt8(bytes: String) DecodeError!i64 {
     if (bytes.len != 8) return error.BadLength;
     return std.mem.readInt(i64, bytes[0..8], .big);
 }
@@ -84,7 +86,7 @@ pub fn encodeFloat4(out: []u8, v: f32) void {
     std.mem.writeInt(u32, out[0..4], bits, .big);
 }
 
-pub fn decodeFloat4(bytes: []const u8) DecodeError!f32 {
+pub fn decodeFloat4(bytes: String) DecodeError!f32 {
     if (bytes.len != 4) return error.BadLength;
     const bits = std.mem.readInt(u32, bytes[0..4], .big);
     return @bitCast(bits);
@@ -96,7 +98,7 @@ pub fn encodeFloat8(out: []u8, v: f64) void {
     std.mem.writeInt(u64, out[0..8], bits, .big);
 }
 
-pub fn decodeFloat8(bytes: []const u8) DecodeError!f64 {
+pub fn decodeFloat8(bytes: String) DecodeError!f64 {
     if (bytes.len != 8) return error.BadLength;
     const bits = std.mem.readInt(u64, bytes[0..8], .big);
     return @bitCast(bits);

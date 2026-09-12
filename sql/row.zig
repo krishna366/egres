@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const _value = @import("value.zig");
+const String = _value.String;
 const _schema = @import("schema.zig");
 const Value = _value.Value;
 const Row = _value.Row;
@@ -27,7 +28,7 @@ pub fn marshalRow(
     ps: *const PhysicalSchema,
     values: []const Value,
     buf: *std.ArrayList(u8),
-) ![]const u8 {
+) !String {
     std.debug.assert(values.len == ps.columns.len);
 
     // Zero-fill the fixed-size prefix: version + null bitmap + fixed region
@@ -78,7 +79,7 @@ pub fn marshalRow(
 pub fn unmarshalRow(
     alloc: std.mem.Allocator,
     ps: *const PhysicalSchema,
-    buffer: []const u8,
+    buffer: String,
     projection: []const u32,
     row: *Row,
 ) !void {
@@ -113,13 +114,13 @@ pub fn unmarshalRow(
 /// test, then one fixed-offset read or varlen-directory slice — O(1)
 /// either way. Filters use this to reject a row before paying for the
 /// full unmarshalRow.
-pub inline fn parseCol(ps: *const PhysicalSchema, buffer: []const u8, col: ColumnLayout) Value {
+pub inline fn parseCol(ps: *const PhysicalSchema, buffer: String, col: ColumnLayout) Value {
     return if (isNull(buffer, col)) .null_value else readValue(ps, buffer, col);
 }
 
 // --- internals --------------------------------------------------------------
 
-inline fn isNull(buffer: []const u8, col: ColumnLayout) bool {
+inline fn isNull(buffer: String, col: ColumnLayout) bool {
     return (buffer[col.null_byte_index] & (@as(u8, 1) << col.null_bit_index)) != 0;
 }
 
@@ -133,7 +134,7 @@ inline fn writeDirEntry(buffer: []u8, ps: *const PhysicalSchema, col: ColumnLayo
 }
 
 /// Read a present (non-null) column into a typed Value. O(1).
-fn readValue(ps: *const PhysicalSchema, buffer: []const u8, col: ColumnLayout) Value {
+fn readValue(ps: *const PhysicalSchema, buffer: String, col: ColumnLayout) Value {
     const off = col.physical_offset;
     return switch (col.ty) {
         .bool_ => .{ .bool_ = buffer[off] != 0 },
@@ -162,7 +163,7 @@ fn readValue(ps: *const PhysicalSchema, buffer: []const u8, col: ColumnLayout) V
 
 /// Slice a varlen column's bytes via its cumulative end-offsets. The span is
 /// [prev_end, this_end) — self-contained, no need to find the next column.
-inline fn varlenSlice(ps: *const PhysicalSchema, buffer: []const u8, col: ColumnLayout) []const u8 {
+inline fn varlenSlice(ps: *const PhysicalSchema, buffer: String, col: ColumnLayout) String {
     const var_base = ps.var_offset_array_start;
     const j = col.var_offset_index;
     const end = std.mem.readInt(u32, buffer[var_base + j * 4 ..][0..4], .little);
@@ -195,7 +196,7 @@ fn writeFixed(dst: []u8, val: Value) void {
     }
 }
 
-inline fn varlenBytes(val: Value) []const u8 {
+inline fn varlenBytes(val: Value) String {
     return switch (val) {
         .text, .bytea => |b| b,
         else => unreachable, // only varlen payloads reach here

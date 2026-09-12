@@ -12,6 +12,8 @@
 //! `ParseTree` is allocator-owned and `deinit` is enough.
 
 const std = @import("std");
+const utils = @import("utils");
+const String = utils.String;
 
 const c = @cImport({
     @cInclude("pg_query.h");
@@ -74,7 +76,7 @@ pub const ParseTree = struct {
 /// allocator.
 pub fn parse(
     alloc: std.mem.Allocator,
-    sql: []const u8,
+    sql: String,
     out_err: ?*?ErrorInfo,
 ) ParseError!ParseTree {
     // libpg_query insists on a NUL-terminated input. Allocate a copy

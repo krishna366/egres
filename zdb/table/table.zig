@@ -6,6 +6,7 @@ pub const Item = @import("../kv.zig").Item;
 const _idx = @import("index.zig");
 const _buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
+const String = utils.String;
 const compress = utils.compression;
 const _binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("vfs");
@@ -71,7 +72,7 @@ pub const Table = struct {
     /// open opens an SST file through the global VFS instance (vfs.g),
     /// in `read_mode`; readAligned transparently handles mmap, direct,
     /// and memory-backed file handles.
-    pub fn open(allocator: std.mem.Allocator, path: []const u8, priority: vfs.Priority) !*Table {
+    pub fn open(allocator: std.mem.Allocator, path: String, priority: vfs.Priority) !*Table {
         const handle = try vfs.g().openFile(allocator, path, .{
             .mode = read_mode,
         });
@@ -180,7 +181,7 @@ pub const Table = struct {
     }
 
     /// Atomically claim ownership of the path, returning the slice if we won the race.
-    fn claimPath(self: *Table) ?[]const u8 {
+    fn claimPath(self: *Table) ?String {
         const ptr = self.path_ptr.swap(null, .acq_rel);
         if (ptr) |p| return p[0..self.path_len];
         return null;
@@ -248,7 +249,7 @@ pub const Table = struct {
         return self.index.blocks.len;
     }
 
-    pub fn blockBaseKey(self: Table, block_idx: usize) Error![]const u8 {
+    pub fn blockBaseKey(self: Table, block_idx: usize) Error!String {
         if (block_idx >= self.index.blocks.len) return error.CorruptTable;
         return self.index.blocks[block_idx].key;
     }
@@ -280,7 +281,7 @@ pub const Table = struct {
 
     /// Decompress and checksum one block's raw bytes into a ref-counted
     /// Value; the one ref is the caller's.
-    fn decodeBlock(self: *const Table, raw: []const u8) Error!*_cache.Value {
+    fn decodeBlock(self: *const Table, raw: String) Error!*_cache.Value {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.allocator);
         const sz = try compress.decompress(
@@ -399,14 +400,14 @@ pub const Table = struct {
 pub const BlockIterator = struct {
     alloc: std.mem.Allocator,
     key_buf: std.ArrayList(u8),
-    block: []const u8,
+    block: String,
     /// The entries region, sliced once at init. Entry offsets stored in
     /// the block are relative to this, not to the block.
-    entries_region: []const u8,
+    entries_region: String,
     layout: BlockLayout,
-    base_key: []const u8,
+    base_key: String,
     entry_idx: usize,
-    val: []const u8,
+    val: String,
     meta: Meta,
     is_valid: bool,
 
@@ -414,7 +415,7 @@ pub const BlockIterator = struct {
         self.key_buf.deinit(self.alloc);
     }
 
-    fn parseBlockLayout(block: []const u8) Error!BlockLayout {
+    fn parseBlockLayout(block: String) Error!BlockLayout {
         // Header is [u64 block_hash][u32 entry_count] then the entry
         // offsets (see builder.zig finishBlock). parseBlockLayout never
         // validates the hash itself — that's already done in readBlock's
@@ -437,8 +438,8 @@ pub const BlockIterator = struct {
 
     pub fn init(
         alloc: std.mem.Allocator,
-        block: []const u8,
-        base_key: []const u8,
+        block: String,
+        base_key: String,
     ) !BlockIterator {
         // See Table Layout diagram in builder.zig.
         // This should be a copy of that. If not, use builder.zig as the source of truth.
@@ -494,8 +495,8 @@ pub const BlockIterator = struct {
     /// pasting the two together. Lets a search compare an entry without
     /// materializing it — the whole point of seeking this way.
     const StoredKey = struct {
-        base: []const u8,
-        diff: []const u8,
+        base: String,
+        diff: String,
 
         fn len(self: StoredKey) usize {
             return self.base.len + self.diff.len;
@@ -558,7 +559,7 @@ pub const BlockIterator = struct {
     fn cmpStoredKey(
         self: *BlockIterator,
         i: usize,
-        target_key: []const u8,
+        target_key: String,
         shared_w_base: usize,
     ) Error!std.math.Order {
         const sk = try self.storedKeyAt(i);
@@ -585,7 +586,7 @@ pub const BlockIterator = struct {
     /// `target` marshaled (Key.marshalTo): the caller marshals once per
     /// seek, then probes compare raw bytes and only the landing entry is
     /// materialized.
-    pub fn seekGe(self: *BlockIterator, target_key: []const u8) Error!void {
+    pub fn seekGe(self: *BlockIterator, target_key: String) Error!void {
         return self.seekGeFrom(target_key, 0);
     }
 
@@ -594,7 +595,7 @@ pub const BlockIterator = struct {
     /// what follows.
     pub fn seekGeFrom(
         self: *BlockIterator,
-        target_key: []const u8,
+        target_key: String,
         from: usize,
     ) Error!void {
         // This binary search is only possible because we're diffing keys

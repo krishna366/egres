@@ -2,6 +2,7 @@ const std = @import("std");
 const fiber = @import("zfiber");
 const flags = @import("flags");
 const utils = @import("utils");
+const String = utils.String;
 const _proto = @import("engine/admin.zig");
 
 const log = std.log.scoped(.zdb_client);
@@ -17,7 +18,7 @@ inline fn nowNs() i128 {
 /// — flags.zig doesn't support enum-typed fields. Two callsites below
 /// compare with `std.mem.eql` instead of an enum tag.
 const Args = struct {
-    addr: []const u8 = "127.0.0.1:8001",
+    addr: String = "127.0.0.1:8001",
     clients: u32 = 1,
     records: u64 = 1000,
     ops: u64 = 10000,
@@ -26,7 +27,7 @@ const Args = struct {
     namespaces: u32 = 1,
     verify_clients: u32 = 0,
     batch_size: u32 = 1,
-    phase: []const u8 = "both",
+    phase: String = "both",
 
     pub const docs = .{
         .self = "ZDB benchmark client (YCSB-shaped load + run phases).",
@@ -61,7 +62,7 @@ fn usage(alloc: std.mem.Allocator) void {
 
 // --- Text protocol (client side) ---
 
-fn sendSet(stream: fiber.net.Stream, ns: u32, key: []const u8, value: []const u8) !void {
+fn sendSet(stream: fiber.net.Stream, ns: u32, key: String, value: String) !void {
     var hdr_buf: [128]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "set {d} {s} ", .{ ns, key }) catch unreachable;
     try stream.writeAll(hdr);
@@ -84,8 +85,8 @@ fn sendSetBatch(
     allocator: std.mem.Allocator,
     stream: fiber.net.Stream,
     ns: u32,
-    keys: []const []const u8,
-    values: []const []const u8,
+    keys: []const String,
+    values: []const String,
 ) !void {
     std.debug.assert(keys.len == values.len);
 
@@ -138,7 +139,7 @@ fn recvSetResponse(stream: fiber.net.Stream) !SetResult {
     }
 }
 
-fn sendGet(stream: fiber.net.Stream, ns: u32, key: []const u8, read_ts: u64) !void {
+fn sendGet(stream: fiber.net.Stream, ns: u32, key: String, read_ts: u64) !void {
     var hdr_buf: [128]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "get {d} {s} {d}\n", .{ ns, key, read_ts }) catch unreachable;
     try stream.writeAll(hdr);
@@ -148,7 +149,7 @@ const GetResult = struct {
     found: bool,
     ts: u64 = 0,
     /// The value bytes, sliced into the caller-provided buffer. Empty on miss.
-    value: []const u8 = "",
+    value: String = "",
 };
 
 /// Reads the response for a `get` into the caller-provided `buf` (which must
@@ -171,7 +172,7 @@ fn recvGetResponse(stream: fiber.net.Stream, buf: []u8) !GetResult {
     }
 }
 
-fn readResponseLine(stream: fiber.net.Stream, buf: []u8) ![]const u8 {
+fn readResponseLine(stream: fiber.net.Stream, buf: []u8) !String {
     var pos: usize = 0;
     while (pos < buf.len) {
         var byte: [1]u8 = undefined;
@@ -198,7 +199,7 @@ fn readResponseLine(stream: fiber.net.Stream, buf: []u8) ![]const u8 {
 /// `buf` must be at least 20 bytes. Changed from `*[24]u8` to `[]u8` so the
 /// same function works for stack-fixed buffers and for slices into a larger
 /// pre-allocated batch buffer (both coerce to `[]u8`).
-fn formatKey(buf: []u8, id: u64) []const u8 {
+fn formatKey(buf: []u8, id: u64) String {
     return std.fmt.bufPrint(buf, "user{d:0>16}", .{id}) catch unreachable;
 }
 
@@ -220,7 +221,7 @@ fn fillValue(buf: []u8, id: u64) void {
 }
 
 /// valueMatches returns true iff `got` equals the expected pattern for id.
-fn valueMatches(got: []const u8, id: u64) bool {
+fn valueMatches(got: String, id: u64) bool {
     var expected_buf: [16 * 1024]u8 = undefined;
     if (got.len > expected_buf.len) return false;
     const expected = expected_buf[0..got.len];
@@ -236,7 +237,7 @@ fn valueMatches(got: []const u8, id: u64) bool {
 /// Caller provides `buf` for the response (sized to hold header + value) and
 /// `read_ts` (typically `SharedState.max_commit_ts` so followers catch up to
 /// every previously-acked write).
-fn getWithRetry(stream: fiber.net.Stream, ns: u32, key: []const u8, read_ts: u64, buf: []u8) !GetResult {
+fn getWithRetry(stream: fiber.net.Stream, ns: u32, key: String, read_ts: u64, buf: []u8) !GetResult {
     const max_retries: u32 = 5;
     var delay_ms: u64 = 10;
     var attempt: u32 = 0;
@@ -359,9 +360,9 @@ fn workerImpl(ctx: *WorkerCtx) !void {
     defer alloc.free(keys_flat);
     const vals_flat = try alloc.alloc(u8, bs * value_size);
     defer alloc.free(vals_flat);
-    const keys_slices = try alloc.alloc([]const u8, bs);
+    const keys_slices = try alloc.alloc(String, bs);
     defer alloc.free(keys_slices);
-    const vals_slices = try alloc.alloc([]const u8, bs);
+    const vals_slices = try alloc.alloc(String, bs);
     defer alloc.free(vals_slices);
     // PRNG only used for run-phase random op selection (read vs write).
     var prng = std.Random.DefaultPrng.init(@as(u64, ctx.id) ^ 0xdeadbeef);
@@ -700,14 +701,14 @@ pub fn main(init: std.process.Init) !void {
 
 /// Root fiber: runs bootstrap, then stops the runtime so `run()` returns.
 /// Fatal arg/data errors call `std.process.exit` directly (as before).
-fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const []const u8) void {
+fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const String) void {
     defer fiber.stop();
     bootstrap(allocator, argv) catch |err| {
         log.err("benchmark failed: {s}", .{@errorName(err)});
     };
 }
 
-fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     flags.initGlobal(allocator);
     defer flags.deinitGlobal();
     const live = try flags.g().register("bench", Args);
@@ -719,7 +720,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const []const u8) !void {
         }
     }
 
-    var leftover: std.ArrayList([]const u8) = .empty;
+    var leftover: std.ArrayList(String) = .empty;
     defer leftover.deinit(allocator);
     flags.g().parseArgv(argv[1..], &leftover) catch |err| {
         std.log.err("flag parse failed: {s}", .{@errorName(err)});

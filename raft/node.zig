@@ -3,6 +3,7 @@ const fiber = @import("zfiber");
 const _raftwal = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const utils = @import("utils");
+const String = utils.String;
 const _transport = @import("transport");
 const Transport = _transport.Transport;
 const _serial = @import("serial");
@@ -25,7 +26,7 @@ pub const PeerRole = zen.RoleEnum;
 pub const Config = struct {
     id: NodeId,
     cluster_id: u64 = 0,
-    listen_addr: []const u8 = "",
+    listen_addr: String = "",
     tick_interval_ms: u32 = 100,
     heartbeat_ticks: u32 = 2,
     election_timeout_min_ticks: u32 = 10,
@@ -84,7 +85,7 @@ pub const Peer = struct {
     // Raft's `matchIndex[i]` — kept here under the more readable name.
     last_index: u64,
     role: PeerRole,
-    addr: []const u8 = "",
+    addr: String = "",
 };
 
 pub const msg_type_raft = _serial.msg_type_raft;
@@ -95,7 +96,7 @@ pub const InboundMsg = struct {
     payload: []u8, // owned copy
 };
 
-pub const Inbound = []const u8;
+pub const Inbound = String;
 pub const Entry = struct {
     term: u64,
     index: u64,
@@ -131,7 +132,7 @@ pub const Node = struct {
         step_down,
     };
 
-    fn dbg(comptime format: []const u8, args: anytype) void {
+    fn dbg(comptime format: String, args: anytype) void {
         raft_log.debug(format, args);
     }
 
@@ -144,7 +145,7 @@ pub const Node = struct {
         /// (still polling shutdown) and retry until apply succeeds. The
         /// state machine must NOT loop on transient errors itself — it would
         /// block the raft fiber from observing shutdown.
-        applyFn: *const fn (*anyopaque, Entry, []const u8) anyerror!void,
+        applyFn: *const fn (*anyopaque, Entry, String) anyerror!void,
         /// Ensure the given file ids are present on local disk, downloading
         /// from the shared object store as needed. Behind the announce
         /// prefetch: raft only relays ids, never file bytes. Single attempt
@@ -156,7 +157,7 @@ pub const Node = struct {
         /// treated as always-ready.
         isReadyFn: ?*const fn (*anyopaque) bool = null,
 
-        pub fn apply(self: *StateMachine, entry: Entry, data: []const u8) anyerror!void {
+        pub fn apply(self: *StateMachine, entry: Entry, data: String) anyerror!void {
             try self.applyFn(self.ctx, entry, data);
         }
         pub fn ensureFiles(self: *StateMachine, file_ids: []const u64) anyerror!void {
@@ -455,7 +456,7 @@ pub const Node = struct {
     }
 
     // handleP0Message would be called concurrently via multiple Serial listener coroutines.
-    fn handleP0Message(ctx: *anyopaque, conn: *Serial, message_type: u16, payload: []const u8) void {
+    fn handleP0Message(ctx: *anyopaque, conn: *Serial, message_type: u16, payload: String) void {
         const self: *Node = @ptrCast(@alignCast(ctx));
         switch (message_type) {
             _serial.msg_type_raft => {
@@ -509,7 +510,7 @@ pub const Node = struct {
         ctx.done.send(1) catch {};
     }
 
-    fn handleJoinRequest(self: *Node, conn: *Serial, payload: []const u8) void {
+    fn handleJoinRequest(self: *Node, conn: *Serial, payload: String) void {
         const parsed = zen.parseMessageWithTail(payload) catch return;
         switch (parsed) {
             .JoinRequest => |req| {
@@ -566,7 +567,7 @@ pub const Node = struct {
     }
 
     fn sendJoinResponse(self: *Node, conn: *Serial, accepted: bool, leader_id: ?NodeId, reason_code: u32) void {
-        const leader_addr: []const u8 = if (leader_id) |lid| blk: {
+        const leader_addr: String = if (leader_id) |lid| blk: {
             if (lid == self.id) break :blk self.config.listen_addr;
             if (self.peers.get(lid)) |peer| break :blk peer.addr;
             break :blk "";
@@ -589,7 +590,7 @@ pub const Node = struct {
 
     // --- join handling end
 
-    fn handleP1Message(ctx: *anyopaque, conn: *Serial, message_type: u16, payload: []const u8) void {
+    fn handleP1Message(ctx: *anyopaque, conn: *Serial, message_type: u16, payload: String) void {
         _ = conn; // dispatch only relays ids; responses go via the transport
         const self: *Node = @ptrCast(@alignCast(ctx));
         switch (message_type) {
@@ -713,7 +714,7 @@ pub const Node = struct {
         defer ann.destroy(self.allocator);
 
         var status: zen.AnnounceStatusEnum = .ok;
-        var fail_error: []const u8 = "";
+        var fail_error: String = "";
         if (self.state_machine) |sm| {
             sm.ensureFiles(ann.file_ids) catch |err| {
                 status = .fail;
@@ -827,7 +828,7 @@ pub const Node = struct {
     /// skips if the snapshot index is at or below the current snapshot.
     /// Bypasses the state machine (Forest is updated by normal `.manifest`
     /// apply; this only affects WAL state).
-    fn applySnapshotEntry(self: *Node, payload: []const u8) !void {
+    fn applySnapshotEntry(self: *Node, payload: String) !void {
         const new_snap = try zen.SnapshotReader.parseRoot(payload);
         const cur = self.log.snapshot();
         if (new_snap.index() <= cur.index) return;
@@ -1451,7 +1452,7 @@ pub const Node = struct {
     /// Propose a data change (normal mutation) through the raft proposal queue.
     pub fn proposeDataChange(
         self: *Node,
-        data: []const u8,
+        data: String,
         cb: ApplyCallback,
         ctx: *anyopaque,
     ) RaftError!void {
@@ -1472,7 +1473,7 @@ pub const Node = struct {
     /// → MergeIterator yields duplicates → builder rejects → KeyOrderViolation.
     /// User-facing writes go through `proposeDataChange` (callback fires on
     /// commit) and are unaffected.
-    pub fn proposeAndWaitForApply(self: *Node, data: []const u8, proposal_type: ProposalType) RaftError!void {
+    pub fn proposeAndWaitForApply(self: *Node, data: String, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
         const start_ms = fiber.coarseMs();
         var ctx = WaitCtx{ .status = .committed };
@@ -1517,7 +1518,7 @@ pub const Node = struct {
 
     pub fn proposeWithCallback(
         self: *Node,
-        data: []const u8,
+        data: String,
         cb: ApplyCallback,
         ctx: *anyopaque,
         proposal_type: ProposalType,
@@ -2343,7 +2344,7 @@ pub const Node = struct {
         return self.peers.contains(id);
     }
 
-    fn addPeer(self: *Node, id: NodeId, role: PeerRole, addr: []const u8) void {
+    fn addPeer(self: *Node, id: NodeId, role: PeerRole, addr: String) void {
         if (self.hasPeer(id)) return;
         const owned_addr = self.allocator.dupe(u8, addr) catch {
             @panic("raft: addPeer out of memory");
@@ -2371,7 +2372,7 @@ pub const Node = struct {
         }
     }
 
-    fn updatePeerAddr(self: *Node, id: NodeId, addr: []const u8) void {
+    fn updatePeerAddr(self: *Node, id: NodeId, addr: String) void {
         const peer = self.peers.getPtr(id) orelse return;
         if (peer.addr.len > 0) self.allocator.free(peer.addr);
         peer.addr = self.allocator.dupe(u8, addr) catch return;
@@ -2478,7 +2479,7 @@ pub const Node = struct {
 
     // TESTING ONLY
     // _propose is and should only being used by tests.
-    pub fn _propose(self: *Node, data: []const u8) RaftError!u64 {
+    pub fn _propose(self: *Node, data: String) RaftError!u64 {
         if (self.state != .leader) return RaftError.NotLeader;
 
         const new_index = self.log.lastIndex() + 1;

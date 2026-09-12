@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const String = sql.value.String;
 const zdb = @import("zdb");
 
 const pred = sql.pred;
@@ -32,7 +33,7 @@ const Fixture = struct {
         } };
     }
 
-    fn col(self: *const Fixture, name: []const u8) *const sql.table.Column {
+    fn col(self: *const Fixture, name: String) *const sql.table.Column {
         return self.tbl.column(name).?;
     }
 
@@ -86,7 +87,7 @@ test "sql.pred: bindNode binds columns, coerces literals, and checks the egid" {
     try testing.expectEqual(&leaf, &leaf.topLevelAnds()[0]);
 
     // Errors, wherever they sit in the tree.
-    const cases = [_]struct { sql: []const u8, err: pred.BindError }{
+    const cases = [_]struct { sql: String, err: pred.BindError }{
         .{ .sql = "SELECT * FROM t WHERE a = 1 AND nope = 2;", .err = error.UndefinedColumn },
         .{ .sql = "SELECT * FROM t WHERE NOT a = 'zz';", .err = error.InvalidValue },
         .{ .sql = "SELECT * FROM t WHERE egid = 0;", .err = error.EgidZero },

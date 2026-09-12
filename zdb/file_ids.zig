@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 const fiber = @import("zfiber");
 
 /// Encoded file_id layout: 16 bits node_id (high) | 48 bits local counter (low).
@@ -27,7 +28,7 @@ pub fn local(file_id: u64) u64 {
 /// stem layout, non-hex chars). 0 is the safe sentinel: it isn't a
 /// valid encoded id (node 0 is reserved by `bind`'s assertion), so
 /// callers can use 0 as "skip cache" or "non-SST file".
-pub fn fromPath(path: []const u8) u64 {
+pub fn fromPath(path: String) u64 {
     const basename = std.fs.path.basename(path);
     if (!std.mem.endsWith(u8, basename, ".sst")) return 0;
     const stem = basename[0 .. basename.len - 4];
@@ -42,7 +43,7 @@ pub fn fromPath(path: []const u8) u64 {
 /// so directory listings sort by (node, local) lexicographically.
 /// Pass `dir = ""` to get the bare filename without any prefix; otherwise
 /// the result is `<dir>/<filename>`. Caller owns the returned slice.
-pub fn sstPath(allocator: std.mem.Allocator, dir: []const u8, file_id: u64) ![]u8 {
+pub fn sstPath(allocator: std.mem.Allocator, dir: String, file_id: u64) ![]u8 {
     if (dir.len == 0) return std.fmt.allocPrint(
         allocator,
         "{x:0>4}_{x:0>12}.sst",

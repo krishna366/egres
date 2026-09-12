@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const utils = @import("utils");
+const String = utils.String;
 const zdb = @import("zdb");
 const vfs = zdb.vfs;
 const zroar = zdb.zroar;
@@ -62,7 +63,7 @@ const Fixture = struct {
         self.tmp.cleanup();
     }
 
-    fn key(primary: []const u8, ts: u64) Key {
+    fn key(primary: String, ts: u64) Key {
         return .{
             .namespace = ns,
             .table_id = tid,
@@ -73,18 +74,18 @@ const Fixture = struct {
 
     fn put(
         self: *Fixture,
-        primary: []const u8,
+        primary: String,
         ts: u64,
-        value: []const u8,
+        value: String,
     ) !void {
         try self.putMeta(primary, ts, value, .{});
     }
 
     fn putMeta(
         self: *Fixture,
-        primary: []const u8,
+        primary: String,
         ts: u64,
-        value: []const u8,
+        value: String,
         meta: Meta,
     ) !void {
         const items = [_]Item{.{
@@ -130,8 +131,8 @@ fn expectRow(
     fx: *Fixture,
     mg: *const Forest.MultiGet,
     read_ts: u64,
-    primary: []const u8,
-    want: ?struct { value: []const u8, ts: u64 },
+    primary: String,
+    want: ?struct { value: String, ts: u64 },
 ) !void {
     const got = mg.item(primary);
     const single = try fx.f.get(fx.alloc, Fixture.key(primary, read_ts), .p0);
@@ -157,7 +158,7 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     defer fx.teardown();
 
     // k01..k10 at ts 10, down in L1.
-    const base = [_][]const u8{
+    const base = [_]String{
         "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10",
     };
     for (base) |k| try fx.put(k, 10, "v1");
@@ -196,7 +197,7 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     });
 
     // Unsorted, with a duplicate and an absent key.
-    const keys = [_][]const u8{
+    const keys = [_]String{
         "k09", "k03", "k01", "k04", "k05", "k06", "k07", "k08", "k02", "k99",
         "k03",
     };
@@ -232,7 +233,7 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
 
 /// A key of table 7, the neighbour of `tid` in the namespace-wide
 /// memtable.
-fn otherKey(primary: []const u8, ts: u64) Key {
+fn otherKey(primary: String, ts: u64) Key {
     return .{
         .namespace = ns,
         .table_id = 7,
@@ -322,10 +323,10 @@ test "multiget: rejects a read_ts below globalMinRead" {
 
 fn writeOneKeyTable(
     alloc: std.mem.Allocator,
-    dir: []const u8,
+    dir: String,
     file_id: u64,
     k: Key,
-    value: []const u8,
+    value: String,
 ) !void {
     const path = try zdb.file_ids.sstPath(alloc, dir, file_id);
     defer alloc.free(path);
@@ -344,7 +345,7 @@ test "multiget: keys across two trees and several bottom tables" {
     defer fx.teardown();
 
     // Ten one-key L3 SSTs, value = key, then a split into two trees.
-    const keys = [_][]const u8{
+    const keys = [_]String{
         "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10",
     };
     for (keys, 1..) |k, file_id| {
@@ -367,7 +368,7 @@ test "multiget: keys across two trees and several bottom tables" {
     }
     try fx.f.splitTreeForTests(ns, fx.tree_id);
 
-    const asked = [_][]const u8{
+    const asked = [_]String{
         "k10", "k01", "k05", "k06", "k00", "k11", "k03",
     };
     var mg = try fx.f.multiGet(alloc, ns, tid, &asked, .{});
@@ -415,7 +416,7 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
     try std.testing.expect(nblocks >= 3);
 
     // blockFor names the block a seek opens.
-    for ([_][]const u8{ "r000", "r150", "r299" }) |k| {
+    for ([_]String{ "r000", "r150", "r299" }) |k| {
         var it = zdb.table.TableIterator.init(alloc, tbl, .p0);
         defer it.deinit();
         try it.seekRange(Fixture.key(k, 10), .{});
@@ -470,7 +471,7 @@ const roar = struct {
 
     fn putDelta(
         fx: *Fixture,
-        primary: []const u8,
+        primary: String,
         ts: u64,
         adds: []const u64,
         rems: []const u64,
@@ -486,7 +487,7 @@ const roar = struct {
 
     fn putState(
         fx: *Fixture,
-        primary: []const u8,
+        primary: String,
         ts: u64,
         vals: []const u64,
     ) !void {
@@ -500,7 +501,7 @@ const roar = struct {
         fx: *Fixture,
         mg: *const Forest.MultiGet,
         read_ts: u64,
-        primary: []const u8,
+        primary: String,
         expected: []const u64,
     ) !void {
         var bm = try mg.bitmap(fx.alloc, primary);

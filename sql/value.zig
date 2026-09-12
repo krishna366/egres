@@ -102,7 +102,7 @@ pub const Type = enum {
     /// spellings can't come from it: `bool` (the variant is bool_; `bool`
     /// is a Zig primitive) and `varchar` (folds into text; any length
     /// modifier is dropped).
-    pub fn fromName(name: []const u8) ?Type {
+    pub fn fromName(name: String) ?Type {
         if (std.mem.eql(u8, name, "bool")) return .bool_;
         if (std.mem.eql(u8, name, "varchar")) return .text;
         return std.meta.stringToEnum(Type, name);
@@ -139,8 +139,8 @@ pub const Value = union(enum) {
     timestamptz: i64,
     interval: Interval,
     uuid: [16]u8,
-    text: []const u8,
-    bytea: []const u8,
+    text: String,
+    bytea: String,
 
     /// The cell's type, or null for SQL NULL. Every non-null tag is
     /// named exactly as its Type.
@@ -199,7 +199,7 @@ pub const Row = struct {
 /// failures surface as errors (the executor maps them to 22P02); types this
 /// slice can't parse (temporal, uuid, interval) return `error.UnsupportedType`
 /// (→ 0A000).
-pub fn parseValue(ty: Type, text: []const u8) !Value {
+pub fn parseValue(ty: Type, text: String) !Value {
     return switch (ty) {
         .bool_ => .{ .bool_ = try parseBool(text) },
         .int2 => .{ .int2 = try std.fmt.parseInt(i16, text, 10) },
@@ -216,14 +216,14 @@ pub fn parseValue(ty: Type, text: []const u8) !Value {
     };
 }
 
-fn parseBool(text: []const u8) !bool {
+fn parseBool(text: String) !bool {
     // Postgres accepts several spellings; cover the common ones.
     if (eqlAny(text, &.{ "t", "true", "1", "yes", "on" })) return true;
     if (eqlAny(text, &.{ "f", "false", "0", "no", "off" })) return false;
     return error.InvalidBool;
 }
 
-fn eqlAny(text: []const u8, options: []const []const u8) bool {
+fn eqlAny(text: String, options: []const String) bool {
     for (options) |o| if (std.ascii.eqlIgnoreCase(text, o)) return true;
     return false;
 }

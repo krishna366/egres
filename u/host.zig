@@ -3,10 +3,11 @@
 
 const std = @import("std");
 const fiber = @import("zfiber");
+const String = @import("utils.zig").String;
 
 /// The memory this process may use. `source` names the bound that
 /// won, for the startup log. 0 bytes when neither could be read.
-pub const Memory = struct { bytes: u64, source: []const u8 };
+pub const Memory = struct { bytes: u64, source: String };
 
 pub fn memory() Memory {
     var out = Memory{
@@ -48,7 +49,7 @@ fn cgroupLimit() ?u64 {
 /// The number in a cgroup limit file, or null when the file is absent,
 /// says `max`, or holds v1's "no limit" (the type's maximum, page
 /// rounded).
-fn parseLimit(path: []const u8) ?u64 {
+fn parseLimit(path: String) ?u64 {
     var buf: [64]u8 = undefined;
     const text = readSmall(path, &buf) orelse return null;
     const trimmed = std.mem.trim(u8, text, " \n");
@@ -60,7 +61,7 @@ fn parseLimit(path: []const u8) ?u64 {
 
 /// A proc or sysfs file read whole into `buf` (their stat sizes mean
 /// nothing, so read until EOF). Null on any error.
-fn readSmall(path: []const u8, buf: []u8) ?[]const u8 {
+fn readSmall(path: String, buf: []u8) ?String {
     const f = fiber.Dir.cwd().openFile(path, .{}) catch return null;
     defer f.close();
     var off: usize = 0;

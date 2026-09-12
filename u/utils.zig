@@ -58,7 +58,7 @@ pub const WaitGroup = struct {
 };
 
 // testPrint helps emit debugging output from tests without affecting non-test builds.
-pub fn testPrint(comptime fmt: []const u8, args: anytype) void {
+pub fn testPrint(comptime fmt: String, args: anytype) void {
     if (!builtin.is_test) return;
     // std.debug.print(fmt, args);
     _ = fmt;
@@ -66,7 +66,7 @@ pub fn testPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 /// Rate-limited log: each call site (unique comptime instantiation) logs at most once per interval.
-pub fn logEvery(comptime interval_secs: i64, comptime fmt: []const u8, args: anytype) void {
+pub fn logEvery(comptime interval_secs: i64, comptime fmt: String, args: anytype) void {
     const S = struct {
         var last: i64 = 0;
     };

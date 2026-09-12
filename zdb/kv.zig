@@ -1,4 +1,6 @@
 const std = @import("std");
+const utils = @import("utils");
+const String = utils.String;
 
 /// How a value's bytes are encoded. Lives in Meta's high nibble.
 ///
@@ -91,7 +93,7 @@ pub const Meta = packed struct(u8) {
 /// it (meta).
 pub const Item = struct {
     key: Key,
-    value: []const u8,
+    value: String,
     // No default. Every construction site is a place where silently defaulting
     // to .raw would drop a row's metadata, so let the compiler catch a new one.
     meta: Meta,
@@ -192,13 +194,13 @@ pub inline fn treeSplitId(tree_id: u64) u32 {
 pub const Key = struct {
     namespace: u64 = 0,
     table_id: u32 = 0,
-    primary: []const u8 = "",
+    primary: String = "",
     timestamp: u64 = 0,
 
     /// Parse a marshaled key: [ns:u64 BE][tid:u32 BE][primary][ts:u64 BE].
     /// For keys without the full prefix/suffix, construct Key directly via
     /// Key{ .primary = ... }.
-    pub fn init(raw: []const u8) Key {
+    pub fn init(raw: String) Key {
         if (raw.len == 0) {
             return .{};
         }
@@ -211,7 +213,7 @@ pub const Key = struct {
         };
     }
 
-    pub fn initAlloc(allocator: std.mem.Allocator, raw: []const u8) !Key {
+    pub fn initAlloc(allocator: std.mem.Allocator, raw: String) !Key {
         var k = init(raw);
         k.primary = try allocator.dupe(u8, k.primary);
         return k;
@@ -229,7 +231,7 @@ pub const Key = struct {
         }
     }
 
-    pub fn marshal(self: Key, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn marshal(self: Key, allocator: std.mem.Allocator) !String {
         if (self.primary.len == 0) {
             return allocator.alloc(u8, 0);
         }
@@ -238,7 +240,7 @@ pub const Key = struct {
         return buf;
     }
 
-    pub fn marshalTo(self: Key, allocator: std.mem.Allocator, data: *std.ArrayList(u8)) ![]const u8 {
+    pub fn marshalTo(self: Key, allocator: std.mem.Allocator, data: *std.ArrayList(u8)) !String {
         if (self.primary.len == 0) {
             return allocator.alloc(u8, 0);
         }

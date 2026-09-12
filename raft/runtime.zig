@@ -1,5 +1,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
+const utils = @import("utils");
+const String = utils.String;
 const _node = @import("node.zig");
 const _serial = @import("serial");
 const Serial = _serial.Serial;
@@ -46,10 +48,10 @@ pub const RaftRuntime = struct {
 /// within a fiber coroutine.
 pub fn requestJoin(
     allocator: std.mem.Allocator,
-    leader_addr: []const u8,
+    leader_addr: String,
     cluster_id: u64,
     node_id: NodeId,
-    self_addr: []const u8,
+    self_addr: String,
 ) !zen.JoinResponseBuffer {
     const addr = try fiber.net.IpAddress.parseIpAndPort(leader_addr);
     const conn = try addr.connect(.{});
@@ -88,10 +90,10 @@ pub fn requestJoin(
 /// Must be called from a fiber coroutine.
 pub fn joinCluster(
     allocator: std.mem.Allocator,
-    seeds: []const []const u8,
+    seeds: []const String,
     cluster_id: u64,
     node_id: NodeId,
-    self_addr: []const u8,
+    self_addr: String,
 ) !void {
     const max_attempts: u32 = 30;
     var backoff_ms: u32 = 250;

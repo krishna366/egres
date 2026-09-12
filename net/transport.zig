@@ -2,6 +2,7 @@ const std = @import("std");
 const fiber = @import("zfiber");
 const _serial = @import("serial");
 const utils = @import("utils");
+const String = utils.String;
 const Serial = _serial.Serial;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.transport);
@@ -37,14 +38,14 @@ pub const Transport = struct {
     pub const Config = struct {
         self_id: u64,
         cluster_id: u64,
-        listen_addr: []const u8, // "ip:port"
+        listen_addr: String, // "ip:port"
         ctx: *anyopaque,
         on_message_p0: _serial.Serial.OnMessageFn,
         on_message_p1: _serial.Serial.OnMessageFn,
     };
 
     const PeerSlot = struct {
-        addr: ?[]const u8, // "ip:port" string, null for inbound-only peers
+        addr: ?String, // "ip:port" string, null for inbound-only peers
         conn: [2]?*Serial, // indexed by @intFromEnum(Priority)
         dial_loops: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
@@ -121,7 +122,7 @@ pub const Transport = struct {
 
     /// Add a peer dynamically and start dialing it.
     /// Safe to call while the server is running.
-    pub fn addPeer(self: *Transport, id: u64, addr: []const u8) !void {
+    pub fn addPeer(self: *Transport, id: u64, addr: String) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         log.debug("addPeer for {d} {s}\n", .{ id, addr });

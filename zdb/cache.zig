@@ -17,11 +17,12 @@
 //!
 //! Values are ref-counted `*Value` structs. The cache incrRefs on put/get and
 //! decrRefs on eviction/deinit. Callers must decrRef values returned by get.
-//! For []const u8 keys, the cache takes ownership of the key on put.
+//! For String keys, the cache takes ownership of the key on put.
 
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 const Allocator = std.mem.Allocator;
 
 // Re-export the canonical refcounted buffer from utils. Kept under the old
@@ -50,7 +51,7 @@ pub fn hashKey(comptime K: type, key: K) u64 {
     }
 }
 
-/// Returns the byte footprint of a key: slice length for []const u8,
+/// Returns the byte footprint of a key: slice length for String,
 /// or @sizeOf(K) for scalar types.
 fn keySize(comptime K: type, key: K) usize {
     if (comptime isSliceOfU8(K)) return key.len;
@@ -78,7 +79,7 @@ pub fn Cache(comptime K: type) type {
             tag: Tag,
         };
 
-        /// HashMap specialised for string keys when K = []const u8.
+        /// HashMap specialised for string keys when K = String.
         const Map = if (isSliceOfU8(K))
             std.StringHashMap(Entry)
         else
@@ -189,8 +190,8 @@ pub fn Cache(comptime K: type) type {
 
         /// Inserts `key` → `val` into the cache. The cache takes its own
         /// reference on `val` (incrRef); the caller retains their existing ref.
-        /// Key ownership is transferred for []const u8 keys.
-        /// On error, the key is freed (for []const u8) but val is NOT decrRef'd.
+        /// Key ownership is transferred for String keys.
+        /// On error, the key is freed (for String) but val is NOT decrRef'd.
         pub fn put(self: *Self, key: K, val: *Value) !void {
             // Key already present: update value in-place, adjusting byte counts.
             if (self.map.getPtr(key)) |entry| {
@@ -265,7 +266,7 @@ pub fn Cache(comptime K: type) type {
         // Internal helpers
         // ----------------------------------------------------------------
 
-        /// Free a key if K = []const u8; no-op for scalar K.
+        /// Free a key if K = String; no-op for scalar K.
         fn freeKey(self: *Self, key: K) void {
             if (comptime isSliceOfU8(K)) self.allocator.free(key);
         }
@@ -322,7 +323,7 @@ pub fn Cache(comptime K: type) type {
         }
 
         /// Push (key, val) into M, evicting first if M is over byte budget.
-        /// Takes ownership of one ref on val AND key (for []const u8).
+        /// Takes ownership of one ref on val AND key (for String).
         /// On error, val is decrRef'd and key is freed.
         fn pushMain(self: *Self, key: K, val: *Value) !void {
             const entry_bytes = keySize(K, key) + val.data.len;

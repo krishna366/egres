@@ -6,6 +6,7 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const String = sql.value.String;
 
 const BitmapNode = sql.exec.BitmapNode;
 const Plan = sql.plan.Plan;
@@ -92,7 +93,7 @@ const Fixture = struct {
     /// The plan of `SELECT * FROM t WHERE <where>`.
     fn planFor(
         self: *Fixture,
-        where: []const u8,
+        where: String,
         opts: sql.plan.Options,
     ) !Plan {
         const a = self.arena.allocator();
@@ -128,7 +129,7 @@ fn expectLookup(
     node: *const BitmapNode,
     index_table_id: u32,
     unique: bool,
-    key: []const u8,
+    key: String,
 ) !void {
     try testing.expect(node.* == .index_lookup);
     const lu = node.index_lookup;

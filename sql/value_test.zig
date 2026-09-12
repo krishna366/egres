@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const String = sql.value.String;
 const pgwire = @import("pgwire");
 const Type = sql.Type;
 const value = sql.value;
@@ -72,7 +73,7 @@ test "sql.value: parseValue coerces literals and rejects unsupported types" {
 
 test "sql.value: formatValue renders text-format output" {
     var buf: [64]u8 = undefined;
-    const cases = [_]struct { v: value.Value, want: []const u8 }{
+    const cases = [_]struct { v: value.Value, want: String }{
         .{ .v = .{ .int4 = -7 }, .want = "-7" },
         .{ .v = .{ .uint8 = 42 }, .want = "42" },
         .{ .v = .{ .bool_ = true }, .want = "t" },

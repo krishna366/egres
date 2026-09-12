@@ -1,6 +1,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const String = utils.String;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.serial);
 
@@ -92,7 +93,7 @@ pub const Serial = struct {
     }
 
     /// Send a framed message. Thread-safe via writer_mu.
-    pub fn send(self: *Serial, message_type: u16, payload: []const u8) !void {
+    pub fn send(self: *Serial, message_type: u16, payload: String) !void {
         self.writer_mu.lock(@src());
         defer self.writer_mu.unlock();
 
@@ -139,7 +140,7 @@ pub const Serial = struct {
         return .{ .message_type = message_type, .payload = payload };
     }
 
-    pub const OnMessageFn = *const fn (*anyopaque, *Serial, u16, []const u8) void;
+    pub const OnMessageFn = *const fn (*anyopaque, *Serial, u16, String) void;
 
     /// Run reader + writer loops. Blocks until TCP closes or errors.
     /// Reader calls on_message for each inbound frame.

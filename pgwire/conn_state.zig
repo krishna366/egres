@@ -19,6 +19,8 @@
 //! `Reader.fixed` and inspect the output via `Allocating.writer.buffered()`.
 
 const std = @import("std");
+const utils = @import("utils");
+const String = utils.String;
 const _proto = @import("proto.zig");
 const _types = @import("types.zig");
 
@@ -62,8 +64,8 @@ pub const Portal = struct {
 /// stay valid until the portal is closed (or until Sync if it's the
 /// unnamed portal — see Postgres protocol §3.4).
 pub const ExecuteCtx = struct {
-    sql: []const u8,
-    params: []const ?[]const u8,
+    sql: String,
+    params: []const ?String,
     /// One format code per param (0=text, 1=binary). Same length
     /// as `params`. The handler is responsible for decoding each
     /// param's bytes according to its format — see
@@ -87,8 +89,8 @@ pub const DescribeKind = _proto.DescribeKind;
 /// NoData.
 pub const DescribeCtx = struct {
     kind: DescribeKind,
-    sql: []const u8,
-    params: []const ?[]const u8,
+    sql: String,
+    params: []const ?String,
     /// Per-param format codes (text/binary). Empty for statement
     /// kind; same length as `params` for portal kind.
     param_formats: []const i16 = &.{},
@@ -101,7 +103,7 @@ pub const Event = union(enum) {
     startup_complete: _proto.StartupParams,
     /// A simple Query message arrived. `sql` borrows from `scratch_in`
     /// and is invalidated on the next `nextEvent` call.
-    query: []const u8,
+    query: String,
     /// Extended-query Execute. Slices borrow from the portal's
     /// alloc-owned storage (stable across `nextEvent` until the portal
     /// is closed).
@@ -127,18 +129,18 @@ pub const Config = struct {
     backend_secret: u32 = 0,
     /// Sent in ParameterStatus messages right after AuthenticationOk.
     /// libpq will pick these up and use them to format input/output.
-    server_version: []const u8 = "13.0",
-    server_encoding: []const u8 = "UTF8",
-    client_encoding: []const u8 = "UTF8",
-    date_style: []const u8 = "ISO, MDY",
-    timezone: []const u8 = "UTC",
-    interval_style: []const u8 = "postgres",
+    server_version: String = "13.0",
+    server_encoding: String = "UTF8",
+    client_encoding: String = "UTF8",
+    date_style: String = "ISO, MDY",
+    timezone: String = "UTC",
+    interval_style: String = "postgres",
     /// Username we report back as the session role. Real Postgres
     /// echoes the StartupMessage's `user` field; we use a constant
     /// because there's no auth/role backing yet.
     /// TODO: echo the actual `user` from the StartupMessage params
     /// (paired with the auth TODO on encodeAuthenticationOk).
-    session_authorization: []const u8 = "postgres",
+    session_authorization: String = "postgres",
     /// Initial transaction status to send after every query batch.
     /// Always idle today because we have no transaction support.
     /// TODO: real BEGIN/COMMIT/ROLLBACK driving tx_status to .in_tx /
@@ -261,7 +263,7 @@ pub const ConnState = struct {
     /// Drop a single statement and any portals derived from it.
     /// Per spec §3.4, closing a statement implicitly closes its
     /// portals.
-    fn dropStatement(self: *ConnState, name: []const u8) void {
+    fn dropStatement(self: *ConnState, name: String) void {
         if (self.statements.fetchRemove(name)) |kv| {
             var stmt = kv.value;
             self.alloc.free(kv.key);
@@ -269,7 +271,7 @@ pub const ConnState = struct {
         }
         // Walk portals and drop any that reference this statement.
         // Two-pass to avoid mutating during iteration.
-        var to_remove: std.ArrayList([]const u8) = .empty;
+        var to_remove: std.ArrayList(String) = .empty;
         defer to_remove.deinit(self.alloc);
         var it = self.portals.iterator();
         while (it.next()) |e| {
@@ -280,7 +282,7 @@ pub const ConnState = struct {
         for (to_remove.items) |k| self.dropPortal(k);
     }
 
-    fn dropPortal(self: *ConnState, name: []const u8) void {
+    fn dropPortal(self: *ConnState, name: String) void {
         if (self.portals.fetchRemove(name)) |kv| {
             var portal = kv.value;
             self.alloc.free(kv.key);
@@ -375,7 +377,7 @@ pub const ConnState = struct {
             // mode, for example, hard-requires
             // `standard_conforming_strings=on`. See SHAKEOUT.md for
             // the per-client matrix.
-            const announce = [_]struct { k: []const u8, v: []const u8 }{
+            const announce = [_]struct { k: String, v: String }{
                 .{ .k = "server_version", .v = self.cfg.server_version },
                 .{ .k = "server_encoding", .v = self.cfg.server_encoding },
                 .{ .k = "client_encoding", .v = self.cfg.client_encoding },
@@ -502,7 +504,7 @@ pub const ConnState = struct {
     /// extended-query-shaped is dropped until Sync.
     fn extError(
         self: *ConnState,
-        msg: []const u8,
+        msg: String,
         code: [5]u8,
     ) StateError!void {
         self.ext_failed = true;
@@ -513,7 +515,7 @@ pub const ConnState = struct {
         });
     }
 
-    fn handleParse(self: *ConnState, body: []const u8) StateError!void {
+    fn handleParse(self: *ConnState, body: String) StateError!void {
         // Cap how many param OIDs a single Parse may carry. Postgres
         // tolerates int16-max but real workloads stay tiny; this
         // gives us a stack-friendly upper bound.
@@ -548,7 +550,7 @@ pub const ConnState = struct {
         try _proto.encodeParseComplete(self.out);
     }
 
-    fn handleBind(self: *ConnState, body: []const u8) StateError!void {
+    fn handleBind(self: *ConnState, body: String) StateError!void {
         // Same comment as handleParse re: the upper bounds.
         var pfmt_storage: [256]i16 = undefined;
         var params_storage: [256]_proto.BindParam = undefined;
@@ -659,7 +661,7 @@ pub const ConnState = struct {
     /// Returns null when an error was emitted (caller should continue
     /// the consumeReady loop), or the `.execute` event when the
     /// portal+statement resolved successfully.
-    fn handleExecute(self: *ConnState, body: []const u8) StateError!?Event {
+    fn handleExecute(self: *ConnState, body: String) StateError!?Event {
         const e = _proto.parseExecute(body) catch {
             try self.extError(
                 "malformed Execute message",
@@ -695,7 +697,7 @@ pub const ConnState = struct {
     }
 
     /// Same null-vs-event convention as handleExecute.
-    fn handleDescribe(self: *ConnState, body: []const u8) StateError!?Event {
+    fn handleDescribe(self: *ConnState, body: String) StateError!?Event {
         const d = _proto.parseDescribe(body) catch {
             try self.extError(
                 "malformed Describe message",
@@ -747,7 +749,7 @@ pub const ConnState = struct {
         }
     }
 
-    fn handleClose(self: *ConnState, body: []const u8) StateError!void {
+    fn handleClose(self: *ConnState, body: String) StateError!void {
         const c = _proto.parseClose(body) catch {
             try self.extError(
                 "malformed Close message",
@@ -775,7 +777,7 @@ pub const ConnState = struct {
 
     fn emitFatal(
         self: *ConnState,
-        msg: []const u8,
+        msg: String,
         code: [5]u8,
     ) StateError!void {
         try self.writeError(.{
@@ -787,7 +789,7 @@ pub const ConnState = struct {
 
     fn emitErrorReady(
         self: *ConnState,
-        msg: []const u8,
+        msg: String,
         code: [5]u8,
     ) StateError!void {
         try self.writeError(.{
@@ -823,7 +825,7 @@ pub const ConnState = struct {
         return _proto.DataRowWriter.begin(&self.scratch_out, self.out, field_count);
     }
 
-    pub fn sendCommandComplete(self: *ConnState, tag: []const u8) StateError!void {
+    pub fn sendCommandComplete(self: *ConnState, tag: String) StateError!void {
         try _proto.encodeCommandComplete(&self.scratch_out, tag);
         try _proto.writeFrame(self.out, .command_complete, self.scratch_out.writer.buffered());
     }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const sql = @import("sql");
+const String = sql.value.String;
 const zdb = @import("zdb");
 
 const expr = sql.expr;
@@ -46,7 +47,7 @@ const Fixture = struct {
         } };
     }
 
-    fn col(self: *const Fixture, name: []const u8) *const sql.table.Column {
+    fn col(self: *const Fixture, name: String) *const sql.table.Column {
         return self.tbl.column(name).?;
     }
 
@@ -75,7 +76,7 @@ const Fixture = struct {
     };
 
     /// Parse `UPDATE t SET <assignment>` and bind its one SET value.
-    fn bind(self: *const Fixture, assignment: []const u8) expr.BindError!Set {
+    fn bind(self: *const Fixture, assignment: String) expr.BindError!Set {
         const text = try std.fmt.allocPrint(
             self.arloc,
             "UPDATE t SET {s};",
@@ -92,7 +93,7 @@ const Fixture = struct {
     }
 
     /// Bind then evaluate one assignment against `row`.
-    fn eval(self: *const Fixture, assignment: []const u8, row: Item) !Value {
+    fn eval(self: *const Fixture, assignment: String, row: Item) !Value {
         const set = try self.bind(assignment);
         return set.root.eval(self.arloc, &self.tbl, row, set.target);
     }
@@ -114,7 +115,7 @@ fn expectEval(
     fx: *const Fixture,
     row: Item,
     want: Value,
-    sql_set: []const u8,
+    sql_set: String,
 ) !void {
     try testing.expectEqual(want, try fx.eval(sql_set, row));
 }
@@ -123,7 +124,7 @@ fn expectEvalErr(
     fx: *const Fixture,
     row: Item,
     want: anyerror,
-    sql_set: []const u8,
+    sql_set: String,
 ) !void {
     try testing.expectError(want, fx.eval(sql_set, row));
 }
