@@ -234,6 +234,13 @@ pub const YieldIntent = enum(u8) {
 };
 
 pub const SpawnOptions = struct {
+    /// Lane-relative worker index, wrapping past the lane's size. High
+    /// priority: the home worker the fiber is pinned to (required).
+    /// Normal priority: the worker it is placed on — for a caller with a
+    /// better spread than the scheduler's local push (a listener dealing
+    /// connections round-robin); the fiber may still be stolen later.
+    /// null: the current worker's ring, or an idle lane peer when
+    /// spawned off-lane.
     worker_id: ?u8 = null,
     lane: Lane = .default,
     priority: Priority = .normal,
@@ -328,6 +335,10 @@ pub const Fiber = struct {
     /// Placement lane (`.default` / `.raft`). Set at spawn; used by
     /// normal-priority routing to pick a worker ring in the right lane.
     lane: Lane,
+    /// Absolute index of the worker a HIGH-priority fiber is pinned to;
+    /// resolved from the lane-relative `SpawnOptions.worker_id` by
+    /// `spawnInner`, read by `routeReady`. Not set for normal priority:
+    /// a normal fiber migrates within its lane and has no home.
     home_worker_id: u8,
 
     cpu_total_ns: u64,
@@ -473,7 +484,7 @@ pub const Fiber = struct {
             .running = std.atomic.Value(u32).init(0),
             .priority = opts.priority,
             .lane = opts.lane,
-            .home_worker_id = opts.worker_id orelse 0,
+            .home_worker_id = undefined, // high priority only; see spawnInner
             .cpu_total_ns = 0,
             .parked_since_ms = 0,
             .waker_prev = null,

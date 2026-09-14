@@ -224,6 +224,20 @@ const idle_words: usize = (max_workers + 63) / 64;
 /// RMW always reads the latest value in modification order).
 pub const IdleWorkers = struct {
     words: [idle_words]std.atomic.Value(u64) align(std.atomic.cache_line) = @splat(.init(0)),
+    /// Where the next `claim` / `anyOffset` starts scanning. Advances on
+    /// every call so the pick rotates over the parked workers instead of
+    /// always landing on the lowest-numbered one: under I/O-bound load the
+    /// busiest workers park briefly but constantly, so a lowest-bit pick
+    /// kept waking THEM as thieves (they pulled every fiber downhill) and
+    /// never reached the long-parked workers above them.
+    cursor: std.atomic.Value(u8) align(std.atomic.cache_line) = .init(0),
+    /// Workers in this lane, so the cursor rotates over the lane's own
+    /// offsets. Rotating over all `max_workers` bits instead sends most
+    /// starts into empty words, and the scan then walks the lane's word
+    /// from bit 0 — 7 claims in 8 went to the lowest parked worker of a
+    /// 32-worker lane. Set by `Runtime.init`; 1 for an empty lane (never
+    /// claimed, keeps the modulo safe).
+    len: u8 = 1,
 
     pub fn markIdle(self: *IdleWorkers, i: u8) void {
         const w = @as(usize, i) >> 6;
@@ -256,19 +270,40 @@ pub const IdleWorkers = struct {
     /// publishes the producer's prior num_thieves fetchAdd to the woken
     /// worker's `selfClear` (the thief +1 handoff).
     pub fn claim(self: *IdleWorkers) ?u8 {
-        for (&self.words, 0..) |*word, wi| {
-            var m = word.load(.seq_cst);
-            while (m != 0) {
-                const bit_i: u6 = @intCast(@ctz(m));
+        const start = self.nextStart();
+        const first_word = start / 64;
+        const start_bit: u6 = @intCast(start % 64);
+        for (0..idle_words) |jmp| {
+            const wi = (first_word + jmp) % idle_words;
+            const word = &self.words[wi];
+            var wd = word.load(.seq_cst);
+            while (wd != 0) {
+                // The start bit belongs to the cursor's own word; the
+                // words after it are walked from bit 0.
+                const bit_i = firstSetFrom(wd, if (jmp == 0) start_bit else 0);
                 const bit = @as(u64, 1) << bit_i;
-                if (word.cmpxchgWeak(m, m & ~bit, .seq_cst, .seq_cst)) |actual| {
-                    m = actual;
+                if (word.cmpxchgWeak(wd, wd & ~bit, .seq_cst, .seq_cst)) |actual| {
+                    wd = actual;
                     continue;
                 }
                 return @intCast(wi * 64 + bit_i);
             }
         }
         return null;
+    }
+
+    /// The rotating scan start over the whole bitmap (a worker index):
+    /// each call moves it one along, so consecutive picks walk the parked
+    /// set round-robin, and every word takes its turn as the first one.
+    fn nextStart(self: *IdleWorkers) usize {
+        return self.cursor.fetchAdd(1, .monotonic) % self.len;
+    }
+
+    /// The first set bit of `word` at or after `start`, wrapping — `word` must
+    /// be non-zero.
+    fn firstSetFrom(word: u64, start: u6) u6 {
+        const rotated = std.math.rotr(u64, word, start);
+        return @intCast((@as(u7, @ctz(rotated)) + start) % 64);
     }
 
     /// Targeted "is THIS worker parked?" peek — the producer side of the
@@ -285,9 +320,16 @@ pub const IdleWorkers = struct {
     /// prefer delivering work to an already-parked worker. The woken worker
     /// clears its own bit via `selfClear`, so no thief +1 is involved.
     pub fn anyOffset(self: *IdleWorkers) ?u8 {
-        for (&self.words, 0..) |*word, wi| {
-            const m = word.load(.seq_cst);
-            if (m != 0) return @intCast(wi * 64 + @ctz(m));
+        const start = self.nextStart();
+        const first_word = start / 64;
+        const start_bit: u6 = @intCast(start % 64);
+        for (0..idle_words) |k| {
+            const wi = (first_word + k) % idle_words;
+            const m = self.words[wi].load(.seq_cst);
+            if (m != 0) {
+                const from: u6 = if (k == 0) start_bit else 0;
+                return @intCast(wi * 64 + firstSetFrom(m, from));
+            }
         }
         return null;
     }

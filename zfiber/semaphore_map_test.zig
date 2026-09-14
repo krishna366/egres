@@ -5,8 +5,8 @@ const SemaphoreMap = fiber.SemaphoreMap;
 const gpa = std.testing.allocator;
 
 fn waiterCount(sm: *SemaphoreMap, key: u64) usize {
-    sm.mu.lock(@src());
-    defer sm.mu.unlock();
+    sm.sl.lock();
+    defer sm.sl.unlock();
     const e = sm.entries.get(key) orelse return 0;
     return e.waiters.items.len;
 }
@@ -260,5 +260,41 @@ test "SemaphoreMap: three-party cycle is detected" {
     sm.release(0xB, 2);
     try h1.join();
     sm.release(0xA, 1);
+    try std.testing.expectEqual(0, sm.entries.count());
+}
+
+test "BIG: SemaphoreMap: 64 owners cycling shared holds free drained entries" {
+    // Stress for the drain-and-recycle path under real concurrency: with
+    // more than `max_kept_capacity` holders at once, drained entries are
+    // freed rather than pooled. `tryRelease` once unlocked the entry's rw
+    // AFTER dropping `sl`, so a concurrent release could recycle (or
+    // free) the entry first and the late unlock landed on a reset lock
+    // or freed memory. That race showed under pgbench's I/O-bound load
+    // and NOT here — three runs of this test passed on the broken
+    // ordering — so this is a stress exercise of the path, not the
+    // tripwire; the rw's underflow assert in a ReleaseSafe server is.
+    // Opt-in (`--bigtest`): a few seconds in Debug.
+    var sm = try SemaphoreMap.init(gpa);
+    defer sm.deinit();
+
+    const owners = 64;
+    const rounds = 10_000;
+    const Body = struct {
+        fn run(map: *SemaphoreMap, owner: u64) void {
+            var i: usize = 0;
+            while (i < rounds) : (i += 1) {
+                _ = map.acquire(1, owner, .shared) catch unreachable;
+                _ = map.acquire(2, owner, .shared) catch unreachable;
+                if (i % 7 == 0) fiber.yield();
+                map.release(2, owner);
+                map.release(1, owner);
+            }
+        }
+    };
+    var handles: [owners]fiber.JoinHandle(void) = undefined;
+    for (&handles, 0..) |*h, i| {
+        h.* = try fiber.spawn(.{}, Body.run, .{ &sm, @as(u64, i + 1) });
+    }
+    for (&handles) |*h| h.join();
     try std.testing.expectEqual(0, sm.entries.count());
 }

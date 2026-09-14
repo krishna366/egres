@@ -157,6 +157,7 @@ const String = utils.String;
 //   --bigtest           Include `BIG: ...` prefixed tests.
 //   --only-bench        Run only `BENCH: ...` tests (used by `zig build bench`).
 //   --parallel <N>      Concurrent test fibers. 0 (default) = max(2, cpu_count/2).
+//   --workers           Print the runtime's per-worker CPU / wake-path dump after the summary.
 
 /// Override the Io instance that `std.debug` (including `defaultPanic`)
 /// uses. The default — `Io.Threaded.global_single_threaded` — is
@@ -241,6 +242,11 @@ const Args = struct {
     /// use-after-free / overflow into runtime memory faults AT the write (the
     /// work-stealing wild-write hunt). Slow; off by default.
     guard: bool = false,
+    /// Print `fiber.dumpWorkerCpu` (per-worker CPU time, ring capacities,
+    /// wake-path counters) after the summary — the same dump the server's
+    /// admin `workers` command writes. Off by default; it is noise unless
+    /// the scheduler itself is what's being looked at.
+    workers: bool = false,
 };
 
 const Counters = struct {
@@ -358,6 +364,7 @@ const help_text =
     \\                      gets killed at --wd-kill-s.
     \\  --parallel <N>      Concurrent test fibers. 0 (default) = max(2, cpu_count/2).
     \\  --verbose           Print "STARTING <name>" before each test (debug wedges).
+    \\  --workers           Print the per-worker CPU / wake-path dump after the summary.
     \\  --wd-stuck-tick-s <N> Watchdog: dump threshold AND tick interval, seconds (default 20).
     \\  --wd-kill-s <N>     Abort process after N seconds of no progress (default 300; 0 disables).
     \\  --help, -h          Show this help and exit.
@@ -398,6 +405,8 @@ fn parseArgs(alloc: std.mem.Allocator) !Args {
             i += 1;
         } else if (std.mem.eql(u8, a, "--guard")) {
             args.guard = true;
+        } else if (std.mem.eql(u8, a, "--workers")) {
+            args.workers = true;
         } else if (std.mem.eql(u8, a, "--verbose")) {
             verbose_start = true;
         } else if (std.mem.eql(u8, a, "--wd-stuck-tick-s") and i + 1 < argv.len) {
@@ -1213,7 +1222,13 @@ pub fn main(init: std.process.Init) !void {
         .{},
     );
     var fiber_rt: fiber.Runtime = undefined;
-    try fiber_rt.init(rt_alloc, .{ .num_workers = fiber_workers, .raft_workers = 0 });
+    // Not pinned: the test box runs other pinned processes too, and a
+    // timing test must not be hostage to whoever shares its core.
+    try fiber_rt.init(rt_alloc, .{
+        .num_workers = fiber_workers,
+        .raft_workers = 0,
+        .pin_workers = false,
+    });
     defer fiber_rt.deinit();
 
     var counters: Counters = .{};
@@ -1275,10 +1290,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const total_s = @as(f64, @floatFromInt(total_ms)) / 1000.0;
     writeColored(out, tty, .dim, " in {d:.1}s (parallel={d})\n", .{ total_s, args.parallel });
-
-    // Per-worker CPU distribution — eyeball how evenly the scheduler spread
-    // test fibers across the worker pool.
-    fiber.dumpWorkerCpu(out) catch {};
+    if (args.workers) fiber.dumpWorkerCpu(out) catch {};
 
     // Tracked-lock leak check. In this binary every `.tracked` lock is
     // transient and must `deinit()` (which unregisters it). By here every test

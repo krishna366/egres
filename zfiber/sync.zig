@@ -106,6 +106,13 @@ pub fn Mutex(comptime track: Track) type {
         /// `unlock` (which writes the next grant) can only run after the
         /// grantee cleared this one.
         granted_to: ?*Fiber = null,
+        /// Contention gauges for the `locks` dump: `contended` counts
+        /// acquires that missed the fast CAS, `handoffs` the unlocks that
+        /// passed the lock to a parked waiter (each one is a cross-worker
+        /// wake, and the lock stays held until that waiter runs). Slow
+        /// paths only, so the uncontended cost is nil.
+        contended: std.atomic.Value(u64) = .init(0),
+        handoffs: std.atomic.Value(u64) = .init(0),
         /// Holder breadcrumb (acquire `@src` + timestamp + registry link), only
         /// when `.tracked`; `void` otherwise. Holder/waiter counts are derived
         /// from `state`/`waiters` at dump time, never stored here.
@@ -116,7 +123,12 @@ pub fn Mutex(comptime track: Track) type {
         /// (racy reads — the system is wedged when we look).
         fn snapshot(ptr: *anyopaque) _reg.Snap {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            return .{ .held = self.state.load(.monotonic), .has_waiters = self.waiters.head != null };
+            return .{
+                .held = self.state.load(.monotonic),
+                .has_waiters = self.waiters.head != null,
+                .contended = self.contended.load(.monotonic),
+                .handoffs = self.handoffs.load(.monotonic),
+            };
         }
         inline fn record(self: *Self, comptime src: std.builtin.SourceLocation) void {
             // Comptime-elided when untracked — no cost, no `reg_node` access.
@@ -145,6 +157,7 @@ pub fn Mutex(comptime track: Track) type {
             // spinlock. The re-check under sl closes the lost-wakeup
             // race — if `unlock` ran between our fast-CAS-fail and
             // sl.lock, we'll see state==0 here and grab it directly.
+            _ = self.contended.fetchAdd(1, .monotonic);
             self.sl.lock();
             if (self.tryAcquire()) {
                 self.sl.unlock();
@@ -178,6 +191,7 @@ pub fn Mutex(comptime track: Track) type {
                 // that popped the waiter, BEFORE the wake — the waiter's
                 // resume-side check can never miss it.
                 self.granted_to = waiter;
+                _ = self.handoffs.fetchAdd(1, .monotonic);
             }
             self.sl.unlock();
 

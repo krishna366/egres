@@ -10,13 +10,13 @@
 //! of them may release.
 //!
 //! There are NO timeouts. Every wait-for cycle has a last edge, and the
-//! requester inserting it runs a DFS over the graph under `mu` BEFORE
+//! requester inserting it runs a DFS over the graph under `sl` BEFORE
 //! parking — so deadlocks are refused at the door (victim = the
 //! edge-closer), no cycle can ever form among parked fibers, and no
 //! parked fiber ever needs interrupting.
 //!
 //! This file never touches fibers, parks, or deadlines: blocking is the
-//! entry RWMutex's job. `mu` guards the entry table and the wait-for
+//! entry RWMutex's job. `sl` guards the entry table and the wait-for
 //! graph (holders + registration-ordered waiters + `waiting`), which
 //! mirror the RWMutex state for detection but never replace it.
 //!
@@ -29,10 +29,17 @@
 
 const std = @import("std");
 const _sync = @import("sync.zig");
+const _spinlock = @import("spinlock.zig");
 
 pub const SemaphoreMap = struct {
     allocator: std.mem.Allocator,
-    mu: _sync.Mutex(.tracked) = .{},
+    /// A spinlock, not a parking mutex: every critical section under it
+    /// is a hash probe, a short list edit or the deadlock DFS — pure CPU,
+    /// never a park — and it is taken 4 times per SQL statement by every
+    /// connection. As a hand-off mutex it ran at 330k hand-offs/s under
+    /// pgbench, each one parking the waiter and waking it on another
+    /// worker while the map stayed locked.
+    sl: _spinlock.Spinlock = .{},
     /// Held-or-contended keys only; an entry is created on first
     /// acquire and recycled by whichever release/abort leaves it with
     /// no holders and no waiters.
@@ -47,7 +54,7 @@ pub const SemaphoreMap = struct {
     /// entries are freed instead of held forever.
     pool: std.ArrayList(*Entry) = .empty,
     /// wouldDeadlock's walker, reused across runs. Only touched under
-    /// `mu`, which serializes detection.
+    /// `sl`, which serializes detection.
     dfs: Dfs,
 
     const max_pooled = 128;
@@ -148,7 +155,6 @@ pub const SemaphoreMap = struct {
         self.pool.deinit(self.allocator);
         self.dfs.deinit();
         self.waiting.deinit(self.allocator);
-        self.mu.deinit();
     }
 
     fn destroyEntry(self: *SemaphoreMap, e: *Entry) void {
@@ -173,9 +179,9 @@ pub const SemaphoreMap = struct {
     ) error{ Deadlock, Upgrade, OutOfMemory }!bool {
         const owner_mode = OwnerMode{ .owner_id = owner_id, .mode = mode };
 
-        self.mu.lock(@src());
+        self.sl.lock();
         const e = self.entryFor(key) catch {
-            self.mu.unlock();
+            self.sl.unlock();
             return error.OutOfMemory;
         };
 
@@ -184,29 +190,29 @@ pub const SemaphoreMap = struct {
             if (hold.mode == .exclusive or mode == .shared) {
                 // If we're already holding an exclusive lock, OR we just want a
                 // shared lock, we're good.
-                self.mu.unlock();
+                self.sl.unlock();
                 return false;
             }
             // Shared→exclusive upgrade in place would have to wait for
             // the owner's own shared hold to drain — a self-deadlock,
             // and two owners upgrading in lockstep deadlock classically.
             // This map does not support it; hand the decision up.
-            self.mu.unlock();
+            self.sl.unlock();
             return error.Upgrade;
         }
 
         // Fast path: uncontended. The probes only take rw's spinlock —
-        // safe under `mu` — and tryLockShared already defers to a
+        // safe under `sl` — and tryLockShared already defers to a
         // pending writer, so preference is preserved.
         if (e.tryLock(mode)) {
             e.holders.append(self.allocator, owner_mode) catch {
                 // Roll the probe back; hand-off (if anyone was parked)
                 // and reclamation behave as a normal release would.
                 self.rollbackHold(key, e, mode);
-                self.mu.unlock();
+                self.sl.unlock();
                 return error.OutOfMemory;
             };
-            self.mu.unlock();
+            self.sl.unlock();
             return true;
         }
 
@@ -214,7 +220,7 @@ pub const SemaphoreMap = struct {
         // edge must be visible before we park so any later requester's
         // DFS can see it — that ordering is the completeness argument.
         e.waiters.append(self.allocator, owner_mode) catch {
-            self.mu.unlock();
+            self.sl.unlock();
             return error.OutOfMemory;
         };
         // An owner can only be waiting on exactly one key at any time.
@@ -223,21 +229,21 @@ pub const SemaphoreMap = struct {
             .mode = mode,
         }) catch {
             _ = removeOwner(&e.waiters, owner_id);
-            self.mu.unlock();
+            self.sl.unlock();
             return error.OutOfMemory;
         };
 
         const cyclic = self.wouldDeadlock(owner_id, e, mode) catch {
             self.deregisterWaiter(e, owner_id);
-            self.mu.unlock();
+            self.sl.unlock();
             return error.OutOfMemory;
         };
         if (cyclic) {
             self.deregisterWaiter(e, owner_id);
-            self.mu.unlock();
+            self.sl.unlock();
             return error.Deadlock;
         }
-        self.mu.unlock();
+        self.sl.unlock();
 
         e.lock(mode); // Block here waiting for lock.
 
@@ -245,21 +251,21 @@ pub const SemaphoreMap = struct {
         // in `waiters`, which is what keeps the entry alive across the
         // wake (release only frees an entry with no holders AND no
         // waiters).
-        self.mu.lock(@src());
+        self.sl.lock();
         self.deregisterWaiter(e, owner_id);
         e.holders.append(self.allocator, owner_mode) catch {
             self.rollbackHold(key, e, mode);
-            self.mu.unlock();
+            self.sl.unlock();
             return error.OutOfMemory;
         };
-        self.mu.unlock();
+        self.sl.unlock();
         return true;
     }
 
     /// Undo a granted-but-unrecorded rw hold (OOM recording it): unlock
-    /// the rw — waking any parked contender; they re-take `mu`, which we
+    /// the rw — waking any parked contender; they re-take `sl`, which we
     /// hold, so they simply queue behind us — and reclaim the entry if
-    /// that left it unused. Caller holds `mu`.
+    /// that left it unused. Caller holds `sl`.
     fn rollbackHold(
         self: *SemaphoreMap,
         key: u64,
@@ -290,34 +296,41 @@ pub const SemaphoreMap = struct {
     /// DDL barrier retaken for the finish, and by its failure path),
     /// where the map is the one place that knows the current state.
     pub fn tryRelease(self: *SemaphoreMap, key: u64, owner_id: u64) bool {
-        self.mu.lock(@src());
+        self.sl.lock();
         const kv = self.entries.getEntry(key) orelse {
-            self.mu.unlock();
+            self.sl.unlock();
             return false;
         };
         const e = kv.value_ptr.*;
         const mode = removeOwner(&e.holders, owner_id) orelse {
-            self.mu.unlock();
+            self.sl.unlock();
             return false;
         };
         if (e.holders.items.len == 0 and e.waiters.items.len == 0) {
-            // We hold `mu` and just proved the entry drained, so drop it
+            // We hold `sl` and just proved the entry drained, so drop it
             // straight from the map — no need for reclaimLocked's
             // defensive re-lookup (that guards the error paths, which
             // don't keep a `key_ptr`). The still-locked rw needs no
             // unlock before recycling — `recycle` resets it.
             self.entries.removeByPtr(kv.key_ptr);
             self.recycle(e);
-            self.mu.unlock();
+            self.sl.unlock();
             return true;
         }
-        self.mu.unlock();
+        // Unlock the rw while still holding `sl`. Once `sl` is dropped a
+        // concurrent release can drain and recycle `e` — reset its rw, or
+        // free it outright when a contention spike grew its lists — and
+        // an rw unlock after that lands on a reset lock or freed memory
+        // (the first word of a freed Entry is its rw: a cross-thread
+        // double free under a 64-client pgbench). The wake this may
+        // issue costs a peer at most a short spin.
         e.unlock(mode);
+        self.sl.unlock();
         return true;
     }
 
     /// The entry for `key`, pulled from the pool (or created) on first
-    /// use. Caller holds `mu`.
+    /// use. Caller holds `sl`.
     fn entryFor(self: *SemaphoreMap, key: u64) !*Entry {
         const gop = try self.entries.getOrPut(self.allocator, key);
         if (gop.found_existing) return gop.value_ptr.*;
@@ -335,7 +348,7 @@ pub const SemaphoreMap = struct {
         return e;
     }
 
-    /// Drop an entry with no holders and no waiters. Caller holds `mu`.
+    /// Drop an entry with no holders and no waiters. Caller holds `sl`.
     /// Looks the entry up by key and compares pointers BEFORE any
     /// deref: callers on error paths may hold an `e` that a concurrent
     /// release already recycled (and the key may even map to a fresh
@@ -354,7 +367,7 @@ pub const SemaphoreMap = struct {
     /// the pool is full or a contention spike ballooned its lists.
     /// The rw may still be locked (release skips the unlock on the
     /// reclaim path); nothing references it anymore, so a plain reset
-    /// is sound. Caller holds `mu`.
+    /// is sound. Caller holds `sl`.
     fn recycle(self: *SemaphoreMap, e: *Entry) void {
         if (self.pool.items.len >= max_pooled or
             e.holders.capacity > max_kept_capacity or
@@ -370,7 +383,7 @@ pub const SemaphoreMap = struct {
 
     /// Pull `owner_id`'s published wait edge: its slot in the entry's
     /// waiter list and its entry in the `waiting` graph. Caller holds
-    /// `mu`.
+    /// `sl`.
     fn deregisterWaiter(self: *SemaphoreMap, e: *Entry, owner_id: u64) void {
         _ = removeOwner(&e.waiters, owner_id);
         _ = self.waiting.remove(owner_id);
@@ -390,7 +403,7 @@ pub const SemaphoreMap = struct {
     /// through `start` itself? Walks the wait-for graph from start's
     /// own blockers outward (iteratively — fiber stacks are small): if
     /// following "waits for" edges leads back to `start`, granting the
-    /// wait would deadlock. Runs under `mu`. A cycle NOT through
+    /// wait would deadlock. Runs under `sl`. A cycle NOT through
     /// `start` is impossible here — its own closing edge was refused
     /// when it was requested.
     fn wouldDeadlock(

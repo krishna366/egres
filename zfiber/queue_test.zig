@@ -124,3 +124,50 @@ test "LocalQueue: concurrent push(grow) + steal lose nothing, duplicate nothing"
     // catches any loss.)
     for (seen) |*s| try std.testing.expectEqual(@as(u8, 1), s.load(.monotonic));
 }
+
+test "IdleWorkers: the pick rotates across words, not just within one" {
+    // Workers 5 (word 0) and 70 (word 1) parked. The cursor's own word
+    // is scanned first (wrapping within it), then the words after it:
+    // a cursor in word 1 picks 70 before 5, a cursor in word 0 picks 5
+    // before 70. Each claim clears the bit it returns. A 128-worker lane,
+    // so the cursor can point into word 1.
+    var iw = fiber.IdleWorkers{ .len = 128 };
+    iw.markIdle(5);
+    iw.markIdle(70);
+    iw.cursor.store(71, .monotonic);
+    try std.testing.expectEqual(@as(?u8, 70), iw.anyOffset());
+    try std.testing.expectEqual(@as(?u8, 70), iw.claim());
+    try std.testing.expectEqual(@as(?u8, 5), iw.claim());
+    try std.testing.expectEqual(@as(?u8, null), iw.claim());
+
+    iw.markIdle(5);
+    iw.markIdle(70);
+    iw.cursor.store(10, .monotonic);
+    try std.testing.expectEqual(@as(?u8, 5), iw.claim());
+    try std.testing.expectEqual(@as(?u8, 70), iw.claim());
+}
+
+test "IdleWorkers: claims spread over a 32-worker lane instead of piling on the lowest id" {
+    // All 32 workers of a lane are parked the whole time (the bit is
+    // re-set after every claim). A fair pick spreads the claims; a pick
+    // that walks from bit 0 hands nearly every claim to worker 0, which
+    // is what a per-worker wake-path dump shows as W00–W03 doing all the
+    // stealing while W12+ sit parked.
+    const lane_len: u8 = 32;
+    var idle: fiber.IdleWorkers = .{ .len = lane_len };
+    var picks: [lane_len]u32 = @splat(0);
+    for (0..lane_len) |i| idle.markIdle(@intCast(i));
+    const rounds: u32 = 100 * @as(u32, lane_len);
+    for (0..rounds) |_| {
+        const off = idle.claim().?;
+        picks[off] += 1;
+        idle.markIdle(off);
+    }
+    var max_share: u32 = 0;
+    for (picks) |n| max_share = @max(max_share, n);
+    // Fair is 100 each; allow slack for the wrap of a rotating cursor.
+    std.debug.print("idle pick histogram over {d} claims: W00={d} W01={d} W31={d} max={d}\n", .{
+        rounds, picks[0], picks[1], picks[31], max_share,
+    });
+    try std.testing.expect(max_share <= 2 * rounds / lane_len);
+}

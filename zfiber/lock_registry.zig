@@ -29,6 +29,10 @@ const SourceLocation = std.builtin.SourceLocation;
 pub const Snap = struct {
     held: u32,
     has_waiters: bool,
+    /// Lifetime contention gauges (see sync.Mutex); 0 for lock types
+    /// that don't keep them.
+    contended: u64 = 0,
+    handoffs: u64 = 0,
 };
 
 /// Embedded in a *tracked* lock (`void`, zero-width, when untracked). Carries
@@ -149,6 +153,19 @@ pub fn dumpLocks(w: *std.Io.Writer) !void {
     while (node) |n| : (node = n.next) {
         total += 1;
         const snap = n.snapshot(n.owner);
+        // Lifetime gauges for every lock that ever contended, named by
+        // its last holder site — the rate between two dumps is what a
+        // hot lock looks like.
+        if (snap.contended > 0) {
+            if (n.holder_src) |sl| {
+                try w.print("lock {s}:{d}", .{ sl.file, sl.line });
+            } else {
+                try w.writeAll("lock -");
+            }
+            try w.print(" contended={d} handoffs={d}\n", .{
+                snap.contended, snap.handoffs,
+            });
+        }
         if (snap.held == 0) continue;
         held += 1;
         const held_for: i64 = if (n.held_since_ms == 0) 0 else now - n.held_since_ms;

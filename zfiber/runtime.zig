@@ -145,6 +145,13 @@ pub const Worker = struct {
     is_thief: bool = false,
     /// xorshift64 state for steal-victim randomization; seeded in `run`.
     rng_state: u64 = 1,
+    /// TSC reading when this worker last finished a fiber step; the
+    /// pre-park poll runs only within a millisecond of it.
+    last_work_ticks: u64 = 0,
+    /// Wake-path counters, worker-private (only this worker writes them;
+    /// `dumpWorkerCpu` reads them racily). Together they say whether an
+    /// idle peer is actually told about work — see `WakeStats`.
+    wake_stats: WakeStats = .{},
     /// Two ready rings, one per `Priority`, allocated in `Worker.init`.
     /// Spinlock-guarded (`LocalQueue(.withlock)`) so a same-lane peer can
     /// steal from the `ready[normal]` ring (see `trySteal`). The owner's own
@@ -222,7 +229,8 @@ pub const Worker = struct {
         if (f.priority == .normal and rt.steal_enabled and !self.is_thief and
             self.ready[@intFromEnum(Priority.normal)].len() >= 2)
         {
-            rt.notifyIdlePeer(self.lane_idx);
+            self.wake_stats.notify_tries += 1;
+            rt.notifyIdlePeer(self);
         }
     }
 
@@ -305,6 +313,7 @@ pub const Worker = struct {
     fn trySteal(self: *Worker) bool {
         const rt = runtime();
         if (!rt.steal_enabled) return false; // stealing off (InitOptions.steal)
+        self.wake_stats.steal_scans += 1;
 
         const range = rt.lane_ranges[self.lane_idx];
         if (range.len <= 1) return false; // lane has no peers to steal from
@@ -321,8 +330,12 @@ pub const Worker = struct {
 
             // Lock-free pre-check: only a victim with a surplus over us is
             // worth locking (this is `stealInto`'s `size <= dest_sz` guard,
-            // peeked without the lock so we skip empties for free).
-            if (vq.len() <= sq.len()) continue;
+            // peeked without the lock so we skip empties for free). A lone
+            // ready fiber stays put: its owner is one step away from it,
+            // and moving it moves its next I/O completion too — that
+            // ping-pong ran at ~3 migrations per statement under pgbench.
+            const vlen = vq.len();
+            if ((!rt.steal_lone and vlen < 2) or vlen <= sq.len()) continue;
 
             var scratch: [steal_chunk]*Fiber = undefined;
             var moved = false;
@@ -331,6 +344,7 @@ pub const Worker = struct {
             while (true) {
                 const n = vq.stealInto(sq.len(), scratch[0..]);
                 if (n == 0) break; // balanced with the victim, or it drained
+                self.wake_stats.stolen += n;
 
                 for (scratch[0..n]) |f| {
                     if (comptime _fb.guard_level >= 1) {
@@ -345,7 +359,10 @@ pub const Worker = struct {
                 }
                 moved = true;
             }
-            if (moved) return true;
+            if (moved) {
+                self.wake_stats.steal_hits += 1;
+                return true;
+            }
         }
         return false;
     }
@@ -394,18 +411,40 @@ pub const Worker = struct {
     /// thief, hand the hunt to a parked peer: what we found may not be all
     /// the work, and with `num_thieves` back at zero, producers would
     /// otherwise be the only ones able to restart the hunt.
-    fn exitThiefAndNotify(self: *Worker, rt: *Runtime, do_notify: bool) void {
+    fn exitThiefAndNotify(self: *Worker, rt: *Runtime, do_notify: bool) bool {
         // No-op unless we hold a +1: the park path calls this
         // unconditionally, and a worker that was DENIED thieving (cap /
         // steal off / single-worker lane) parks with is_thief == false —
         // an unguarded fetchSub would wrap num_thieves to maxInt and
         // permanently suppress every producer wake in the lane.
-        if (!self.is_thief) return;
+        if (!self.is_thief) return false;
         self.is_thief = false;
         if (rt.num_thieves[self.lane_idx].v.fetchSub(1, .seq_cst) == 1) {
-            if (do_notify) {
-                rt.notifyIdlePeer(self.lane_idx);
+            if (do_notify) rt.notifyIdlePeer(self);
+            return true;
+        }
+        return false;
+    }
+
+    /// Poll instead of blocking, for up to `prepark_poll_ns`: submit what
+    /// the fibers queued (their sends), then watch the completion ring —
+    /// which also carries a peer's eventfd wake — and our own rings. We
+    /// are marked idle throughout, so a producer may claim our bit
+    /// meanwhile; that ends the poll too, since the claim comes with a
+    /// thief +1 we must go and honour. true = something to do.
+    fn pollBeforePark(self: *Worker, rt: *Runtime) bool {
+        const start = readTicks();
+        self.loop.run(.no_wait) catch {};
+        while (true) {
+            if (self.hasReady()) return true;
+            if (!rt.idle[self.lane_idx].isIdle(self.laneOffset())) return true;
+            if (completionsReady(&self.loop) > 0) {
+                self.loop.run(.no_wait) catch {};
+                continue;
             }
+            const spent = cyclesToNs(readTicks() -% start);
+            if (spent >= rt.prepark_poll_ns) return false;
+            std.atomic.spinLoopHint();
         }
     }
 
@@ -416,8 +455,72 @@ pub const Worker = struct {
     /// the dispatch / park paths balance it. A spurious wake (own timer,
     /// I/O completion, stop) finds the bit still set and just clears it.
     fn unpark(self: *Worker, rt: *Runtime) void {
-        if (!rt.idle[self.lane_idx].selfClear(self.laneOffset()))
+        if (!rt.idle[self.lane_idx].selfClear(self.laneOffset())) {
             self.is_thief = true;
+            self.wake_stats.thief_wakes += 1;
+        }
+    }
+
+    /// Pin this worker's OS thread to one CPU: the `id`-th CPU of the
+    /// process's allowed set (`sched_getaffinity`), wrapping past the
+    /// end when there are more workers than CPUs. A pinned worker never
+    /// migrates, so its rings, io_uring and TSC reads stay on one core
+    /// and "an idle worker" means "an idle core". Linux only; a failure
+    /// is logged and ignored — pinning is a performance property, not a
+    /// correctness one.
+    // TODO: evaluate placing the raft lane's workers (the main loop and
+    // the apply loop) on the two threads of one physical core (CPU i and
+    // its SMT sibling, 0 and 16 on the bench box). They are light, hand
+    // each other data every batch, and would share L1/L2; the freed
+    // cores would go to SQL workers. Needs a worker-to-CPU map that is
+    // set before the workers start (setting it later races their first
+    // pin), and an A/B on tpcb and select-only.
+    fn pinToCpu(self: *Worker) void {
+        if (builtin.os.tag != .linux) return;
+        const linux = std.os.linux;
+        var allowed: linux.cpu_set_t = @splat(0);
+        const size = @sizeOf(linux.cpu_set_t);
+        const rc = linux.sched_getaffinity(0, size, &allowed);
+        if (@as(isize, @bitCast(rc)) < 0) {
+            std.log.warn("W{d}: sched_getaffinity failed", .{self.id});
+            return;
+        }
+        var count: usize = 0;
+        for (allowed) |word| count += @popCount(word);
+        if (count == 0) return;
+        // More workers than allowed CPUs: pinning would stack them on
+        // shared CPUs and take the kernel's balancing away. Leave every
+        // worker free instead.
+        const total = runtime().workers.len;
+        if (total > count) {
+            if (self.id == 0) std.log.warn(
+                "{d} workers on {d} allowed CPUs: workers left unpinned",
+                .{ total, count },
+            );
+            return;
+        }
+        // The id-th set bit of the mask is our CPU.
+        var nth = @as(usize, self.id) % count;
+        var cpu: usize = 0;
+        outer: for (allowed, 0..) |word, wi| {
+            var bits = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                if (nth == 0) {
+                    cpu = wi * @bitSizeOf(usize) + @ctz(bits);
+                    break :outer;
+                }
+                nth -= 1;
+            }
+        }
+        var set: linux.cpu_set_t = @splat(0);
+        const word_bits = @bitSizeOf(usize);
+        const shift: std.math.Log2Int(usize) = @intCast(cpu % word_bits);
+        set[cpu / word_bits] |= @as(usize, 1) << shift;
+        linux.sched_setaffinity(0, &set) catch |err| {
+            std.log.warn("W{d}: pin to cpu {d} failed: {s}", .{
+                self.id, cpu, @errorName(err),
+            });
+        };
     }
 
     /// Cross-thread wake: issue the `wake_async` notify (an eventfd write —
@@ -517,6 +620,8 @@ pub const Worker = struct {
         current_do_not_use_directly = self;
         defer current_do_not_use_directly = prev;
 
+        if (runtime().pin_workers) self.pinToCpu();
+
         // Seed this worker thread's TSC conversion factor from the
         // global once (set during Runtime.init by calibrateTsc).
         // After this, `cyclesToNs` reads `tsc_factor_tls` without an
@@ -581,10 +686,11 @@ pub const Worker = struct {
             if (self.nextFiber()) |f| {
                 // A thief that found work stops thieving; the last one
                 // out hands the hunt to a parked peer (wake chain).
-                if (self.is_thief) self.exitThiefAndNotify(rt, true);
+                if (self.is_thief) _ = self.exitThiefAndNotify(rt, true);
 
                 const finished = self.runFiber(f);
                 const exit = readTicks();
+                self.last_work_ticks = exit;
                 // Skip the reading if the counter went backwards (thread
                 // migrated mid-step to a CPU with a slightly behind TSC).
                 const cycNs = cyclesToNs(exit -| enter);
@@ -645,7 +751,7 @@ pub const Worker = struct {
             //    markIdle BEFORE the final recheck, because producers publish
             //    work and THEN consult num_thieves / the idle bitmap; doing
             //    it after guarantees the two sides can't both miss (Dekker).
-            self.exitThiefAndNotify(rt, false);
+            const last_thief = self.exitThiefAndNotify(rt, false);
             self.markIdle();
 
             // The recheck has TWO halves,
@@ -658,15 +764,33 @@ pub const Worker = struct {
             //     → the work sits in THAT PEER's ring, un-notified; only
             //     `trySteal` can reach it, and only now that we've left the
             //     thieving state. So this trySteal isn't "thieving again"
-            //     — it's the peer-ring half of the lost-wakeup recheck.
-            if (self.hasReady() or self.trySteal()) {
+            //     — it's the peer-ring half of the lost-wakeup recheck. It
+            //     is only ours to do when we were the LAST thief out: with
+            //     another thief still hunting, a push suppressed on our
+            //     account is that thief's to find (a thief that finds work
+            //     hands the hunt on, so the chain never drops it).
+            if (self.hasReady() or (last_thief and self.trySteal())) {
                 self.unpark(rt);
                 continue;
             }
 
-            // 4. Block until a libxev completion (timer / I/O / cross-
-            //    thread async wake, including stop's) fires, then leave the
-            //    parked state and re-find work on the next pass.
+            // 4. About to block. A worker that ran a fiber within the last
+            //    millisecond is mid-burst: its connections' next completions
+            //    are likely microseconds away, and a park plus the kernel
+            //    wake (and a C-state exit on a pinned core) costs more than
+            //    that. Poll the completion ring for a short while first.
+            const since_work = cyclesToNs(readTicks() -% self.last_work_ticks);
+            if (rt.prepark_poll_ns > 0 and since_work < std.time.ns_per_ms and
+                self.pollBeforePark(rt))
+            {
+                self.wake_stats.poll_hits += 1;
+                self.unpark(rt);
+                continue;
+            }
+            // Block until a libxev completion (timer / I/O / cross-thread
+            // async wake, including stop's) fires, then leave the parked
+            // state and re-find work on the next pass.
+            self.wake_stats.parks += 1;
             self.loop.run(.once) catch |err| {
                 std.debug.panic("xev.Loop.run failed: {}", .{err});
             };
@@ -686,6 +810,28 @@ fn wakeAsyncCallback(
     // re-check `stopping` on its next iteration.
     return .rearm;
 }
+
+/// Per-worker counters on the idle-peer wake path. `notify_tries` is
+/// how often a local push found the normal ring at 2+ (the trigger in
+/// `scheduleLocal`); `gated_thief` and `gated_noidle` are tries that
+/// went nowhere because a thief was already out or nobody was parked;
+/// `notify_sent` is an eventfd write to a parked peer. `thief_wakes` are
+/// wakes this worker got as the claimed thief, `steal_scans` its
+/// `trySteal` calls, `steal_hits` the ones that moved anything, `stolen`
+/// the fibers moved here, `parks` how often it blocked in the loop.
+pub const WakeStats = struct {
+    notify_tries: u64 = 0,
+    gated_thief: u64 = 0,
+    gated_noidle: u64 = 0,
+    notify_sent: u64 = 0,
+    thief_wakes: u64 = 0,
+    steal_scans: u64 = 0,
+    steal_hits: u64 = 0,
+    stolen: u64 = 0,
+    parks: u64 = 0,
+    /// Pre-park polls that found work, sparing a park + kernel wake.
+    poll_hits: u64 = 0,
+};
 
 pub const Stats = struct {
     total: usize,
@@ -723,6 +869,15 @@ pub const InitOptions = struct {
     /// was placed on (no migration) — used by the stress harness to A/B the
     /// stealing path. High-priority work is pinned regardless.
     steal: bool = true,
+
+    /// Pin each worker thread to one CPU (Linux only; a no-op elsewhere):
+    /// worker i takes the i-th CPU of the process's allowed set; with
+    /// more workers than CPUs nobody is pinned. See `Worker.pinToCpu`.
+    pin_workers: bool = true,
+
+    /// See `Runtime.steal_lone` / `Runtime.prepark_poll_ns`.
+    steal_lone: bool = false,
+    prepark_poll_ns: u64 = 20_000,
 };
 
 /// Resolve how many workers serve the `.raft` lane, as a fraction of the
@@ -773,6 +928,18 @@ pub const Runtime = struct {
 
     /// Work stealing on/off (`InitOptions.steal`). Read by `trySteal`.
     steal_enabled: bool = true,
+    /// Pin worker threads to CPUs (`InitOptions.pin_workers`); read once
+    /// by each worker at the top of `runMain`.
+    pin_workers: bool = true,
+
+    /// Tunables a host may set after `init` and before load (plain
+    /// fields; workers read them on every pass). `steal_lone`: a thief
+    /// may take a victim's only ready fiber (false: it waits for a ring
+    /// of 2+, see `trySteal`). `prepark_poll_ns`: how long a worker that
+    /// ran a fiber within the last millisecond polls its completion ring
+    /// before blocking; 0 = block at once (see `Worker.pollBeforePark`).
+    steal_lone: bool = false,
+    prepark_poll_ns: u64 = 20_000,
 
     /// Contiguous worker-id range each lane owns. A `len == 0` lane
     /// falls back to `.default` (see `effectiveLaneIdx`).
@@ -807,6 +974,9 @@ pub const Runtime = struct {
         self.fibers_sl = .{};
         self.stopping = .init(false);
         self.steal_enabled = opts.steal;
+        self.pin_workers = opts.pin_workers;
+        self.steal_lone = opts.steal_lone;
+        self.prepark_poll_ns = opts.prepark_poll_ns;
         self.idle = .{ .{}, .{} };
         self.num_thieves = @splat(.{});
 
@@ -818,6 +988,9 @@ pub const Runtime = struct {
             .{ .start = raft_count, .len = @intCast(n - raft_workers) }, // .default
             .{ .start = 0, .len = raft_count }, // .raft
         };
+        for (&self.idle, self.lane_ranges) |*idle, range| {
+            idle.len = @max(range.len, 1);
+        }
 
         self.workers = try allocator.alloc(Worker, n);
         errdefer allocator.free(self.workers);
@@ -920,10 +1093,17 @@ pub const Runtime = struct {
     /// registers the wakee as a thief FIRST and then CAS-claims one
     /// idle bit — a woken worker can thus never observe its claimed bit
     /// (`Worker.unpark`) without the matching +1 already in place.
-    fn notifyIdlePeer(self: *Runtime, lane_idx: u8) void {
+    fn notifyIdlePeer(self: *Runtime, w: *Worker) void {
+        const lane_idx = w.lane_idx;
         const n = &self.num_thieves[lane_idx].v;
-        if (n.load(.seq_cst) > 0) return; // a thief is already out
-        if (!self.idle[lane_idx].anySet()) return; // nobody parked to wake
+        if (n.load(.seq_cst) > 0) { // a thief is already out
+            w.wake_stats.gated_thief += 1;
+            return;
+        }
+        if (!self.idle[lane_idx].anySet()) { // nobody parked to wake
+            w.wake_stats.gated_noidle += 1;
+            return;
+        }
 
         if (n.fetchAdd(1, .seq_cst) != 0) {
             // Lost the 0→1 election to another producer (or a worker began
@@ -938,6 +1118,7 @@ pub const Runtime = struct {
             std.debug.assert(peer_id < self.workers.len);
             // Expensive call: 1us
             self.workers[peer_id].wake_async.notify() catch {};
+            w.wake_stats.notify_sent += 1;
         } else {
             // Everyone un-parked on its own between the peek and the
             // claim; the +1 has no owner — undo it.
@@ -969,7 +1150,15 @@ pub const Runtime = struct {
             const h = (@intFromPtr(f) *% 0x9E3779B97F4A7C15) >> 32;
             break :blk @intCast(h % range.len);
         };
-        const peer = &self.workers[@as(usize, range.start) + off];
+        self.injectTo(@as(usize, range.start) + off, f);
+    }
+
+    /// Push a normal-priority fiber straight into worker `idx`'s ring and
+    /// wake it if parked — the placement primitive behind `injectNormal`
+    /// and behind `routeReady`'s `placed` worker (a spawn that named a
+    /// normal-priority `worker_id`).
+    fn injectTo(self: *Runtime, idx: usize, f: *Fiber) void {
+        const peer = &self.workers[idx];
         peer.ready[@intFromEnum(Priority.normal)].push(f) catch
             @panic("out of memory injecting fiber into a worker ring");
         peer.notifyIfParked();
@@ -1019,11 +1208,13 @@ pub const Runtime = struct {
 ///   - High priority is pinned: it goes to its home worker's `ready[high]`
 ///     ring — via `scheduleLocal` when we're already on the home thread,
 ///     else a direct cross-thread ring push with an async notify.
-///   - Normal priority is lane-bound but worker-free: when we're running on a
-///     worker in the fiber's lane, push to that local ring (which grows on
-///     demand via `scheduleLocal`); otherwise `injectNormal` pushes straight
-///     into a lane worker's ring and pokes it if parked.
-fn routeReady(rt: *Runtime, f: *Fiber) void {
+///   - Normal priority is lane-bound but worker-free. A spawn that named a
+///     `worker_id` passes it as `placed` and the fiber goes into that ring
+///     (`injectTo`) for this one push only. Otherwise, when we're running
+///     on a worker in the fiber's lane, push to that local ring (which
+///     grows on demand via `scheduleLocal`); else `injectNormal` pushes
+///     straight into a lane worker's ring and pokes it if parked.
+fn routeReady(rt: *Runtime, f: *Fiber, placed: ?usize) void {
     switch (f.priority) {
         .high => {
             const home = &rt.workers[f.home_worker_id];
@@ -1040,6 +1231,7 @@ fn routeReady(rt: *Runtime, f: *Fiber) void {
             }
         },
         .normal => {
+            if (placed) |idx| return rt.injectTo(idx, f);
             const lane_idx = rt.effectiveLaneIdx(f.lane);
             if (currentWorkerOrNull()) |w| {
                 if (w.lane_idx == lane_idx) {
@@ -1070,26 +1262,31 @@ fn spawnInner(
     comptime detached: bool,
 ) !*Fiber {
     const rt = runtime();
-    switch (opts.priority) {
-        .high => std.debug.assert(opts.worker_id != null),
-        .normal => std.debug.assert(opts.worker_id == null),
-    }
+    if (opts.priority == .high) std.debug.assert(opts.worker_id != null);
 
     const f = try Fiber.init(rt.allocator, opts, func, args);
     errdefer f.deinit(rt.allocator);
 
-    // `f.lane` is set from `opts` in `Fiber.init`. For high priority,
-    // resolve the lane-relative `worker_id` to an absolute home worker.
-    if (opts.priority == .high) {
+    // `f.lane` is set from `opts` in `Fiber.init`. Resolve the
+    // lane-relative `worker_id` to an absolute worker. High priority:
+    // the fiber's permanent home, kept on the fiber for `routeReady`.
+    // Normal priority: only the ring it is placed in, so it is not kept —
+    // after this one push the fiber is woken and stolen like any other.
+    var placed: ?usize = null;
+    if (opts.worker_id) |wid| {
         const range = rt.lane_ranges[rt.effectiveLaneIdx(f.lane)];
-        f.home_worker_id = range.start + (opts.worker_id.? % range.len);
+        const idx = range.start + (wid % range.len);
+        switch (opts.priority) {
+            .high => f.home_worker_id = idx,
+            .normal => placed = idx,
+        }
     }
 
     if (detached) f.detached = true;
 
     try rt.appendFiber(f);
     f.state.store(@bitCast(State{ .tag = .ready, .awaken = false }), .release);
-    routeReady(rt, f);
+    routeReady(rt, f, placed);
     return f;
 }
 
@@ -1105,8 +1302,10 @@ fn spawnInner(
 ///     *lane-relative*: the absolute home worker is
 ///     `lane.start + worker_id % lane.len` — e.g. worker_id 3 in a
 ///     2-worker raft lane resolves to lane offset 1.
-///   - Normal priority migrates freely within its lane and must NOT name
-///     a `worker_id`.
+///   - Normal priority migrates freely within its lane. It MAY name a
+///     `worker_id` (same lane-relative addressing) as the worker it is
+///     placed on — a listener dealing connections round-robin — and is
+///     woken and stolen like any other normal fiber after that.
 /// `lane` selects the worker range (default `.default`, the fallback when
 /// the requested lane has no workers).
 pub fn spawn(
@@ -1207,7 +1406,7 @@ pub fn wake(f: *Fiber) void {
         }
     }
 
-    routeReady(runtime(), f);
+    routeReady(runtime(), f, null);
 }
 
 /// Request runtime shutdown from anywhere — typically a fiber that has
@@ -1258,8 +1457,8 @@ pub fn currentFiberOrNull() ?*Fiber {
 /// gauge — the deepest the ring was ever driven lies in `[cap/2, cap)`. A
 /// `nmCap` above the initial size means the normal ring absorbed a burst; the
 /// high ring should stay at the initial size (≈1 pinned loop per home worker).
-/// Plain text — safe to drop into logs, an admin dump, or the test-runner
-/// summary. All counters are read racily; fine for a coarse gauge.
+/// Plain text — safe to drop into logs or an admin dump. All counters are
+/// read racily; fine for a coarse gauge.
 pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
     const workers = runtime().workers;
     const hi = @intFromEnum(Priority.high);
@@ -1281,7 +1480,7 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
         var bar: [24]u8 = undefined;
         const bar_w: usize = if (max_ns == 0) 0 else @intCast((w.cpu_total_ns *| 24) / max_ns);
         @memset(bar[0..bar_w], '#');
-        try writer.print("  W{d:>2} lane={d} {d:>6} ms  hiCap={d:>4} nmCap={d:>5}  {s}\n", .{
+        try writer.print("  W{d:0>2} lane={d} {d:>6} ms  hiCap={d:>4} nmCap={d:>5}  {s}\n", .{
             w.id,                   w.lane_idx,             @divTrunc(w.cpu_total_ns, std.time.ns_per_ms),
             w.ready[hi].capacity(), w.ready[nm].capacity(), bar[0..bar_w],
         });
@@ -1301,6 +1500,36 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
     // (peak depth was in [cap/2, cap)).
     try writer.print("  ring capacity (never shrinks → ≈ peak): hi_max={d} nm_max={d} (init {d})\n", .{
         cap_hi, cap_nm, _queue.local_queue_capacity,
+    });
+    // The idle-peer wake path, per worker (see WakeStats). Five numbers
+    // per worker, each named for what happened; the legend is printed
+    // with the table because the dump is read cold, from an admin
+    // command or a test run, not next to this code.
+    try writer.writeAll(
+        "wake path (lifetime counts, per worker):\n" ++
+            "  woke     parked peers this worker woke because work piled up in its ring\n" ++
+            "  skipped  pile-ups that woke nobody: a thief was already hunting, or nobody was parked\n" ++
+            "  stole    fibers this worker took from busier peers\n" ++
+            "  parked   times it blocked with nothing to do\n" ++
+            "  polled   times the pre-park poll found work, so it did not block\n",
+    );
+    const col = "{s:>8}";
+    try writer.print("        " ++ col ++ col ++ col ++ col ++ col ++ "\n", .{
+        "woke", "skipped", "stole", "parked", "polled",
+    });
+    var total: [5]u64 = .{ 0, 0, 0, 0, 0 };
+    for (workers) |*w| {
+        const s = w.wake_stats;
+        const row: [5]u64 = .{
+            s.notify_sent, s.gated_thief + s.gated_noidle, s.stolen, s.parks, s.poll_hits,
+        };
+        try writer.print("  W{d:0>2}   {d:>8}{d:>8}{d:>8}{d:>8}{d:>8}\n", .{
+            w.id, row[0], row[1], row[2], row[3], row[4],
+        });
+        for (&total, row) |*t, v| t.* += v;
+    }
+    try writer.print("  total {d:>8}{d:>8}{d:>8}{d:>8}{d:>8}\n", .{
+        total[0], total[1], total[2], total[3], total[4],
     });
 }
 

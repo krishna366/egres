@@ -17,6 +17,7 @@
 //! plane is fiber-native.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
 const _fb = @import("fiber.zig");
 const _rt = @import("runtime.zig");
@@ -39,7 +40,11 @@ pub const Stat = struct {
 
 /// Flags accepted by `File.sync` for zio API parity. Ignored — `std.Io`'s
 /// `sync` is a full flush.
-pub const SyncFlags = struct {};
+pub const SyncFlags = struct {
+    /// fdatasync: data and the metadata needed to read it back (size,
+    /// block map), not timestamps. The WAL's durability point.
+    data_only: bool = false,
+};
 
 pub const File = struct {
     fd: SioFile.Handle,
@@ -120,12 +125,12 @@ pub const File = struct {
             @panic("fs.preadBatch: fiber woken before all reads completed — spurious wake");
     }
 
-    /// Flush data + metadata to disk. libxev has no fsync op, so the blocking
-    /// `fsync` runs on the `fsops` pool while this fiber parks — the worker
-    /// thread stays free for other fibers.
+    /// Flush data + metadata to disk (data only with `data_only`). libxev
+    /// has no fsync op, so the blocking syscall runs on the `fsops` pool
+    /// while this fiber parks — the worker thread stays free for other
+    /// fibers.
     pub fn sync(self: File, flags: SyncFlags) !void {
-        _ = flags;
-        return _fsops.run(syncImpl, .{self.fd});
+        return _fsops.run(syncImpl, .{ self.fd, flags.data_only });
     }
 
     /// Truncate / extend the file to `length` bytes. Offloaded (can block on
@@ -151,7 +156,15 @@ pub const File = struct {
     }
 };
 
-fn syncImpl(fd: SioFile.Handle) !void {
+fn syncImpl(fd: SioFile.Handle, data_only: bool) !void {
+    // A data-only sync leaves the inode's timestamps out, which is what
+    // a log append wants. Where the OS has no fdatasync (macOS, Windows)
+    // a full sync is the honest equivalent.
+    const has_fdatasync = switch (builtin.os.tag) {
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
+        else => false,
+    };
+    if (data_only and has_fdatasync) return std.posix.fdatasync(fd);
     return sioFile(fd).sync(_fsops.io());
 }
 

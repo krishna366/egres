@@ -38,6 +38,7 @@ pub const Stats = _rt.Stats;
 pub const spawn = _rt.spawn;
 pub const spawnDetached = _rt.spawnDetached;
 pub const yield = _rt.yield;
+pub const Spinlock = _rt.Spinlock;
 pub const park = _rt.park;
 pub const wake = _rt.wake;
 pub const stop = _rt.stop;
@@ -114,3 +115,6 @@ pub const fsops = @import("fsops.zig");
 // From net.zig — TCP networking with zio.net-compatible Stream/Server/
 // IpAddress and the std.Io.Reader/Writer socket adapters.
 pub const net = @import("net.zig");
+
+/// The parked-worker bitmap, exported for its tests.
+pub const IdleWorkers = @import("queue.zig").IdleWorkers;
