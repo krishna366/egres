@@ -166,30 +166,41 @@ pub const TableCache = struct {
         // periodic progress if the group hangs.
         var tse: utils.SafeError = .{};
         var completed = std.atomic.Value(usize).init(0);
+
+        // The watchdog waits on this, so it exits the moment the last
+        // open lands rather than at its next 500 ms poll: the group's
+        // wait() below holds the apply fiber, and a flush or compaction
+        // apply used to cost a full 500 ms because of it.
+        var done = fiber.Watermark.init(self.allocator);
+        defer done.deinit();
+
         const total = misses.items.len;
         var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
         try g.ensureTotalCapacity(1 + misses.items.len);
-        g.spawn(.{}, loadTablesWatchdog, .{ total, &completed }) catch {};
+        g.spawn(.{}, loadTablesWatchdog, .{ total, &completed, &done }) catch {};
         for (misses.items) |n| {
-            try g.spawn(.{}, openFiber, .{ self, n, &tse, &completed });
+            try g.spawn(.{}, openFiber, .{ self, n, &tse, &completed, &done });
         }
         g.wait();
         if (tse.get()) |err| return err;
     }
 
-    /// Sibling of the `openFiber` spawns: poll the completed counter
-    /// every 500 ms and log every 15 s while we're still short. Exits
-    /// as soon as all opens are accounted for, so it doesn't hold the
-    /// group's `wait()` open.
+    /// Sibling of the `openFiber` spawns: log every 15 s while opens
+    /// are still short. Woken by `done` as each open lands, so it exits
+    /// with the last one and never holds the group's `wait()` open.
     fn loadTablesWatchdog(
         total: usize,
         completed: *std.atomic.Value(usize),
+        done: *fiber.Watermark,
     ) void {
         const start = fiber.coarseMs();
         var last_warn = start;
         while (completed.load(.acquire) < total) {
-            fiber.sleepMs(500);
+            done.waitFor(total, 500) catch |err| switch (err) {
+                error.Timeout => {},
+                else => return,
+            };
             const now = fiber.coarseMs();
             if (now - last_warn >= 15_000) {
                 log.warn(
@@ -206,8 +217,9 @@ pub const TableCache = struct {
         need: *TableNeed,
         tse: *utils.SafeError,
         completed: *std.atomic.Value(usize),
+        done: *fiber.Watermark,
     ) void {
-        defer _ = completed.fetchAdd(1, .release);
+        defer done.advance(completed.fetchAdd(1, .release) + 1);
         // Phase A: check under write lock (brief — no I/O).
         self.mu.lock(@src());
         if (self.tables.get(need.id)) |t| {

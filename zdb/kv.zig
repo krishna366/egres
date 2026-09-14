@@ -291,6 +291,13 @@ pub const Key = struct {
     namespace: u64 = 0,
     table_id: u32 = 0,
     primary: String = "",
+    /// Range-end sentinel: a key with `after` set sorts just past every
+    /// stored key with the same primary and before any longer one, so
+    /// `[k, k.after]` is exactly the entries of `k` with nothing copied.
+    /// Query-side only: it is never set on a stored key and `marshal`
+    /// does not write it. Only `order` honours it; a raw compare of
+    /// `primary` bytes does not see it.
+    after: bool = false,
 
     /// Parse a marshaled key: [ns:u64 BE][tid:u32 BE][primary]. A key
     /// names a row, not a version: a version's timestamp lives in
@@ -376,7 +383,9 @@ pub const Key = struct {
         if (ns_ord != .eq) return ns_ord;
         const tid_ord = std.math.order(self.table_id, other.table_id);
         if (tid_ord != .eq) return tid_ord;
-        return std.mem.order(u8, self.primary, other.primary);
+        const p_ord = std.mem.order(u8, self.primary, other.primary);
+        if (p_ord != .eq) return p_ord;
+        return std.math.order(@intFromBool(self.after), @intFromBool(other.after));
     }
 
     /// Length of the marshaled key; 0 for an empty primary.

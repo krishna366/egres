@@ -3,6 +3,7 @@ const testing = std.testing;
 const skiplist = @import("zdb").skl;
 const Key = @import("zdb").kv.Key;
 const Meta = @import("zdb").kv.Meta;
+const Kind = @import("zdb").kv.Kind;
 const u = @import("utils");
 const String = u.String;
 
@@ -421,4 +422,49 @@ test "skiplist: meta reaches the iterator" {
     try testing.expectEqualStrings("b", second.key.primary);
     const second_meta = second.newest().meta;
     try testing.expectEqual(Meta{ .kind = .deleted }, second_meta);
+}
+
+/// The version timestamps the iterator hands out for key "k" under
+/// `limit`, newest first.
+fn expectVersions(
+    sl: *skiplist.SkipList,
+    limit: skiplist.Iterator.Limit,
+    want: []const u64,
+) !void {
+    var it = try skiplist.Iterator.init(testing.allocator, sl, limit);
+    defer it.deinit();
+    try it.seekRange(.{}, .{});
+    const item = it.itemRef() orelse return error.TestExpectedItem;
+    const vers = item.versions.slice();
+    try testing.expectEqual(want.len, vers.len);
+    for (want, vers) |ts, ver| try testing.expectEqual(ts, ver.ts);
+}
+
+test "skiplist: iterator limit copies only what a reader can use" {
+    var sl = try skiplist.SkipList.init(testing.allocator);
+    defer sl.release();
+    // Read back newest first: 50 delta, 40 delta, 30 state, 20, 10.
+    const puts = [_]struct { ts: u64, kind: Kind }{
+        .{ .ts = 10, .kind = .state }, .{ .ts = 20, .kind = .state },
+        .{ .ts = 30, .kind = .state }, .{ .ts = 40, .kind = .delta },
+        .{ .ts = 50, .kind = .delta },
+    };
+    for (puts) |p| try sl.putItem(.{
+        .key = .{ .primary = "k" },
+        .versions = .{ .one = .{
+            .ts = p.ts,
+            .meta = .{ .kind = p.kind },
+            .value = "v",
+        } },
+    });
+
+    // The default: everything, as a flush needs it.
+    try expectVersions(sl, .{}, &.{ 50, 40, 30, 20, 10 });
+    // A read at 45 wanting one version: the delta at 40 folds down
+    // to the state at 30; 50 is not visible.
+    try expectVersions(sl, .{ .read_ts = 45, .want = 1 }, &.{ 40, 30 });
+    // At 35 the newest visible version is already a state.
+    try expectVersions(sl, .{ .read_ts = 35, .want = 1 }, &.{30});
+    // Nothing visible at 5: empty.
+    try expectVersions(sl, .{ .read_ts = 5 }, &.{});
 }

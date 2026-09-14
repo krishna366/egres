@@ -57,7 +57,15 @@ pub const WaitGroup = struct {
     }
 };
 
-// testPrint helps emit debugging output from tests without affecting non-test builds.
+/// Empty an ArrayList and keep its buffer. `clearRetainingCapacity`
+/// does the same but first memsets the whole slice with `undefined`,
+/// a real 0xAA fill in Debug and ReleaseSafe, which showed up on hot
+/// resets (a version merge per key on a full-table scan). One place to
+/// change if the reset strategy ever changes.
+pub fn clearRetainCap(list: anytype) void {
+    list.items.len = 0;
+}
+
 pub fn testPrint(comptime fmt: String, args: anytype) void {
     if (!builtin.is_test) return;
     // std.debug.print(fmt, args);
@@ -132,15 +140,23 @@ pub const RefValue = struct {
         return v;
     }
 
+    /// A freed value's count is left at this poison, so a late take or
+    /// release on it trips the guards below instead of corrupting the
+    /// heap silently. These checks stay on in every build mode: a
+    /// refcount bug here is a cross-thread double free.
+    const dead: i32 = -0x4000_0000;
+
     pub fn incrRef(self: *RefValue) *RefValue {
-        _ = self.ref.fetchAdd(1, .monotonic);
+        const prev = self.ref.fetchAdd(1, .monotonic);
+        if (prev <= 0) @panic("RefValue.incrRef on a freed value");
         return self;
     }
 
     pub fn decrRef(self: *RefValue) void {
         const prev = self.ref.fetchSub(1, .acq_rel);
-        std.debug.assert(prev > 0);
+        if (prev <= 0) @panic("RefValue.decrRef below zero (double release)");
         if (prev == 1) {
+            self.ref.store(dead, .release);
             self.allocator.free(self.data);
             self.allocator.destroy(self);
         }

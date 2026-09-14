@@ -26,7 +26,6 @@ const TableIterator = _table.TableIterator;
 const Tree = _tree.Tree;
 const merge_iterator = _table.merge_iterator;
 const Iterator = merge_iterator.Iterator;
-const MergeIterator = merge_iterator.MergeIterator;
 const Pin = merge_iterator.Pin;
 
 /// Many keys of one table at one read_ts, resolved together (see
@@ -51,25 +50,36 @@ pub fn multiGet(
     return mg;
 }
 
-/// The walk: the memtables (with the txn's pending writes, when
-/// given) through one merge, then each tree's levels for the keys
-/// still pending. Memtable refs are taken BEFORE the tree lookup:
-/// data flushed in between is then visible in both, and the node's
-/// maxTs skips the L0 duplicate. The reverse order could miss it in
-/// both.
+/// The walk: the memtables newest first (the txn's pending writes,
+/// when given, then the active memtable, then the immutables), each
+/// probed for the keys still open, then each tree's levels for the
+/// keys still pending. No merge over the memtables: a newer source
+/// settles a key before an older one is asked, and the node's maxTs
+/// keeps an older source from re-supplying a version the newer one
+/// already gave (the same rule the L0 walk uses). Memtable refs are
+/// taken BEFORE the tree lookup: data flushed in between is then
+/// visible in both, and maxTs skips the L0 duplicate. The reverse
+/// order could miss it in both.
 fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
     const alloc = mg.allocator;
     {
-        const srcs = try self.memtables.getIterators(alloc, mg.opts.pending);
-        defer alloc.free(srcs);
-        var merge: Iterator = .{
-            .merge = MergeIterator.init(alloc, srcs) catch |err| {
-                for (srcs) |*it| it.deinit();
-                return err;
-            },
-        };
-        defer merge.deinit(); // releases each source's skiplist ref
-        try mg.drainMerge(&merge);
+        // One usable version per key; deltas fold down to their state.
+        const srcs = try self.memtables.getIterators(alloc, mg.opts.pending, .{
+            .read_ts = mg.opts.read_ts,
+            .want = 1,
+        });
+        defer {
+            for (srcs) |*it| it.deinit(); // releases each source's skiplist ref
+            alloc.free(srcs);
+        }
+        for (srcs) |*it| {
+            for (mg.pending.items) |node| {
+                if (node.done()) continue;
+                try mg.takeVersions(node, it);
+            }
+            MultiGet.removeDone(&mg.pending);
+            if (mg.pending.items.len == 0) break;
+        }
     }
 
     // Keys ascend, so a tree covers a contiguous run of the pending
@@ -96,7 +106,7 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
         try mg.walkTree(tree, pend[i..j], 0);
         i = j;
     }
-    MultiGet.compactPending(&mg.pending);
+    MultiGet.removeDone(&mg.pending);
 }
 
 /// One point read: the row, the timestamp it is read as of, and the
@@ -203,8 +213,8 @@ pub fn getBitmap(
 /// collapse), so a table's share of them is one contiguous slice
 /// found by binary search and consecutive keys land in the same
 /// block. The sources are walked newest first — the txn's pending
-/// writes and the memtables through one merge (`drainMerge`), then
-/// each tree's levels from the top (`walkTree`) — and at every level
+/// writes, then each memtable (`fillMultiGet`), then each tree's
+/// levels from the top (`walkTree`) — and at every level
 /// only the tables whose range and bloom filter admit a key that is
 /// still pending are probed. A key leaves `pending` as soon as its
 /// versions settle it, so lower levels cost only what is still open.
@@ -302,7 +312,12 @@ pub const MultiGet = struct {
                 .hash = (Key{ .primary = key }).bloomHash(),
             };
         }
-        std.mem.sort(Node, all, {}, Node.lessByKey);
+        // Unstable is fine (equal keys are interchangeable) and, unlike
+        // `mem.sort`, has no 512-element scratch cache: in a safe build
+        // that cache is poison-filled on every call, which was a third of
+        // the CPU on a point-read path that sorts one key. A single key
+        // needs no sort at all.
+        if (all.len > 1) std.mem.sortUnstable(Node, all, {}, Node.lessByKey);
         // Collapse duplicates: the sort made them adjacent.
         var kept: usize = 0;
         for (all) |node| {
@@ -424,7 +439,7 @@ pub const MultiGet = struct {
     }
 
     /// Drop the nodes that are done from `pending`.
-    pub fn compactPending(pending: *std.ArrayList(*Node)) void {
+    pub fn removeDone(pending: *std.ArrayList(*Node)) void {
         var kept: usize = 0;
         for (pending.items) |node| {
             if (node.done()) continue;
@@ -432,15 +447,6 @@ pub const MultiGet = struct {
             kept += 1;
         }
         pending.items.len = kept;
-    }
-
-    /// One merge over the sources above the trees (the txn's pending
-    /// writes and the memtables), seeked once per pending node.
-    /// Memtable seeks cost no I/O, and the merge settles the order
-    /// across memtables.
-    pub fn drainMerge(self: *MultiGet, merge: *Iterator) !void {
-        for (self.pending.items) |node| try self.takeVersions(node, merge);
-        compactPending(&self.pending);
     }
 
     /// The level loop over one tree for `run`, pending nodes in key
@@ -463,7 +469,7 @@ pub const MultiGet = struct {
 
         var lvl = from_level;
         while (lvl < tree.opts.max_levels) : (lvl += 1) {
-            compactPending(&pending);
+            removeDone(&pending);
             const open = pending.items;
             if (open.len == 0) return;
 
@@ -520,7 +526,7 @@ pub const MultiGet = struct {
         }.f);
 
         const arloc = self.arena.allocator();
-        self.accepted.clearRetainingCapacity();
+        utils.clearRetainCap(&self.accepted);
         for (nodes[lo..hi]) |node| {
             if (node.done()) continue;
             if (!tbl.containsHash(node.hash)) continue;
@@ -547,7 +553,7 @@ pub const MultiGet = struct {
     fn prefetch(self: *MultiGet, tbl: *Table) !void {
         const cache = _table.table.block_cache orelse return;
         const arloc = self.arena.allocator();
-        self.blocks.clearRetainingCapacity();
+        utils.clearRetainCap(&self.blocks);
         for (self.accepted.items) |node| {
             const idx = tbl.blockFor(self.keyAt(node)) orelse return;
             if (self.blocks.items.len > 0 and self.blocks.getLast() == idx) {
@@ -568,7 +574,7 @@ pub const MultiGet = struct {
     /// unbounded and lands on the key's newest version; of each item
     /// the versions at or below what the node still wants are taken,
     /// down to the first terminal. The key check ends the walk, and it
-    /// compares whole keys because the memtable merge's sources span
+    /// compares whole keys because the memtable sources span
     /// namespaces and tables. A source that yields one version per
     /// item (an SST until it packs) is walked item by item; a merged
     /// source hands the whole key over in one item.
@@ -576,7 +582,12 @@ pub const MultiGet = struct {
         const read_ts = self.opts.read_ts;
         const start = self.keyAt(node);
 
-        try it.seekRange(start, .{});
+        // Bound the seek to this one key. An unbounded seek that misses
+        // lands on the next key in order, and the memtable iterator
+        // copies that key's whole version chain before the key compare
+        // below can reject it; after a table's last row that neighbour
+        // is a hot row of the next table with thousands of versions.
+        try it.seekRange(start, keyAfter(start));
         while (it.itemRef()) |found| {
             if (found.key.order(start) != .eq) return;
             if (found.visibleAt(node.maxTs(read_ts))) |vis| {
@@ -588,7 +599,19 @@ pub const MultiGet = struct {
         }
     }
 
+    /// The range end that admits only `key`: the same key with `after`
+    /// set (see `Key.after`). Borrows `key.primary`; nothing is copied.
+    fn keyAfter(key: Key) Key {
+        return .{
+            .namespace = key.namespace,
+            .table_id = key.table_id,
+            .primary = key.primary,
+            .after = true,
+        };
+    }
+
     /// Append `wanted`'s versions, holding the storage behind them.
+
     fn take(
         self: *MultiGet,
         node: *Node,
@@ -899,7 +922,7 @@ pub const Cursor = struct {
     /// holding; it stays pinned. No-op unless `opts.pin_values`.
     pub fn releasePins(self: *Cursor) !void {
         for (self.pins.items) |pin| pin.release();
-        self.pins.clearRetainingCapacity();
+        utils.clearRetainCap(&self.pins);
         if (self.opts.pin_values and self.next_pending) {
             for (self.merge.?.currentPins()) |pin| {
                 try self.pins.append(self.allocator, pin.acquire());
@@ -946,6 +969,10 @@ pub const Cursor = struct {
             const srcs = try self.forest.memtables.getIterators(
                 a,
                 self.opts.pending,
+                .{
+                    .read_ts = self.opts.read_ts,
+                    .want = self.want_versions,
+                },
             );
             self.merge = try tree.openMerge(
                 a,
@@ -1071,7 +1098,7 @@ pub fn maxKey(
         allocator: std.mem.Allocator,
         best: std.ArrayList(u8) = .empty,
         fn emit(c: *@This(), item: Item) anyerror!bool {
-            c.best.clearRetainingCapacity();
+            utils.clearRetainCap(&c.best);
             _ = try item.key.marshalTo(c.allocator, &c.best);
             return true;
         }

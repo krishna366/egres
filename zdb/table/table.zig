@@ -223,7 +223,8 @@ pub const Table = struct {
 
     /// Increment the reference count. Call this when sharing a Table pointer.
     pub fn incrRef(self: *Table) void {
-        _ = self.ref.fetchAdd(1, .monotonic);
+        const prev = self.ref.fetchAdd(1, .monotonic);
+        if (prev <= 0) @panic("Table.incrRef on a freed table");
     }
 
     /// Decrement the reference count. When it reaches zero the table's
@@ -240,8 +241,11 @@ pub const Table = struct {
     /// but nothing breaks.
     pub fn decrRef(self: *Table) void {
         const prev = self.ref.fetchSub(1, .acq_rel);
-        std.debug.assert(prev > 0);
+        if (prev <= 0) @panic("Table.decrRef below zero (double release)");
         if (prev == 1) {
+            // Poison the count before freeing: a late take or release on
+            // this table then panics here instead of corrupting the heap.
+            self.ref.store(-0x4000_0000, .release);
             if (self.claimPath()) |p| {
                 self.allocator.free(p);
             }
@@ -669,7 +673,7 @@ pub const BlockIterator = struct {
         const diff = er[diff_start..diff_end];
 
         // Reconstruct full key into reusable buffer: base[0..overlap] ++ diff.
-        self.key_buf.clearRetainingCapacity();
+        utils.clearRetainCap(&self.key_buf);
         try self.key_buf.appendSlice(self.alloc, self.base_key[0..key_overlap]);
         try self.key_buf.appendSlice(self.alloc, diff);
 
@@ -702,7 +706,7 @@ pub const BlockIterator = struct {
         const hdrs = value[4..@intCast(hdr_len)];
         const bytes = value[@intCast(hdr_len)..];
 
-        self.vers.clearRetainingCapacity();
+        utils.clearRetainCap(&self.vers);
         try self.vers.ensureTotalCapacity(self.alloc, count);
         if (count == 1) {
             // Nearly every entry after compaction: the value is the
@@ -829,7 +833,7 @@ pub const TableIterator = struct {
         const lo = self.table.blockFor(target) orelse return;
 
         // Marshal once; the in-block search compares against these bytes.
-        self.seek_buf.clearRetainingCapacity();
+        utils.clearRetainCap(&self.seek_buf);
         const traw = try target.marshalTo(self.allocator, &self.seek_buf);
 
         // The block is still open from the last seek: search it in

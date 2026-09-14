@@ -202,7 +202,7 @@ pub const MergeIterator = struct {
     }
 
     pub fn seekRange(self: *MergeIterator, start: Key, end: Key) Error!void {
-        self.live.clearRetainingCapacity();
+        utils.clearRetainCap(&self.live);
         for (self.srcs) |src| {
             try src.it.seekRange(start, end);
             src.item = src.it.itemRef();
@@ -216,7 +216,7 @@ pub const MergeIterator = struct {
     /// source the item was built from; empty when the merge is
     /// exhausted. The pins stay borrowed: the sources hold them.
     pub fn currentPins(self: *MergeIterator) []const Pin {
-        self.pins.clearRetainingCapacity();
+        utils.clearRetainCap(&self.pins);
         for (self.live.items[0..self.n_cur]) |src| {
             var buf: [1]Pin = undefined;
             for (src.it.currentPins(&buf)) |pin| {
@@ -283,13 +283,17 @@ pub const MergeIterator = struct {
 
         // The sources are in prio order, so a stable sort keeps the
         // lower source's copy of an equal timestamp for the dedup to
-        // keep.
-        self.vers.clearRetainingCapacity();
+        // keep. Insertion sort: stable, in place, and right for the
+        // few versions a key has — `mem.sort` carries a 512-element
+        // scratch cache that a safe build poison-fills on every call,
+        // which was a third of a full-table scan once rows had versions
+        // in more than one source.
+        utils.clearRetainCap(&self.vers);
         for (self.live.items[0..self.n_cur]) |src| {
             const vers = src.item.?.versions.slice();
             try self.vers.appendSlice(self.allocator, vers);
         }
-        std.mem.sort(Version, self.vers.items, {}, newerFirst);
+        std.sort.insertion(Version, self.vers.items, {}, newerFirst);
         var kept: usize = 1;
         for (self.vers.items[1..]) |ver| {
             if (ver.ts == self.vers.items[kept - 1].ts) continue;

@@ -248,26 +248,31 @@ pub const Memtables = struct {
         self: *Memtables,
         allocator: std.mem.Allocator,
         pending: ?*_skl.SkipList,
+        limit: _skl.Iterator.Limit,
     ) ![]merge_iterator.Iterator {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
+
         const extra: usize = @intFromBool(pending != null);
         const total = extra + 1 + self.immutables.items.len;
         const out = try allocator.alloc(merge_iterator.Iterator, total);
         errdefer allocator.free(out);
+
         var made: usize = 0;
         errdefer for (out[0..made]) |*it| it.deinit();
         if (pending) |p| {
-            out[0] = .{ .skiplist = try _skl.Iterator.init(allocator, p) };
+            out[0] = .{
+                .skiplist = try _skl.Iterator.init(allocator, p, limit),
+            };
             made += 1;
         }
         out[extra] = .{
-            .skiplist = try _skl.Iterator.init(allocator, self.current),
+            .skiplist = try _skl.Iterator.init(allocator, self.current, limit),
         };
         made += 1;
         for (self.immutables.items, 0..) |imm, i| {
             out[extra + 1 + i] = .{
-                .skiplist = try _skl.Iterator.init(allocator, imm),
+                .skiplist = try _skl.Iterator.init(allocator, imm, limit),
             };
             made += 1;
         }

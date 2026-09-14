@@ -65,7 +65,7 @@ pub const SkipList = struct {
     node_count: Atomic(usize),
     /// Bytes written into this memtable: keys, nodes and their towers,
     /// version nodes and values. Used by `memoryUsage`/`shouldFreeze` instead
-    /// of arena capacity: the arena is preheated to `max_arena_size`, so
+    /// of arena capacity: the arena reserves `max_arena_size` up front, so
     /// `queryCapacity()` reports the full reservation even when empty —
     /// which would make an empty memtable look "full" and trip the
     /// freeze threshold immediately.
@@ -76,13 +76,22 @@ pub const SkipList = struct {
     }
 
     /// `init` with a caller-chosen starting arena capacity. Pass 0 to
-    /// skip the preheat and grow on demand — right for small private
+    /// skip the reservation and grow on demand — right for small private
     /// skiplists like a transaction's pending writes.
     pub fn initCapacity(allocator: Allocator, capacity: usize) !*Self {
         var arena = std.heap.ArenaAllocator.init(allocator);
         if (capacity > 0) {
-            // Preheat the first chunk to `capacity` bytes.
-            _ = try arena.allocator().alloc(u8, capacity);
+            // Reserve the first chunk at `capacity` bytes without
+            // touching it. Through the raw entry point: `Allocator.alloc`
+            // fills what it returns with `undefined`, which a safe build
+            // writes out as 64 MiB of 0xAA, faulting in every page while
+            // the swap holds the tree lock. Untouched, the pages fault in
+            // as the entries arrive instead.
+            _ = arena.allocator().rawAlloc(
+                capacity,
+                std.mem.Alignment.fromByteUnits(1),
+                @returnAddress(),
+            ) orelse return error.OutOfMemory;
             _ = arena.reset(.retain_capacity);
         }
 
@@ -326,8 +335,8 @@ pub const SkipList = struct {
 
     pub fn memoryUsage(self: *Self) usize {
         // Bytes written, tracked on every put. We deliberately do NOT use
-        // `arena.queryCapacity()`: the arena is preheated to
-        // `max_arena_size`, so an empty memtable would report the full
+        // `arena.queryCapacity()`: the arena reserves `max_arena_size`
+        // up front, so an empty memtable would report the full
         // 64 MiB reservation and trip `shouldFreeze` immediately, spinning
         // the newMemtable loop forever.
         return self.used_bytes.load(.monotonic);
@@ -338,7 +347,7 @@ pub const SkipList = struct {
     }
 
     pub fn iterator(self: *Self, allocator: Allocator) !Iterator {
-        return Iterator.init(allocator, self);
+        return Iterator.init(allocator, self, .{});
     }
 };
 
@@ -356,13 +365,31 @@ pub const Iterator = struct {
     node: ?*SkipList.Node,
     vers: std.ArrayList(Version) = .empty,
     end_key: Key = .{},
+    limit: Limit,
 
-    pub fn init(allocator: Allocator, skiplist: *SkipList) !Iterator {
+    /// How much of a key's chain a reader needs. `fill` walks the
+    /// chain newest first, skips versions above `read_ts`, and stops
+    /// after the version that both completes a fold (a state or a
+    /// tombstone, not a delta) and brings the count to `want`. The
+    /// default copies everything: what a flush or a compaction needs.
+    /// A hot row carries thousands of versions per memtable lifetime;
+    /// a read wants one or two of them.
+    pub const Limit = struct {
+        read_ts: u64 = std.math.maxInt(u64),
+        want: u32 = std.math.maxInt(u32),
+    };
+
+    pub fn init(
+        allocator: Allocator,
+        skiplist: *SkipList,
+        limit: Limit,
+    ) !Iterator {
         skiplist.acquire();
         var it: Iterator = .{
             .allocator = allocator,
             .skiplist = skiplist,
             .node = skiplist.head.next[0].load(.acquire),
+            .limit = limit,
         };
         errdefer it.deinit();
         try it.fill();
@@ -413,11 +440,15 @@ pub const Iterator = struct {
     /// a version node while this walks; either the chain before or the
     /// chain after is seen, both complete.
     fn fill(self: *Iterator) !void {
-        self.vers.clearRetainingCapacity();
+        utils.clearRetainCap(&self.vers);
         const node = self.node orelse return;
+        const lim = self.limit;
         var cur = node.vhead.load(.acquire);
         while (cur) |vnode| : (cur = vnode.next.load(.acquire)) {
-            try self.vers.append(self.allocator, vnode.ver);
+            const ver = vnode.ver;
+            if (ver.ts > lim.read_ts) continue;
+            try self.vers.append(self.allocator, ver);
+            if (self.vers.items.len >= lim.want and !ver.meta.isDelta()) break;
         }
     }
 };

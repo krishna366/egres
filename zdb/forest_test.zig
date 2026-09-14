@@ -826,7 +826,7 @@ test "forest: getIterators outlives a concurrent flush+pop" {
 
     // Snapshot under the lock — each skl.Iterator.init bumps
     // refcount before getIterators returns.
-    const iters = try mts.getIterators(alloc, null);
+    const iters = try mts.getIterators(alloc, null, .{});
 
     // Simulate flush completion: drop M_5 from immutables (release fires
     // inside popOldestIfMatches). M_5's refcount goes from 2 → 1

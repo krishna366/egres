@@ -188,3 +188,21 @@ test "Key: marshal round trip carries no timestamp" {
     // An empty primary is a bound, not a row: it marshals to nothing.
     try expectEqual(@as(usize, 0), (Key{ .namespace = 9 }).len());
 }
+
+test "Key: after sorts past its primary and before every longer one" {
+    const k: Key = .{ .table_id = 7, .primary = "k" };
+    const k_end: Key = .{ .table_id = 7, .primary = "k", .after = true };
+    const k_nul: Key = .{ .table_id = 7, .primary = "k\x00" };
+    const ka: Key = .{ .table_id = 7, .primary = "ka" };
+    const j: Key = .{ .table_id = 7, .primary = "j" };
+    try std.testing.expectEqual(std.math.Order.lt, k.order(k_end));
+    try std.testing.expectEqual(std.math.Order.gt, k_end.order(k));
+    try std.testing.expectEqual(std.math.Order.eq, k_end.order(k_end));
+    // The old bound was primary ++ "\x00"; `after` admits the same set.
+    try std.testing.expectEqual(std.math.Order.lt, k_end.order(k_nul));
+    try std.testing.expectEqual(std.math.Order.lt, k_end.order(ka));
+    try std.testing.expectEqual(std.math.Order.gt, k_end.order(j));
+    // Never crosses a table or namespace boundary.
+    const other: Key = .{ .table_id = 8, .primary = "a" };
+    try std.testing.expectEqual(std.math.Order.lt, k_end.order(other));
+}

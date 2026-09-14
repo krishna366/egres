@@ -147,6 +147,76 @@ fn benchMergeScan(b: *Bench) !void {
     }
 }
 
+/// Build a table holding EVERY key `0..n` with `nv` versions each, the
+/// newest at `ts_top` and each next one lower. Tables with disjoint
+/// timestamp bands give the merge a key that every source holds.
+fn buildShared(
+    alloc: std.mem.Allocator,
+    n: usize,
+    nv: usize,
+    ts_top: usize,
+    block_size: u32,
+    val_len: usize,
+) !zdb.table.builder.TableBuffer {
+    var b = Builder.init(alloc, .{ .target_block_size = block_size });
+    defer b.deinit();
+
+    const val = try alloc.alloc(u8, val_len);
+    defer alloc.free(val);
+    @memset(val, 'v');
+
+    var vers: [8]zdb.kv.Version = undefined;
+    for (vers[0..nv], 0..) |*v, k| v.* = .{ .ts = ts_top - k, .meta = .{}, .value = val };
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kb: [16]u8 = undefined;
+        const p = try keyAt(&kb, i);
+        try b.addItem(.{ .key = .{ .primary = p }, .versions = .{ .many = vers[0..nv] } });
+    }
+    return b.finish();
+}
+
+const shared_keys: usize = 16 * 1024;
+const shared_sources: usize = 3;
+const shared_vers: usize = 2;
+
+/// The version path of the merge: every key sits in all three sources
+/// with two versions each, so each step appends six versions, sorts
+/// them by timestamp and dedups — what `merge scan 8 tables`, with its
+/// disjoint keys, never touches.
+fn benchMergeScanShared(b: *Bench) !void {
+    const a = gpa;
+    var tables: [shared_sources]*Table = undefined;
+    var opened: usize = 0;
+    defer for (tables[0..opened]) |t| destroyTable(t);
+    while (opened < shared_sources) : (opened += 1) {
+        var tb = try buildShared(a, shared_keys, shared_vers, 100 - 10 * opened, 4096, value_len);
+        defer tb.deinit();
+        tables[opened] = try Table.openHandle(a, try fromBuf(a, tb.bytes), .p0);
+    }
+
+    b.resetTimer();
+    var i: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        var iters: [shared_sources]merge.Iterator = undefined;
+        for (tables, 0..) |t, j| {
+            iters[j] = .{ .table = TableIterator.init(a, t, .p0) };
+        }
+        var m = try merge.MergeIterator.init(a, iters[0..]);
+        defer m.deinit();
+
+        try m.seekRange(.{}, .{});
+        var count: usize = 0;
+        while (m.itemRef()) |item| : (count += 1) {
+            if (item.versions.slice().len != shared_sources * shared_vers) return error.LostVersion;
+            b.addBytes(item.key.primary.len + item.newest().value.len);
+            try m.next();
+        }
+        if (count != shared_keys) return error.ShortScan;
+    }
+}
+
 fn benchPointSeeks(b: *Bench) !void {
     const a = gpa;
     const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
@@ -296,6 +366,9 @@ fn benchFullScan(b: *Bench) !void {
 
 test "BENCH: merge scan 8 tables" {
     try benchMergeScan(bench.current());
+}
+test "BENCH: merge scan 3 sources sharing every key" {
+    try benchMergeScanShared(bench.current());
 }
 test "BENCH: table point seeks" {
     try benchPointSeeks(bench.current());
