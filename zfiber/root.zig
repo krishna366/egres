@@ -30,8 +30,9 @@ pub const Worker = _rt.Worker;
 pub const Runtime = _rt.Runtime;
 pub const CoarseClock = _rt.CoarseClock;
 pub const coarseMs = _rt.coarseMs;
-pub const clockMsUseRarely = @import("coarse_clock.zig").clockMsUseRarely;
+pub const timestampNow = @import("coarse_clock.zig").timestampNow;
 pub const ClockKind = @import("coarse_clock.zig").ClockKind;
+pub const TimeUnit = @import("coarse_clock.zig").TimeUnit;
 pub const Deadlines = _rt.Deadlines;
 pub const Timeout = _rt.Timeout;
 pub const Stats = _rt.Stats;
@@ -71,6 +72,7 @@ pub const Mutex = _sync.Mutex;
 pub const Condition = _sync.Condition;
 pub const RWMutex = _sync.RWMutex;
 pub const Notify = _sync.Notify;
+pub const Event = _sync.Event;
 
 // Lock-holder tracking for the tracked Mutex/RWMutex modes — `dumpLocks`
 // answers "which locks are held, by what code?" on a wedged server.

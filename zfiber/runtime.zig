@@ -426,13 +426,14 @@ pub const Worker = struct {
         return false;
     }
 
-    /// Poll instead of blocking, for up to `prepark_poll_ns`: submit what
+    /// Poll instead of blocking, for up to `prepark_poll_us`: submit what
     /// the fibers queued (their sends), then watch the completion ring —
     /// which also carries a peer's eventfd wake — and our own rings. We
     /// are marked idle throughout, so a producer may claim our bit
     /// meanwhile; that ends the poll too, since the claim comes with a
     /// thief +1 we must go and honour. true = something to do.
     fn pollBeforePark(self: *Worker, rt: *Runtime) bool {
+        const budget_ns = rt.prepark_poll_us * std.time.ns_per_us;
         const start = readTicks();
         self.loop.run(.no_wait) catch {};
         while (true) {
@@ -443,7 +444,7 @@ pub const Worker = struct {
                 continue;
             }
             const spent = cyclesToNs(readTicks() -% start);
-            if (spent >= rt.prepark_poll_ns) return false;
+            if (spent >= budget_ns) return false;
             std.atomic.spinLoopHint();
         }
     }
@@ -780,7 +781,7 @@ pub const Worker = struct {
             //    wake (and a C-state exit on a pinned core) costs more than
             //    that. Poll the completion ring for a short while first.
             const since_work = cyclesToNs(readTicks() -% self.last_work_ticks);
-            if (rt.prepark_poll_ns > 0 and since_work < std.time.ns_per_ms and
+            if (rt.prepark_poll_us > 0 and since_work < std.time.ns_per_ms and
                 self.pollBeforePark(rt))
             {
                 self.wake_stats.poll_hits += 1;
@@ -875,9 +876,9 @@ pub const InitOptions = struct {
     /// more workers than CPUs nobody is pinned. See `Worker.pinToCpu`.
     pin_workers: bool = true,
 
-    /// See `Runtime.steal_lone` / `Runtime.prepark_poll_ns`.
+    /// See `Runtime.steal_lone` / `Runtime.prepark_poll_us`.
     steal_lone: bool = false,
-    prepark_poll_ns: u64 = 20_000,
+    prepark_poll_us: u64 = 20,
 };
 
 /// Resolve how many workers serve the `.raft` lane, as a fraction of the
@@ -935,11 +936,12 @@ pub const Runtime = struct {
     /// Tunables a host may set after `init` and before load (plain
     /// fields; workers read them on every pass). `steal_lone`: a thief
     /// may take a victim's only ready fiber (false: it waits for a ring
-    /// of 2+, see `trySteal`). `prepark_poll_ns`: how long a worker that
-    /// ran a fiber within the last millisecond polls its completion ring
-    /// before blocking; 0 = block at once (see `Worker.pollBeforePark`).
+    /// of 2+, see `trySteal`). `prepark_poll_us`: how long, in
+    /// microseconds, a worker that ran a fiber within the last
+    /// millisecond polls its completion ring before blocking; 0 = block
+    /// at once (see `Worker.pollBeforePark`).
     steal_lone: bool = false,
-    prepark_poll_ns: u64 = 20_000,
+    prepark_poll_us: u64 = 20,
 
     /// Contiguous worker-id range each lane owns. A `len == 0` lane
     /// falls back to `.default` (see `effectiveLaneIdx`).
@@ -976,7 +978,7 @@ pub const Runtime = struct {
         self.steal_enabled = opts.steal;
         self.pin_workers = opts.pin_workers;
         self.steal_lone = opts.steal_lone;
-        self.prepark_poll_ns = opts.prepark_poll_ns;
+        self.prepark_poll_us = opts.prepark_poll_us;
         self.idle = .{ .{}, .{} };
         self.num_thieves = @splat(.{});
 

@@ -455,3 +455,31 @@ test "Notify: one waiter, many notifiers, no lost wakeup" {
     try std.testing.expectEqual(@as(usize, total), produced.load(.acquire));
     try std.testing.expectEqual(@as(usize, total), seen);
 }
+
+test "Event: waitForDone returns at once when idle, and wakes every waiter on setDone" {
+    var ev: fiber.Event = .{};
+    ev.waitForDone(); // nothing running
+
+    ev.setRunning();
+    try std.testing.expect(ev.isRunning());
+    var woken: std.atomic.Value(u32) = .init(0);
+    const Waiter = struct {
+        fn run(e: *fiber.Event, n: *std.atomic.Value(u32)) void {
+            e.waitForDone();
+            _ = n.fetchAdd(1, .release);
+        }
+    };
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.ensureTotalCapacity(8);
+    for (0..8) |_| try g.spawn(.{}, Waiter.run, .{ &ev, &woken });
+    fiber.yield();
+    fiber.yield();
+    try std.testing.expectEqual(@as(u32, 0), woken.load(.acquire));
+
+    ev.setDone();
+    g.wait();
+    try std.testing.expectEqual(@as(u32, 8), woken.load(.acquire));
+    try std.testing.expect(!ev.isRunning());
+    ev.waitForDone();
+}

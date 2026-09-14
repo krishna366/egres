@@ -282,6 +282,14 @@ pub const FileHandle = struct {
         if (self.file) |f| f.sync(.{}) catch {};
     }
 
+    /// fdatasync, errors propagated: the data and the metadata needed
+    /// to read it back are durable on return. The WAL's durability point
+    /// (raft/diskwal.zig); a failure here must reach the caller.
+    pub fn syncData(self: FileHandle) !void {
+        const f = self.file orelse return;
+        try f.sync(.{ .data_only = true });
+    }
+
     pub fn truncate(self: FileHandle, size: u64) !void {
         try self.file.?.setSize(size);
     }
@@ -473,6 +481,48 @@ pub fn syncDir(path: String) void {
     const f = fiber.File.fromFd(fd);
     defer f.close();
     f.sync(.{}) catch {};
+}
+
+/// Filesystem magic numbers (statfs `f_type`) that decide how a file is
+/// best laid out; see raft/diskwal.zig `Prezero`.
+pub const fs_magic = struct {
+    pub const ext4: i64 = 0xef53;
+    pub const xfs: i64 = 0x58465342;
+    pub const zfs: i64 = 0x2fc12fc1;
+    pub const btrfs: i64 = 0x9123683e;
+    pub const tmpfs: i64 = 0x01021994;
+};
+
+/// The filesystem magic of `path` (statfs `f_type`), or null when it
+/// cannot be read. Linux only: the magic numbers and the statfs layout
+/// are Linux's; elsewhere the answer is null.
+pub fn fsMagic(path: String) ?i64 {
+    if (builtin.os.tag == .linux) return linuxFsMagic(path);
+    return null;
+}
+
+fn linuxFsMagic(path: String) ?i64 {
+    // struct statfs on 64-bit Linux; only f_type is read.
+    const Statfs = extern struct {
+        f_type: i64,
+        f_bsize: i64,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_fsid: [2]i32,
+        f_namelen: i64,
+        f_frsize: i64,
+        f_flags: i64,
+        f_spare: [4]i64,
+    };
+    comptime std.debug.assert(@sizeOf(Statfs) == 120);
+    const path_z = posix.toPosixPath(path) catch return null;
+    var st: Statfs = undefined;
+    const rc = std.os.linux.syscall2(.statfs, @intFromPtr(&path_z), @intFromPtr(&st));
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    return st.f_type;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

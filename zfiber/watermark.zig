@@ -30,6 +30,8 @@ const Entry = struct {
     /// Set to true if this entry was removed from waiters. Avoids an O(N) loop
     /// for defer removal.
     removed: bool = false,
+    /// Set by `reset` before the wake: the value was set under this waiter.
+    reset: bool = false,
 };
 
 // Timed waits arm the waiter fiber's OWN `Fiber.timeout` (via
@@ -77,35 +79,65 @@ pub const Watermark = struct {
     /// close — `closed` only affects the wait paths.
     pub fn close(self: *Watermark) void {
         const was_closed = self.closed.swap(true, .release);
-        if (!was_closed) self.wakeAll();
+        if (!was_closed) self.wakeAll(.closed);
+    }
+
+    /// Set the value, lowering allowed: for a watermark of something
+    /// that can go back, like a log index after a truncation. Every
+    /// parked waiter wakes: a `waitForOrReset` caller with
+    /// `error.Reset`, so it can re-check what it waits for; a plain
+    /// `waitFor`/`waitForUntimed` caller re-parks for its target
+    /// (`waitFor` re-arms its full timeout) and never sees it.
+    pub fn reset(self: *Watermark, new_value: u64) void {
+        self.value.store(new_value, .release);
+        self.wakeAll(.reset);
     }
 
     /// Block until `value >= target` or the watermark is closed.
     /// Returns `error.Closed` if `close()` was called or
     /// `error.OutOfMemory` if the waiter table can't grow.
     pub fn waitForUntimed(self: *Watermark, target: u64) error{ Closed, OutOfMemory }!void {
-        self.waitForImpl(target, null) catch |err| switch (err) {
-            error.Closed => return error.Closed,
-            error.OutOfMemory => return error.OutOfMemory,
-            // A null timeout never arms a deadline, so it can't time out.
-            error.Timeout => unreachable,
-        };
+        while (true) {
+            return self.waitForImpl(target, null) catch |err| switch (err) {
+                error.Closed => error.Closed,
+                error.OutOfMemory => error.OutOfMemory,
+                error.Reset => continue,
+                // A null timeout never arms a deadline, so it can't time out.
+                error.Timeout => unreachable,
+            };
+        }
     }
 
     /// Like `waitForUntimed`, but gives up after `timeout_ms` with
     /// `error.Timeout`.
     pub fn waitFor(self: *Watermark, target: u64, timeout_ms: u64) error{ Closed, Timeout, OutOfMemory }!void {
-        return self.waitForImpl(target, timeout_ms);
+        while (true) {
+            return self.waitForImpl(target, timeout_ms) catch |err| switch (err) {
+                error.Reset => continue,
+                else => |e| e,
+            };
+        }
+    }
+
+    /// `waitForUntimed` that reports a `reset` instead of re-parking:
+    /// `error.Reset` means the value was set, possibly lowered, while
+    /// waiting, and the caller decides what to wait for now.
+    pub fn waitForOrReset(self: *Watermark, target: u64) error{ Closed, OutOfMemory, Reset }!void {
+        return self.waitForImpl(target, null) catch |err| switch (err) {
+            error.Timeout => unreachable,
+            else => |e| e,
+        };
     }
 
     /// Shared wait body. `timeout_ms == null` is the untimed wait (no `Deadlines`
     /// entry); a value arms a per-worker deadline that fires, bumps `timed_out`,
     /// and wakes us. Enqueues ONCE and parks ONCE: a parked waiter has exactly
-    /// three legitimate wakers — `advance` (sets `value >= target`), `close`
-    /// (sets `closed`), and the deadline (bumps `timed_out`) — each setting its
-    /// condition BEFORE the wake. So on resume one must hold; a wake with none is
-    /// a spurious wake and panics (a park must only return for a real reason).
-    fn waitForImpl(self: *Watermark, target: u64, timeout_ms: ?u64) error{ Closed, Timeout, OutOfMemory }!void {
+    /// four legitimate wakers — `advance` (sets `value >= target`), `close`
+    /// (sets `closed`), `reset` (sets the entry's `reset`), and the deadline
+    /// (bumps `timed_out`) — each setting its condition BEFORE the wake. So on
+    /// resume one must hold; a wake with none is a spurious wake and panics (a
+    /// park must only return for a real reason).
+    fn waitForImpl(self: *Watermark, target: u64, timeout_ms: ?u64) error{ Closed, Timeout, OutOfMemory, Reset }!void {
         // Fast paths — skip arming a timer when the answer is already known.
         if (self.value.load(.acquire) >= target) return;
         if (self.closed.load(.acquire)) return error.Closed;
@@ -157,6 +189,7 @@ pub const Watermark = struct {
         // Prefer a satisfied/closed result over Timeout if both landed.
         if (self.value.load(.acquire) >= target) return;
         if (self.closed.load(.acquire)) return error.Closed;
+        if (entry.reset) return error.Reset;
         if (owner != null and me.timeout.didFire()) return error.Timeout;
         std.debug.panic(
             "watermark.waitFor: woken with value={d} < target={d}, not closed, not timed out — spurious wake",
@@ -219,11 +252,12 @@ pub const Watermark = struct {
         }
     }
 
-    /// Wake every queued waiter (used by `close`). They'll see
-    /// `closed == true` when they re-check and return `error.Closed`.
+    /// Wake every queued waiter, for `close` (they see `closed` when
+    /// they re-check and return `error.Closed`) or `reset` (their entry
+    /// is marked, and they return `error.Reset` or re-park).
     /// Mirrors `wakeReached`'s first-fire claim: a timed waiter whose
     /// deadline already fired is left for that deadline to wake.
-    fn wakeAll(self: *Watermark) void {
+    fn wakeAll(self: *Watermark, why: enum { closed, reset }) void {
         self.sl.lock();
         var to_wake: ?*Fiber = null;
         var i: usize = 0;
@@ -235,6 +269,7 @@ pub const Watermark = struct {
                 i += 1;
                 continue;
             }
+            if (why == .reset) e.reset = true;
             e.fiber.waker_next = to_wake;
             to_wake = e.fiber;
             _ = self.waiters.swapRemove(i);

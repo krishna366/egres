@@ -4,7 +4,7 @@ const fiber = @import("zfiber");
 /// Fresh monotonic ms — same source `Deadlines.register` / `onTimer`
 /// use. Direct vDSO read; no cache lag under load.
 fn nowMs() i64 {
-    return fiber.clockMsUseRarely(.monotonic);
+    return fiber.timestampNow(.monotonic, .millis);
 }
 
 /// Minimal `on_fire` context: stamps WHEN the timeout fired. `Timeout` is a

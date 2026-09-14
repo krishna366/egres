@@ -539,6 +539,45 @@ pub fn RWMutex(comptime track: Track) type {
 /// One waiter at a time. Two fibers calling `wait` concurrently is
 /// undefined; build on top of `WaitQueue` directly if you need a
 /// multi-waiter event.
+/// Work that is either running or done, with any number of fibers
+/// waiting for done: `setRunning` at the start, `setDone` at the end,
+/// `waitForDone` from anyone, any time. Mutex + Condition underneath:
+/// the state lives under the mutex, so a wait that races the finish
+/// is not lost. One piece of work at a time; the transitions assert it.
+pub const Event = struct {
+    mu: Mutex(.untracked) = .{},
+    cond: Condition = .{},
+    running: bool = false,
+
+    pub fn setRunning(self: *Event) void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        std.debug.assert(!self.running);
+        self.running = true;
+    }
+
+    pub fn setDone(self: *Event) void {
+        self.mu.lock(@src());
+        std.debug.assert(self.running);
+        self.running = false;
+        self.mu.unlock();
+        self.cond.broadcast();
+    }
+
+    pub fn isRunning(self: *Event) bool {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        return self.running;
+    }
+
+    /// Returns at once when nothing is running.
+    pub fn waitForDone(self: *Event) void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        while (self.running) self.cond.wait(&self.mu);
+    }
+};
+
 pub const Notify = struct {
     sl: Spinlock = .{},
     waiter: ?*Fiber = null,

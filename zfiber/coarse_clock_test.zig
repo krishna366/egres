@@ -10,9 +10,9 @@ test "CoarseClock: ms() advances during a parked fiber's sleep" {
     // current. Under heavy parallel load the tick can lag, making
     // `coarseMs` deltas under-report by 10+ ms even when the sleep
     // ran fine. We sidestep that here by reading a fresh clock.
-    const before_ms = fiber.clockMsUseRarely(.monotonic);
+    const before_ms = fiber.timestampNow(.monotonic, .millis);
     fiber.sleepMs(30);
-    const after_ms = fiber.clockMsUseRarely(.monotonic);
+    const after_ms = fiber.timestampNow(.monotonic, .millis);
     const observed_delta = after_ms - before_ms;
 
     if (observed_delta < 25 or observed_delta >= 250) {

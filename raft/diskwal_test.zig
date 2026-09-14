@@ -1,4 +1,5 @@
 const std = @import("std");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const String = utils.String;
 const raft = @import("raft");
@@ -138,7 +139,7 @@ test "diskwal term and index basics" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
     const log = &ds;
 
@@ -165,7 +166,7 @@ test "diskwal entriesRange max_bytes keeps at least one" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
     const log = &ds;
 
@@ -194,7 +195,7 @@ test "diskwal append overwrites conflicting suffix" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
     const log = &ds;
 
@@ -226,7 +227,7 @@ test "diskwal truncateFrom drops suffix" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
     const log = &ds;
 
@@ -249,7 +250,7 @@ test "diskwal persists hardstate and entries across reopen" {
     }
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
         try log.setHardState(.{
@@ -262,7 +263,7 @@ test "diskwal persists hardstate and entries across reopen" {
     }
 
     {
-        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds2.deinit();
         const log2 = &ds2;
         try std.testing.expectEqual(@as(u64, 2), log2.lastIndex());
@@ -287,7 +288,7 @@ test "diskwal drops malformed trailing wal files on reopen" {
 
     // Write enough entries to trigger a rotation, producing at least 2 WAL files.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
         for (1..70) |i| {
@@ -325,10 +326,10 @@ test "diskwal drops malformed trailing wal files on reopen" {
     // Reopen — the malformed current file should be dropped. The previous
     // rotated file becomes current and its entries should survive.
     {
-        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds2.deinit();
         const log = &ds2;
-        // Should have entries from the rotated file (at least the first segment's worth).
+        // Should have entries from the rotated file (at least the first log file's worth).
         try std.testing.expect(log.lastIndex() > 0);
     }
 }
@@ -348,7 +349,7 @@ test "diskwal tolerates WAL firstIndex below snapshot+1 on reopen" {
     }
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
         try log.setSnapshot(.{ .index = 5, .term = 2, .data = "snap" });
@@ -356,7 +357,7 @@ test "diskwal tolerates WAL firstIndex below snapshot+1 on reopen" {
     }
 
     // Used to error.CorruptLogFile; now succeeds.
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
 }
 
@@ -368,11 +369,11 @@ test "BIG: diskwal storage" {
         alloc.free(wal_dir);
     }
 
-    // Keep this large enough to cross a segment boundary.
+    // Keep this large enough to cross a log file boundary.
     const N: u64 = 62_000;
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
 
@@ -407,7 +408,7 @@ test "BIG: diskwal storage" {
     }
 
     {
-        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds2.deinit();
         const log2 = &ds2;
         try std.testing.expectEqual(@as(u64, 60_099), log2.lastIndex());
@@ -425,28 +426,31 @@ test "BIG: diskwal truncate storage" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    // 2 MiB log files (1 MiB past the header): about 16k of these
+    // ~64-byte records each.
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{ .log_file_size = 2 << 20 });
     defer ds.deinit();
     const log = &ds;
 
-    const num_entries: u64 = (raft.diskwal.max_num_entries * 3) / 2;
-    const compact_to: u64 = raft.diskwal.max_num_entries + 10;
+    const per_log_file: u64 = 20_000;
+    const num_entries: u64 = (per_log_file * 3) / 2;
+    const compact_to: u64 = per_log_file + 10;
 
-    // Fill across segment boundaries.
+    // Fill across log file boundaries.
     try appendRange(alloc, log, 1, num_entries, 1);
     try std.testing.expectEqual(num_entries, log.lastIndex());
     try checkRange(log, 1, num_entries + 1);
 
-    // Compaction here is segment-granular. Compact beyond first segment so
+    // Compaction here is log file-granular. Compact beyond first log file so
     // early indices become unavailable.
     try log.compactUntil(compact_to);
     try std.testing.expectEqual(@as(?u64, null), try log.term(1));
     const first_after_compact = log.firstIndex();
     try checkRange(log, first_after_compact, num_entries + 1);
 
-    // Append one more full-segment worth and verify full retained range.
-    try appendRange(alloc, log, num_entries + 1, num_entries + raft.diskwal.max_num_entries, 2);
-    const new_last = num_entries + raft.diskwal.max_num_entries;
+    // Append one more full-log file worth and verify full retained range.
+    try appendRange(alloc, log, num_entries + 1, num_entries + per_log_file, 2);
+    const new_last = num_entries + per_log_file;
     try std.testing.expectEqual(new_last, log.lastIndex());
     try std.testing.expectEqual(@as(?u64, 2), try log.term(new_last));
     try checkRange(log, first_after_compact, new_last + 1);
@@ -467,21 +471,21 @@ test "BIG: diskwal large payload rotation" {
     defer alloc.free(payload);
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
 
         var idx: u64 = 1;
         while (idx <= total_entries) : (idx += 1) {
             fillLargePayload(payload, idx);
-            // Use term=index to exercise varying term persistence across segments.
+            // Use term=index to exercise varying term persistence across log files.
             try appendEntry(alloc, log, idx, idx, payload);
         }
         try log.sync();
 
         try std.testing.expectEqual(total_entries, log.lastIndex());
 
-        // 150 x 4MiB should span exactly 3 WAL segment files with current limits.
+        // 150 x 4MiB should span exactly 3 WAL log files with current limits.
         try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
 
         // Validate reads that cross file boundaries.
@@ -518,7 +522,7 @@ test "BIG: diskwal large payload rotation" {
 
     // Reopen and verify recovery paths over the same boundary ranges.
     {
-        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds2.deinit();
         const log2 = &ds2;
 
@@ -542,7 +546,7 @@ test "BIG: diskwal large payload rotation" {
         }
 
         // Overwrite from an older index after reopen. This should truncate the
-        // suffix and drop the highest segment file, leaving two WAL files.
+        // suffix and drop the highest log file, leaving two WAL files.
         fillLargePayload(payload, 100);
         try appendEntry(alloc, log2, 100, 100, payload);
         try log2.sync();
@@ -721,7 +725,7 @@ test "diskwal CURRENT.wal recovery after clean close" {
 
     // Write 5 entries and close.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
         try appendRange(alloc, log, 1, 5, 1);
@@ -730,7 +734,7 @@ test "diskwal CURRENT.wal recovery after clean close" {
 
     // Reopen — CURRENT.wal should be recovered via CRC scan.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
 
@@ -753,7 +757,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
 
     // Write 5 entries.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
         try appendRange(alloc, log, 1, 5, 1);
@@ -791,7 +795,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
 
     // Reopen — should recover only entries 1 and 2.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
 
@@ -804,7 +808,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
 
 test "diskwal writeHeader/readHeader round-trip" {
     // Drive writeHeader and readHeader directly (no DiskWAL wrapper, no
-    // data-region records). Verifies that a logFile's in-memory slots
+    // data-region records). Verifies that a LogFile's in-memory slots
     // survive a serialize/deserialize cycle through the on-disk WalHeader,
     // covering both the empty-slots case (freshly created) and the
     // populated case (multiple appended data slots).
@@ -817,12 +821,12 @@ test "diskwal writeHeader/readHeader round-trip" {
 
     const vfs_inst = vfs.g();
 
-    var lf = try raft.diskwal.logFile.createCurrent(vfs_inst, alloc, wal_dir, 1);
+    var lf = try raft.diskwal.LogFile.createCurrent(vfs_inst, alloc, wal_dir, 1, .{ .log_file_size = 4 << 20 });
     defer lf.deinit();
 
     // Empty case: createCurrent writes a WalHeader with no data slots.
     {
-        var slots = try raft.diskwal.logFile.readHeader(alloc, lf.handle);
+        var slots = try raft.diskwal.LogFile.readHeader(alloc, lf.handle);
         defer slots.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), slots.items.len);
     }
@@ -849,7 +853,7 @@ test "diskwal writeHeader/readHeader round-trip" {
     try lf.writeHeader();
 
     {
-        var slots = try raft.diskwal.logFile.readHeader(alloc, lf.handle);
+        var slots = try raft.diskwal.LogFile.readHeader(alloc, lf.handle);
         defer slots.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 2), slots.items.len);
 
@@ -897,7 +901,7 @@ test "diskwal findIndexOlderThan bytes-only branch" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
 
     // 10 entries with 1 KiB payload each = 10 KiB total tail.
@@ -929,7 +933,7 @@ test "diskwal findIndexOlderThan age-only branch" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
 
     const now_secs: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
@@ -964,7 +968,7 @@ test "diskwal findIndexOlderThan returns larger of bytes and age" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
 
     const now_secs: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
@@ -994,15 +998,15 @@ test "diskwal findIndexOlderThan returns null on empty WAL" {
         alloc.free(wal_dir);
     }
 
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
     defer ds.deinit();
     try std.testing.expectEqual(@as(?u64, null), ds.findIndexOlderThan(1, 1));
 }
 
 test "diskwal rotation creates numbered file and new CURRENT.wal" {
     // Fill entries until rotation is triggered, then verify:
-    // - A numbered .wal file exists (rotated segment)
-    // - CURRENT.wal exists (new active segment)
+    // - A numbered .wal file exists (rotated log file)
+    // - CURRENT.wal exists (new active log file)
     // - All entries are readable across the boundary
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
@@ -1012,12 +1016,12 @@ test "diskwal rotation creates numbered file and new CURRENT.wal" {
     }
 
     // Write enough large entries to trigger rotation.
-    // Each entry ~4 MiB, log_file_size is 256 MiB, so ~64 entries should fill a segment.
+    // Each entry ~4 MiB; with 32 MiB log files a handful fills one.
     const payload_size: usize = 4 * 1024 * 1024;
     const num_entries: u64 = 70; // enough to trigger at least one rotation
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
 
@@ -1038,7 +1042,7 @@ test "diskwal rotation creates numbered file and new CURRENT.wal" {
 
     // Reopen and verify all entries survived rotation + recovery.
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, 1024);
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
         defer ds.deinit();
         const log = &ds;
 
@@ -1048,4 +1052,113 @@ test "diskwal rotation creates numbered file and new CURRENT.wal" {
         try std.testing.expectEqual(@as(?u64, num_entries), try log.term(num_entries));
         try std.testing.expectEqual(@as(?u64, 35), try log.term(35));
     }
+}
+
+test "diskwal: no prezero (copy-on-write filesystem setting)" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const opts: raft.diskwal.OpenOptions = .{
+        .log_file_size = 2 << 20,
+        .prezero = .false,
+    };
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        try appendRange(alloc, &ds, 1, 40_000, 1);
+        try ds.sync();
+        try std.testing.expect(try countWalFiles(wal_dir) >= 2);
+    }
+    // Log files were not zero-filled: the rotated one holds its data
+    // and nothing past it; the current one is only as big as its data.
+    var ds2 = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+    defer ds2.deinit();
+    try std.testing.expectEqual(@as(u64, 40_000), ds2.lastIndex());
+    try checkRange(&ds2, 1, 40_001);
+}
+
+fn dirHas(path: String, name: String) !bool {
+    var it = try vfs.iterateDir(path);
+    defer it.deinit();
+    while (try it.next()) |entry_dir| {
+        if (std.mem.eql(u8, entry_dir.name, name)) return true;
+    }
+    return false;
+}
+
+test "diskwal prepared log file: renamed in at rotation, a stray one removed at open" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    // 2 MiB log files: 1 MiB of records past the header. Zero-filled
+    // even on tmpfs, so the fill path runs wherever the tests do.
+    const opts: raft.diskwal.OpenOptions = .{ .log_file_size = 2 << 20, .prezero = .true };
+    const payload = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(payload);
+
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        // Prepare log file 2 as the sync fiber would, and let it finish.
+        ds.wal_store.next.prepare();
+        while (!ds.wal_store.next.isReady()) fiber.yield();
+        try std.testing.expect(try dirHas(wal_dir, "00002.wal.tmp"));
+        try std.testing.expect(!try dirHas(wal_dir, "00002.wal"));
+
+        // Four 300 KiB records cross 1 MiB: the fourth rotates.
+        for (1..5) |i| {
+            fillLargePayload(payload, @intCast(i));
+            try appendEntry(alloc, &ds, @intCast(i), 1, payload);
+        }
+        try ds.sync();
+        try std.testing.expect(try dirHas(wal_dir, "00002.wal"));
+        try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
+        try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
+    }
+    // A prepared log file left behind by a crash is removed at open, and
+    // the log files around it are untouched.
+    {
+        var stray = try raft.diskwal.LogFile.createNamed(vfs.g(), alloc, wal_dir, "00003.wal.tmp", 3, opts);
+        stray.deinit();
+    }
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        try std.testing.expect(!try dirHas(wal_dir, "00003.wal.tmp"));
+        try std.testing.expectEqual(@as(u64, 4), ds.lastIndex());
+        for (1..5) |i| try std.testing.expectEqual(@as(?u64, 1), try ds.term(@intCast(i)));
+        fillLargePayload(payload, 5);
+        try appendEntry(alloc, &ds, 5, 1, payload);
+        try ds.sync();
+    }
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        try std.testing.expectEqual(@as(u64, 5), ds.lastIndex());
+        for (1..6) |i| try std.testing.expectEqual(@as(?u64, 1), try ds.term(@intCast(i)));
+    }
+}
+
+test "diskwal Prezero: true and false are fixed, auto reads the filesystem" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const Prezero = raft.diskwal.Prezero;
+    try std.testing.expectEqual(Prezero.true, Prezero.true.resolve(wal_dir));
+    try std.testing.expectEqual(Prezero.false, Prezero.false.resolve(wal_dir));
+    const magic = vfs.fsMagic(wal_dir) orelse return error.TestUnexpectedResult;
+    const want: Prezero = switch (magic) {
+        vfs.fs_magic.zfs, vfs.fs_magic.btrfs, vfs.fs_magic.tmpfs => .false,
+        else => .true,
+    };
+    try std.testing.expectEqual(want, Prezero.auto.resolve(wal_dir));
 }

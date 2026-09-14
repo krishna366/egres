@@ -6,7 +6,6 @@ const m = @import("metrics");
 const flags = @import("flags");
 const utils = @import("raft").utils;
 const String = utils.String;
-const WaitGroup = utils.WaitGroup;
 
 /// `--snapshot` — Raft snapshot triggers and polling cadence. The leader's
 /// snapshot loop reads these every iteration so operators can tune at
@@ -223,7 +222,15 @@ pub const StorageImpl = struct {
         log.info("applyManifestChange enter idx={d} cmd={t} mt={d} tcs={d}", .{
             index, mcs.cmd, mcs.memtable_id, mcs.sstable_changes.len,
         });
-        defer log.info("applyManifestChange exit  idx={d} cmd={t}", .{ index, mcs.cmd });
+        // The apply fiber applies everything in order: a slow manifest
+        // apply holds every data entry behind it. Log how long each took.
+        const t0 = fiber.timestampNow(.monotonic, .micros);
+        defer {
+            const t1 = fiber.timestampNow(.monotonic, .micros);
+            log.info("applyManifestChange exit  idx={d} cmd={t} took={d}us", .{
+                index, mcs.cmd, t1 - t0,
+            });
+        }
 
         switch (mcs.cmd) {
             .new_memtable => try self.forest.newMemtable(mcs.memtable_id, index),
@@ -383,23 +390,6 @@ pub const InFlight = struct {
 /// How far a propose blocks: `commit` = replicated to a quorum (durable +
 /// ordered); `apply` = also applied to this node's state (locally readable).
 pub const Wait = enum { commit, apply };
-
-/// Blocks a `.commit` propose until the commit callback fires. Single waiter
-/// (the proposer) + single notifier (the callback), and `Notify` handles the
-/// notify-before-park race via its `pending` flag — no counter/init like a
-/// WaitGroup. The proposer only parks after a successful propose, and raft
-/// resolves every accepted proposal (commit or step-down), so it always wakes.
-const CommitWait = struct {
-    done: fiber.Notify = .{},
-    status: raft.CommitStatus,
-};
-
-fn onCommitWait(ctx_raw: *anyopaque, entry: raft.Entry, status: raft.CommitStatus) void {
-    _ = entry;
-    const ctx: *CommitWait = @ptrCast(@alignCast(ctx_raw));
-    ctx.status = status;
-    ctx.done.notify();
-}
 
 /// The glue binding `zdb` (the forest) and `raft` (the node) into one
 /// replicated storage unit: writes flow through raft and apply into the forest,
@@ -929,6 +919,7 @@ pub const Engine = struct {
                 continue;
             };
             if (reader.entryType() != .manifest) continue;
+
             const payload = reader.data();
             if (payload.len == 0) continue;
             const parsed = zdb_bufs.parseMessageWithTail(payload) catch |err| {
@@ -942,6 +933,7 @@ pub const Engine = struct {
                         mcs.deinit(self.allocator);
                         self.allocator.destroy(mcs);
                     }
+                    try replayNames(&draft, mcs.*);
                     try draft.commit(mcs.sstable_changes, mcs.tree_changes);
                 },
                 else => continue,
@@ -969,6 +961,45 @@ pub const Engine = struct {
             .oldest_memtable_index = oldest,
         });
         log.info("snapshot proposed: index={d} term={d} bytes={d}", .{ target, target_term, data.len });
+    }
+
+    /// The manifest-state effects of a change beyond its tree and table
+    /// lists — the namespace and table id counters and both name
+    /// registries — exactly as the live apply path produces them
+    /// (Forest.applyNamespaceCreate / applyCreateTree / applyDropTree /
+    /// applyDropNamespace). A snapshot draft must replay these too: the
+    /// WAL below the snapshot is gone after a restart, so a name that is
+    /// not in the snapshot is lost and its database or table becomes
+    /// unreachable even though its rows are all there.
+    ///
+    /// TODO: We probably should move table names over to the table schema, and
+    /// avoid storing them in the MANIFEST.
+    fn replayNames(
+        dst: *manifest.ForestState,
+        mcs: manifest.ManifestChange,
+    ) !void {
+        const treeTableId = zdb.kv.treeTableId;
+        switch (mcs.cmd) {
+            .create_ns => for (mcs.tree_changes) |tc| {
+                if (tc.op != .create) continue;
+                dst.advanceNamespace(tc.namespace_id);
+                try dst.registerNamespaceName(tc.namespace_id, tc.name);
+            },
+            .create_tree => for (mcs.tree_changes) |tc| {
+                if (tc.op != .create) continue;
+                const table_id = treeTableId(tc.tree_id);
+                try dst.advanceTableId(tc.namespace_id, table_id);
+                try dst.registerTableName(tc.namespace_id, table_id, tc.name);
+            },
+            .drop_tree => for (mcs.tree_changes) |tc| {
+                if (tc.op != .delete) continue;
+                dst.dropTable(tc.namespace_id, treeTableId(tc.tree_id));
+            },
+            .drop_ns => if (mcs.tree_changes.len > 0) {
+                dst.dropNamespace(mcs.tree_changes[0].namespace_id);
+            },
+            else => {},
+        }
     }
 
     /// Single-purpose loop: when leader, propose a `newMemtable` whenever
@@ -1322,10 +1353,9 @@ pub const Engine = struct {
         switch (wait_for) {
             .apply => try self.node.proposeAndWaitForApply(payload, proposal_type),
             .commit => {
-                var ctx = CommitWait{ .status = .committed };
-                try self.node.proposeWithCallback(payload, &onCommitWait, @ptrCast(&ctx), proposal_type);
-                ctx.done.wait();
-                switch (ctx.status) {
+                var w: raft.ProposalWaiter = .{};
+                try self.node.propose(payload, proposal_type, &w);
+                switch (w.wait()) {
                     .committed => {},
                     .not_leader => return error.NotLeader,
                     else => return error.NotCommitted,

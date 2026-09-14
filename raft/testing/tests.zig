@@ -25,8 +25,6 @@ test "all" {
     return error.SkipZigTest;
 }
 
-fn noopCb(_: *anyopaque, _: raft.Entry, _: raft.CommitStatus) void {}
-
 fn defaultConfig() Config {
     return .{
         .id = 1,
@@ -169,15 +167,15 @@ pub fn testConvertToVoterAndLearnerAdjustQuorum() !void {
 
     const quorum_before = leader.quorum_size;
 
-    try leader.proposeConfChange(.{ .change_type = .add_learner, .node_id = 4, .addr = "127.0.0.1:9004" }, &noopCb, undefined);
+    try leader.proposeConfChange(.{ .change_type = .add_learner, .node_id = 4, .addr = "127.0.0.1:9004" }, null);
     cluster.waitForTicks(20);
     try std.testing.expectEqual(quorum_before, leader.quorum_size);
 
-    try leader.proposeConfChange(.{ .change_type = .to_voter, .node_id = 4 }, &noopCb, undefined);
+    try leader.proposeConfChange(.{ .change_type = .to_voter, .node_id = 4 }, null);
     cluster.waitForTicks(20);
     try std.testing.expect(leader.quorum_size > quorum_before);
 
-    try leader.proposeConfChange(.{ .change_type = .to_learner, .node_id = 4 }, &noopCb, undefined);
+    try leader.proposeConfChange(.{ .change_type = .to_learner, .node_id = 4 }, null);
     cluster.waitForTicks(20);
     try std.testing.expectEqual(quorum_before, leader.quorum_size);
 }
@@ -247,29 +245,14 @@ pub fn testProposalCallbackFiresOnCommit() !void {
     defer node.deinit();
     try node.becomeLeader();
 
-    const Ctx = struct {
-        called: bool = false,
-        entry: ?raft.Entry = null,
-        status: ?raft.CommitStatus = null,
-    };
-    const callback = struct {
-        fn run(raw: *anyopaque, entry: raft.Entry, status: raft.CommitStatus) void {
-            const ctx: *Ctx = @ptrCast(@alignCast(raw));
-            ctx.called = true;
-            ctx.entry = entry;
-            ctx.status = status;
-        }
-    };
-
-    var ctx = Ctx{};
-    try node.proposeDataChange("hello", callback.run, &ctx);
+    var w: raft.ProposalWaiter = .{};
+    try node.proposeDataChange("hello", &w);
     _ = try node.processProposalRequests();
-    node.advance();
+    node.advance(); // commits, and finishes the waiter right there
     node.applyCommits();
 
-    try std.testing.expect(ctx.called);
-    try std.testing.expectEqual(@as(u64, 1), (ctx.entry orelse return error.Invalid).index);
-    try std.testing.expectEqual(raft.CommitStatus.committed, ctx.status orelse return error.Invalid);
+    try std.testing.expectEqual(raft.CommitStatus.committed, w.wait());
+    try std.testing.expectEqual(@as(u64, 1), w.entry.index);
 }
 
 // ---- Transport helpers ----
@@ -341,29 +324,9 @@ pub fn testTransportProcessesProposal() !void {
     }
     try group.spawn(.{}, runRaftRuntime, .{&rt});
 
-    const Ctx = struct {
-        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    };
-    const callback = struct {
-        fn run(raw: *anyopaque, _: raft.Entry, _: raft.CommitStatus) void {
-            const ctx: *Ctx = @ptrCast(@alignCast(raw));
-            ctx.done.store(true, .seq_cst);
-        }
-    };
-
-    var ctx = Ctx{};
-    try node.proposeDataChange("transport-cb", callback.run, &ctx);
-
-    var observed = false;
-    for (0..500) |_| {
-        if (ctx.done.load(.seq_cst)) {
-            observed = true;
-            break;
-        }
-        fiber.sleepMs(10);
-    }
-
-    try std.testing.expect(observed);
+    var w: raft.ProposalWaiter = .{};
+    try node.proposeDataChange("transport-cb", &w);
+    try std.testing.expectEqual(raft.CommitStatus.committed, w.wait());
     node.shutdown.start();
 }
 
@@ -414,12 +377,10 @@ pub fn testProposeAfterShutdownReturnsQueueClosed() !void {
     defer node.deinit();
 
     node.shutdown.start();
-    const callback = struct {
-        fn run(_: *anyopaque, _: raft.Entry, _: raft.CommitStatus) void {}
-    };
+    var w: raft.ProposalWaiter = .{};
     try std.testing.expectError(
         raft.RaftError.QueueClosed,
-        node.proposeDataChange("x", callback.run, undefined),
+        node.proposeDataChange("x", &w),
     );
 }
 

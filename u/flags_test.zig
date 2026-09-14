@@ -424,3 +424,27 @@ test "registry: concurrent updates same module are serialised" {
     try std.testing.expectEqual(@as(u16, 0), err_flag.load(.acquire));
     try std.testing.expectEqual(@as(u64, 4 * 100), raft.version());
 }
+
+const ModeCfg = struct {
+    mode: enum { auto, on, off, true, false } = .auto,
+
+    pub const docs = .{
+        .mode = "auto picks per filesystem.",
+    };
+};
+
+test "enum field: parsed by tag name, rejects anything else" {
+    const alloc = std.testing.allocator;
+    var live = try flags.Live(ModeCfg).init(alloc, "");
+    defer live.deinit();
+    try std.testing.expectEqual(.auto, live.snapshot().mode);
+    try live.update("mode=off");
+    try std.testing.expectEqual(.off, live.snapshot().mode);
+    try std.testing.expectError(error.InvalidEnum, live.update("mode=maybe"));
+    try std.testing.expectEqual(.off, live.snapshot().mode);
+    // `true` and `false` are ordinary tags when the enum declares them.
+    try live.update("mode=true");
+    try std.testing.expectEqual(.true, live.snapshot().mode);
+    try live.update("mode=false");
+    try std.testing.expectEqual(.false, live.snapshot().mode);
+}

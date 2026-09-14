@@ -116,11 +116,38 @@ pub const CommitStatus = enum {
     invalid_req,
 };
 
-pub const ApplyCallback = *const fn (
-    ctx: *anyopaque,
-    entry: Entry,
-    status: CommitStatus,
-) void;
+/// What a proposer holds while its proposal is in flight, and where the
+/// outcome lands. The node fills `entry` when the proposal is appended
+/// (index, term, HLC timestamp), then sets `status` exactly once, at
+/// commit or once this node has applied the entry (`after`), or with a
+/// failure status when the proposal cannot get there, and notifies. The
+/// proposer parks in `wait`, and keeps the struct alive until then.
+pub const ProposalWaiter = struct {
+    /// When the waiter is finished: at commit (durable on a quorum), or
+    /// once this node has applied the entry. The apply fiber finishes an
+    /// apply waiter right after the entry, so the proposer parks once
+    /// instead of waking at commit and parking again for apply.
+    pub const WaitFor = enum { commit, apply };
+
+    wait_for: WaitFor = .commit,
+    entry: Entry = .{ .term = 0, .index = 0 },
+    status: CommitStatus = .shutdown,
+    done: fiber.Notify = .{},
+
+    pub fn wait(self: *ProposalWaiter) CommitStatus {
+        self.done.wait();
+        if (self.entry.index != 0) {
+            _metrics.timeline().record(self.entry.index, .woken, fiber.timestampNow(.monotonic, .micros));
+        }
+        return self.status;
+    }
+
+    /// Node side: the outcome, exactly once.
+    fn finish(self: *ProposalWaiter, status: CommitStatus) void {
+        self.status = status;
+        self.done.notify();
+    }
+};
 
 pub const Node = struct {
     const TimeoutResetReason = enum {
@@ -178,7 +205,7 @@ pub const Node = struct {
 
     state: State,
     /// Commit index. Lockless reads on hot replication paths via `commit_index.load()`;
-    /// applyLoop and callbackLoop block on `commit_index.waitForUntimed(target)`.
+    /// applyLoop blocks on `commit_index.waitForUntimed(target)`.
     /// Initialized in `init` (the fiber Watermark needs an allocator).
     commit_index: Watermark,
     apply_index: std.atomic.Value(u64),
@@ -205,7 +232,18 @@ pub const Node = struct {
 
     prng: std.Random.DefaultPrng,
     proposal_ch: fiber.Channel(ProposalRequest) = undefined,
-    apply_callbacks: fiber.Channel(PendingApply) = undefined,
+    /// Proposals waiting for commit, in index order. `advanceCommitIndex`
+    /// finishes them on the main loop, which is also the only appender,
+    /// so no lock.
+    commit_waiters: std.ArrayList(*ProposalWaiter) = .empty,
+    /// Proposals waiting for apply, in index order; `fireApplied`
+    /// drains them on the apply fiber. `applied_held` is the one
+    /// taken out but not yet due.
+    apply_waiters: fiber.Channel(*ProposalWaiter) = undefined,
+    // applied_held is cached when we receive a waiter but haven't reached its
+    // index yet.
+    applied_held: ?*ProposalWaiter = null,
+
     event_notify: fiber.Notify = .{},
     inbound_ch: fiber.Channel(InboundMsg) = undefined,
     /// One-shot shutdown signal: fire via `shutdown.start()` (POSIX signal,
@@ -247,14 +285,12 @@ pub const Node = struct {
     const proposal_queue_capacity: usize = 4096;
     const ProposalRequest = struct {
         data: []u8,
-        apply_cb: ApplyCallback,
-        ctx: *anyopaque,
         proposal_type: ProposalType = .data,
-    };
-    const PendingApply = struct {
-        entry: Entry,
-        cb: ApplyCallback,
-        ctx: *anyopaque,
+        /// Null: nobody waits (the bootstrap self-add); the entry goes
+        /// into the log and that is all.
+        waiter: ?*ProposalWaiter,
+        /// When it was queued; the timeline gets it once there is an index.
+        proposed_us: i64,
     };
 
     pub fn init(
@@ -300,7 +336,8 @@ pub const Node = struct {
             .applied_ts = Watermark.init(allocator),
         };
         node.proposal_ch = try fiber.Channel(ProposalRequest).initAlloc(allocator, proposal_queue_capacity);
-        node.apply_callbacks = try fiber.Channel(PendingApply).initAlloc(allocator, 1024);
+        node.apply_waiters = try fiber.Channel(*ProposalWaiter).initAlloc(allocator, 1024);
+        node.log.on_written = .{ .ctx = node, .call = onWritten };
         node.inbound_ch = try fiber.Channel(InboundMsg).initAlloc(allocator, 1024);
         node.shutdown = fiber.Shutdown.init(allocator);
         errdefer allocator.destroy(node);
@@ -385,12 +422,13 @@ pub const Node = struct {
         self.proposal_ch.close(.graceful);
         while (self.proposal_ch.tryReceive()) |req| {
             self.allocator.free(req.data);
-            req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
+            self.reject(req, .shutdown);
         } else |_| {}
         self.proposal_ch.deinit();
         self.failAllPendingCallbacks(.shutdown);
-        self.apply_callbacks.close(.immediate);
-        self.apply_callbacks.deinit();
+        self.commit_waiters.deinit(self.allocator);
+        self.apply_waiters.close(.immediate);
+        self.apply_waiters.deinit();
         // Fires start() (idempotent) then joins the signal-watcher fiber (if
         // install() was used) before freeing — nothing stays parked.
         self.shutdown.deinit();
@@ -491,25 +529,6 @@ pub const Node = struct {
         pub const no_file_store: u32 = 5;
     };
 
-    const JoinCtx = struct {
-        done: fiber.Channel(u8) = undefined,
-        status: CommitStatus = .committed,
-
-        fn init(self: *JoinCtx, alloc: std.mem.Allocator) !void {
-            self.done = try fiber.Channel(u8).initAlloc(alloc, 1);
-        }
-
-        fn deinit(self: *JoinCtx) void {
-            self.done.deinit();
-        }
-    };
-
-    fn onJoinCommit(ctx_raw: *anyopaque, _: Entry, status: CommitStatus) void {
-        const ctx: *JoinCtx = @ptrCast(@alignCast(ctx_raw));
-        ctx.status = status;
-        ctx.done.send(1) catch {};
-    }
-
     fn handleJoinRequest(self: *Node, conn: *Serial, payload: String) void {
         const parsed = zen.parseMessageWithTail(payload) catch return;
         switch (parsed) {
@@ -537,29 +556,18 @@ pub const Node = struct {
                     return;
                 }
 
-                var ctx = JoinCtx{};
-                ctx.init(self.allocator) catch {
-                    self.sendJoinResponse(conn, false, self.id, JoinReason.conf_change_rejected);
-                    return;
-                };
-                defer ctx.deinit();
-
+                var w: ProposalWaiter = .{};
                 self.proposeConfChange(.{
                     .change_type = .add_learner,
                     .node_id = @intCast(req.nodeId()),
                     .addr = req.addr(),
-                }, &onJoinCommit, @ptrCast(&ctx)) catch |err| {
+                }, &w) catch |err| {
                     raft_log.err("join proposeConfChange failed: {s}", .{@errorName(err)});
                     self.sendJoinResponse(conn, false, self.id, JoinReason.conf_change_rejected);
                     return;
                 };
-
-                _ = ctx.done.receive() catch {
-                    self.sendJoinResponse(conn, false, self.id, JoinReason.conf_change_rejected);
-                    return;
-                };
-
-                const accepted = ctx.status == .committed or ctx.status == .existing_node;
+                const status = w.wait();
+                const accepted = status == .committed or status == .existing_node;
                 self.sendJoinResponse(conn, accepted, self.id, if (accepted) JoinReason.ok else JoinReason.conf_change_rejected);
             },
             else => {},
@@ -824,7 +832,7 @@ pub const Node = struct {
     /// Build the current conf state from the peers map (including self).
     /// Caller must deinit the returned ConfState.
     /// Apply a `.snapshot` log entry: parse the marshalled SnapshotStruct,
-    /// install via `setSnapshot`, then trim segments below it. Idempotent —
+    /// install via `setSnapshot`, then trim log files below it. Idempotent —
     /// skips if the snapshot index is at or below the current snapshot.
     /// Bypasses the state machine (Forest is updated by normal `.manifest`
     /// apply; this only affects WAL state).
@@ -889,14 +897,10 @@ pub const Node = struct {
         // callers with error.Closed.
         self.commit_index.close();
         self.applied_ts.close();
-        // callbackLoop idles parked on apply_callbacks.receive(), NOT on
-        // commit_index — so closing the watermarks above doesn't wake it. Close
-        // the channel here too or that loop never observes shutdown and
-        // blockingRunAllLoops' join hangs forever. Graceful, not immediate: any
-        // buffered callbacks stay drainable for deinit's failAllPendingCallbacks
-        // to fail with .shutdown (immediate would clear them and wedge their
-        // waiters).
-        self.apply_callbacks.close(.graceful);
+        // Graceful, not immediate: buffered callbacks stay drainable for
+        // deinit's failAllPendingCallbacks to fail with .shutdown
+        // (immediate would clear them and wedge their waiters).
+        self.apply_waiters.close(.graceful);
     }
 
     pub fn isShuttingDown(self: *const Node) bool {
@@ -998,8 +1002,6 @@ pub const Node = struct {
         }
     }
 
-    fn noopCommitCb(_: *anyopaque, _: Entry, _: CommitStatus) void {}
-
     pub fn becomeLeader(self: *Node) RaftError!void {
         if (self.state == .learner) return;
         self.state = .leader;
@@ -1021,7 +1023,7 @@ pub const Node = struct {
                 .change_type = .add_voter,
                 .node_id = self.id,
                 .addr = self.config.listen_addr,
-            }, &noopCommitCb, undefined) catch |err| {
+            }, null) catch |err| {
                 raft_log.err("node {d}: bootstrap self-add failed: {s}", .{ self.id, @errorName(err) });
             };
         }
@@ -1360,6 +1362,9 @@ pub const Node = struct {
             if (entries_to_append.items.len > 0) {
                 dbg("node {d}: appending {d} entries to log", .{ self.id, entries_to_append.items.len });
                 try self.log.append(entries_to_append.items);
+                // TODO: Follower can be optimized to not run sync, and reply
+                // back with synced index. In fact, as synced index advances, it
+                // can reply back to leader without a trigger.
                 try self.log.sync();
             }
         }
@@ -1414,12 +1419,7 @@ pub const Node = struct {
 
     /// Encode a ConfChange and propose it through the normal proposal queue.
     /// For fire-and-forget (e.g., join requests), use a no-op callback.
-    pub fn proposeConfChange(
-        self: *Node,
-        cc: ConfChange,
-        cb: ApplyCallback,
-        ctx: *anyopaque,
-    ) RaftError!void {
+    pub fn proposeConfChange(self: *Node, cc: ConfChange, w: ?*ProposalWaiter) RaftError!void {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
@@ -1435,7 +1435,7 @@ pub const Node = struct {
             .addr = cc.addr,
         });
         _ = try cc_writer.finishWithTail();
-        try self.proposeWithCallback(buf.items, cb, ctx, .conf);
+        try self.propose(buf.items, .conf, w);
     }
 
     /// Marshal a SnapshotStruct as the proposal payload and propose it
@@ -1449,14 +1449,10 @@ pub const Node = struct {
         try self.proposeAndWaitForApply(buf, .snapshot);
     }
 
-    /// Propose a data change (normal mutation) through the raft proposal queue.
-    pub fn proposeDataChange(
-        self: *Node,
-        data: String,
-        cb: ApplyCallback,
-        ctx: *anyopaque,
-    ) RaftError!void {
-        return self.proposeWithCallback(data, cb, ctx, .data);
+    /// Propose a data change (normal mutation) through the raft proposal
+    /// queue; `w` wakes at commit.
+    pub fn proposeDataChange(self: *Node, data: String, w: ?*ProposalWaiter) RaftError!void {
+        return self.propose(data, .data, w);
     }
 
     /// Synchronous propose-and-block-until-applied wrapper. The wait doubles
@@ -1476,56 +1472,36 @@ pub const Node = struct {
     pub fn proposeAndWaitForApply(self: *Node, data: String, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
         const start_ms = fiber.coarseMs();
-        var ctx = WaitCtx{ .status = .committed };
-        // TODO: the ctx.wg should be a notify.
-        ctx.wg.init();
-        ctx.wg.add(1);
-        try self.proposeWithCallback(data, &onWaitCommit, @ptrCast(&ctx), proposal_type);
+        var w: ProposalWaiter = .{ .wait_for = .apply };
+        try self.propose(data, proposal_type, &w);
+        const status = w.wait();
 
-        ctx.wg.wait() catch |err| {
-            raft_log.err("proposeAndWaitForApply: wait for commit failed: {s}", .{@errorName(err)});
-            return error.CommitFailed;
-        };
-
-        const commit_ms = fiber.coarseMs();
-        if (commit_ms - start_ms > 5_000) {
-            raft_log.warn("proposeAndWaitForApply: commit phase slow type={s} ms={d}", .{
-                @tagName(proposal_type), commit_ms - start_ms,
-            });
+        const took_ms = fiber.coarseMs() - start_ms;
+        if (took_ms > 5_000) {
+            // The timeline's slot, if the ring still has it, says where
+            // the time went; `woken` was recorded by `wait`.
+            if (_metrics.timeline().lookup(w.entry.index)) |slot| {
+                raft_log.warn("proposeAndWaitForApply: commit+apply slow type={s} ms={d} index={d}: {f}", .{
+                    @tagName(proposal_type), took_ms, w.entry.index, slot,
+                });
+            } else {
+                raft_log.warn("proposeAndWaitForApply: commit+apply slow type={s} ms={d} index={d}", .{
+                    @tagName(proposal_type), took_ms, w.entry.index,
+                });
+            }
         }
-        if (ctx.status != .committed) return error.NotCommitted;
-        // Wait for applied to catch up to this entry's timestamp. The
-        // tracker's check-and-suspend is atomic under its mutex, so no
-        // advance can slip past us between the check and the wait.
-        self.applied_ts.waitForUntimed(ctx.entry_ts) catch |err| {
-            raft_log.err("proposeAndWaitForApply: wait for apply (ts={d}): {s}", .{ ctx.entry_ts, @errorName(err) });
-            return error.CommitFailed;
-        };
+        if (status != .committed) return error.NotCommitted;
+        // Woken after this node applied the entry (and after applied_ts
+        // moved past it), so there is no second wait.
+        std.debug.assert(self.applied_ts.load() >= w.entry.timestamp);
     }
 
-    const WaitCtx = struct {
-        wg: utils.WaitGroup = .{},
-        status: CommitStatus,
-        entry_ts: u64 = 0,
-    };
-
-    fn onWaitCommit(ctx_raw: *anyopaque, entry: Entry, status: CommitStatus) void {
-        const ctx: *WaitCtx = @ptrCast(@alignCast(ctx_raw));
-        ctx.status = status;
-        ctx.entry_ts = entry.timestamp;
-        ctx.wg.done();
-    }
-
-    pub fn proposeWithCallback(
-        self: *Node,
-        data: String,
-        cb: ApplyCallback,
-        ctx: *anyopaque,
-        proposal_type: ProposalType,
-    ) RaftError!void {
+    /// Queue a proposal for the main loop; `w` gets the outcome (see
+    /// `ProposalWaiter`), or null when nobody wants it.
+    pub fn propose(self: *Node, data: String, proposal_type: ProposalType, w: ?*ProposalWaiter) RaftError!void {
         if (self.isShuttingDown()) return error.QueueClosed;
 
-        // How long proposeWithCallback polls `StateMachine.isReady` before
+        // How long propose polls `StateMachine.isReady` before
         // returning `error.NotReady`. Long enough to absorb startup (recovery +
         // the leader's bootstrap `newMemtable` round-trip), short enough that a
         // client doesn't sit forever if the SM is genuinely stuck.
@@ -1543,9 +1519,9 @@ pub const Node = struct {
         errdefer self.allocator.free(owned);
         self.proposal_ch.trySend(.{
             .data = owned,
-            .apply_cb = cb,
-            .ctx = ctx,
             .proposal_type = proposal_type,
+            .waiter = w,
+            .proposed_us = nowUs(),
         }) catch |err| switch (err) {
             error.ChannelClosed => return error.QueueClosed,
             error.ChannelFull => return error.QueueFull,
@@ -1556,10 +1532,10 @@ pub const Node = struct {
     /// Append the successful subset of `requests` to the leader's log,
     /// assigning each a fresh HLC timestamp under the propose lock so log
     /// order equals timestamp order. Each successfully-appended request's
-    /// apply callback is enqueued into `apply_callbacks`; rejected conf
-    /// changes fire their apply_cb inline and are NOT enqueued. If the
-    /// enqueue fails (channel closed during shutdown), the callback fires
-    /// inline with `.shutdown`.
+    /// waiter is queued (`commit_waiters` or `apply_waiters`);
+    /// rejected conf changes are finished inline and are NOT queued. If
+    /// the queueing fails (channel closed during shutdown), the waiter
+    /// is finished inline with `.shutdown`.
     fn appendProposalsToLeaderLog(
         self: *Node,
         requests: []const ProposalRequest,
@@ -1585,11 +1561,7 @@ pub const Node = struct {
             const is_conf = req.proposal_type == .conf;
             if (is_conf) {
                 if (self.pending_conf_change or has_conf) {
-                    req.apply_cb(
-                        req.ctx,
-                        .{ .term = self.current_term, .index = 0 },
-                        .pending_conf_change,
-                    );
+                    self.reject(req, .pending_conf_change);
                     continue;
                 }
 
@@ -1600,31 +1572,31 @@ pub const Node = struct {
                 switch (ct) {
                     .add_voter, .add_learner, .to_voter, .to_learner, .remove_node, .update_addr => {},
                     .unknown, _ => {
-                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_req);
+                        self.reject(req, .invalid_req);
                         continue;
                     },
                 }
                 // Reject add if addr is missing or unparseable.
                 if (ct == .add_voter or ct == .add_learner) {
                     _ = fiber.net.IpAddress.parseIpAndPort(cc.addr()) catch {
-                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_addr);
+                        self.reject(req, .invalid_addr);
                         continue;
                     };
                     // Allow self-add (bootstrap), reject if peer already exists.
                     // Use update_addr to change an existing peer's address.
                     if (cc.nodeId() != self.id and self.peers.contains(cc.nodeId())) {
-                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .existing_node);
+                        self.reject(req, .existing_node);
                         continue;
                     }
                 }
 
                 if (ct == .update_addr) {
                     _ = fiber.net.IpAddress.parseIpAndPort(cc.addr()) catch {
-                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .invalid_addr);
+                        self.reject(req, .invalid_addr);
                         continue;
                     };
                     if (cc.nodeId() != self.id and !self.peers.contains(cc.nodeId())) {
-                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .unknown_node);
+                        self.reject(req, .unknown_node);
                         continue;
                     }
                 }
@@ -1632,14 +1604,14 @@ pub const Node = struct {
                 // Reject if the target peer doesn't exist for changes that require it.
                 if (ct == .to_voter or ct == .to_learner or ct == .remove_node) {
                     if (cc.nodeId() != self.id and !self.peers.contains(cc.nodeId())) {
-                        req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .unknown_node);
+                        self.reject(req, .unknown_node);
                         continue;
                     }
                 }
 
                 // Reject if this would remove the last voter.
                 if (self.quorum_size <= 1 and (ct == .to_learner or ct == .remove_node)) {
-                    req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .last_voter);
+                    self.reject(req, .last_voter);
                     continue;
                 }
                 has_conf = true;
@@ -1683,14 +1655,16 @@ pub const Node = struct {
             // on channel closed (shutdown) or fiber cancellation — in either
             // case we fire the callback inline with .shutdown so the client
             // isn't left hanging.
-            const pending: PendingApply = .{
-                .entry = .{ .index = index, .term = self.current_term, .timestamp = ts },
-                .cb = req.apply_cb,
-                .ctx = req.ctx,
-            };
-            self.apply_callbacks.send(pending) catch {
-                req.apply_cb(req.ctx, pending.entry, .shutdown);
-            };
+            const tl = _metrics.timeline();
+            tl.record(index, .proposed, req.proposed_us);
+            tl.record(index, .buffered, nowUs());
+            if (req.waiter) |w| {
+                w.entry = .{ .index = index, .term = self.current_term, .timestamp = ts };
+                switch (w.wait_for) {
+                    .commit => self.commit_waiters.append(self.allocator, w) catch w.finish(.shutdown),
+                    .apply => self.apply_waiters.send(w) catch w.finish(.shutdown),
+                }
+            }
 
             index += 1;
         }
@@ -1713,7 +1687,7 @@ pub const Node = struct {
         if (self.isShuttingDown()) {
             while (self.proposal_ch.tryReceive()) |req| {
                 self.allocator.free(req.data);
-                req.apply_cb(req.ctx, .{ .term = self.current_term, .index = 0 }, .shutdown);
+                self.reject(req, .shutdown);
             } else |_| {}
             return 0;
         }
@@ -1733,15 +1707,14 @@ pub const Node = struct {
 
         defer for (batch.items) |req| self.allocator.free(req.data);
 
-        const term = self.current_term;
-        // appendProposalsToLeaderLog enqueues each successful entry's
-        // PendingApply directly into apply_callbacks with the assigned HLC
-        // timestamp. Rejected conf changes already fired their apply_cb inline
-        // from within the function, so there's no per-request loop here.
+        // appendProposalsToLeaderLog queues each successful entry's
+        // waiter with the assigned HLC timestamp. Rejected conf changes
+        // were finished inline from within the function, so there's no
+        // per-request loop here.
         self.appendProposalsToLeaderLog(batch.items) catch |err| switch (err) {
             error.NotLeader => {
                 for (batch.items) |req| {
-                    req.apply_cb(req.ctx, .{ .term = term, .index = 0 }, .not_leader);
+                    self.reject(req, .not_leader);
                 }
                 return batch.items.len;
             },
@@ -1762,12 +1735,11 @@ pub const Node = struct {
         // lane-relative and wraps if the raft lane has < 3 workers.
         var g = fiber.Group(void).init(self.allocator);
         defer g.deinit();
-        try g.ensureTotalCapacity(7);
+        try g.ensureTotalCapacity(6);
 
         try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 0 }, mainLoop, .{ self, self.config.tick_interval_ms });
         try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 1 }, applyLoop, .{self});
         try g.spawn(.{ .lane = .raft, .priority = .high, .worker_id = 2 }, tickLoop, .{ self, self.config.tick_interval_ms });
-        try g.spawn(.{ .lane = .raft }, callbackLoop, .{self});
         try g.spawn(.{ .lane = .raft }, clockTickLoop, .{self});
         try g.spawn(.{ .lane = .raft }, commitPersistLoop, .{self});
         // Reacts to the shutdown signal (from wherever it fires) by closing
@@ -1775,29 +1747,6 @@ pub const Node = struct {
         try g.spawn(.{ .lane = .raft }, shutdownWatchLoop, .{self});
 
         g.wait();
-    }
-
-    /// Fires `apply_callbacks` with `.committed` once each entry commits.
-    /// The channel is in log-index order (populated by
-    /// `appendProposalsToLeaderLog`), so the loop is: pull the next pending
-    /// callback, wait until commit_index catches up to its index, fire.
-    pub fn callbackLoop(self: *Node) void {
-        while (!self.isShuttingDown()) {
-            const ready = self.apply_callbacks.receive() catch |err| {
-                if (err != error.ChannelClosed) {
-                    raft_log.err("callbackLoop: receive: {s}", .{@errorName(err)});
-                }
-                return;
-            };
-            self.commit_index.waitForUntimed(ready.entry.index) catch |err| {
-                if (err != error.Closed) {
-                    raft_log.err("callbackLoop: waitFor commit >= {d}: {s}", .{ ready.entry.index, @errorName(err) });
-                }
-                ready.cb(ready.ctx, ready.entry, .shutdown);
-                return;
-            };
-            ready.cb(ready.ctx, ready.entry, .committed);
-        }
     }
 
     pub fn applyLoop(self: *Node) void {
@@ -1831,7 +1780,9 @@ pub const Node = struct {
 
         while (ai < ci) {
             utils.logEvery(1, "applyCommits progress: ai={d} ci={d} remaining={d}", .{ ai, ci, ci - ai });
+            const now = nowUs();
             var result = self.log.entriesRange(.{ .lo = ai + 1, .hi = ci + 1, .max_bytes = max_apply_bytes }) catch return;
+            _metrics.g().observeStage("entries_range", nowUs() - now);
             defer result.deinit();
             if (result.entries.len == 0) return;
 
@@ -1847,6 +1798,10 @@ pub const Node = struct {
                         // the apply path is the bottleneck when commit
                         // outpaces apply.
                         const t_apply = fiber.coarseMs();
+                        // Timeline: queueing behind earlier entries, and the
+                        // apply call itself, split.
+                        const picked_us = nowUs();
+                        _metrics.timeline().record(entry.index, .picked, picked_us);
                         const sm_entry = Entry{
                             .index = entry.index,
                             .term = entry.term,
@@ -1876,6 +1831,10 @@ pub const Node = struct {
                             break;
                         }
                         _metrics.g().observePhase("apply", t_apply);
+                        _metrics.g().observeStage(
+                            if (ety == .manifest) "apply_manifest" else "apply_data",
+                            nowUs() - picked_us,
+                        );
                     }
                 } else if (ety == .snapshot and reader.data().len > 0) {
                     self.applySnapshotEntry(reader.data()) catch |err| {
@@ -1883,6 +1842,7 @@ pub const Node = struct {
                     };
                 }
                 ai = entry.index;
+                _metrics.timeline().record(ai, .apply, nowUs());
                 self.apply_index.store(ai, .release);
                 // Advance applied AFTER the state machine has applied the
                 // entry (or is a no-op for empty-data ticks). Matches the
@@ -1890,15 +1850,31 @@ pub const Node = struct {
                 // timestamp <= T is visible." advance() broadcasts under
                 // its own lock, so no reader can be mid-(check, suspend).
                 self.applied_ts.advance(reader.timestamp());
-                // Proposal callbacks fire from `callbackLoop` as soon as
-                // commit advances — they do not wait for the state-machine
-                // apply.
+                // Apply waiters wake here, after the entry is applied and
+                // `applied_ts` has passed it; commit waiters woke in
+                // `advanceCommitIndex`, without waiting for apply.
+                self.processApplyWaiters(ai);
             }
         }
         dbg(
             "applyCommits.2 ticks: {d} node {d}: applyCommits ai={d} ci={d}",
             .{ self.tick_count, self.id, ai, ci },
         );
+    }
+
+    /// Fire the apply-time callbacks of every entry at or below `ai`,
+    /// in index order (they were enqueued in it). Apply fiber only.
+    fn processApplyWaiters(self: *Node, ai: u64) void {
+        while (true) {
+            const w = self.applied_held orelse
+                (self.apply_waiters.tryReceive() catch return);
+            if (w.entry.index > ai) {
+                self.applied_held = w;
+                return;
+            }
+            self.applied_held = null;
+            w.finish(.committed);
+        }
     }
 
     /// Tick loop: periodically notifies the event notifier to trigger raft processing.
@@ -1926,6 +1902,7 @@ pub const Node = struct {
         while (!self.isShuttingDown()) {
             fiber.sleepMs(poll);
             if (!self.isLeader()) continue;
+
             const last_ts = utils.hlc.HLC.fromU64(self.log.lastTimestamp());
             const wall_sec: u32 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).toSeconds());
             if (wall_sec <= last_ts.seconds) continue;
@@ -1936,12 +1913,22 @@ pub const Node = struct {
         }
     }
 
-    /// Helper used by mainLoop to spawn the WAL fsync into a sub-fiber so
-    /// the leader can broadcast AppendEntries while the local sync is in
-    /// flight (Raft paper §7 pipelining). Passes `log_grew` so the fiber
-    /// is a fast no-op on iterations that didn't append anything new.
-    fn syncLogTask(self: *Node) RaftLogError!void {
-        return self.log.sync();
+    /// The WAL writer fiber's report after each batch: mark the
+    /// timeline and poke mainLoop, whose advance() commits through
+    /// `log.syncedIndex()`. The leader appends and broadcasts while the
+    /// disk is busy (Raft paper §7 pipelining).
+    fn onWritten(ctx: *anyopaque, written: DiskWAL.Written) void {
+        const self: *Node = @ptrCast(@alignCast(ctx));
+        const tl = _metrics.timeline();
+        tl.recordRange(written.first_index, written.last_index, .write_start, written.started_us);
+        tl.recordRange(written.first_index, written.last_index, .write_end, written.done_us);
+        self.event_notify.notify();
+    }
+
+    /// The timeline's clock: monotonic microseconds, since it only
+    /// takes differences.
+    fn nowUs() i64 {
+        return fiber.timestampNow(.monotonic, .micros);
     }
 
     /// Main processing loop. Blocks on the event notifier, drains inbound messages,
@@ -1981,32 +1968,10 @@ pub const Node = struct {
             _metrics.g().observePhase("propose", t);
             const log_grew = self.log.lastIndex() > last_before;
 
-            // Spawn WAL fsync into a sub-fiber so it can overlap with
-            // broadcast (Raft paper §7 pipelining). `addEntries` already
-            // populated cache + write_buf; the spawned `sync()` does the
-            // pwrite (durable due to O_DSYNC) on a separate fiber.
-            var sync_handle = fiber.spawn(
-                .{ .lane = .raft },
-                syncLogTask,
-                .{self},
-            ) catch @panic("fiber.spawn syncLogTask");
-            // Tracks whether we still need to join the sync handle. Set to
-            // false in the q==1 branch (where we wait early). We capture
-            // this decision *before* advance(), since advance can apply
-            // conf changes that mutate quorum_size mid-iteration.
-            var sync_pending: bool = true;
-
-            // When quorum_size == 1, advance() would commit through the
-            // just-appended (unsynced) entries since the leader is sole
-            // voter. Wait for sync before advance in that case.
-            if (self.quorum_size == 1) {
-                t = fiber.coarseMs();
-                sync_handle.join() catch |err| {
-                    raft_log.err("node {d}: sync_handle.join (pre-advance) failed: {s}", .{ self.id, @errorName(err) });
-                };
-                _metrics.g().observePhase("log_sync_q_one", t);
-                sync_pending = false;
-            }
+            // The appends above went to the WAL's write buffer and asked
+            // its writer fiber for a round; `onWritten` pokes this loop
+            // after each batch, and advance() below commits only through
+            // `log.syncedIndex()`. mainLoop never waits on the disk.
 
             // Phase: advance — advanceCommitIndex + applyConfChanges + notify.
             t = fiber.coarseMs();
@@ -2027,18 +1992,6 @@ pub const Node = struct {
             t = fiber.coarseMs();
             self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
             _metrics.g().observePhase("broadcast", t);
-
-            // Phase: sync_wait — time waiting for the sync fiber to finish
-            // AFTER broadcast already completed. Near-zero when sync fully
-            // overlapped broadcast; positive when broadcast finished first
-            // and we're still waiting on disk.
-            if (sync_pending) {
-                t = fiber.coarseMs();
-                sync_handle.join() catch |err| {
-                    raft_log.err("node {d}: sync_handle.join (post-broadcast) failed: {s}", .{ self.id, @errorName(err) });
-                };
-                _metrics.g().observePhase("log_sync_q_many", t);
-            }
         }
     }
 
@@ -2225,7 +2178,8 @@ pub const Node = struct {
         defer matches.deinit(self.allocator);
 
         // Leader always has its own log up to lastIndex.
-        matches.append(self.allocator, self.log.lastIndex()) catch return;
+        // The leader's own vote: what is durable, not what is appended.
+        matches.append(self.allocator, self.log.syncedIndex()) catch return;
 
         var it = self.peers.valueIterator();
         while (it.next()) |peer| {
@@ -2243,16 +2197,35 @@ pub const Node = struct {
 
         const term = self.log.term(candidate) catch return orelse return;
         if (term != self.current_term) return;
+
+        const prev = self.commit_index.load();
         self.commit_index.advance(candidate);
+        _metrics.timeline().recordRange(prev + 1, candidate, .commit, nowUs());
+
+        self.processCommitWaiters(candidate);
+    }
+
+    /// Fire the commit callbacks of every pending proposal at or below
+    /// `ci`, in index order. Main loop only. Everything queued is this
+    /// leader's: the leader commits only entries of its own term, and a
+    /// step-down fails the queue before the term changes.
+    fn processCommitWaiters(self: *Node, ci: u64) void {
+        var n: usize = 0;
+        for (self.commit_waiters.items) |w| {
+            if (w.entry.index > ci) break;
+            w.finish(.committed);
+            n += 1;
+        }
+        if (n > 0) self.commit_waiters.replaceRangeAssumeCapacity(0, n, &.{});
     }
 
     // commit_index advances when leader sees a quorum match.
     // apply_index advances when entries are applied to the state machine (via callbacks).
     // conf_applied_index advances when conf changes are applied to raft membership.
     //
-    // `commit_index.advance()` broadcasts internally on a real advance, so both
-    // applyLoop (state-machine apply) and callbackLoop (proposal-callback firing)
-    // are woken without a separate notify call.
+    // `commit_index.advance()` broadcasts internally on a real advance, so
+    // applyLoop (state-machine apply) is woken without a separate notify
+    // call; proposal commit callbacks fire right there in advanceCommitIndex.
     pub fn advance(self: *Node) void {
         self.advanceCommitIndex();
         self.applyConfChanges();
@@ -2471,10 +2444,23 @@ pub const Node = struct {
     }
 
     fn failAllPendingCallbacks(self: *Node, status: CommitStatus) void {
-        while (true) {
-            const head = self.apply_callbacks.tryReceive() catch break;
-            head.cb(head.ctx, head.entry, status);
+        for (self.commit_waiters.items) |w| w.finish(status);
+        utils.clearRetainCap(&self.commit_waiters);
+        if (self.applied_held) |w| {
+            self.applied_held = null;
+            w.finish(status);
         }
+        while (true) {
+            const head = self.apply_waiters.tryReceive() catch break;
+            head.finish(status);
+        }
+    }
+
+    /// A proposal that never reached the log: no index, this term.
+    fn reject(self: *Node, req: ProposalRequest, status: CommitStatus) void {
+        const w = req.waiter orelse return;
+        w.entry = .{ .term = self.current_term, .index = 0 };
+        w.finish(status);
     }
 
     // TESTING ONLY

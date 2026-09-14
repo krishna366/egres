@@ -59,7 +59,7 @@ fn benchOne(
     const dir = try tmp.dir.realPathFileAlloc(io, ".", b.alloc);
     defer b.alloc.free(dir);
 
-    var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, 0);
+    var dwal = try diskwal.DiskWAL.openPath(dir, b.alloc, .{ .cache_capacity = 0 });
     defer dwal.deinit();
 
     const payload = try b.alloc.alloc(u8, payload_size);
@@ -102,11 +102,11 @@ fn benchOne(
         switch (fsync_mode) {
             .per_append => for (batch.items) |*e| {
                 try dwal.wal_store.addEntries(&.{e.*});
-                try dwal.wal_store.sync(true);
+                try dwal.wal_store.syncLocked();
             },
             .per_batch => {
                 try dwal.wal_store.addEntries(batch.items);
-                try dwal.wal_store.sync(true);
+                try dwal.wal_store.syncLocked();
             },
             .never => try dwal.wal_store.addEntries(batch.items),
         }

@@ -11,6 +11,7 @@ pub const Error = error{
     InvalidBool,
     InvalidInt,
     InvalidFloat,
+    InvalidEnum,
     InvalidDuration,
     InvalidArgv,
 } || std.mem.Allocator.Error;
@@ -170,6 +171,7 @@ fn isAllowedFieldType(comptime FT: type) bool {
         .bool => true,
         .int => |i| i.bits <= 64,
         .float => |f| f.bits == 32 or f.bits == 64,
+        .@"enum" => true,
         .pointer => |p| blk: {
             if (p.size != .slice) break :blk false;
             if (p.child != u8) break :blk false;
@@ -260,6 +262,8 @@ fn parseField(
             const trimmed = std.mem.trim(u8, value, whitespace);
             break :blk std.fmt.parseFloat(FT, trimmed) catch error.InvalidFloat;
         },
+        .@"enum" => std.meta.stringToEnum(FT, std.mem.trim(u8, value, whitespace)) orelse
+            error.InvalidEnum,
         .pointer => try arena.dupe(u8, value),
         else => unreachable,
     };
@@ -393,6 +397,13 @@ fn humanType(comptime FT: type, comptime field_name: String) String {
             break :blk @typeName(FT);
         },
         .float => "float",
+        .@"enum" => |e| comptime blk: {
+            var names: String = "";
+            for (e.fields, 0..) |f, i| {
+                names = names ++ (if (i == 0) "" else "|") ++ f.name;
+            }
+            break :blk names;
+        },
         .pointer => "string",
         else => unreachable,
     };
@@ -404,6 +415,7 @@ fn writeDefault(comptime FT: type, value: FT, out: *std.ArrayList(u8), allocator
         .bool => try out.appendSlice(allocator, if (value) "true" else "false"),
         .int => try out.print(allocator, "{d}", .{value}),
         .float => try out.print(allocator, "{d}", .{value}),
+        .@"enum" => try out.appendSlice(allocator, @tagName(value)),
         .pointer => try out.appendSlice(allocator, value),
         else => unreachable,
     }

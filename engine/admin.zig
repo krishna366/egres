@@ -6,7 +6,6 @@ const m = @import("metrics");
 const flags = @import("flags");
 const utils = @import("raft").utils;
 const String = utils.String;
-const WaitGroup = utils.WaitGroup;
 const Engine = @import("engine.zig").Engine;
 
 const zdb_bufs = zdb.buffers;
@@ -863,27 +862,14 @@ pub const AdminServer = struct {
         // 1. Move callback fire before on_apply in applyCommits
         // 2. For reads, track applied_timestamp in StorageApplier and block reads
         //    until applied_timestamp >= read timestamp for linearizability.
-        // Set up the commit context with WaitGroup.
-        var ctx = CommitCtx{
-            .status = .committed,
-        };
-        ctx.wg.init();
-        ctx.wg.add(1);
-
-        self.engine.node.proposeDataChange(proposal_bytes, &onCommit, @ptrCast(&ctx)) catch |err| {
+        var w: raft.ProposalWaiter = .{};
+        self.engine.node.proposeDataChange(proposal_bytes, &w) catch |err| {
             log.err("propose failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, "propose failed");
             return;
         };
-
-        // Block until the commit callback fires.
-        ctx.wg.wait() catch {
-            log.err("wg.wait failed for " ++ verb, .{});
-            try proto.writeErr(stream, "commit wait failed");
-            return;
-        };
-
-        switch (ctx.status) {
+        const status = w.wait();
+        switch (status) {
             .committed => {
                 log.debug(verb ++ " committed", .{});
                 try proto.writeOk(stream);
@@ -894,8 +880,8 @@ pub const AdminServer = struct {
                 try proto.writeNotLeader(stream, leader);
             },
             else => {
-                log.err(verb ++ " failed: status={s}", .{@tagName(ctx.status)});
-                try proto.writeErr(stream, @tagName(ctx.status));
+                log.err(verb ++ " failed: status={s}", .{@tagName(status)});
+                try proto.writeErr(stream, @tagName(status));
             },
         }
     }
@@ -924,25 +910,20 @@ pub const AdminServer = struct {
         const proposal_bytes = try Engine.encodeMutations(self.engine.allocator, batch.ns, kvs);
         defer self.engine.allocator.free(proposal_bytes);
 
-        var ctx = CommitCtx{ .status = .committed };
-        ctx.wg.init();
-        ctx.wg.add(1);
-        self.engine.node.proposeDataChange(proposal_bytes, &onCommit, @ptrCast(&ctx)) catch |err| {
+        var w: raft.ProposalWaiter = .{};
+        self.engine.node.proposeDataChange(proposal_bytes, &w) catch |err| {
             log.err("batch propose failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, "propose failed");
             return;
         };
-        ctx.wg.wait() catch {
-            try proto.writeErr(stream, "commit wait failed");
-            return;
-        };
-        switch (ctx.status) {
+        const status = w.wait();
+        switch (status) {
             .committed => try proto.writeOk(stream),
             .not_leader => {
                 const leader = self.engine.node.getLeaderId() orelse 0;
                 try proto.writeNotLeader(stream, leader);
             },
-            else => try proto.writeErr(stream, @tagName(ctx.status)),
+            else => try proto.writeErr(stream, @tagName(status)),
         }
     }
 
@@ -1128,32 +1109,24 @@ pub const AdminServer = struct {
             };
         }
 
-        var ctx = CommitCtx{ .status = .committed };
-        ctx.wg.init();
-        ctx.wg.add(1);
-
+        var w: raft.ProposalWaiter = .{};
         self.engine.node.proposeConfChange(.{
             .change_type = change_type,
             .node_id = req.node_id,
             .addr = req.addr,
-        }, &onCommit, @ptrCast(&ctx)) catch |err| {
+        }, &w) catch |err| {
             log.err("conf change failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;
         };
-
-        ctx.wg.wait() catch {
-            try proto.writeErr(stream, "cancelled");
-            return;
-        };
-
-        switch (ctx.status) {
+        const status = w.wait();
+        switch (status) {
             .committed => try proto.writeOk(stream),
             .not_leader => {
                 const leader = self.engine.node.getLeaderId() orelse 0;
                 try proto.writeNotLeader(stream, leader);
             },
-            else => try proto.writeErr(stream, @tagName(ctx.status)),
+            else => try proto.writeErr(stream, @tagName(status)),
         }
     }
 
@@ -1314,20 +1287,6 @@ pub const AdminServer = struct {
         try proto.writeOk(stream);
     }
 };
-
-const CommitCtx = struct {
-    wg: WaitGroup = .{},
-    status: raft.CommitStatus,
-    /// Timestamp the leader assigned to the committed entry (0 on failure).
-    commit_ts: u64 = 0,
-};
-
-fn onCommit(ctx_raw: *anyopaque, entry: raft.Entry, status: raft.CommitStatus) void {
-    const ctx: *CommitCtx = @ptrCast(@alignCast(ctx_raw));
-    ctx.status = status;
-    ctx.commit_ts = entry.timestamp;
-    ctx.wg.done();
-}
 
 fn writeUnknownNamespace(stream: fiber.net.Stream, ns: u32) !void {
     var buf: [64]u8 = undefined;

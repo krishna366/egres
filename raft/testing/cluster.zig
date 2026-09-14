@@ -16,7 +16,7 @@ pub const TestLog = struct {
             vfs.deleteTree(wal_dir) catch {};
             allocator.free(wal_dir);
         }
-        const disk = try raft.DiskWAL.openPath(wal_dir, allocator, 1024);
+        const disk = try raft.DiskWAL.openPath(wal_dir, allocator, .{});
         return .{ .disk = disk, .wal_dir = wal_dir };
     }
 

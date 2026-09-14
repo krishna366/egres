@@ -42,7 +42,7 @@ fn blockingUnlink(path: [*:0]const u8) void {
 }
 
 /// Monotonic nanoseconds. 0.16 removed `std.time.nanoTimestamp`; this is
-/// the direct CLOCK_MONOTONIC read (same pattern as `fiber.clockMsUseRarely`)
+/// the direct CLOCK_MONOTONIC read (same pattern as `fiber.timestampNow`)
 /// — and monotonic is the right base for measuring op latencies anyway.
 fn nowNs() i64 {
     var tp: std.posix.timespec = undefined;

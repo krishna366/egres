@@ -277,6 +277,43 @@ fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const String) void {
     };
 }
 
+/// Scheduler knobs for A/B runs; the defaults are the measured-best
+/// settings. See zfiber.Runtime.steal_lone / prepark_poll_us.
+/// `--wal` — raft WAL log file layout. The defaults suit a local SSD on
+/// any filesystem: `prezero=auto` zero-fills log files on ext4 and xfs
+/// and skips it on ZFS, btrfs and tmpfs.
+const WalCfg = struct {
+    log_file_mib: u64 = 256,
+    prezero: raft.diskwal.Prezero = .auto,
+
+    pub const docs = .{
+        .self = "Raft WAL log files (see raft/diskwal.zig OpenOptions).",
+        .log_file_mib = "Log file size in MiB; a record that would cross " ++
+            "it rotates to a pre-created log file.",
+        .prezero = "Zero-fill a log file when it is created so appends " ++
+            "never grow the file: true for ext4/xfs, false for ZFS/btrfs/tmpfs, " ++
+            "auto decides by statfs.",
+    };
+};
+
+const RuntimeCfg = struct {
+    steal_lone: bool = false,
+    poll_us: u64 = 20,
+
+    pub const docs = .{
+        .self = "Fiber scheduler tunables (see zfiber runtime.zig). The " ++
+            "defaults are the measured best on a 32-thread box: pgbench " ++
+            "select-only +10% at 8 clients without lone-fiber steals, and " ++
+            "+23% at 1 and 8 clients with a 20 us poll before parking.",
+        .steal_lone = "A thief may take a worker's only ready fiber. " ++
+            "false (default): it waits for a ring of 2+, so a fiber about " ++
+            "to run on its own worker is not bounced between workers.",
+        .poll_us = "Microseconds a worker that had work within the last " ++
+            "ms polls its completion ring before blocking. 0 = block at " ++
+            "once; above ~100 the spinning starts to cost writes.",
+    };
+};
+
 fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     flags.initGlobal(allocator);
     defer flags.deinitGlobal();
@@ -286,6 +323,8 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const live_store = try flags.g().register("store", StoreCfg);
     const live_cache = try flags.g().register("cache", CacheCfg);
     const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
+    const live_runtime = try flags.g().register("runtime", RuntimeCfg);
+    const live_wal = try flags.g().register("wal", WalCfg);
 
     // --help is terminal; handle after registration so writeHelpAll has
     // every module's fields populated.
@@ -314,6 +353,12 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const data_cfg = live_data.snapshot();
     const store_cfg = live_store.snapshot();
     const cache_cfg = live_cache.snapshot();
+    const runtime_cfg = live_runtime.snapshot();
+    const wal_cfg = live_wal.snapshot();
+    // Scheduler tunables: the runtime is already up (main), so set them
+    // on it directly, before any listener spawns a connection fiber.
+    fiber.runtime().steal_lone = runtime_cfg.steal_lone;
+    fiber.runtime().prepark_poll_us = runtime_cfg.poll_us;
     if (raft_cfg.id == 0 or data_cfg.dir.len == 0) {
         std.log.err("--raft requires id (>0); --data requires dir", .{});
         usage(allocator);
@@ -412,7 +457,10 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
 
     // Open raft WAL.
     log.info("opening raft WAL at {s}", .{wal_dir});
-    var wal = try raft.DiskWAL.openPath(wal_dir, allocator, 1024);
+    var wal = try raft.DiskWAL.openPath(wal_dir, allocator, .{
+        .log_file_size = wal_cfg.log_file_mib << 20,
+        .prezero = wal_cfg.prezero,
+    });
     defer deinitWithLog("wal", &wal);
     // Genesis before the node reads the log: a fresh WAL gets its
     // deterministic bootstrap prefix (default database), pre-committed.

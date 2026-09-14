@@ -4,7 +4,7 @@ const fiber = @import("zfiber");
 /// Direct vDSO monotonic ms — accurate elapsed measurement without the
 /// coarse clock's loop-tick lag.
 fn nowMs() i64 {
-    return fiber.clockMsUseRarely(.monotonic);
+    return fiber.timestampNow(.monotonic, .millis);
 }
 
 test "Watermark: waitForUntimed returns when value crosses target" {
@@ -303,4 +303,42 @@ test "Watermark: mixed timed waiters under concurrent advance" {
 
     // Every waiter resolved exactly once (ok or Timeout); no hang/crash.
     try std.testing.expectEqual(@as(u32, N), resolved.load(.acquire));
+}
+
+test "Watermark: reset lowers the value; waitForOrReset reports it, waitForUntimed re-parks" {
+    var wm = fiber.Watermark.init(std.testing.allocator);
+    defer wm.deinit();
+    wm.advance(100);
+
+    var saw_reset: std.atomic.Value(bool) = .init(false);
+    var plain_done: std.atomic.Value(bool) = .init(false);
+    const W = struct {
+        fn orReset(w: *fiber.Watermark, flag: *std.atomic.Value(bool)) void {
+            w.waitForOrReset(150) catch |err| {
+                if (err == error.Reset) flag.store(true, .release);
+                return;
+            };
+        }
+        fn plain(w: *fiber.Watermark, flag: *std.atomic.Value(bool)) void {
+            w.waitForUntimed(150) catch return;
+            flag.store(true, .release);
+        }
+    };
+    var g: fiber.Group(void) = .init(std.testing.allocator);
+    defer g.deinit();
+    try g.ensureTotalCapacity(2);
+    try g.spawn(.{}, W.orReset, .{ &wm, &saw_reset });
+    try g.spawn(.{}, W.plain, .{ &wm, &plain_done });
+    while (wm.waiters.items.len < 2) fiber.yield();
+
+    wm.reset(49);
+    try std.testing.expectEqual(@as(u64, 49), wm.load());
+    while (!saw_reset.load(.acquire)) fiber.yield();
+    // The plain waiter went back to waiting for 150.
+    while (wm.waiters.items.len < 1) fiber.yield();
+    try std.testing.expect(!plain_done.load(.acquire));
+
+    wm.advance(150);
+    g.wait();
+    try std.testing.expect(plain_done.load(.acquire));
 }

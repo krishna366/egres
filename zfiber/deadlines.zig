@@ -132,7 +132,7 @@ pub const Deadlines = struct {
     /// Register a deadline. `ms_from_now` is clamped up to `min_timeout_ms`.
     /// Appends `t` to the `timeouts` array (the caller owns `t`'s storage).
     ///
-    /// "Now" is read via `clockMsUseRarely(.monotonic)` — direct vDSO
+    /// "Now" is read via `timestampNow(.monotonic, .millis)` — direct vDSO
     /// CLOCK_MONOTONIC, no caching. Using `loop.now()` would hand us
     /// libxev's cached value, which can be arbitrarily stale between
     /// `loop.run` iterations under heavy worker load; that stale
@@ -148,7 +148,7 @@ pub const Deadlines = struct {
         t: *Timeout,
         ms_from_now: u64,
     ) !void {
-        const current_ms = _coarse.clockMsUseRarely(.monotonic);
+        const current_ms = _coarse.timestampNow(.monotonic, .millis);
         const ms = @max(ms_from_now, min_timeout_ms);
         t._deadline_ms = current_ms + @as(i64, @intCast(ms));
 
@@ -328,7 +328,7 @@ fn onTimerNode(
     // a future register re-arms). Don't drain / re-arm.
     _ = result catch return .disarm;
 
-    const now = _coarse.clockMsUseRarely(.monotonic);
+    const now = _coarse.timestampNow(.monotonic, .millis);
     self.drainExpired(now);
     // Re-arm for whatever remains (this node fired, so the head lost its timer).
     self.armForHead(now);

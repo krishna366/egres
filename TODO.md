@@ -1,5 +1,17 @@
 # TODO.md
 
+### PROJECT: Rename ForestState to Manifest
+Sep 15, 2026
+
+- `manifest.ForestState` is the manifest: its own doc says "in-memory manifest
+  state", `Forest.ms` holds it, `ManifestChange` entries of log type `.manifest`
+  mutate it, and a raft snapshot carries its bytes. `Forest` stays the live
+  object (trees installed, memtables running); `Manifest` is the catalogue of it.
+- Mechanical: 66 references in 8 files, 46 of them in manifest.zig and its test.
+  The zbuf schema table in zdb/buffers.zig renames its generated reader/writer
+  too; the wire format is keyed by table id, so no bump.
+- Separate change, after the WAL change lands.
+
 ### PROJECT: Improve zbuf APIs
 
 The buffer should be a simple wrapper over the bytes. Right now, it's too

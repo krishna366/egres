@@ -44,25 +44,29 @@ const std = @import("std");
 const _context = @import("context.zig");
 
 pub const ClockKind = enum { monotonic, realtime };
+pub const TimeUnit = enum { millis, micros };
 
-/// Current time in ms for the requested clock, via `std.Io.Timestamp.now` on
-/// the process io (`context.g().io`) — the same time source the rest of the
-/// codebase uses. `context.g()` asserts the process context was initialized;
-/// every caller here (CoarseClock, Deadlines, the tests) runs inside a started
-/// runtime, which is well after `context.initGlobal`.
+/// The current time on `kind`'s clock, in `unit`, via `std.Io.Timestamp.now`
+/// on the process io (`context.g().io`) — the same time source the rest of
+/// the codebase uses. `context.g()` asserts the process context was
+/// initialized; every caller here (CoarseClock, Deadlines, the tests) runs
+/// inside a started runtime, which is well after `context.initGlobal`.
 ///
-/// "Use rarely" — it's a full clock read, fine in init/calibration paths or
-/// once-per-tick / per-timeout-registration reads, but the hot-path CPU
-/// accounting in `Worker.run` should stick to `rdtsc`. No caching — unlike the
-/// cached `ms()`, which can be up to ~1 ms stale.
-pub fn clockMsUseRarely(comptime kind: ClockKind) i64 {
+/// A full clock read, uncached — unlike `ms()`, which can be up to ~1 ms
+/// stale. Fine in init/calibration paths, once per tick, per timeout
+/// registration or per timeline mark; the hot-path CPU accounting in
+/// `Worker.run` sticks to `rdtsc`.
+pub fn timestampNow(comptime kind: ClockKind, comptime unit: TimeUnit) i64 {
     // std.Io.Clock spells monotonic as `.awake` (Linux CLOCK_MONOTONIC,
     // macOS CLOCK_UPTIME_RAW); `.real` is wall-clock Unix time.
     const ts = std.Io.Timestamp.now(_context.g().io, switch (kind) {
         .monotonic => .awake,
         .realtime => .real,
     });
-    return @intCast(ts.toMilliseconds());
+    return switch (unit) {
+        .millis => ts.toMilliseconds(),
+        .micros => ts.toMicroseconds(),
+    };
 }
 
 pub const CoarseClock = struct {
@@ -76,7 +80,7 @@ pub const CoarseClock = struct {
     /// Seed the cache so `ms()` is valid the instant `Runtime.init`
     /// returns — before any worker thread starts ticking it.
     pub fn init() CoarseClock {
-        return .{ .cached_ms = .init(clockMsUseRarely(.realtime)) };
+        return .{ .cached_ms = .init(timestampNow(.realtime, .millis)) };
     }
 
     pub fn deinit(self: *CoarseClock) void {
@@ -89,7 +93,7 @@ pub const CoarseClock = struct {
     /// load (no store, no invalidation); the surviving CAS is best
     /// effort — if a peer won the boundary, ours no-ops harmlessly.
     pub fn update(self: *CoarseClock) void {
-        const now = clockMsUseRarely(.realtime);
+        const now = timestampNow(.realtime, .millis);
         const last = self.cached_ms.load(.monotonic);
         if (last < now) {
             _ = self.cached_ms.cmpxchgWeak(last, now, .acquire, .monotonic);
