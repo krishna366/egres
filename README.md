@@ -26,12 +26,27 @@ and surface deadlocks / runaway loops under sustained write load.
 
 ### 1. Build the binaries
 
-Always build in `ReleaseFast` for load tests. The default `zig build` is
-`Debug`, whose safety checks dominate the runtime and make throughput numbers
-meaningless.
+Never benchmark the default `zig build`: it is `Debug`, whose safety
+checks dominate the runtime. Two release modes matter:
+
+- `ReleaseFast` for benchmarks. Its numbers are the ones to report.
+- `ReleaseSafe` for every long-running correctness test (the e2e
+  scripts, kill -9 durability runs, soak), for everyday development,
+  and for any benchmark that crashed under `ReleaseFast`: the same bug
+  that is a silent heap corruption in `ReleaseFast` (a lock-table
+  release race was, under a 64-client pgbench load) is an assertion with
+  a stack trace in `ReleaseSafe`.
+
+The checks cost about 20% on CPU-bound point reads and nothing on
+disk-bound writes or on scans. `ReleaseSafe` also writes `undefined`
+as 0xAA, including inside std's allocator on every allocation, so
+allocation-heavy code looks slower than it is; do not size hot paths
+by `ReleaseSafe` profiles alone. Always say which mode a number came
+from, and never compare across modes.
 
 ```bash
-zig build --release=fast egres zdb-bench
+zig build -Doptimize=ReleaseFast egres zdb-bench   # benchmarks
+zig build -Doptimize=ReleaseSafe egres             # tests, development
 ```
 
 Binaries land in `zig-out/bin/`.

@@ -1,0 +1,59 @@
+# Benchmark-box tuning for PostgreSQL 18 on 32 cores / 121 GB / NVMe.
+# Append to the data directory's postgresql.conf, then restart:
+#   cat postgresql.conf.tuned >> /data/pg18/data/postgresql.conf
+#   pg_ctl -D /data/pg18/data restart
+# Do not apply this to an instance that is mid-benchmark.
+
+# 25% of RAM: the usual starting point for a dedicated PG box.
+shared_buffers = 30GB
+
+# What the planner assumes is cached, buffers plus OS page cache.
+effective_cache_size = 80GB
+
+# Per sort/hash node; pgbench barely uses it, other queries will.
+work_mem = 16MB
+
+# Speeds up the index builds that `pgbench -i` does at the end.
+maintenance_work_mem = 2GB
+
+# Large WAL write buffer so many committing clients do not contend.
+wal_buffers = 64MB
+
+# Room between checkpoints so a run is not one long checkpoint storm.
+max_wal_size = 16GB
+
+# Keeps enough WAL preallocated to avoid segment churn at steady rate.
+min_wal_size = 4GB
+
+# Spread checkpoint I/O over 90% of the interval to flatten latency.
+checkpoint_completion_target = 0.9
+
+# Durable commits: matches what Egres does, so the compare is fair.
+synchronous_commit = on
+
+# Never off for a published number; crash safety is part of the test.
+fsync = on
+
+# Headroom above the highest -c in the matrix, plus the harness psql.
+max_connections = 300
+
+# Huge pages cut TLB misses on a 30GB buffer pool; try, do not require.
+huge_pages = try
+
+# NVMe random reads cost nearly the same as sequential ones.
+random_page_cost = 1.1
+
+# NVMe handles deep queues, so let the executor prefetch aggressively.
+effective_io_concurrency = 200
+
+# No logging process competing for CPU during a measured run.
+logging_collector = off
+
+# Only real problems in the log; per-statement noise skews latency.
+log_min_messages = warning
+
+# Loopback only: the benchmark client runs on the same box.
+listen_addresses = '127.0.0.1'
+
+# Port the test instance uses, separate from any system PostgreSQL.
+port = 5433
