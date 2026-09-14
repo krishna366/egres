@@ -33,6 +33,10 @@ pub const Options = struct {
     /// LIMIT: stop after this many rows. Under a locking statement
     /// that is how many rows are gathered and locked.
     limit: ?usize = null,
+    /// count(*): the rows are never looked at, so a sequential scan
+    /// counts the ones that pass the predicate into `Batch.counted`
+    /// instead of appending them.
+    count_only: bool = false,
 };
 
 pub const Plan = struct {
@@ -76,6 +80,7 @@ pub fn plan(
         src.* = .{ .seq_scan = .{
             .pred = pred,
             .keep_value = opts.keep_value,
+            .count_only = opts.count_only,
         } };
     }
     const root = try arloc.create(RowNode);

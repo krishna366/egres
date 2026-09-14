@@ -70,6 +70,9 @@ pub const Batch = struct {
     /// the first refusal and stash that row (rows are sequential, so a
     /// smaller one is never offered in its place). Cleared by `reset`.
     no_space: bool = false,
+    /// Rows a count-only source counted instead of appending (see
+    /// plan.Options.count_only). Cleared by `reset`.
+    counted: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !Batch {
         var rows: std.ArrayList(Item) = .empty;
@@ -88,10 +91,13 @@ pub const Batch = struct {
 
     /// Empty the batch; capacity stays (it never shrinks).
     pub fn reset(self: *Batch) void {
-        self.rows.clearRetainingCapacity();
-        self.bytes.clearRetainingCapacity();
+        // Not clearRetainingCapacity: in ReleaseSafe it memsets
+        // the used items with undefined on every batch.
+        self.rows.items.len = 0;
+        self.bytes.items.len = 0;
         self.sel = Selection.initEmpty();
         self.no_space = false;
+        self.counted = 0;
     }
 
     pub fn numRows(self: *const Batch) usize {
@@ -332,10 +338,13 @@ pub const BitmapNode = union(enum) {
 };
 
 /// One operator. `next` either fills `b` (sources) or narrows `b.sel`
-/// (filters): true = selected rows are in `b` (a partial batch only
-/// when the source ran dry); false = exhausted, and sticky. ONE Batch
-/// per pipeline, owned by the plan root and passed down. `deinit`
-/// frees this node's own resources only — the plan deinits every node.
+/// (filters). Its bool says whether THIS batch is valid: true = selected
+/// rows (or a count) are in `b`, a partial batch only when the source
+/// ran dry; false = `b` is empty, the node is exhausted, and every later
+/// call is false too. A false never carries rows, so a caller may stop
+/// on it without looking at `b`. ONE Batch per pipeline, owned by the
+/// plan root and passed down. `deinit` frees this node's own resources
+/// only — the plan deinits every node.
 pub const RowNode = union(enum) {
     seq_scan: SeqScan,
     fetch: Fetch,
@@ -377,6 +386,9 @@ pub const SeqScan = struct {
     pred: ?*const Pred = null,
     /// false = keys only (a DELETE that never reads the row back).
     keep_value: bool = true,
+    /// count(*): count the rows that pass `pred` into `Batch.counted`
+    /// and hand nothing over.
+    count_only: bool = false,
     cursor: ?Forest.Cursor = null,
     /// A pulled row that did not fit: the borrow stays valid until the
     /// next cursor.next, which happens only after it is appended.
@@ -402,6 +414,18 @@ pub const SeqScan = struct {
             );
         }
         const cursor = &self.cursor.?;
+        if (self.count_only) {
+            // Nothing is handed over: the whole range is counted in one
+            // call, and the batch carries only the count.
+            while (try cursor.next()) |item| {
+                if (self.pred) |pred| {
+                    if (!pred.matches(ctx.tbl, item)) continue;
+                }
+                b.counted += 1;
+            }
+            self.done = true;
+            return b.counted > 0;
+        }
         const mode: Batch.ValueMode = if (self.keep_value) .borrow else .none;
         if (self.stash) |item| {
             // An empty batch admits any single row.
@@ -439,6 +463,9 @@ pub const SeqScan = struct {
 /// borrows under the batch result's pins, copied into the batch as
 /// they fit; a chunk's unconsumed tail stays pinned until the next
 /// fill. Takes no locks: row locks are Materialize's, on the output.
+///
+/// TODO: For select count(*) queries, we don't need to fetch the rows. We can
+/// just return based on cardinality of the bitmaps.
 pub const Fetch = struct {
     bnode: *BitmapNode,
     pred: ?*const Pred = null,
@@ -449,10 +476,17 @@ pub const Fetch = struct {
     /// first next.
     bm: ?zroar.Bitmap = null,
     it: ?zroar.Iterator = null,
-    /// The chunk in hand: its keys (slices into `key_bytes`, both
-    /// statement-arena buffers of one batch fill's capacity), the
-    /// batch result, and the next key to place.
+    /// The chunk in hand: its keys, the batch result, and the next key
+    /// to place. `key_bytes` is the storage, 8 bytes per egid key;
+    /// `key_slices` the table over it that multiGet takes, one slice per
+    /// slot; `keys` the prefix of that table in use. Both are sized once
+    /// to the chunk capacity — the bitmap's cardinality, capped at one
+    /// batch fill — and overwritten per chunk. Sized to the set rather
+    /// than the cap: a point read pulls one egid, and a cap-sized pair
+    /// of buffers was a 24 KiB allocation (poison-filled in a safe
+    /// build) per statement.
     keys: []String = &.{},
+    key_slices: []String = &.{},
     key_bytes: []u8 = &.{},
     res: ?Forest.MultiGet = null,
     chunk_pos: usize = 0,
@@ -468,13 +502,17 @@ pub const Fetch = struct {
 
             self.it = self.bm.?.iterator();
             self.from_index = self.bnode.fromIndex(); // For debug assert
-            self.key_bytes = try ctx.arloc.alloc(u8, row_cap * 8);
-            self.keys = try ctx.arloc.alloc(String, row_cap);
+            const cap: usize = @intCast(@max(1, @min(
+                row_cap,
+                self.bm.?.getCardinality(),
+            )));
+            self.key_bytes = try ctx.arloc.alloc(u8, cap * 8);
+            self.key_slices = try ctx.arloc.alloc(String, cap);
         }
 
         while (!batch.full()) {
             if (self.res == null) {
-                if (!try self.nextChunk(ctx, batch.row_limit)) {
+                if (!try self.fetchKeys(ctx, batch.row_limit)) {
                     self.done = true;
                     break;
                 }
@@ -504,16 +542,16 @@ pub const Fetch = struct {
 
     /// Pull up to `limit` egids from the bitmap into the chunk buffers
     /// and read them in one batch. false = the bitmap is exhausted.
-    fn nextChunk(self: *Fetch, ctx: *ExecCtx, limit: usize) !bool {
+    fn fetchKeys(self: *Fetch, ctx: *ExecCtx, limit: usize) !bool {
         var n: usize = 0;
-        while (n < @min(limit, row_cap)) : (n += 1) {
+        while (n < @min(limit, self.key_slices.len)) : (n += 1) {
             const egid = self.it.?.next() orelse break;
             const key = self.key_bytes[n * 8 ..][0..8];
             key.* = _key.encodeEgid(egid);
-            self.keys[n] = key;
+            self.key_slices[n] = key;
         }
         if (n == 0) return false;
-        self.keys.len = n;
+        self.keys = self.key_slices[0..n];
         self.res = try ctx.tx.multiGet(ctx.table_id, self.keys);
         self.chunk_pos = 0;
         return true;
@@ -604,9 +642,9 @@ pub const Materialize = struct {
             return false;
         }
         batch.row_limit = @min(row_cap, remaining);
-        const more = try self.child.next(ctx, batch);
+        const valid = try self.child.next(ctx, batch);
         self.remaining = remaining - batch.sel.count();
-        return more;
+        return valid;
     }
 
     /// Every selected row of the child, copied into the statement arena
@@ -648,7 +686,9 @@ pub const Materialize = struct {
         const keys = try ctx.arloc.alloc(Key, rows.len);
         for (rows, keys) |row, *key| key.* = row.key;
 
-        std.mem.sort(Key, keys, {}, lessThanKey);
+        // Keys are distinct rows, so stability is moot; the unstable
+        // sort has no scratch cache to poison-fill per statement.
+        std.mem.sortUnstable(Key, keys, {}, lessThanKey);
         for (keys) |key| try ctx.tx.lockRow(key.table_id, key.primary);
     }
 

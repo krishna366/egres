@@ -611,7 +611,6 @@ pub const MultiGet = struct {
     }
 
     /// Append `wanted`'s versions, holding the storage behind them.
-
     fn take(
         self: *MultiGet,
         node: *Node,
@@ -1048,82 +1047,86 @@ pub const Cursor = struct {
 /// has no keys. Assumes a monotonically-increasing row id (SQL's egid), so
 /// the max lives in the rightmost tree and, within it, the rightmost SST of
 /// each level: last-by-id in L0 (newest flush = highest ids) or last-by-
-/// smallest in L≥1 (highest range). Step 1 takes the max of those SSTs'
-/// in-memory `biggest` keys — O(#levels), no I/O. Step 2 scans from that
-/// floor and keeps the highest key: the SSTs top out at floor, so anything
-/// beyond it is an unflushed memtable row. If the scan surfaces nothing
-/// higher, the floor stands. The returned Key's `primary` is owned by
-/// `allocator` (free it). Callers derive a table's next id from it without
-/// persisting a counter — so the max is the largest STORED key, deleted
-/// or not: the memtable scan counts tombstones (include_deleted) and step
-/// 1's SST `biggest` is physical, so a deleted current-max still seeds the
-/// next id past itself and an id is never re-minted onto a tombstoned row.
+/// smallest in L≥1 (highest range). Those SSTs' in-memory `biggest` keys
+/// give a floor — O(#levels), no I/O — and every key above it is an
+/// unflushed memtable row, so the memtables are the only thing seeked:
+/// each one from the floor to the table end, keeping the last key. No SST
+/// is opened.
+///
+/// Order matters: the memtables are pinned BEFORE the tree is read. A
+/// flush completing between the two moves rows from a memtable into a
+/// new L0 file; pinned first, the popped memtable is still ours to read,
+/// so the row is seen either way. Tree first, the row would be in a file
+/// the floor never saw and gone from the memtables by the time they are
+/// read.
+///
+/// The returned Key's `primary` is owned by `allocator` (free it).
+/// Callers derive a table's next id from it without persisting a
+/// counter — so the max is the largest STORED key, deleted or not: the
+/// memtable walk counts tombstones (the skiplist iterator hides
+/// nothing) and the SST `biggest` is physical, so a deleted current-max
+/// still seeds the next id past itself and an id is never re-minted onto
+/// a tombstoned row.
 pub fn maxKey(
     self: *Forest,
     allocator: std.mem.Allocator,
     ns: u64,
     table_id: u32,
 ) !?Key {
-    // Step 1: floor = max `biggest` over the rightmost SST of each level in
-    // the rightmost tree. Owned by `allocator`, or null if no SSTs.
-    var floor: ?Key = null;
-    errdefer if (floor) |f| f.free(allocator);
-    {
-        const trees = self.getTable(ns, table_id) orelse return null;
-        const tree = trees.getRightmostTree() orelse return null;
-        defer tree.release();
-        var best_sst: Key = .{};
-        const held = tree.mu.hold(.shared, @src());
-        defer held.release();
-        for (tree.levels) |*lv| {
-            const items = lv.entries(held);
-            if (items.len == 0) continue;
-
-            const b = items[items.len - 1].table.biggest; // rightmost
-            if (b.primary.len == 0) continue;
-
-            if (best_sst.primary.len == 0 or
-                b.order(best_sst) == .gt) best_sst = b;
-        }
-        // Dupe out from under the tables — they may close once locks drop.
-        if (best_sst.primary.len > 0) floor = try best_sst.dupe(allocator);
+    // Step 1: pin every memtable (active + immutables) — see the doc on
+    // why this precedes the tree. `want = 1`: the walk needs keys, not
+    // version chains.
+    const iters = try self.memtables.getIterators(allocator, null, .{ .want = 1 });
+    defer {
+        for (iters) |*it| it.deinit();
+        allocator.free(iters);
     }
 
-    // Step 2: scan from floor (or the table start if there's no floor) and
-    // keep the highest key. `best` is a single reused buffer holding the
-    // latest (thus, at end, the largest) key's marshaled bytes — no
-    // per-row alloc churn. `floor` backs the left bound, so it outlives the
-    // scan.
-    const Ctx = struct {
-        allocator: std.mem.Allocator,
-        best: std.ArrayList(u8) = .empty,
-        fn emit(c: *@This(), item: Item) anyerror!bool {
-            utils.clearRetainCap(&c.best);
-            _ = try item.key.marshalTo(c.allocator, &c.best);
-            return true;
+    // Step 2: floor = max `biggest` over the rightmost SST of each level in
+    // the rightmost tree. Owned by `allocator`; null if no SSTs (or no
+    // tree yet — the memtables may still hold rows).
+    var floor: ?Key = null;
+    errdefer if (floor) |f| f.free(allocator);
+    if (self.getTable(ns, table_id)) |trees| {
+        if (trees.getRightmostTree()) |tree| {
+            defer tree.release();
+            var best_sst: Key = .{};
+            const held = tree.mu.hold(.shared, @src());
+            defer held.release();
+            for (tree.levels) |*lv| {
+                const items = lv.entries(held);
+                if (items.len == 0) continue;
+
+                const b = items[items.len - 1].table.biggest; // rightmost
+                if (b.primary.len == 0) continue;
+
+                if (best_sst.primary.len == 0 or
+                    b.order(best_sst) == .gt) best_sst = b;
+            }
+            // Dupe out from under the tables — they may close once locks drop.
+            if (best_sst.primary.len > 0) floor = try best_sst.dupe(allocator);
         }
-    };
-    var ctx = Ctx{ .allocator = allocator };
-    defer ctx.best.deinit(allocator);
-    // [floor, table end): floor (if any) is an in-table key we keep; no
-    // floor limits to the table start. limitToTable confines the memtable.
-    // include_deleted: a tombstoned max is still a stored key, so it must
-    // count — else its id gets re-minted onto a deleted row (see doc).
-    const scan_range = (KeyRange{
+    }
+
+    // Step 3: walk each memtable over [floor, table end) — floor (if any)
+    // is an in-table key we keep; no floor limits to the table start — and
+    // keep the largest key. `best` borrows a skiplist node; the pins from
+    // step 1 keep it alive until it is duped below.
+    const range = (KeyRange{
         .left = floor orelse Key{},
     }).limitToTable(ns, table_id);
-    _ = try self.scan(
-        allocator,
-        scan_range,
-        .{ .include_deleted = true },
-        &ctx,
-        Ctx.emit,
-    );
+    var best: ?Key = null;
+    for (iters) |*it| {
+        try it.seekRange(range.left, range.right);
+        while (it.skiplist.itemRef()) |item| : (try it.skiplist.next()) {
+            if (best == null or item.key.order(best.?) == .gt) best = item.key;
+        }
+    }
 
     // A memtable row above floor wins; otherwise floor stands (or null if
     // the table had no SSTs and no rows).
-    if (ctx.best.items.len > 0) {
-        const k = try Key.initAlloc(allocator, ctx.best.items);
+    if (best) |b| {
+        const k = try b.dupe(allocator);
         if (floor) |f| f.free(allocator);
         return k;
     }

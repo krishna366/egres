@@ -64,6 +64,10 @@ pub const Literal = union(enum) {
     str: String, // borrowed
     bool_: bool,
     null_value,
+    /// CURRENT_TIMESTAMP / LOCALTIMESTAMP: the transaction's start
+    /// time, resolved by the executor (dml.coerceLiteral) — the one
+    /// literal that is not a constant.
+    current_timestamp,
     unsupported,
 };
 
@@ -73,11 +77,13 @@ pub const Insert = struct {
     rows: [][]Literal, // borrowed rows of literals
 };
 
-/// What a SELECT projects: `*` (all live columns) or a named list (which may
-/// include the `egid` pseudo-column). Names are borrowed.
+/// What a SELECT projects: `*` (all live columns), a named list (which
+/// may include the `egid` pseudo-column), or `count(*)` — one int8 cell,
+/// the number of rows the plan yields. Names are borrowed.
 pub const Projection = union(enum) {
     star,
     columns: []String,
+    count_star,
 };
 
 /// A single `column = literal` comparison — the equality leaf of a WHERE.
@@ -283,8 +289,16 @@ const InsertStmtJson = struct {
     // INSERT ... SELECT has a SelectStmt WITHOUT valuesLists (→ rejected).
     const SelectWrap = struct { SelectStmt: SelectValues = .{} };
     const SelectValues = struct { valuesLists: []const ListNode = &.{} };
-    const ListNode = struct { List: struct { items: []const AConstNode = &.{} } = .{} };
-    const AConstNode = struct { A_Const: AConst = .{} };
+    const ListNode = struct {
+        List: struct { items: []const ValueNode = &.{} } = .{},
+    };
+    // One VALUES item: a constant, or a SQL value function
+    // (CURRENT_TIMESTAMP and kin). Anything else leaves both null →
+    // `.unsupported`.
+    const ValueNode = struct {
+        A_Const: ?AConst = null,
+        SQLValueFunction: ?struct { op: String = "" } = null,
+    };
     // A_Const encodes its value under a type-named key; the key's presence is
     // the discriminant (libpg_query omits zero inner values, so `ival: {}`
     // still means integer 0).
@@ -328,8 +342,27 @@ const SelectStmtJson = struct {
         } = null,
     };
 
-    const ResTargetNode = struct { ResTarget: struct { val: ColumnRefWrap = .{} } = .{} };
-    // A target / WHERE operand must be a column reference; anything else
+    const ResTargetNode = struct {
+        ResTarget: struct { val: TargetVal = .{} } = .{},
+    };
+    // A projection item: a column reference, or a function call — of
+    // which only `count(*)` is accepted. Anything else (arithmetic, a
+    // cast) leaves both null → rejected.
+    const TargetVal = struct {
+        ColumnRef: ?ColumnRef = null,
+        FuncCall: ?FuncCallNode = null,
+    };
+    // count(*) is a FuncCall with agg_star and no args; the other
+    // fields are decoded only to reject what they mark.
+    const FuncCallNode = struct {
+        funcname: []const NameNode = &.{},
+        agg_star: bool = false,
+        args: []const std.json.Value = &.{},
+        agg_distinct: bool = false,
+        agg_filter: ?std.json.Value = null, // FILTER (WHERE ...)
+        over: ?std.json.Value = null, // a window function
+    };
+    // A WHERE operand must be a column reference; anything else
     // (function, arithmetic) leaves ColumnRef null → rejected.
     const ColumnRefWrap = struct { ColumnRef: ?ColumnRef = null };
     const ColumnRef = struct { fields: []const FieldNode = &.{} };
@@ -578,7 +611,7 @@ fn parseInsert(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
     var rows: std.ArrayList([]Literal) = .empty;
     for (sel.SelectStmt.valuesLists) |ln| {
         const lits = try alloc.alloc(Literal, ln.List.items.len);
-        for (ln.List.items, lits) |ac, *lit| lit.* = literalFrom(ac.A_Const);
+        for (ln.List.items, lits) |item, *lit| lit.* = literalFromValue(item);
         try rows.append(alloc, lits);
     }
 
@@ -587,6 +620,20 @@ fn parseInsert(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         .columns = columns,
         .rows = try rows.toOwnedSlice(alloc),
     } };
+}
+
+/// A VALUES item as a Literal: the constant, or the value function.
+fn literalFromValue(node: InsertStmtJson.ValueNode) Literal {
+    if (node.A_Const) |ac| return literalFrom(ac);
+    const svf = node.SQLValueFunction orelse return .unsupported;
+    // The precision forms (CURRENT_TIMESTAMP(3)) keep the full µs;
+    // LOCALTIMESTAMP is the same instant on a UTC-only server.
+    const ops = [_]String{
+        "SVFOP_CURRENT_TIMESTAMP", "SVFOP_CURRENT_TIMESTAMP_N",
+        "SVFOP_LOCALTIMESTAMP",    "SVFOP_LOCALTIMESTAMP_N",
+    };
+    for (ops) |op| if (std.mem.eql(u8, svf.op, op)) return .current_timestamp;
+    return .unsupported;
 }
 
 fn literalFrom(ac: InsertStmtJson.AConst) Literal {
@@ -607,6 +654,10 @@ pub fn litToValue(a: std.mem.Allocator, lit: Literal, ty: _value.Type) !_value.V
     const text: String = switch (lit) {
         .null_value => return .null_value,
         .unsupported => return error.UnsupportedLiteral,
+        // Resolved by the executor before coercion (dml.coerceLiteral);
+        // a position without a transaction time (SET, WHERE) never
+        // produces it.
+        .current_timestamp => return error.UnsupportedLiteral,
         .str, .float => |s| s,
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",
@@ -771,9 +822,9 @@ fn parseExpr(
     return .{ .expr = .{ .binop = .{ .op = op, .lhs = lhs, .rhs = rhs } } };
 }
 
-/// SELECT [cols|*] FROM one_table [WHERE ...] [FOR UPDATE] [LIMIT n].
-/// Joins, subqueries, ORDER BY / GROUP BY / OFFSET / DISTINCT and
-/// expression targets are rejected.
+/// SELECT [cols|*|count(*)] FROM one_table [WHERE ...] [FOR UPDATE]
+/// [LIMIT n]. Joins, subqueries, ORDER BY / GROUP BY / OFFSET /
+/// DISTINCT and expression targets are rejected.
 fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
     const ss = try fromValue(SelectStmtJson, alloc, body) orelse return .unsupported;
 
@@ -806,19 +857,30 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
     const rv = ss.fromClause[0].RangeVar orelse
         return invalid("only table sources are supported");
 
-    // Every target must be a column reference; a `*` anywhere makes it a
-    // star projection.
+    // Every target must be a column reference, except the one aggregate,
+    // a lone `count(*)`; a `*` anywhere makes it a star projection.
     var star = false;
+    var count_star = false;
     for (ss.targetList) |tn| {
+        if (tn.ResTarget.val.FuncCall) |fc| {
+            if (!isCountStar(fc))
+                return invalid("only count(*) is supported in SELECT");
+            count_star = true;
+            continue;
+        }
         const cr = tn.ResTarget.val.ColumnRef orelse
             return invalid("only column references are supported in SELECT");
         for (cr.fields) |f| {
             if (f.A_Star != null) star = true;
         }
     }
+    if (count_star and ss.targetList.len != 1)
+        return invalid("count(*) cannot be combined with other targets");
+    if (count_star and ss.lockingClause.len > 0)
+        return invalid("FOR UPDATE is not allowed with count(*)");
 
     var cols: std.ArrayList(String) = .empty;
-    if (!star) {
+    if (!star and !count_star) {
         for (ss.targetList) |tn| {
             const fields = tn.ResTarget.val.ColumnRef.?.fields;
             if (fields.len == 0 or fields[fields.len - 1].String == null)
@@ -848,13 +910,29 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         for_update = true;
     }
 
+    const projection: Projection = if (count_star)
+        .count_star
+    else if (star)
+        .star
+    else
+        .{ .columns = try cols.toOwnedSlice(alloc) };
     return .{ .select = .{
         .table = rv.relname,
-        .projection = if (star) .star else .{ .columns = try cols.toOwnedSlice(alloc) },
+        .projection = projection,
         .where = where,
         .for_update = for_update,
         .limit = limit,
     } };
+}
+
+/// Whether a target's function call is exactly `count(*)`: no
+/// arguments, no DISTINCT, no FILTER, no OVER.
+fn isCountStar(fc: SelectStmtJson.FuncCallNode) bool {
+    if (fc.funcname.len == 0) return false;
+    const name = fc.funcname[fc.funcname.len - 1].String.sval;
+    return std.mem.eql(u8, name, "count") and fc.agg_star and
+        fc.args.len == 0 and !fc.agg_distinct and
+        fc.agg_filter == null and fc.over == null;
 }
 
 /// Reject a recognized statement with a static client-facing reason —

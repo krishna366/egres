@@ -25,8 +25,18 @@ pub const oid = struct {
     pub const float4: Oid = 700;
     pub const float8: Oid = 701;
     pub const numeric: Oid = 1700;
+    pub const timestamp: Oid = 1114;
+    pub const timestamptz: Oid = 1184;
     pub const unknown: Oid = 705;
 };
+
+/// Postgres's datetime epoch, 2000-01-01 00:00:00 UTC, in Unix µs. Only
+/// the BINARY wire format uses it: a `timestamp`/`timestamptz` travels
+/// as int8 µs and a `date` as int4 days, both counted from this instant.
+/// Egres stores and computes in Unix time; an encoder subtracts this
+/// before the byte swap and a decoder adds it after. Text format never
+/// sees it.
+pub const pg_epoch_unix_us: i64 = 946_684_800_000_000;
 
 /// One column descriptor for a result set. `format_code = 0` means text.
 /// `type_modifier = -1` means "no modifier" (e.g. for varchar(N), N is

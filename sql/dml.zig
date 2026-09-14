@@ -53,7 +53,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     // Open AFTER the intent locks: a statement that parked behind
     // DDL holding the table lock exclusively (CREATE/DROP INDEX)
     // must see the reloaded schema, not a stale cached Table.
-    const tbl = self.srv.openTable(ns, table_id) catch |err| {
+    const tbl = self.openTable(ns, table_id) catch |err| {
         log.err("insert into '{s}': load schema: {s}", .{ ins.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
@@ -99,9 +99,13 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         for (values) |*v| v.* = .null_value; // reset all to null
 
         for (row_lits, target_cols) |lit, col| {
-            values[col.pos] =
-                (try coerceLiteral(state, arloc, lit, col.ty)) orelse
-                return;
+            values[col.pos] = (try coerceLiteral(
+                state,
+                arloc,
+                lit,
+                col.ty,
+                tx.start_us,
+            )) orelse return;
         }
 
         for (tbl.indexes) |*idx| {
@@ -129,7 +133,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     // on this session sees the rows.
     const egids = try arloc.alloc(u64, num_rows);
     for (row_bytes, egids) |bytes, *egid| {
-        egid.* = self.srv.allocEgid(ns, table_id) catch |err| switch (err) {
+        egid.* = self.allocEgid(ns, table_id) catch |err| switch (err) {
             error.NotLeader => return replyError(state, "not the leader"),
             else => {
                 log.err("insert into '{s}': alloc egid: {s}", .{ ins.table, @errorName(err) });
@@ -161,13 +165,15 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
     // Open AFTER the intent locks — see insert's comment.
-    const tbl = self.srv.openTable(ns, table_id) catch |err| {
+    const tbl = self.openTable(ns, table_id) catch |err| {
         log.err("select from '{s}': load schema: {s}", .{ sel.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
 
     // Resolve outputs: `*` is the user columns; by name, egid resolves
-    // like any other column (Table.column).
+    // like any other column (Table.column). count(*) projects no
+    // column: one int8 cell, the number of rows the plan yields.
+    const is_count = sel.projection == .count_star;
     var cols: std.ArrayList(*const _table.Column) = .empty;
     switch (sel.projection) {
         .star => for (tbl.columns) |*c| try cols.append(arloc, c),
@@ -180,10 +186,16 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
                 );
             try cols.append(arloc, c);
         },
+        .count_star => {},
     }
 
-    const fields = try arloc.alloc(pgwire.FieldDescription, cols.items.len);
-    for (cols.items, fields) |c, *fd| fd.* = .{
+    const fields = try arloc.alloc(
+        pgwire.FieldDescription,
+        if (is_count) 1 else cols.items.len,
+    );
+    if (is_count) {
+        fields[0] = .{ .name = "count", .type_oid = pgwire.oid.int8 };
+    } else for (cols.items, fields) |c, *fd| fd.* = .{
         .name = c.name,
         .type_oid = _value.pgTypeOid(c.ty),
         .format_code = 0,
@@ -200,9 +212,13 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // committed above read_ts (that lockRow would have bumped →
     // restarted), so the rows it then serves are the newest versions,
     // frozen by our locks.
+    // count(*) counts every match and keeps no row bytes; its LIMIT
+    // bounds the one output row, not the rows counted.
     var plan = (try planFor(state, arloc, tbl, sel.where, .{
         .read_ts = tx.read_ts,
-        .limit = sel.limit,
+        .keep_value = !is_count,
+        .limit = if (is_count) null else sel.limit,
+        .count_only = is_count,
     })) orelse return;
     defer plan.deinit();
     var ctx = ExecCtx{
@@ -219,19 +235,28 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // wire before the last lockRow and a Restart re-runs a statement
     // that has sent nothing. An empty result still gets its description.
     var first = true;
+    var count: u64 = 0;
     while (true) {
         // An executor error is a read failure — replied; an emit
         // error is a wire error — surfaced to the serve loop.
-        const more = plan.root.next(&ctx, batch) catch |err|
+        const valid = plan.root.next(&ctx, batch) catch |err|
             return replyRunErr(state, "select from", sel.table, err);
         if (first) {
             try state.sendRowDescription(fields);
             first = false;
         }
-        if (!more) break;
+        // An invalid batch is an empty one (RowNode.next): nothing to
+        // count or emit, and the plan is exhausted.
+        if (!valid) break;
+        if (is_count) {
+            count += batch.sel.count() + batch.counted;
+            continue;
+        }
         var it = batch.selected();
         while (it.next()) |row| try emitter.emit(row);
     }
+    // count(*) is one row — which only LIMIT 0 drops.
+    if (is_count and (sel.limit orelse 1) > 0) try emitter.emitCount(count);
 
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "SELECT {d}", .{emitter.count}));
 }
@@ -253,7 +278,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
     // Open AFTER the intent locks — see insert's comment.
-    const tbl = self.srv.openTable(ns, table_id) catch |err| {
+    const tbl = self.openTable(ns, table_id) catch |err| {
         logDeleteErr(del.table, "load schema", err);
         return replyError(state, "failed to load table schema");
     };
@@ -332,7 +357,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
     // Open AFTER the intent locks — see insert's comment.
-    const tbl = self.srv.openTable(ns, table_id) catch |err| {
+    const tbl = self.openTable(ns, table_id) catch |err| {
         log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
@@ -487,6 +512,16 @@ pub const RowEmitter = struct {
         try dw.finish();
         self.count += 1;
     }
+
+    /// count(*)'s one output row: the int8 cell.
+    pub fn emitCount(self: *RowEmitter, count: u64) !void {
+        var dw = try self.state.beginDataRow(1);
+        const w = try dw.beginColumn();
+        try _value.formatValue(w, .{ .int8 = @intCast(count) });
+        dw.endColumn();
+        try dw.finish();
+        self.count += 1;
+    }
 };
 
 /// Advance a writer's read_ts to every built unique index's
@@ -531,15 +566,32 @@ fn planFor(
     return try _plan.plan(arloc, tbl, pred, opts);
 }
 
-/// litToValue plus the client-facing error mapping shared by INSERT
-/// and UPDATE. null = the error reply was already sent (the
+/// litToValue plus INSERT's client-facing error mapping, and the one
+/// non-constant literal: CURRENT_TIMESTAMP is the transaction's start
+/// (`now_us`, Unix µs), typed by the column it lands in — a timestamp
+/// column, else 42804. null = the error reply was already sent (the
 /// pred.bind convention).
 fn coerceLiteral(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,
     lit: _parse.Literal,
     ty: _value.Type,
+    now_us: i64,
 ) !?_value.Value {
+    if (lit == .current_timestamp) {
+        return switch (ty) {
+            .timestamp => .{ .timestamp = now_us },
+            .timestamptz => .{ .timestamptz = now_us },
+            else => {
+                try replyErrorCode(
+                    state,
+                    pgwire.sqlstate.datatype_mismatch,
+                    "CURRENT_TIMESTAMP needs a timestamp column",
+                );
+                return null;
+            },
+        };
+    }
     return litToValue(a, lit, ty) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.UnsupportedLiteral, error.UnsupportedType => {
@@ -657,7 +709,11 @@ fn lockIndexKeys(
     tx: *_txn.Txn,
     keys: []IndexKey,
 ) !bool {
-    std.mem.sort(IndexKey, keys, {}, IndexKey.lessThan);
+    // Grouping needs adjacency only, and a group's outcome does not
+    // depend on the order within it (two adds is an error, one add
+    // has one egid), so the unstable sort — no per-call scratch cache
+    // to poison-fill — is fine here.
+    std.mem.sortUnstable(IndexKey, keys, {}, IndexKey.lessThan);
     for (keys) |ik| {
         if (!ik.idx.unique) continue;
         tx.lockRow(ik.idx.index_table_id, ik.key) catch |err| {

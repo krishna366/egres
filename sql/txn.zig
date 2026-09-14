@@ -102,6 +102,11 @@ pub const Txn = struct {
     /// raft's, not ours — apply rewrites every wire key's ts to the
     /// commit entry's HLC.
     read_ts: u64,
+    /// Wall-clock µs since the Unix epoch when the txn began: the value
+    /// of CURRENT_TIMESTAMP for every statement in it (transaction
+    /// start, as in Postgres). Set by the server at creation; 0 in
+    /// unit tests, which never evaluate it.
+    start_us: i64 = 0,
     /// Reads settled by prior statements. Revalidated on a bump (see
     /// lockRow). INVARIANT: all are valid as of the current read_ts —
     /// bump revalidates `prev`, restart re-runs `cur` — so COMMIT never

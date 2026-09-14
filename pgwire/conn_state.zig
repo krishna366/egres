@@ -341,11 +341,14 @@ pub const ConnState = struct {
 
             // SSLRequest / GSSEncRequest: client sniffs to see if we
             // support TLS. We send 'N' (no) and let it retry plain.
-            // The byte goes raw — not framed — per protocol.
+            // The byte goes raw — not framed — per protocol. It must
+            // reach the wire before we read again: the client sends
+            // nothing more until it sees the answer.
             if (code == _types.ssl_request_code or
                 code == _types.gss_enc_request_code)
             {
                 try self.out.writeByte('N');
+                try self.out.flush();
                 continue;
             }
             // CancelRequest: we have no cancel keys, so ignore and

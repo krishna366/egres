@@ -42,9 +42,10 @@ const writeCatalogRows = _ddl.writeCatalogRows;
 ///     keeps its bottom level empty, the install condition;
 ///  3. take the exclusive table intent as a BARRIER only: drains
 ///     statements still holding a pre-index Table (openTable runs
-///     after dmlTxn, so post-barrier statements load the reload);
-///  4. under it: catalog row (valid_ts = building) + reloadTable —
-///     every later statement sees the index and leaves it alone;
+///     after dmlTxn, so post-barrier statements load fresh);
+///  4. under it: catalog row (valid_ts = building) + forgetTable —
+///     every later statement loads the catalog afresh, sees the
+///     index and leaves it alone;
 ///     read_ts = that row's own commit HLC, read back from the row.
 ///     Durable and self-describing: any node could re-run this
 ///     backfill from the catalog row alone;
@@ -65,9 +66,9 @@ const writeCatalogRows = _ddl.writeCatalogRows;
 ///     postings; for a unique index a put or tombstone per touched
 ///     key, two rows on one key being 23505. valid_ts = the applied
 ///     ts after that commit;
-///  9. set valid_ts + reloadTable — a statement whose own read_ts
+///  9. set valid_ts + forgetTable — a statement whose own read_ts
 ///     is at or above valid_ts may now use the index; an older
-///     snapshot scans instead. The reload destroys the cached Table,
+///     snapshot scans instead. Forgetting destroys the cached Table,
 ///     which is only safe while no statement holds it (DML holds
 ///     the shared intent from dmlTxn to txn end); the barrier
 ///     drains them and parks new ones.
@@ -140,7 +141,7 @@ pub fn createIndex(
                 "column is already indexed",
             );
     }
-    // `t` (and `col` into it) dangle past reloadTable below; keep
+    // `t` (and `col` into it) dangle past forgetTable below; keep
     // what's needed.
     const column_id = col.column_id;
 
@@ -216,8 +217,8 @@ pub fn createIndex(
         .tkey = tkey,
         .txn_id = txn_id,
     };
-    self.srv.reloadTable(ns, base_tid) catch |err|
-        return build.fail("reload table", err);
+    self.srv.forgetTable(ns, base_tid) catch |err|
+        return build.fail("forget table", err);
     build.read_ts = build.readTs() catch |err|
         return build.fail("read read_ts", err);
 
@@ -731,7 +732,7 @@ const IndexBuild = struct {
             &.{},
             &.{vdef},
         );
-        try self.handler.srv.reloadTable(self.ns, self.def.base_table_id);
+        try self.handler.srv.forgetTable(self.ns, self.def.base_table_id);
     }
 };
 
@@ -859,7 +860,7 @@ fn removeIndex(
 
     const mc = try eng.forest.buildDropTables(a, ns, &.{index_tid});
     try eng.proposeMC(mc, .apply);
-    try self.srv.reloadTable(ns, base_tid);
+    try self.srv.forgetTable(ns, base_tid);
 }
 
 fn logCreateIndexErr(name: String, what: String, err: anyerror) void {

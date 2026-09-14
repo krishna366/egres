@@ -58,10 +58,16 @@ pub const Database = struct {
     locks: fiber.SemaphoreMap,
     oracle: Oracle,
     /// Per-table cache: compiled schema + egid counter, keyed by table_id
-    /// (the namespace is this database's). Guards the map AND every cached
-    /// table's `next_egid` (mutated on hand-out and on the apply fiber via
-    /// applyCommitted). Heap entries so held pointers survive map growth.
-    tables_mu: fiber.Mutex(.tracked) = .{},
+    /// (the namespace is this database's). Guards the map; each table's
+    /// `next_egid` is atomic and needs only a shared hold to reach it.
+    /// Heap entries so held pointers survive map growth. Readers share:
+    /// every statement looks its table up here, egid hand-out and the
+    /// apply fiber included (as an exclusive hand-off mutex this ran at
+    /// ~94k hand-offs/s under a 64-client pgbench); first load and the
+    /// DDL swap take it exclusively, only around the egid seed and the
+    /// publish (see updateEgidAndPut) — the schema load itself runs
+    /// with no lock held.
+    tables_mu: fiber.RWMutex(.untracked) = .{},
     tables: std.AutoHashMap(u32, *_table.Table),
 
     fn init(allocator: std.mem.Allocator, ns: u64) !Database {
@@ -93,8 +99,8 @@ pub const Database = struct {
     /// forest.maxKey, covering rows applied before caching.
     fn applyCommitted(self: *Database, items: []const zdb.kv.Item) void {
         {
-            self.tables_mu.lock(@src());
-            defer self.tables_mu.unlock();
+            self.tables_mu.lockShared(@src());
+            defer self.tables_mu.unlockShared();
             // Items in a run share this namespace; only table_id varies,
             // and consecutive items share a table in practice.
             var tbl: ?*_table.Table = null;
@@ -105,10 +111,8 @@ pub const Database = struct {
                     tbl = self.tables.get(table_id);
                 }
                 const cached = tbl orelse continue;
-                if (_key.decodeEgid(item.key.primary)) |egid| {
-                    if (egid + 1 > cached.next_egid)
-                        cached.next_egid = egid + 1;
-                }
+                if (_key.decodeEgid(item.key.primary)) |egid|
+                    cached.raiseNextEgid(egid + 1);
             }
         }
         self.oracle.updateItems(items) catch |err|
@@ -119,6 +123,10 @@ pub const Database = struct {
 pub const Server = struct {
     engine: *engine.Engine,
     listen_addr: fiber.net.IpAddress,
+    /// Connections accepted so far; deals each new connection's fiber to
+    /// the next lane worker (see runListener). Only the accept loop
+    /// touches it.
+    conn_seq: u64 = 0,
     /// Compiled layout of the CATALOG table's own rows — NOT a user-table
     /// schema. Every namespace's catalog (table 1) has the identical
     /// compiled-in schema (catalog.logical_schema; it can't live in a
@@ -228,73 +236,111 @@ pub const Server = struct {
         if (db) |d| d.applyCommitted(items);
     }
 
-    /// The cached Table for `table_id` in `db`, loading + seeding it on
-    /// first use. Caller holds `db.tables_mu`.
-    fn openTableLocked(self: *Server, db: *Database, table_id: u32) !*_table.Table {
-        if (db.tables.get(table_id)) |t| return t;
-
+    /// Load `table_id`'s schema onto the heap — the part of a cache miss
+    /// that needs no lock. DDL holds the table intent lock exclusively
+    /// and DML holds it shared before it gets here, so the catalog rows
+    /// cannot change under the read, and a park on it stalls no other
+    /// statement's lookup and not the apply fiber. `next_egid` stays 0
+    /// until updateEgidAndPut seeds it.
+    fn loadTable(self: *Server, db: *Database, table_id: u32) !*_table.Table {
         var loaded = try _table.loadTableSchema(self.engine.allocator, self.engine.forest, &self.catalog_ps, &self.index_catalog_ps, db.ns, table_id);
         errdefer loaded.deinit();
-        // Seed the egid counter past the table's max applied row id (covers
-        // snapshot SSTs the apply observer never saw). Empty table → start at 1.
-        if (try self.engine.forest.maxKey(self.engine.allocator, db.ns, table_id)) |mk| {
-            defer mk.free(self.engine.allocator);
-            loaded.next_egid = (_key.decodeEgid(mk.primary) orelse 0) + 1;
-        } else {
-            loaded.next_egid = 1;
-        }
-
         const t = try self.engine.allocator.create(_table.Table);
-        errdefer self.engine.allocator.destroy(t);
         t.* = loaded;
-        try db.tables.put(table_id, t);
         return t;
+    }
+
+    fn destroyTable(self: *Server, t: *_table.Table) void {
+        t.deinit();
+        self.engine.allocator.destroy(t);
     }
 
     /// The cached Table for (namespace, table_id) — schema for INSERT/SELECT.
     pub fn openTable(self: *Server, ns: u64, table_id: u32) !*_table.Table {
-        const db = try self.database(ns);
-        db.tables_mu.lock(@src());
-        defer db.tables_mu.unlock();
-        return self.openTableLocked(db, table_id);
+        return self.openTableIn(try self.database(ns), table_id);
     }
 
-    /// Swap the cached Table for a freshly loaded one — DDL that
-    /// changed the schema (CREATE/DROP INDEX) calls this while
-    /// holding the table intent lock EXCLUSIVELY, which is what makes
-    /// destroying the old entry safe: DML holds its Table only under
-    /// the shared intent lock (taken before openTable), and
-    /// applyCommitted touches cached tables only under tables_mu.
-    /// `next_egid` is runtime state, not catalog state — carry the
-    /// larger of the old counter and the fresh seed across the swap.
-    pub fn reloadTable(self: *Server, ns: u64, table_id: u32) !void {
-        const db = try self.database(ns);
+    /// `openTable` for a caller that already holds the Database — the
+    /// per-statement path (Handler.openTable), which resolves it once
+    /// per session instead of under `databases_mu` every statement. A
+    /// hit costs a shared hold; a miss (first touch of a table) loads
+    /// the schema with no lock held, then seeds and publishes under
+    /// the exclusive hold — unless another session published first,
+    /// in which case ours is the wasted copy (once per table per
+    /// process at most).
+    pub fn openTableIn(
+        self: *Server,
+        db: *Database,
+        table_id: u32,
+    ) !*_table.Table {
+        db.tables_mu.lockShared(@src());
+        const hit = db.tables.get(table_id);
+        db.tables_mu.unlockShared();
+        if (hit) |t| return t;
+
+        const fresh = try self.loadTable(db, table_id);
+        errdefer self.destroyTable(fresh);
+
         db.tables_mu.lock(@src());
         defer db.tables_mu.unlock();
-        const old = db.tables.fetchRemove(table_id) orelse {
-            // Nothing cached: the next openTable loads fresh anyway.
-            return;
-        };
-        errdefer {
-            old.value.deinit();
-            self.engine.allocator.destroy(old.value);
+
+        if (db.tables.get(table_id)) |t| {
+            self.destroyTable(fresh);
+            return t;
         }
-        const t = try self.openTableLocked(db, table_id);
-        t.next_egid = @max(t.next_egid, old.value.next_egid);
-        old.value.deinit();
-        self.engine.allocator.destroy(old.value);
+        try self.updateEgidAndPut(db, table_id, fresh);
+        return fresh;
     }
 
-    /// Drop a table's cache entry outright (DROP TABLE) — same
-    /// exclusive-intent-lock safety argument as reloadTable.
+    /// Seed `t.next_egid` past the table's max applied row id and put
+    /// `t` in the cache. Caller holds `db.tables_mu` exclusively and
+    /// the map has no entry for `table_id`. The seed and the publish
+    /// are one step on purpose: the apply fiber skips uncached tables,
+    /// so a row applied between the two would be missing from the
+    /// counter and its egid handed out again.
+    ///
+    /// maxKey takes no lock and the memtable keeps taking writes under
+    /// it, so its answer is a lower bound, not a snapshot. That is
+    /// enough because of the apply order: one fiber does forest.put
+    /// and then the applyCommitted observer call for the same rows,
+    /// and the observer takes `tables_mu` shared. A row applied before
+    /// this hold began was seen by the walk; a row applied during it
+    /// blocks at the observer until the publish, then raises the
+    /// counter itself. Either way the counter ends past every committed
+    /// row.
+    fn updateEgidAndPut(
+        self: *Server,
+        db: *Database,
+        table_id: u32,
+        t: *_table.Table,
+    ) !void {
+        // Covers snapshot SSTs the apply observer never saw. Empty
+        // table → start at 1.
+        if (try self.engine.forest.maxKey(self.engine.allocator, db.ns, table_id)) |mk| {
+            defer mk.free(self.engine.allocator);
+            t.raiseNextEgid((_key.decodeEgid(mk.primary) orelse 0) + 1);
+        } else {
+            t.raiseNextEgid(1);
+        }
+        try db.tables.put(table_id, t);
+    }
+
+    /// Drop a table's cache entry: DROP TABLE, and every DDL that
+    /// changes the schema (CREATE/DROP INDEX). The next openTable loads
+    /// fresh from the catalog and reseeds `next_egid` from maxKey. The
+    /// caller holds the table intent lock EXCLUSIVELY, which is what
+    /// makes destroying the entry safe: DML holds its Table only under
+    /// the shared intent lock (taken before openTable), and
+    /// applyCommitted touches cached tables only under tables_mu. The
+    /// counter needs no carry-over: under the exclusive intent no
+    /// INSERT is in flight, and a committed row is applied before its
+    /// txn releases the shared intent, so the reseed already covers
+    /// every handed-out id that became a row.
     pub fn forgetTable(self: *Server, ns: u64, table_id: u32) !void {
         const db = try self.database(ns);
         db.tables_mu.lock(@src());
         defer db.tables_mu.unlock();
-        if (db.tables.fetchRemove(table_id)) |old| {
-            old.value.deinit();
-            self.engine.allocator.destroy(old.value);
-        }
+        if (db.tables.fetchRemove(table_id)) |old| self.destroyTable(old.value);
     }
 
     /// Reserve the next egid for a table (leader path). newTxn already ran
@@ -302,15 +348,18 @@ pub const Server = struct {
     /// tail (onDataApplied only advances it) — the id handed out is past
     /// every committed row.
     pub fn allocEgid(self: *Server, ns: u64, table_id: u32) !u64 {
-        const db = try self.database(ns);
-        db.tables_mu.lock(@src());
-        defer db.tables_mu.unlock();
-        const t = try self.openTableLocked(db, table_id);
-        const egid = t.next_egid;
-        // egids start at 1 (openTableLocked seeds the counter); 0 is
+        return self.allocEgidIn(try self.database(ns), table_id);
+    }
+
+    /// `allocEgid` with the Database in hand (see openTableIn). A hit
+    /// costs a shared hold plus one fetchAdd; the caller's shared
+    /// intent lock keeps the Table alive past the hold.
+    pub fn allocEgidIn(self: *Server, db: *Database, table_id: u32) !u64 {
+        const t = try self.openTableIn(db, table_id);
+        const egid = t.next_egid.fetchAdd(1, .monotonic);
+        // egids start at 1 (updateEgidAndPut seeds the counter); 0 is
         // never a row.
         std.debug.assert(egid >= 1);
-        t.next_egid += 1;
         return egid;
     }
 
@@ -334,7 +383,18 @@ pub const Server = struct {
                 stream.close();
                 return;
             }
-            fiber.spawnDetached(.{}, handleConn, .{ self, stream }) catch {
+            // Round-robin over the lane's workers. A connection's fiber
+            // stays where it is placed (its I/O completes on that
+            // worker's ring), so the spread at accept IS the steady-state
+            // spread; the scheduler's local push would pile every
+            // connection onto this worker and leave stealing to sort it
+            // out one fiber at a time.
+            self.conn_seq +%= 1;
+            fiber.spawnDetached(
+                .{ .worker_id = @truncate(self.conn_seq) },
+                handleConn,
+                .{ self, stream },
+            ) catch {
                 stream.close();
                 continue;
             };
@@ -369,6 +429,11 @@ pub const Handler = struct {
     /// must not reach the manifest (nextTableId's getOrPut would resurrect
     /// its counter entry).
     namespace: u64 = 0,
+    /// The session's Database, resolved once: Server.database never
+    /// frees one, so the pointer is good for the session and every
+    /// statement skips the `databases_mu` lookup (three per statement
+    /// otherwise — and each was a contended hand-off under load).
+    db: ?*Database = null,
     /// The live transaction, `t.implicit` telling which kind: an open
     /// interactive block (BEGIN..COMMIT/ROLLBACK, implicit=false, lives
     /// across statements) or the auto-commit txn of the DML statement
@@ -578,6 +643,28 @@ pub const Handler = struct {
         self.endImplicit();
     }
 
+    /// The Database for `ns`: the cached one when it is the session's,
+    /// else resolved (and cached) through Server.database.
+    fn sessionDb(self: *Handler, ns: u64) !*Database {
+        if (self.db) |d| {
+            if (d.ns == ns) return d;
+        }
+        const d = try self.srv.database(ns);
+        self.db = d;
+        return d;
+    }
+
+    /// The cached Table for (ns, table_id), through the session's
+    /// Database — the per-statement schema lookup.
+    pub fn openTable(self: *Handler, ns: u64, table_id: u32) !*_table.Table {
+        return self.srv.openTableIn(try self.sessionDb(ns), table_id);
+    }
+
+    /// Reserve the next egid for a table (see Server.allocEgid).
+    pub fn allocEgid(self: *Handler, ns: u64, table_id: u32) !u64 {
+        return self.srv.allocEgidIn(try self.sessionDb(ns), table_id);
+    }
+
     pub fn newTxn(self: *Handler, ns: u64) !*_txn.Txn {
         const eng = self.srv.engine;
         // Best-effort catch-up: a leader waits out its committed tail
@@ -587,7 +674,7 @@ pub const Handler = struct {
         // Database first, read_ts second: a commit applying between
         // the two lands in this database's now-existing oracle, so a
         // conflict newer than our snapshot can never go unrecorded.
-        const db = try self.srv.database(ns);
+        const db = try self.sessionDb(ns);
         const t = try eng.allocator.create(_txn.Txn);
         errdefer eng.allocator.destroy(t);
         t.* = _txn.Txn.init(
@@ -600,6 +687,7 @@ pub const Handler = struct {
             &db.oracle,
             eng.forest,
         );
+        t.start_us = fiber.timestampNow(.realtime, .micros);
         return t;
     }
 
@@ -635,7 +723,7 @@ pub const Handler = struct {
             try replyLockErr(state, err);
             return null;
         };
-        const db = try self.srv.database(ns);
+        const db = try self.sessionDb(ns);
         if (db.dropped) {
             try replyErrorCode(
                 state,

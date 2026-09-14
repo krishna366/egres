@@ -136,7 +136,18 @@ pub const Table = struct {
     /// across leader changes without a term; seeded from forest.maxKey on
     /// cache-load (snapshot rows the observer never saw); advanced by the
     /// leader on hand-out. Not from the catalog. See sql.Server.
-    next_egid: u64 = 0,
+    ///
+    /// Atomic so hand-out (fetchAdd) and the apply observer (fetchMax)
+    /// need no lock: the counter carries no other data, so monotonic
+    /// ordering is enough. The Table pointer itself stays valid under
+    /// the table intent lock (see sql.Server.forgetTable).
+    next_egid: std.atomic.Value(u64) = .init(0),
+
+    /// Raise `next_egid` to at least `floor`: the apply observer's
+    /// `max(next_egid, committed_egid + 1)`, and the reload merge.
+    pub fn raiseNextEgid(self: *Table, floor: u64) void {
+        _ = self.next_egid.fetchMax(floor, .monotonic);
+    }
 
     pub fn deinit(self: *Table) void {
         self.arena.deinit();

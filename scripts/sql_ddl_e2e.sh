@@ -94,6 +94,50 @@ expect "CREATE TABLE mine_pkey" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE min
 expect "PK index name collision fails CREATE" "already exists" \
     psql "$E" -X -c "CREATE TABLE mine (id int PRIMARY KEY);"
 
+# --- restart from a raft snapshot: names must ride in the snapshot ----------
+# Once a snapshot is taken the WAL below it is gone, so the database and
+# table names have to be in the snapshot itself (engine.replayNames).
+# A tiny memtable makes the rows below flush, which lets the snapshot
+# reach past the CREATE TABLE; the snapshot flags make the leader take
+# one within a second or two.
+stop_server
+./zig-out/bin/egres --raft="id=1" --data="dir=$DATA;memtable-size=4096" \
+    --snapshot="min-bytes=1;min-age-seconds=1;poll-interval-seconds=1" \
+    >"$LOG" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+    if grep -q "sql listener started" "$LOG" 2>/dev/null &&
+        grep -q "become-leader" "$LOG" 2>/dev/null; then break; fi
+    sleep 0.2
+done
+psql "$E" -X -qc "CREATE TABLE snap_t (a int PRIMARY KEY, s text);" >/dev/null
+pad=$(head -c 200 /dev/zero | tr '\0' x)
+rows=$(for i in $(seq 1 40); do printf "(%d,'%s')," "$i" "$pad"; done)
+psql "$E" -X -qc "INSERT INTO snap_t VALUES ${rows%,};" >/dev/null
+# Wait for a snapshot whose index is past snap_t's create_tree entry.
+covered=0
+for _ in $(seq 1 150); do
+    created=$(grep -oE "enter idx=[0-9]+ cmd=create_tree" "$LOG" | tail -1 |
+        grep -oE "[0-9]+" | head -1 || true)
+    snap=$(grep -oE "snapshot proposed: index=[0-9]+" "$LOG" | tail -1 |
+        grep -oE "[0-9]+" || true)
+    if [ -n "$created" ] && [ -n "$snap" ] && [ "$snap" -ge "$created" ]; then
+        covered=1; break
+    fi
+    sleep 0.2
+done
+if [ "$covered" = 1 ]; then ok "snapshot covers the DDL"; else
+    bad "no snapshot past the CREATE TABLE (create=$created snap=$snap)"; fi
+stop_server
+start_server
+expect "rows resolve after a snapshot restart" "(40 rows)" \
+    psql "$E" -X -c "SELECT * FROM snap_t;"
+expect "table name survives a snapshot restart" "already exists" \
+    psql "$E" -X -c "CREATE TABLE snap_t (a int PRIMARY KEY);"
+expect "post_restart still known" "already exists" \
+    psql "$E" -X -c "CREATE TABLE post_restart (a int4 PRIMARY KEY);"
+psql "$E" -X -qc "DROP TABLE snap_t;" >/dev/null
+
 # --- per-database name scoping + drop cascades ------------------------------
 expect "CREATE DATABASE app" "CREATE DATABASE" psql "$E" -X -c "CREATE DATABASE app;"
 expect "same table name in app" "CREATE TABLE" psql "$A" -X -c "CREATE TABLE t (x uint8);"

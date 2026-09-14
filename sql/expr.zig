@@ -183,7 +183,9 @@ fn literalValue(
         .str => |s| .{ .text = s },
         .bool_ => |b| .{ .bool_ = b },
         .null_value => .null_value,
-        .unsupported => unreachable,
+        // parseExpr yields neither: a SET value is a constant or a
+        // column, never a value function.
+        .unsupported, .current_timestamp => unreachable,
     };
 }
 

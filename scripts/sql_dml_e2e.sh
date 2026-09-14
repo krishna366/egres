@@ -83,6 +83,44 @@ expect "unsupported operator rejected" "column = value" q "SELECT name FROM t WH
 star_out=$(q "SELECT * FROM t;" 2>&1)
 if grep -q "egid" <<<"$star_out"; then bad "egid leaked into SELECT *"; else ok "egid excluded from SELECT *"; fi
 
+# --- count(*): one int8 row; WHERE narrows it, only LIMIT 0 drops it -------
+expect "count(*)" "2" v "SELECT count(*) FROM t;"
+expect "count(*) header" "count" q "SELECT count(*) FROM t;"
+expect "count(*) tag" "(1 row)" q "SELECT count(*) FROM t;"
+expect "count(*) with WHERE" "1" v "SELECT count(*) FROM t WHERE id = 1;"
+expect "count(*) by egid" "1" v "SELECT count(*) FROM t WHERE egid = 2;"
+expect "count(*) no match is 0" "0" v "SELECT count(*) FROM t WHERE id = 99;"
+expect "count(*) LIMIT 0 drops the row" "(0 rows)" \
+    q "SELECT count(*) FROM t LIMIT 0;"
+expect "count(*) LIMIT 5 keeps it" "2" v "SELECT count(*) FROM t LIMIT 5;"
+expect "count(col) rejected" "only count" q "SELECT count(id) FROM t;"
+expect "count(*) with columns rejected" "other targets" \
+    q "SELECT id, count(*) FROM t;"
+expect "count(*) FOR UPDATE rejected" "FOR UPDATE" \
+    q "SELECT count(*) FROM t FOR UPDATE;"
+
+# --- timestamps: CURRENT_TIMESTAMP and literals into timestamp columns -----
+q "CREATE TABLE ts (id int4, ts1 timestamp, ts2 timestamptz);" >/dev/null
+expect "INSERT CURRENT_TIMESTAMP" "INSERT 0 1" \
+    q "INSERT INTO ts VALUES (1, CURRENT_TIMESTAMP, LOCALTIMESTAMP);"
+ts_lit="'2026-09-12 10:00:00.5', '2026-09-12 12:00:00+02'"
+expect "INSERT timestamp literals" "INSERT 0 1" \
+    q "INSERT INTO ts VALUES (2, $ts_lit);"
+expect "timestamp renders" "2026-09-12 10:00:00.5" \
+    v "SELECT ts1 FROM ts WHERE id = 2;"
+expect "timestamptz normalizes to UTC" "2026-09-12 10:00:00+00" \
+    v "SELECT ts2 FROM ts WHERE id = 2;"
+expect "CURRENT_TIMESTAMP is now (this year)" "$(date -u +%Y)-" \
+    v "SELECT ts1 FROM ts WHERE id = 1;"
+expect "WHERE on a timestamp" "2" \
+    v "SELECT id FROM ts WHERE ts1 = '2026-09-12 10:00:00.5';"
+expect "CURRENT_TIMESTAMP into int rejected" "timestamp column" \
+    q "INSERT INTO ts VALUES (CURRENT_TIMESTAMP, NULL, NULL);"
+expect "bad timestamp literal" "invalid value" \
+    q "INSERT INTO ts VALUES (3, 'yesterday', NULL);"
+expect "count(*) on ts" "2" v "SELECT count(*) FROM ts;"
+q "DROP TABLE ts;" >/dev/null
+
 # --- omitted column defaults NULL; egid auto-allocates ---------------------
 expect "INSERT partial cols" "INSERT 0 1" q "INSERT INTO t (name) VALUES ('c');"
 expect "auto egid 3 = c" "c" v "SELECT name FROM t WHERE egid = 3;"

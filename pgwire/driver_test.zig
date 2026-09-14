@@ -245,3 +245,79 @@ test "driver: full startup + Query + Terminate round-trip" {
     // database=d).
     try std.testing.expectEqualStrings("d", handler.database.items);
 }
+
+/// Client that sends SSLRequest alone and waits for the 'N' before it
+/// sends Startup, the way libpq behaves with sslmode=prefer. A server
+/// that buffers the 'N' instead of flushing it leaves both sides
+/// waiting; the test runner's hard timeout then fails the test.
+fn sslProbeClientFn(ctx: *TestCtx) anyerror!void {
+    const port = try ctx.port_ch.receive();
+    var addr_buf: [32]u8 = undefined;
+    const addr_str = try std.fmt.bufPrint(
+        &addr_buf,
+        "127.0.0.1:{d}",
+        .{port},
+    );
+    const addr = try IpAddress.parseIpAndPort(addr_str);
+
+    var stream = try addr.connect(.{});
+    defer stream.close();
+
+    var probe: [8]u8 = undefined;
+    std.mem.writeInt(u32, probe[0..4], 8, .big);
+    std.mem.writeInt(u32, probe[4..8], pgwire.types.ssl_request_code, .big);
+    try stream.writeAll(&probe);
+
+    var answer: [1]u8 = undefined;
+    const got = try stream.read(&answer);
+    try testing.expectEqual(@as(usize, 1), got);
+    try testing.expectEqual(@as(u8, 'N'), answer[0]);
+
+    var to_send: std.ArrayList(u8) = .empty;
+    defer to_send.deinit(ctx.a);
+    try buildStartup(&to_send, ctx.a);
+    try buildTerminate(&to_send, ctx.a);
+    try stream.writeAll(to_send.items);
+
+    var inbox: std.ArrayList(u8) = .empty;
+    defer inbox.deinit(ctx.a);
+    var buf: [1024]u8 = undefined;
+    while (true) {
+        const n = stream.read(&buf) catch |e| switch (e) {
+            error.EOF => break,
+            else => return e,
+        };
+        if (n == 0) break;
+        try inbox.appendSlice(ctx.a, buf[0..n]);
+    }
+
+    // AuthenticationOk is the first framed message after the probe.
+    try testing.expect(inbox.items.len > 0);
+    try testing.expectEqual(@as(u8, 'R'), inbox.items[0]);
+}
+
+test "driver: SSLRequest alone is answered before Startup arrives" {
+    const a = std.testing.allocator;
+
+    var handler = StubHandler{ .alloc = a };
+    defer handler.deinit();
+
+    var port_buf: [1]u16 = undefined;
+    var port_ch = Channel(u16).init(&port_buf);
+
+    var ctx = TestCtx{
+        .port_ch = &port_ch,
+        .a = a,
+        .handler = &handler,
+    };
+
+    var group = fiber.Group(anyerror!void).init(a);
+    defer group.deinit();
+
+    try group.spawn(.{}, serverFn, .{&ctx});
+    try group.spawn(.{}, sslProbeClientFn, .{&ctx});
+
+    for (group.wait()) |r| try r;
+
+    try std.testing.expectEqualStrings("d", handler.database.items);
+}

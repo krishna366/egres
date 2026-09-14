@@ -227,6 +227,21 @@ test "sql.parse: INSERT ... VALUES parses rows, columns, and literals" {
     try testing.expectEqual(@as(i64, 0), cols.insert.rows[0][0].int); // zero-valued ival
     try testing.expectEqual(true, cols.insert.rows[0][1].bool_);
     try testing.expect(cols.insert.rows[0][2] == .null_value);
+
+    // CURRENT_TIMESTAMP and LOCALTIMESTAMP (with or without a
+    // precision) are the one non-constant literal; any other function
+    // or expression is an unsupported item, rejected at execute.
+    const ts = try parse.statement(
+        alloc,
+        "INSERT INTO t (at) VALUES (CURRENT_TIMESTAMP), (LOCALTIMESTAMP), " ++
+            "(CURRENT_TIMESTAMP(3)), (now()), (1 + 1), (CURRENT_DATE);",
+    );
+    try testing.expect(ts.insert.rows[0][0] == .current_timestamp);
+    try testing.expect(ts.insert.rows[1][0] == .current_timestamp);
+    try testing.expect(ts.insert.rows[2][0] == .current_timestamp);
+    try testing.expect(ts.insert.rows[3][0] == .unsupported);
+    try testing.expect(ts.insert.rows[4][0] == .unsupported);
+    try testing.expect(ts.insert.rows[5][0] == .unsupported);
 }
 
 test "sql.parse: INSERT rejections carry a reason" {
@@ -267,6 +282,19 @@ test "sql.parse: SELECT parses projection, table, and an equality filter" {
     const f = s2.select.where.?.eq;
     try testing.expectEqualStrings("id", f.column);
     try testing.expectEqual(@as(i64, 5), f.literal.int);
+
+    // count(*): its own projection kind; WHERE and LIMIT parse as usual.
+    const c1 = try parse.statement(alloc, "SELECT count(*) FROM t;");
+    try testing.expectEqualStrings("t", c1.select.table);
+    try testing.expect(c1.select.projection == .count_star);
+    try testing.expect(c1.select.where == null);
+    const c2 = try parse.statement(
+        alloc,
+        "select COUNT(*) from t where id = 5 limit 0;",
+    );
+    try testing.expect(c2.select.projection == .count_star);
+    try testing.expectEqualStrings("id", c2.select.where.?.eq.column);
+    try testing.expectEqual(@as(?usize, 0), c2.select.limit);
 }
 
 test "sql.parse: WHERE parses AND / OR / NOT and IS [NOT] NULL" {
@@ -366,7 +394,22 @@ test "sql.parse: SELECT rejections carry a reason" {
         // FETCH ... WITH TIES is refused too, but the vendored grammar
         // already rejects the syntax, so it cannot be reached here.
         .{ .sql = "SELECT * FROM a, b;", .needle = "one table" },
-        .{ .sql = "SELECT count(*) FROM t;", .needle = "column references" },
+        .{ .sql = "SELECT count(id) FROM t;", .needle = "count(*)" },
+        .{ .sql = "SELECT sum(id) FROM t;", .needle = "count(*)" },
+        .{ .sql = "SELECT count(DISTINCT id) FROM t;", .needle = "count(*)" },
+        .{
+            .sql = "SELECT count(*) FILTER (WHERE id = 1) FROM t;",
+            .needle = "count(*)",
+        },
+        .{ .sql = "SELECT id, count(*) FROM t;", .needle = "other targets" },
+        .{
+            .sql = "SELECT count(*), count(*) FROM t;",
+            .needle = "other targets",
+        },
+        .{
+            .sql = "SELECT count(*) FROM t FOR UPDATE;",
+            .needle = "FOR UPDATE",
+        },
         .{ .sql = "SELECT * FROM t WHERE a > 5;", .needle = "column = value" },
     };
     for (cases) |case| {
