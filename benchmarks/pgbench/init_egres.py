@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Emit the pgbench schema and data as SQL that Egres can execute.
 
-`pgbench -i` cannot be used against Egres: it needs COPY, char(n), NOT
-NULL, multi-table DROP/TRUNCATE, VACUUM and ALTER TABLE.  This writes
-plain CREATE TABLE + multi-row INSERT to stdout instead, to be piped
-through psql.
+`pgbench -i` cannot be used against Egres: it needs COPY, NOT NULL,
+multi-table DROP/TRUNCATE, VACUUM and ALTER TABLE.  This writes pgbench's
+own CREATE TABLE statements (minus NOT NULL) + multi-row INSERT to
+stdout instead, to be piped through psql.
 
 Mirrors `pgbench -i -s S`: branches=S, tellers=10*S, accounts=100000*S,
-all balances 0, and accounts.filler padded to 84 spaces the way
-pgbench's char(84) pads the empty string.
+all balances 0, and accounts.filler the empty string, which pgbench's
+char(84) pads to 84 spaces on the way out.  Egres stores a char(n)
+value stripped, so the accounts rows are smaller on disk than in
+Postgres.
 
 Usage: init_egres.py SCALE [ROWS_PER_STMT] [--parallel N]
 """
@@ -61,14 +63,15 @@ def main():
     # Dropped one at a time: Egres has no multi-table DROP.
     for t in tables:
         w("drop table if exists %s;\n" % t)
+    # pgbench's DDL (initCreateTables in pgbench.c), NOT NULL dropped.
     w("create table pgbench_history(tid int, bid int, aid int,"
-      " delta int, mtime timestamp, filler text);\n")
+      " delta int, mtime timestamp, filler char(22));\n")
     w("create table pgbench_tellers(tid int primary key, bid int,"
-      " tbalance int, filler text);\n")
+      " tbalance int, filler char(84));\n")
     w("create table pgbench_accounts(aid int primary key, bid int,"
-      " abalance int, filler text);\n")
+      " abalance int, filler char(84));\n")
     w("create table pgbench_branches(bid int primary key,"
-      " bbalance int, filler text);\n")
+      " bbalance int, filler char(88));\n")
 
     def emit(table, cols, n, rowfn):
         for start in range(1, n + 1, rows_per_stmt):
@@ -80,9 +83,8 @@ def main():
          lambda i: "(%d,0)" % i)
     emit("pgbench_tellers", "tid,bid,tbalance", 10 * scale,
          lambda i: "(%d,%d,0)" % (i, (i - 1) // 10 + 1))
-    filler = "'" + " " * 84 + "'"
     emit("pgbench_accounts", "aid,bid,abalance,filler", 100000 * scale,
-         lambda i: "(%d,%d,0,%s)" % (i, (i - 1) // 100000 + 1, filler))
+         lambda i: "(%d,%d,0,'')" % (i, (i - 1) // 100000 + 1))
 
 
 if __name__ == "__main__":

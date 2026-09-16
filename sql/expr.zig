@@ -76,15 +76,17 @@ pub const SetNode = union(enum) {
     ) EvalError!Value {
         std.debug.assert(self.fits(target));
         // A leaf already of the target's type is the cell itself.
+        // (A string column of another length is not a leaf of the
+        // target's type: its cell must go through the length check.)
         switch (self.*) {
             .value => |v| if (v == .null_value or v.ty() == target.ty) return v,
-            .column => |col| if (col.ty == target.ty)
+            .column => |col| if (col.ty == target.ty and col.type_mod == target.type_mod)
                 return tbl.parseCol(item, col),
             .binop => {},
         }
         const result = try self.scalar(arloc, tbl, item) orelse
             return .null_value;
-        return coerceScalar(result, target.ty);
+        return coerceScalar(result, target);
     }
 
     /// This subtree's value for one row, before assignment; null = SQL
@@ -117,6 +119,8 @@ pub const BindError = error{
     UnsupportedValue,
     TypeMismatch,
     NoSuchOperator,
+    StringTooLong,
+    InvalidUtf8,
     OutOfMemory,
 };
 
@@ -169,11 +173,13 @@ fn literalValue(
     target: ?*const Column,
 ) BindError!Value {
     if (target) |col| {
-        return _parse.litToValue(arloc, lit, col.ty) catch |err| switch (err) {
+        return _parse.litToValue(arloc, lit, col) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedLiteral,
             error.UnsupportedType,
             => return error.UnsupportedValue,
+            error.StringTooLong => return error.StringTooLong,
+            error.InvalidUtf8 => return error.InvalidUtf8,
             else => return error.InvalidValue,
         };
     }
@@ -209,7 +215,7 @@ fn resultType(op: Op, lhs: ?Type, rhs: ?Type) BindError!?Type {
     const l = lhs orelse rhs orelse return null;
     const r = rhs orelse l;
     if (op == .concat) {
-        if (l != .text or r != .text) return error.NoSuchOperator;
+        if (!l.isString() or !r.isString()) return error.NoSuchOperator;
         return .text;
     }
     if (!l.isNumeric() or !r.isNumeric()) return error.NoSuchOperator;
@@ -259,15 +265,45 @@ pub fn bind(
                 code.undefined_function,
                 "operator does not exist for these operand types",
             ),
+            error.StringTooLong => try replyStringTooLong(state, arloc, target),
+            error.InvalidUtf8 => try replyInvalidUtf8(state),
         }
         return null;
     };
+}
+
+/// 22001 with Postgres's wording: `value too long for type
+/// character(84)` / `character varying(20)`. Shared with dml.zig
+/// (INSERT literals, SET results at eval).
+pub fn replyStringTooLong(
+    state: *pgwire.ConnState,
+    a: std.mem.Allocator,
+    col: *const Column,
+) !void {
+    const type_name: String = if (col.ty == .bpchar) "character" else "character varying";
+    const msg = try std.fmt.allocPrint(
+        a,
+        "value too long for type {s}({d})",
+        .{ type_name, col.type_mod orelse 1 },
+    );
+    try replyErrorCode(state, pgwire.sqlstate.string_data_right_truncation, msg);
+}
+
+/// 22021, Postgres's wording.
+pub fn replyInvalidUtf8(state: *pgwire.ConnState) !void {
+    try replyErrorCode(
+        state,
+        pgwire.sqlstate.character_not_in_repertoire,
+        "invalid byte sequence for encoding \"UTF8\"",
+    );
 }
 
 pub const EvalError = error{
     IntOutOfRange,
     FloatOutOfRange,
     DivisionByZero,
+    StringTooLong,
+    InvalidUtf8,
     OutOfMemory,
 };
 
@@ -358,12 +394,13 @@ fn floatOp(op: Op, x: f64, y: f64) EvalError!f64 {
     return r;
 }
 
-/// Assign a computed scalar to a column of `ty`: integers with a
-/// range check, an int into a float widened, an f64 into a float4
-/// narrowed (overflow → FloatOutOfRange), text as is. Any other
-/// pairing never binds.
-fn coerceScalar(s: Scalar, ty: Type) EvalError!Value {
-    switch (ty) {
+/// Assign a computed scalar to `target`: integers with a range check,
+/// an int into a float widened, an f64 into a float4 narrowed
+/// (overflow → FloatOutOfRange), text through the column's string
+/// rules (value.coerceString: `char(n)` stripped, lengths checked).
+/// Any other pairing never binds.
+fn coerceScalar(s: Scalar, target: *const Column) EvalError!Value {
+    switch (target.ty) {
         .int2 => return .{ .int2 = try intCast(i16, s) },
         .int4 => return .{ .int4 = try intCast(i32, s) },
         .int8 => return .{ .int8 = try intCast(i64, s) },
@@ -378,7 +415,9 @@ fn coerceScalar(s: Scalar, ty: Type) EvalError!Value {
                 return error.FloatOutOfRange;
             return .{ .float4 = narrow };
         },
-        .text => return .{ .text = s.text },
+        .text, .bpchar, .varchar => return .{
+            .text = try _value.coerceString(s.text, target.ty, target.type_mod),
+        },
         else => unreachable,
     }
 }

@@ -349,3 +349,34 @@ test "sql.plan: the root materializes; keep_value and limit reach it" {
     try testing.expectEqual(@as(?usize, 5), capped.root.materialize.remaining);
     try testing.expect(source(&capped).* == .fetch);
 }
+
+test "sql.plan: never is the empty set, and a scan under NOT" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+
+    const never: Pred = .never;
+    var alone = try sql.plan.plan(a, &fx.tbl, &never, stream);
+    defer alone.deinit();
+    try expectEgids(try bitmapOf(&alone), &.{});
+
+    // It empties an AND and drops out of an OR, like `= NULL`.
+    const a_eq_1 = Pred{ .eq = .{ .col = fx.tbl.column("a").?, .val = .{ .int4 = 1 } } };
+    const and_kids = [_]Pred{ a_eq_1, never };
+    const and_ = Pred{ .and_ = &and_kids };
+    var both = try sql.plan.plan(a, &fx.tbl, &and_, stream);
+    defer both.deinit();
+    try expectEgids(try bitmapOf(&both), &.{});
+
+    const or_kids = [_]Pred{ never, a_eq_1 };
+    const or_ = Pred{ .or_ = &or_kids };
+    var either = try sql.plan.plan(a, &fx.tbl, &or_, stream);
+    defer either.deinit();
+    try expectLookup(try bitmapOf(&either), pkey_index_id, true, try int4Key(a, 1));
+
+    // NOT never is every row: no index answers it, so a scan.
+    const not_ = Pred{ .not = &never };
+    var negated = try sql.plan.plan(a, &fx.tbl, &not_, stream);
+    defer negated.deinit();
+    try expectScan(&negated);
+}

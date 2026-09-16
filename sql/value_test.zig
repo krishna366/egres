@@ -23,6 +23,8 @@ test "sql.value: fixedWidth and isVarlen per type" {
     try testing.expectEqual(@as(?u8, 16), Type.interval.fixedWidth());
     try testing.expectEqual(@as(?u8, 16), Type.uuid.fixedWidth());
     try testing.expectEqual(@as(?u8, null), Type.text.fixedWidth());
+    try testing.expectEqual(@as(?u8, null), Type.bpchar.fixedWidth());
+    try testing.expectEqual(@as(?u8, null), Type.varchar.fixedWidth());
     try testing.expectEqual(@as(?u8, null), Type.bytea.fixedWidth());
 
     try testing.expect(!Type.int4.isVarlen());
@@ -67,7 +69,7 @@ test "sql.value: parseValue coerces literals and rejects unsupported types" {
     try testing.expectError(error.InvalidCharacter, value.parseValue(.int4, "nope"));
     try testing.expectError(error.InvalidBool, value.parseValue(.bool_, "maybe"));
     // Types this slice can't parse.
-    try testing.expectError(error.UnsupportedType, value.parseValue(.date, "2026-01-01"));
+    try testing.expectError(error.UnsupportedType, value.parseValue(.time, "10:00"));
     try testing.expectError(error.UnsupportedType, value.parseValue(.uuid, "x"));
 }
 
@@ -149,7 +151,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
     };
     for (out) |c| {
         var w = std.Io.Writer.fixed(&buf);
-        try value.formatValue(&w, c.v);
+        try value.formatValue(&w, null, c.v);
         try testing.expectEqualStrings(c.want, w.buffered());
     }
     // Round trip every day of a leap year and its neighbours.
@@ -174,7 +176,7 @@ test "sql.value: formatValue renders text-format output" {
     };
     for (cases) |c| {
         var w = std.Io.Writer.fixed(&buf);
-        try value.formatValue(&w, c.v);
+        try value.formatValue(&w, null, c.v);
         try testing.expectEqualStrings(c.want, w.buffered());
     }
 }
@@ -186,8 +188,111 @@ test "sql.value: pgTypeOid widens unsigned ints" {
     try testing.expectEqual(pgwire.oid.int8, value.pgTypeOid(.uint4)); // widen
     try testing.expectEqual(pgwire.oid.numeric, value.pgTypeOid(.uint8)); // widen
     try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.text));
-    try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.date)); // no dedicated oid yet
+    try testing.expectEqual(pgwire.oid.date, value.pgTypeOid(.date));
+    try testing.expectEqual(pgwire.oid.text, value.pgTypeOid(.time)); // no dedicated oid yet
     try testing.expectEqual(pgwire.oid.timestamp, value.pgTypeOid(.timestamp));
     const tstz = value.pgTypeOid(.timestamptz);
     try testing.expectEqual(pgwire.oid.timestamptz, tstz);
+}
+
+test "sql.value: coerceString strips, counts codepoints, and rejects" {
+    const cs = value.coerceString;
+    // bpchar: trailing spaces stripped, then counted; excess that is only
+    // spaces is fine.
+    try testing.expectEqualStrings("ab", try cs("ab   ", .bpchar, 5));
+    try testing.expectEqualStrings("abcde", try cs("abcde   ", .bpchar, 5));
+    try testing.expectEqualStrings("", try cs("     ", .bpchar, 2));
+    try testing.expectError(error.StringTooLong, cs("abcdef", .bpchar, 5));
+    // Only U+0020 is padding: a tab counts and stays.
+    try testing.expectEqualStrings("ab\t", try cs("ab\t", .bpchar, 5));
+    try testing.expectError(error.StringTooLong, cs("abcde\t", .bpchar, 5));
+    // n counts codepoints, not bytes.
+    try testing.expectEqualStrings("héllo", try cs("héllo", .bpchar, 5));
+    try testing.expectEqualStrings("héllo", try cs("héllo", .varchar, 5));
+    try testing.expectError(error.StringTooLong, cs("héllo!", .varchar, 5));
+    // varchar: no strip, length checked.
+    try testing.expectEqualStrings("ab  ", try cs("ab  ", .varchar, 4));
+    try testing.expectError(error.StringTooLong, cs("ab   ", .varchar, 4));
+    // text: validated only. A null length skips the check for all.
+    try testing.expectEqualStrings("ab   ", try cs("ab   ", .text, null));
+    try testing.expectEqualStrings("abcdefgh", try cs("abcdefgh  ", .bpchar, null));
+    // Invalid UTF-8 is refused for every string type.
+    try testing.expectError(error.InvalidUtf8, cs("a\xff", .text, null));
+    try testing.expectError(error.InvalidUtf8, cs("a\xff", .bpchar, 5));
+    try testing.expectError(error.InvalidUtf8, cs("a\xff", .varchar, 5));
+}
+
+test "sql.value: formatValue pads a char(n) cell to n codepoints" {
+    var buf: [16]u8 = undefined;
+    var col = sql.table.Column{
+        .column_id = 1,
+        .pos = 0,
+        .name = "c",
+        .ty = .bpchar,
+        .pkey_position = null,
+        .type_mod = 5,
+    };
+    var w: std.Io.Writer = .fixed(&buf);
+    try value.formatValue(&w, &col, .{ .text = "ab" });
+    try testing.expectEqualStrings("ab   ", w.buffered());
+    col.type_mod = 6;
+    w = .fixed(&buf);
+    try value.formatValue(&w, &col, .{ .text = "héllo" });
+    try testing.expectEqualStrings("héllo ", w.buffered());
+    col.type_mod = 3;
+    w = .fixed(&buf);
+    try value.formatValue(&w, &col, .{ .text = "abcdef" }); // never truncates
+    try testing.expectEqualStrings("abcdef", w.buffered());
+    // A text column of the same value is not padded.
+    col.ty = .text;
+    w = .fixed(&buf);
+    try value.formatValue(&w, &col, .{ .text = "ab" });
+    try testing.expectEqualStrings("ab", w.buffered());
+}
+
+test "sql.value: string types share cells, OIDs and modifiers differ" {
+    try testing.expect(Type.text.isString() and Type.bpchar.isString() and Type.varchar.isString());
+    try testing.expect(!Type.bytea.isString());
+    try testing.expect(Type.text.assignableTo(.bpchar));
+    try testing.expect(Type.bpchar.assignableTo(.varchar));
+    try testing.expect(!Type.bpchar.assignableTo(.bytea));
+    try testing.expectEqual(pgwire.oid.bpchar, value.pgTypeOid(.bpchar));
+    try testing.expectEqual(pgwire.oid.varchar, value.pgTypeOid(.varchar));
+    try testing.expectEqual(@as(i32, 88), value.pgTypeModifier(84));
+    try testing.expectEqual(@as(i32, -1), value.pgTypeModifier(null));
+    try testing.expectEqual(Type.bpchar, Type.fromName("bpchar").?);
+    try testing.expectEqual(Type.bpchar, Type.fromName("char").?);
+    try testing.expectEqual(Type.text, Type.fromName("varchar").?);
+    const v = try value.parseValue(.bpchar, "abc");
+    try testing.expectEqualStrings("abc", v.text);
+}
+
+test "sql.value: date parses and prints as YYYY-MM-DD" {
+    try testing.expectEqual(@as(i32, 0), try value.parseDate("1970-01-01"));
+    try testing.expectEqual(@as(i32, 1), try value.parseDate("1970-01-02"));
+    try testing.expectEqual(@as(i32, -1), try value.parseDate("1969-12-31"));
+    try testing.expectEqual(@as(i32, 9568), try value.parseDate("1996-03-13")); // a dbgen lineitem date
+    try testing.expectEqual(@as(i32, 10957), try value.parseDate("2000-01-01"));
+    try testing.expectEqual(@as(i32, 11016), try value.parseDate(" 2000-02-29 ")); // leap day
+    // A timestamp literal keeps its day, as in Postgres; a zone is ignored.
+    try testing.expectEqual(@as(i32, 9568), try value.parseDate("1996-03-13 10:00"));
+    try testing.expectEqual(@as(i32, 9568), try value.parseDate("1996-03-13 23:59:59.999999+05"));
+    try testing.expectEqual(@as(i32, -1), try value.parseDate("1969-12-31 23:59:59"));
+    try testing.expectError(error.InvalidTimestamp, value.parseDate("2001-02-29"));
+    try testing.expectError(error.InvalidTimestamp, value.parseDate("1996-13-01"));
+    try testing.expectError(error.InvalidTimestamp, value.parseDate("96-03-13"));
+    try testing.expectError(error.InvalidTimestamp, value.parseDate("1996/03/13"));
+    try testing.expectError(error.InvalidTimestamp, value.parseDate(""));
+
+    const v = try value.parseValue(.date, "1996-03-13");
+    try testing.expectEqual(@as(i32, 9568), v.date);
+    try testing.expectEqual(pgwire.oid.date, value.pgTypeOid(.date));
+
+    var buf: [16]u8 = undefined;
+    const cases = [_]String{ "1970-01-01", "1969-12-31", "1996-03-13", "2000-02-29", "2024-12-31", "0001-01-01", "9999-12-31" };
+    for (cases) |text| {
+        var w: std.Io.Writer = .fixed(&buf);
+        try value.formatValue(&w, null, .{ .date = try value.parseDate(text) });
+        try testing.expectEqualStrings(text, w.buffered());
+    }
 }

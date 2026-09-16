@@ -156,7 +156,7 @@ fn readValue(ps: *const PhysicalSchema, buffer: String, col: ColumnLayout) Value
             .months = std.mem.readInt(i32, buffer[off + 12 ..][0..4], .little),
         } },
         .uuid => .{ .uuid = buffer[off..][0..16].* },
-        .text => .{ .text = varlenSlice(ps, buffer, col) },
+        .text, .bpchar, .varchar => .{ .text = varlenSlice(ps, buffer, col) },
         .bytea => .{ .bytea = varlenSlice(ps, buffer, col) },
     };
 }

@@ -170,3 +170,47 @@ test "sql.pred: eval follows SQL three-valued logic" {
     try testing.expect(!a_eq_null.matches(tbl, r2));
     try testing.expect(!or_.matches(tbl, r3));
 }
+
+test "sql.pred: a literal longer than its char(n) column binds to never" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A one-column table (c char(3)), assembled like Fixture.
+    const logical = [_]sql.schema.LogicalColumn{
+        .{ .column_id = 1, .name = "c", .ty = .bpchar, .type_mod = 3 },
+    };
+    const ps = try sql.schema.compile(a, .{ .columns = &logical, .current_version = 1 }, 1);
+    const columns = try a.alloc(sql.table.Column, 1);
+    columns[0] = .{ .column_id = 1, .pos = 0, .name = "c", .ty = .bpchar, .pkey_position = null, .type_mod = 3 };
+    var tbl = sql.table.Table{
+        .columns = columns,
+        .indexes = try a.alloc(sql.table.Index, 0),
+        .ps = ps,
+        .version = 1,
+        .arena = std.heap.ArenaAllocator.init(a),
+    };
+    defer tbl.deinit();
+
+    // Within the length (spaces stripped): an ordinary comparison.
+    const fits = try sql.parse.statement(a, "SELECT * FROM t WHERE c = 'ab  ';");
+    const p_fits = try pred.bindNode(a, &tbl, fits.select.where.?);
+    try testing.expectEqualStrings("ab", p_fits.eq.val.text);
+
+    // Over the length: never, wherever it sits, and NOT flips it.
+    const over = try sql.parse.statement(a, "SELECT * FROM t WHERE c = 'abcd' OR NOT c = 12345;");
+    const p_over = try pred.bindNode(a, &tbl, over.select.where.?);
+    try testing.expect(p_over.or_[0] == .never);
+    try testing.expect(p_over.or_[1].not.* == .never);
+
+    // never is false; NOT never is true (never unknown).
+    var buf: std.ArrayList(u8) = .empty;
+    const bytes = try sql.row.marshalRow(a, &tbl.ps, &.{.{ .text = "ab" }}, &buf);
+    const row = Item{
+        .key = .{ .namespace = 1, .table_id = 16, .primary = try a.dupe(u8, &sql.key.encodeEgid(1)) },
+        .versions = .{ .one = .{ .ts = 1, .meta = .{}, .value = bytes } },
+    };
+    try testing.expectEqual(@as(?bool, false), p_over.or_[0].eval(&tbl, row));
+    try testing.expectEqual(@as(?bool, true), p_over.or_[1].eval(&tbl, row));
+    try testing.expect(p_over.matches(&tbl, row));
+}

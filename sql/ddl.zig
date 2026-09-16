@@ -130,6 +130,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             .name = c.name,
             .ty = c.ty,
             .pkey_position = if (c.pkey) 1 else null,
+            .type_mod = c.type_mod,
         };
         if (!c.pkey and !c.unique) continue;
         // The same rule as CREATE INDEX: no index of any kind on an

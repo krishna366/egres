@@ -309,6 +309,61 @@ else bad "oversized row came back with the wrong length"; fi
 expect "UPDATE oversized rows" "UPDATE 3" q "UPDATE big SET id = 9;"
 expect "DELETE oversized rows" "DELETE 3" q "DELETE FROM big WHERE id = 9;"
 
+# --- char(n) / varchar(n): stripped on the way in, padded on the way out ---
+# SELECT lists take column references only, so padding is checked by the
+# byte length of the bare value (`v` prints it plus a newline).
+expect_len() { # <desc> <bytes> <sql>: the value's length in bytes, newline included
+    local got; got=$(v "$3" | wc -c)
+    if [ "$got" = "$2" ]; then ok "$1"; else bad "$1 — got $got bytes"; fi
+}
+expect "CREATE char/varchar table" "CREATE TABLE" \
+    q "CREATE TABLE cn (id int PRIMARY KEY, a char(5), b varchar(3), c char);"
+expect "INSERT 'ab ' into char(5)" "INSERT 0 1" q "INSERT INTO cn VALUES (1, 'ab ', 'xy', 'z');"
+expect_len "char(5) reads back padded to 5" 6 "SELECT a FROM cn WHERE id = 1;"
+expect "char(5) value is the padded text" "ab   " v "SELECT a FROM cn WHERE id = 1;"
+expect_len "varchar(3) reads back unpadded" 3 "SELECT b FROM cn WHERE id = 1;"
+expect_len "bare char is char(1)" 2 "SELECT c FROM cn WHERE id = 1;"
+expect "char(5) rejects 6 chars" "value too long for type character(5)" \
+    q "INSERT INTO cn VALUES (2, 'abcdef', 'x', 'y');"
+expect "char(5) accepts excess spaces" "INSERT 0 1" q "INSERT INTO cn VALUES (2, 'abcde   ', 'x', 'y');"
+expect "varchar(3) rejects 4 chars" "value too long for type character varying(3)" \
+    q "INSERT INTO cn VALUES (3, 'a', 'wxyz', 'y');"
+expect "INSERT varchar(3) with trailing spaces" "INSERT 0 1" q "INSERT INTO cn VALUES (4, 'q', 'a  ', 'y');"
+expect_len "varchar(3) keeps trailing spaces" 4 "SELECT b FROM cn WHERE id = 4;"
+expect "char(n) counts codepoints" "INSERT 0 1" q "INSERT INTO cn VALUES (5, 'héllo', 'é', 'é');"
+expect_len "multibyte char(5) is 5 codepoints, no padding" 7 "SELECT a FROM cn WHERE id = 5;"
+expect "padded literal in WHERE matches stripped store" "(1 row)" q "SELECT id FROM cn WHERE a = 'ab   ';"
+expect "unpadded literal in WHERE matches too" "(1 row)" q "SELECT id FROM cn WHERE a = 'ab';"
+expect "too-long literal in WHERE matches nothing" "(0 rows)" q "SELECT id FROM cn WHERE a = 'abcdefgh';"
+expect "UPDATE SET into char(5)" "UPDATE 1" q "UPDATE cn SET a = 'up   ' WHERE id = 1;"
+expect_len "updated char(5) padded" 6 "SELECT a FROM cn WHERE id = 1;"
+expect "UPDATE SET too long is 22001" "value too long for type character(5)" \
+    q "UPDATE cn SET a = 'toolong' WHERE id = 1;"
+expect "concat into varchar(3) is length-checked" "value too long for type character varying(3)" \
+    q "UPDATE cn SET b = b || 'zz' WHERE id = 1;"
+expect "UNIQUE index on char(n)" "CREATE INDEX" q "CREATE UNIQUE INDEX cn_a ON cn (a);"
+expect "unique lookup unpadded" "(1 row)" q "SELECT id FROM cn WHERE a = 'héllo';"
+expect "duplicate under padding is a violation" "duplicate key" q "INSERT INTO cn VALUES (6, 'up', 'b', 'c');"
+expect "DROP char table" "DROP TABLE" q "DROP TABLE cn;"
+
+# --- date: YYYY-MM-DD in, YYYY-MM-DD out, equality and index on it -------
+expect "CREATE table with a date column" "CREATE TABLE" \
+    q "CREATE TABLE dt (id int PRIMARY KEY, d date, when_ts timestamp);"
+expect "INSERT date literal" "INSERT 0 1" q "INSERT INTO dt VALUES (1, '1996-03-13', '1996-03-13 10:11:12');"
+expect "INSERT leap day" "INSERT 0 1" q "INSERT INTO dt VALUES (2, '2000-02-29', NULL);"
+expect "INSERT pre-epoch date" "INSERT 0 1" q "INSERT INTO dt VALUES (3, '1969-12-31', NULL);"
+expect "date reads back ISO" "1996-03-13" v "SELECT d FROM dt WHERE id = 1;"
+expect "leap day reads back" "2000-02-29" v "SELECT d FROM dt WHERE id = 2;"
+expect "pre-epoch reads back" "1969-12-31" v "SELECT d FROM dt WHERE id = 3;"
+expect "invalid date is 22P02" "invalid value for column type" q "INSERT INTO dt VALUES (4, '2001-02-29', NULL);"
+expect "malformed date is 22P02" "invalid value for column type" q "INSERT INTO dt VALUES (4, '13/03/1996', NULL);"
+expect "WHERE on a date" "(1 row)" q "SELECT id FROM dt WHERE d = '2000-02-29';"
+expect "UPDATE a date" "UPDATE 1" q "UPDATE dt SET d = '2001-01-01' WHERE id = 3;"
+expect "updated date reads back" "2001-01-01" v "SELECT d FROM dt WHERE id = 3;"
+expect "index on a date column" "CREATE INDEX" q "CREATE INDEX dt_d ON dt (d);"
+expect "indexed date lookup" "(1 row)" q "SELECT id FROM dt WHERE d = '2001-01-01';"
+expect "DROP date table" "DROP TABLE" q "DROP TABLE dt;"
+
 # --- no unexpected server-side errors --------------------------------------
 if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
 

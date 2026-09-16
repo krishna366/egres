@@ -94,7 +94,8 @@ pub fn plan(
 /// one-id set; `col = v` on a valid index its entry (unique: the one
 /// row; non-unique: the posting bitmap); `col IS NULL` on a valid
 /// non-unique index the posting under the NULL tag key. A comparison
-/// against NULL can never be true (3VL), so it is the EMPTY set. An
+/// against NULL can never be true (3VL), and `never` is false by
+/// construction, so both are the EMPTY set. An
 /// AND intersects every indexable child and can drop the rest, so one
 /// indexable child is enough to route it (the dropped terms are the
 /// residual's job); an OR must union EVERY child, so all of them must
@@ -122,7 +123,8 @@ fn bitmapFor(
         },
         .and_ => |kids| return try andOf(arloc, tbl, read_ts, kids),
         .or_ => |kids| return try orOf(arloc, tbl, read_ts, kids),
-        .not => return null,
+        .not => return null, // We can't evaluate NOT via an index. So, make BitmapNode null.
+        .never => return try emptySet(arloc),
     }
 }
 

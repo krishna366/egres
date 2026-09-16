@@ -9,6 +9,10 @@
 const std = @import("std");
 const pgwire = @import("pgwire");
 const utils = @import("utils");
+/// The runtime column (table.zig imports this file too; Zig allows the
+/// cycle). formatValue takes it because a char(n) cell is a plain text
+/// value and only the column knows to pad it.
+const Column = @import("table.zig").Column;
 
 /// A borrowed byte string (names, row bytes, encoded keys); see
 /// `utils.String`.
@@ -52,6 +56,13 @@ pub const Type = enum {
     uuid,
     text,
     bytea,
+    /// `char(n)`: text stored stripped of trailing spaces, padded back
+    /// to n codepoints on output. Cells are `Value.text`; the column's
+    /// `type_mod` (n) drives the boundary behavior, never the value tag.
+    bpchar,
+    /// `varchar(n)`: text with a length check on the way in. Bare
+    /// `varchar` is `.text`.
+    varchar,
 
     /// Byte width of a fixed-width type, or null for a varlen type.
     pub inline fn fixedWidth(self: Type) ?u8 {
@@ -61,8 +72,14 @@ pub const Type = enum {
             .int4, .uint4, .float4, .date => 4,
             .int8, .uint8, .float8, .time, .timestamp, .timestamptz => 8,
             .interval, .uuid => 16,
-            .text, .bytea => null,
+            .text, .bytea, .bpchar, .varchar => null,
         };
+    }
+
+    /// The three string types. Their cells are all `Value.text` and
+    /// they assign to and concatenate with each other freely.
+    pub inline fn isString(self: Type) bool {
+        return self == .text or self == .bpchar or self == .varchar;
     }
 
     pub inline fn isVarlen(self: Type) bool {
@@ -94,22 +111,28 @@ pub const Type = enum {
         if (self == to) return true;
         if (self.isInteger()) return to.isNumeric();
         if (self.isFloat()) return to.isFloat();
+        if (self.isString()) return to.isString();
         return false;
     }
 
     /// Resolve a DDL type name to a storage Type, or null if unsupported.
     /// libpg_query normalizes pg_catalog spellings to internal names before
     /// we see them (int/integer→int4, bigint→int8, real→float4, boolean→
-    /// bool, character varying→varchar), and those internal names ARE our
-    /// variant names — so the enum itself is the lookup table. Only two
-    /// spellings can't come from it: `bool` (the variant is bool_; `bool`
-    /// is a Zig primitive) and `varchar` (folds into text; any length
-    /// modifier is dropped).
+    /// bool, character varying→varchar, char/character→bpchar), and those
+    /// internal names ARE our variant names — so the enum itself is the
+    /// lookup table. Two spellings can't come from it: `bool` (the variant
+    /// is bool_; `bool` is a Zig primitive) and `varchar`, which is `.text`
+    /// here; the DDL parser turns it into `.varchar` when a length is
+    /// given (the length lives in the column's `type_mod`).
     pub fn fromName(name: String) ?Type {
         if (std.mem.eql(u8, name, "bool")) return .bool_;
         if (std.mem.eql(u8, name, "varchar")) return .text;
+        if (std.mem.eql(u8, name, "char") or std.mem.eql(u8, name, "character")) return .bpchar;
         return std.meta.stringToEnum(Type, name);
     }
+
+    /// The largest `char(n)` / `varchar(n)` Postgres accepts.
+    pub const max_type_mod: u32 = 10_485_760;
 };
 
 /// A Postgres interval: months + days + microseconds kept separate (a
@@ -199,8 +222,8 @@ pub const Row = struct {
 /// Parse a SQL literal into a typed cell of column type `ty`. The returned
 /// `text`/`bytea` Value BORROWS `text` (the caller keeps it alive until the row
 /// is marshaled). NULL is handled by the caller, not here. Numeric/bool/
-/// timestamp parse failures surface as errors (the executor maps them to
-/// 22P02); types this slice can't parse (date, time, interval, uuid) return
+/// date/timestamp parse failures surface as errors (the executor maps them
+/// to 22P02); types this slice can't parse (time, interval, uuid) return
 /// `error.UnsupportedType` (→ 0A000).
 pub fn parseValue(ty: Type, text: String) !Value {
     return switch (ty) {
@@ -213,11 +236,12 @@ pub fn parseValue(ty: Type, text: String) !Value {
         .uint8 => .{ .uint8 = try std.fmt.parseInt(u64, text, 10) },
         .float4 => .{ .float4 = try std.fmt.parseFloat(f32, text) },
         .float8 => .{ .float8 = try std.fmt.parseFloat(f64, text) },
-        .text => .{ .text = text },
+        .text, .bpchar, .varchar => .{ .text = text },
         .bytea => .{ .bytea = text },
         .timestamp => .{ .timestamp = try parseTimestamp(text, false) },
         .timestamptz => .{ .timestamptz = try parseTimestamp(text, true) },
-        .date, .time, .interval, .uuid => error.UnsupportedType,
+        .date => .{ .date = try parseDate(text) },
+        .time, .interval, .uuid => error.UnsupportedType,
     };
 }
 
@@ -233,18 +257,59 @@ fn eqlAny(text: String, options: []const String) bool {
     return false;
 }
 
-/// Render a non-null cell as its text-format wire representation. The caller
-/// emits SQL NULL as `proto.DataValue.null_value` and never passes it here.
-pub fn formatValue(w: *std.Io.Writer, v: Value) !void {
+/// Check and normalize a string on its way into a column of string type
+/// `ty` with length `type_mod` (n; null = no length check). Every string
+/// type must be valid UTF-8, as in Postgres. `bpchar` strips trailing
+/// spaces (only U+0020, which is never a continuation byte, so the strip
+/// needs no decoding) and, like `varchar`, refuses more than n codepoints.
+/// A `bpchar` value whose excess is only spaces is accepted. The result
+/// is a subslice of `s`.
+pub fn coerceString(s: String, ty: Type, type_mod: ?u32) error{ InvalidUtf8, StringTooLong }!String {
+    std.debug.assert(ty.isString());
+    if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+
+    // varchar maintains its trailing spaces. bpchar drops it.
+    const out = if (ty == .bpchar) std.mem.trimEnd(u8, s, " ") else s;
+    if (ty == .text) return out;
+
+    const n = type_mod orelse return out;
+    if (out.len > n and countCodepoints(out) > n) return error.StringTooLong;
+    return out;
+}
+
+/// Codepoints in valid UTF-8 (`coerceString` validated it).
+fn countCodepoints(s: String) usize {
+    return std.unicode.utf8CountCodepoints(s) catch unreachable;
+}
+
+/// Write a `bpchar` cell the way Postgres sends it: the stored (stripped)
+/// text padded with spaces to `n` codepoints.
+fn writePadded(w: *std.Io.Writer, s: String, n: u32) !void {
+    try w.writeAll(s);
+    const have = countCodepoints(s);
+    if (have < n) try w.splatByteAll(' ', n - have);
+}
+
+/// Render a non-null cell as its text-format wire representation. `col` is
+/// the cell's column when there is one: it decides the rendering where the
+/// value alone cannot, since a `char(n)` cell is a plain `.text` stored
+/// stripped and comes back padded to the column's length. null (a computed
+/// cell such as count(*)) renders the value as is. The caller emits SQL
+/// NULL as `proto.DataValue.null_value` and never passes it here.
+pub fn formatValue(w: *std.Io.Writer, col: ?*const Column, v: Value) !void {
+    if (col) |c| if (c.ty == .bpchar) {
+        return writePadded(w, v.text, c.type_mod orelse 1);
+    };
+
     switch (v) {
         .null_value => {}, // caller handles null out-of-band
         .bool_ => |b| try w.writeAll(if (b) "t" else "f"),
         .text, .bytea => |s| try w.writeAll(s),
         // Every numeric payload renders via {d}; `inline` binds the capture
-        // to each tag's concrete type. date/time/interval/uuid can't be
-        // inserted this slice, so a live value never actually reaches those
-        // tags — they degrade to the raw fields rather than crash. TODO:
-        // proper Postgres text formats for them.
+        // to each tag's concrete type. time/interval/uuid can't be inserted
+        // this slice, so a live value never actually reaches those tags —
+        // they degrade to the raw fields rather than crash.
+        // TODO: proper Postgres text formats for them.
         inline .int2,
         .int4,
         .int8,
@@ -253,9 +318,9 @@ pub fn formatValue(w: *std.Io.Writer, v: Value) !void {
         .uint8,
         .float4,
         .float8,
-        .date,
         .time,
         => |x| try w.print("{d}", .{x}),
+        .date => |days| try formatDate(w, days),
         .timestamp => |us| try formatTimestamp(w, us, false),
         .timestamptz => |us| try formatTimestamp(w, us, true),
         .interval => |iv| try w.print("{d}mon {d}d {d}us", .{ iv.months, iv.days, iv.micros }),
@@ -292,16 +357,50 @@ pub fn pgTypeOid(ty: Type) pgwire.Oid {
         .float8 => pgwire.oid.float8,
         .timestamp => pgwire.oid.timestamp,
         .timestamptz => pgwire.oid.timestamptz,
-        .text, .bytea, .date, .time, .interval, .uuid => pgwire.oid.text,
+        .date => pgwire.oid.date,
+        .bpchar => pgwire.oid.bpchar,
+        .varchar => pgwire.oid.varchar,
+        .text, .bytea, .time, .interval, .uuid => pgwire.oid.text,
     };
 }
 
+/// The RowDescription type modifier for a column: Postgres reports a
+/// `char(n)` / `varchar(n)` length as n plus its 4-byte varlena header
+/// (VARHDRSZ), and -1 for every type without a modifier.
+pub fn pgTypeModifier(type_mod: ?u32) i32 {
+    const n = type_mod orelse return -1;
+    return @as(i32, @intCast(n)) + 4;
+}
+
 // -----------------------------------------------------------------------------
-// Timestamps: Postgres text form ↔ int8 Unix µs, always UTC.
+// Dates and timestamps: Postgres text form ↔ int4 days / int8 Unix µs, UTC.
 // -----------------------------------------------------------------------------
 
 const us_per_sec: i64 = 1_000_000;
 const us_per_day: i64 = 86_400 * us_per_sec;
+
+/// Parse a date literal into days since 1970-01-01. Postgres's date
+/// input takes anything its timestamp input does and keeps the day, so
+/// this is parseTimestamp with the time of day dropped: `YYYY-MM-DD`,
+/// or a full timestamp truncated to its date (a zone offset is ignored,
+/// as for a plain timestamp). Anything else is `error.InvalidTimestamp`
+/// (→ 22P02).
+pub fn parseDate(text: String) !i32 {
+    const us = try parseTimestamp(text, false);
+    return @intCast(@divFloor(us, us_per_day));
+}
+
+/// Render days since 1970-01-01 as `YYYY-MM-DD`, exactly what Postgres
+/// prints in the default (ISO) DateStyle.
+pub fn formatDate(w: *std.Io.Writer, days: i32) !void {
+    const c = civilFromDays(days);
+    // Unsigned on purpose (see formatTimestamp).
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{
+        @as(u64, @intCast(c.year)),
+        @as(u64, @intCast(c.month)),
+        @as(u64, @intCast(c.day)),
+    });
+}
 
 /// Parse `YYYY-MM-DD[ HH:MM[:SS[.ffffff]]][Z|±HH[:MM]]` (a `T` may
 /// separate date and time) into Unix µs. Only four-digit years.

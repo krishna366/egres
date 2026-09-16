@@ -60,6 +60,7 @@ expect "NOT NULL rejected" "column constraints" \
     psql "$E" -X -c "CREATE TABLE u (a int NOT NULL);"
 expect "serial rejected by name" "serial" psql "$E" -X -c "CREATE TABLE u (a serial);"
 expect "composite pkey rejected" "table-level" psql "$E" -X -c "CREATE TABLE u (a int, b int, PRIMARY KEY (a, b));"
+
 expect "interval pkey rejected" "interval columns" \
     psql "$E" -X -c "CREATE TABLE u (a interval PRIMARY KEY);"
 
@@ -307,6 +308,14 @@ expect "index survives restart" "already exists" psql "$E" -X -c "CREATE INDEX i
 expect "indexed write after restart" "INSERT 0 1" psql "$E" -X -c "INSERT INTO items VALUES (5,'red');"
 expect "DROP TABLE cascades the index" "DROP TABLE" psql "$E" -X -c "DROP TABLE items;"
 expect "cascaded index name freed" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE items_color (a int);"
+
+# --- char(n) / varchar(n): the length is part of the column ---------------
+expect "char(n) and varchar(n) columns" "CREATE TABLE" \
+    psql "$E" -X -c "CREATE TABLE cn (id int PRIMARY KEY, a char(5), b varchar(3), c char, d varchar);"
+expect "char(0) rejected" "at least 1" psql "$E" -X -c "CREATE TABLE cn0 (a char(0));"
+expect "char(1,2) is a syntax error" "syntax error" psql "$E" -X -c "CREATE TABLE cn2 (a char(1,2));"
+expect "length on text rejected" "not allowed for type" psql "$E" -X -c "CREATE TABLE cn3 (a text(4));"
+expect "DROP char(n) table" "DROP TABLE" psql "$E" -X -c "DROP TABLE cn;"
 
 # --- no unexpected server-side errors ---------------------------------------
 if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi

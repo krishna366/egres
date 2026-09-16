@@ -18,6 +18,7 @@ const std = @import("std");
 const pgwire = @import("pgwire");
 const parser = pgwire.parser;
 const _value = @import("value.zig");
+const Column = @import("table.zig").Column;
 
 const String = _value.String;
 
@@ -27,6 +28,8 @@ const String = _value.String;
 pub const ColumnDef = struct {
     name: String,
     ty: _value.Type,
+    /// `char(n)` / `varchar(n)` length; null for every other type.
+    type_mod: ?u32 = null,
     pkey: bool = false,
     unique: bool = false,
 };
@@ -236,9 +239,17 @@ const CreateStmtJson = struct {
     const ColumnDefJson = struct {
         colname: String = "",
         /// `int` arrives pg_catalog-qualified: names = [pg_catalog, int4].
-        typeName: struct { names: []const NameNode = &.{} } = .{},
+        /// `char(84)` is names = [pg_catalog, bpchar] with typmods =
+        /// [{A_Const: {ival: {ival: 84}}}]; `varchar(20)` the same shape
+        /// under varchar. A bare `char` arrives as `bpchar` with typmods
+        /// [1] (the grammar fills it), a bare `varchar` with none.
+        typeName: struct {
+            names: []const NameNode = &.{},
+            typmods: []const TypmodNode = &.{},
+        } = .{},
         constraints: []const ConstraintNode = &.{},
     };
+    const TypmodNode = struct { A_Const: ?InsertStmtJson.AConst = null };
     const ConstraintNode = struct {
         Constraint: struct { contype: String = "" } = .{},
     };
@@ -476,8 +487,34 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
         const names = cd.typeName.names;
         if (names.len == 0) return .unsupported;
         const tyname = names[names.len - 1].String.sval;
-        const ty = _value.Type.fromName(tyname) orelse
+        var ty = _value.Type.fromName(tyname) orelse
             return invalidFmt(alloc, "unsupported type \"{s}\"", .{tyname});
+
+        // A length modifier: only `char(n)` / `varchar(n)` take one, a
+        // single integer in 1..max_type_mod. A lengthless `char` is
+        // `char(1)`; a lengthless `varchar` stays `.text`.
+        const typmods = cd.typeName.typmods;
+        var type_mod: ?u32 = null;
+        if (typmods.len > 0) {
+            const is_varchar = std.mem.eql(u8, tyname, "varchar");
+            if (ty != .bpchar and !is_varchar)
+                return invalidFmt(alloc, "type modifier is not allowed for type \"{s}\"", .{tyname});
+            if (typmods.len != 1)
+                return invalidFmt(alloc, "invalid type modifier for type \"{s}\"", .{tyname});
+            const ac = typmods[0].A_Const orelse
+                return invalidFmt(alloc, "invalid type modifier for type \"{s}\"", .{tyname});
+            const iv = ac.ival orelse
+                return invalidFmt(alloc, "invalid type modifier for type \"{s}\"", .{tyname});
+            if (iv.ival < 1)
+                return invalidFmt(alloc, "length for type {s} must be at least 1", .{tyname});
+            if (iv.ival > _value.Type.max_type_mod)
+                return invalidFmt(alloc, "length for type {s} cannot exceed {d}", //
+                    .{ tyname, _value.Type.max_type_mod });
+            type_mod = @intCast(iv.ival);
+            if (is_varchar) ty = .varchar;
+        } else if (ty == .bpchar) {
+            type_mod = 1;
+        }
 
         var pkey = false;
         var unique = false;
@@ -503,6 +540,7 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
         try columns.append(alloc, .{
             .name = cd.colname,
             .ty = ty,
+            .type_mod = type_mod,
             .pkey = pkey,
             .unique = unique,
         });
@@ -645,12 +683,12 @@ fn literalFrom(ac: InsertStmtJson.AConst) Literal {
     return .unsupported;
 }
 
-/// Coerce a parsed literal to a cell of column type `ty`, reusing
-/// value.parseValue by rendering non-string literals to text first
-/// (int/bool stringified into `a`, so a text-typed column can borrow
-/// it). NULL passes through; a non-literal item is
-/// `error.UnsupportedLiteral`.
-pub fn litToValue(a: std.mem.Allocator, lit: Literal, ty: _value.Type) !_value.Value {
+/// Coerce a parsed literal to a cell of `col`, reusing value.parseValue
+/// by rendering non-string literals to text first (int/bool stringified
+/// into `a`, so a text-typed column can borrow it). A string column goes
+/// through value.coerceString with its length. NULL passes through; a
+/// non-literal item is `error.UnsupportedLiteral`.
+pub fn litToValue(a: std.mem.Allocator, lit: Literal, col: *const Column) !_value.Value {
     const text: String = switch (lit) {
         .null_value => return .null_value,
         .unsupported => return error.UnsupportedLiteral,
@@ -662,7 +700,8 @@ pub fn litToValue(a: std.mem.Allocator, lit: Literal, ty: _value.Type) !_value.V
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",
     };
-    return _value.parseValue(ty, text);
+    if (col.ty.isString()) return .{ .text = try _value.coerceString(text, col.ty, col.type_mod) };
+    return _value.parseValue(col.ty, text);
 }
 
 /// A parsed WHERE tree or a rejection reason (borrowed).

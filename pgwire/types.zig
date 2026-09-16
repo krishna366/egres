@@ -27,6 +27,9 @@ pub const oid = struct {
     pub const numeric: Oid = 1700;
     pub const timestamp: Oid = 1114;
     pub const timestamptz: Oid = 1184;
+    pub const date: Oid = 1082;
+    pub const bpchar: Oid = 1042;
+    pub const varchar: Oid = 1043;
     pub const unknown: Oid = 705;
 };
 
@@ -74,6 +77,8 @@ pub const sqlstate = struct {
     pub const invalid_catalog_name: [5]u8 = .{ '3', 'D', '0', '0', '0' };
     pub const feature_not_supported: [5]u8 = .{ '0', 'A', '0', '0', '0' };
     pub const invalid_text_representation: [5]u8 = .{ '2', '2', 'P', '0', '2' };
+    pub const string_data_right_truncation: [5]u8 = .{ '2', '2', '0', '0', '1' };
+    pub const character_not_in_repertoire: [5]u8 = .{ '2', '2', '0', '2', '1' };
     pub const numeric_value_out_of_range: [5]u8 = .{ '2', '2', '0', '0', '3' };
     pub const division_by_zero: [5]u8 = .{ '2', '2', '0', '1', '2' };
     pub const not_null_violation: [5]u8 = .{ '2', '3', '5', '0', '2' };

@@ -54,13 +54,16 @@ pub const Field = enum(u32) {
     added_in_version = 5,
     dropped_in_version = 6,
     pkey_position = 7,
+    type_mod = 8,
 };
 
 /// The fixed schema of the catalog table, compiled into the binary (never
 /// persisted — that would be circular). Version 1; changing it is a binary
 /// upgrade, not a DDL. ids are uint4 (u32), `type` is the Type ordinal in
 /// uint2, versions are uint2 (u16); dropped_in_version is NULL while the
-/// described column is live, pkey_position is NULL for non-key columns.
+/// described column is live, pkey_position is NULL for non-key columns,
+/// type_mod (uint4) is the `char(n)` / `varchar(n)` length and NULL for
+/// every other column.
 pub const logical_schema: LogicalSchema = .{
     .current_version = 1,
     .columns = &.{
@@ -71,6 +74,7 @@ pub const logical_schema: LogicalSchema = .{
         .{ .column_id = @intFromEnum(Field.added_in_version), .name = "added_in_version", .ty = .uint2 },
         .{ .column_id = @intFromEnum(Field.dropped_in_version), .name = "dropped_in_version", .ty = .uint2 },
         .{ .column_id = @intFromEnum(Field.pkey_position), .name = "pkey_position", .ty = .uint2 },
+        .{ .column_id = @intFromEnum(Field.type_mod), .name = "type_mod", .ty = .uint4 },
     },
 };
 
@@ -92,7 +96,7 @@ pub const Error = error{CorruptCatalogRow};
 /// Build the catalog row cells (column_id order) describing `column` of
 /// `owner_table_id`. Pass `&result` to marshalRow with the catalog's compiled
 /// PhysicalSchema. `column.name` is borrowed — marshalRow copies it out.
-pub fn encodeColumn(owner_table_id: u32, column: LogicalColumn) [7]Value {
+pub fn encodeColumn(owner_table_id: u32, column: LogicalColumn) [8]Value {
     return .{
         .{ .uint4 = owner_table_id },
         .{ .uint4 = column.column_id },
@@ -101,15 +105,16 @@ pub fn encodeColumn(owner_table_id: u32, column: LogicalColumn) [7]Value {
         .{ .uint2 = column.added_in_version },
         if (column.dropped_in_version) |d| .{ .uint2 = d } else .null_value,
         if (column.pkey_position) |p| .{ .uint2 = p } else .null_value,
+        if (column.type_mod) |n| .{ .uint4 = n } else .null_value,
     };
 }
 
-/// Decode a fully-read catalog row (SELECT *, seven cells in column_id
+/// Decode a fully-read catalog row (SELECT *, eight cells in column_id
 /// order) into the column it describes. `column.name` borrows `r`'s buffer,
 /// so it stays valid only while that buffer does — dupe it to outlive a
 /// reused Row.
 pub fn decodeColumn(r: *const Row) Error!TableColumn {
-    if (r.len() != 7) return error.CorruptCatalogRow;
+    if (r.len() != 8) return error.CorruptCatalogRow;
 
     const ty = std.enums.fromInt(Type, r.at(3).uint2) orelse return error.CorruptCatalogRow;
     const dropped: ?u16 = switch (r.at(5)) {
@@ -122,6 +127,11 @@ pub fn decodeColumn(r: *const Row) Error!TableColumn {
         .uint2 => |p| p,
         else => return error.CorruptCatalogRow,
     };
+    const type_mod: ?u32 = switch (r.at(7)) {
+        .null_value => null,
+        .uint4 => |n| n,
+        else => return error.CorruptCatalogRow,
+    };
     return .{
         .table_id = r.at(0).uint4,
         .column = .{
@@ -131,6 +141,7 @@ pub fn decodeColumn(r: *const Row) Error!TableColumn {
             .added_in_version = r.at(4).uint2,
             .dropped_in_version = dropped,
             .pkey_position = pkey,
+            .type_mod = type_mod,
         },
     };
 }

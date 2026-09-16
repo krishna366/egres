@@ -71,6 +71,50 @@ test "sql.parse: CREATE TABLE parses columns, types, and the primary key" {
     try testing.expectEqual(@as(usize, 0), empty.create_table.columns.len);
 }
 
+test "sql.parse: CREATE TABLE char(n) and varchar(n) carry their length" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ct = try parse.statement(alloc,
+        \\CREATE TABLE t (a char(84), b char, c character(3), d varchar(20),
+        \\  e varchar, f character varying(5), g text);
+    );
+    const cols = ct.create_table.columns;
+    try testing.expectEqual(@as(usize, 7), cols.len);
+    try testing.expectEqual(sql.Type.bpchar, cols[0].ty);
+    try testing.expectEqual(@as(?u32, 84), cols[0].type_mod);
+    // A lengthless `char` is char(1).
+    try testing.expectEqual(sql.Type.bpchar, cols[1].ty);
+    try testing.expectEqual(@as(?u32, 1), cols[1].type_mod);
+    try testing.expectEqual(sql.Type.bpchar, cols[2].ty);
+    try testing.expectEqual(@as(?u32, 3), cols[2].type_mod);
+    try testing.expectEqual(sql.Type.varchar, cols[3].ty);
+    try testing.expectEqual(@as(?u32, 20), cols[3].type_mod);
+    // A lengthless `varchar` is plain text.
+    try testing.expectEqual(sql.Type.text, cols[4].ty);
+    try testing.expectEqual(@as(?u32, null), cols[4].type_mod);
+    try testing.expectEqual(sql.Type.varchar, cols[5].ty);
+    try testing.expectEqual(@as(?u32, 5), cols[5].type_mod);
+    try testing.expectEqual(sql.Type.text, cols[6].ty);
+    try testing.expectEqual(@as(?u32, null), cols[6].type_mod);
+
+    const cases = [_]struct { sql: String, needle: String }{
+        .{ .sql = "CREATE TABLE t (a char(0));", .needle = "at least 1" },
+        .{ .sql = "CREATE TABLE t (a varchar(0));", .needle = "at least 1" },
+        .{ .sql = "CREATE TABLE t (a char(10485761));", .needle = "cannot exceed" },
+        .{ .sql = "CREATE TABLE t (a text(5));", .needle = "not allowed for type" },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(std.mem.indexOf(u8, stmt.invalid, case.needle) != null);
+    }
+    // Two lengths is a grammar error in Postgres, not a type check.
+    try testing.expectError(error.SyntaxError, parse.statement(alloc, "CREATE TABLE t (a char(1,2));"));
+}
+
 test "sql.parse: CREATE TABLE semantic rejections carry a reason" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

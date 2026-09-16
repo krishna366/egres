@@ -25,6 +25,11 @@ pub const Pred = union(enum) {
     and_: []const Pred,
     or_: []const Pred,
     not: *const Pred,
+    /// Constant false: a comparison bind already knows can never hold,
+    /// such as a literal longer than its `char(n)` / `varchar(n)`
+    /// column. The planner reads no rows for it. Though, if this is part of a
+    /// NOT Pred, then it would always be true.
+    never,
 
     /// `col = val`, `val` already coerced to `col.ty` (for the egid
     /// pseudo-column: a positive uint8, or NULL).
@@ -67,6 +72,8 @@ pub const Pred = union(enum) {
             },
             .and_ => |kids| {
                 var unknown = false;
+                // TODO: We should have a mechanism to surface false evaluations
+                // quickly instead of going serially through every kid.eval.
                 for (kids) |*kid| {
                     if (kid.eval(tbl, item)) |b| {
                         if (!b) return false;
@@ -87,6 +94,7 @@ pub const Pred = union(enum) {
                 const b = child.eval(tbl, item) orelse return null;
                 return !b;
             },
+            .never => return false,
         }
     }
 
@@ -120,8 +128,12 @@ pub fn bindNode(
     switch (where) {
         .eq => |f| {
             const col = tbl.column(f.column) orelse return error.UndefinedColumn;
-            const val = _parse.litToValue(arloc, f.literal, col.ty) catch |err| switch (err) {
+            const val = _parse.litToValue(arloc, f.literal, col) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                // A literal longer than a `char(n)` / `varchar(n)` column
+                // is not an error in Postgres, it just never matches:
+                // every stored cell is at most n codepoints.
+                error.StringTooLong => return .never,
                 else => return error.InvalidValue,
             };
             // The egid IS the row key. Its column is uint8, so a

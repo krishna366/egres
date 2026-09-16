@@ -103,7 +103,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
                 state,
                 arloc,
                 lit,
-                col.ty,
+                col,
                 tx.start_us,
             )) orelse return;
         }
@@ -198,6 +198,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     } else for (cols.items, fields) |c, *fd| fd.* = .{
         .name = c.name,
         .type_oid = _value.pgTypeOid(c.ty),
+        .type_modifier = _value.pgTypeModifier(c.type_mod),
         .format_code = 0,
     };
     var emitter = RowEmitter{
@@ -438,7 +439,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         egid.* = _key.decodeEgid(item.key.primary).?;
         for (sets) |*set| {
             set.val = set.node.eval(arloc, tbl, item, set.target) catch |err|
-                return replyEvalErr(state, err);
+                return replyEvalErr(state, arloc, err, set.target);
             if (set.val == .null_value and set.target.pkey_position != null)
                 return replyPkeyNull(state);
             const idx = set.index orelse continue;
@@ -505,7 +506,7 @@ pub const RowEmitter = struct {
             if (v == .null_value) {
                 try dw.writeNull();
             } else {
-                try _value.formatValue(try dw.beginColumn(), v);
+                try _value.formatValue(try dw.beginColumn(), col, v);
                 dw.endColumn();
             }
         }
@@ -517,7 +518,7 @@ pub const RowEmitter = struct {
     pub fn emitCount(self: *RowEmitter, count: u64) !void {
         var dw = try self.state.beginDataRow(1);
         const w = try dw.beginColumn();
-        try _value.formatValue(w, .{ .int8 = @intCast(count) });
+        try _value.formatValue(w, null, .{ .int8 = @intCast(count) });
         dw.endColumn();
         try dw.finish();
         self.count += 1;
@@ -575,11 +576,11 @@ fn coerceLiteral(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,
     lit: _parse.Literal,
-    ty: _value.Type,
+    col: _table.Column,
     now_us: i64,
 ) !?_value.Value {
     if (lit == .current_timestamp) {
-        return switch (ty) {
+        return switch (col.ty) {
             .timestamp => .{ .timestamp = now_us },
             .timestamptz => .{ .timestamptz = now_us },
             else => {
@@ -592,7 +593,7 @@ fn coerceLiteral(
             },
         };
     }
-    return litToValue(a, lit, ty) catch |err| switch (err) {
+    return litToValue(a, lit, &col) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.UnsupportedLiteral, error.UnsupportedType => {
             try replyErrorCode(
@@ -600,6 +601,14 @@ fn coerceLiteral(
                 pgwire.sqlstate.feature_not_supported,
                 "unsupported value or column type",
             );
+            return null;
+        },
+        error.StringTooLong => {
+            try replyStringTooLong(state, a, &col);
+            return null;
+        },
+        error.InvalidUtf8 => {
+            try replyInvalidUtf8(state);
             return null;
         },
         else => {
@@ -613,11 +622,22 @@ fn coerceLiteral(
     };
 }
 
+const replyStringTooLong = _expr.replyStringTooLong;
+const replyInvalidUtf8 = _expr.replyInvalidUtf8;
+
 /// Map an eval failure (expr.eval: arithmetic on one row's SET
-/// values) onto the wire.
-fn replyEvalErr(state: *pgwire.ConnState, err: _expr.EvalError) !void {
+/// values, or a string landing in a `char(n)` / `varchar(n)` column)
+/// onto the wire. `target` is the column being assigned.
+fn replyEvalErr(
+    state: *pgwire.ConnState,
+    a: std.mem.Allocator,
+    err: _expr.EvalError,
+    target: *const _table.Column,
+) !void {
     return switch (err) {
         error.OutOfMemory => err,
+        error.StringTooLong => replyStringTooLong(state, a, target),
+        error.InvalidUtf8 => replyInvalidUtf8(state),
         error.IntOutOfRange => replyErrorCode(
             state,
             pgwire.sqlstate.numeric_value_out_of_range,

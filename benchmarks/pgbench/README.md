@@ -67,18 +67,21 @@ choice.
       --conn "host=127.0.0.1 port=3210 dbname=egres sslmode=disable" \
       --init egres --scale 100 --modes simple
 
-`pgbench -i` does not work against Egres: it needs COPY, `char(n)`,
-NOT NULL, multi-table DROP and TRUNCATE, VACUUM and ALTER TABLE.
-`--init egres` instead pipes generated SQL through psql:
+`pgbench -i` does not work against Egres: it needs COPY, NOT NULL,
+multi-table DROP and TRUNCATE, VACUUM and ALTER TABLE. `--init egres`
+instead pipes generated SQL through psql:
 
     python3 init_egres.py 100 | psql "$CONN" -X -q -v ON_ERROR_STOP=1
 
-The generator emits four CREATE TABLE statements and multi-row
-INSERTs of 500 rows each, matching what `pgbench -i` produces:
-`branches = scale`, `tellers = 10 * scale`, `accounts = 100000 *
-scale`, all balances zero, and `accounts.filler` padded to 84 spaces
-the way pgbench's `char(84)` pads the empty string. Load time and
-rows/s go to `<out>/<label>-init.txt`.
+The generator emits pgbench's own four CREATE TABLE statements (minus
+NOT NULL, so `filler` is `char(84)` on accounts and tellers, `char(88)`
+on branches, `char(22)` on history) and multi-row INSERTs of 500 rows
+each, matching what `pgbench -i` produces: `branches = scale`,
+`tellers = 10 * scale`, `accounts = 100000 * scale`, all balances
+zero, `accounts.filler` the empty string. Egres stores `char(n)`
+stripped of trailing spaces and pads on output, so the accounts rows
+are smaller on disk than in Postgres, where `char(84)` stores 84
+spaces. Load time and rows/s go to `<out>/<label>-init.txt`.
 
 `init_egres.py` accepts `--parallel N`, which is currently ignored;
 the single-stream generator is fast enough at the scales run today.

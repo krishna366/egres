@@ -50,6 +50,8 @@ pub const Column = struct {
     name: String,
     ty: _value.Type,
     pkey_position: ?u16,
+    /// `char(n)` / `varchar(n)` length; null otherwise (schema.LogicalColumn).
+    type_mod: ?u32 = null,
 
     /// The row-key pseudo-column (`egid_column`).
     pub fn isEgid(self: *const Column) bool {
@@ -294,6 +296,7 @@ pub fn loadTableSchema(
             .name = lc.name,
             .ty = lc.ty,
             .pkey_position = lc.pkey_position,
+            .type_mod = lc.type_mod,
         });
     }
     const columns = try cols.toOwnedSlice(a);
