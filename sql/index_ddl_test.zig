@@ -8,7 +8,6 @@ const zdb = @import("zdb");
 const Forest = zdb.forest.Forest;
 const Key = zdb.kv.Key;
 const Meta = zdb.kv.Meta;
-const Oracle = sql.oracle.Oracle;
 const RowIndexKeys = sql.index_ddl.RowIndexKeys;
 const String = sql.value.String;
 const Txn = sql.txn.Txn;
@@ -25,8 +24,7 @@ const Fixture = struct {
     tmp: std.testing.TmpDir,
     dir_path: [:0]u8,
     forest: *Forest,
-    sm: fiber.SemaphoreMap,
-    oracle: Oracle,
+    db: sql.database.Database,
     arena: std.heap.ArenaAllocator,
     tbl: sql.table.Table,
 
@@ -74,8 +72,7 @@ const Fixture = struct {
             .tmp = tmp,
             .dir_path = dir_path,
             .forest = f,
-            .sm = try fiber.SemaphoreMap.init(testing.allocator),
-            .oracle = Oracle.init(testing.allocator),
+            .db = try sql.database.Database.init(testing.allocator, ns),
             .arena = arena,
             .tbl = .{
                 .columns = columns,
@@ -89,8 +86,7 @@ const Fixture = struct {
 
     fn teardown(self: *Fixture) void {
         self.tbl.deinit();
-        self.oracle.deinit();
-        self.sm.deinit();
+        self.db.deinit();
         self.forest.close();
         testing.allocator.free(self.dir_path);
         self.tmp.cleanup();
@@ -108,11 +104,9 @@ const Fixture = struct {
         return Txn.init(
             testing.allocator,
             1,
-            ns,
             read_ts,
             1,
-            &self.sm,
-            &self.oracle,
+            &self.db,
             self.forest,
         );
     }

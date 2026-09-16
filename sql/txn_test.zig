@@ -7,7 +7,6 @@ const utils = @import("utils");
 const zdb = @import("zdb");
 
 const Txn = sql.txn.Txn;
-const Oracle = sql.oracle.Oracle;
 const Forest = zdb.forest.Forest;
 const Key = zdb.kv.Key;
 const Meta = zdb.kv.Meta;
@@ -22,8 +21,7 @@ const Fixture = struct {
     tmp: std.testing.TmpDir,
     dir_path: [:0]u8,
     forest: *Forest,
-    sm: fiber.SemaphoreMap,
-    oracle: Oracle = undefined,
+    db: sql.database.Database,
 
     fn setup(rows: []const zdb.kv.Item) !Fixture {
         var tmp = std.testing.tmpDir(.{});
@@ -44,14 +42,12 @@ const Fixture = struct {
             .tmp = tmp,
             .dir_path = dir_path,
             .forest = f,
-            .sm = try fiber.SemaphoreMap.init(testing.allocator),
-            .oracle = Oracle.init(testing.allocator),
+            .db = try sql.database.Database.init(testing.allocator, ns),
         };
     }
 
     fn teardown(self: *Fixture) void {
-        self.oracle.deinit();
-        self.sm.deinit();
+        self.db.deinit();
         self.forest.close();
         testing.allocator.free(self.dir_path);
         self.tmp.cleanup();
@@ -65,11 +61,9 @@ const Fixture = struct {
         return Txn.init(
             testing.allocator,
             id,
-            ns,
             read_ts,
             1,
-            &self.sm,
-            &self.oracle,
+            &self.db,
             self.forest,
         );
     }
@@ -77,7 +71,7 @@ const Fixture = struct {
     /// Record a commit of `primary` at `ts` in the oracle, the way apply
     /// does — a one-item run through updateItems.
     fn commit(self: *Fixture, primary: String, ts: u64) !void {
-        try self.oracle.updateItems(&.{.{
+        try self.db.oracle.updateItems(&.{.{
             .key = rowKey(primary),
             .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = "" } },
         }});
@@ -179,12 +173,12 @@ test "txn: lockRow is re-entrant and deinit releases every held lock" {
     // Re-lock of a held row: the map answers "already yours", no second
     // hold is recorded.
     try tx.lockRow(tid, "r1");
-    try testing.expectEqual(2, tx.held.items.len);
-    try testing.expectEqual(2, fx.sm.entries.count());
+    try testing.expectEqual(2, tx.held_rows.items.len);
+    try testing.expectEqual(2, fx.db.row_locks.entries.count());
 
     // Txn end releases everything — the table drains.
     tx.deinit();
-    try testing.expectEqual(0, fx.sm.entries.count());
+    try testing.expectEqual(0, fx.db.row_locks.entries.count());
 }
 
 test "txn: fresh lock on a newer-committed row bumps and restarts" {
@@ -201,7 +195,7 @@ test "txn: fresh lock on a newer-committed row bumps and restarts" {
     // with no second bump check.
     try testing.expectEqual(600, tx.read_ts);
     try tx.lockRow(tid, "r1");
-    try testing.expectEqual(1, tx.held.items.len);
+    try testing.expectEqual(1, tx.held_rows.items.len);
 }
 
 test "txn: bumpTo — no-op at or below read_ts, else Restart or Conflict" {
@@ -303,7 +297,7 @@ test "txn: bump revalidates a recorded posting read by its index key" {
         try tx.recordRead(blue);
         try tx.beginStatement();
 
-        try fx.oracle.updateItems(&.{.{
+        try fx.db.oracle.updateItems(&.{.{
             .key = blue,
             .versions = .{ .one = .{ .ts = 550, .meta = .{}, .value = "" } },
         }});
@@ -363,26 +357,70 @@ test "txn: lockTable coexists with row locks and is re-entrant" {
     defer fx.teardown();
     var tx = fx.txn();
 
-    // Shared intent + a row lock in the same table: distinct entries
-    // (TableKey and Key identity hashes use different seeds).
+    // A shared table lock and a row lock in the same table live
+    // apart: the table lock on its RWMutex, the row in the map.
     try tx.lockTable(tid, .shared);
     try tx.lockRow(tid, "r1");
-    try testing.expectEqual(2, tx.held.items.len);
-    try testing.expectEqual(2, fx.sm.entries.count());
+    try testing.expectEqual(1, tx.held_tables.items.len);
+    try testing.expectEqual(1, tx.held_rows.items.len);
+    try testing.expectEqual(1, fx.db.row_locks.entries.count());
+    const table_lock = try fx.db.tableLock(tid);
+    try testing.expect(table_lock.isHeld(.shared));
 
-    // Per-statement re-acquire inside one txn is a no-op.
+    // Per-statement re-acquire inside one txn is a no-op; asking for
+    // exclusive over a held shared is refused, never self-blocked.
     try tx.lockTable(tid, .shared);
-    try testing.expectEqual(2, tx.held.items.len);
+    try testing.expectEqual(1, tx.held_tables.items.len);
+    try testing.expectError(error.Upgrade, tx.lockTable(tid, .exclusive));
 
-    // A second txn shares the intent lock but blocks... deadlock and
-    // blocking behavior is the map's own test surface; here just check
-    // shared coexistence.
+    // A second txn shares the table lock; an exclusive taker (DDL) would
+    // park until both release, which is the mutex's own test surface.
     var tx2 = fx.txnAs(2);
     try tx2.lockTable(tid, .shared);
     tx2.deinit();
+    try testing.expect(table_lock.isHeld(.shared));
 
+    // Txn end releases the row lock and the table lock.
     tx.deinit();
-    try testing.expectEqual(0, fx.sm.entries.count());
+    try testing.expectEqual(0, fx.db.row_locks.entries.count());
+    try testing.expect(!table_lock.isHeld(.shared));
+}
+
+test "table locks: one mutex per table id, created on first use, allTableLocks lists them" {
+    var fx = try Fixture.setup(&.{});
+    defer fx.teardown();
+
+    // Same id, same mutex; different ids, different mutexes.
+    const a = try fx.db.tableLock(tid);
+    try testing.expectEqual(a, try fx.db.tableLock(tid));
+    const b = try fx.db.tableLock(tid + 1);
+    try testing.expect(a != b);
+
+    // DROP DATABASE's set is every mutex created so far.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const every = try fx.db.allTableLocks(arena.allocator());
+    try testing.expectEqual(2, every.len);
+    var seen_a = false;
+    var seen_b = false;
+    for (every) |m| {
+        if (m == a) seen_a = true;
+        if (m == b) seen_b = true;
+    }
+    try testing.expect(seen_a and seen_b);
+
+    // The pass DROP DATABASE makes: take and release each exclusive.
+    // With nothing held it goes straight through, and leaves the
+    // mutexes free for the next statement.
+    for (every) |m| {
+        m.lock(@src());
+        m.unlock();
+    }
+    var tx = fx.txn();
+    try tx.lockTable(tid, .shared);
+    try testing.expect(a.isHeld(.shared));
+    tx.deinit();
+    try testing.expect(!a.isHeld(.shared));
 }
 
 const itid: u32 = 17; // a secondary index's table id in these tests

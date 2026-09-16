@@ -35,7 +35,8 @@ const StubHandler = struct {
         defer session.close();
         while (!session.closed()) {
             const state = &session.state;
-            switch (try session.nextEvent()) {
+            const ev = try session.nextEvent();
+            switch (ev) {
                 .startup_complete => |params| try self.onStartup(state, params),
                 .query => |sql| {
                     try self.onQuery(state, sql);
@@ -43,9 +44,9 @@ const StubHandler = struct {
                 },
                 .execute => |ctx| try self.onExecute(state, ctx),
                 .describe => |ctx| try self.onDescribe(state, ctx),
-                .sync, .terminate => {},
+                .sync, .flush, .terminate => {},
             }
-            try session.flush();
+            if (pgwire.Session.flushAfter(ev)) try session.flush();
         }
     }
 

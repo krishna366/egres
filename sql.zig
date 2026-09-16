@@ -41,6 +41,7 @@ pub const catalog = @import("sql/catalog.zig");
 pub const table = @import("sql/table.zig");
 pub const key = @import("sql/key.zig");
 pub const parse = @import("sql/parse.zig");
+pub const database = @import("sql/database.zig");
 pub const txn = @import("sql/txn.zig");
 pub const oracle = @import("sql/oracle.zig");
 pub const server = @import("sql/server.zig");

@@ -412,7 +412,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     defer alloc.free(dc.tree_changes);
     try std.testing.expectEqual(@as(usize, 5), dc.tree_changes.len);
     try std.testing.expectEqual(manifest.Command.drop_ns, dc.cmd);
-    try f.applyDropNamespace(dc);
+    try f.applyNamespaceDrop(dc);
 
     try std.testing.expect(!f.hasNamespace(7));
     try std.testing.expect(!f.hasTable(7, 3));
@@ -428,7 +428,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const dc2 = try f.buildDropNamespace(alloc, 7);
     defer alloc.free(dc2.tree_changes);
     try std.testing.expectEqual(@as(usize, 0), dc2.tree_changes.len);
-    try f.applyDropNamespace(dc2);
+    try f.applyNamespaceDrop(dc2);
 
     // Re-creating the namespace works, and its table ids restart at the
     // floor — the counter was forgotten with the namespace. (Production

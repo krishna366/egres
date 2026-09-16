@@ -142,7 +142,7 @@ pub const Table = struct {
     /// Atomic so hand-out (fetchAdd) and the apply observer (fetchMax)
     /// need no lock: the counter carries no other data, so monotonic
     /// ordering is enough. The Table pointer itself stays valid under
-    /// the table intent lock (see sql.Server.forgetTable).
+    /// the table lock (see sql.Server.forgetTable).
     next_egid: std.atomic.Value(u64) = .init(0),
 
     /// Raise `next_egid` to at least `floor`: the apply observer's

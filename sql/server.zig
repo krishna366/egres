@@ -26,6 +26,7 @@ const _key = @import("key.zig");
 const _schema = @import("schema.zig");
 const _table = @import("table.zig");
 const _txn = @import("txn.zig");
+const _database = @import("database.zig");
 const _value = @import("value.zig");
 const Oracle = @import("oracle.zig").Oracle;
 
@@ -39,86 +40,7 @@ const String = _value.String;
 /// user name; that also misses and falls back per onStartup).
 pub const default_database = "egres";
 
-/// One database's transaction machinery: the lock table and the commit
-/// oracle. A SQL txn is connection-bound to one database, so wait-for
-/// graphs and conflict tracking are naturally namespace-local — per-ns
-/// instances keep tenants off each other's mutexes and give DROP
-/// DATABASE one object to tear down (teardown itself is deferred).
-pub const Database = struct {
-    /// This database's namespace id (implied by every key it owns).
-    ns: u64,
-    /// DROP DATABASE landed. Written under the EXCLUSIVE namespace
-    /// intent lock, read under the shared one (see Txn.lockNamespace) —
-    /// the lock is the synchronization. A statement that was parked on
-    /// the namespace key while the drop ran wakes to find this set and
-    /// answers 3D000 instead of touching dropped trees. (The manifest is
-    /// the authority for NEW statements — sessionNamespace; this flag
-    /// covers the ones already past that gate.)
-    dropped: bool = false,
-    locks: fiber.SemaphoreMap,
-    oracle: Oracle,
-    /// Per-table cache: compiled schema + egid counter, keyed by table_id
-    /// (the namespace is this database's). Guards the map; each table's
-    /// `next_egid` is atomic and needs only a shared hold to reach it.
-    /// Heap entries so held pointers survive map growth. Readers share:
-    /// every statement looks its table up here, egid hand-out and the
-    /// apply fiber included (as an exclusive hand-off mutex this ran at
-    /// ~94k hand-offs/s under a 64-client pgbench); first load and the
-    /// DDL swap take it exclusively, only around the egid seed and the
-    /// publish (see updateEgidAndPut) — the schema load itself runs
-    /// with no lock held.
-    tables_mu: fiber.RWMutex(.untracked) = .{},
-    tables: std.AutoHashMap(u32, *_table.Table),
-
-    fn init(allocator: std.mem.Allocator, ns: u64) !Database {
-        return .{
-            .ns = ns,
-            .locks = try fiber.SemaphoreMap.init(allocator),
-            .oracle = Oracle.init(allocator),
-            .tables = std.AutoHashMap(u32, *_table.Table).init(allocator),
-        };
-    }
-
-    fn deinit(self: *Database, allocator: std.mem.Allocator) void {
-        var it = self.tables.valueIterator();
-        while (it.next()) |t| {
-            t.*.deinit();
-            allocator.destroy(t.*);
-        }
-        self.tables.deinit();
-        self.tables_mu.deinit();
-        self.locks.deinit();
-        self.oracle.deinit();
-    }
-
-    /// Apply-fiber update for a run of committed items sharing this
-    /// database's namespace: advance each cached table's egid counter
-    /// past every committed row id, and record every key in the oracle at
-    /// its commit ts (apply already rewrote it to the entry's HLC).
-    /// Uncached tables are skipped — first cache seeds egid from
-    /// forest.maxKey, covering rows applied before caching.
-    fn applyCommitted(self: *Database, items: []const zdb.kv.Item) void {
-        {
-            self.tables_mu.lockShared(@src());
-            defer self.tables_mu.unlockShared();
-            // Items in a run share this namespace; only table_id varies,
-            // and consecutive items share a table in practice.
-            var tbl: ?*_table.Table = null;
-            var table_id: u32 = 0;
-            for (items) |item| {
-                if (tbl == null or item.key.table_id != table_id) {
-                    table_id = item.key.table_id;
-                    tbl = self.tables.get(table_id);
-                }
-                const cached = tbl orelse continue;
-                if (_key.decodeEgid(item.key.primary)) |egid|
-                    cached.raiseNextEgid(egid + 1);
-            }
-        }
-        self.oracle.updateItems(items) catch |err|
-            log.err("oracle ns={d}: {s}", .{ self.ns, @errorName(err) });
-    }
-};
+pub const Database = _database.Database;
 
 pub const Server = struct {
     engine: *engine.Engine,
@@ -167,7 +89,7 @@ pub const Server = struct {
         self.index_catalog_ps.deinit(self.engine.allocator);
         var dbs = self.databases.valueIterator();
         while (dbs.next()) |d| {
-            d.*.deinit(self.engine.allocator);
+            d.*.deinit();
             self.engine.allocator.destroy(d.*);
         }
         self.databases.deinit();
@@ -237,22 +159,17 @@ pub const Server = struct {
     }
 
     /// Load `table_id`'s schema onto the heap — the part of a cache miss
-    /// that needs no lock. DDL holds the table intent lock exclusively
+    /// that needs no lock. DDL holds the table lock exclusively
     /// and DML holds it shared before it gets here, so the catalog rows
     /// cannot change under the read, and a park on it stalls no other
     /// statement's lookup and not the apply fiber. `next_egid` stays 0
-    /// until updateEgidAndPut seeds it.
+    /// until publishTable seeds it.
     fn loadTable(self: *Server, db: *Database, table_id: u32) !*_table.Table {
         var loaded = try _table.loadTableSchema(self.engine.allocator, self.engine.forest, &self.catalog_ps, &self.index_catalog_ps, db.ns, table_id);
         errdefer loaded.deinit();
         const t = try self.engine.allocator.create(_table.Table);
         t.* = loaded;
         return t;
-    }
-
-    fn destroyTable(self: *Server, t: *_table.Table) void {
-        t.deinit();
-        self.engine.allocator.destroy(t);
     }
 
     /// The cached Table for (namespace, table_id) — schema for INSERT/SELECT.
@@ -273,74 +190,19 @@ pub const Server = struct {
         db: *Database,
         table_id: u32,
     ) !*_table.Table {
-        db.tables_mu.lockShared(@src());
-        const hit = db.tables.get(table_id);
-        db.tables_mu.unlockShared();
-        if (hit) |t| return t;
-
+        if (db.cachedTable(table_id)) |t| return t;
         const fresh = try self.loadTable(db, table_id);
-        errdefer self.destroyTable(fresh);
-
-        db.tables_mu.lock(@src());
-        defer db.tables_mu.unlock();
-
-        if (db.tables.get(table_id)) |t| {
-            self.destroyTable(fresh);
-            return t;
-        }
-        try self.updateEgidAndPut(db, table_id, fresh);
-        return fresh;
+        const stored = db.openAndCacheTable(self.engine.forest, table_id, fresh) catch |err| {
+            db.destroyTable(fresh);
+            return err;
+        };
+        if (stored != fresh) db.destroyTable(fresh);
+        return stored;
     }
 
-    /// Seed `t.next_egid` past the table's max applied row id and put
-    /// `t` in the cache. Caller holds `db.tables_mu` exclusively and
-    /// the map has no entry for `table_id`. The seed and the publish
-    /// are one step on purpose: the apply fiber skips uncached tables,
-    /// so a row applied between the two would be missing from the
-    /// counter and its egid handed out again.
-    ///
-    /// maxKey takes no lock and the memtable keeps taking writes under
-    /// it, so its answer is a lower bound, not a snapshot. That is
-    /// enough because of the apply order: one fiber does forest.put
-    /// and then the applyCommitted observer call for the same rows,
-    /// and the observer takes `tables_mu` shared. A row applied before
-    /// this hold began was seen by the walk; a row applied during it
-    /// blocks at the observer until the publish, then raises the
-    /// counter itself. Either way the counter ends past every committed
-    /// row.
-    fn updateEgidAndPut(
-        self: *Server,
-        db: *Database,
-        table_id: u32,
-        t: *_table.Table,
-    ) !void {
-        // Covers snapshot SSTs the apply observer never saw. Empty
-        // table → start at 1.
-        if (try self.engine.forest.maxKey(self.engine.allocator, db.ns, table_id)) |mk| {
-            defer mk.free(self.engine.allocator);
-            t.raiseNextEgid((_key.decodeEgid(mk.primary) orelse 0) + 1);
-        } else {
-            t.raiseNextEgid(1);
-        }
-        try db.tables.put(table_id, t);
-    }
-
-    /// Drop a table's cache entry: DROP TABLE, and every DDL that
-    /// changes the schema (CREATE/DROP INDEX). The next openTable loads
-    /// fresh from the catalog and reseeds `next_egid` from maxKey. The
-    /// caller holds the table intent lock EXCLUSIVELY, which is what
-    /// makes destroying the entry safe: DML holds its Table only under
-    /// the shared intent lock (taken before openTable), and
-    /// applyCommitted touches cached tables only under tables_mu. The
-    /// counter needs no carry-over: under the exclusive intent no
-    /// INSERT is in flight, and a committed row is applied before its
-    /// txn releases the shared intent, so the reseed already covers
-    /// every handed-out id that became a row.
+    /// Evict `table_id`'s cached Table (see Database.forgetTable).
     pub fn forgetTable(self: *Server, ns: u64, table_id: u32) !void {
-        const db = try self.database(ns);
-        db.tables_mu.lock(@src());
-        defer db.tables_mu.unlock();
-        if (db.tables.fetchRemove(table_id)) |old| self.destroyTable(old.value);
+        (try self.database(ns)).forgetTable(table_id);
     }
 
     /// Reserve the next egid for a table (leader path). newTxn already ran
@@ -353,7 +215,7 @@ pub const Server = struct {
 
     /// `allocEgid` with the Database in hand (see openTableIn). A hit
     /// costs a shared hold plus one fetchAdd; the caller's shared
-    /// intent lock keeps the Table alive past the hold.
+    /// table lock keeps the Table alive past the hold.
     pub fn allocEgidIn(self: *Server, db: *Database, table_id: u32) !u64 {
         const t = try self.openTableIn(db, table_id);
         const egid = t.next_egid.fetchAdd(1, .monotonic);
@@ -537,7 +399,8 @@ pub const Handler = struct {
         defer session.close();
         while (!session.closed()) {
             const state = &session.state;
-            switch (try session.nextEvent()) {
+            const ev = try session.nextEvent();
+            switch (ev) {
                 .startup_complete => |params| try self.onStartup(state, params),
                 .query => |sql| {
                     try self.onQuery(state, sql);
@@ -545,9 +408,9 @@ pub const Handler = struct {
                 },
                 .execute => |ctx| try self.onExecute(state, ctx),
                 .describe => |ctx| try self.onDescribe(state, ctx),
-                .sync, .terminate => {},
+                .sync, .flush, .terminate => {},
             }
-            try session.flush();
+            if (pgwire.Session.flushAfter(ev)) try session.flush();
         }
     }
 
@@ -845,7 +708,7 @@ pub const Handler = struct {
 
     /// The Database for `ns`: the cached one when it is the session's,
     /// else resolved (and cached) through Server.database.
-    fn sessionDb(self: *Handler, ns: u64) !*Database {
+    pub fn sessionDb(self: *Handler, ns: u64) !*Database {
         if (self.db) |d| {
             if (d.ns == ns) return d;
         }
@@ -880,11 +743,9 @@ pub const Handler = struct {
         t.* = _txn.Txn.init(
             eng.allocator,
             self.srv.next_txn_id.fetchAdd(1, .monotonic),
-            ns,
             eng.node.appliedTs(),
             eng.node.current_term,
-            &db.locks,
-            &db.oracle,
+            db,
             eng.forest,
         );
         t.start_us = fiber.timestampNow(.realtime, .micros);
@@ -905,13 +766,14 @@ pub const Handler = struct {
         return t;
     }
 
-    /// The txn a DML statement runs in, holding its shared namespace-
-    /// and table-intent locks (in that order — the global lock order is
-    /// ns → table → row). Null means the statement is over: a lock error
-    /// was already reported, or the database was dropped while we were
-    /// parked on the namespace key (drops take it exclusive). DROP
-    /// TABLE / DROP DATABASE queue behind these intents; writer
-    /// preference then parks new DML behind the pending drop.
+    /// The txn a DML statement runs in, holding its shared table
+    /// lock (the global lock order is table → row). Null means the
+    /// statement is over: a lock error was already reported, or the
+    /// database was dropped. DROP TABLE and DROP DATABASE queue
+    /// behind the table lock; writer preference then parks new DML
+    /// behind the pending drop. The `dropped` check comes AFTER the
+    /// take: see Database.dropped for why that order is what makes
+    /// the drop's pass over the tables complete.
     pub fn dmlTxn(
         self: *Handler,
         state: *pgwire.ConnState,
@@ -919,12 +781,12 @@ pub const Handler = struct {
         table_id: u32,
     ) !?*_txn.Txn {
         const tx = try self.statementTxn(ns);
-        tx.lockNamespace(.shared) catch |err| {
+        tx.lockTable(table_id, .shared) catch |err| {
             try replyLockErr(state, err);
             return null;
         };
         const db = try self.sessionDb(ns);
-        if (db.dropped) {
+        if (db.dropped.load(.acquire)) {
             try replyErrorCode(
                 state,
                 pgwire.sqlstate.invalid_catalog_name,
@@ -932,10 +794,6 @@ pub const Handler = struct {
             );
             return null;
         }
-        tx.lockTable(table_id, .shared) catch |err| {
-            try replyLockErr(state, err);
-            return null;
-        };
         return tx;
     }
 

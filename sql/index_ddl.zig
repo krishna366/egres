@@ -5,7 +5,6 @@
 //! Free functions over `*Handler` — see the note in ddl.zig.
 
 const std = @import("std");
-const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 const zen = zdb.buffers;
@@ -16,6 +15,7 @@ const _parse = @import("parse.zig");
 const _key = @import("key.zig");
 const _table = @import("table.zig");
 const _txn = @import("txn.zig");
+const _database = @import("database.zig");
 const _value = @import("value.zig");
 const _server = @import("server.zig");
 
@@ -40,7 +40,7 @@ const writeCatalogRows = _ddl.writeCatalogRows;
 ///  1. create the index tree (raft, applied);
 ///  2. reserve the tree against compactions for the whole build —
 ///     keeps its bottom level empty, the install condition;
-///  3. take the exclusive table intent as a BARRIER only: drains
+///  3. take the exclusive table lock as a BARRIER only: drains
 ///     statements still holding a pre-index Table (openTable runs
 ///     after dmlTxn, so post-barrier statements load fresh);
 ///  4. under it: catalog row (valid_ts = building) + forgetTable —
@@ -70,7 +70,7 @@ const writeCatalogRows = _ddl.writeCatalogRows;
 ///     is at or above valid_ts may now use the index; an older
 ///     snapshot scans instead. Forgetting destroys the cached Table,
 ///     which is only safe while no statement holds it (DML holds
-///     the shared intent from dmlTxn to txn end); the barrier
+///     the shared table lock from dmlTxn to txn end); the barrier
 ///     drains them and parks new ones.
 /// A failure after step 4 removes the index again under the barrier
 /// (catalog tombstone + tree drop, `removeIndex`), so the name is
@@ -173,38 +173,18 @@ pub fn createIndex(
     try eng.reserveTree(tree_key);
     defer eng.releaseTree(tree_key);
 
-    const txn_id = self.srv.next_txn_id.fetchAdd(1, .monotonic);
     const db = try self.srv.database(ns);
-    const nskey = zdb.kv.namespaceHash(ns);
 
-    _ = db.locks.acquire(nskey, txn_id, .shared) catch |err|
-        return replyLockErr(state, err);
-    defer db.locks.release(nskey, txn_id);
-
-    // The barrier: the base table's exclusive intent, taken twice
-    // under one owner (steps 3 and 7) and released once for the build
-    // in between. `fail` retakes it when needed — a re-acquire by the
-    // holder is a no-op — so one deferred tryRelease covers every
-    // exit, held or not.
-    const tkey = (zdb.kv.TableKey{
-        .namespace = ns,
-        .table_id = base_tid,
-    }).identityHash();
-
-    _ = db.locks.acquire(tkey, txn_id, .exclusive) catch |err|
-        return replyLockErr(state, err);
-    defer _ = db.locks.tryRelease(tkey, txn_id);
-
+    // The barrier: the base table's exclusive lock, taken at steps
+    // 3 and 7 and dropped for the build in between. `fail` retakes it
+    // when needed, and one deferred dropBarrier covers every exit,
+    // held or not.
     const def = _catalog.IndexDef{
         .base_table_id = base_tid,
         .index_table_id = index_tid,
         .column_id = column_id,
         .unique = ci.unique,
         .valid_ts = _catalog.IndexDef.building,
-    };
-    writeCatalogRows(self, arloc, ns, base_tid, &.{}, &.{def}) catch |err| {
-        logCreateIndexErr(name, "catalog row", err);
-        return replyError(state, "create index failed");
     };
     var build = IndexBuild{
         .handler = self,
@@ -213,18 +193,26 @@ pub fn createIndex(
         .ns = ns,
         .def = def,
         .name = name,
-        .locks = &db.locks,
-        .tkey = tkey,
-        .txn_id = txn_id,
+        .barrier = db.tableLock(base_tid) catch
+            return replyError(state, "internal error: lock state"),
+    };
+    build.takeBarrier();
+    defer build.dropBarrier();
+
+    // TODO: This can return the timestamp the catalog was written at, so we
+    // don't need to run build.readTs.
+    writeCatalogRows(self, arloc, ns, base_tid, &.{}, &.{def}) catch |err| {
+        logCreateIndexErr(name, "catalog row", err);
+        return replyError(state, "create index failed");
     };
     self.srv.forgetTable(ns, base_tid) catch |err|
         return build.fail("forget table", err);
     build.read_ts = build.readTs() catch |err|
         return build.fail("read read_ts", err);
 
-    // Release the table lock before the backfill, so other txns can
+    // Drop the barrier before the backfill, so other txns can
     // proceed.
-    db.locks.release(tkey, txn_id);
+    build.dropBarrier();
     log.info(
         "create index '{s}': backfill (ns={d} base={d} index={d} read_ts={d})",
         .{ name, ns, base_tid, index_tid, build.read_ts },
@@ -233,8 +221,7 @@ pub fn createIndex(
     var rows = build.scan() catch |err| return build.fail("backfill", err);
     build.install(&rows) catch |err| return build.fail("install", err);
 
-    _ = db.locks.acquire(tkey, txn_id, .exclusive) catch |err|
-        return replyLockErr(state, err);
+    build.takeBarrier();
     build.merge(&rows) catch |err| return build.fail("merge", err);
     build.markValid() catch |err| return build.fail("mark valid", err);
 
@@ -496,10 +483,10 @@ const IndexBuild = struct {
     ns: u64,
     def: _catalog.IndexDef,
     name: String,
-    /// The barrier's lock map, key and owner (createIndex's).
-    locks: *fiber.SemaphoreMap,
-    tkey: u64,
-    txn_id: u64,
+    /// The barrier: the base table's exclusive lock, and whether
+    /// this build holds it now.
+    barrier: *_database.RWMutex,
+    barrier_held: bool = false,
     /// The catalog row's commit HLC: the first scan's snapshot, and
     /// the bound the second scan starts from.
     read_ts: u64 = 0,
@@ -507,15 +494,26 @@ const IndexBuild = struct {
     /// rows up to: the install's ts and the index's `valid_ts`.
     valid_ts: u64 = 0,
 
+    /// Take the barrier unless held.
+    fn takeBarrier(self: *IndexBuild) void {
+        if (self.barrier_held) return;
+        self.barrier.lock(@src());
+        self.barrier_held = true;
+    }
+
+    /// Drop the barrier if held.
+    fn dropBarrier(self: *IndexBuild) void {
+        if (!self.barrier_held) return;
+        self.barrier.unlock();
+        self.barrier_held = false;
+    }
+
     /// Log `err`, remove the index under the barrier (retaken if
     /// released — a no-op if held), and reply: 23505 for a duplicate,
     /// else a plain failure. The name is free to retry either way.
     fn fail(self: *IndexBuild, what: String, err: anyerror) !void {
         logCreateIndexErr(self.name, what, err);
-        _ = self.locks.acquire(self.tkey, self.txn_id, .exclusive) catch |e| {
-            logCreateIndexErr(self.name, "remove: barrier", e);
-            return replyError(self.state, "create index failed");
-        };
+        self.takeBarrier();
         removeIndex(
             self.handler,
             self.a,
@@ -739,7 +737,7 @@ const IndexBuild = struct {
 /// DROP INDEX. The index's column must not be the PRIMARY KEY's —
 /// that index is structural and lives and dies with its table; any
 /// other index, unique or not, drops. Under the base table's
-/// exclusive intent (the reload swaps its cached schema),
+/// exclusive lock (the reload swaps its cached schema),
 /// `removeIndex` does the work.
 pub fn dropIndex(
     self: *Handler,
@@ -802,20 +800,11 @@ pub fn dropIndex(
 
     // Locks: same shape as dropTable, on the BASE table — the
     // reload below swaps its cached schema.
-    const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
     const db = try self.srv.database(ns);
-    const nskey = zdb.kv.namespaceHash(ns);
-    _ = db.locks.acquire(nskey, owner, .shared) catch |err|
-        return replyLockErr(state, err);
-    defer db.locks.release(nskey, owner);
-
-    const tkey = (zdb.kv.TableKey{
-        .namespace = ns,
-        .table_id = base_tid,
-    }).identityHash();
-    _ = db.locks.acquire(tkey, owner, .exclusive) catch |err|
-        return replyLockErr(state, err);
-    defer db.locks.release(tkey, owner);
+    const table_lock = db.tableLock(base_tid) catch
+        return replyError(state, "internal error: lock state");
+    table_lock.lock(@src());
+    defer table_lock.unlock();
 
     removeIndex(self, a, ns, base_tid, index_tid) catch |err| {
         logDropIndexErr(di.name, "remove", err);
@@ -835,8 +824,7 @@ pub fn dropIndex(
 /// (reads would see silently-empty results), and unlike dropTable's
 /// tolerated catalog garbage, a live IndexDef row would resurrect
 /// the index on the next schema load. The caller holds the base
-/// table's exclusive intent; this must not take it (a SemaphoreMap
-/// re-acquire is a no-op, and its release would then panic).
+/// table's exclusive lock; this must not take it.
 fn removeIndex(
     self: *Handler,
     a: std.mem.Allocator,

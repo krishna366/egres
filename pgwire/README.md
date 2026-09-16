@@ -27,7 +27,8 @@ const session = try pgwire.Session.open(alloc, &stream, .{});
 defer session.close();
 while (!session.closed()) {
     const state = &session.state;
-    switch (try session.nextEvent()) {
+    const ev = try session.nextEvent();
+    switch (ev) {
         .startup_complete => |params| try h.onStartup(state, params),
         .query => |sql| {
             try h.onQuery(state, sql);
@@ -35,11 +36,15 @@ while (!session.closed()) {
         },
         .execute => |ctx| try h.onExecute(state, ctx),
         .describe => |ctx| try h.onDescribe(state, ctx),
-        .sync, .terminate => {},
+        .sync, .flush, .terminate => {},
     }
-    try session.flush();                     // logical-boundary flush
+    if (pgwire.Session.flushAfter(ev)) try session.flush();
 }
 ```
+
+Execute and Describe replies stay in the write buffer until the batch's
+Sync, a client Flush, or the buffer filling, as Postgres does: one
+socket write per extended batch, not one per message.
 
 `nextEvent` blocks on the Reader for input; `sendXxx` methods queue output
 frames through the Writer (auto-flushes when the write buffer fills, giving
@@ -55,6 +60,7 @@ memory). `close` does a final flush for a trailing fatal error.
 | `execute` | `h.onExecute(state, ExecuteCtx)`. RFQ is **not** emitted here — it arrives on the next `Sync`. An error sets `state.ext_failed`. |
 | `describe` | `h.onDescribe(state, DescribeCtx)`. ParameterDescription already emitted for `stmt` kind. |
 | `sync` | RFQ already queued; the flush sends it. |
+| `flush` | Client `H` frame: flush what is queued, ahead of any Sync. |
 | `terminate` | Frontend `X` frame, clean EOF, or fatal error. Loop exits. |
 
 ## Features

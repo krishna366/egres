@@ -65,33 +65,40 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
     const ns = eng.forest.lookupNamespace(name) orelse
         return replyError(state, "database does not exist");
 
-    // Exclusive namespace intent: queue behind every open txn and
-    // in-flight statement (they hold it shared, first lock → txn
-    // end), so the drop never lands mid-transaction; writer
-    // preference parks new DML behind us meanwhile. `dropped` is
-    // set under the exclusive hold — a statement waking from the
-    // key afterwards sees it and answers 3D000 (see dmlTxn). Fresh
-    // owner id — DDL runs outside any txn; parking under ddl_mu is
-    // safe (global order ddl_mu → intent, DML never takes ddl_mu).
+    // Set `dropped` first, then take and release every table lock
+    // exclusive, ONE AT A TIME: each take waits for the statements
+    // and open txns holding that table shared, and a statement that
+    // takes a table after the flag answers 3D000 (dmlTxn checks
+    // after its take), so once the pass is over no txn that touched
+    // a table before the flag is still open. Holding one table lock at
+    // a time keeps this out of any lock cycle: a DML txn parked
+    // behind us waits only for that table's holders to end. A
+    // failed propose clears the flag. Parking under ddl_mu is safe
+    // (global order ddl_mu → table lock, DML never takes ddl_mu).
     const db = self.srv.database(ns) catch
         return replyError(state, "internal error: database state");
-    const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
-    const nskey = zdb.kv.namespaceHash(ns);
-    _ = db.locks.acquire(nskey, owner, .exclusive) catch |err|
-        return replyLockErr(state, err);
-    defer db.locks.release(nskey, owner);
-
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
+    db.dropped.store(true, .release);
+    const table_locks = db.allTableLocks(arena.allocator()) catch {
+        db.dropped.store(false, .release);
+        return replyError(state, "internal error: lock state");
+    };
+    for (table_locks) |m| {
+        m.lock(@src());
+        m.unlock();
+    }
+
     const mc = eng.forest.buildDropNamespace(arena.allocator(), ns) catch |err| {
         log.err("drop database '{s}': {s}", .{ name, @errorName(err) });
+        db.dropped.store(false, .release);
         return replyError(state, "drop database failed");
     };
     eng.proposeMC(mc, .apply) catch |err| {
         log.err("drop database '{s}': propose: {s}", .{ name, @errorName(err) });
+        db.dropped.store(false, .release);
         return replyError(state, "drop database proposal failed");
     };
-    db.dropped = true;
     log.info("dropped database '{s}' (ns={d})", .{ name, ns });
     try state.sendCommandComplete("DROP DATABASE");
 }
@@ -262,7 +269,7 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     // One key-only catalog scan answers both DROP questions: is this
     // name an index (reject), and which index trees belong to it (drop
     // with the base below). Safe pre-lock: ddl_mu serializes every
-    // catalog mutation; the intent locks only fence in-flight DML.
+    // catalog mutation; the table locks only fence in-flight DML.
     var scan = _table.scanIndexKeys(a, eng.forest, ns, table_id) catch |err| {
         log.err("drop table '{s}': index scan: {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table failed");
@@ -270,29 +277,18 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     if (scan.is_index)
         return replyErrorCode(state, pgwire.sqlstate.wrong_object_type, "cannot DROP TABLE an index; use DROP INDEX");
 
-    // Shared namespace intent + exclusive table intent (ns → table,
-    // the global order): queue behind every open txn's shared table
-    // hold so the drop never lands mid-transaction, while the ns
-    // hold makes a concurrent DROP DATABASE queue behind US. Writer
-    // preference parks new DML behind the pending table key. Fresh
-    // owner id — DDL runs outside any txn. Safe to park while
-    // holding ddl_mu: the global order is ddl_mu → intent lock (DML
-    // never takes ddl_mu), so no cycle can involve both.
+    // Exclusive table lock: queue behind every open txn's shared
+    // hold so the drop never lands mid-transaction. Writer preference
+    // parks new DML behind the pending lock. A concurrent DROP
+    // DATABASE is serialized by ddl_mu. Safe to park while holding
+    // ddl_mu: the global order is ddl_mu → table lock (DML never takes
+    // ddl_mu), so no cycle can involve both.
     const db = self.srv.database(ns) catch
         return replyError(state, "internal error: database state");
-    const owner = self.srv.next_txn_id.fetchAdd(1, .monotonic);
-    const nskey = zdb.kv.namespaceHash(ns);
-
-    _ = db.locks.acquire(nskey, owner, .shared) catch |err|
-        return replyLockErr(state, err);
-    defer db.locks.release(nskey, owner);
-    const tkey = (zdb.kv.TableKey{
-        .namespace = ns,
-        .table_id = table_id,
-    }).identityHash();
-    _ = db.locks.acquire(tkey, owner, .exclusive) catch |err|
-        return replyLockErr(state, err);
-    defer db.locks.release(tkey, owner);
+    const table_lock = db.tableLock(table_id) catch
+        return replyError(state, "internal error: lock state");
+    table_lock.lock(@src());
+    defer table_lock.unlock();
 
     // The table and its index tables drop together, in one atomic change
     // — order is irrelevant. Their rows in the CATALOG trees stay behind
@@ -308,7 +304,7 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
         return replyError(state, "drop table proposal failed");
     };
     // Evict the cached Table (safe: we hold the exclusive table
-    // intent, and DML holds its Table only under the shared one).
+    // table lock, and DML holds its Table only under the shared one).
     // Index table_ids are never cached — they have no columns.
     try self.srv.forgetTable(ns, table_id);
 

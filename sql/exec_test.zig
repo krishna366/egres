@@ -13,7 +13,6 @@ const RowNode = exec.RowNode;
 const Pred = sql.pred.Pred;
 const Table = sql.table.Table;
 const Txn = sql.txn.Txn;
-const Oracle = sql.oracle.Oracle;
 const Forest = zdb.forest.Forest;
 const Item = zdb.kv.Item;
 const Value = sql.value.Value;
@@ -43,8 +42,7 @@ const Fixture = struct {
     tmp: std.testing.TmpDir,
     dir_path: [:0]u8,
     forest: *Forest,
-    sm: fiber.SemaphoreMap,
-    oracle: Oracle,
+    db: sql.database.Database,
     arena: std.heap.ArenaAllocator,
     tbl: Table,
 
@@ -127,8 +125,7 @@ const Fixture = struct {
             .tmp = tmp,
             .dir_path = dir_path,
             .forest = f,
-            .sm = try fiber.SemaphoreMap.init(testing.allocator),
-            .oracle = Oracle.init(testing.allocator),
+            .db = try sql.database.Database.init(testing.allocator, ns),
             .arena = arena,
             .tbl = tbl,
         };
@@ -136,8 +133,7 @@ const Fixture = struct {
 
     fn teardown(self: *Fixture) void {
         self.tbl.deinit();
-        self.oracle.deinit();
-        self.sm.deinit();
+        self.db.deinit();
         self.forest.close();
         testing.allocator.free(self.dir_path);
         self.tmp.cleanup();
@@ -148,11 +144,9 @@ const Fixture = struct {
         return Txn.init(
             testing.allocator,
             1,
-            ns,
             read_ts,
             1,
-            &self.sm,
-            &self.oracle,
+            &self.db,
             self.forest,
         );
     }
@@ -497,7 +491,7 @@ test "sql.exec: fetch: no row locks of its own, held row across batches" {
     // The fetch owns its bitmap tree: one deinit frees the leaf too.
     var node = RowNode{ .fetch = .{ .bnode = &leaf } };
     defer node.deinit();
-    try testing.expectEqual(@as(usize, 0), tx.held.items.len);
+    try testing.expectEqual(@as(usize, 0), tx.held_rows.items.len);
     var batches: usize = 0;
     var total: usize = 0;
     var last: u64 = 0;
@@ -516,7 +510,7 @@ test "sql.exec: fetch: no row locks of its own, held row across batches" {
     try testing.expect(batches >= 2);
     // Row locks are Materialize's, on the output: a bare fetch under a
     // locking ctx takes none.
-    try testing.expectEqual(@as(usize, 0), tx.held.items.len);
+    try testing.expectEqual(@as(usize, 0), tx.held_rows.items.len);
 }
 
 test "sql.exec: fetch: a bitmap wider than one chunk, with a residual" {
@@ -603,7 +597,7 @@ test "sql.exec: materialize: ascending arena copies, locks held, streams back" {
 
     const rows = try node.materialize.gatherAndLockRows(&ctx, &b);
     try testing.expectEqual(@as(usize, 1250), rows.len);
-    try testing.expectEqual(@as(usize, 1250), tx.held.items.len);
+    try testing.expectEqual(@as(usize, 1250), tx.held_rows.items.len);
     var last: u64 = 0;
     for (rows) |r| {
         const egid = sql.key.decodeEgid(r.key.primary).?;
@@ -661,7 +655,7 @@ test "sql.exec: materialize over a fetch locks the output rows only" {
 
     const rows = try node.materialize.gatherAndLockRows(&ctx, &b);
     try testing.expectEqual(@as(usize, 150), rows.len);
-    try testing.expectEqual(@as(usize, 150), tx.held.items.len);
+    try testing.expectEqual(@as(usize, 150), tx.held_rows.items.len);
     for (rows) |r| {
         const egid = sql.key.decodeEgid(r.key.primary).?;
         try testing.expect(egid % 2 == 0);
@@ -717,7 +711,7 @@ test "sql.exec: materialize without lock streams the child, bounded" {
     }
     try testing.expectEqual(@as(usize, 2500), total);
     try testing.expectEqual(@as(usize, 3), batches);
-    try testing.expectEqual(@as(usize, 0), tx.held.items.len);
+    try testing.expectEqual(@as(usize, 0), tx.held_rows.items.len);
     try testing.expect(node.materialize.rows == null);
 }
 
@@ -742,7 +736,7 @@ test "sql.exec: materialize with lock and a limit locks the limited rows" {
 
     const rows = try node.materialize.gatherAndLockRows(&ctx, &b);
     try testing.expectEqual(@as(usize, 100), rows.len);
-    try testing.expectEqual(@as(usize, 100), tx.held.items.len);
+    try testing.expectEqual(@as(usize, 100), tx.held_rows.items.len);
     for (rows, 1..) |r, i| {
         const egid = sql.key.decodeEgid(r.key.primary).?;
         try testing.expectEqual(@as(u64, 2 * i), egid);

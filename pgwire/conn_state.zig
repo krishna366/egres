@@ -116,6 +116,10 @@ pub const Event = union(enum) {
     /// ReadyForQuery; this is just a notification so the driver can
     /// flush.
     sync,
+    /// Extended-query Flush arrived: the client wants every reply
+    /// queued so far on the wire now, ahead of any Sync. The front-end
+    /// flushes; nothing else changes.
+    flush,
     /// Frontend asked us to close ('X' frame), the peer cleanly closed
     /// the reader (EOF before next header), or we sent a fatal error.
     /// Caller should drop the connection.
@@ -481,12 +485,7 @@ pub const ConnState = struct {
                     try _proto.encodeReadyForQuery(self.out, self.tx_status);
                     return .sync;
                 },
-                .flush => {
-                    // Flush asks the backend to emit any buffered
-                    // output immediately. We're already unbuffered —
-                    // the outer loop will flush whatever's in `out`.
-                    continue;
-                },
+                .flush => return .flush,
                 else => {
                     try self.emitErrorReady(
                         "unsupported message",

@@ -255,9 +255,9 @@ pub const StorageImpl = struct {
             },
             .tree_split => try self.forest.applySplit(mcs.*),
             .create_ns => try self.forest.applyNamespaceCreate(mcs.*),
+            .drop_ns => try self.forest.applyNamespaceDrop(mcs.*),
             .create_tree => try self.forest.applyCreateTree(mcs.*),
             .drop_tree => try self.forest.applyDropTree(mcs.*),
-            .drop_ns => try self.forest.applyDropNamespace(mcs.*),
             else => log.err("unknown ManifestChange cmd={d}", .{@intFromEnum(mcs.cmd)}),
         }
     }
@@ -967,7 +967,7 @@ pub const Engine = struct {
     /// lists — the namespace and table id counters and both name
     /// registries — exactly as the live apply path produces them
     /// (Forest.applyNamespaceCreate / applyCreateTree / applyDropTree /
-    /// applyDropNamespace). A snapshot draft must replay these too: the
+    /// applyNamespaceDrop). A snapshot draft must replay these too: the
     /// WAL below the snapshot is gone after a restart, so a name that is
     /// not in the snapshot is lost and its database or table becomes
     /// unreachable even though its rows are all there.

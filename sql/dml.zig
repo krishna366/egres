@@ -50,7 +50,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
 
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
-    // Open AFTER the intent locks: a statement that parked behind
+    // Open AFTER the table lock: a statement that parked behind
     // DDL holding the table lock exclusively (CREATE/DROP INDEX)
     // must see the reloaded schema, not a stale cached Table.
     const tbl = self.openTable(ns, table_id) catch |err| {
@@ -165,7 +165,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
 
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
-    // Open AFTER the intent locks — see insert's comment.
+    // Open AFTER the table lock — see insert's comment.
     const tbl = self.openTable(ns, table_id) catch |err| {
         log.err("select from '{s}': load schema: {s}", .{ sel.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
@@ -252,7 +252,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
 
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
-    // Open AFTER the intent locks — see insert's comment.
+    // Open AFTER the table lock — see insert's comment.
     const tbl = self.openTable(ns, table_id) catch |err| {
         logDeleteErr(del.table, "load schema", err);
         return replyError(state, "failed to load table schema");
@@ -331,7 +331,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
 
     const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
 
-    // Open AFTER the intent locks — see insert's comment.
+    // Open AFTER the table lock — see insert's comment.
     const tbl = self.openTable(ns, table_id) catch |err| {
         log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
@@ -467,11 +467,15 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
 }
 
 /// Describe's answer for a SELECT: the RowDescription `select` would
-/// send, resolved under the same intent locks — the Table must not
-/// be dropped under the lookup — in the block's txn or an implicit
-/// one that ends here. Describe runs no statement, so the txn does
-/// no read tracking. Every reply the lookup can fail with is the one
-/// `select` would send (42P01, 42703, a lock error).
+/// send. The Table comes from the database's cache under the cache's
+/// shared lock: forgetTable destroys an entry only under the
+/// exclusive one, so the Table lives for as long as the hold, and no
+/// table lock or txn is needed — which matters, since every
+/// prepared SELECT sends a Describe. The names are copied out before
+/// the hold ends and the reply goes out after it: nothing may write
+/// to the socket under the cache lock. A miss (the first touch of
+/// the table in this process) loads the schema the way a statement
+/// does, under the table lock (describeSelectLoad).
 pub fn describeSelect(
     self: *Handler,
     state: *pgwire.ConnState,
@@ -490,6 +494,38 @@ pub fn describeSelect(
     defer arena.deinit();
     const arloc = arena.allocator();
 
+    const db = try self.sessionDb(ns);
+    const hold = db.holdTable(table_id) orelse
+        return describeSelectLoad(self, state, arloc, ns, table_id, sel);
+
+    const resolved = blk: {
+        // state.send* can block below. Release the table hold here itself.
+        defer hold.release();
+        const r = projectionOf(arloc, hold.tbl, sel);
+        if (r) |proj| {
+            for (proj.fields) |*fd| fd.name = try arloc.dupe(u8, fd.name);
+        } else |_| {}
+        break :blk r;
+    };
+
+    const proj = resolved catch |err| switch (err) {
+        error.UndefinedColumn => return replyUndefinedColumn(state),
+        error.OutOfMemory => return err,
+    };
+    try state.sendRowDescription(proj.fields);
+}
+
+/// describeSelect for a table not in the cache: load it the way a
+/// statement does, under the table lock, in the block's txn or an
+/// implicit one that ends here.
+fn describeSelectLoad(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
+    ns: u64,
+    table_id: u32,
+    sel: _parse.Select,
+) !void {
     defer self.endImplicit();
     _ = (try self.dmlTxn(state, ns, table_id)) orelse return;
     const tbl = self.openTable(ns, table_id) catch |err| {
@@ -508,31 +544,23 @@ pub fn describeSelect(
 /// projects no column — one int8 field.
 const SelectFields = struct {
     cols: []const *const _table.Column,
-    fields: []const pgwire.FieldDescription,
+    fields: []pgwire.FieldDescription,
 };
 
 /// Resolve `sel`'s projection: `*` is the user columns; by name, egid
-/// resolves like any other column (Table.column). null = 42703 was
-/// replied for a name the table lacks. Shared by `select` (whose
-/// RowEmitter takes the columns) and `describeSelect`.
-fn selectFields(
-    state: *pgwire.ConnState,
+/// resolves like any other column (Table.column). Pure:
+/// UndefinedColumn for a name the table lacks. The field names
+/// borrow the Table.
+fn projectionOf(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     sel: _parse.Select,
-) !?SelectFields {
+) error{ UndefinedColumn, OutOfMemory }!SelectFields {
     var cols: std.ArrayList(*const _table.Column) = .empty;
     switch (sel.projection) {
         .star => for (tbl.columns) |*c| try cols.append(arloc, c),
         .columns => |names| for (names) |nm| {
-            const c = tbl.column(nm) orelse {
-                try replyErrorCode(
-                    state,
-                    pgwire.sqlstate.undefined_column,
-                    "column does not exist",
-                );
-                return null;
-            };
+            const c = tbl.column(nm) orelse return error.UndefinedColumn;
             try cols.append(arloc, c);
         },
         .count_star => {},
@@ -552,6 +580,31 @@ fn selectFields(
         .format_code = 0,
     };
     return .{ .cols = cols.items, .fields = fields };
+}
+
+/// projectionOf with the reply: null = 42703 was sent. `select`'s
+/// RowEmitter takes the columns.
+fn selectFields(
+    state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
+    tbl: *const _table.Table,
+    sel: _parse.Select,
+) !?SelectFields {
+    return projectionOf(arloc, tbl, sel) catch |err| switch (err) {
+        error.UndefinedColumn => {
+            try replyUndefinedColumn(state);
+            return null;
+        },
+        error.OutOfMemory => return err,
+    };
+}
+
+fn replyUndefinedColumn(state: *pgwire.ConnState) !void {
+    try replyErrorCode(
+        state,
+        pgwire.sqlstate.undefined_column,
+        "column does not exist",
+    );
 }
 
 /// Turns each row into a projected DataRow on the wire — plain

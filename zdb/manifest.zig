@@ -1132,7 +1132,7 @@ pub fn applyDropTree(self: *Forest, mc: _manifest.ManifestChange) !void {
     }
 }
 
-/// The delete-changes walk shared by applyDropTree and applyDropNamespace.
+/// The delete-changes walk shared by applyDropTree and applyNamespaceDrop.
 /// Runs on the apply loop, like every other create and drop.
 pub fn applyTreeDeletes(self: *Forest, mc: _manifest.ManifestChange) !void {
     for (mc.tree_changes) |tc| {
@@ -1163,7 +1163,7 @@ pub fn applyTreeDeletes(self: *Forest, mc: _manifest.ManifestChange) !void {
 /// buildDropNamespace is Phase A of DROP DATABASE: emit a delete change for
 /// every tree in every table of the namespace — the default table, system
 /// tables (catalog etc.), and user tables alike. drop_ns. Namespace ids are
-/// never reused, so no counter rewind is needed; applyDropNamespace forgets
+/// never reused, so no counter rewind is needed; applyNamespaceDrop forgets
 /// the counter entirely. Returns an empty change set for an unknown
 /// namespace (idempotent). Caller owns the returned slice.
 pub fn buildDropNamespace(
@@ -1197,13 +1197,13 @@ pub fn buildDropNamespace(
     };
 }
 
-/// applyDropNamespace is Phase B of DROP DATABASE: tear down every tree of
+/// applyNamespaceDrop is Phase B of DROP DATABASE: tear down every tree of
 /// the namespace (same per-tree semantics as applyDropTree — SSTs shared via
 /// refcount survive; physical reclaim is snapshot GC's job), then forget the
 /// namespace's manifest state (table_id counter + name, freeing the name
 /// for re-CREATE). Leftover memtable entries for the namespace are dropped
 /// at flush (buildFlush skips items with no route). Idempotent. drop_ns.
-pub fn applyDropNamespace(self: *Forest, mc: _manifest.ManifestChange) !void {
+pub fn applyNamespaceDrop(self: *Forest, mc: _manifest.ManifestChange) !void {
     try self.applyTreeDeletes(mc);
     if (mc.tree_changes.len > 0) {
         self.ms.dropNamespace(mc.tree_changes[0].namespace_id);

@@ -13,7 +13,8 @@
 //!     defer session.close();
 //!     while (!session.closed()) {
 //!         const state = &session.state;
-//!         switch (try session.nextEvent()) {
+//!         const ev = try session.nextEvent();
+//!         switch (ev) {
 //!             .startup_complete => |params| try h.onStartup(state, params),
 //!             .query => |sql| {
 //!                 try h.onQuery(state, sql);
@@ -21,9 +22,9 @@
 //!             },
 //!             .execute => |ctx| try h.onExecute(state, ctx),
 //!             .describe => |ctx| try h.onDescribe(state, ctx),
-//!             .sync, .terminate => {},
+//!             .sync, .flush, .terminate => {},
 //!         }
-//!         try session.flush();
+//!         if (pgwire.Session.flushAfter(ev)) try session.flush();
 //!     }
 //!
 //! What each event owes (see `conn_state.Event`):
@@ -40,8 +41,13 @@
 //!    of the batch is dropped until Sync.
 //!  - `describe`: RowDescription or NoData (ParameterDescription was
 //!    already sent for the statement kind).
-//!  - `sync`, `terminate`: nothing; the flush after the switch sends
-//!    what the state machine queued.
+//!  - `sync`, `flush`, `terminate`: nothing; the flush after the
+//!    switch sends what the state machine queued.
+//!
+//! Replies to Execute and Describe stay in the write buffer until the
+//! batch's Sync (or a Flush, or the buffer filling), as Postgres does:
+//! one socket write per batch instead of one per message. `flushAfter`
+//! says which events end a batch.
 
 const std = @import("std");
 const fiber = @import("zfiber");
@@ -136,6 +142,16 @@ pub const Session = struct {
     /// logical boundary — ReadyForQuery, an error, a Sync.
     pub fn flush(self: *Session) !void {
         try self.writer.interface.flush();
+    }
+
+    /// Whether the replies to `ev` go on the wire now. Execute and
+    /// Describe replies wait for the batch's Sync or a Flush; every
+    /// other event ends what the client is waiting on.
+    pub fn flushAfter(ev: _conn_state.Event) bool {
+        return switch (ev) {
+            .execute, .describe => false,
+            .startup_complete, .query, .sync, .flush, .terminate => true,
+        };
     }
 };
 

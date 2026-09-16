@@ -17,6 +17,8 @@ const Key = zdb.kv.Key;
 const Forest = zdb.forest.Forest;
 const Meta = zdb.kv.Meta;
 const Oracle = @import("oracle.zig").Oracle;
+const Database = @import("database.zig").Database;
+const RWMutex = @import("database.zig").RWMutex;
 const String = @import("value.zig").String;
 
 /// One statement-generation's read tracking: the point-read identity
@@ -60,6 +62,12 @@ const ReadSet = struct {
     }
 };
 
+/// A table lock this txn holds, released at txn end.
+const HeldTable = struct {
+    mutex: *RWMutex,
+    mode: fiber.SemaphoreMap.Mode,
+};
+
 pub const Txn = struct {
     allocator: std.mem.Allocator,
     /// Owner token for the lock table; Server-issued, process-local.
@@ -74,18 +82,20 @@ pub const Txn = struct {
     /// between our reads and the propose means another leader may have
     /// committed writes our locked reads never saw — abort instead.
     term: u64,
-    /// The database's lock table (leader-local keyed semaphores).
-    locks: *fiber.SemaphoreMap,
-    /// The database's commit oracle: newest commit_ts per key identity,
-    /// consulted after every fresh row lock (the bump check) and when a
-    /// bump revalidates prior reads.
-    oracle: *Oracle,
+    /// The database this txn runs in: its row lock table (leader-local
+    /// keyed semaphores with deadlock detection), table locks, and
+    /// commit oracle (newest commit_ts per key identity, consulted
+    /// after every fresh row lock — the bump check — and when a bump
+    /// revalidates prior reads).
+    db: *Database,
+    /// The table locks this txn holds, in acquisition order.
+    held_tables: std.ArrayList(HeldTable) = .empty,
     /// Committed storage, the fallback half of `lookup`.
     forest: *zdb.forest.Forest,
     /// Lock keys (row + table identity hashes) this txn newly acquired
     /// (the map handles re-entrant acquires); released in deinit — lock
     /// lifetime IS txn lifetime.
-    held: std.ArrayList(u64) = .empty,
+    held_rows: std.ArrayList(u64) = .empty,
     /// A statement in this txn errored: locks are already released
     /// (Postgres aborts and releases at error time), pending writes are
     /// doomed, and only COMMIT/ROLLBACK — both of which roll back — are
@@ -125,28 +135,26 @@ pub const Txn = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         id: u64,
-        ns: u64,
         read_ts: u64,
         term: u64,
-        locks: *fiber.SemaphoreMap,
-        oracle: *Oracle,
+        db: *Database,
         forest: *zdb.forest.Forest,
     ) Txn {
         return .{
             .allocator = allocator,
             .id = id,
-            .ns = ns,
+            .ns = db.ns,
             .read_ts = read_ts,
             .term = term,
-            .locks = locks,
-            .oracle = oracle,
+            .db = db,
             .forest = forest,
         };
     }
 
     pub fn deinit(self: *Txn) void {
         self.releaseLocks();
-        self.held.deinit(self.allocator);
+        self.held_rows.deinit(self.allocator);
+        self.held_tables.deinit(self.allocator);
         self.prev.deinit(self.allocator);
         self.cur.deinit(self.allocator);
         if (self.writes) |w| w.release();
@@ -192,8 +200,19 @@ pub const Txn = struct {
     /// the cycle alive); the txn object itself stays for the failed-state
     /// bookkeeping until the block ends.
     pub fn releaseLocks(self: *Txn) void {
-        for (self.held.items) |key| self.locks.release(key, self.id);
-        self.held.clearRetainingCapacity();
+        for (self.held_rows.items) |key| self.db.row_locks.release(key, self.id);
+        self.held_rows.clearRetainingCapacity();
+        // Tables after the rows, in reverse acquisition order.
+        var i = self.held_tables.items.len;
+        while (i > 0) {
+            i -= 1;
+            const h = self.held_tables.items[i];
+            switch (h.mode) {
+                .shared => h.mutex.unlockShared(),
+                .exclusive => h.mutex.unlock(),
+            }
+        }
+        self.held_tables.clearRetainingCapacity();
     }
 
     pub const LockError = error{ Deadlock, Upgrade, OutOfMemory };
@@ -231,7 +250,7 @@ pub const Txn = struct {
             .primary = primary,
         }).identityHash();
         if (!try self.lockKey(h, .exclusive)) return;
-        return self.bumpTo(self.oracle.commitTs(h));
+        return self.bumpTo(self.db.oracle.commitTs(h));
     }
 
     /// Advance read_ts to `ts` so the statement can see state applied
@@ -244,52 +263,61 @@ pub const Txn = struct {
     /// names locally applied state, which cannot regress.
     pub fn bumpTo(self: *Txn, ts: u64) error{ Conflict, Restart }!void {
         if (ts <= self.read_ts) return;
-        if (self.prev.aboveReadTs(self.oracle, self.read_ts))
+        if (self.prev.aboveReadTs(&self.db.oracle, self.read_ts))
             return error.Conflict;
         self.read_ts = ts;
         return error.Restart;
     }
 
-    /// Table intent lock: shared for DML statements (they only need the
-    /// table to keep existing), exclusive for DROP TABLE. Re-entrant per
-    /// txn like row locks; released at txn end. No bump check: table
-    /// keys are never committed to, so their oracle floor is only ever
-    /// the horizon — pure noise.
+    /// Table lock (Database.tableLock): shared for DML statements (they
+    /// only need the table to keep existing), exclusive for DDL.
+    /// Re-entrant per txn like row locks; released at txn end. The
+    /// global lock order is table → row.
     pub fn lockTable(
         self: *Txn,
         table_id: u32,
         mode: fiber.SemaphoreMap.Mode,
     ) LockError!void {
-        _ = try self.lockKey((zdb.kv.TableKey{
-            .namespace = self.ns,
-            .table_id = table_id,
-        }).identityHash(), mode);
+        try self.lockTableMutex(try self.db.tableLock(table_id), mode);
     }
 
-    /// Namespace intent lock, one level above `lockTable`: shared for
-    /// every DML statement and DROP TABLE, exclusive for DROP DATABASE —
-    /// which thus queues behind every open txn and blocks new ones
-    /// (writer preference). Acquired BEFORE any table lock (the global
-    /// order is ns → table → row). Re-entrant per txn; released at txn
-    /// end. No bump check, like lockTable.
-    pub fn lockNamespace(
+    /// Take a table lock unless this txn already holds it. A held
+    /// exclusive covers a shared request; shared then exclusive is
+    /// `Upgrade`: the mutex cannot grant that to its own reader, and
+    /// SQL never asks (DDL runs outside blocks). Recorded for release.
+    fn lockTableMutex(
         self: *Txn,
+        mutex: *RWMutex,
         mode: fiber.SemaphoreMap.Mode,
     ) LockError!void {
-        _ = try self.lockKey(zdb.kv.namespaceHash(self.ns), mode);
+        for (self.held_tables.items) |h| {
+            if (h.mutex != mutex) continue;
+            if (h.mode == .exclusive or mode == .shared) return;
+            return error.Upgrade;
+        }
+        // Allocate memory before acquiring locks.
+        try self.held_tables.ensureUnusedCapacity(self.allocator, 1);
+
+        // Note that all DML txns would acquire locks in shared mode.
+        switch (mode) {
+            .shared => mutex.lockShared(@src()),
+            .exclusive => mutex.lock(@src()),
+        }
+        self.held_tables.appendAssumeCapacity(.{
+            .mutex = mutex,
+            .mode = mode,
+        });
     }
 
-    /// True = newly acquired (recorded in `held`); false = re-entrant.
+    /// True = newly acquired (recorded in `held_rows`); false = re-entrant.
     fn lockKey(
         self: *Txn,
         key: u64,
         mode: fiber.SemaphoreMap.Mode,
     ) LockError!bool {
-        if (!try self.locks.acquire(key, self.id, mode)) return false;
-        self.held.append(self.allocator, key) catch |err| {
-            self.locks.release(key, self.id);
-            return err;
-        };
+        try self.held_rows.ensureUnusedCapacity(self.allocator, 1);
+        if (!try self.db.row_locks.acquire(key, self.id, mode)) return false;
+        self.held_rows.appendAssumeCapacity(key);
         return true;
     }
 
