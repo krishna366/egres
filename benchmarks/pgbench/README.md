@@ -59,13 +59,13 @@ top-level README) and start it on a fresh data directory:
     ./zig-out/bin/egres --raft="id=1" --data="dir=/data/egres"
 
 Egres listens on port 3210, the database is `egres`, and TLS is not
-supported, so `sslmode=disable` is required. Egres implements only
-the simple query protocol, so `--modes simple` is the only valid
-choice.
+supported, so `sslmode=disable` is required. All three query modes
+run against it: `simple`, `extended` (Parse/Bind/Execute per command)
+and `prepared` (one named Parse per script command, then Bind/Execute).
 
     ./run.sh --label egres \
       --conn "host=127.0.0.1 port=3210 dbname=egres sslmode=disable" \
-      --init egres --scale 100 --modes simple
+      --init egres --scale 100 --modes "simple extended prepared"
 
 `pgbench -i` does not work against Egres: it needs COPY, NOT NULL,
 multi-table DROP and TRUNCATE, VACUUM and ALTER TABLE. `--init egres`

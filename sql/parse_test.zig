@@ -667,3 +667,159 @@ test "sql.parse: UPDATE rejections carry a reason" {
         try testing.expect(found != null);
     }
 }
+
+test "sql.parse: $n placeholders parse in every literal position" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // INSERT VALUES cells, one placeholder used twice.
+    const ins = try parse.statement(
+        alloc,
+        "INSERT INTO t (a, b) VALUES ($1, $2), ($2, 'x');",
+    );
+    const rows = ins.insert.rows;
+    try testing.expectEqual(@as(u16, 1), rows[0][0].param);
+    try testing.expectEqual(@as(u16, 2), rows[0][1].param);
+    try testing.expectEqual(@as(u16, 2), rows[1][0].param);
+    try testing.expectEqualStrings("x", rows[1][1].str);
+    try testing.expectEqual(@as(u16, 2), ins.insert.param_count);
+    try testing.expectEqual(@as(u16, 2), ins.paramCount());
+
+    // WHERE leaves, anywhere in the tree.
+    const sel = try parse.statement(
+        alloc,
+        "SELECT * FROM t WHERE a = $1 AND (b = $3 OR NOT c = $2);",
+    );
+    const top = sel.select.where.?.and_;
+    try testing.expectEqual(@as(u16, 1), top[0].eq.literal.param);
+    try testing.expectEqual(@as(u16, 3), top[1].or_[0].eq.literal.param);
+    try testing.expectEqual(@as(u16, 2), top[1].or_[1].not.eq.literal.param);
+    try testing.expectEqual(@as(u16, 3), sel.select.param_count);
+
+    const del = try parse.statement(alloc, "DELETE FROM t WHERE a = $1;");
+    try testing.expectEqual(@as(u16, 1), del.delete.where.?.eq.literal.param);
+    try testing.expectEqual(@as(u16, 1), del.delete.param_count);
+
+    // SET: at the root, under an operator, and in the WHERE.
+    const up = try parse.statement(
+        alloc,
+        "UPDATE t SET a = a + $1, b = $2 WHERE c = $3;",
+    );
+    const sets = up.update.sets;
+    try testing.expectEqual(@as(u16, 1), sets[0].value.binop.rhs.literal.param);
+    try testing.expectEqual(@as(u16, 2), sets[1].value.literal.param);
+    try testing.expectEqual(@as(u16, 3), up.update.where.?.eq.literal.param);
+    try testing.expectEqual(@as(u16, 3), up.update.param_count);
+
+    // The count is the highest index, whether or not the lower ones
+    // are used; a statement without placeholders needs none.
+    const gap = try parse.statement(alloc, "SELECT * FROM t WHERE a = $2;");
+    try testing.expectEqual(@as(u16, 2), gap.select.param_count);
+    const none = try parse.statement(alloc, "SELECT * FROM t WHERE a = 1;");
+    try testing.expectEqual(@as(u16, 0), none.paramCount());
+    const ddl = try parse.statement(alloc, "CREATE TABLE t (a int);");
+    try testing.expectEqual(@as(u16, 0), ddl.paramCount());
+
+    // `$0` and an index above the cap are rejected with a reason.
+    const cases = [_]struct { sql: String, needle: String }{
+        .{ .sql = "SELECT * FROM t WHERE a = $0;", .needle = "$0" },
+        .{ .sql = "INSERT INTO t VALUES ($70000);", .needle = "65535" },
+        .{ .sql = "UPDATE t SET a = $0;", .needle = "$0" },
+        .{ .sql = "UPDATE t SET a = a + $0;", .needle = "$0" },
+        .{ .sql = "DELETE FROM t WHERE a = $65536;", .needle = "65535" },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        const found = std.mem.indexOf(u8, stmt.invalid, case.needle);
+        try testing.expect(found != null);
+    }
+}
+
+/// A column of `ty` for the Params cases; `n` is a string length.
+fn paramCol(ty: sql.Type, n: ?u32) sql.table.Column {
+    return .{
+        .column_id = 1,
+        .pos = 0,
+        .name = "c",
+        .ty = ty,
+        .pkey_position = null,
+        .type_mod = n,
+    };
+}
+
+/// `$index` of `params` as a cell of a `ty` column.
+fn bindParam(
+    params: parse.Params,
+    index: u16,
+    ty: sql.Type,
+    n: ?u32,
+) !sql.Value {
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const col = paramCol(ty, n);
+    return parse.litToValue(fba.allocator(), .{ .param = index }, &col, params);
+}
+
+test "sql.parse: Params bind $n text and binary values to a column" {
+    const Value = sql.Value;
+    const expectEqual = testing.expectEqual;
+    const expectError = testing.expectError;
+
+    // Text values take the literal path: column-typed parsing and the
+    // string rules (char(n) stripped and length-checked); NULL is NULL.
+    const text = parse.Params{
+        .values = &.{ "42", "hi ", null, "2000-02-29", "abcd", "x" },
+        .formats = &.{ 0, 0, 0, 0, 0, 0 },
+    };
+    try expectEqual(Value{ .int4 = 42 }, try bindParam(text, 1, .int4, null));
+    const kept = try bindParam(text, 2, .text, null);
+    try testing.expectEqualStrings("hi ", kept.text);
+    const stripped = try bindParam(text, 2, .bpchar, 3);
+    try testing.expectEqualStrings("hi", stripped.text);
+    try testing.expect(try bindParam(text, 3, .int4, null) == .null_value);
+    const date = try bindParam(text, 4, .date, null);
+    try expectEqual(Value{ .date = 11016 }, date);
+    try expectError(error.StringTooLong, bindParam(text, 5, .bpchar, 3));
+    try expectError(error.InvalidCharacter, bindParam(text, 6, .int4, null));
+    // Past what Bind supplied.
+    try expectError(error.UnboundParam, bindParam(text, 7, .int4, null));
+    // A plain literal is unaffected by the params in hand.
+    const col = paramCol(.int4, null);
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    const lit = try parse.litToValue(a, .{ .int = 7 }, &col, text);
+    try expectEqual(Value{ .int4 = 7 }, lit);
+
+    // Binary values decode through pgwire.binary for the six
+    // primitives; any other column type has no decoder (0A000).
+    var f8_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &f8_bytes, @bitCast(@as(f64, 1.5)), .big);
+    const minus_two = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe };
+    const binary = parse.Params{
+        .values = &.{
+            &.{ 0, 0, 0, 42 }, &.{1}, &minus_two, &f8_bytes, "hi", &.{ 0, 42 },
+        },
+        .formats = &.{ 1, 1, 1, 1, 1, 1 },
+    };
+    try expectEqual(Value{ .int4 = 42 }, try bindParam(binary, 1, .int4, null));
+    const flag = try bindParam(binary, 2, .bool_, null);
+    try expectEqual(Value{ .bool_ = true }, flag);
+    try expectEqual(Value{ .int8 = -2 }, try bindParam(binary, 3, .int8, null));
+    const float = try bindParam(binary, 4, .float8, null);
+    try expectEqual(Value{ .float8 = 1.5 }, float);
+    try expectError(error.UnsupportedType, bindParam(binary, 5, .text, null));
+    // The wrong width for the column's type.
+    try expectError(error.BadLength, bindParam(binary, 6, .int4, null));
+
+    // A per-param format list decides per value.
+    const mixed = parse.Params{
+        .values = &.{ "7", &.{ 0, 0, 0, 8 } },
+        .formats = &.{ 0, 1 },
+    };
+    try expectEqual(Value{ .int4 = 7 }, try bindParam(mixed, 1, .int4, null));
+    try expectEqual(Value{ .int4 = 8 }, try bindParam(mixed, 2, .int4, null));
+}

@@ -411,17 +411,48 @@ fn handleConn(self: *Server, stream: fiber.net.Stream) void {
     // writes dropped) runs BEFORE the socket closes above. Covers clean
     // Terminate and every error exit from serve.
     defer handler.deinit();
-    pgwire.serve(self.engine.allocator, &s, &handler, .{}) catch |err| {
+    handler.serve(&s) catch |err| {
         log.warn("conn serve error: {s}", .{@errorName(err)});
     };
 }
 
-/// pgwire handler. Only `onQuery` is required by `pgwire.serve`
-/// (onStartup/onExecute/onDescribe are @hasDecl-gated). Parses via
+/// A parsed statement kept for the session (Handler.parsed): the
+/// arena owns the libpg_query tree, the Stmt borrowing from it, and
+/// the SQL text that keys the entry.
+const ParsedStmt = struct {
+    arena: std.heap.ArenaAllocator,
+    stmt: _parse.Stmt,
+};
+
+/// How many parsed statements a session keeps before the cache is
+/// emptied and refilled. pgbench has five; a driver's statement cache
+/// is typically this size or smaller.
+const max_parsed = 256;
+
+/// One connection: the pgwire event loop (`serve`) and the four
+/// handlers it dispatches to. Parses via
 /// libpg_query and dispatches the statements this slice supports;
-/// everything else is a clean error.
+/// everything else is a clean error. The extended protocol's
+/// Execute runs the same statements (runStatement) with three
+/// differences, all read off `mode`: no RowDescription (Describe
+/// sent it), no ReadyForQuery (Sync's), and an error drops the rest
+/// of the batch (ext_failed).
 pub const Handler = struct {
     srv: *Server,
+    /// Which protocol the statement in flight came in on. Set by the
+    /// two entry points (onQuery, onExecute) before runStatement.
+    mode: enum { simple, extended } = .simple,
+    /// The Bind values for the statement in flight (Execute), empty
+    /// for a simple query. Every `$n` a statement carries resolves
+    /// here (parse.litToValue).
+    params: _parse.Params = .{},
+    /// Parsed statements by SQL text, for the extended protocol: a
+    /// prepared statement is parsed once per session, and the
+    /// unnamed statement re-sent with the same text hits the same
+    /// entry. Entries live until the session ends or the cache
+    /// overflows (max_parsed). The simple path keeps its per-query
+    /// arena and never looks here.
+    parsed: std.StringHashMapUnmanaged(*ParsedStmt) = .empty,
     /// The session's namespace, resolved once from the startup packet's
     /// database (Postgres resolves at connect too). 0 = the name didn't
     /// exist at connect; every query then fails with 3D000. Re-validated
@@ -457,6 +488,67 @@ pub const Handler = struct {
             self.txn = null;
         }
         if (self.exec_batch) |*b| b.deinit();
+        self.clearParsed();
+        self.parsed.deinit(self.srv.engine.allocator);
+    }
+
+    fn clearParsed(self: *Handler) void {
+        var it = self.parsed.valueIterator();
+        while (it.next()) |entry| {
+            entry.*.arena.deinit();
+            self.srv.engine.allocator.destroy(entry.*);
+        }
+        self.parsed.clearRetainingCapacity();
+    }
+
+    /// The parsed form of `sql`, from the session's cache or parsed
+    /// into it. null = a syntax error (not cached: the client is told
+    /// and does not re-send it). A full cache is emptied first.
+    fn cachedStatement(self: *Handler, sql: String) !?_parse.Stmt {
+        if (self.parsed.get(sql)) |entry| return entry.stmt;
+        if (self.parsed.count() >= max_parsed) self.clearParsed();
+
+        const gpa = self.srv.engine.allocator;
+        const entry = try gpa.create(ParsedStmt);
+        errdefer gpa.destroy(entry);
+
+        entry.arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer entry.arena.deinit();
+
+        const arloc = entry.arena.allocator();
+        entry.stmt = _parse.statement(arloc, sql) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.SyntaxError, error.JsonError => return null,
+        };
+        try self.parsed.put(gpa, try arloc.dupe(u8, sql), entry);
+        return entry.stmt;
+    }
+
+    /// The connection's event loop, from the startup handshake to
+    /// Terminate or a dead socket. A simple query gets its
+    /// ReadyForQuery here; an extended batch gets it from the state
+    /// machine at Sync (see pgwire.driver).
+    fn serve(self: *Handler, stream: *fiber.net.Stream) !void {
+        const session = try pgwire.Session.open(
+            self.srv.engine.allocator,
+            stream,
+            .{},
+        );
+        defer session.close();
+        while (!session.closed()) {
+            const state = &session.state;
+            switch (try session.nextEvent()) {
+                .startup_complete => |params| try self.onStartup(state, params),
+                .query => |sql| {
+                    try self.onQuery(state, sql);
+                    try state.endCommand();
+                },
+                .execute => |ctx| try self.onExecute(state, ctx),
+                .describe => |ctx| try self.onDescribe(state, ctx),
+                .sync, .terminate => {},
+            }
+            try session.flush();
+        }
     }
 
     /// The session's row batch, made on first use.
@@ -507,46 +599,154 @@ pub const Handler = struct {
         return true;
     }
 
-    pub fn onQuery(self: *Handler, state: *pgwire.ConnState, sql_text: String) !void {
-        state.error_sent = false;
-        // Any statement error inside an open block aborts the txn: locks
-        // release NOW (a deadlock victim must not keep its cycle alive
-        // until the client's ROLLBACK), and the session enters E state
-        // until COMMIT/ROLLBACK ends the block.
-        defer if (self.txn) |t| {
-            // Blocks only: an implicit txn can linger here solely when a
-            // reply failed mid-statement (dying connection) — session
-            // teardown destroys it.
-            if (state.error_sent and !t.implicit and !t.failed) {
-                t.failed = true;
-                t.releaseLocks();
-                state.tx_status = .failed_tx;
-            }
-        };
-
-        const trimmed = std.mem.trim(u8, sql_text, " \t\r\n;");
-        if (trimmed.len == 0) {
-            try state.sendEmptyQueryResponse();
-            return;
+    /// A statement (or Describe) ended: any error inside an open block
+    /// aborts the txn — locks release NOW (a deadlock victim must not
+    /// keep its cycle alive until the client's ROLLBACK), and the
+    /// session enters E state until COMMIT/ROLLBACK ends the block.
+    /// Wired as a defer by every entry point.
+    fn failBlockOnError(self: *Handler, state: *pgwire.ConnState) void {
+        const t = self.txn orelse return;
+        // Blocks only: an implicit txn can linger here solely when a
+        // reply failed mid-statement (dying connection) — session
+        // teardown destroys it.
+        if (state.error_sent and !t.implicit and !t.failed) {
+            t.failed = true;
+            t.releaseLocks();
+            state.tx_status = .failed_tx;
         }
+    }
+
+    /// Whether `sql` is nothing but whitespace and semicolons — an
+    /// empty query, answered with EmptyQueryResponse on both paths.
+    fn isEmptyQuery(sql: String) bool {
+        return std.mem.trim(u8, sql, " \t\r\n;").len == 0;
+    }
+
+    fn replySyntaxError(state: *pgwire.ConnState) !void {
+        try state.sendError(.{
+            .code = pgwire.sqlstate.syntax_error,
+            .message = "syntax error",
+        });
+    }
+
+    /// The simple query protocol: one statement per message, parsed
+    /// into a per-query arena and run. The driver sends ReadyForQuery
+    /// after.
+    pub fn onQuery(self: *Handler, state: *pgwire.ConnState, sql_text: String) !void {
+        self.mode = .simple;
+        self.params = .{};
+        state.error_sent = false;
+        defer self.failBlockOnError(state);
+
+        if (isEmptyQuery(sql_text)) return state.sendEmptyQueryResponse();
         // Parse into an arena: the Stmt borrows its strings from the
         // libpg_query tree, and the arena reclaims all of it — tree and
         // borrowed statement alike — when this scope ends.
         var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
         defer arena.deinit();
-        const stmt = _parse.statement(arena.allocator(), sql_text) catch {
-            try state.sendError(.{
-                .code = pgwire.sqlstate.syntax_error,
-                .message = "syntax error",
-            });
-            return;
+        const stmt = _parse.statement(arena.allocator(), sql_text) catch
+            return replySyntaxError(state);
+        try self.runStatement(state, stmt);
+    }
+
+    /// The extended protocol's Execute: the portal's statement, parsed
+    /// once per session (cachedStatement), run with its Bind values as
+    /// `params`. Sync sends ReadyForQuery; an error here drops every
+    /// message before it (ext_failed). What Execute cannot do yet is
+    /// refused up front: a row limit (PortalSuspended and resuming a
+    /// portal) and binary result columns.
+    pub fn onExecute(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        ctx: pgwire.ExecuteCtx,
+    ) !void {
+        self.mode = .extended;
+        self.params = .{ .values = ctx.params, .formats = ctx.param_formats };
+        defer self.params = .{};
+
+        state.error_sent = false;
+        defer self.failBlockOnError(state);
+        defer if (state.error_sent) {
+            state.ext_failed = true;
         };
 
+        const unsupported = pgwire.sqlstate.feature_not_supported;
+        if (ctx.max_rows != 0) {
+            return replyErrorCode(
+                state,
+                unsupported,
+                "portal row limits are not supported",
+            );
+        }
+        for (ctx.result_formats) |format| if (format != 0) {
+            return replyErrorCode(
+                state,
+                unsupported,
+                "binary result format is not supported",
+            );
+        };
+        if (isEmptyQuery(ctx.sql)) return state.sendEmptyQueryResponse();
+
+        const stmt = (try self.cachedStatement(ctx.sql)) orelse
+            return replySyntaxError(state);
+        const needed = stmt.paramCount();
+        if (needed != ctx.params.len) {
+            var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
+            defer arena.deinit();
+            const msg = try std.fmt.allocPrint(
+                arena.allocator(),
+                "bind message supplies {d} parameters, " ++
+                    "but prepared statement requires {d}",
+                .{ ctx.params.len, needed },
+            );
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.protocol_violation,
+                msg,
+            );
+        }
+        try self.runStatement(state, stmt);
+    }
+
+    /// The extended protocol's Describe: a SELECT's RowDescription, NoData
+    /// for everything else. The state machine already sent
+    /// ParameterDescription for the statement kind (echoing the client's
+    /// OIDs; inferring them is future work). Like Execute, an error drops
+    /// the batch and fails an open block.
+    pub fn onDescribe(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        ctx: pgwire.DescribeCtx,
+    ) !void {
+        state.error_sent = false;
+        defer self.failBlockOnError(state);
+        defer if (state.error_sent) {
+            state.ext_failed = true;
+        };
+
+        if (isEmptyQuery(ctx.sql)) return state.sendNoData();
+        const stmt = (try self.cachedStatement(ctx.sql)) orelse
+            return replySyntaxError(state);
+        if (self.txn) |t| if (t.failed) return replyFailedBlock(state);
+        switch (stmt) {
+            .select => |sel| try _dml.describeSelect(self, state, sel),
+            else => try state.sendNoData(),
+        }
+    }
+
+    /// Run one parsed statement: the block-state checks, then the
+    /// dispatch. Shared by both protocols; `mode` and `params` are
+    /// already set for it.
+    fn runStatement(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        stmt: _parse.Stmt,
+    ) !void {
         if (self.txn) |t| {
             // A failed block accepts only COMMIT/ROLLBACK (both roll
             // back) until the client ends it.
             if (t.failed and stmt != .commit_txn and stmt != .rollback_txn)
-                return replyErrorCode(state, pgwire.sqlstate.in_failed_sql_transaction, "current transaction is aborted, commands ignored until end of transaction block");
+                return replyFailedBlock(state);
             // Leadership moved since BEGIN: nothing this txn read or
             // buffered can be trusted — abort eagerly (the defer above
             // flips the failed state).
@@ -829,6 +1029,16 @@ pub const Handler = struct {
         return true;
     }
 };
+
+/// 25P02: the block is aborted and only COMMIT/ROLLBACK is taken.
+fn replyFailedBlock(state: *pgwire.ConnState) !void {
+    return replyErrorCode(
+        state,
+        pgwire.sqlstate.in_failed_sql_transaction,
+        "current transaction is aborted, commands ignored until end of " ++
+            "transaction block",
+    );
+}
 
 /// Map a lock failure onto the wire. Deadlock: this statement's wait
 /// would have closed a cycle — it is the victim; 40P01, the client

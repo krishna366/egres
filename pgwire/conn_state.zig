@@ -378,8 +378,7 @@ pub const ConnState = struct {
             // backend sends after AuthOk. Some clients refuse to
             // proceed without specific entries — pgx's simple-query
             // mode, for example, hard-requires
-            // `standard_conforming_strings=on`. See SHAKEOUT.md for
-            // the per-client matrix.
+            // `standard_conforming_strings=on`.
             const announce = [_]struct { k: String, v: String }{
                 .{ .k = "server_version", .v = self.cfg.server_version },
                 .{ .k = "server_encoding", .v = self.cfg.server_encoding },

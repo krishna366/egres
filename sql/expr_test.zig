@@ -79,6 +79,15 @@ const Fixture = struct {
 
     /// Parse `UPDATE t SET <assignment>` and bind its one SET value.
     fn bind(self: *const Fixture, assignment: String) expr.BindError!Set {
+        return self.bindWith(assignment, .{});
+    }
+
+    /// `bind` with the values a Bind message would have supplied.
+    fn bindWith(
+        self: *const Fixture,
+        assignment: String,
+        params: sql.parse.Params,
+    ) expr.BindError!Set {
         const text = try std.fmt.allocPrint(
             self.arloc,
             "UPDATE t SET {s};",
@@ -90,7 +99,13 @@ const Fixture = struct {
         const target = self.tbl.column(clause.column) orelse
             return error.UndefinedColumn;
         const tbl = &self.tbl;
-        const root = try expr.bindNode(self.arloc, tbl, clause.value, target);
+        const root = try expr.bindNode(
+            self.arloc,
+            tbl,
+            clause.value,
+            target,
+            params,
+        );
         return .{ .target = target, .root = root };
     }
 
@@ -237,4 +252,49 @@ test "sql.expr: eval — floats, text, and copies" {
     const copy = try fx.eval("b = b", row);
     try testing.expectEqualStrings("ab", copy.text);
     try expectEval(&fx, row, .{ .int4 = 5 }, "a = a");
+}
+
+test "sql.expr: bind — a $n is typed by its column, or by its text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try Fixture.init(arena.allocator());
+
+    const text = sql.parse.Params{
+        .values = &.{ "5", "x", null, "1.5" },
+        .formats = &.{ 0, 0, 0, 0 },
+    };
+    // At the root: a cell of the target column, as a quoted literal is.
+    const root = try fx.bindWith("a = $1", text);
+    try testing.expectEqual(Value{ .int4 = 5 }, root.root.value);
+    try testing.expectError(error.InvalidValue, fx.bindWith("a = $2", text));
+    // Under an operator: an integer, a float, or text by what the
+    // bytes say; the operator then type-checks as usual.
+    const add = try fx.bindWith("a = a + $1", text);
+    try testing.expectEqual(Value{ .int8 = 5 }, add.root.binop.rhs.value);
+    const cat = try fx.bindWith("b = b || $2", text);
+    try testing.expectEqualStrings("x", cat.root.binop.rhs.value.text);
+    const nul = try fx.bindWith("a = a + $3", text);
+    try testing.expect(nul.root.binop.rhs.value == .null_value);
+    const mixed = try fx.bindWith("c = a * $4", text);
+    try testing.expectEqual(Value{ .float8 = 1.5 }, mixed.root.binop.rhs.value);
+    try testing.expectError(
+        error.NoSuchOperator,
+        fx.bindWith("a = a + $2", text),
+    );
+    try testing.expectError(
+        error.TypeMismatch,
+        fx.bindWith("a = a * $4", text),
+    );
+
+    // A binary value under an operator has no type to decode with.
+    const binary = sql.parse.Params{
+        .values = &.{&.{ 0, 0, 0, 5 }},
+        .formats = &.{1},
+    };
+    const typed = try fx.bindWith("a = $1", binary);
+    try testing.expectEqual(Value{ .int4 = 5 }, typed.root.value);
+    try testing.expectError(
+        error.UnsupportedValue,
+        fx.bindWith("a = a + $1", binary),
+    );
 }

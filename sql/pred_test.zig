@@ -68,7 +68,7 @@ test "sql.pred: bindNode binds columns, coerces literals, and checks the egid" {
         a,
         "SELECT * FROM t WHERE a = 1 AND (b = 'x' OR NOT egid = 3) AND b IS NOT NULL;",
     );
-    const p = try pred.bindNode(a, &fx.tbl, stmt.select.where.?);
+    const p = try pred.bindNode(a, &fx.tbl, stmt.select.where.?, .{});
     const top = p.and_;
     try testing.expectEqual(@as(usize, 3), top.len);
     try testing.expectEqual(fx.col("a"), top[0].eq.col);
@@ -98,7 +98,10 @@ test "sql.pred: bindNode binds columns, coerces literals, and checks the egid" {
     };
     for (cases) |case| {
         const s = try sql.parse.statement(a, case.sql);
-        try testing.expectError(case.err, pred.bindNode(a, &fx.tbl, s.select.where.?));
+        try testing.expectError(
+            case.err,
+            pred.bindNode(a, &fx.tbl, s.select.where.?, .{}),
+        );
     }
 }
 
@@ -194,12 +197,12 @@ test "sql.pred: a literal longer than its char(n) column binds to never" {
 
     // Within the length (spaces stripped): an ordinary comparison.
     const fits = try sql.parse.statement(a, "SELECT * FROM t WHERE c = 'ab  ';");
-    const p_fits = try pred.bindNode(a, &tbl, fits.select.where.?);
+    const p_fits = try pred.bindNode(a, &tbl, fits.select.where.?, .{});
     try testing.expectEqualStrings("ab", p_fits.eq.val.text);
 
     // Over the length: never, wherever it sits, and NOT flips it.
     const over = try sql.parse.statement(a, "SELECT * FROM t WHERE c = 'abcd' OR NOT c = 12345;");
-    const p_over = try pred.bindNode(a, &tbl, over.select.where.?);
+    const p_over = try pred.bindNode(a, &tbl, over.select.where.?, .{});
     try testing.expect(p_over.or_[0] == .never);
     try testing.expect(p_over.or_[1].not.* == .never);
 

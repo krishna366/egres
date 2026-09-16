@@ -71,13 +71,54 @@ pub const Literal = union(enum) {
     /// time, resolved by the executor (dml.coerceLiteral) — the one
     /// literal that is not a constant.
     current_timestamp,
+    /// `$n`, 1-based as the client wrote it: a value the Bind message
+    /// supplies at execute (Params.toValue), typed by the column it
+    /// meets like a quoted literal.
+    param: u16,
     unsupported,
 };
+
+/// The highest placeholder index a statement may use (`$65535`);
+/// Postgres's own limit.
+pub const max_params: u16 = std.math.maxInt(u16);
+
+/// The `$n` placeholders met while parsing one statement: the highest
+/// index, which is how many values the client must bind.
+const ParamTally = struct {
+    count: u16 = 0,
+
+    /// Record `$number`; null when it is not a usable index (`$0`, or
+    /// above max_params).
+    fn note(self: *ParamTally, number: i64) ?Literal {
+        if (number < 1 or number > max_params) return null;
+        const n: u16 = @intCast(number);
+        self.count = @max(self.count, n);
+        return .{ .param = n };
+    }
+};
+
+/// The reason a `$number` cannot be bound, in Postgres's wording.
+fn badParamMsg(alloc: std.mem.Allocator, number: i64) parser.ParseError!String {
+    if (number < 1) {
+        return std.fmt.allocPrint(
+            alloc,
+            "there is no parameter ${d}",
+            .{number},
+        );
+    }
+    return std.fmt.allocPrint(
+        alloc,
+        "parameter number ${d} exceeds the maximum of {d}",
+        .{ number, max_params },
+    );
+}
 
 pub const Insert = struct {
     table: String, // borrowed
     columns: ?[]String, // borrowed target columns; null = positional (all columns)
     rows: [][]Literal, // borrowed rows of literals
+    /// How many `$n` values Bind must supply: the highest index used.
+    param_count: u16 = 0,
 };
 
 /// What a SELECT projects: `*` (all live columns), a named list (which
@@ -121,11 +162,15 @@ pub const Select = struct {
     for_update: bool = false,
     /// LIMIT n: stop after n rows. null = every row (LIMIT ALL too).
     limit: ?usize = null,
+    /// How many `$n` values Bind must supply: the highest index used.
+    param_count: u16 = 0,
 };
 
 pub const Delete = struct {
     table: String, // borrowed
     where: ?Where, // null = delete every row
+    /// How many `$n` values Bind must supply: the highest index used.
+    param_count: u16 = 0,
 };
 
 /// A SET value as the grammar built it: precedence and parentheses
@@ -153,6 +198,8 @@ pub const Update = struct {
     table: String, // borrowed
     sets: []SetClause, // borrowed
     where: ?Where, // null = update every row
+    /// How many `$n` values Bind must supply: the highest index used.
+    param_count: u16 = 0,
 };
 
 pub const Stmt = union(enum) {
@@ -171,6 +218,18 @@ pub const Stmt = union(enum) {
     rollback_txn,
     invalid: String, // recognized but rejected; reason
     unsupported,
+
+    /// How many `$n` values Bind must supply. Only DML carries
+    /// placeholders; every other statement needs none.
+    pub fn paramCount(self: Stmt) u16 {
+        return switch (self) {
+            .insert => |ins| ins.param_count,
+            .select => |sel| sel.param_count,
+            .delete => |del| del.param_count,
+            .update => |up| up.param_count,
+            else => 0,
+        };
+    }
 };
 
 pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
@@ -303,12 +362,13 @@ const InsertStmtJson = struct {
     const ListNode = struct {
         List: struct { items: []const ValueNode = &.{} } = .{},
     };
-    // One VALUES item: a constant, or a SQL value function
-    // (CURRENT_TIMESTAMP and kin). Anything else leaves both null →
-    // `.unsupported`.
+    // One VALUES item: a constant, a SQL value function
+    // (CURRENT_TIMESTAMP and kin), or a `$n` placeholder. Anything
+    // else leaves all three null → `.unsupported`.
     const ValueNode = struct {
         A_Const: ?AConst = null,
         SQLValueFunction: ?struct { op: String = "" } = null,
+        ParamRef: ?ParamRef = null,
     };
     // A_Const encodes its value under a type-named key; the key's presence is
     // the discriminant (libpg_query omits zero inner values, so `ival: {}`
@@ -320,6 +380,8 @@ const InsertStmtJson = struct {
         boolval: ?struct { boolval: bool = false } = null,
         isnull: bool = false,
     };
+    /// `$n`. libpg_query omits a zero, so `$0` arrives with no number.
+    pub const ParamRef = struct { number: i64 = 0 };
 };
 
 /// SELECT [cols|*] FROM t [WHERE ...]
@@ -388,11 +450,16 @@ const SelectStmtJson = struct {
         A_Expr: ?AExpr = null,
         BoolExpr: ?BoolExprNode = null,
         NullTest: ?NullTestNode = null,
+        // The right side is a constant or a `$n`; anything else
+        // leaves both null → rejected.
         const AExpr = struct {
             kind: String = "",
             name: []const NameNode = &.{},
             lexpr: ColumnRefWrap = .{},
-            rexpr: struct { A_Const: InsertStmtJson.AConst = .{} } = .{},
+            rexpr: struct {
+                A_Const: ?InsertStmtJson.AConst = null,
+                ParamRef: ?InsertStmtJson.ParamRef = null,
+            } = .{},
         };
         // AND_EXPR / OR_EXPR / NOT_EXPR. libpg_query flattens `a AND b
         // AND c` into ONE node with three args (parse_test asserts it);
@@ -419,14 +486,15 @@ const DeleteStmtJson = struct {
     withClause: ?std.json.Value = null, // WITH ... DELETE
 };
 
-/// One value-expression node: exactly one of the three is present.
-/// Any other node kind (FuncCall, TypeCast, ParamRef, SubLink,
-/// SetToDefault, MultiAssignRef) leaves all three null → rejected.
-/// Recursive through pointers: std.json allocates a `*T` field.
+/// One value-expression node: exactly one of the four is present.
+/// Any other node kind (FuncCall, TypeCast, SubLink, SetToDefault,
+/// MultiAssignRef) leaves all four null → rejected. Recursive through
+/// pointers: std.json allocates a `*T` field.
 const ExprNode = struct {
     A_Const: ?InsertStmtJson.AConst = null,
     ColumnRef: ?SelectStmtJson.ColumnRef = null,
     A_Expr: ?AExpr = null,
+    ParamRef: ?InsertStmtJson.ParamRef = null,
 
     const AExpr = struct {
         kind: String = "",
@@ -646,10 +714,18 @@ fn parseInsert(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         columns = cols;
     }
 
+    var params = ParamTally{};
     var rows: std.ArrayList([]Literal) = .empty;
     for (sel.SelectStmt.valuesLists) |ln| {
         const lits = try alloc.alloc(Literal, ln.List.items.len);
-        for (ln.List.items, lits) |item, *lit| lit.* = literalFromValue(item);
+        for (ln.List.items, lits) |item, *lit| {
+            if (item.ParamRef) |pr| {
+                lit.* = params.note(pr.number) orelse
+                    return .{ .invalid = try badParamMsg(alloc, pr.number) };
+                continue;
+            }
+            lit.* = literalFromValue(item);
+        }
         try rows.append(alloc, lits);
     }
 
@@ -657,10 +733,12 @@ fn parseInsert(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         .table = is.relation.relname,
         .columns = columns,
         .rows = try rows.toOwnedSlice(alloc),
+        .param_count = params.count,
     } };
 }
 
-/// A VALUES item as a Literal: the constant, or the value function.
+/// A VALUES item as a Literal: the constant, or the value function
+/// (a `$n` is the caller's: it needs the statement's tally).
 fn literalFromValue(node: InsertStmtJson.ValueNode) Literal {
     if (node.A_Const) |ac| return literalFrom(ac);
     const svf = node.SQLValueFunction orelse return .unsupported;
@@ -683,12 +761,73 @@ fn literalFrom(ac: InsertStmtJson.AConst) Literal {
     return .unsupported;
 }
 
+/// The values a Bind message supplied for the statement being run:
+/// `values[n - 1]` is `$n`'s bytes (null = SQL NULL) and `formats[n -
+/// 1]` says how to read them, 0 text or 1 binary. Both borrow the
+/// portal, which outlives the Execute. Empty on the simple-query path,
+/// where no statement carries a placeholder.
+pub const Params = struct {
+    values: []const ?String = &.{},
+    formats: []const i16 = &.{},
+
+    /// `$index` as a cell of `col`. A text value takes the path a
+    /// quoted literal takes — column-typed parsing, the string types'
+    /// length rules; a binary one decodes through pgwire.binary for
+    /// the six primitives it covers and is `error.UnsupportedType`
+    /// for every other column type. An index past what Bind supplied
+    /// is `error.UnboundParam` (the runner checks the count first, so
+    /// only a bug reaches it).
+    pub fn toValue(self: Params, index: u16, col: *const Column) !_value.Value {
+        if (index == 0 or index > self.values.len) return error.UnboundParam;
+
+        const bytes = self.values[index - 1] orelse return .null_value;
+        if (self.isBinary(index)) return binaryValue(col.ty, bytes);
+        if (col.ty.isString())
+            return .{ .text = try _value.coerceString(bytes, col) };
+        return _value.parseValue(col.ty, bytes);
+    }
+
+    /// `$index`'s bytes as bound, null for SQL NULL, with no column to
+    /// type them (a placeholder under a SET operator). Text only: a
+    /// binary value has no type to decode with, `error.UnsupportedType`.
+    pub fn rawText(self: Params, index: u16) !?String {
+        if (index == 0 or index > self.values.len) return error.UnboundParam;
+        if (self.isBinary(index)) return error.UnsupportedType;
+        return self.values[index - 1];
+    }
+
+    fn isBinary(self: Params, index: u16) bool {
+        return index <= self.formats.len and self.formats[index - 1] == 1;
+    }
+};
+
+/// A binary-format parameter as a cell of `ty`: the six primitives
+/// pgwire.binary decodes; anything else has no decoder here.
+fn binaryValue(ty: _value.Type, bytes: String) !_value.Value {
+    const binary = pgwire.binary;
+    return switch (ty) {
+        .bool_ => .{ .bool_ = try binary.decodeBool(bytes) },
+        .int2 => .{ .int2 = try binary.decodeInt2(bytes) },
+        .int4 => .{ .int4 = try binary.decodeInt4(bytes) },
+        .int8 => .{ .int8 = try binary.decodeInt8(bytes) },
+        .float4 => .{ .float4 = try binary.decodeFloat4(bytes) },
+        .float8 => .{ .float8 = try binary.decodeFloat8(bytes) },
+        else => error.UnsupportedType,
+    };
+}
+
 /// Coerce a parsed literal to a cell of `col`, reusing value.parseValue
 /// by rendering non-string literals to text first (int/bool stringified
 /// into `a`, so a text-typed column can borrow it). A string column goes
 /// through value.coerceString with its length. NULL passes through; a
-/// non-literal item is `error.UnsupportedLiteral`.
-pub fn litToValue(a: std.mem.Allocator, lit: Literal, col: *const Column) !_value.Value {
+/// non-literal item is `error.UnsupportedLiteral`; a `$n` is the bound
+/// value (Params.toValue).
+pub fn litToValue(
+    a: std.mem.Allocator,
+    lit: Literal,
+    col: *const Column,
+    params: Params,
+) !_value.Value {
     const text: String = switch (lit) {
         .null_value => return .null_value,
         .unsupported => return error.UnsupportedLiteral,
@@ -696,11 +835,13 @@ pub fn litToValue(a: std.mem.Allocator, lit: Literal, col: *const Column) !_valu
         // a position without a transaction time (SET, WHERE) never
         // produces it.
         .current_timestamp => return error.UnsupportedLiteral,
+        .param => |n| return params.toValue(n, col),
         .str, .float => |s| s,
         .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .bool_ => |b| if (b) "t" else "f",
     };
-    if (col.ty.isString()) return .{ .text = try _value.coerceString(text, col.ty, col.type_mod) };
+    if (col.ty.isString())
+        return .{ .text = try _value.coerceString(text, col) };
     return _value.parseValue(col.ty, text);
 }
 
@@ -731,6 +872,7 @@ fn columnOf(ref: SelectStmtJson.ColumnRefWrap) ?String {
 /// arena cell.
 fn parseWhere(
     alloc: std.mem.Allocator,
+    params: *ParamTally,
     where: SelectStmtJson.WhereNode,
 ) parser.ParseError!ParsedWhere {
     if (where.BoolExpr) |be| {
@@ -738,7 +880,7 @@ fn parseWhere(
             if (be.args.len != 1)
                 return ParsedWhere.reject("NOT takes exactly one operand");
             const child = try alloc.create(Where);
-            child.* = switch (try parseWhere(alloc, be.args[0])) {
+            child.* = switch (try parseWhere(alloc, params, be.args[0])) {
                 .where => |x| x,
                 .invalid => |msg| return .{ .invalid = msg },
             };
@@ -749,7 +891,7 @@ fn parseWhere(
             return ParsedWhere.reject("unsupported WHERE clause");
         const kids = try alloc.alloc(Where, be.args.len);
         for (be.args, kids) |arg, *kid| {
-            kid.* = switch (try parseWhere(alloc, arg)) {
+            kid.* = switch (try parseWhere(alloc, params, arg)) {
                 .where => |x| x,
                 .invalid => |msg| return .{ .invalid = msg },
             };
@@ -779,7 +921,14 @@ fn parseWhere(
 
     const column = columnOf(ae.lexpr) orelse
         return ParsedWhere.reject("WHERE left side must be a column");
-    const lit = literalFrom(ae.rexpr.A_Const);
+    if (ae.rexpr.ParamRef) |pr| {
+        const lit = params.note(pr.number) orelse
+            return .{ .invalid = try badParamMsg(alloc, pr.number) };
+        return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
+    }
+    const ac = ae.rexpr.A_Const orelse
+        return ParsedWhere.reject("WHERE right side must be a literal");
+    const lit = literalFrom(ac);
     if (lit == .unsupported)
         return ParsedWhere.reject("WHERE right side must be a literal");
     return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
@@ -809,19 +958,24 @@ fn opFrom(name: String) ?Expr.Op {
     };
 }
 
-/// Parse a SET value: a literal, a column, or `+ - * / % ||` over
-/// them, recursively. Anything else (a function, a cast, a
-/// parameter, a subquery, DEFAULT, another operator) yields a clean
-/// `.invalid` reason; only OOM propagates. Each child lands in one
-/// arena cell.
+/// Parse a SET value: a literal, a `$n`, a column, or `+ - * / % ||`
+/// over them, recursively. Anything else (a function, a cast, a
+/// subquery, DEFAULT, another operator) yields a clean `.invalid`
+/// reason; only OOM propagates. Each child lands in one arena cell.
 fn parseExpr(
     arloc: std.mem.Allocator,
+    params: *ParamTally,
     node: ExprNode,
 ) parser.ParseError!ParsedExpr {
     if (node.A_Const) |ac| {
         const lit = literalFrom(ac);
         if (lit == .unsupported)
             return ParsedExpr.reject("unsupported literal in SET");
+        return .{ .expr = .{ .literal = lit } };
+    }
+    if (node.ParamRef) |pr| {
+        const lit = params.note(pr.number) orelse
+            return .{ .invalid = try badParamMsg(arloc, pr.number) };
         return .{ .expr = .{ .literal = lit } };
     }
     if (node.ColumnRef != null) {
@@ -841,13 +995,13 @@ fn parseExpr(
 
     const rhs_node = ae.rexpr orelse return ParsedExpr.reject(bad_op);
     const rhs = try arloc.create(Expr);
-    rhs.* = switch (try parseExpr(arloc, rhs_node.*)) {
+    rhs.* = switch (try parseExpr(arloc, params, rhs_node.*)) {
         .expr => |e| e,
         .invalid => |msg| return .{ .invalid = msg },
     };
     const lhs = try arloc.create(Expr);
     if (ae.lexpr) |lhs_node| {
-        lhs.* = switch (try parseExpr(arloc, lhs_node.*)) {
+        lhs.* = switch (try parseExpr(arloc, params, lhs_node.*)) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };
@@ -928,8 +1082,9 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         }
     }
 
+    var params = ParamTally{};
     var where: ?Where = null;
-    if (ss.whereClause) |node| switch (try parseWhere(alloc, node)) {
+    if (ss.whereClause) |node| switch (try parseWhere(alloc, &params, node)) {
         .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
@@ -961,6 +1116,7 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
         .where = where,
         .for_update = for_update,
         .limit = limit,
+        .param_count = params.count,
     } };
 }
 
@@ -1029,13 +1185,18 @@ fn parseDelete(
     if (ds.withClause != null)
         return invalid("WITH is not supported");
 
+    var params = ParamTally{};
     var where: ?Where = null;
-    if (ds.whereClause) |node| switch (try parseWhere(alloc, node)) {
+    if (ds.whereClause) |node| switch (try parseWhere(alloc, &params, node)) {
         .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
 
-    return .{ .delete = .{ .table = ds.relation.relname, .where = where } };
+    return .{ .delete = .{
+        .table = ds.relation.relname,
+        .where = where,
+        .param_count = params.count,
+    } };
 }
 
 /// UPDATE one_table SET col = expr [, ...] [WHERE ...]. FROM,
@@ -1056,8 +1217,9 @@ fn parseUpdate(
         return invalid("WITH is not supported");
     if (us.targetList.len == 0) return .unsupported;
 
+    var params = ParamTally{};
     var where: ?Where = null;
-    if (us.whereClause) |node| switch (try parseWhere(alloc, node)) {
+    if (us.whereClause) |node| switch (try parseWhere(alloc, &params, node)) {
         .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
@@ -1070,7 +1232,7 @@ fn parseUpdate(
             if (std.mem.eql(u8, s.column, rt.name))
                 return invalid("duplicate column in SET");
         }
-        const value = switch (try parseExpr(alloc, rt.val)) {
+        const value = switch (try parseExpr(alloc, &params, rt.val)) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };
@@ -1081,6 +1243,7 @@ fn parseUpdate(
         .table = us.relation.relname,
         .sets = try sets.toOwnedSlice(alloc),
         .where = where,
+        .param_count = params.count,
     } };
 }
 

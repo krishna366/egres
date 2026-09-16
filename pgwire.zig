@@ -14,8 +14,8 @@ pub const driver = @import("pgwire/driver.zig");
 pub const types = @import("pgwire/types.zig");
 pub const binary = @import("pgwire/binary.zig");
 
-// Driver — the one I/O entry point most callers want.
-pub const serve = driver.serve;
+// Driver — one connection's I/O plumbing; the front-end runs the loop.
+pub const Session = driver.Session;
 pub const Options = driver.Options;
 pub const Stream = driver.Stream;
 

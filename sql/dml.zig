@@ -105,6 +105,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
                 lit,
                 col,
                 tx.start_us,
+                self.params,
             )) orelse return;
         }
 
@@ -170,41 +171,12 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         return replyError(state, "failed to load table schema");
     };
 
-    // Resolve outputs: `*` is the user columns; by name, egid resolves
-    // like any other column (Table.column). count(*) projects no
-    // column: one int8 cell, the number of rows the plan yields.
     const is_count = sel.projection == .count_star;
-    var cols: std.ArrayList(*const _table.Column) = .empty;
-    switch (sel.projection) {
-        .star => for (tbl.columns) |*c| try cols.append(arloc, c),
-        .columns => |names| for (names) |nm| {
-            const c = tbl.column(nm) orelse
-                return replyErrorCode(
-                    state,
-                    pgwire.sqlstate.undefined_column,
-                    "column does not exist",
-                );
-            try cols.append(arloc, c);
-        },
-        .count_star => {},
-    }
-
-    const fields = try arloc.alloc(
-        pgwire.FieldDescription,
-        if (is_count) 1 else cols.items.len,
-    );
-    if (is_count) {
-        fields[0] = .{ .name = "count", .type_oid = pgwire.oid.int8 };
-    } else for (cols.items, fields) |c, *fd| fd.* = .{
-        .name = c.name,
-        .type_oid = _value.pgTypeOid(c.ty),
-        .type_modifier = _value.pgTypeModifier(c.type_mod),
-        .format_code = 0,
-    };
+    const proj = (try selectFields(state, arloc, tbl, sel)) orelse return;
     var emitter = RowEmitter{
         .state = state,
         .tbl = tbl,
-        .outs = cols.items,
+        .outs = proj.cols,
     };
 
     // One loop for both kinds of plan. Plain SELECT streams each fill
@@ -215,7 +187,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // frozen by our locks.
     // count(*) counts every match and keeps no row bytes; its LIMIT
     // bounds the one output row, not the rows counted.
-    var plan = (try planFor(state, arloc, tbl, sel.where, .{
+    var plan = (try planFor(state, arloc, tbl, sel.where, self.params, .{
         .read_ts = tx.read_ts,
         .keep_value = !is_count,
         .limit = if (is_count) null else sel.limit,
@@ -235,6 +207,8 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // that is the whole gather and every lock, so nothing reaches the
     // wire before the last lockRow and a Restart re-runs a statement
     // that has sent nothing. An empty result still gets its description.
+    // On the extended path it is Describe's to send (describeSelect),
+    // never Execute's.
     var first = true;
     var count: u64 = 0;
     while (true) {
@@ -243,7 +217,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
         const valid = plan.root.next(&ctx, batch) catch |err|
             return replyRunErr(state, "select from", sel.table, err);
         if (first) {
-            try state.sendRowDescription(fields);
+            if (self.mode == .simple) try state.sendRowDescription(proj.fields);
             first = false;
         }
         // An invalid batch is an empty one (RowNode.next): nothing to
@@ -289,7 +263,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     // anything else scans; no WHERE → tombstone every live row.
     // Materialize gathers the matches and locks every one; then they
     // are tombstoned from the gathered rows.
-    var plan = (try planFor(state, arloc, tbl, del.where, .{
+    var plan = (try planFor(state, arloc, tbl, del.where, self.params, .{
         .read_ts = tx.read_ts,
         // Indexed tables keep the old bytes so every index entry —
         // a unique key's tombstone, a posting's remove — can be
@@ -390,7 +364,14 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
                 pgwire.sqlstate.feature_not_supported,
                 "egid cannot be updated",
             );
-        const node = try _expr.bind(state, arloc, tbl, col, clause.value);
+        const node = try _expr.bind(
+            state,
+            arloc,
+            tbl,
+            col,
+            clause.value,
+            self.params,
+        );
         var index: ?*const _table.Index = null;
         for (tbl.indexes) |*idx| {
             if (idx.isBuilding()) continue; // see insert
@@ -404,7 +385,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     // Materialize gathers each match's PRE-image and locks every
     // one; the rewrite (and any index moves, whose old keys come
     // from that pre-image) happens post-lock.
-    var plan = (try planFor(state, arloc, tbl, up.where, .{
+    var plan = (try planFor(state, arloc, tbl, up.where, self.params, .{
         .read_ts = tx.read_ts,
     })) orelse return;
     defer plan.deinit();
@@ -485,6 +466,94 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     try state.sendCommandComplete(try std.fmt.allocPrint(arloc, "UPDATE {d}", .{n}));
 }
 
+/// Describe's answer for a SELECT: the RowDescription `select` would
+/// send, resolved under the same intent locks — the Table must not
+/// be dropped under the lookup — in the block's txn or an implicit
+/// one that ends here. Describe runs no statement, so the txn does
+/// no read tracking. Every reply the lookup can fail with is the one
+/// `select` would send (42P01, 42703, a lock error).
+pub fn describeSelect(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    sel: _parse.Select,
+) !void {
+    const eng = self.srv.engine;
+    const ns = try self.sessionNamespace(state) orelse return;
+    const table_id = eng.forest.lookupTable(ns, sel.table) orelse
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_table,
+            "table does not exist",
+        );
+
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+
+    defer self.endImplicit();
+    _ = (try self.dmlTxn(state, ns, table_id)) orelse return;
+    const tbl = self.openTable(ns, table_id) catch |err| {
+        log.err(
+            "describe select from '{s}': load schema: {s}",
+            .{ sel.table, @errorName(err) },
+        );
+        return replyError(state, "failed to load table schema");
+    };
+    const proj = (try selectFields(state, arloc, tbl, sel)) orelse return;
+    try state.sendRowDescription(proj.fields);
+}
+
+/// A SELECT's output, resolved against its table: the projected
+/// columns and their wire descriptions, one per column. count(*)
+/// projects no column — one int8 field.
+const SelectFields = struct {
+    cols: []const *const _table.Column,
+    fields: []const pgwire.FieldDescription,
+};
+
+/// Resolve `sel`'s projection: `*` is the user columns; by name, egid
+/// resolves like any other column (Table.column). null = 42703 was
+/// replied for a name the table lacks. Shared by `select` (whose
+/// RowEmitter takes the columns) and `describeSelect`.
+fn selectFields(
+    state: *pgwire.ConnState,
+    arloc: std.mem.Allocator,
+    tbl: *const _table.Table,
+    sel: _parse.Select,
+) !?SelectFields {
+    var cols: std.ArrayList(*const _table.Column) = .empty;
+    switch (sel.projection) {
+        .star => for (tbl.columns) |*c| try cols.append(arloc, c),
+        .columns => |names| for (names) |nm| {
+            const c = tbl.column(nm) orelse {
+                try replyErrorCode(
+                    state,
+                    pgwire.sqlstate.undefined_column,
+                    "column does not exist",
+                );
+                return null;
+            };
+            try cols.append(arloc, c);
+        },
+        .count_star => {},
+    }
+
+    const is_count = sel.projection == .count_star;
+    const fields = try arloc.alloc(
+        pgwire.FieldDescription,
+        if (is_count) 1 else cols.items.len,
+    );
+    if (is_count) {
+        fields[0] = .{ .name = "count", .type_oid = pgwire.oid.int8 };
+    } else for (cols.items, fields) |c, *fd| fd.* = .{
+        .name = c.name,
+        .type_oid = _value.pgTypeOid(c.ty),
+        .type_modifier = _value.pgTypeModifier(c.type_mod),
+        .format_code = 0,
+    };
+    return .{ .cols = cols.items, .fields = fields };
+}
+
 /// Turns each row into a projected DataRow on the wire — plain
 /// SELECT's sink per batch, and driven over a FOR UPDATE capture
 /// post-lock. Columns format straight into the frame (pgwire
@@ -558,11 +627,13 @@ fn planFor(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     where: ?_parse.Where,
+    params: _parse.Params,
     opts: _plan.Options,
 ) !?_plan.Plan {
     var pred: ?*const Pred = null;
     if (where) |tree| {
-        pred = (try _pred.bind(state, arloc, tbl, tree)) orelse return null;
+        pred = (try _pred.bind(state, arloc, tbl, tree, params)) orelse
+            return null;
     }
     return try _plan.plan(arloc, tbl, pred, opts);
 }
@@ -570,14 +641,15 @@ fn planFor(
 /// litToValue plus INSERT's client-facing error mapping, and the one
 /// non-constant literal: CURRENT_TIMESTAMP is the transaction's start
 /// (`now_us`, Unix µs), typed by the column it lands in — a timestamp
-/// column, else 42804. null = the error reply was already sent (the
-/// pred.bind convention).
+/// column, else 42804. A `$n` is the bound value (`params`). null =
+/// the error reply was already sent (the pred.bind convention).
 fn coerceLiteral(
     state: *pgwire.ConnState,
     a: std.mem.Allocator,
     lit: _parse.Literal,
     col: _table.Column,
     now_us: i64,
+    params: _parse.Params,
 ) !?_value.Value {
     if (lit == .current_timestamp) {
         return switch (col.ty) {
@@ -593,7 +665,7 @@ fn coerceLiteral(
             },
         };
     }
-    return litToValue(a, lit, &col) catch |err| switch (err) {
+    return litToValue(a, lit, &col, params) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.UnsupportedLiteral, error.UnsupportedType => {
             try replyErrorCode(

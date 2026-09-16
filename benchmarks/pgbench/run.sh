@@ -37,7 +37,6 @@ usage: run.sh --label <name> --conn "<conninfo>" [options]
   --warmup S         warmup seconds, 0 skips it     (default 10)
   --clients "LIST"   client counts          (default "1 8 32 64")
   --modes "LIST"     simple | extended | prepared   (default simple)
-                     Egres speaks only the simple query protocol.
   --workloads "LIST" select-only tpcb-like hot-update
   --out DIR          results directory
   --pgbin DIR        directory holding pgbench and psql

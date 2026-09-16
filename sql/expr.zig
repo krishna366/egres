@@ -125,30 +125,32 @@ pub const BindError = error{
 };
 
 /// Bind one node and, recursively, its children, pure: names →
-/// columns, literals → typed cells, operators type-checked against
-/// their operands. `target` is the column being assigned — set at the
-/// root, null under an operator. A literal takes its type (as PG
-/// resolves an "unknown" literal from where it stands: `'7'` into an
-/// int, `'t'` into a bool), and the root's result must fit it. `arloc`
-/// (the statement arena) backs the tree. `bind` adds the wire; pub
-/// for the unit tests, which have no connection to reply on.
+/// columns, literals and `$n` values → typed cells, operators
+/// type-checked against their operands. `target` is the column being
+/// assigned — set at the root, null under an operator. A literal
+/// takes its type (as PG resolves an "unknown" literal from where it
+/// stands: `'7'` into an int, `'t'` into a bool), and the root's
+/// result must fit it. `arloc` (the statement arena) backs the tree.
+/// `bind` adds the wire; pub for the unit tests, which have no
+/// connection to reply on.
 pub fn bindNode(
     arloc: std.mem.Allocator,
     tbl: *const Table,
     expr: _parse.Expr,
     target: ?*const Column,
+    params: _parse.Params,
 ) BindError!*const SetNode {
     const node = try arloc.create(SetNode);
     switch (expr) {
         .literal => |lit| node.* = .{
-            .value = try literalValue(arloc, lit, target),
+            .value = try literalValue(arloc, lit, target, params),
         },
         .column => |name| node.* = .{
             .column = tbl.column(name) orelse return error.UndefinedColumn,
         },
         .binop => |b| {
-            const lhs = try bindNode(arloc, tbl, b.lhs.*, null);
-            const rhs = try bindNode(arloc, tbl, b.rhs.*, null);
+            const lhs = try bindNode(arloc, tbl, b.lhs.*, null, params);
+            const rhs = try bindNode(arloc, tbl, b.rhs.*, null, params);
             node.* = .{ .binop = .{
                 .op = b.op,
                 .lhs = lhs,
@@ -165,15 +167,24 @@ pub fn bindNode(
 
 /// A literal as a cell: of `target`'s type when there is one
 /// (parse.litToValue), else the widest cell of its own kind — int8,
-/// float8, text. (A non-literal item never parses — parseExpr rejects
-/// it.)
+/// float8, text. A `$n` under an operator has only its text to go
+/// by, and is read the way an unknown-typed literal would be: an
+/// integer, else a float, else text (`abalance + $1` computes in
+/// int8 and is range-checked on assignment). (A non-literal item
+/// never parses — parseExpr rejects it.)
 fn literalValue(
     arloc: std.mem.Allocator,
     lit: _parse.Literal,
     target: ?*const Column,
+    params: _parse.Params,
 ) BindError!Value {
     if (target) |col| {
-        return _parse.litToValue(arloc, lit, col) catch |err| switch (err) {
+        return _parse.litToValue(
+            arloc,
+            lit,
+            col,
+            params,
+        ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedLiteral,
             error.UnsupportedType,
@@ -189,6 +200,13 @@ fn literalValue(
         .str => |s| .{ .text = s },
         .bool_ => |b| .{ .bool_ = b },
         .null_value => .null_value,
+        .param => |n| {
+            const text = params.rawText(n) catch |err| switch (err) {
+                error.UnsupportedType => return error.UnsupportedValue,
+                error.UnboundParam => return error.InvalidValue,
+            };
+            return untypedText(text orelse return .null_value);
+        },
         // parseExpr yields neither: a SET value is a constant or a
         // column, never a value function.
         .unsupported, .current_timestamp => unreachable,
@@ -203,6 +221,12 @@ fn numberFromText(text: String) BindError!Value {
     if (std.fmt.parseInt(i64, text, 10)) |n| return .{ .int8 = n } else |_| {}
     const f = std.fmt.parseFloat(f64, text) catch return error.InvalidValue;
     return .{ .float8 = f };
+}
+
+/// A bound value with no type to read it by: a number when it is
+/// one, else text.
+fn untypedText(text: String) Value {
+    return numberFromText(text) catch .{ .text = text };
 }
 
 /// The type `lhs op rhs` yields, or NoSuchOperator when the operator
@@ -235,9 +259,10 @@ pub fn bind(
     tbl: *const Table,
     target: *const Column,
     expr: _parse.Expr,
+    params: _parse.Params,
 ) !?*const SetNode {
     const code = pgwire.sqlstate;
-    return bindNode(arloc, tbl, expr, target) catch |err| {
+    return bindNode(arloc, tbl, expr, target, params) catch |err| {
         switch (err) {
             error.OutOfMemory => return err,
             error.UndefinedColumn => try replyErrorCode(
@@ -416,7 +441,7 @@ fn coerceScalar(s: Scalar, target: *const Column) EvalError!Value {
             return .{ .float4 = narrow };
         },
         .text, .bpchar, .varchar => return .{
-            .text = try _value.coerceString(s.text, target.ty, target.type_mod),
+            .text = try _value.coerceString(s.text, target),
         },
         else => unreachable,
     }

@@ -3,8 +3,9 @@
 # endpoint. Builds, starts a fresh single-node egres, drives psql through
 # insert/select/filter, egid visibility, update (point + multi-SET + scan +
 # full-table), delete (point + scan + full-table), a restart-persistence +
-# monotonic-egid leg (incl. no-reuse of a deleted max), and greps the server
-# log. Wipes /data/egres — that dir is throw-away.
+# monotonic-egid leg (incl. no-reuse of a deleted max), the extended query
+# protocol with $n parameters (psql's \bind / \parse / \bind_named), and
+# greps the server log. Wipes /data/egres — that dir is throw-away.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -363,6 +364,99 @@ expect "updated date reads back" "2001-01-01" v "SELECT d FROM dt WHERE id = 3;"
 expect "index on a date column" "CREATE INDEX" q "CREATE INDEX dt_d ON dt (d);"
 expect "indexed date lookup" "(1 row)" q "SELECT id FROM dt WHERE d = '2001-01-01';"
 expect "DROP date table" "DROP TABLE" q "DROP TABLE dt;"
+
+# --- extended query protocol: psql 18's \bind, \parse, \bind_named --------
+# `\bind` sends Parse (unnamed) + Bind + Describe(portal) + Execute + Sync,
+# the shape pgbench -M extended uses; `\parse` + `\bind_named` is a named
+# statement reused across Binds, pgbench -M prepared's shape. psql reads
+# these from stdin one line at a time, so the helpers take a script.
+x() { psql "$E" -X -tA <<<"$1"; }  # bare values
+xq() { psql "$E" -X <<<"$1"; }     # tags and headers too
+expect "CREATE table for the extended path" "CREATE TABLE" \
+    q "CREATE TABLE pt (id int PRIMARY KEY, name text, n int8);"
+expect "extended INSERT with params" "INSERT 0 2" \
+    xq 'INSERT INTO pt VALUES ($1, $2, $3), ($4, $5, 0) \bind 1 a 10 2 b \g'
+expect "extended SELECT with a param" "b" \
+    x 'SELECT name FROM pt WHERE id = $1 \bind 2 \g'
+expect "extended SELECT header comes from Describe" "name" \
+    xq 'SELECT name FROM pt WHERE id = $1 \bind 2 \g'
+expect "extended SELECT row count tag" "(1 row)" \
+    xq 'SELECT name FROM pt WHERE id = $1 \bind 2 \g'
+expect "extended count(*)" "2" x 'SELECT count(*) FROM pt \bind \g'
+expect "extended UPDATE, param under an operator" "UPDATE 1" \
+    xq 'UPDATE pt SET n = n + $1 WHERE name = $2 \bind 5 a \g'
+expect "the UPDATE landed" "15" x 'SELECT n FROM pt WHERE id = $1 \bind 1 \g'
+expect "extended UPDATE, param at the root" "UPDATE 1" \
+    xq 'UPDATE pt SET name = $1 WHERE id = $2 \bind z 2 \g'
+expect "highest index counts, lower ones unused" "z" \
+    x 'SELECT name FROM pt WHERE id = $2 \bind 99 2 \g'
+expect "extended DELETE with a param" "DELETE 1" \
+    xq 'DELETE FROM pt WHERE id = $1 \bind 2 \g'
+expect "the DELETE landed" "1" x 'SELECT count(*) FROM pt \bind \g'
+expect "too few params is 08P01" \
+    "bind message supplies 0 parameters, but prepared statement requires 1" \
+    x 'SELECT name FROM pt WHERE id = $1 \bind \g'
+expect "too many params is 08P01" \
+    "bind message supplies 2 parameters, but prepared statement requires 1" \
+    x 'SELECT name FROM pt WHERE id = $1 \bind 1 2 \g'
+expect "a param that does not parse for its column" "invalid value in WHERE" \
+    x 'SELECT name FROM pt WHERE id = $1 \bind abc \g'
+expect "\$0 is rejected" "there is no parameter \$0" \
+    x 'SELECT name FROM pt WHERE id = $0 \bind \g'
+expect "syntax error over the extended path" "syntax error" \
+    x 'SELEC 1 \bind \g'
+expect "Describe of a missing table" "table does not exist" \
+    x 'SELECT * FROM nope \bind \g'
+expect "DDL over the extended path" "CREATE TABLE" \
+    xq 'CREATE TABLE px (id int) \bind \g'
+expect "DROP over the extended path" "DROP TABLE" \
+    xq 'DROP TABLE px \bind \g'
+
+# A named statement: parsed once, bound three times, closed, then gone.
+named_out=$(x 'SELECT name FROM pt WHERE id = $1 \parse s1
+\bind_named s1 1 \g
+INSERT INTO pt VALUES (3, $1, 0) \bind c \g
+\bind_named s1 3 \g
+\bind_named s1 1 \g
+\close_prepared s1
+\bind_named s1 1 \g' 2>&1)
+if [ "$(printf '%s\n' "$named_out" | grep -c '^a$')" = 2 ] &&
+    grep -q '^c$' <<<"$named_out" &&
+    grep -q 'unknown prepared statement' <<<"$named_out"; then
+    ok "named statement: reused across Binds, then closed"
+else
+    bad "named statement — got: $named_out"
+fi
+
+# A transaction block over the extended path: an error aborts it, the
+# next statement is refused with 25P02 until ROLLBACK.
+expect "extended BEGIN/COMMIT" "COMMIT" \
+    xq 'BEGIN \bind \g
+INSERT INTO pt VALUES ($1, $2, $3) \bind 4 d 0 \g
+COMMIT \bind \g'
+expect "the block committed" "d" \
+    x 'SELECT name FROM pt WHERE id = $1 \bind 4 \g'
+expect "error in an extended block aborts it" "current transaction is aborted" \
+    x 'BEGIN \bind \g
+SELECT * FROM nope \bind \g
+SELECT name FROM pt WHERE id = $1 \bind 1 \g
+ROLLBACK \bind \g'
+
+# Pipeline: two Executes before one Sync. The first fails, so the
+# second is dropped until the Sync; its row never comes back.
+pipe_out=$(x '\startpipeline
+SELECT * FROM nope \bind \sendpipeline
+SELECT name FROM pt WHERE id = $1 \bind 1 \sendpipeline
+\endpipeline' 2>&1)
+if grep -q 'table does not exist' <<<"$pipe_out" &&
+    ! grep -q '^a$' <<<"$pipe_out"; then
+    ok "pipeline: an error drops the Executes after it until Sync"
+else
+    bad "pipeline — got: $pipe_out"
+fi
+expect "connection is usable after the pipeline" "a" \
+    x 'SELECT name FROM pt WHERE id = $1 \bind 1 \g'
+expect "DROP the extended-path table" "DROP TABLE" q "DROP TABLE pt;"
 
 # --- no unexpected server-side errors --------------------------------------
 if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi

@@ -257,22 +257,25 @@ fn eqlAny(text: String, options: []const String) bool {
     return false;
 }
 
-/// Check and normalize a string on its way into a column of string type
-/// `ty` with length `type_mod` (n; null = no length check). Every string
-/// type must be valid UTF-8, as in Postgres. `bpchar` strips trailing
-/// spaces (only U+0020, which is never a continuation byte, so the strip
-/// needs no decoding) and, like `varchar`, refuses more than n codepoints.
-/// A `bpchar` value whose excess is only spaces is accepted. The result
-/// is a subslice of `s`.
-pub fn coerceString(s: String, ty: Type, type_mod: ?u32) error{ InvalidUtf8, StringTooLong }!String {
-    std.debug.assert(ty.isString());
+/// Check and normalize a string on its way into `col`, a string column:
+/// its type says whether to strip, its `type_mod` is the length n (null
+/// = no length check). Every string type must be valid UTF-8, as in
+/// Postgres. `bpchar` strips trailing spaces (only U+0020, which is
+/// never a continuation byte, so the strip needs no decoding) and, like
+/// `varchar`, refuses more than n codepoints. A `bpchar` value whose
+/// excess is only spaces is accepted. The result is a subslice of `s`.
+pub fn coerceString(
+    s: String,
+    col: *const Column,
+) error{ InvalidUtf8, StringTooLong }!String {
+    std.debug.assert(col.ty.isString());
     if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
 
     // varchar maintains its trailing spaces. bpchar drops it.
-    const out = if (ty == .bpchar) std.mem.trimEnd(u8, s, " ") else s;
-    if (ty == .text) return out;
+    const out = if (col.ty == .bpchar) std.mem.trimEnd(u8, s, " ") else s;
+    if (col.ty == .text) return out;
 
-    const n = type_mod orelse return out;
+    const n = col.type_mod orelse return out;
     if (out.len > n and countCodepoints(out) > n) return error.StringTooLong;
     return out;
 }

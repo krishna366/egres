@@ -112,28 +112,33 @@ pub const Pred = union(enum) {
 pub const BindError = error{
     UndefinedColumn,
     InvalidValue,
+    /// A binary-format `$n` for a column type with no binary decoder.
+    UnsupportedValue,
     EgidZero,
     OutOfMemory,
 };
 
 /// Bind one WHERE node — and, recursively, its children — to `tbl`:
-/// names → columns, literals → typed cells (parse.litToValue). Pure;
-/// `bind` adds the client-facing error mapping. `arloc` (the statement
-/// arena) backs the tree.
+/// names → columns, literals and `$n` values → typed cells
+/// (parse.litToValue). Pure; `bind` adds the client-facing error
+/// mapping. `arloc` (the statement arena) backs the tree.
 pub fn bindNode(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     where: _parse.Where,
+    params: _parse.Params,
 ) BindError!Pred {
     switch (where) {
         .eq => |f| {
             const col = tbl.column(f.column) orelse return error.UndefinedColumn;
-            const val = _parse.litToValue(arloc, f.literal, col) catch |err| switch (err) {
+            const val = _parse.litToValue(arloc, f.literal, col, //
+                params) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // A literal longer than a `char(n)` / `varchar(n)` column
                 // is not an error in Postgres, it just never matches:
                 // every stored cell is at most n codepoints.
                 error.StringTooLong => return .never,
+                error.UnsupportedType => return error.UnsupportedValue,
                 else => return error.InvalidValue,
             };
             // The egid IS the row key. Its column is uint8, so a
@@ -150,12 +155,13 @@ pub fn bindNode(
         },
         .and_, .or_ => |kids| {
             const out = try arloc.alloc(Pred, kids.len);
-            for (kids, out) |kid, *slot| slot.* = try bindNode(arloc, tbl, kid);
+            for (kids, out) |kid, *slot|
+                slot.* = try bindNode(arloc, tbl, kid, params);
             return if (where == .and_) .{ .and_ = out } else .{ .or_ = out };
         },
         .not => |child| {
             const out = try arloc.create(Pred);
-            out.* = try bindNode(arloc, tbl, child.*);
+            out.* = try bindNode(arloc, tbl, child.*, params);
             return .{ .not = out };
         },
     }
@@ -169,10 +175,11 @@ pub fn bind(
     arloc: std.mem.Allocator,
     tbl: *const _table.Table,
     where: _parse.Where,
+    params: _parse.Params,
 ) !?*const Pred {
     const bad_value = pgwire.sqlstate.invalid_text_representation;
     const p = try arloc.create(Pred);
-    p.* = bindNode(arloc, tbl, where) catch |err| {
+    p.* = bindNode(arloc, tbl, where, params) catch |err| {
         switch (err) {
             error.OutOfMemory => return err,
             error.UndefinedColumn => try replyErrorCode(
@@ -181,6 +188,11 @@ pub fn bind(
                 "column does not exist",
             ),
             error.InvalidValue => try replyErrorCode(state, bad_value, "invalid value in WHERE"),
+            error.UnsupportedValue => try replyErrorCode(
+                state,
+                pgwire.sqlstate.feature_not_supported,
+                "unsupported value or column type",
+            ),
             error.EgidZero => try replyErrorCode(
                 state,
                 bad_value,

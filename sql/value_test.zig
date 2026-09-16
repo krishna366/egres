@@ -195,8 +195,25 @@ test "sql.value: pgTypeOid widens unsigned ints" {
     try testing.expectEqual(pgwire.oid.timestamptz, tstz);
 }
 
+/// A string column of `ty` and length `n` for the coerceString cases.
+fn strCol(ty: value.Type, n: ?u32) sql.table.Column {
+    return .{
+        .column_id = 1,
+        .pos = 0,
+        .name = "s",
+        .ty = ty,
+        .pkey_position = null,
+        .type_mod = n,
+    };
+}
+
 test "sql.value: coerceString strips, counts codepoints, and rejects" {
-    const cs = value.coerceString;
+    const cs = struct {
+        fn cs(text: String, ty: value.Type, n: ?u32) !String {
+            const col = strCol(ty, n);
+            return value.coerceString(text, &col);
+        }
+    }.cs;
     // bpchar: trailing spaces stripped, then counted; excess that is only
     // spaces is fine.
     try testing.expectEqualStrings("ab", try cs("ab   ", .bpchar, 5));

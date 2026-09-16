@@ -158,7 +158,6 @@ pub fn build(b: *std.Build) void {
     // Deferred for Zig 0.16 migration: builds an executable that pulls in
     // std.process.Child paths in raft/testing.
     // _ = addRaftMultiprocHarness(b, target, optimize, mods, regen_buffers_step);
-    addPgwireShakeout(b, target, optimize, mods);
 }
 
 fn makeModule(
@@ -909,25 +908,6 @@ fn collectLibpgQuerySources(b: *std.Build) [][]const u8 {
     }.lt);
     return paths.toOwnedSlice(b.allocator) catch
         @panic("OOM finalizing libpg_query source list");
-}
-
-fn addPgwireShakeout(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    mods: Modules,
-) void {
-    const exe = b.addExecutable(.{
-        .name = "pgwire-shakeout",
-        .root_module = makeModule(b, target, optimize, "pgwire-shakeout/main.zig"),
-    });
-    addImports(exe.root_module, mods, .{ "zfiber", "pgwire", "utils" });
-    addLibpgQuerySources(b, exe);
-    b.installArtifact(exe);
-
-    const install = b.addInstallArtifact(exe, .{});
-    const step = b.step("pgwire-shakeout", "Build the pgwire psql shakeout server");
-    step.dependOn(&install.step);
 }
 
 fn addVendoredCompressionSources(b: *std.Build, compile: *std.Build.Step.Compile) void {

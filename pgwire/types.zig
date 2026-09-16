@@ -76,6 +76,7 @@ pub const sqlstate = struct {
     pub const datatype_mismatch: [5]u8 = .{ '4', '2', '8', '0', '4' };
     pub const invalid_catalog_name: [5]u8 = .{ '3', 'D', '0', '0', '0' };
     pub const feature_not_supported: [5]u8 = .{ '0', 'A', '0', '0', '0' };
+    pub const protocol_violation: [5]u8 = .{ '0', '8', 'P', '0', '1' };
     pub const invalid_text_representation: [5]u8 = .{ '2', '2', 'P', '0', '2' };
     pub const string_data_right_truncation: [5]u8 = .{ '2', '2', '0', '0', '1' };
     pub const character_not_in_repertoire: [5]u8 = .{ '2', '2', '0', '2', '1' };

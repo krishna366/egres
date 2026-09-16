@@ -947,7 +947,7 @@ test "ext: Close(statement) drops dependent portals" {
 test "pgwire root: re-exports surface" {
     // Smoke-test the public root: each named export should be
     // accessible without further qualification.
-    _ = pgwire.serve;
+    _ = pgwire.Session;
     _ = pgwire.ConnState;
     _ = pgwire.parse;
     _ = pgwire.FieldDescription;

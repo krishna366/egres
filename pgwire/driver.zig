@@ -1,47 +1,47 @@
-//! Layer 2: fiber-backed I/O driver for the pgwire state machine.
+//! Layer 2: fiber-backed I/O for the pgwire state machine.
 //!
 //! This is the *only* file in pgwire that is allowed to know about
 //! sockets — proto.zig / conn_state.zig / parser.zig must remain pure.
 //!
-//! Caller pattern (caller owns the accept loop):
+//! A `Session` is one connection's plumbing: the read and write
+//! buffers, the stream's reader and writer, and the `ConnState` that
+//! pulls frames through them. The front-end owns the accept loop AND
+//! the event dispatch, so its handler is a concrete type and every
+//! call on it is a plain call:
 //!
-//!     while (true) {
-//!         const stream = try server.accept();
-//!         try group.spawn(handle, .{ stream });
+//!     const session = try pgwire.Session.open(alloc, &stream, .{});
+//!     defer session.close();
+//!     while (!session.closed()) {
+//!         const state = &session.state;
+//!         switch (try session.nextEvent()) {
+//!             .startup_complete => |params| try h.onStartup(state, params),
+//!             .query => |sql| {
+//!                 try h.onQuery(state, sql);
+//!                 try state.endCommand();
+//!             },
+//!             .execute => |ctx| try h.onExecute(state, ctx),
+//!             .describe => |ctx| try h.onDescribe(state, ctx),
+//!             .sync, .terminate => {},
+//!         }
+//!         try session.flush();
 //!     }
-//!     fn handle(stream: fiber.net.Stream) !void {
-//!         defer stream.close();
-//!         var h = MyHandler{};
-//!         try pgwire.serve(allocator, &stream, &h, .{});
-//!     }
 //!
-//! The handler's surface area:
+//! What each event owes (see `conn_state.Event`):
 //!
-//!  - `fn onQuery(self, state: *ConnState, sql: String) !void`
-//!    Required. Drives a simple-query (Q) message. Handler emits
-//!    RowDescription (0..1) → DataRow (0..N) → CommandComplete (or
-//!    sendError on failure). Driver emits the trailing RFQ.
-//!
-//!  - `fn onStartup(self, state: *ConnState, params: StartupParams) !void`
-//!    Optional. Fires once after the startup handshake with the
-//!    client's session parameters (database, user, …). The param
-//!    slices borrow the read buffer — dupe anything you keep.
-//!
-//!  - `fn onExecute(self, state: *ConnState, ctx: ExecuteCtx) !void`
-//!    Optional. Required if any client uses the extended-query
-//!    protocol (most non-libpq drivers). Handler emits the row
-//!    stream same as onQuery, but does NOT receive RFQ from the
-//!    driver — extended batches close on Sync, which the state
-//!    machine handles itself. If absent, the driver replies with
-//!    ErrorResponse and the rest of the batch resyncs at Sync.
-//!
-//!  - `fn onDescribe(self, state: *ConnState, ctx: DescribeCtx) !void`
-//!    Optional. Required by clients that send Describe before
-//!    Bind+Execute (pgx default mode does). Handler must emit
-//!    RowDescription or NoData (the state machine has already
-//!    emitted ParameterDescription for the statement-kind). If
-//!    absent, we fall back to NoData which works for some clients
-//!    and breaks others.
+//!  - `startup_complete`: the state machine already queued AuthOk +
+//!    ParameterStatus + ReadyForQuery. The params borrow the read
+//!    buffer — dupe anything kept.
+//!  - `query`: the handler emits RowDescription (0..1) → DataRow
+//!    (0..N) → CommandComplete (or sendError), and the front-end
+//!    then calls `endCommand` for the trailing ReadyForQuery.
+//!  - `execute`: the same row stream, but NO ReadyForQuery — an
+//!    extended batch closes on Sync, which the state machine answers
+//!    itself. An error must also set `state.ext_failed` so the rest
+//!    of the batch is dropped until Sync.
+//!  - `describe`: RowDescription or NoData (ParameterDescription was
+//!    already sent for the statement kind).
+//!  - `sync`, `terminate`: nothing; the flush after the switch sends
+//!    what the state machine queued.
 
 const std = @import("std");
 const fiber = @import("zfiber");
@@ -68,91 +68,76 @@ pub const Options = struct {
     conn: _conn_state.Config = .{},
 };
 
-/// Drive a Postgres v3 simple-query session over `stream`. Returns
-/// when the peer terminates or the stream errors. The caller still
-/// owns the stream — we don't close it.
-pub fn serve(
+/// One connection's I/O plumbing around a `ConnState`. Heap-allocated
+/// (`open`) because the state machine keeps pointers to the reader
+/// and writer interfaces, which in turn find their owner by field
+/// offset — none of it may move. The caller still owns the stream;
+/// `close` does not close it.
+pub const Session = struct {
     alloc: std.mem.Allocator,
-    stream: *Stream,
-    handler: anytype,
-    opts: Options,
-) !void {
-    // Heap-allocated buffers — fibers have small stacks, so we
-    // never put multi-KiB buffers on the stack here. (See
-    // feedback_no_stack_buffers in the project memory.)
-    const read_buf = try alloc.alloc(u8, opts.read_chunk);
-    defer alloc.free(read_buf);
-    const write_buf = try alloc.alloc(u8, opts.write_chunk);
-    defer alloc.free(write_buf);
+    read_buf: []u8,
+    write_buf: []u8,
+    reader: Stream.Reader,
+    writer: Stream.Writer,
+    state: _conn_state.ConnState,
 
-    // TODO: Add timeouts
-    var r = stream.reader(read_buf);
-    var w = stream.writer(write_buf);
-
-    var state = _conn_state.ConnState.init(alloc, &r.interface, &w.interface, opts.conn);
-    defer state.deinit();
-
-    // The state machine pulls bytes through `r.interface` itself — when
-    // its buffer is empty, the reader's drain hook fiber-blocks on the
-    // socket. Frames flow out via `w.interface`; auto-flush triggers
-    // when the write buffer fills (large result sets), explicit flush
-    // below handles logical boundaries (RFQ, errors).
-    while (state.phase != .closed) {
-        try handleEvent(&state, handler);
-        try w.interface.flush();
+    pub fn open(
+        alloc: std.mem.Allocator,
+        stream: *Stream,
+        opts: Options,
+    ) !*Session {
+        const self = try alloc.create(Session);
+        errdefer alloc.destroy(self);
+        // Heap-allocated buffers — fibers have small stacks, so we
+        // never put multi-KiB buffers on the stack here.
+        self.alloc = alloc;
+        self.read_buf = try alloc.alloc(u8, opts.read_chunk);
+        errdefer alloc.free(self.read_buf);
+        self.write_buf = try alloc.alloc(u8, opts.write_chunk);
+        errdefer alloc.free(self.write_buf);
+        // TODO: Add timeouts
+        self.reader = stream.reader(self.read_buf);
+        self.writer = stream.writer(self.write_buf);
+        self.state = _conn_state.ConnState.init(
+            alloc,
+            &self.reader.interface,
+            &self.writer.interface,
+            opts.conn,
+        );
+        return self;
     }
 
-    // Final flush — emit any trailing fatal error written during the
-    // last event. Connection is dying; swallow errors.
-    w.interface.flush() catch {};
-}
-
-fn handleEvent(state: *_conn_state.ConnState, handler: anytype) !void {
-    const H = @TypeOf(handler.*);
-    const ev = try state.nextEvent();
-    switch (ev) {
-        .startup_complete => |params| {
-            // State machine has already enqueued the AuthOk +
-            // ParameterStatus + ReadyForQuery batch — nothing to emit.
-            // Hand the session params to the handler if it wants them.
-            if (@hasDecl(H, "onStartup")) try handler.onStartup(state, params);
-        },
-        .query => |sql| {
-            try handler.onQuery(state, sql);
-            try state.endCommand();
-        },
-        .execute => |ctx| {
-            if (@hasDecl(H, "onExecute")) {
-                try handler.onExecute(state, ctx);
-            } else {
-                // No extended-query handler — the client will
-                // see this via the next Sync's RFQ.
-                try state.sendError(.{
-                    .code = .{ 'X', 'X', '0', '0', '0' },
-                    .message = "handler does not implement onExecute",
-                });
-                state.ext_failed = true;
-            }
-        },
-        .describe => |ctx| {
-            if (@hasDecl(H, "onDescribe")) {
-                try handler.onDescribe(state, ctx);
-            } else {
-                // Spec-compliant fallback: NoData is legal but
-                // tells the client we don't have a row schema
-                // to share. Some clients tolerate it; some don't.
-                try state.sendNoData();
-            }
-        },
-        .sync => {
-            // State machine has already emitted RFQ. Outer loop
-            // will flush.
-        },
-        .terminate => {
-            // phase is now .closed; outer loop's check breaks out.
-        },
+    /// Final flush — a trailing fatal error written during the last
+    /// event — then teardown. The connection is dying; flush errors
+    /// are swallowed.
+    pub fn close(self: *Session) void {
+        self.writer.interface.flush() catch {};
+        self.state.deinit();
+        self.alloc.free(self.write_buf);
+        self.alloc.free(self.read_buf);
+        self.alloc.destroy(self);
     }
-}
+
+    /// The peer terminated, the reader hit EOF, or a fatal error went
+    /// out: the loop is over.
+    pub fn closed(self: *const Session) bool {
+        return self.state.phase == .closed;
+    }
+
+    /// The next event. The state machine pulls bytes through the
+    /// reader itself — when its buffer is empty, the reader's drain
+    /// hook fiber-blocks on the socket.
+    pub fn nextEvent(self: *Session) !_conn_state.Event {
+        return self.state.nextEvent();
+    }
+
+    /// Send what the event queued: auto-flush already fired whenever
+    /// the write buffer filled (large result sets); this is the
+    /// logical boundary — ReadyForQuery, an error, a Sync.
+    pub fn flush(self: *Session) !void {
+        try self.writer.interface.flush();
+    }
+};
 
 test {
     std.testing.refAllDecls(@This());

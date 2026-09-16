@@ -104,7 +104,7 @@ const Fixture = struct {
         );
         const stmt = try sql.parse.statement(a, text);
         const pred = try a.create(Pred);
-        pred.* = try sql.pred.bindNode(a, &self.tbl, stmt.select.where.?);
+        pred.* = try sql.pred.bindNode(a, &self.tbl, stmt.select.where.?, .{});
         return sql.plan.plan(a, &self.tbl, pred, opts);
     }
 };
