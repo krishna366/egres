@@ -311,19 +311,19 @@ pub const DirStore = struct {
         if (page_off >= a_off and page_off < a_off + a_len) {
             page_off = ((page_off + a_len) / _vfs.page_size % pages) * _vfs.page_size;
         }
-        const t0 = _lookahead.nowNs();
+        const t0 = fiber.timestampNow(.monotonic, .nanos);
         if (try f.read(buf[0.._vfs.page_size], page_off) != _vfs.page_size) return error.ShortRead;
-        const fixed_ns = _lookahead.nowNs() - t0;
+        const fixed_ns: u64 = @intCast(fiber.timestampNow(.monotonic, .nanos) - t0);
         if (!_lookahead.verifyProbeData(page_off, buf[0.._vfs.page_size])) return error.BadProbeData;
 
-        const t1 = _lookahead.nowNs();
+        const t1 = fiber.timestampNow(.monotonic, .nanos);
         var got: usize = 0;
         while (got < a_len) {
             const n = try f.read(buf[got..], a_off + got);
             if (n == 0) return error.ShortRead;
             got += n;
         }
-        const total = _lookahead.nowNs() - t1;
+        const total: u64 = @intCast(fiber.timestampNow(.monotonic, .nanos) - t1);
         if (!_lookahead.verifyProbeData(a_off, buf)) return error.BadProbeData;
         return .{ .size = a_len, .ttfb_ns = fixed_ns, .total_ns = total };
     }

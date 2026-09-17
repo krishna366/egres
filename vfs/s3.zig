@@ -26,7 +26,6 @@ const attempts_max = 3; // connect/5xx retries per request
 const pool_cap = 8; // idle keep-alive connections held per store
 const idle_ttl_ms = 30_000; // drop idle conns older than this at checkout
 
-const nowNs = _lookahead.nowNs;
 
 pub const S3Config = struct {
     /// Endpoint URL: `http://host[:port]` or `https://host[:port]`. The
@@ -405,9 +404,9 @@ pub const S3Store = struct {
 
         const reader = conn.rd();
         if (ttfb_ns) |out| {
-            const sent = nowNs();
+            const sent = fiber.timestampNow(.monotonic, .nanos);
             _ = reader.peekByte() catch return error.BadResponse;
-            out.* = nowNs() - sent;
+            out.* = @intCast(fiber.timestampNow(.monotonic, .nanos) - sent);
         }
         return parseResponse(reader, a, method, want_body);
     }
@@ -426,12 +425,12 @@ pub const S3Store = struct {
     pub fn probeRead(self: *S3Store, off: u64, len: u64) !_lookahead.Probe {
         const conn = try self.getConn(false);
         var ttfb: u64 = 0;
-        const t0 = nowNs();
+        const t0 = fiber.timestampNow(.monotonic, .nanos);
         var resp = self.requestOnce(conn, "GET", _lookahead.probe_object, null, .{ off, len }, true, &ttfb) catch |err| {
             conn.deinit(self.a);
             return err;
         };
-        const total = nowNs() - t0;
+        const total: u64 = @intCast(fiber.timestampNow(.monotonic, .nanos) - t0);
         if (resp.conn_close) conn.deinit(self.a) else self.putConn(conn);
         defer resp.deinit(self.a);
         if (resp.status != 200 and resp.status != 206) return error.S3Error;

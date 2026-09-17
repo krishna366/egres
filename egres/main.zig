@@ -325,6 +325,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
     const live_runtime = try flags.g().register("runtime", RuntimeCfg);
     const live_wal = try flags.g().register("wal", WalCfg);
+    const live_io = try flags.g().register("io", zdb.vfs.calibrate.Cfg);
 
     // --help is terminal; handle after registration so writeHelpAll has
     // every module's fields populated.
@@ -355,6 +356,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const cache_cfg = live_cache.snapshot();
     const runtime_cfg = live_runtime.snapshot();
     const wal_cfg = live_wal.snapshot();
+    const io_cfg = live_io.snapshot();
     // Scheduler tunables: the runtime is already up (main), so set them
     // on it directly, before any listener spawns a connection fiber.
     fiber.runtime().steal_lone = runtime_cfg.steal_lone;
@@ -414,12 +416,16 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         .wal_dir = wal_dir,
     };
 
+    // The I/O limiter, from the disk's measured profile unless a flag
+    // pins it. The probe runs before the limiter exists (its own reads
+    // and writes must not be throttled) and before anything else
+    // touches the device.
+    const bw_config = try zdb.vfs.calibrate.bwConfig(allocator, io_cfg, data_cfg.dir);
+    zdb.vfs.VFS.initGlobal(bw_config);
+
     log.info("starting egres id={d} cluster={d} raft={s} admin={s} sql={s} dir={s} wal={s} tick={d}ms seeds={d}", .{
         raft_cfg.id, raft_cfg.cluster_id, raft_addr, client_addr, sql_addr, data_cfg.dir, wal_dir, raft_cfg.tick_ms, seeds.len,
     });
-
-    // Initialize VFS with bandwidth limit.
-    zdb.vfs.VFS.initGlobal(.{ .bytes_per_sec = 1024 * 1024 * 1024 });
 
     // The shared object store (SST distribution). `.none` on single node.
     var store: zdb.vfs.FileStore = if (std.mem.eql(u8, store_cfg.kind, "dir"))

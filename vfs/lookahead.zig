@@ -37,12 +37,6 @@ pub const Probe = struct {
     total_ns: u64,
 };
 
-/// Monotonic nanoseconds — the clock every probe is timed with.
-pub fn nowNs() u64 {
-    const ts = std.Io.Timestamp.now(utils.context.g().io, .awake);
-    return @intCast(ts.nanoseconds);
-}
-
 /// Adaptive duration for logs ({f}): microseconds below 10 ms, else ms.
 const Dur = struct {
     ns: u64,
