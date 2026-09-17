@@ -575,13 +575,6 @@ pub const wal = struct {
         self.current = &self.files.items[self.files.items.len - 1];
     }
 
-    /// Whether `current` is past half its bytes or half its slots: the
-    /// point at which the next log file gets prepared. Lock held.
-    pub fn halfFull(self: *const wal) bool {
-        return self.current.write_offset * 2 >= self.opts.log_file_size or
-            self.current.numEntries() * 2 >= max_num_entries;
-    }
-
     pub fn addEntries(self: *wal, entries: []const _raftlog.LogEntryBuffer) !void {
         if (entries.len == 0) return;
 
@@ -609,12 +602,15 @@ pub const wal = struct {
             expected_index += 1;
 
             const bytes = entry_buf.bytes orelse return _raftlog.RaftLogError.Invalid;
+            // Rotate when the log file is full, or as soon as the prepared
+            // file is ready if the current one was handed out unfilled
+            // (every append into it costs a journal write). Rotation
+            // flushes self.write_buf to the outgoing file first.
+            const next_ready = !self.current.filled and self.next.isReady();
             if (self.current.firstEmptySlot() >= max_num_entries or
                 self.current.write_offset + zbuf.Frame.hdr_size + bytes.len >
-                    self.opts.log_file_size)
+                    self.opts.log_file_size or next_ready)
             {
-                // Log file full: rotate (which flushes self.write_buf to the
-                // outgoing file before creating the new one).
                 try self.rotate();
             }
 
@@ -637,9 +633,10 @@ pub const wal = struct {
         // One wake for the whole batch: the writer takes it as one write.
         self.buf.advance(expected_index - 1);
         // The next log file is created and zero-filled by its own fiber
-        // once the current one is half full, so rotation finds it ready
-        // and the zeros never delay a batch write.
-        if (self.halfFull()) self.next.prepare();
+        // from the moment the current one is in use (a no-op while one
+        // is in flight), so the fill has the current file's whole life
+        // to finish and rotation finds it ready.
+        self.next.prepare();
     }
 
     pub fn deleteBefore(self: *wal, raft_index: u64) void {

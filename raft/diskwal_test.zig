@@ -426,9 +426,11 @@ test "BIG: diskwal truncate storage" {
         alloc.free(wal_dir);
     }
 
-    // 2 MiB log files (1 MiB past the header): about 16k of these
-    // ~64-byte records each.
-    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{ .log_file_size = 2 << 20 });
+    // 17 MiB log files (1 MiB past the 16 MiB header): about 16k of
+    // these ~64-byte records each.
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{
+        .log_file_size = 17 << 20,
+    });
     defer ds.deinit();
     const log = &ds;
 
@@ -765,7 +767,7 @@ test "diskwal CRC corruption truncates at corrupt entry" {
     }
 
     // Corrupt the 3rd entry's payload by flipping a byte.
-    // Entries start at log_file_offset (1 MiB). Each entry is framed as
+    // Entries start at log_file_offset. Each entry is framed as
     // `[u64 hash | u32 len | payload]` — see zbuf.Frame.hdr_size.
     {
         // The current file is 00001.wal (no rotation happened).
@@ -821,7 +823,15 @@ test "diskwal writeHeader/readHeader round-trip" {
 
     const vfs_inst = vfs.g();
 
-    var lf = try raft.diskwal.LogFile.createCurrent(vfs_inst, alloc, wal_dir, 1, .{ .log_file_size = 4 << 20 });
+    // Log file functions take the setting already resolved by the wal.
+    const lf_opts: raft.diskwal.OpenOptions = .{ .log_file_size = 20 << 20, .prezero = .false };
+    var lf = try raft.diskwal.LogFile.createCurrent(
+        vfs_inst,
+        alloc,
+        wal_dir,
+        1,
+        lf_opts,
+    );
     defer lf.deinit();
 
     // Empty case: createCurrent writes a WalHeader with no data slots.
@@ -838,7 +848,7 @@ test "diskwal writeHeader/readHeader round-trip" {
         .term = 5,
         .index = 101,
         .timestamp = 0xDEAD_BEF0,
-        .data_offset = 1 << 20,
+        .data_offset = diskwal.log_file_offset,
         .data_len = 42,
         .entry_type = zen.EntryTypeEnum.data,
     });
@@ -846,7 +856,7 @@ test "diskwal writeHeader/readHeader round-trip" {
         .term = 6,
         .index = 102,
         .timestamp = 0xDEAD_BEF1,
-        .data_offset = (1 << 20) + 50,
+        .data_offset = diskwal.log_file_offset + 50,
         .data_len = 100,
         .entry_type = zen.EntryTypeEnum.conf,
     });
@@ -860,14 +870,16 @@ test "diskwal writeHeader/readHeader round-trip" {
         try std.testing.expectEqual(@as(u64, 5), slots.items[0].term);
         try std.testing.expectEqual(@as(u64, 101), slots.items[0].index);
         try std.testing.expectEqual(@as(u64, 0xDEAD_BEF0), slots.items[0].timestamp);
-        try std.testing.expectEqual(@as(u32, 1 << 20), slots.items[0].data_offset);
+        const first_offset: u32 = diskwal.log_file_offset;
+        try std.testing.expectEqual(first_offset, slots.items[0].data_offset);
         try std.testing.expectEqual(@as(u32, 42), slots.items[0].data_len);
         try std.testing.expectEqual(zen.EntryTypeEnum.data, slots.items[0].entry_type);
 
         try std.testing.expectEqual(@as(u64, 6), slots.items[1].term);
         try std.testing.expectEqual(@as(u64, 102), slots.items[1].index);
         try std.testing.expectEqual(@as(u64, 0xDEAD_BEF1), slots.items[1].timestamp);
-        try std.testing.expectEqual(@as(u32, (1 << 20) + 50), slots.items[1].data_offset);
+        const second_offset: u32 = diskwal.log_file_offset + 50;
+        try std.testing.expectEqual(second_offset, slots.items[1].data_offset);
         try std.testing.expectEqual(@as(u32, 100), slots.items[1].data_len);
         try std.testing.expectEqual(zen.EntryTypeEnum.conf, slots.items[1].entry_type);
     }
@@ -1062,7 +1074,7 @@ test "diskwal: no prezero (copy-on-write filesystem setting)" {
         alloc.free(wal_dir);
     }
     const opts: raft.diskwal.OpenOptions = .{
-        .log_file_size = 2 << 20,
+        .log_file_size = 17 << 20,
         .prezero = .false,
     };
     {
@@ -1071,6 +1083,11 @@ test "diskwal: no prezero (copy-on-write filesystem setting)" {
         try appendRange(alloc, &ds, 1, 40_000, 1);
         try ds.sync();
         try std.testing.expect(try countWalFiles(wal_dir) >= 2);
+        // Nothing is prepared ahead: with no fill to run, the next log
+        // file is created inline at rotation.
+        try std.testing.expect(ds.wal_store.next.creating == null);
+        try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
+        try std.testing.expect(!try dirHas(wal_dir, "00003.wal.tmp"));
     }
     // Log files were not zero-filled: the rotated one holds its data
     // and nothing past it; the current one is only as big as its data.
@@ -1096,9 +1113,12 @@ test "diskwal prepared log file: renamed in at rotation, a stray one removed at 
         vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
-    // 2 MiB log files: 1 MiB of records past the header. Zero-filled
+    // 17 MiB log files: 1 MiB of records past the header. Zero-filled
     // even on tmpfs, so the fill path runs wherever the tests do.
-    const opts: raft.diskwal.OpenOptions = .{ .log_file_size = 2 << 20, .prezero = .true };
+    const opts: raft.diskwal.OpenOptions = .{
+        .log_file_size = 17 << 20,
+        .prezero = .true,
+    };
     const payload = try alloc.alloc(u8, 300 * 1024);
     defer alloc.free(payload);
 
@@ -1161,4 +1181,74 @@ test "diskwal Prezero: true and false are fixed, auto reads the filesystem" {
         else => .true,
     };
     try std.testing.expectEqual(want, Prezero.auto.resolve(wal_dir));
+}
+
+test "diskwal prepared log file: a late prepare never delays rotation" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const opts: raft.diskwal.OpenOptions = .{
+        .log_file_size = 17 << 20,
+        .prezero = .true,
+    };
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+    defer ds.deinit();
+    const next = &ds.wal_store.next;
+
+    // Prepare fid 2 and ask for the next file before its fill has
+    // run. If the fiber already finished (a fast disk beat us), the
+    // case cannot be built here.
+    next.prepare();
+    if (next.isReady()) return error.SkipZigTest;
+    var early = try next.swapIn();
+    defer early.deinit();
+    // An unfilled file under the next fid, at once; the prepare keeps
+    // running.
+    try std.testing.expectEqual(@as(u64, 3), early.fid);
+    try std.testing.expect(!early.filled);
+    try std.testing.expect(early.handle.file_size < opts.log_file_size);
+    try std.testing.expect(try dirHas(wal_dir, "00003.wal"));
+    try std.testing.expect(next.creating != null);
+
+    // The prepared file, once ready, comes in under a fresh fid so
+    // file order stays time order, and is filled.
+    while (!next.isReady()) fiber.yield();
+    var late = try next.swapIn();
+    defer late.deinit();
+    try std.testing.expectEqual(@as(u64, 4), late.fid);
+    try std.testing.expect(late.filled);
+    try std.testing.expect(try dirHas(wal_dir, "00004.wal"));
+    try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
+    try std.testing.expect(!try dirHas(wal_dir, "00002.wal"));
+}
+
+test "diskwal: an unfilled log file rotates once the prepared one is ready" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const opts: raft.diskwal.OpenOptions = .{
+        .log_file_size = 17 << 20,
+        .prezero = .true,
+    };
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+    defer ds.deinit();
+
+    // Mark the current file as one handed out unfilled, with the
+    // next one prepared and ready: the next append rotates.
+    try appendRange(alloc, &ds, 1, 3, 1);
+    try std.testing.expectEqual(@as(usize, 1), try countWalFiles(wal_dir));
+    ds.wal_store.current.filled = false;
+    ds.wal_store.next.prepare();
+    while (!ds.wal_store.next.isReady()) fiber.yield();
+    try appendRange(alloc, &ds, 4, 4, 1);
+    try ds.sync();
+    try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
+    try std.testing.expect(ds.wal_store.current.filled);
+    try checkRange(&ds, 1, 5);
 }

@@ -21,12 +21,13 @@ const DiskWAL = @import("diskwal.zig").DiskWAL;
 // is the file being appended to.
 //
 // Layout:
-//   [0, 1 MiB)              header region (`log_file_offset`)
-//   [1 MiB, log_file_size)  records, back to back
+//   [0, 16 MiB)             header region (`log_file_offset`)
+//   [16 MiB, log_file_size) records, back to back
 //
 // The header region holds one zbuf `WalHeader` message inside a zbuf
-// frame ([hash | len | payload], `zbuf.Frame`), zero-padded to the end
-// of the region. The message is an array of `WalSlot`s, one per record:
+// frame ([hash | len | payload], `zbuf.Frame`); the rest of the region
+// is zeros, written by the fill or never written (a hole reads as
+// zeros). The message is an array of `WalSlot`s, one per record:
 // term, index, HLC timestamp, the record's offset and length in the
 // file, flags, and the entry type. It is written when the file rotates
 // out; until then the header is the empty message from `createNamed`.
@@ -49,15 +50,18 @@ const DiskWAL = @import("diskwal.zig").DiskWAL;
 // per file. A stray .wal.tmp, a next file whose rotation never came,
 // is deleted.
 
-// 1 MiB header / 41 bytes-per-slot (37-byte WalSlot + 4-byte offset entry
-// in the WalHeader's slots array) ≈ 25,500 max slots; round down to 20k
-// to leave margin for the WalHeader struct, the frame prefix, and any
-// future schema growth (zbuf's size_bytes lets us add fields without
-// breaking older WAL files). `writeHeader` checks the fit.
-pub const max_num_entries: usize = 20_000;
+// 16 MiB header / 41 bytes-per-slot (37-byte WalSlot + 4-byte offset
+// entry in the WalHeader's slots array) ≈ 409,000 max slots; round down
+// to 380k to leave margin for the WalHeader struct, the frame prefix,
+// and any future schema growth (zbuf's size_bytes lets us add fields
+// without breaking older WAL files). `writeHeader` checks the fit. The
+// header is sized so that a 256 MiB file of ~700-byte records fills
+// its bytes before its slots: at 20k slots a file of 1 KiB records
+// rotated every 8 MiB, a rotation every two seconds under pgbench.
+pub const max_num_entries: usize = 380_000;
 /// Slot lookups return this for "past the last slot".
 pub const no_slot: usize = std.math.maxInt(usize);
-pub const log_file_offset: usize = 1 << 20;
+pub const log_file_offset: usize = 16 << 20;
 /// Zero-fill writes go out in pieces this big, at the lowest I/O
 /// priority. Two reasons: a batch write that arrives while a log file is
 /// being prepared waits behind at most one piece (about 2 ms on the
@@ -80,7 +84,8 @@ pub const Prezero = enum {
     false,
 
     /// The setting to apply to log files under `dir_path`: `true` or
-    /// `false`, never `auto`.
+    /// `false`, never `auto`. The wal calls this once at open and hands
+    /// the settled value down; the log file functions never see `auto`.
     pub fn resolve(self: Prezero, dir_path: String) Prezero {
         if (self != .auto) return self;
         if (builtin.os.tag != .linux) return .false;
@@ -144,6 +149,11 @@ pub const LogFile = struct {
     slots: std.ArrayList(entry), // each slots[i] is a real data entry
     write_offset: u64, // next write position (meaningful for current file)
     is_current: bool,
+    /// Zero-filled to `log_file_size`, so no append grows the file.
+    /// False for a file handed out while its prepare was still running
+    /// (NextLog.swapIn): its appends extend it, and the wal rotates off
+    /// it as soon as the prepared file is ready.
+    filled: bool = true,
 
     /// Room for any log file name: the 20 digits of a u64 fid (the
     /// `0>5` is a minimum width, not a cap) plus `.wal` and `.tmp`, 28
@@ -163,21 +173,36 @@ pub const LogFile = struct {
         return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, name });
     }
 
-    /// Inverse of writeHeader. Reads the 1 MiB header region from `handle`,
-    /// peels back the [hash | len] frame, parses the WalHeader zbuf
-    /// message, and returns the data-slot list (each entry is a real WAL
-    /// record). Caller owns the returned list.
+    /// Inverse of writeHeader. Reads the framed WalHeader at the start
+    /// of `handle`'s header region, parses the zbuf message, and returns
+    /// the data-slot list (each entry is a real WAL record). Caller owns
+    /// the returned list. The first read is one page, not the 12-byte
+    /// frame prefix: the disk moves a whole block either way, and a
+    /// page holds a header with a few slots whole, so most files cost
+    /// one read. A larger header is read a second time at exactly its
+    /// frame length, never the whole region.
     pub fn readHeader(
         alloc: std.mem.Allocator,
         handle: _vfs.FileHandle,
     ) !std.ArrayList(entry) {
-        // Read the entire 1 MiB header region in one shot.
-        const hdr_result = try handle.readAligned(alloc, 0, log_file_offset, .p0);
-        defer hdr_result.free();
-        const hdr = hdr_result.data;
+        const page = try handle.readAligned(alloc, 0, _vfs.page_size, .p0);
+        defer page.free();
 
-        // Frame prefix [hash | len] gates the WalHeader bytes — strips the
-        // zero padding after the message and verifies the hash in one pass.
+        const prefix = zbuf.Frame.readPrefix(page.data) catch
+            return error.InvalidLogHeader;
+        const frame_len = prefix.frameLen();
+        if (frame_len > log_file_offset) return error.InvalidLogHeader;
+        if (frame_len <= page.data.len) return parseHeader(alloc, page.data);
+
+        const whole = try handle.readAligned(alloc, 0, frame_len, .p0);
+        defer whole.free();
+        return parseHeader(alloc, whole.data);
+    }
+
+    /// The slot list of the framed WalHeader at the start of `hdr`.
+    fn parseHeader(alloc: std.mem.Allocator, hdr: String) !std.ArrayList(entry) {
+        // Frame prefix [hash | len] gates the WalHeader bytes and
+        // verifies the hash in one pass.
         const msg_bytes = zbuf.Frame.read(hdr) catch return error.InvalidLogHeader;
 
         // parseRoot validates the zbuf message tail (table_id 42255 = WalHeader).
@@ -313,6 +338,7 @@ pub const LogFile = struct {
         fid: u64,
         opts: OpenOptions,
     ) !LogFile {
+        std.debug.assert(opts.prezero != .auto);
         var name_buf: LogFile.NameBuf = undefined;
         const path = try fullPath(alloc, dir_path, try fname(fid, &name_buf));
         defer alloc.free(path);
@@ -333,10 +359,11 @@ pub const LogFile = struct {
         var lf = try scanFrames(fid, handle, alloc);
         // A log file from before pre-zeroing, or one whose preparation
         // was cut short: bring it to size so appends never grow it.
-        if (lf.handle.file_size < opts.log_file_size and opts.prezero.resolve(dir_path) == .true) {
+        if (lf.handle.file_size < opts.log_file_size and opts.prezero == .true) {
             try lf.zeroFill(lf.handle.file_size, opts.log_file_size);
             try lf.handle.syncData();
         }
+        lf.filled = opts.prezero == .true;
         return lf;
     }
 
@@ -364,6 +391,7 @@ pub const LogFile = struct {
         fid: u64,
         opts: OpenOptions,
     ) !LogFile {
+        std.debug.assert(opts.prezero != .auto);
         const path = try fullPath(alloc, dir_path, name);
         defer alloc.free(path);
 
@@ -389,6 +417,7 @@ pub const LogFile = struct {
             .slots = std.ArrayList(entry).empty,
             .write_offset = log_file_offset,
             .is_current = true,
+            .filled = opts.prezero == .true,
         };
         errdefer lf.deinit();
 
@@ -398,7 +427,7 @@ pub const LogFile = struct {
         // region and ignores the header). If it later ends up read by
         // openRotated, the empty WalHeader still parses cleanly.
         try lf.writeHeader();
-        if (opts.prezero.resolve(dir_path) == .true) {
+        if (opts.prezero == .true) {
             try lf.zeroFill(log_file_offset, opts.log_file_size);
         }
         try lf.handle.syncData();
@@ -526,19 +555,19 @@ pub const LogFile = struct {
         return zbuf.Frame.read(buf[rec_start..rec_end]) catch error.CrcMismatch;
     }
 
-    /// Build the WAL header region as a single WalHeader zbuf message and
-    /// write it in one syscall. `slots` stores every data entry in arrival
+    /// Build the WAL header as a single WalHeader zbuf message and write
+    /// it in one syscall. `slots` stores every data entry in arrival
     /// order; the per-file `first_index` is implicit in slots[0].index for
     /// non-empty files (and discoverable by walking the chain across files
     /// for empty ones), so it isn't persisted. The encoded message must
-    /// fit within `log_file_offset`; the unused tail of the region is
-    /// zero-padded. The zbuf message tail (table_id + root offset) lets
-    /// the reader validate the format with `WalHeaderReader.parseRoot`,
-    /// replacing the legacy magic/version check.
+    /// fit within `log_file_offset`; only the frame is written, the rest
+    /// of the region stays as it is (zeros from the fill, or a hole). The
+    /// zbuf message tail (table_id + root offset) lets the reader validate
+    /// the format with `WalHeaderReader.parseRoot`, replacing the legacy
+    /// magic/version check.
     pub fn writeHeader(self: *LogFile) !void {
         const hdr_region = try self.allocator.alloc(u8, log_file_offset);
         defer self.allocator.free(hdr_region);
-        @memset(hdr_region, 0);
 
         var msg_buf = std.ArrayList(u8).initBuffer(hdr_region[zbuf.Frame.hdr_size..]);
         var hdr_writer = try zen.WalHeaderWriter.initWithBuf(self.allocator, &msg_buf);
@@ -563,10 +592,11 @@ pub const LogFile = struct {
         }
 
         // Wrap the zbuf message in a [hash | len] frame so the read path
-        // can find its end inside the zero-padded region and verify it.
+        // can find its end and verify it.
         try zbuf.Frame.write(hdr_region, msg_buf.items);
 
-        try self.handle.write(hdr_region, 0, .p0);
+        const frame_len = @as(usize, zbuf.Frame.hdr_size) + msg_buf.items.len;
+        try self.handle.write(hdr_region[0..frame_len], 0, .p0);
     }
 };
 
@@ -575,8 +605,10 @@ pub const LogFile = struct {
 /// (<fid>.wal.tmp, which `openPath` ignores and removes, so a restart
 /// never takes it for the current log file while the real one, whose
 /// header is written only when it rotates, sits below it with an empty
-/// header). `swapIn` joins that fiber at rotation and renames the file
-/// into place. Every method runs with the wal lock held; the fiber
+/// header). `swapIn` renames the prepared file into place at rotation,
+/// under a fid taken then, so file order is time order whichever file
+/// it hands back; a prepare still running does not delay the rotation
+/// (see swapIn). Every method runs with the wal lock held; the fiber
 /// itself only hands back its result through the join handle.
 pub const NextLog = struct {
     allocator: std.mem.Allocator,
@@ -590,12 +622,19 @@ pub const NextLog = struct {
     creating: ?fiber.JoinHandle(anyerror!LogFile) = null,
 
     /// Start creating the next log file, unless one is being created or
-    /// is ready. A spawn failure is logged and skipped: `swapIn` then
-    /// creates inline.
+    /// is ready. With prezero off there is nothing to do ahead: the
+    /// file is then a header write and one dsync, the same cost inline
+    /// at rotation. A spawn failure is logged and skipped: `swapIn`
+    /// then creates inline, unfilled.
     pub fn prepare(self: *NextLog) void {
+        if (self.opts.prezero == .false) return;
         if (self.creating != null) return;
         const fid = self.takeFid();
-        self.creating = fiber.spawn(.{ .lane = .raft }, create, .{ self, fid }) catch |err| {
+        self.creating = fiber.spawn(
+            .{ .lane = .raft },
+            createAndFill,
+            .{ self, fid },
+        ) catch |err| {
             std.log.warn("raft/diskwal: no fiber to prepare log file {d}: {s}", .{
                 fid, @errorName(err),
             });
@@ -603,7 +642,8 @@ pub const NextLog = struct {
         };
     }
 
-    fn create(self: *NextLog, fid: u64) anyerror!LogFile {
+    fn createAndFill(self: *NextLog, fid: u64) anyerror!LogFile {
+        std.debug.assert(self.opts.prezero == .true);
         var name_buf: LogFile.NameBuf = undefined;
         return LogFile.createNamed(
             self.vfs_inst,
@@ -621,19 +661,52 @@ pub const NextLog = struct {
         return h.fiber.isFinished();
     }
 
-    /// The prepared log file renamed into place, waiting for its fill if
-    /// that is still running (less work than creating a second one), or
-    /// one created here when none was prepared or the creation failed.
+    /// The next current log file, at once. The prepared one, renamed
+    /// into place under a fresh fid, when its fill is done; otherwise a
+    /// file created here, never zero-filled: rotation runs under the
+    /// wal lock, and a fill here (log_file_size at the lowest I/O priority,
+    /// starved whenever compaction is writing) would stall every commit
+    /// in flight. An unfilled file's appends extend it, a few ms of
+    /// journal work each, bounded by the file's life: the wal rotates
+    /// again as soon as a prepared file is ready. A prepare still
+    /// running is left running for that rotation.
     pub fn swapIn(self: *NextLog) !LogFile {
+        var inline_opts = self.opts;
+        inline_opts.prezero = .false;
         if (self.creating) |*handle| {
+            if (!handle.fiber.isFinished()) {
+                std.log.warn(
+                    "raft/diskwal: next log file not ready at rotation; " ++
+                        "using an unfilled one",
+                    .{},
+                );
+                return LogFile.createCurrent(
+                    self.vfs_inst,
+                    self.allocator,
+                    self.dir_path,
+                    self.takeFid(),
+                    inline_opts,
+                );
+            }
+
+            // Zero-filled file is ready. Use it.
             defer self.creating = null;
             if (handle.join()) |lf| {
                 var prepared = lf;
-                self.rename(prepared.fid) catch |err| {
+                const tmp_fid = prepared.fid;
+                // The tmp fid is still the next one unless a rotation
+                // went by meanwhile; then a fresh fid keeps file order
+                // equal to time order.
+                const fid = if (tmp_fid + 1 == self.next_fid)
+                    tmp_fid
+                else
+                    self.takeFid();
+                self.rename(tmp_fid, fid) catch |err| {
                     prepared.deinit();
-                    deleteTmpByFid(self.allocator, self.dir_path, prepared.fid);
+                    deleteTmpByFid(self.allocator, self.dir_path, tmp_fid);
                     return err;
                 };
+                prepared.fid = fid;
                 return prepared;
             } else |err| {
                 std.log.err("raft/diskwal: prepared log file failed: {s}; creating inline", .{
@@ -646,7 +719,7 @@ pub const NextLog = struct {
             self.allocator,
             self.dir_path,
             self.takeFid(),
-            self.opts,
+            inline_opts,
         );
     }
 
@@ -666,11 +739,16 @@ pub const NextLog = struct {
         return fid;
     }
 
-    /// <fid>.wal.tmp becomes <fid>.wal, and the name is made durable
-    /// before anything is appended under it.
-    fn rename(self: *NextLog, fid: u64) !void {
+    /// <tmp_fid>.wal.tmp becomes <fid>.wal, and the name is made durable
+    /// before anything is appended under it. The two differ when a
+    /// rotation went by while the file was still being prepared.
+    fn rename(self: *NextLog, tmp_fid: u64, fid: u64) !void {
         var tmp_buf: LogFile.NameBuf = undefined;
-        const tmp_path = try LogFile.fullPath(self.allocator, self.dir_path, try LogFile.tmpName(fid, &tmp_buf));
+        const tmp_path = try LogFile.fullPath(
+            self.allocator,
+            self.dir_path,
+            try LogFile.tmpName(tmp_fid, &tmp_buf),
+        );
         defer self.allocator.free(tmp_path);
 
         var name_buf: LogFile.NameBuf = undefined;

@@ -110,17 +110,35 @@ pub const Frame = struct {
         return sz;
     }
 
+    /// The decoded [hash | len] prefix of a frame.
+    pub const Prefix = struct {
+        hash: u64,
+        len: u32,
+
+        /// Bytes the whole frame takes: prefix and payload.
+        pub fn frameLen(self: Prefix) usize {
+            return @as(usize, hdr_size) + @as(usize, self.len);
+        }
+    };
+
+    /// Decode the prefix at the start of `buf`. Touches only the first
+    /// `hdr_size` bytes, so `buf` need not hold the payload: a caller
+    /// that has read only the start of a frame learns from `frameLen`
+    /// how much to read for `read`.
+    pub fn readPrefix(buf: []const u8) !Prefix {
+        if (buf.len < hdr_size) return Error.OutOfBounds;
+        return .{ .hash = try readU64(buf, 0), .len = try readU32(buf, 8) };
+    }
+
     /// Reads the frame prefix from `buf`, validates the encoded length fits
     /// within `buf`, and verifies the hash against the payload bytes.
     /// Returns a slice into `buf` covering just the payload (no copy).
     pub fn read(buf: []const u8) ![]const u8 {
-        if (buf.len < hdr_size) return Error.OutOfBounds;
-        const stored_hash = try readU64(buf, 0);
-        const len = try readU32(buf, 8);
-        const end = @as(usize, hdr_size) + @as(usize, len);
+        const prefix = try readPrefix(buf);
+        const end = prefix.frameLen();
         if (end > buf.len) return Error.OutOfBounds;
         const payload = buf[hdr_size..end];
-        if (hash(payload) != stored_hash) return Error.Invalid;
+        if (hash(payload) != prefix.hash) return Error.Invalid;
         return payload;
     }
 };
