@@ -68,20 +68,25 @@ fn benchUntrackedRwLockShared(b: *bench.Bench) !void {
 
 // ── Contended: N fibers, one per distinct worker, hammer ONE shared lock ──
 // The single-fiber benches above measure the uncontended fast path. These
-// measure tracking overhead under real cross-worker contention: each fiber is
-// pinned to its own worker (high priority so it stays put rather than piling on
-// the spawner's ring) and runs b.n/N acquire-release pairs on the SAME lock.
+// measure the lock under real cross-worker contention: each fiber is pinned to
+// its own worker (high priority so it stays put rather than piling on the
+// spawner's ring) and runs b.n/N acquire-release pairs on the SAME lock.
 // ns/op is wall-time per op across the N-way contention.
-const contend_fibers = 4;
-
-fn Contended(comptime LockT: type, comptime shared: bool) type {
+//
+// For RWMutex the first `writers` fibers take the exclusive lock, the rest
+// the shared one. All-shared is the reader-scaling case: readers exclude
+// nobody, so the cost is purely the lock word bouncing between cores. The
+// mixed case exercises the slow path: readers backing off, the writer
+// parking on the reader count and being woken by the last reader out.
+fn Contended(comptime LockT: type) type {
     return struct {
         lock: *LockT,
         iters: u64,
+        shared: bool,
         fn run(self: *@This()) void {
             var i: u64 = 0;
             while (i < self.iters) : (i += 1) {
-                if (shared) {
+                if (@hasDecl(LockT, "lockShared") and self.shared) {
                     self.lock.lockShared(@src());
                     self.lock.unlockShared();
                 } else {
@@ -93,19 +98,20 @@ fn Contended(comptime LockT: type, comptime shared: bool) type {
     };
 }
 
-fn benchContended(b: *bench.Bench, comptime LockT: type, comptime shared: bool) !void {
-    const Ctx = Contended(LockT, shared);
+fn benchContended(b: *bench.Bench, comptime LockT: type, comptime fibers: usize, comptime writers: usize) !void {
+    comptime std.debug.assert(writers <= fibers);
+    const Ctx = Contended(LockT);
     var lock: LockT = .{};
     defer lock.deinit(); // no-op when untracked; unregisters when tracked
-    const per = @max(b.n / contend_fibers, 1);
-    var ctxs: [contend_fibers]Ctx = undefined;
-    for (&ctxs) |*c| c.* = .{ .lock = &lock, .iters = per };
+    const per = @max(b.n / fibers, 1);
+    var ctxs: [fibers]Ctx = undefined;
+    for (&ctxs, 0..) |*c, idx| c.* = .{ .lock = &lock, .iters = per, .shared = idx >= writers };
 
     b.resetTimer();
     var group: fiber.Group(void) = .init(b.alloc);
     defer group.deinit();
-    try group.ensureTotalCapacity(contend_fibers);
-    for (0..contend_fibers) |w| {
+    try group.ensureTotalCapacity(fibers);
+    for (0..fibers) |w| {
         try group.spawn(
             .{ .priority = .high, .worker_id = @intCast(w) },
             Ctx.run,
@@ -116,16 +122,25 @@ fn benchContended(b: *bench.Bench, comptime LockT: type, comptime shared: bool) 
 }
 
 fn benchContendedMutexTracked(b: *bench.Bench) !void {
-    try benchContended(b, fiber.Mutex(.tracked), false);
+    try benchContended(b, fiber.Mutex(.tracked), 4, 4);
 }
 fn benchContendedMutexUntracked(b: *bench.Bench) !void {
-    try benchContended(b, fiber.Mutex(.untracked), false);
+    try benchContended(b, fiber.Mutex(.untracked), 4, 4);
 }
 fn benchContendedRwSharedTracked(b: *bench.Bench) !void {
-    try benchContended(b, fiber.RWMutex(.tracked), true);
+    try benchContended(b, fiber.RWMutex(.tracked), 4, 0);
 }
 fn benchContendedRwSharedUntracked(b: *bench.Bench) !void {
-    try benchContended(b, fiber.RWMutex(.untracked), true);
+    try benchContended(b, fiber.RWMutex(.untracked), 4, 0);
+}
+fn benchContendedRwShared16(b: *bench.Bench) !void {
+    // Needs a runtime with at least 16 workers; the bench runtime sizes to
+    // the CPU count.
+    if (fiber.runtime().workers.len < 16) return error.SkipZigTest;
+    try benchContended(b, fiber.RWMutex(.untracked), 16, 0);
+}
+fn benchContendedRwMixed(b: *bench.Bench) !void {
+    try benchContended(b, fiber.RWMutex(.untracked), 4, 1);
 }
 
 // ── The idle-bit gate's economics: the check it adds vs the syscall it skips ──
@@ -193,6 +208,12 @@ test "BENCH: contended rwlock-shared tracked (4 workers)" {
 }
 test "BENCH: contended rwlock-shared untracked (4 workers)" {
     try benchContendedRwSharedUntracked(bench.current());
+}
+test "BENCH: contended rwlock-shared untracked (16 workers)" {
+    try benchContendedRwShared16(bench.current());
+}
+test "BENCH: contended rwlock 1 writer + 3 readers untracked (4 workers)" {
+    try benchContendedRwMixed(bench.current());
 }
 test "BENCH: wake xev.Async.notify (syscall)" {
     try benchAsyncNotify(bench.current());

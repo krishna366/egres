@@ -297,42 +297,84 @@ pub const Condition = struct {
 /// the exclusive variants; `lockShared` / `unlockShared` /
 /// `tryLockShared` are the shared variants.
 ///
-/// Implementation: single spinlock guards the composite
-/// {readers, writer, writers_pending, both queues}; readers and
-/// writers park on separate WaitQueues so wake can target the
-/// right class without the "broadcast or wrong-class wakeup"
-/// hazard from a mixed queue.
+/// Implementation: one atomic word (`State`) holds the reader
+/// count, the pending-writer count and the writer bit. The
+/// shared fast path is a single `fetchAdd` on that word: if the
+/// previous value shows no writer held or pending, the +1 IS the
+/// hold and the spinlock is never touched. `unlockShared` is the
+/// matching `fetchSub`. The writer side and every wait-queue
+/// mutation run under `sl`, and the two writer fields change only
+/// under `sl` — that is what lets a reader in the slow path check
+/// them with a plain load once it holds `sl`.
+///
+/// A reader's +1 that lands while a writer is held or pending is
+/// NOT a hold: the reader undoes it with `readerOut` and parks.
+/// The undo goes through the same last-reader-out wake as
+/// `unlockShared`, because a writer may have parked on that
+/// transient count. Readers and writers park on separate
+/// WaitQueues so wake can target the right class without the
+/// "broadcast or wrong-class wakeup" hazard from a mixed queue.
 pub fn RWMutex(comptime track: Track) type {
     return struct {
         const Self = @This();
 
+        /// The lock word. Packed field order is bit order, low to
+        /// high: `readers` in bits 0..31, `pending` in 32..62, the
+        /// writer bit at 63.
+        pub const State = packed struct(u64) {
+            /// Active readers, plus transient +1s from readers about
+            /// to back off (see `lockSharedSlow`). Changes anywhere.
+            readers: u32 = 0,
+            /// Writers in `writers_wq`, or popped from it but not yet
+            /// holding. New readers defer while this is nonzero —
+            /// that is where writer preference is enforced. Changes
+            /// only under `sl`.
+            pending_w: u31 = 0,
+            /// A writer holds the lock. Changes only under `sl`.
+            writer_held: bool = false,
+
+            fn bits(s: State) u64 {
+                return @bitCast(s);
+            }
+            fn from(word: u64) State {
+                return @bitCast(word);
+            }
+            /// A reader arriving now must defer.
+            fn blocked(s: State) bool {
+                return s.writer_held or s.pending_w != 0;
+            }
+        };
+        const one_reader: u64 = State.bits(.{ .readers = 1 });
+        const one_pending_writer: u64 = State.bits(.{ .pending_w = 1 });
+        const writer_bit: u64 = State.bits(.{ .writer_held = true });
+
+        /// The following is the same as adding a writer_bit and removing a
+        /// pending_writer bit. But, we can do both in a single add using this
+        /// const.
+        const pending_to_writer: u64 = writer_bit -% one_pending_writer;
+
+        state: std.atomic.Value(u64) = .init(0),
+
+        /// Guards the wait queues and the writer-side transitions of
+        /// `state`. Never touched by the shared fast path.
         sl: Spinlock = .{},
-
-        /// Active reader count. Mutated only under sl.
-        readers: u32 = 0,
-        /// True iff a writer currently holds the lock exclusively.
-        writer: bool = false,
-        /// Count of writers currently in `writers_wq`. New
-        /// `lockShared` calls defer when this is > 0 — that's where
-        /// writer preference is enforced.
-        writers_pending: u32 = 0,
-
         readers_wq: WaitQueue = .{},
         writers_wq: WaitQueue = .{},
 
-        /// Holder breadcrumb; `.tracked` only (counts derived from the fields
-        /// above at dump time). For a shared session only the FIRST reader
-        /// records — the `readers` 0->1 edge under `sl` is the race-free
-        /// "opener" signal, so concurrent readers don't fight over
+        /// Holder breadcrumb; `.tracked` only (counts derived from `state`
+        /// at dump time). For a shared session only the FIRST reader
+        /// records — the reader whose `fetchAdd` saw `readers == 0` is the
+        /// race-free "opener", so concurrent readers don't fight over
         /// `holder_src` (no extra state needed).
         reg_node: if (track == .tracked) _reg.Tracking else void =
             if (track == .tracked) .{} else {},
 
         fn snapshot(ptr: *anyopaque) _reg.Snap {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            const s = State.from(self.state.load(.monotonic));
             return .{
-                .held = if (self.writer) 1 else self.readers,
-                .has_waiters = self.writers_pending > 0 or self.readers_wq.head != null,
+                .held = if (s.writer_held) 1 else s.readers,
+                .has_waiters = s.pending_w > 0 or self.readers_wq.head != null,
             };
         }
         inline fn record(self: *Self, comptime src: std.builtin.SourceLocation) void {
@@ -341,28 +383,59 @@ pub fn RWMutex(comptime track: Track) type {
 
         // ---- shared (read) ----
 
-        pub fn tryLockShared(self: *Self, comptime src: std.builtin.SourceLocation) bool {
+        /// Count one reader in and return the state before it. The +1
+        /// is a hold iff `!prev.blocked()`; otherwise the caller owes a
+        /// `readerOut`.
+        fn readerIn(self: *Self) State {
+            return State.from(self.state.fetchAdd(one_reader, .acquire));
+        }
+
+        /// Count one reader out — a real hold or a transient +1, the
+        /// word does not distinguish. The last reader out with a writer
+        /// pending wakes it: that writer parked on our count. Not
+        /// called under `sl` (takes it for the pop).
+        fn readerOut(self: *Self) void {
+            const prev = State.from(self.state.fetchSub(one_reader, .release));
+            std.debug.assert(prev.readers > 0);
+            if (prev.readers != 1 or prev.writer_held or prev.pending_w == 0) return;
             self.sl.lock();
-            if (self.writer or self.writers_pending > 0) {
-                self.sl.unlock();
+            const w = self.writers_wq.popHead();
+            self.sl.unlock();
+            if (w) |waiter| _rt.wake(waiter);
+        }
+
+        pub fn tryLockShared(self: *Self, comptime src: std.builtin.SourceLocation) bool {
+            const prev = self.readerIn();
+            if (prev.blocked()) {
+                self.readerOut();
                 return false;
             }
-            self.readers += 1;
-            const first = self.readers == 1; // opener of the shared session
-            self.sl.unlock();
-            if (first) self.record(src);
+            if (prev.readers == 0) self.record(src);
             return true;
         }
 
         pub fn lockShared(self: *Self, comptime src: std.builtin.SourceLocation) void {
+            const prev = self.readerIn();
+            if (prev.blocked()) return self.lockSharedSlow(src);
+            if (prev.readers == 0) self.record(src);
+        }
+
+        /// Entered with a transient +1 that is not a hold. Undo it,
+        /// then wait under `sl` like a plain queue: the writer fields
+        /// change only under `sl`, so a load taken while holding it
+        /// stays true until we release it — a writer's `unlock` cannot
+        /// slip between our check and our `pushTail`, which is the
+        /// lost-wakeup it would otherwise be.
+        fn lockSharedSlow(self: *Self, comptime src: std.builtin.SourceLocation) void {
+            self.readerOut();
             const me = _rt.currentFiber();
             while (true) {
                 self.sl.lock();
-                if (!self.writer and self.writers_pending == 0) {
-                    self.readers += 1;
-                    const first = self.readers == 1; // opener of the shared session
+                if (!State.from(self.state.load(.acquire)).blocked()) {
+                    const prev = self.readerIn();
+                    std.debug.assert(!prev.blocked());
                     self.sl.unlock();
-                    if (first) self.record(src);
+                    if (prev.readers == 0) self.record(src);
                     return;
                 }
                 self.readers_wq.pushTail(me);
@@ -372,31 +445,24 @@ pub fn RWMutex(comptime track: Track) type {
         }
 
         pub fn unlockShared(self: *Self) void {
-            self.sl.lock();
-            std.debug.assert(self.readers > 0);
-            self.readers -= 1;
-            // When the last reader leaves, wake one writer if any are
-            // pending. Targeted wake from `writers_wq` — no mixed-
-            // queue class confusion.
-            if (self.readers == 0 and self.writers_pending > 0) {
-                const w = self.writers_wq.popHead();
-                self.sl.unlock();
-                if (w) |waiter| _rt.wake(waiter);
-                return;
-            }
-            self.sl.unlock();
+            self.readerOut();
         }
 
         // ---- exclusive (write) ----
 
         pub fn tryLock(self: *Self, comptime src: std.builtin.SourceLocation) bool {
+            // Under `sl` so the writer bit keeps its only-under-sl rule.
+            // A transient reader +1 fails this like a real one; fine for
+            // a try.
             self.sl.lock();
-            if (self.writer or self.readers > 0) {
-                self.sl.unlock();
-                return false;
-            }
-            self.writer = true;
+            const taken = self.state.cmpxchgStrong(
+                0,
+                writer_bit,
+                .acquire,
+                .monotonic,
+            ) == null;
             self.sl.unlock();
+            if (!taken) return false;
             self.record(src);
             return true;
         }
@@ -405,33 +471,36 @@ pub fn RWMutex(comptime track: Track) type {
             const me = _rt.currentFiber();
 
             self.sl.lock();
-            self.writers_pending += 1;
-            while (self.readers > 0 or self.writer) {
+            // Announce first: every reader whose +1 lands after this RMW
+            // sees `pending` and backs off, so the readers counted in
+            // `s` are the only ones we wait for. Readers already counted
+            // may themselves be transient — their undo wakes us.
+            var s = State.from(self.state.fetchAdd(one_pending_writer, .acquire) +% one_pending_writer);
+            while (s.readers != 0 or s.writer_held) {
                 self.writers_wq.pushTail(me);
                 self.sl.unlock();
                 _rt.park();
                 self.sl.lock();
+                s = State.from(self.state.load(.acquire));
             }
-            // It's important to keep this writers_pending counter and have the just
-            // woken up writer decrement it. Between the time my waker pops me from
-            // the writers_wq and writer_pending -= 1, a reader can't sneak in and
-            // acquire the shared lock, pushing the writer back to park. The lock
-            // executes a clear preference for writers.
-            self.writers_pending -= 1;
-            self.writer = true;
+            // One RMW for pending -1 and writer bit set. As two, a reader
+            // between them would see neither and take a hold. Staying
+            // pending until we hold is also what keeps the preference:
+            // between our waker's pop and this line no reader can get in.
+            _ = self.state.fetchAdd(pending_to_writer, .acquire);
             self.sl.unlock();
             self.record(src);
         }
 
         pub fn unlock(self: *Self) void {
             self.sl.lock();
-            std.debug.assert(self.writer);
-            self.writer = false;
+            const prev = State.from(self.state.fetchSub(writer_bit, .release));
+            std.debug.assert(prev.writer_held);
 
             // Writer-preferred: if any writer is queued, hand off
             // exclusively. Otherwise wake every queued reader so they
             // can all acquire concurrently.
-            if (self.writers_pending > 0) {
+            if (prev.pending_w > 0) {
                 const w = self.writers_wq.popHead();
                 self.sl.unlock();
                 if (w) |waiter| _rt.wake(waiter);
@@ -523,10 +592,10 @@ pub fn RWMutex(comptime track: Track) type {
         /// exclusive hold counts as shared too). A racy read, for debug
         /// asserts only.
         pub fn isHeld(self: *const Self, mode: Mode) bool {
-            const writer = @atomicLoad(bool, &self.writer, .acquire);
+            const s = State.from(self.state.load(.acquire));
             return switch (mode) {
-                .exclusive => writer,
-                .shared => writer or @atomicLoad(u32, &self.readers, .acquire) > 0,
+                .exclusive => s.writer_held,
+                .shared => s.writer_held or s.readers > 0,
             };
         }
     };
