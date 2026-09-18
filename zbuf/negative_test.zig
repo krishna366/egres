@@ -1,6 +1,16 @@
 const std = @import("std");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const String = utils.String;
+
+/// The compiler run blocks its thread in the pipe reads and the wait,
+/// about half a second. On a fiber worker that would stall the worker's
+/// loop, and every deadline registered there, for the whole run: the
+/// timing tests in the suite would then fail under parallelism. So it
+/// runs on the offload pool.
+fn runCompiler(alloc: std.mem.Allocator, argv: []const String) std.process.RunError!std.process.RunResult {
+    return std.process.run(alloc, utils.context.g().io, .{ .argv = argv });
+}
 
 fn runGenExpectFail(alloc: std.mem.Allocator, schema_path: String, expect_substr: String) !void {
     const argv = [_]String{
@@ -11,9 +21,7 @@ fn runGenExpectFail(alloc: std.mem.Allocator, schema_path: String, expect_substr
         schema_path,
     };
 
-    const res = try std.process.run(alloc, utils.context.g().io, .{
-        .argv = &argv,
-    });
+    const res = try fiber.fsops.run(runCompiler, .{ alloc, &argv });
     defer alloc.free(res.stdout);
     defer alloc.free(res.stderr);
 
