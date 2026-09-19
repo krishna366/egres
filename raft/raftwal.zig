@@ -31,7 +31,6 @@ pub const HardStateUpdate = struct {
     raft_id: ?u64 = null,
     checkpoint_index: ?u64 = null,
     commit_index: ?u64 = null,
-    max_file_id: ?u64 = null,
 };
 
 pub const Snapshot = zen.SnapshotStruct;

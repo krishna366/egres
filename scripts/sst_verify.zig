@@ -10,10 +10,20 @@ const Key = zdb.kv.Key;
 /// Returns true on success, false on any failure. Prints the result line
 /// directly so we don't need to retain pointers into the table after it's
 /// dropped (smallest/biggest live in the table's index memory).
+/// The file id an SST's name encodes (`<id:016x>.sst`, see
+/// `zdb.sstPath`). 0 when the name does not follow that layout — this
+/// tool only reports the id, so a stray name is not an error.
+fn idFromName(basename: String) u64 {
+    if (!std.mem.endsWith(u8, basename, ".sst")) return 0;
+    const stem = basename[0 .. basename.len - 4];
+    if (stem.len != 16) return 0;
+    return std.fmt.parseInt(u64, stem, 16) catch 0;
+}
+
 fn verifyOne(allocator: std.mem.Allocator, path: String) bool {
     const base = std.fs.path.basename(path);
 
-    const t = Table.open(allocator, path, .p2) catch |err| {
+    const t = Table.open(allocator, path, idFromName(base), .p2) catch |err| {
         std.debug.print("FAIL {s} open={s}\n", .{ base, @errorName(err) });
         return false;
     };

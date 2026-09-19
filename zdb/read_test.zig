@@ -12,7 +12,7 @@ const Item = zdb.kv.Item;
 const Meta = zdb.kv.Meta;
 const Forest = zdb.forest.Forest;
 const Builder = zdb.table.builder.Builder;
-const manifest = zdb.manifest;
+const _manifest = zdb.manifest;
 
 const ns: u64 = 1;
 const tid: u32 = 0;
@@ -30,15 +30,11 @@ const Fixture = struct {
     dir: [:0]u8,
     f: *Forest,
     tree_id: u64,
-    next_memtable: u64,
-    lease_ctx: u8 = 0,
+    /// Stands in for the raft log: every fixture step that would be its
+    /// own log entry takes the next index. Memtable ids and L0 order both
+    /// come from it, exactly as they do on the apply path.
+    next_index: u64,
 
-    const Lease = struct {
-        fn call(_: *anyopaque, _: u64) anyerror!void {}
-    };
-
-    /// On the fixture's final address: the lease callback keeps a
-    /// pointer into it.
     fn setup(self: *Fixture, alloc: std.mem.Allocator) !void {
         self.* = .{
             .alloc = alloc,
@@ -46,15 +42,19 @@ const Fixture = struct {
             .dir = undefined,
             .f = undefined,
             .tree_id = undefined,
-            .next_memtable = 2,
+            .next_index = 0,
         };
         self.dir = try tmpPath(alloc, &self.tmp);
         self.f = try Forest.open(alloc, .{ .dir = self.dir });
         self.tree_id = try self.f.createTree(ns, tid, .{ .inf = true });
-        self.f.file_ids.bind(1, 0, @ptrCast(&self.lease_ctx), Lease.call);
         // Forest.open leaves an id-0 placeholder memtable that a swap
         // discards rather than freezes; start on a real one.
-        try self.f.newMemtable(1, 1);
+        try self.f.newMemtable(self.nextIndex());
+    }
+
+    fn nextIndex(self: *Fixture) u64 {
+        self.next_index += 1;
+        return self.next_index;
     }
 
     fn teardown(self: *Fixture) void {
@@ -97,9 +97,7 @@ const Fixture = struct {
     /// Freeze the current memtable into an immutable one; nothing is
     /// flushed.
     fn freeze(self: *Fixture) !void {
-        const id = self.next_memtable;
-        self.next_memtable += 1;
-        try self.f.newMemtable(id, id);
+        try self.f.newMemtable(self.nextIndex());
     }
 
     /// Freeze and flush to an L0 SST.
@@ -108,7 +106,7 @@ const Fixture = struct {
         var fl = (try self.f.buildFlush()) orelse
             return error.TestExpectedFlush;
         defer fl.changes.deinit(self.alloc);
-        try self.f.applyFlush(fl.changes.items, fl.memtable_id);
+        try self.f.applyFlush(self.nextIndex(), fl.changes.items, fl.memtable_id);
     }
 
     /// Compact every L0 table into L1.
@@ -116,10 +114,10 @@ const Fixture = struct {
         const tree = self.f.getTree(ns, self.tree_id) orelse
             return error.TestExpectedTree;
         defer tree.release();
-        var comp = try tree.buildCompaction(0, &self.f.file_ids, 0);
+        var comp = try tree.buildCompaction(0, 0);
         defer comp.deinit(self.alloc);
         try std.testing.expect(comp.items.len > 0);
-        try tree.applyCompaction(comp.items);
+        try tree.applyCompaction(self.nextIndex(), comp.items);
     }
 };
 
@@ -343,7 +341,7 @@ fn writeOneKeyTable(
     ts: u64,
     value: String,
 ) !void {
-    const path = try zdb.file_ids.sstPath(alloc, dir, file_id);
+    const path = try zdb.sstPath(alloc, dir, file_id);
     defer alloc.free(path);
     var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
     defer bld.deinit();
@@ -370,16 +368,16 @@ test "multiget: keys across two trees and several bottom tables" {
         const tree = fx.f.getTree(ns, fx.tree_id) orelse
             return error.TestExpectedTree;
         defer tree.release();
-        var changes: [keys.len]manifest.SSTableChange = undefined;
+        var changes: [keys.len]_manifest.SSTableChange = undefined;
         for (&changes, 1..) |*c, file_id| {
-            c.* = manifest.createSSTableChange(
+            c.* = _manifest.createSSTableChange(
                 @intCast(file_id),
                 ns,
                 fx.tree_id,
                 3,
             );
         }
-        try tree.applyCompaction(&changes);
+        try tree.applyCompaction(1, &changes);
     }
     try fx.f.splitTreeForTests(ns, fx.tree_id);
 

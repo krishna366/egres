@@ -36,6 +36,18 @@ pub const LevelState = struct {
     tables: std.AutoHashMap(u64, void), // set of sst_ids at this level
 };
 
+/// What the manifest knows about one SST file, independent of which trees
+/// list it.
+pub const SstInfo = struct {
+    /// Log index of the entry that first listed this id. L0 recency comes
+    /// from this, not from the id: ids are random, log indexes are not.
+    raft_index: u64,
+    /// How many (tree, level) listings name this id. A split hands the
+    /// same file to a second tree, so one file can be listed more than
+    /// once; the record dies when the last listing goes.
+    refs: u32,
+};
+
 pub const TreeState = struct {
     namespace_id: u64 = 0,
     // The SQL table is derived from the tree_id (Key.treeTableId), not
@@ -73,9 +85,12 @@ pub const first_namespace: u64 = 16;
 /// produces the bytes that go into a Raft snapshot's `data` field;
 /// `restoreFrom` is the inverse, used by recovery to install the manifest
 /// before WAL replay.
-pub const ForestState = struct {
+pub const Manifest = struct {
     allocator: std.mem.Allocator,
     trees: std.AutoHashMap(TreeKey, TreeState),
+    /// Per-SST records, keyed by sst_id. One entry per file any tree
+    /// lists; guarded by `mu` like `trees`.
+    ssts: std.AutoHashMap(u64, SstInfo),
     /// Per-namespace manifest state (see `Namespace`), snapshot-persisted and
     /// maintained by the apply paths on every node — so a re-elected leader
     /// never re-issues a table_id, and database-name resolution is native
@@ -107,7 +122,7 @@ pub const ForestState = struct {
         tables: std.StringHashMapUnmanaged(u32) = .empty,
 
         /// Free the owned strings (database name + table-name keys) and the
-        /// map. The caller removes `name` from the ForestState.names reverse
+        /// map. The caller removes `name` from the Manifest.names reverse
         /// index first — its key borrows the string freed here.
         pub fn deinit(self: *Namespace, allocator: std.mem.Allocator) void {
             if (self.name.len > 0) allocator.free(self.name);
@@ -117,10 +132,11 @@ pub const ForestState = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator) ForestState {
+    pub fn init(allocator: std.mem.Allocator) Manifest {
         return .{
             .allocator = allocator,
             .trees = std.AutoHashMap(TreeKey, TreeState).init(allocator),
+            .ssts = std.AutoHashMap(u64, SstInfo).init(allocator),
             .namespaces = std.AutoHashMap(u64, Namespace).init(allocator),
             .names = std.StringHashMap(u64).init(allocator),
         };
@@ -129,7 +145,7 @@ pub const ForestState = struct {
     /// Reserve the next namespace id (leader path). Floors at
     /// `first_namespace`. Like table_ids, a burned id (failed propose) is never
     /// reused.
-    pub fn nextNamespace(self: *ForestState) u64 {
+    pub fn nextNamespace(self: *Manifest) u64 {
         self.mu.lock(@src());
         defer self.mu.unlock();
         if (self.next_ns_id < first_namespace)
@@ -141,7 +157,7 @@ pub const ForestState = struct {
 
     /// Raise the namespace counter past `namespace` (apply path, all nodes).
     /// Idempotent; never lowers it; floors at first_namespace.
-    pub fn advanceNamespace(self: *ForestState, namespace: u64) void {
+    pub fn advanceNamespace(self: *Manifest, namespace: u64) void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         if (self.next_ns_id < first_namespace)
@@ -154,7 +170,7 @@ pub const ForestState = struct {
     /// `first_table_id` for a namespace's first user table. The reserved id is
     /// only a hint until the create_tree commits — a burned id (failed propose)
     /// is never reused because advanceTableId only ever raises the counter.
-    pub fn nextTableId(self: *ForestState, namespace: u64) !u32 {
+    pub fn nextTableId(self: *Manifest, namespace: u64) !u32 {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
@@ -171,7 +187,7 @@ pub const ForestState = struct {
     /// Idempotent; never lowers it (so re-applying or applying a low system
     /// table leaves a higher user counter untouched). Floors at first_table_id.
     pub fn advanceTableId(
-        self: *ForestState,
+        self: *Manifest,
         namespace: u64,
         table_id: u32,
     ) !void {
@@ -192,7 +208,7 @@ pub const ForestState = struct {
     /// (uniqueness is checked before propose) — logged and skipped, never
     /// clobbered.
     pub fn registerNamespaceName(
-        self: *ForestState,
+        self: *Manifest,
         namespace: u64,
         name: String,
     ) !void {
@@ -221,7 +237,7 @@ pub const ForestState = struct {
     }
 
     /// Resolve a database name to its namespace.
-    pub fn lookupNamespace(self: *ForestState, name: String) ?u64 {
+    pub fn lookupNamespace(self: *Manifest, name: String) ?u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.names.get(name);
@@ -233,7 +249,7 @@ pub const ForestState = struct {
     /// logged and skipped, never clobbered. Empty name records nothing
     /// (system trees, splits).
     pub fn registerTableName(
-        self: *ForestState,
+        self: *Manifest,
         namespace: u64,
         table_id: u32,
         name: String,
@@ -263,7 +279,7 @@ pub const ForestState = struct {
     /// Resolve a table name to its table_id within a namespace (per-query
     /// hot path).
     pub fn lookupTable(
-        self: *ForestState,
+        self: *Manifest,
         namespace: u64,
         name: String,
     ) ?u32 {
@@ -278,7 +294,7 @@ pub const ForestState = struct {
     /// reused; freeing the name is by design (DROP TABLE then CREATE TABLE
     /// of the same name works). Reverse lookup walks the map — drops are
     /// rare, name resolution is the hot path. Idempotent.
-    pub fn dropTable(self: *ForestState, namespace: u64, table_id: u32) void {
+    pub fn dropTable(self: *Manifest, namespace: u64, table_id: u32) void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         const ns = self.namespaces.getPtr(namespace) orelse return;
@@ -296,7 +312,7 @@ pub const ForestState = struct {
     /// Safe because namespace ids are never reused: no later create can see
     /// the missing entry as a lowered floor, and freeing the names is by
     /// design (DROP DATABASE then CREATE DATABASE of the same name works).
-    pub fn dropNamespace(self: *ForestState, namespace: u64) void {
+    pub fn dropNamespace(self: *Manifest, namespace: u64) void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         if (self.namespaces.fetchRemove(namespace)) |kv| {
@@ -313,7 +329,7 @@ pub const ForestState = struct {
     /// that loop copies under the lock instead of holding a `TreeState`
     /// across its own work. Null if the tree is not listed.
     pub fn treeRange(
-        self: *ForestState,
+        self: *Manifest,
         alloc: std.mem.Allocator,
         key: TreeKey,
     ) !?KeyRange {
@@ -331,7 +347,7 @@ pub const ForestState = struct {
     /// Every listed tree's key — one namespace's when `namespace` is
     /// given — copied out under the lock. Caller frees the slice.
     pub fn treeKeys(
-        self: *ForestState,
+        self: *Manifest,
         alloc: std.mem.Allocator,
         namespace: ?u64,
     ) ![]TreeKey {
@@ -349,7 +365,7 @@ pub const ForestState = struct {
 
     /// Every SST id any tree lists (a table shared by two trees appears
     /// twice), copied out under the lock. Caller frees the slice.
-    pub fn listedFileIds(self: *ForestState, alloc: std.mem.Allocator) ![]u64 {
+    pub fn listedFileIds(self: *Manifest, alloc: std.mem.Allocator) ![]u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         var out: std.ArrayList(u64) = .empty;
@@ -364,11 +380,34 @@ pub const ForestState = struct {
         return out.toOwnedSlice(alloc);
     }
 
+    /// A fresh SST file id, drawn from the process CSPRNG.
+    ///
+    /// Ids are unique by probability: with n ids in play the chance that
+    /// any two of them collide is about n²/2⁶⁵, which stays negligible
+    /// for any number of files a cluster can hold. Zero is skipped — it
+    /// is the "no id" sentinel. A draw that hits an id the manifest
+    /// already lists is redrawn, which makes a collision with a known id
+    /// impossible rather than merely unlikely; `ssts` makes that one
+    /// lookup. A later change (the retire list) adds a second set to
+    /// the check.
+    pub fn newFileId(self: *Manifest) u64 {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+
+        while (true) {
+            var bytes: [8]u8 = undefined;
+            utils.context.g().io.random(&bytes);
+            const id = std.mem.readInt(u64, &bytes, .little);
+            if (id == 0 or self.ssts.contains(id)) continue;
+            return id;
+        }
+    }
+
     /// A tree's manifest record, borrowed for as long as `held` is: the
     /// record's key bytes are freed by a delete or range update, so this
     /// exists only under a caller's hold. Null if the tree is not listed.
     pub fn treeState(
-        self: *ForestState,
+        self: *Manifest,
         held: Lock.Shared,
         key: TreeKey,
     ) ?*const TreeState {
@@ -376,7 +415,7 @@ pub const ForestState = struct {
         return self.trees.getPtr(key);
     }
 
-    fn freeTree(self: *ForestState, tree_state: *TreeState) void {
+    fn freeTree(self: *Manifest, tree_state: *TreeState) void {
         for (tree_state.levels.items) |*lm| lm.tables.deinit();
         tree_state.levels.deinit(self.allocator);
         if (tree_state.left.primary.len > 0)
@@ -385,21 +424,26 @@ pub const ForestState = struct {
             self.allocator.free(tree_state.right.primary);
     }
 
-    pub fn deinit(self: *ForestState) void {
+    pub fn deinit(self: *Manifest) void {
         var it = self.trees.iterator();
         while (it.next()) |kv| self.freeTree(kv.value_ptr);
         self.trees.deinit();
+        self.ssts.deinit();
         self.names.deinit(); // keys borrow the names owned below
         var nit = self.namespaces.valueIterator();
         while (nit.next()) |n| n.deinit(self.allocator);
         self.namespaces.deinit();
     }
 
-    /// Applies a single table CREATE or DELETE to the tree's levels. Caller
-    /// holds the manifest lock exclusively — `held` is the proof.
+    /// Applies a single table CREATE or DELETE to the tree's levels, and
+    /// maintains the file's `SstInfo`. `index` is the log index of the
+    /// entry being applied; a CREATE that does not carry its own
+    /// `raft_index` (every live proposal) takes it. Caller holds the
+    /// manifest lock exclusively — `held` is the proof.
     pub fn applySSTableChange(
-        self: *ForestState,
+        self: *Manifest,
         held: Lock.Exclusive,
+        index: u64,
         tc: SSTableChange,
     ) !void {
         self.mu.assertHeld(held);
@@ -417,16 +461,52 @@ pub const ForestState = struct {
                 try tree.levels.append(self.allocator, lm);
             }
             try tree.levels.items[tc.level].tables.put(tc.sst_id, {});
+            // A split re-lists a file another tree already holds: that
+            // finds the existing record and keeps its original
+            // raft_index, so the file's L0 recency never moves.
+            const slot = try self.ssts.getOrPut(tc.sst_id);
+            if (!slot.found_existing) slot.value_ptr.* = .{
+                .raft_index = if (tc.raft_index != 0) tc.raft_index else index,
+                .refs = 0,
+            };
+            slot.value_ptr.refs += 1;
         } else if (tc.op == .delete) {
             const tree = self.trees.getPtr(key) orelse
                 return ManifestError.TreeNotFound;
             // Scan levels to find and remove the table.
             for (tree.levels.items) |*lm| {
                 if (lm.tables.remove(tc.sst_id)) {
+                    self.unlistSst(tc.sst_id);
                     break;
                 }
             }
         }
+    }
+
+    /// Drop one listing of `id`, forgetting the file once the last one
+    /// goes. Caller holds the manifest lock exclusively.
+    fn unlistSst(self: *Manifest, id: u64) void {
+        // Every listed id has a record; a delete for an unknown id is a
+        // bug in the change that carried it, not a case to tolerate.
+        const info = self.ssts.getPtr(id).?;
+        std.debug.assert(info.refs > 0);
+        info.refs -= 1;
+        // Part B appends the id to the retire list here.
+        if (info.refs == 0) _ = self.ssts.remove(id);
+    }
+
+    /// The log index of the entry that first listed `sst_id`. Asking for
+    /// an id the manifest does not list is a bug, so it panics.
+    ///
+    /// Only for installing a file that already exists — `Tree.open`
+    /// reading a level list, and the split that re-lists the parent's
+    /// files under the child. A path installing a NEW file (flush,
+    /// compaction, backfill) uses its own applying index instead: that is
+    /// what the manifest stored for it a moment earlier.
+    pub fn raftIndexOf(self: *Manifest, sst_id: u64) u64 {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        return self.ssts.get(sst_id).?.raft_index;
     }
 
     /// Applies a tree CREATE, DELETE, or UPDATE.
@@ -434,7 +514,7 @@ pub const ForestState = struct {
     /// UPDATE changes the tree's key range. Caller holds the manifest lock
     /// exclusively — `held` is the proof.
     pub fn applyTreeChange(
-        self: *ForestState,
+        self: *Manifest,
         held: Lock.Exclusive,
         tc: TreeChange,
     ) !void {
@@ -453,6 +533,10 @@ pub const ForestState = struct {
         } else if (tc.op == .delete) {
             if (self.trees.fetchRemove(key)) |kv| {
                 var tree = kv.value;
+                for (tree.levels.items) |lm| {
+                    var tit = lm.tables.keyIterator();
+                    while (tit.next()) |id| self.unlistSst(id.*);
+                }
                 self.freeTree(&tree);
             }
         } else if (tc.op == .update) {
@@ -468,9 +552,12 @@ pub const ForestState = struct {
 
     /// Apply a batch of tree + table changes under the mutex. In-memory only:
     /// durability comes from the surrounding Raft log entry, not from any
-    /// disk write here.
+    /// disk write here. `index` is that entry's log index: a new SST takes
+    /// it as its `raft_index`, which is what orders L0. Paths with no raft
+    /// entry behind them (single-node `createTree`, tests) pass 0.
     pub fn commit(
-        self: *ForestState,
+        self: *Manifest,
+        index: u64,
         table_changes: []const SSTableChange,
         tree_changes: []const TreeChange,
     ) !void {
@@ -480,11 +567,11 @@ pub const ForestState = struct {
         defer held.release();
 
         for (tree_changes) |tc| try self.applyTreeChange(held, tc);
-        for (table_changes) |tc| try self.applySSTableChange(held, tc);
+        for (table_changes) |tc| try self.applySSTableChange(held, index, tc);
     }
 
     /// Count total table entries across all trees and levels.
-    pub fn tableCount(self: *ForestState) u32 {
+    pub fn tableCount(self: *Manifest) u32 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         var count: u32 = 0;
@@ -497,18 +584,18 @@ pub const ForestState = struct {
         return count;
     }
 
-    /// Serialize the entire ForestState into a self-describing byte blob
+    /// Serialize the entire Manifest into a self-describing byte blob
     /// suitable for embedding in a Raft snapshot's `data` field. Captures
     /// every tree, every per-level table list, the tree key ranges + namespace
-    /// assignments, and the per-namespace `next_table_id` high-water-marks. The
-    /// `next_file_id` counter is *not* persisted — it is restored from the
-    /// per-node HardState lease by the Forest layer. Tree ids are derived
-    /// (table_id<<32 | split_id), so there is no tree-id counter to persist.
+    /// assignments, the per-namespace `next_table_id` high-water-marks, and
+    /// each SST's `raft_index` (restore needs it to rebuild L0 order). No
+    /// file-id counter is persisted — ids are random. Tree ids are derived
+    /// (table_id<<32 | split_id), so there is no tree-id counter either.
     ///
     /// Wire format reuses the existing `ManifestChange` zbuf shape: a list of
     /// `tree_changes` (CREATE per tree), `sstable_changes` (CREATE per SST),
     /// and `next_table_ids` (one per namespace).
-    pub fn serialize(self: *ForestState, allocator: std.mem.Allocator) ![]u8 {
+    pub fn serialize(self: *Manifest, allocator: std.mem.Allocator) ![]u8 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -561,12 +648,15 @@ pub const ForestState = struct {
             for (tree.levels.items, 0..) |lm, level_idx| {
                 var tit = lm.tables.iterator();
                 while (tit.next()) |tkv| {
-                    try table_changes.append(a, createSSTableChange(
+                    var sst_change = createSSTableChange(
                         tkv.key_ptr.*,
                         tk.namespace,
                         tk.tree_id,
                         @intCast(level_idx),
-                    ));
+                    );
+                    sst_change.raft_index =
+                        self.ssts.get(tkv.key_ptr.*).?.raft_index;
+                    try table_changes.append(a, sst_change);
                 }
             }
         }
@@ -597,7 +687,7 @@ pub const ForestState = struct {
     /// lifts: nothing else touches the manifest meanwhile. Two phases —
     /// the map rebuild under an exclusive hold, then the name registry
     /// through the same one-shot calls the apply path uses.
-    pub fn restoreFrom(self: *ForestState, bytes: String) !void {
+    pub fn restoreFrom(self: *Manifest, bytes: String) !void {
         const reader = try _zen.ManifestChangeReader.parseRoot(bytes);
         {
             const held = self.mu.hold(.exclusive, @src());
@@ -608,6 +698,7 @@ pub const ForestState = struct {
             var it = self.trees.iterator();
             while (it.next()) |kv| self.freeTree(kv.value_ptr);
             self.trees.clearRetainingCapacity();
+            self.ssts.clearRetainingCapacity();
             self.names.clearRetainingCapacity(); // keys borrow the names below
             var nit = self.namespaces.valueIterator();
             while (nit.next()) |n| n.deinit(self.allocator);
@@ -631,12 +722,16 @@ pub const ForestState = struct {
             i = 0;
             while (i < tbl_len) : (i += 1) {
                 const tc = try reader.sstableChangesAt(i);
-                try self.applySSTableChange(held, .{
+                // Every serialized create carries its own raft_index, so
+                // the applying-entry index is irrelevant here.
+                std.debug.assert(tc.raftIndex() != 0);
+                try self.applySSTableChange(held, 0, .{
                     .op = tc.op(),
                     .sst_id = tc.sstId(),
                     .namespace_id = tc.namespaceId(),
                     .tree_id = tc.treeId(),
                     .level = tc.level(),
+                    .raft_index = tc.raftIndex(),
                 });
             }
 
@@ -674,16 +769,16 @@ pub const ForestState = struct {
         }
     }
 
-    /// Deep-copy this ForestState into a fresh standalone copy. Used when
+    /// Deep-copy this Manifest into a fresh standalone copy. Used when
     /// building a snapshot draft so the live state is never mutated by the
     /// snapshot pipeline.
     pub fn clone(
-        self: *ForestState,
+        self: *Manifest,
         allocator: std.mem.Allocator,
-    ) !ForestState {
+    ) !Manifest {
         const bytes = try self.serialize(allocator);
         defer allocator.free(bytes);
-        var out = ForestState.init(allocator);
+        var out = Manifest.init(allocator);
         errdefer out.deinit();
         try out.restoreFrom(bytes);
         return out;
@@ -780,7 +875,7 @@ pub fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
         self.opts,
         namespace_id,
         tree_id,
-        &self.ms,
+        &self.manifest,
         &self.table_cache,
     );
     errdefer tree.release();
@@ -802,7 +897,7 @@ pub fn collectMissingFileIds(
 ) ![]u64 {
     // The ids come out under the manifest lock; the disk check (a stat
     // per file) runs after it is released.
-    const listed = try self.ms.listedFileIds(allocator);
+    const listed = try self.manifest.listedFileIds(allocator);
     defer allocator.free(listed);
     var out: std.ArrayList(u64) = .empty;
     errdefer out.deinit(allocator);
@@ -812,20 +907,18 @@ pub fn collectMissingFileIds(
     return out.toOwnedSlice(allocator);
 }
 
-/// Walk `self.ms.trees` and install each tree (Tree + TableTrees entries).
-/// Used after `ForestState.restoreFrom(snapshot.data)` at recovery — the
+/// Walk `self.manifest.trees` and install each tree (Tree + TableTrees entries).
+/// Used after `Manifest.restoreFrom(snapshot.data)` at recovery — the
 /// manifest already names every tree and table, but the in-memory Tree
 /// objects and TableTrees need to be rebuilt from it. Tree ids are
 /// derived (table_id<<32 | split_id), so there is no counter to advance.
 ///
-/// File ids are NOT scanned here: each node's local counter is
-/// restored from HardState's `max_file_id` via `forest.file_ids.bind`,
-/// which is independent of (and immune to) ids in other nodes'
-/// namespaces that show up in the manifest.
+/// File ids need no recovery either: they are drawn at random by
+/// `Manifest.newFileId`, so there is no counter or lease to restore.
 pub fn openTablesFromManifest(self: *Forest) !void {
     // installTree opens each Tree (which dupes its key range from the
     // manifest), so we only need the keys here.
-    const keys = try self.ms.treeKeys(self.allocator, null);
+    const keys = try self.manifest.treeKeys(self.allocator, null);
     defer self.allocator.free(keys);
     for (keys) |tk| try self.installTree(tk.namespace, tk.tree_id);
 }
@@ -846,7 +939,8 @@ pub fn createTree(
     const right_raw = try range.right.marshal(self.allocator);
     defer self.allocator.free(right_raw);
 
-    try self.ms.commit(&.{}, &.{
+    // Single-node path: no raft entry behind this, so index 0.
+    try self.manifest.commit(0, &.{}, &.{
         _manifest.createTreeChange(
             tree_id,
             namespace_id,
@@ -877,7 +971,7 @@ pub fn buildNamespaceCreate(
 ) !_manifest.ManifestChange {
     std.debug.assert(namespace_id > 0);
     if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
-    if (self.ms.lookupNamespace(name)) |_| return error.NameExists;
+    if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
 
     // One tree per system table: the default (raw-KV) table plus the SQL
     // catalogs, born with the namespace — catalog rows must never race
@@ -921,7 +1015,7 @@ pub fn buildCreateNamespace(
     alloc: std.mem.Allocator,
     name: String,
 ) !CreateNamespaceResult {
-    const namespace = self.ms.nextNamespace();
+    const namespace = self.manifest.nextNamespace();
     return .{
         .namespace = namespace,
         .change = try self.buildNamespaceCreate(alloc, namespace, name),
@@ -931,13 +1025,13 @@ pub fn buildCreateNamespace(
 /// Resolve a database name to its namespace id (manifest state, current
 /// on every node via the apply path).
 pub fn lookupNamespace(self: *Forest, name: String) ?u64 {
-    return self.ms.lookupNamespace(name);
+    return self.manifest.lookupNamespace(name);
 }
 
 /// Resolve a table name to its table_id within a namespace (manifest
 /// state, current on every node via the apply path).
 pub fn lookupTable(self: *Forest, namespace_id: u64, name: String) ?u32 {
-    return self.ms.lookupTable(namespace_id, name);
+    return self.manifest.lookupTable(namespace_id, name);
 }
 
 /// applyNamespaceCreate is Phase B: commits each TreeChange to the manifest,
@@ -947,11 +1041,15 @@ pub fn lookupTable(self: *Forest, namespace_id: u64, name: String) ?u32 {
 /// (create_ns).
 ///
 /// Skips any TreeChange whose tree already exists (re-apply).
-pub fn applyNamespaceCreate(self: *Forest, mc: _manifest.ManifestChange) !void {
+pub fn applyNamespaceCreate(
+    self: *Forest,
+    index: u64,
+    mc: _manifest.ManifestChange,
+) !void {
     for (mc.tree_changes) |tc| {
         if (tc.op != .create) continue; // only CREATE for ns_create
-        self.ms.advanceNamespace(tc.namespace_id);
-        try self.ms.registerNamespaceName(tc.namespace_id, tc.name);
+        self.manifest.advanceNamespace(tc.namespace_id);
+        try self.manifest.registerNamespaceName(tc.namespace_id, tc.name);
         // Per-tree, not per-namespace: an ns_create carries the default
         // AND catalog trees — checking only table 0 would skip the rest.
         if (self.hasTree(tc.namespace_id, tc.tree_id)) {
@@ -962,7 +1060,7 @@ pub fn applyNamespaceCreate(self: *Forest, mc: _manifest.ManifestChange) !void {
             );
             continue;
         }
-        try self.ms.commit(&.{}, &.{tc});
+        try self.manifest.commit(index, &.{}, &.{tc});
         // Empty left/right encodes the infinite range; each tree lands in
         // its table derived from the tree_id (0 = raw-KV, 1 = catalog).
         try self.installTree(tc.namespace_id, tc.tree_id);
@@ -1018,7 +1116,7 @@ pub fn buildCreateTables(
     names: []const String,
 ) !CreateTablesResult {
     for (names) |name|
-        if (name.len > 0 and self.ms.lookupTable(namespace_id, name) != null)
+        if (name.len > 0 and self.manifest.lookupTable(namespace_id, name) != null)
             return error.NameExists;
 
     const table_ids = try alloc.alloc(u32, names.len);
@@ -1027,7 +1125,7 @@ pub fn buildCreateTables(
     errdefer alloc.free(tree_changes);
 
     for (names, 0..) |name, i| {
-        const table_id = try self.ms.nextTableId(namespace_id);
+        const table_id = try self.manifest.nextTableId(namespace_id);
         table_ids[i] = table_id;
         const tree_id = self.nextTreeId(namespace_id, table_id);
         tree_changes[i] = _manifest.createTreeChange(
@@ -1055,21 +1153,25 @@ pub fn buildCreateTables(
 /// counter past the created table (idempotent; this is what keeps a
 /// re-elected leader's allocator current). Idempotent on (namespace,
 /// tree_id). Called on all nodes after Raft commit (create_tree).
-pub fn applyCreateTree(self: *Forest, mc: _manifest.ManifestChange) !void {
+pub fn applyCreateTree(
+    self: *Forest,
+    index: u64,
+    mc: _manifest.ManifestChange,
+) !void {
     for (mc.tree_changes) |tc| {
         if (tc.op != .create) continue;
-        try self.ms.advanceTableId(tc.namespace_id, treeTableId(tc.tree_id));
+        try self.manifest.advanceTableId(tc.namespace_id, treeTableId(tc.tree_id));
         // Before the idempotency skip, like advanceTableId: a re-apply
         // (WAL replay over snapshot-restored state) re-registers as a
         // no-op.
-        try self.ms.registerTableName(
+        try self.manifest.registerTableName(
             tc.namespace_id,
             treeTableId(tc.tree_id),
             tc.name,
         );
         // already applied
         if (self.hasTree(tc.namespace_id, tc.tree_id)) continue;
-        try self.ms.commit(&.{}, &.{tc});
+        try self.manifest.commit(index, &.{}, &.{tc});
         try self.installTree(tc.namespace_id, tc.tree_id);
     }
 }
@@ -1121,20 +1223,28 @@ pub fn buildDropTables(
 /// detaches, and the table cache holds its own ref). The data is immediately
 /// unqueryable (route + manifest gone); physical reclaim of orphaned SSTs is
 /// left to snapshot GC — a follow-up.
-pub fn applyDropTree(self: *Forest, mc: _manifest.ManifestChange) !void {
-    try self.applyTreeDeletes(mc);
+pub fn applyDropTree(
+    self: *Forest,
+    index: u64,
+    mc: _manifest.ManifestChange,
+) !void {
+    try self.applyTreeDeletes(index, mc);
     // Forget each dropped table's name (first delete of a multi-tree
     // table removes it; the rest are no-ops). drop_ns doesn't
     // come here — dropNamespace frees the whole map.
     for (mc.tree_changes) |tc| {
         if (tc.op != .delete) continue;
-        self.ms.dropTable(tc.namespace_id, treeTableId(tc.tree_id));
+        self.manifest.dropTable(tc.namespace_id, treeTableId(tc.tree_id));
     }
 }
 
 /// The delete-changes walk shared by applyDropTree and applyNamespaceDrop.
 /// Runs on the apply loop, like every other create and drop.
-pub fn applyTreeDeletes(self: *Forest, mc: _manifest.ManifestChange) !void {
+pub fn applyTreeDeletes(
+    self: *Forest,
+    index: u64,
+    mc: _manifest.ManifestChange,
+) !void {
     for (mc.tree_changes) |tc| {
         if (tc.op != .delete) continue;
 
@@ -1156,7 +1266,7 @@ pub fn applyTreeDeletes(self: *Forest, mc: _manifest.ManifestChange) !void {
         }
 
         // Remove from the manifest (frees the TreeState + its table set).
-        try self.ms.commit(&.{}, &.{tc});
+        try self.manifest.commit(index, &.{}, &.{tc});
     }
 }
 
@@ -1203,10 +1313,14 @@ pub fn buildDropNamespace(
 /// namespace's manifest state (table_id counter + name, freeing the name
 /// for re-CREATE). Leftover memtable entries for the namespace are dropped
 /// at flush (buildFlush skips items with no route). Idempotent. drop_ns.
-pub fn applyNamespaceDrop(self: *Forest, mc: _manifest.ManifestChange) !void {
-    try self.applyTreeDeletes(mc);
+pub fn applyNamespaceDrop(
+    self: *Forest,
+    index: u64,
+    mc: _manifest.ManifestChange,
+) !void {
+    try self.applyTreeDeletes(index, mc);
     if (mc.tree_changes.len > 0) {
-        self.ms.dropNamespace(mc.tree_changes[0].namespace_id);
+        self.manifest.dropNamespace(mc.tree_changes[0].namespace_id);
     }
 }
 
@@ -1234,7 +1348,7 @@ pub fn buildSplit(
     // The old tree's bounds, copied out under the manifest lock: this
     // runs on the split-propose fiber while the apply loop may commit
     // (rehashing the map, freeing a dropped tree's keys).
-    const old_range = try self.ms.treeRange(alloc, .{
+    const old_range = try self.manifest.treeRange(alloc, .{
         .namespace = namespace_id,
         .tree_id = tree_id,
     }) orelse return null;
@@ -1314,9 +1428,13 @@ pub fn buildSplit(
 /// use of a tree. Called on all nodes after Raft commit. The new tree_id
 /// is derived deterministically (table's next split index), so there is
 /// no counter for a new leader to re-issue.
-pub fn applySplit(self: *Forest, mc: _manifest.ManifestChange) !void {
+pub fn applySplit(
+    self: *Forest,
+    index: u64,
+    mc: _manifest.ManifestChange,
+) !void {
     // Commit MANIFEST so we can recover from a crash.
-    try self.ms.commit(mc.sstable_changes, mc.tree_changes);
+    try self.manifest.commit(index, mc.sstable_changes, mc.tree_changes);
 
     // Find the old tree_id (UPDATE) and new tree_id (CREATE) from tree_changes.
     // Both changes carry the same namespace (a split stays within one).
@@ -1343,7 +1461,7 @@ pub fn applySplit(self: *Forest, mc: _manifest.ManifestChange) !void {
         self.opts,
         namespace_id,
         old_tree_id,
-        &self.ms,
+        &self.manifest,
         &self.table_cache,
     );
     errdefer left.release();
@@ -1352,7 +1470,7 @@ pub fn applySplit(self: *Forest, mc: _manifest.ManifestChange) !void {
         self.opts,
         namespace_id,
         new_tree_id,
-        &self.ms,
+        &self.manifest,
         &self.table_cache,
     );
     errdefer right.release();
@@ -1409,5 +1527,6 @@ pub fn splitTreeForTests(self: *Forest, namespace_id: u64, tree_id: u64) !void {
         namespace_id,
         tree_id,
     ) orelse return;
-    try self.applySplit(mc);
+    // Test-only path: no raft entry behind it, so index 0.
+    try self.applySplit(0, mc);
 }

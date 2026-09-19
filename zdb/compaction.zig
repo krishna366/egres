@@ -16,7 +16,7 @@ const _level_handler = @import("level.zig");
 const _table = @import("table.zig");
 const vfs = @import("vfs");
 const _metrics = @import("metrics.zig");
-const _fi = @import("file_ids.zig");
+const _forest = @import("forest.zig");
 const _read = @import("read.zig");
 const zroar = @import("zroar");
 const _tree = @import("tree.zig");
@@ -581,20 +581,20 @@ pub fn computeCompactCandidate(self: *Tree, held: Lock.Exclusive) !void {
 
 /// doCompact runs the full compaction pipeline: buildCompaction (Phase A)
 /// then applyCompaction (Phase B). For Raft integration, callers can use
-/// buildCompaction and applyCompaction separately.
+/// buildCompaction and applyCompaction separately. `index` is the log
+/// index the outputs are listed under, as for `applyCompaction`.
 pub fn doCompact(
     self: *Tree,
+    index: u64,
     src_level: u8,
-    file_ids: *_fi.FileIds,
     global_min_read: u64,
 ) !void {
     var changes = try self.buildCompaction(
         src_level,
-        file_ids,
         global_min_read,
     );
     defer changes.deinit(self.allocator);
-    try self.applyCompaction(changes.items);
+    try self.applyCompaction(index, changes.items);
 }
 
 /// Diagnostics. `keys_in - keys_out` is what this compaction discarded on
@@ -631,7 +631,6 @@ pub const Emitter = struct {
     tree: *Tree,
     bld: *Builder,
     group: *fiber.Group(?FlushResult),
-    file_ids: *_fi.FileIds,
     stats: *Metrics,
     file_sz: usize,
     dest: usize,
@@ -642,7 +641,6 @@ pub const Emitter = struct {
         tree: *Tree,
         bld: *Builder,
         group: *fiber.Group(?FlushResult),
-        file_ids: *_fi.FileIds,
         stats: *Metrics,
         file_sz: usize,
         dest: usize,
@@ -653,7 +651,6 @@ pub const Emitter = struct {
             .tree = tree,
             .bld = bld,
             .group = group,
-            .file_ids = file_ids,
             .stats = stats,
             .file_sz = file_sz,
             .dest = dest,
@@ -714,7 +711,7 @@ pub const Emitter = struct {
             // otherwise be compacted below a table holding an older
             // one, and the read path expects newer versions at higher
             // levels so it can stop at the first hit.
-            try e.tree.flushBuilderOutput(e.bld, e.group, e.file_ids);
+            try e.tree.flushBuilderOutput(e.bld, e.group);
             e.bld.reset();
         }
         try e.bld.addItem(.{
@@ -739,7 +736,6 @@ pub const Emitter = struct {
 pub fn buildCompaction(
     self: *Tree,
     src_level: u8,
-    file_ids: *_fi.FileIds,
     global_min_read: u64,
 ) !std.ArrayList(_manifest.SSTableChange) {
     const src: usize = src_level;
@@ -911,7 +907,6 @@ pub fn buildCompaction(
         self,
         &bld,
         &flush_group,
-        file_ids,
         &stats,
         file_sz,
         dest,
@@ -926,7 +921,7 @@ pub fn buildCompaction(
     }
 
     // Flush any remaining data.
-    try self.flushBuilderOutput(&bld, &flush_group, file_ids);
+    try self.flushBuilderOutput(&bld, &flush_group);
 
     // Sum up input key counts + on-disk byte sizes from every src + bot
     // SST's index for the "expected" baseline. If keys_in != expected, the
@@ -1032,14 +1027,13 @@ pub fn flushBuilderOutput(
     self: *Tree,
     bld: *Builder,
     group: *fiber.Group(?FlushResult),
-    file_ids: *_fi.FileIds,
 ) !void {
     var tb = try bld.finish();
     defer tb.deinit();
     if (tb.bytes.len == 0) return;
 
-    const id = try file_ids.allocate();
-    const path = try _fi.sstPath(self.allocator, self.opts.dir, id);
+    const id = self.manifest.newFileId();
+    const path = try _forest.sstPath(self.allocator, self.opts.dir, id);
     errdefer self.allocator.free(path);
 
     const wh = try vfs.g().createFile(path, .{ .mode = .direct });

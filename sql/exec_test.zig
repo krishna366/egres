@@ -22,13 +22,6 @@ const ns: u64 = 16;
 const tid: u32 = 16;
 const read_ts: u64 = 500;
 
-/// buildFlush allocates an SST id, which needs a durable-lease callback;
-/// nothing here restarts, so persisting the ceiling is a no-op.
-const Lease = struct {
-    fn call(_: *anyopaque, _: u64) anyerror!void {}
-};
-var lease_ctx: u8 = 0;
-
 /// Builds a fixture's committed rows under the table's layout.
 const RowBuilder = *const fn (
     a: std.mem.Allocator,
@@ -108,17 +101,16 @@ const Fixture = struct {
         if (on_disk) {
             // The id-0 placeholder memtable is released, never flushed:
             // write into a real one.
-            f.file_ids.bind(1, 0, @ptrCast(&lease_ctx), Lease.call);
-            try f.newMemtable(1, 1);
+            try f.newMemtable(1);
         }
         try f.put(try build(a, &tbl));
         if (on_disk) {
-            try f.newMemtable(2, 2);
+            try f.newMemtable(2);
             const fl = (try f.buildFlush()) orelse
                 return error.TestExpectedFlush;
             var changes = fl.changes;
             defer changes.deinit(testing.allocator);
-            try f.applyFlush(changes.items, fl.memtable_id);
+            try f.applyFlush(3, changes.items, fl.memtable_id);
         }
 
         return .{

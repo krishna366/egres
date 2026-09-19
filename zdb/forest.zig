@@ -12,7 +12,6 @@ const vfs = @import("vfs");
 const _tree = @import("tree.zig");
 const _skl = @import("skl/skiplist.zig");
 const _metrics = @import("metrics.zig");
-const _fi = @import("file_ids.zig");
 const zroar = @import("zroar");
 
 const Key = @import("kv.zig").Key;
@@ -28,6 +27,23 @@ const Item = _table.table.Item;
 const SkipList = _skl.SkipList;
 const Builder = _table.builder.Builder;
 const merge_iterator = _table.merge_iterator;
+
+/// Build the SST path for `file_id`. Filename layout is `<id:016x>.sst` —
+/// fixed-width hex, so directory listings sort by id lexicographically.
+/// Pass `dir = ""` to get the bare filename without any prefix; otherwise
+/// the result is `<dir>/<filename>`. Caller owns the returned slice.
+pub fn sstPath(allocator: std.mem.Allocator, dir: String, file_id: u64) ![]u8 {
+    if (dir.len == 0) return std.fmt.allocPrint(
+        allocator,
+        "{x:0>16}.sst",
+        .{file_id},
+    );
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{x:0>16}.sst",
+        .{ dir, file_id },
+    );
+}
 
 // ---------------------------------------------------------------------------
 // TableTrees
@@ -285,7 +301,7 @@ pub const Memtables = struct {
     pub fn currentId(self: *Memtables) u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        return self.current.id;
+        return self.current.raft_index;
     }
 
     /// Aggregate sizes for the active + immutable memtables, taken under
@@ -310,27 +326,30 @@ pub const Memtables = struct {
     }
 
     /// Freeze the current memtable: move it to immutables, create a new
-    /// current. `log_index` is the apply index of the Raft `newMemtable` entry;
-    /// it pins the snapshot horizon (`snapshot.index <=
-    /// oldest.created_at_log_index - 1`).
+    /// current. `log_index` is the apply index of the Raft `newMemtable`
+    /// entry: it becomes the new memtable's `raft_index`, which is its
+    /// identity and pins the snapshot horizon (`snapshot.index <=
+    /// oldest.raft_index - 1`). A log index is deterministic on every
+    /// node and monotonic by construction, which is what
+    /// `popOldestIfMatches`'s `<` / `>` comparisons need.
     ///
-    /// Special case: the id=0 placeholder (created by `Forest.open` before any
-    /// real `newMemtable` has been applied) is *discarded*, not frozen — it
-    /// would otherwise sit in immutables forever, since no flush ever targets
-    /// id=0.
-    pub fn swapCurrentOut(self: *Memtables, new_id: u64, log_index: u64) !void {
+    /// Special case: the raft_index=0 placeholder (created by `Forest.open`
+    /// before any real `newMemtable` has been applied) is *discarded*, not
+    /// frozen — it would otherwise sit in immutables forever, since no
+    /// flush ever targets it. A real entry's log index is >= 1, so it
+    /// never collides with the placeholder.
+    pub fn swapCurrentOut(self: *Memtables, log_index: u64) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        if (self.current.id == 0) {
+        if (self.current.raft_index == 0) {
             self.current.release();
         } else {
             // Newest-first: the just-frozen memtable goes in front.
             try self.immutables.insert(self.allocator, 0, self.current);
         }
         const new_mt = try SkipList.init(self.allocator);
-        new_mt.id = new_id;
-        new_mt.created_at_log_index = log_index;
+        new_mt.raft_index = log_index;
         self.current = new_mt;
     }
 
@@ -341,8 +360,8 @@ pub const Memtables = struct {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         const imms = self.immutables.items;
-        if (imms.len > 0) return imms[imms.len - 1].created_at_log_index;
-        return self.current.created_at_log_index;
+        if (imms.len > 0) return imms[imms.len - 1].raft_index;
+        return self.current.raft_index;
     }
 
     /// Drop any phantom immutables whose id is strictly less than
@@ -351,13 +370,13 @@ pub const Memtables = struct {
     ///
     /// Used by `applyFlush`. Three cases reflect leader/follower divergence
     /// during recovery replay:
-    ///   - oldest.id < expected_id  → phantom: flush already happened
+    ///   - oldest.raft_index < expected_id  → phantom: flush already happened
     ///     pre-snap on leader, SST is in snap.data, but we still have the
     ///     local memtable (e.g., its `newMemtable` was post-snap and
     ///     replayed, but its `flush` was pre-snap and compacted). Release
     ///     and continue checking the next oldest.
-    ///   - oldest.id == expected_id → normal: pop and release.
-    ///   - oldest.id > expected_id  → flush's target memtable was popped on
+    ///   - oldest.raft_index == expected_id → normal: pop and release.
+    ///   - oldest.raft_index > expected_id  → flush's target memtable was popped on
     ///     the leader pre-snap and never re-created here (its `newMemtable`
     ///     proposal was below snap.index). Nothing local to remove; the SST
     ///     install above handles the data side.
@@ -369,14 +388,14 @@ pub const Memtables = struct {
         // Newest-first storage: the oldest sits at the END, so both
         // the phantom sweep and the pop are cheap tail removals.
         while (self.immutables.items.len > 0 and
-            self.immutables.items[self.immutables.items.len - 1].id <
+            self.immutables.items[self.immutables.items.len - 1].raft_index <
                 expected_id)
         {
             const phantom = self.immutables.pop().?;
             log.info(
                 "popOldestIfMatches: releasing phantom immutable id={d} " ++
                     "(expected_id={d})",
-                .{ phantom.id, expected_id },
+                .{ phantom.raft_index, expected_id },
             );
             phantom.release();
         }
@@ -390,10 +409,10 @@ pub const Memtables = struct {
             return;
         }
         const oldest_id =
-            self.immutables.items[self.immutables.items.len - 1].id;
+            self.immutables.items[self.immutables.items.len - 1].raft_index;
         if (oldest_id != expected_id) {
             log.info(
-                "popOldestIfMatches: skipping pop, oldest.id={d} > " ++
+                "popOldestIfMatches: skipping pop, oldest.raft_index={d} > " ++
                     "expected_id={d} (recovery: pre-snap flush, memtable " ++
                     "not re-created locally)",
                 .{ oldest_id, expected_id },
@@ -427,11 +446,7 @@ pub const Memtables = struct {
 pub const Forest = struct {
     allocator: std.mem.Allocator,
     opts: _config.Config,
-    ms: _manifest.ForestState,
-    /// Per-node file_id allocator. Wired at startup via `bindWorker`.
-    /// All callers go through `file_ids.allocate()`; raw `fetchAdd` is
-    /// never correct because it skips the HardState lease.
-    file_ids: _fi.FileIds,
+    manifest: _manifest.Manifest,
     /// One TableTrees per table, keyed by its `{namespace, table_id}` identity.
     /// The TableTreess own the live `*Tree` objects (in their sorted entries);
     /// there is no separate tree map. Look a tree up by id via `getTree`.
@@ -505,23 +520,22 @@ pub const Forest = struct {
     /// later via `installManifest` (called by recovery if a Raft snapshot is
     /// present); fresh starts go straight to `createTree` / Raft replay.
     pub fn open(allocator: std.mem.Allocator, opts: _config.Config) !*Forest {
-        var ms = _manifest.ForestState.init(allocator);
-        errdefer ms.deinit();
+        var manifest = _manifest.Manifest.init(allocator);
+        errdefer manifest.deinit();
 
         const self = try allocator.create(Forest);
         errdefer allocator.destroy(self);
 
-        // Initial placeholder memtable. id and created_at_log_index both 0
-        // are the sentinel values that mark "no real memtable yet" — the
-        // first replayed `newMemtable` swaps it out (Phase 5).
+        // Initial placeholder memtable. raft_index 0 is the sentinel that
+        // marks "no real memtable yet" — the first replayed `newMemtable`
+        // swaps it out (Phase 5).
         const mt = try SkipList.init(allocator);
         errdefer mt.release();
 
         self.* = .{
             .allocator = allocator,
             .opts = opts,
-            .ms = ms,
-            .file_ids = .{},
+            .manifest = manifest,
             .tables = utils.SafeHashMap(TableKey, *TableTrees).init(allocator),
             .table_cache = TableCache.init(allocator, opts.dir),
             .memtables = Memtables.init(allocator, mt),
@@ -565,8 +579,7 @@ pub const Forest = struct {
         }
         self.tables.deinit();
 
-        self.ms.deinit();
-        self.file_ids.mu.deinit();
+        self.manifest.deinit();
         self.table_cache.deinit();
         self.allocator.destroy(self);
     }
@@ -582,11 +595,12 @@ pub const Forest = struct {
 
     /// Create a new memtable, freezing the current one.
     /// Called when the newMemtable entry is committed via Raft.
-    /// The new_id is assigned by the leader and included in the proposal so
-    /// all nodes use the same ID. `log_index` is the apply index of that
-    /// Raft entry — pins the snapshot horizon for the new memtable.
-    pub fn newMemtable(self: *Forest, new_id: u64, log_index: u64) !void {
-        try self.memtables.swapCurrentOut(new_id, log_index);
+    /// `log_index` is the apply index of that Raft entry: it pins the
+    /// snapshot horizon for the new memtable and IS the new memtable's id,
+    /// so every node derives the same id without the leader proposing one,
+    /// and ids stay monotonic across freezes.
+    pub fn newMemtable(self: *Forest, log_index: u64) !void {
+        try self.memtables.swapCurrentOut(log_index);
     }
 
     /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen
@@ -676,8 +690,8 @@ pub const Forest = struct {
                 continue;
             }
 
-            const file_id = try self.file_ids.allocate();
-            const path = try _fi.sstPath(
+            const file_id = self.manifest.newFileId();
+            const path = try sstPath(
                 self.allocator,
                 self.opts.dir,
                 file_id,
@@ -703,7 +717,7 @@ pub const Forest = struct {
             defer dir_sync.join();
         }
 
-        return .{ .changes = changes, .memtable_id = mt.id };
+        return .{ .changes = changes, .memtable_id = mt.raft_index };
     }
 
     /// Writes table bytes to a new SST file, syncs, and closes.
@@ -837,8 +851,8 @@ pub const Forest = struct {
             tb.deinit();
             return;
         }
-        const file_id = try self.file_ids.allocate();
-        const path = try _fi.sstPath(self.allocator, self.opts.dir, file_id);
+        const file_id = self.manifest.newFileId();
+        const path = try sstPath(self.allocator, self.opts.dir, file_id);
         try g.spawn(.{}, writeAndSyncTable, .{
             self.allocator, tb, path, file_id, tk, lvl, err_out,
         });
@@ -894,16 +908,16 @@ pub const Forest = struct {
     /// commit. Also removes the flushed memtable from the immutable list.
     pub fn applyFlush(
         self: *Forest,
+        index: u64,
         changes: []const _manifest.SSTableChange,
         memtable_id: u64,
     ) !void {
-        if (changes.len > 0) {
-            try self.ms.commit(changes, &.{});
-        }
-
         // Load all new L0 tables concurrently via the cache. writeFile may
         // have pre-opened these (follower path) → cache hit. On the leader,
         // flush writes bytes directly, so these will typically be misses.
+        // This is the step that can fail (I/O), so it runs before any
+        // state changes: a retry of the entry then starts from a clean
+        // manifest and clean levels.
         var needed: std.ArrayList(_tree.TableNeed) = .empty;
         defer needed.deinit(self.allocator);
         for (changes) |c| {
@@ -914,6 +928,12 @@ pub const Forest = struct {
             });
         }
         try self.table_cache.loadTables(needed.items);
+
+        // Manifest and levels change together, both in memory; the entry
+        // itself is already durable in the raft log.
+        if (changes.len > 0) {
+            try self.manifest.commit(index, changes, &.{});
+        }
 
         // Install each loaded table into its tree's level. We zip changes and
         // needed in the same order they were built, so indices align.
@@ -927,7 +947,9 @@ pub const Forest = struct {
             {
                 const held = tree.mu.hold(.exclusive, @src());
                 defer held.release();
-                try tree.levels[c.level].addEntry(held, n.id, n.table.?);
+                // A flush output is a new file, so the applying entry's
+                // index is exactly what the manifest just stored for it.
+                try tree.levels[c.level].addEntry(held, n.id, index, n.table.?);
             }
 
             // Metrics: one per-tree flush output + bytes written to L0.
@@ -1057,7 +1079,7 @@ pub const Forest = struct {
 
     /// Check if an SST file exists on disk.
     pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = _fi.sstPath(
+        const path = sstPath(
             self.allocator,
             self.opts.dir,
             file_id,
@@ -1080,7 +1102,7 @@ pub const Forest = struct {
             return;
         }
 
-        const path = _fi.sstPath(
+        const path = sstPath(
             self.allocator,
             self.opts.dir,
             file_id,
@@ -1171,7 +1193,7 @@ pub const Forest = struct {
 
         // Pre-open the table into the cache so it's ready when compaction needs
         // it.
-        const t = Table.open(self.allocator, path, .p1) catch |err| {
+        const t = Table.open(self.allocator, path, file_id, .p1) catch |err| {
             log.err(
                 "writeFile: Table.open failed for {d}: {s}",
                 .{ file_id, @errorName(err) },
@@ -1198,7 +1220,7 @@ pub const Forest = struct {
         allocator: std.mem.Allocator,
         file_id: u64,
     ) ?String {
-        const path = _fi.sstPath(
+        const path = sstPath(
             self.allocator,
             self.opts.dir,
             file_id,

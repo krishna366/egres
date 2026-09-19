@@ -69,7 +69,7 @@ pub const TreeChange = schema.Table(.{
 });
 
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a
-// level. `sst_id` is the on-disk SST identifier (file_ids.allocate), NOT a SQL
+// level. `sst_id` is the on-disk SST identifier (Manifest.newFileId), NOT a SQL
 // table id — the SQL table is the tree, derivable from tree_id. One tree holds
 // many SSTs; one SST can belong to many trees (shared after a split/clone,
 // freed when its refcount hits 0). `namespace_id` + `tree_id` locate the owning
@@ -81,14 +81,18 @@ pub const SSTableChange = schema.Table(.{
     .{ .id = 3, .name = "sst_id", .ty = schema.U64 }, // on-disk SST id
     .{ .id = 4, .name = "tree_id", .ty = schema.U64 },
     .{ .id = 5, .name = "namespace_id", .ty = schema.U64 },
-    // CRC32 of SST file (CREATE only)
+    // CRC32 of the SST file (CREATE only). Reserved: nothing sets it yet.
     .{ .id = 6, .name = "checksum", .ty = schema.U32 },
     // file size in bytes (CREATE only)
     .{ .id = 7, .name = "size", .ty = schema.U64 },
+    // log index of the entry that first listed this SST; 0 on a live
+    // proposal (the apply fills it from its own entry), set in a snapshot
+    // so restore recovers L0 order.
+    .{ .id = 8, .name = "raft_index", .ty = schema.U64 },
 });
 
 // Per-namespace manifest state, persisted ONLY inside a snapshot (a
-// serialized ForestState): the next-free table_id high-water-mark (so a
+// serialized Manifest): the next-free table_id high-water-mark (so a
 // re-elected leader never re-issues an id even after a DROP) and the
 // database name (SQL CREATE DATABASE; empty for unnamed legacy namespaces).
 // Live (non-snapshot) ManifestChanges leave `namespaces` empty.
@@ -99,7 +103,7 @@ pub const Namespace = schema.Table(.{
 });
 
 // Which kind of change a ManifestChange carries. `none` (0) is the zero value
-// left by the snapshot path (ForestState.serialize sets only the state fields);
+// left by the snapshot path (Manifest.serialize sets only the state fields);
 // it is never dispatched. DDL commands are verb-first and grouped as
 // consecutive create/drop pairs by object.
 pub const Command = schema.EnumDef(.{

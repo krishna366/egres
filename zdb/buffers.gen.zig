@@ -1490,6 +1490,7 @@ pub const SSTableChangeStruct = struct {
     namespace_id: u64 = 0,
     checksum: u32 = 0,
     size: u64 = 0,
+    raft_index: u64 = 0,
     pub fn deinit(self: *SSTableChangeStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -1509,6 +1510,7 @@ pub const SSTableChangeStruct = struct {
             .namespace_id = self.namespace_id,
             .checksum = self.checksum,
             .size = self.size,
+            .raft_index = self.raft_index,
         };
         errdefer s.deinit(alloc);
         return s;
@@ -1530,6 +1532,7 @@ pub const SSTableChangeStruct = struct {
         try writer.setNamespaceId(self.namespace_id);
         try writer.setChecksum(self.checksum);
         try writer.setSize(self.size);
+        try writer.setRaftIndex(self.raft_index);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1542,7 +1545,7 @@ pub const SSTableChangeReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46597;
-    pub const SIZE_BYTES: u16 = 43;
+    pub const SIZE_BYTES: u16 = 51;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -1608,6 +1611,13 @@ pub const SSTableChangeReader = struct {
         return zbuf.readU64(self.buf, @as(usize, self.base + 35)) catch 0;
     }
 
+    pub fn raftIndex(self: Self) u64 {
+        const slot_end = @as(u32, self.base) + 51;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 43)) catch 0;
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try SSTableChangeWriter.initWithBuf(alloc, out);
         try writer.setOp(self.op());
@@ -1617,6 +1627,7 @@ pub const SSTableChangeReader = struct {
         try writer.setNamespaceId(self.namespaceId());
         try writer.setChecksum(self.checksum());
         try writer.setSize(self.size());
+        try writer.setRaftIndex(self.raftIndex());
         const result = try writer.finish();
         return result.offset;
     }
@@ -1633,6 +1644,7 @@ pub const SSTableChangeReader = struct {
             .namespace_id = self.namespaceId(),
             .checksum = self.checksum(),
             .size = self.size(),
+            .raft_index = self.raftIndex(),
         };
         errdefer s.deinit(alloc);
         return s;
@@ -1680,7 +1692,7 @@ pub const SSTableChangeWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46597;
-    pub const SIZE_BYTES: u16 = 43;
+    pub const SIZE_BYTES: u16 = 51;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -1736,6 +1748,11 @@ pub const SSTableChangeWriter = struct {
         try zbuf.patchU64(out.items, self.base + 35, v);
     }
 
+    pub fn setRaftIndex(self: *Self, v: u64) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU64(out.items, self.base + 43, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -1748,6 +1765,7 @@ pub const SSTableChangeWriter = struct {
         if (@hasField(Values, "namespace_id")) try self.setNamespaceId(@field(values, "namespace_id"));
         if (@hasField(Values, "checksum")) try self.setChecksum(@field(values, "checksum"));
         if (@hasField(Values, "size")) try self.setSize(@field(values, "size"));
+        if (@hasField(Values, "raft_index")) try self.setRaftIndex(@field(values, "raft_index"));
     }
 
     pub fn finish(self: *Self) Error!SSTableChangeBuffer {

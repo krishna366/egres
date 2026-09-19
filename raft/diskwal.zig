@@ -851,17 +851,7 @@ pub const DiskWAL = struct {
         if (update.raft_id) |v| next.raft_id = v;
         if (update.checkpoint_index) |v| next.checkpoint_index = v;
         if (update.commit_index) |v| next.commit_index = v;
-        if (update.max_file_id) |v| next.max_file_id = v;
         self.meta.setHardState(next) catch |err| return mapToRaftLogError(err);
-    }
-
-    /// Persist a new `max_file_id` ceiling. Designed to be passed as a
-    /// callback to `zdb.file_ids.FileIds.bind` (matches the
-    /// `*anyopaque, u64 → !void` shape it expects). The DiskWAL itself
-    /// is the persistence backend, so the callback lives here.
-    pub fn persistMaxFileId(ctx: *anyopaque, new_max: u64) anyerror!void {
-        const self: *DiskWAL = @ptrCast(@alignCast(ctx));
-        try self.setHardState(.{ .max_file_id = new_max });
     }
 
     pub fn snapshot(self: *DiskWAL) *const _raftlog.Snapshot {

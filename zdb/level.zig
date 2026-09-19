@@ -129,6 +129,10 @@ pub const KeyRange = struct {
 
 pub const TableEntry = struct {
     id: u64,
+    /// Log index of the entry that first listed this SST
+    /// (`Manifest.raftIndexOf`). L0 is ordered by it: file ids are random,
+    /// so they say nothing about which table is newer.
+    raft_index: u64,
     table: *Table,
 };
 
@@ -203,13 +207,20 @@ pub const Level = struct {
         }
     }
 
-    /// sortEntries: L0 → by id ascending; L≥1 → by table.smallest key.
-    /// L0 tables would overlap. Newer tables would have higher ids and would be at the end.
+    /// sortEntries: L0 → by raft_index ascending, ties broken by id;
+    /// L≥1 → by table.smallest key.
+    /// L0 tables overlap, so the list has to carry their order: the newer
+    /// table has the higher raft_index and sits at the end. (Two tables
+    /// can share an index — one flush writes one SST per tree — but then
+    /// their key ranges are disjoint and the order between them is
+    /// immaterial; the id tie-break only keeps the sort deterministic.)
     /// L1 and onwards would have non-overlapping tables.
     fn sortEntries(self: *Level) void {
         if (self.level == 0) {
             std.mem.sort(TableEntry, self.tables.items, {}, struct {
                 fn lt(_: void, a: TableEntry, b: TableEntry) bool {
+                    if (a.raft_index != b.raft_index)
+                        return a.raft_index < b.raft_index;
                     return a.id < b.id;
                 }
             }.lt);
@@ -223,9 +234,19 @@ pub const Level = struct {
     }
 
     /// addEntry appends an entry, sorts, and increments the table's ref count.
-    pub fn addEntry(self: *Level, held: Lock.Exclusive, id: u64, t: *Table) !void {
+    pub fn addEntry(
+        self: *Level,
+        held: Lock.Exclusive,
+        id: u64,
+        raft_index: u64,
+        t: *Table,
+    ) !void {
         self.mu.assertHeld(held);
-        try self.tables.append(self.allocator, .{ .id = id, .table = t });
+        try self.tables.append(self.allocator, .{
+            .id = id,
+            .raft_index = raft_index,
+            .table = t,
+        });
         t.incrRef();
         self.total_size += @intCast(t.fileSize());
         self.sortEntries();
@@ -235,7 +256,11 @@ pub const Level = struct {
     /// table's ref.
     pub fn deleteEntry(self: *Level, held: Lock.Exclusive, id: u64) void {
         self.mu.assertHeld(held);
-        return self.deleteEntries(&.{.{ .id = id, .table = undefined }});
+        return self.deleteEntries(&.{.{
+            .id = id,
+            .raft_index = undefined,
+            .table = undefined,
+        }});
     }
 
     fn deleteEntries(self: *Level, to_del: []const TableEntry) void {
@@ -347,7 +372,8 @@ pub const Level = struct {
     }
 
     /// Pin the tables that could hold `search_key`, appended to `out` in
-    /// read order: L0 back-to-front (highest id = newest) so the first hit
+    /// read order: L0 back-to-front (newest = highest raft_index, last in
+    /// the list) so the first hit
     /// wins; L≥1 the one table whose range covers the key. Each pin is a
     /// ref, so the caller releases the lock and reads afterwards — an
     /// install that drops one of these tables from the level meanwhile

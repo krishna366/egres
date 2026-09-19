@@ -24,8 +24,7 @@ pub const SnapshotCfg = struct {
 };
 
 const zdb_bufs = zdb.buffers;
-const manifest = zdb.manifest;
-const fi = zdb.file_ids;
+const _manifest = zdb.manifest;
 const Forest = zdb.forest.Forest;
 const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
@@ -99,7 +98,7 @@ pub const StorageImpl = struct {
     }
 
     /// Cheap check: SM is ready for a data proposal once `recoverFromSnapshot`
-    /// has finished AND a real memtable (id != 0) is current. The leader
+    /// has finished AND a real memtable (raft_index != 0) is current. The leader
     /// polls this in `Node.proposeDataChange`; without the memtable gate, a
     /// write that races startup would land in the placeholder and be dropped
     /// by the first `swapCurrentOut`.
@@ -233,14 +232,14 @@ pub const StorageImpl = struct {
         }
 
         switch (mcs.cmd) {
-            .new_memtable => try self.forest.newMemtable(mcs.memtable_id, index),
-            .flush => try self.forest.applyFlush(mcs.sstable_changes, mcs.memtable_id),
+            .new_memtable => try self.forest.newMemtable(index),
+            .flush => try self.forest.applyFlush(index, mcs.sstable_changes, mcs.memtable_id),
             .compaction => {
                 if (mcs.sstable_changes.len > 0) {
                     const sc = mcs.sstable_changes[0];
                     if (self.forest.getTree(sc.namespace_id, sc.tree_id)) |tree| {
                         defer tree.release();
-                        try tree.applyCompaction(mcs.sstable_changes);
+                        try tree.applyCompaction(index, mcs.sstable_changes);
                     }
                 }
             },
@@ -249,15 +248,15 @@ pub const StorageImpl = struct {
                     const sc = mcs.sstable_changes[0];
                     if (self.forest.getTree(sc.namespace_id, sc.tree_id)) |tree| {
                         defer tree.release();
-                        try tree.applyBackfill(mcs.sstable_changes);
+                        try tree.applyBackfill(index, mcs.sstable_changes);
                     }
                 }
             },
-            .tree_split => try self.forest.applySplit(mcs.*),
-            .create_ns => try self.forest.applyNamespaceCreate(mcs.*),
-            .drop_ns => try self.forest.applyNamespaceDrop(mcs.*),
-            .create_tree => try self.forest.applyCreateTree(mcs.*),
-            .drop_tree => try self.forest.applyDropTree(mcs.*),
+            .tree_split => try self.forest.applySplit(index, mcs.*),
+            .create_ns => try self.forest.applyNamespaceCreate(index, mcs.*),
+            .drop_ns => try self.forest.applyNamespaceDrop(index, mcs.*),
+            .create_tree => try self.forest.applyCreateTree(index, mcs.*),
+            .drop_tree => try self.forest.applyDropTree(index, mcs.*),
             else => log.err("unknown ManifestChange cmd={d}", .{@intFromEnum(mcs.cmd)}),
         }
     }
@@ -342,7 +341,7 @@ pub const StorageImpl = struct {
 
         if (self.forest.hasFile(file_id)) return;
 
-        const name = try fi.sstPath(self.allocator, "", file_id);
+        const name = try zdb.sstPath(self.allocator, "", file_id);
         defer self.allocator.free(name);
 
         const data = try self.store.getAll(self.allocator, name);
@@ -448,17 +447,13 @@ pub const Engine = struct {
     bg: fiber.Group(void),
 
     /// Construct the engine and do all the node/forest wiring: build the apply
-    /// state machine and install it on the node, create the raft runtime, and
-    /// bind the forest's file-id allocator to the node + WAL (node id namespaces
-    /// ids; the counter resumes past HardState's persisted max_file_id). Heap-
-    /// allocated so `storage_impl`/`sm`/`raft_rt` keep stable addresses.
+    /// state machine and install it on the node, and create the raft runtime.
+    /// Heap-allocated so `storage_impl`/`sm`/`raft_rt` keep stable addresses.
     pub fn open(
         allocator: std.mem.Allocator,
         node: *raft.Node,
         forest: *Forest,
-        wal: *raft.DiskWAL,
         snapshot_cfg: *flags.Live(SnapshotCfg),
-        raft_node_id: u64,
         store: *zdb.vfs.FileStore,
     ) !*Engine {
         const self = try allocator.create(Engine);
@@ -483,12 +478,6 @@ pub const Engine = struct {
         };
         self.sm = self.storage_impl.asStateMachine();
         self.node.state_machine = &self.sm;
-        self.forest.file_ids.bind(
-            @intCast(raft_node_id),
-            node.log.hardState().max_file_id,
-            @ptrCast(wal),
-            raft.DiskWAL.persistMaxFileId,
-        );
         return self;
     }
 
@@ -755,7 +744,7 @@ pub const Engine = struct {
         if (snap.index == 0 or snap.data.len == 0) return;
 
         log.info("recovery: restoring manifest from snapshot index={d} bytes={d}", .{ snap.index, snap.data.len });
-        try self.forest.ms.restoreFrom(snap.data);
+        try self.forest.manifest.restoreFrom(snap.data);
         oldest_idx = snap.oldest_memtable_index;
 
         // Download every missing SST from the shared object store before
@@ -887,7 +876,7 @@ pub const Engine = struct {
 
         // Seed draft from previous snapshot's manifest, then replay every
         // manifest-bearing log entry in (prev_snap.index, target].
-        var draft = manifest.ForestState.init(self.allocator);
+        var draft = _manifest.Manifest.init(self.allocator);
         defer draft.deinit();
         if (prev_snap.data.len > 0) {
             try draft.restoreFrom(prev_snap.data);
@@ -934,7 +923,7 @@ pub const Engine = struct {
                         self.allocator.destroy(mcs);
                     }
                     try replayNames(&draft, mcs.*);
-                    try draft.commit(mcs.sstable_changes, mcs.tree_changes);
+                    try draft.commit(stored.index, mcs.sstable_changes, mcs.tree_changes);
                 },
                 else => continue,
             }
@@ -975,8 +964,8 @@ pub const Engine = struct {
     /// TODO: We probably should move table names over to the table schema, and
     /// avoid storing them in the MANIFEST.
     fn replayNames(
-        dst: *manifest.ForestState,
-        mcs: manifest.ManifestChange,
+        dst: *_manifest.Manifest,
+        mcs: _manifest.ManifestChange,
     ) !void {
         const treeTableId = zdb.kv.treeTableId;
         switch (mcs.cmd) {
@@ -1079,8 +1068,9 @@ pub const Engine = struct {
     fn proposeNewMemtable(self: *Engine) !void {
         self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_ms = fiber.coarseMs() });
         defer self.removeInFlight(.new_memtable, 0, 0);
-        const new_id = try self.forest.file_ids.allocate();
-        const payload = try zdb_bufs.marshalRoot(self.allocator, manifest.ManifestChange{ .cmd = .new_memtable, .memtable_id = new_id });
+        // memtable_id stays 0 in the proposal: the id is assigned at apply
+        // as the entry's own log index, identically on every node.
+        const payload = try zdb_bufs.marshalRoot(self.allocator, _manifest.ManifestChange{ .cmd = .new_memtable, .memtable_id = 0 });
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
     }
@@ -1144,7 +1134,6 @@ pub const Engine = struct {
         defer tree.release();
         var changes = try tree.buildCompaction(
             src,
-            &self.forest.file_ids,
             self.forest.globalMinRead(),
         );
         defer changes.deinit(self.allocator);
@@ -1238,7 +1227,7 @@ pub const Engine = struct {
     /// fetch remains the backstop. No-op without a store (single node:
     /// joins are rejected without one, so peers imply a store). Pub: SST
     /// creators outside the engine (sql index backfill) call it too.
-    pub fn distributeNewFiles(self: *Engine, changes: []const manifest.SSTableChange) !void {
+    pub fn distributeNewFiles(self: *Engine, changes: []const _manifest.SSTableChange) !void {
         if (self.store.* == .none) return;
         const fe = std.log.scoped(.file_event);
         var file_ids = std.ArrayList(u64).empty;
@@ -1247,7 +1236,7 @@ pub const Engine = struct {
             if (c.op != .create) continue;
 
             try file_ids.append(self.allocator, c.sst_id);
-            const name = try fi.sstPath(self.allocator, "", c.sst_id);
+            const name = try zdb.sstPath(self.allocator, "", c.sst_id);
             defer self.allocator.free(name);
 
             // Retried proposes and splits re-reference already-uploaded ids.
@@ -1368,7 +1357,7 @@ pub const Engine = struct {
     /// it. Pairs with the forest `build*` constructors: the caller builds the
     /// change (leader side), this makes it real everywhere. Control plane uses
     /// `.apply` — the change must be locally visible when the caller returns.
-    pub fn proposeMC(self: *Engine, mc: manifest.ManifestChange, wait_for: Wait) !void {
+    pub fn proposeMC(self: *Engine, mc: _manifest.ManifestChange, wait_for: Wait) !void {
         const payload = try encodeManifestChange(self.allocator, mc.cmd, mc.sstable_changes, mc.tree_changes, mc.memtable_id);
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload, .manifest, wait_for);
@@ -1401,15 +1390,15 @@ pub const Engine = struct {
 /// Encode a ManifestChange into a zbuf-serialized payload for proposeDataChange.
 fn encodeManifestChange(
     allocator: std.mem.Allocator,
-    cmd: manifest.Command,
-    sstable_changes: []manifest.SSTableChange,
-    tree_changes: []manifest.TreeChange,
+    cmd: _manifest.Command,
+    sstable_changes: []_manifest.SSTableChange,
+    tree_changes: []_manifest.TreeChange,
     memtable_id: u64,
 ) ![]u8 {
     // marshalRoot serializes every field of the nested SSTableChange /
     // TreeChange (namespace_id, checksum, size, …); a hand-written writer
     // that copies only a subset would silently drop the new id-model fields.
-    return zdb_bufs.marshalRoot(allocator, manifest.ManifestChange{
+    return zdb_bufs.marshalRoot(allocator, _manifest.ManifestChange{
         .cmd = cmd,
         .sstable_changes = sstable_changes,
         .tree_changes = tree_changes,

@@ -1,14 +1,14 @@
 const std = @import("std");
 const zdb = @import("zdb");
 
-const manifest = zdb.manifest;
-const ManifestError = manifest.ManifestError;
+const _manifest = zdb.manifest;
+const ManifestError = _manifest.ManifestError;
 const TreeKey = zdb.kv.TreeKey;
-const createSSTableChange = manifest.createSSTableChange;
-const deleteSSTableChange = manifest.deleteSSTableChange;
-const createTreeChange = manifest.createTreeChange;
-const deleteTreeChange = manifest.deleteTreeChange;
-const updateTreeChange = manifest.updateTreeChange;
+const createSSTableChange = _manifest.createSSTableChange;
+const deleteSSTableChange = _manifest.deleteSSTableChange;
+const createTreeChange = _manifest.createTreeChange;
+const deleteTreeChange = _manifest.deleteTreeChange;
+const updateTreeChange = _manifest.updateTreeChange;
 
 const tree_id: u64 = 1;
 
@@ -23,18 +23,18 @@ fn tk(namespace: u64, id: u64) TreeKey {
 
 test "manifest commit applies tree + table changes" {
     const alloc = std.testing.allocator;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
-    try ms.commit(&.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
-    try ms.commit(&.{
+    try manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    try manifest.commit(2, &.{
         createSSTableChange(1, 0, tree_id, 0),
         createSSTableChange(2, 0, tree_id, 1),
         createSSTableChange(3, 0, tree_id, 2),
     }, &.{});
 
-    try std.testing.expectEqual(@as(u32, 3), ms.tableCount());
-    const tree = ms.trees.get(tk(0, tree_id)).?;
+    try std.testing.expectEqual(@as(u32, 3), manifest.tableCount());
+    const tree = manifest.trees.get(tk(0, tree_id)).?;
     try std.testing.expect(tree.levels.items[0].tables.contains(1));
     try std.testing.expect(tree.levels.items[1].tables.contains(2));
     try std.testing.expect(tree.levels.items[2].tables.contains(3));
@@ -46,23 +46,23 @@ test "manifest commit applies tree + table changes" {
 
 test "manifest tree create and delete" {
     const alloc = std.testing.allocator;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
-    try ms.commit(&.{}, &.{ createTreeChange(1, 0, &.{}, &.{}), createTreeChange(2, 0, &.{}, &.{}) });
-    try ms.commit(&.{
+    try manifest.commit(1, &.{}, &.{ createTreeChange(1, 0, &.{}, &.{}), createTreeChange(2, 0, &.{}, &.{}) });
+    try manifest.commit(2, &.{
         createSSTableChange(10, 0, 1, 0),
         createSSTableChange(20, 0, 2, 0),
     }, &.{});
 
     // Delete tree 2 — its tables are automatically cleaned up.
-    try ms.commit(&.{}, &.{deleteTreeChange(2, 0)});
+    try manifest.commit(3, &.{}, &.{deleteTreeChange(2, 0)});
 
-    try std.testing.expectEqual(@as(u32, 1), ms.trees.count());
-    try std.testing.expect(ms.trees.contains(tk(0, 1)));
-    try std.testing.expect(!ms.trees.contains(tk(0, 2)));
-    try std.testing.expectEqual(@as(u32, 1), ms.tableCount());
-    try std.testing.expect(ms.trees.get(tk(0, 1)).?.levels.items[0].tables.contains(10));
+    try std.testing.expectEqual(@as(u32, 1), manifest.trees.count());
+    try std.testing.expect(manifest.trees.contains(tk(0, 1)));
+    try std.testing.expect(!manifest.trees.contains(tk(0, 2)));
+    try std.testing.expectEqual(@as(u32, 1), manifest.tableCount());
+    try std.testing.expect(manifest.trees.get(tk(0, 1)).?.levels.items[0].tables.contains(10));
 }
 
 // -------------------------------------------------------------------------
@@ -71,25 +71,25 @@ test "manifest tree create and delete" {
 
 test "manifest multi-tree table" {
     const alloc = std.testing.allocator;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
-    try ms.commit(&.{}, &.{ createTreeChange(1, 0, &.{}, &.{}), createTreeChange(2, 0, &.{}, &.{}) });
+    try manifest.commit(1, &.{}, &.{ createTreeChange(1, 0, &.{}, &.{}), createTreeChange(2, 0, &.{}, &.{}) });
 
     // Same table_id=100 belongs to both trees (post-split shared SST scenario).
-    try ms.commit(&.{
+    try manifest.commit(2, &.{
         createSSTableChange(100, 0, 1, 0),
         createSSTableChange(100, 0, 2, 0),
     }, &.{});
 
     // Delete from tree 1 — table should still exist in tree 2.
-    try ms.commit(&.{deleteSSTableChange(100, 0, 1, 0)}, &.{});
-    try std.testing.expect(!ms.trees.get(tk(0, 1)).?.levels.items[0].tables.contains(100));
-    try std.testing.expect(ms.trees.get(tk(0, 2)).?.levels.items[0].tables.contains(100));
+    try manifest.commit(3, &.{deleteSSTableChange(100, 0, 1, 0)}, &.{});
+    try std.testing.expect(!manifest.trees.get(tk(0, 1)).?.levels.items[0].tables.contains(100));
+    try std.testing.expect(manifest.trees.get(tk(0, 2)).?.levels.items[0].tables.contains(100));
 
     // Delete from tree 2 — now table should be gone from all trees.
-    try ms.commit(&.{deleteSSTableChange(100, 0, 2, 0)}, &.{});
-    try std.testing.expectEqual(@as(u32, 0), ms.tableCount());
+    try manifest.commit(4, &.{deleteSSTableChange(100, 0, 2, 0)}, &.{});
+    try std.testing.expectEqual(@as(u32, 0), manifest.tableCount());
 }
 
 // -------------------------------------------------------------------------
@@ -98,8 +98,8 @@ test "manifest multi-tree table" {
 
 test "manifest tree key range update" {
     const alloc = std.testing.allocator;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     const Key = zdb.kv.Key;
 
@@ -114,16 +114,16 @@ test "manifest tree key range update" {
     const right_raw = try right.marshal(alloc);
     defer alloc.free(right_raw);
 
-    try ms.commit(&.{}, &.{createTreeChange(1, 0, left_raw, mid_raw)});
+    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, left_raw, mid_raw)});
     {
-        const tree = ms.trees.get(tk(0, 1)).?;
+        const tree = manifest.trees.get(tk(0, 1)).?;
         try std.testing.expectEqualStrings("aaa", tree.left.primary);
         try std.testing.expectEqualStrings("mmm", tree.right.primary);
     }
 
-    try ms.commit(&.{}, &.{updateTreeChange(1, 0, left_raw, right_raw)});
+    try manifest.commit(2, &.{}, &.{updateTreeChange(1, 0, left_raw, right_raw)});
     {
-        const tree = ms.trees.get(tk(0, 1)).?;
+        const tree = manifest.trees.get(tk(0, 1)).?;
         try std.testing.expectEqualStrings("aaa", tree.left.primary);
         try std.testing.expectEqualStrings("zzz", tree.right.primary);
     }
@@ -135,12 +135,12 @@ test "manifest tree key range update" {
 
 test "manifest applySSTableChange on missing tree errors" {
     const alloc = std.testing.allocator;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     try std.testing.expectError(
         ManifestError.TreeNotFound,
-        ms.commit(&.{createSSTableChange(1, 0, 999, 0)}, &.{}),
+        manifest.commit(1, &.{createSSTableChange(1, 0, 999, 0)}, &.{}),
     );
 }
 
@@ -153,7 +153,7 @@ test "manifest serialize/restoreFrom round-trip" {
 
     // Build a non-trivial state: 2 trees with key ranges + namespaces, tables
     // spread across L0–L3, including the "shared table across trees" case.
-    var src = manifest.ForestState.init(alloc);
+    var src = _manifest.Manifest.init(alloc);
     defer src.deinit();
 
     const Key = zdb.kv.Key;
@@ -164,7 +164,7 @@ test "manifest serialize/restoreFrom round-trip" {
     const z_raw = try (Key{ .primary = "zzz" }).marshal(alloc);
     defer alloc.free(z_raw);
 
-    try src.commit(&.{}, &.{
+    try src.commit(1, &.{}, &.{
         createTreeChange(1, 7, a_raw, m_raw),
         createTreeChange(2, 7, m_raw, z_raw),
         // A named user table, split into two trees — the name must survive
@@ -174,7 +174,7 @@ test "manifest serialize/restoreFrom round-trip" {
         createTreeChange(zdb.kv.makeTreeId(16, 1), 7, m_raw, &.{}),
     });
     try src.registerTableName(7, 16, "users");
-    try src.commit(&.{
+    try src.commit(2, &.{
         createSSTableChange(10, 7, 1, 0),
         createSSTableChange(11, 7, 1, 0),
         createSSTableChange(12, 7, 1, 1),
@@ -191,7 +191,7 @@ test "manifest serialize/restoreFrom round-trip" {
     try std.testing.expect(bytes.len > 0);
 
     // Restore into a fresh state.
-    var dst = manifest.ForestState.init(alloc);
+    var dst = _manifest.Manifest.init(alloc);
     defer dst.deinit();
     try dst.restoreFrom(bytes);
 
@@ -229,18 +229,18 @@ test "manifest serialize/restoreFrom round-trip" {
 test "manifest restoreFrom replaces existing state" {
     const alloc = std.testing.allocator;
 
-    var src = manifest.ForestState.init(alloc);
+    var src = _manifest.Manifest.init(alloc);
     defer src.deinit();
-    try src.commit(&.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
-    try src.commit(&.{createSSTableChange(10, 0, 1, 0)}, &.{});
+    try src.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try src.commit(2, &.{createSSTableChange(10, 0, 1, 0)}, &.{});
     const bytes = try src.serialize(alloc);
     defer alloc.free(bytes);
 
     // Fill `dst` with garbage that should disappear after restore.
-    var dst = manifest.ForestState.init(alloc);
+    var dst = _manifest.Manifest.init(alloc);
     defer dst.deinit();
-    try dst.commit(&.{}, &.{createTreeChange(99, 0, &.{}, &.{})});
-    try dst.commit(&.{createSSTableChange(999, 0, 99, 0)}, &.{});
+    try dst.commit(3, &.{}, &.{createTreeChange(99, 0, &.{}, &.{})});
+    try dst.commit(4, &.{createSSTableChange(999, 0, 99, 0)}, &.{});
     try dst.registerTableName(0, 55, "stale");
     try std.testing.expect(dst.trees.contains(tk(0, 99)));
 
@@ -259,36 +259,36 @@ test "manifest restoreFrom replaces existing state" {
 
 test "manifest table names: register/lookup/drop" {
     const alloc = std.testing.allocator;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
-    try ms.registerTableName(5, 16, "users");
-    try std.testing.expectEqual(@as(?u32, 16), ms.lookupTable(5, "users"));
+    try manifest.registerTableName(5, 16, "users");
+    try std.testing.expectEqual(@as(?u32, 16), manifest.lookupTable(5, "users"));
 
     // Idempotent re-apply; a collision (build-side bug) is skipped, never
     // clobbered.
-    try ms.registerTableName(5, 16, "users");
-    try ms.registerTableName(5, 17, "users");
-    try std.testing.expectEqual(@as(?u32, 16), ms.lookupTable(5, "users"));
+    try manifest.registerTableName(5, 16, "users");
+    try manifest.registerTableName(5, 17, "users");
+    try std.testing.expectEqual(@as(?u32, 16), manifest.lookupTable(5, "users"));
 
     // Empty names record nothing; lookups are namespace-scoped.
-    try ms.registerTableName(5, 18, "");
-    try std.testing.expect(ms.lookupTable(5, "") == null);
-    try std.testing.expect(ms.lookupTable(6, "users") == null);
+    try manifest.registerTableName(5, 18, "");
+    try std.testing.expect(manifest.lookupTable(5, "") == null);
+    try std.testing.expect(manifest.lookupTable(6, "users") == null);
 
     // dropTable frees the name for a re-register at a fresh id; idempotent.
-    ms.dropTable(5, 16);
-    try std.testing.expect(ms.lookupTable(5, "users") == null);
-    ms.dropTable(5, 16);
-    try ms.registerTableName(5, 19, "users");
-    try std.testing.expectEqual(@as(?u32, 19), ms.lookupTable(5, "users"));
+    manifest.dropTable(5, 16);
+    try std.testing.expect(manifest.lookupTable(5, "users") == null);
+    manifest.dropTable(5, 16);
+    try manifest.registerTableName(5, 19, "users");
+    try std.testing.expectEqual(@as(?u32, 19), manifest.lookupTable(5, "users"));
 
     // dropNamespace forgets every table name (leak-checked by the test
     // allocator).
-    try ms.registerTableName(5, 20, "orders");
-    ms.dropNamespace(5);
-    try std.testing.expect(ms.lookupTable(5, "users") == null);
-    try std.testing.expect(ms.lookupTable(5, "orders") == null);
+    try manifest.registerTableName(5, 20, "orders");
+    manifest.dropNamespace(5);
+    try std.testing.expect(manifest.lookupTable(5, "users") == null);
+    try std.testing.expect(manifest.lookupTable(5, "orders") == null);
 }
 
 // -------------------------------------------------------------------------
@@ -298,23 +298,23 @@ test "manifest table names: register/lookup/drop" {
 test "manifest clone is independent of source" {
     const alloc = std.testing.allocator;
 
-    var src = manifest.ForestState.init(alloc);
+    var src = _manifest.Manifest.init(alloc);
     defer src.deinit();
-    try src.commit(&.{}, &.{createTreeChange(1, 5, &.{}, &.{})});
-    try src.commit(&.{createSSTableChange(10, 5, 1, 0)}, &.{});
+    try src.commit(1, &.{}, &.{createTreeChange(1, 5, &.{}, &.{})});
+    try src.commit(2, &.{createSSTableChange(10, 5, 1, 0)}, &.{});
 
     var copy = try src.clone(alloc);
     defer copy.deinit();
 
     // Mutating src must not affect copy.
-    try src.commit(&.{createSSTableChange(11, 5, 1, 0)}, &.{});
+    try src.commit(3, &.{createSSTableChange(11, 5, 1, 0)}, &.{});
     try std.testing.expectEqual(@as(u32, 2), src.tableCount());
     try std.testing.expectEqual(@as(u32, 1), copy.tableCount());
     try std.testing.expect(copy.trees.get(tk(5, 1)).?.levels.items[0].tables.contains(10));
     try std.testing.expect(!copy.trees.get(tk(5, 1)).?.levels.items[0].tables.contains(11));
 
     // Mutating copy must not affect src.
-    try copy.commit(&.{}, &.{deleteTreeChange(1, 5)});
+    try copy.commit(4, &.{}, &.{deleteTreeChange(1, 5)});
     try std.testing.expectEqual(@as(u32, 0), copy.trees.count());
     try std.testing.expectEqual(@as(u32, 1), src.trees.count());
 }
@@ -325,28 +325,28 @@ test "manifest clone is independent of source" {
 
 test "manifest table_id counter allocate/advance/persist" {
     const alloc = std.testing.allocator;
-    const first = manifest.first_table_id;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    const first = _manifest.first_table_id;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     // First allocation in a namespace floors at first_table_id; then +1 each.
-    try std.testing.expectEqual(first, try ms.nextTableId(16));
-    try std.testing.expectEqual(first + 1, try ms.nextTableId(16));
+    try std.testing.expectEqual(first, try manifest.nextTableId(16));
+    try std.testing.expectEqual(first + 1, try manifest.nextTableId(16));
     // A different namespace is independent.
-    try std.testing.expectEqual(first, try ms.nextTableId(17));
+    try std.testing.expectEqual(first, try manifest.nextTableId(17));
 
     // advanceTableId only ever raises: an id below the current high-water-mark
     // is ignored (next = first+1 < the counter, which is already at first+2)...
-    try ms.advanceTableId(16, first);
-    try std.testing.expectEqual(first + 2, try ms.nextTableId(16));
+    try manifest.advanceTableId(16, first);
+    try std.testing.expectEqual(first + 2, try manifest.nextTableId(16));
     // ...but a higher id jumps the counter forward.
-    try ms.advanceTableId(16, 1000);
-    try std.testing.expectEqual(@as(u32, 1001), try ms.nextTableId(16));
+    try manifest.advanceTableId(16, 1000);
+    try std.testing.expectEqual(@as(u32, 1001), try manifest.nextTableId(16));
 
     // Counters survive serialize → restore (the snapshot path).
-    const bytes = try ms.serialize(alloc);
+    const bytes = try manifest.serialize(alloc);
     defer alloc.free(bytes);
-    var dst = manifest.ForestState.init(alloc);
+    var dst = _manifest.Manifest.init(alloc);
     defer dst.deinit();
     try dst.restoreFrom(bytes);
     try std.testing.expectEqual(@as(u32, 1002), try dst.nextTableId(16));
@@ -355,26 +355,104 @@ test "manifest table_id counter allocate/advance/persist" {
 
 test "manifest next_ns_id allocate/advance/persist" {
     const alloc = std.testing.allocator;
-    const first = manifest.first_namespace;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    const first = _manifest.first_namespace;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     // Fresh state allocates from first_namespace; then +1 each.
-    try std.testing.expectEqual(first, ms.nextNamespace());
-    try std.testing.expectEqual(first + 1, ms.nextNamespace());
+    try std.testing.expectEqual(first, manifest.nextNamespace());
+    try std.testing.expectEqual(first + 1, manifest.nextNamespace());
 
     // advance only raises: a reserved (sub-floor) id is ignored...
-    ms.advanceNamespace(3);
-    try std.testing.expectEqual(first + 2, ms.nextNamespace());
+    manifest.advanceNamespace(3);
+    try std.testing.expectEqual(first + 2, manifest.nextNamespace());
     // ...a higher id jumps the counter forward.
-    ms.advanceNamespace(100);
-    try std.testing.expectEqual(@as(u64, 101), ms.nextNamespace());
+    manifest.advanceNamespace(100);
+    try std.testing.expectEqual(@as(u64, 101), manifest.nextNamespace());
 
     // Survives serialize → restore (the snapshot path).
-    const bytes = try ms.serialize(alloc);
+    const bytes = try manifest.serialize(alloc);
     defer alloc.free(bytes);
-    var dst = manifest.ForestState.init(alloc);
+    var dst = _manifest.Manifest.init(alloc);
     defer dst.deinit();
     try dst.restoreFrom(bytes);
     try std.testing.expectEqual(@as(u64, 102), dst.nextNamespace());
+}
+
+// -------------------------------------------------------------------------
+// File ids
+// -------------------------------------------------------------------------
+
+test "manifest newFileId draws nonzero, distinct ids" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    try manifest.commit(2, &.{
+        createSSTableChange(10, 0, tree_id, 0),
+        createSSTableChange(20, 0, tree_id, 1),
+    }, &.{});
+
+    // Every draw is nonzero, pairwise distinct, and never a listed id.
+    var seen = std.AutoHashMap(u64, void).init(alloc);
+    defer seen.deinit();
+    for (0..100) |_| {
+        const id = manifest.newFileId();
+        try std.testing.expect(id != 0 and id != 10 and id != 20);
+        try std.testing.expect(!seen.contains(id));
+        try seen.put(id, {});
+    }
+}
+
+test "manifest sst refs across create, share, and delete" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}),
+        createTreeChange(2, 0, &.{}, &.{}),
+    });
+
+    // One file listed by tree 1 at index 5.
+    try manifest.commit(5, &.{createSSTableChange(77, 0, 1, 0)}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), manifest.ssts.get(77).?.refs);
+    try std.testing.expectEqual(@as(u64, 5), manifest.raftIndexOf(77));
+
+    // A split hands the same file to tree 2 later: a second listing, but
+    // the file keeps the index that introduced it.
+    try manifest.commit(9, &.{createSSTableChange(77, 0, 2, 0)}, &.{});
+    try std.testing.expectEqual(@as(u32, 2), manifest.ssts.get(77).?.refs);
+    try std.testing.expectEqual(@as(u64, 5), manifest.raftIndexOf(77));
+
+    // One delete leaves the other listing standing.
+    try manifest.commit(11, &.{deleteSSTableChange(77, 0, 1, 0)}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), manifest.ssts.get(77).?.refs);
+
+    // Dropping the last listing's tree forgets the file.
+    try manifest.commit(12, &.{}, &.{deleteTreeChange(2, 0)});
+    try std.testing.expect(manifest.ssts.get(77) == null);
+}
+
+test "manifest serialize round-trip preserves raft_index" {
+    const alloc = std.testing.allocator;
+    var src = _manifest.Manifest.init(alloc);
+    defer src.deinit();
+
+    try src.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try src.commit(4, &.{createSSTableChange(10, 0, 1, 0)}, &.{});
+    try src.commit(6, &.{createSSTableChange(20, 0, 1, 0)}, &.{});
+    try src.commit(8, &.{createSSTableChange(30, 0, 1, 1)}, &.{});
+
+    const bytes = try src.serialize(alloc);
+    defer alloc.free(bytes);
+
+    var dst = _manifest.Manifest.init(alloc);
+    defer dst.deinit();
+    try dst.restoreFrom(bytes);
+
+    try std.testing.expectEqual(@as(u64, 4), dst.raftIndexOf(10));
+    try std.testing.expectEqual(@as(u64, 6), dst.raftIndexOf(20));
+    try std.testing.expectEqual(@as(u64, 8), dst.raftIndexOf(30));
 }

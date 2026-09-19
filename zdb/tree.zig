@@ -8,7 +8,7 @@ const _level_handler = @import("level.zig");
 const _table = @import("table.zig");
 const vfs = @import("vfs");
 const _metrics = @import("metrics.zig");
-const _fi = @import("file_ids.zig");
+const _forest = @import("forest.zig");
 const zroar = @import("zroar");
 const _compaction = @import("compaction.zig");
 
@@ -204,7 +204,7 @@ pub const TableCache = struct {
             const now = fiber.coarseMs();
             if (now - last_warn >= 15_000) {
                 log.warn(
-                    "loadTables watchdog: {d}/{d} opens completed after {d}ms",
+                    "loadTables watchdog: {d}/{d} opens completed after {d}manifest",
                     .{ completed.load(.acquire), total, now - start },
                 );
                 last_warn = now;
@@ -232,7 +232,7 @@ pub const TableCache = struct {
         // Phase B: open the SST file WITHOUT holding the lock.
         // Table.open may yield the fiber (async I/O); holding the lock here
         // would deadlock cooperative fibers on the same OS thread (EDEADLK).
-        const path = _fi.sstPath(
+        const path = _forest.sstPath(
             self.allocator,
             self.dir,
             need.id,
@@ -241,7 +241,7 @@ pub const TableCache = struct {
             return;
         };
         defer self.allocator.free(path);
-        const t = Table.open(self.allocator, path, .p0) catch |err| {
+        const t = Table.open(self.allocator, path, need.id, .p0) catch |err| {
             tse.set(err);
             return;
         };
@@ -286,7 +286,7 @@ pub const Tree = struct {
     opts: _config.Config,
     namespace: u64,
     tree_id: u64,
-    ms: *_manifest.ForestState,
+    manifest: *_manifest.Manifest,
     cache: *TableCache,
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
@@ -360,7 +360,7 @@ pub const Tree = struct {
         opts: _config.Config,
         namespace: u64,
         tree_id: u64,
-        ms: *_manifest.ForestState,
+        manifest: *_manifest.Manifest,
         cache: *TableCache,
     ) !*Tree {
         const self = try allocator.create(Tree);
@@ -385,9 +385,9 @@ pub const Tree = struct {
         var needed: std.ArrayList(TableNeed) = .empty;
         defer needed.deinit(allocator);
         {
-            const held = ms.mu.hold(.shared, @src());
+            const held = manifest.mu.hold(.shared, @src());
             defer held.release();
-            if (ms.treeState(held, .{
+            if (manifest.treeState(held, .{
                 .namespace = namespace,
                 .tree_id = tree_id,
             })) |tree| {
@@ -415,7 +415,7 @@ pub const Tree = struct {
             .opts = opts,
             .namespace = namespace,
             .tree_id = tree_id,
-            .ms = ms,
+            .manifest = manifest,
             .cache = cache,
             .levels = levels,
             .key_range = kr,
@@ -426,7 +426,12 @@ pub const Tree = struct {
             const held = self.mu.hold(.exclusive, @src());
             defer held.release();
             for (needed.items) |n| {
-                try levels[n.level].addEntry(held, n.id, n.table.?);
+                try levels[n.level].addEntry(
+                    held,
+                    n.id,
+                    manifest.raftIndexOf(n.id),
+                    n.table.?,
+                );
             }
         }
         try self.updateCompactCandidate();
@@ -749,16 +754,16 @@ pub const Tree = struct {
     /// Called after Raft commit on all nodes (leader and followers).
     pub fn applyCompaction(
         self: *Tree,
+        index: u64,
         changes: []const _manifest.SSTableChange,
     ) !void {
         if (changes.len == 0) return;
 
-        // Commit to manifest (durable) before touching the levels.
-        try self.ms.commit(changes, &.{});
-
         // Batch-load all CREATE tables via the cache in a single concurrent
         // pass. writeFile may have pre-opened them (follower path) → hit;
-        // otherwise loadTables opens them.
+        // otherwise loadTables opens them. This is the step that can fail
+        // (I/O), so it runs before any state changes: a retry of the
+        // entry then starts from a clean manifest and clean levels.
         var needed: std.ArrayList(TableNeed) = .empty;
         defer needed.deinit(self.allocator);
         for (changes) |c| {
@@ -770,6 +775,10 @@ pub const Tree = struct {
             }
         }
         try self.cache.loadTables(needed.items);
+
+        // Manifest and levels change together, both in memory; the entry
+        // itself is already durable in the raft log.
+        try self.manifest.commit(index, changes, &.{});
 
         // Apply level changes in original order: delete old entries, add new.
         // Track total bytes created and the destination level for metrics.
@@ -788,7 +797,15 @@ pub const Tree = struct {
                     const n = needed.items[need_idx];
                     need_idx += 1;
                     std.debug.assert(c.sst_id == n.id);
-                    try self.levels[c.level].addEntry(held, n.id, n.table.?);
+                    // A compaction or backfill output is a new file, so
+                    // the applying entry's index is exactly what the
+                    // manifest just stored for it.
+                    try self.levels[c.level].addEntry(
+                        held,
+                        n.id,
+                        index,
+                        n.table.?,
+                    );
                     bytes_out += n.table.?.fileSize();
                     dest_level = @intCast(c.level);
                 }
@@ -827,6 +844,7 @@ pub const Tree = struct {
     /// INDEX loudly on a skip.
     pub fn applyBackfill(
         self: *Tree,
+        index: u64,
         changes: []const _manifest.SSTableChange,
     ) !void {
         if (changes.len == 0) return;
@@ -847,6 +865,6 @@ pub const Tree = struct {
             );
             return;
         }
-        try self.applyCompaction(changes);
+        try self.applyCompaction(index, changes);
     }
 };

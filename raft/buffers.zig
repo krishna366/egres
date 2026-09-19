@@ -61,14 +61,6 @@ pub const HardState = schema.Table(.{
     // by the persist cadence; on crash recovery we just re-derive the
     // tail through normal raft.
     .{ .id = 6, .name = "commit_index", .ty = schema.U64 },
-    // Per-node file_id allocation ceiling. This node has reserved every
-    // id up to and including `max_file_id` (low bits of the encoded
-    // `node_id|local` file_id). Persisted BEFORE any id in the new
-    // range is handed out, so on restart we resume past every id we
-    // could have written to disk — closes the orphan-SST collision
-    // after a mid-flush crash without a disk scan. Bounded waste per
-    // crash: one lease batch.
-    .{ .id = 7, .name = "max_file_id", .ty = schema.U64 },
 });
 
 pub const Snapshot = schema.Table(.{

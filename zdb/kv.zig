@@ -239,7 +239,7 @@ pub const Item = struct {
 /// (see makeTreeId), so a tree's SQL table is derivable from it and is
 /// never stored separately. Two namespaces can reuse the same tree_id, so the
 /// namespace must always travel with it — this struct is the map key for both
-/// `Forest.trees` and `ForestState.trees`.
+/// `Forest.trees` and `Manifest.trees`.
 pub const TreeKey = packed struct(u128) {
     namespace: u64,
     tree_id: u64,

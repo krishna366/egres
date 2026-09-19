@@ -489,8 +489,9 @@ pub const MultiGet = struct {
             defer Level.releaseTables(self.allocator, tables);
 
             if (lvl == 0) {
-                // L0 sorts by id ascending (newest last): walk in
-                // reverse so the newest table settles a key first.
+                // L0 sorts by raft_index ascending (newest = highest
+                // raft_index, last in the list): walk in reverse so the
+                // newest table settles a key first.
                 var ri = tables.len;
                 while (ri > 0) {
                     ri -= 1;
@@ -1046,7 +1047,7 @@ pub const Cursor = struct {
 /// The largest stored key for (namespace, table_id), or null if the table
 /// has no keys. Assumes a monotonically-increasing row id (SQL's egid), so
 /// the max lives in the rightmost tree and, within it, the rightmost SST of
-/// each level: last-by-id in L0 (newest flush = highest ids) or last-by-
+/// each level: last in L0 (newest flush = highest raft_index) or last-by-
 /// smallest in L≥1 (highest range). Those SSTs' in-memory `biggest` keys
 /// give a floor — O(#levels), no I/O — and every key above it is an
 /// unflushed memtable row, so the memtables are the only thing seeked:

@@ -12,7 +12,6 @@ const compress = utils.compression;
 const _binaryfuse = @import("../binaryfusefilter.zig");
 const vfs = @import("vfs");
 const _cache = @import("../cache.zig");
-const _fi = @import("../file_ids.zig");
 const Builder = @import("builder.zig").Builder;
 
 /// Module-level block cache singleton. Set before opening tables to enable
@@ -69,9 +68,9 @@ pub const Table = struct {
     ref: std.atomic.Value(i32),
     smallest: Key,
     biggest: Key,
-    /// Parsed from the SST filename (see `zdb.file_ids.sstPath`). 0 for
-    /// in-memory tables — also the sentinel "skip block-cache" value
-    /// since 0 isn't a valid encoded id (node 0 is reserved).
+    /// The id the manifest lists this file under, supplied by the caller
+    /// that opened it. 0 for in-memory tables — also the sentinel "skip
+    /// block-cache" value, since 0 is never handed out as a file id.
     file_id: u64,
     // Owned path split into atomic pointer + length for thread-safe detach.
     // Use getPath() to read, claimPath() to atomically take ownership.
@@ -85,13 +84,18 @@ pub const Table = struct {
     /// open opens an SST file through the global VFS instance (vfs.g),
     /// in `read_mode`; readAligned transparently handles mmap, direct,
     /// and memory-backed file handles.
-    pub fn open(allocator: std.mem.Allocator, path: String, priority: vfs.Priority) !*Table {
+    pub fn open(
+        allocator: std.mem.Allocator,
+        path: String,
+        file_id: u64,
+        priority: vfs.Priority,
+    ) !*Table {
         const handle = try vfs.g().openFile(allocator, path, .{
             .mode = read_mode,
         });
         const t = try initFromHandle(allocator, handle, priority);
         errdefer t.decrRef();
-        t.file_id = _fi.fromPath(path);
+        t.file_id = file_id;
         const duped = try allocator.dupe(u8, path);
         t.path_ptr = std.atomic.Value(?[*]const u8).init(duped.ptr);
         t.path_len = duped.len;

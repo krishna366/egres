@@ -3,7 +3,6 @@ const utils = @import("utils");
 const String = utils.String;
 const zdb = @import("zdb");
 
-fn noopPersist(_: *anyopaque, _: u64) anyerror!void {}
 const vfs = zdb.vfs;
 
 const Key = zdb.kv.Key;
@@ -12,9 +11,9 @@ const Builder = _table.builder.Builder;
 const Table = _table.Table;
 const TableIterator = _table.TableIterator;
 
-const manifest = zdb.manifest;
-const createSSTableChange = manifest.createSSTableChange;
-const createTreeChange = manifest.createTreeChange;
+const _manifest = zdb.manifest;
+const createSSTableChange = _manifest.createSSTableChange;
+const createTreeChange = _manifest.createTreeChange;
 
 const _level = zdb.level;
 const Level = _level.Level;
@@ -97,17 +96,19 @@ fn buildTableMeta(
 /// Install `tb` as SST `id` at `level` for `tree_id`, on disk + in the manifest.
 fn installTable(
     alloc: std.mem.Allocator,
-    ms: *manifest.ForestState,
+    manifest: *_manifest.Manifest,
     dir_path: String,
     tb: *_table.builder.TableBuffer,
     id: u64,
     tree_id: u64,
     level: u32,
 ) !void {
-    const path = try zdb.file_ids.sstPath(alloc, dir_path, id);
+    const path = try zdb.sstPath(alloc, dir_path, id);
     defer alloc.free(path);
     try vfs.writeFile(path, tb.bytes);
-    try ms.commit(&.{createSSTableChange(id, 0, tree_id, level)}, &.{});
+    // No raft here: the id doubles as the log index, so the fixtures
+    // install in id order and L0 sorts the way each test expects.
+    try manifest.commit(id, &.{createSSTableChange(id, 0, tree_id, level)}, &.{});
 }
 
 /// Sum of stale_data_size across a level's tables. buildCompaction records it
@@ -172,14 +173,48 @@ test "levels: handler L0 sort" {
     defer held.release();
     defer level.deinit();
 
-    try level.addEntry(held, 3, t3);
-    try level.addEntry(held, 1, t1);
-    try level.addEntry(held, 2, t2);
+    try level.addEntry(held, 3, 3, t3);
+    try level.addEntry(held, 1, 1, t1);
+    try level.addEntry(held, 2, 2, t2);
 
-    // L0 sorts ascending by ID.
+    // L0 sorts ascending by raft_index (here equal to the id).
     try std.testing.expectEqual(@as(u64, 1), level.tables.items[0].id);
     try std.testing.expectEqual(@as(u64, 2), level.tables.items[1].id);
     try std.testing.expectEqual(@as(u64, 3), level.tables.items[2].id);
+}
+
+test "levels: handler L0 sorts by raft_index, not by id" {
+    const alloc = std.testing.allocator;
+
+    var tba = try buildTable(alloc, &.{.{ .key = "a", .ts = 1, .val = "v" }});
+    defer tba.deinit();
+    var tbb = try buildTable(alloc, &.{.{ .key = "b", .ts = 1, .val = "v" }});
+    defer tbb.deinit();
+    var tbc = try buildTable(alloc, &.{.{ .key = "c", .ts = 1, .val = "v" }});
+    defer tbc.deinit();
+
+    const ta = try openTableOwned(alloc, &tba);
+    defer destroyTable(ta);
+    const tb = try openTableOwned(alloc, &tbb);
+    defer destroyTable(tb);
+    const tc = try openTableOwned(alloc, &tbc);
+    defer destroyTable(tc);
+
+    var lock: zdb.level.Lock = .{};
+    var level = Level.init(alloc, 0, &lock);
+    const held = lock.hold(.exclusive, @src());
+    defer held.release();
+    defer level.deinit();
+
+    // Ids run opposite to the order the tables were introduced in, which
+    // is what random ids do. Only raft_index says which one is newest.
+    try level.addEntry(held, 900, 10, ta);
+    try level.addEntry(held, 700, 20, tb);
+    try level.addEntry(held, 800, 30, tc);
+
+    try std.testing.expectEqual(@as(u64, 900), level.tables.items[0].id);
+    try std.testing.expectEqual(@as(u64, 700), level.tables.items[1].id);
+    try std.testing.expectEqual(@as(u64, 800), level.tables.items[2].id);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,9 +248,9 @@ test "levels: handler L1 sort" {
     defer held.release();
     defer level.deinit();
 
-    try level.addEntry(held, 3, tc); // "c"
-    try level.addEntry(held, 1, ta); // "a"
-    try level.addEntry(held, 2, tb); // "b"
+    try level.addEntry(held, 3, 3, tc); // "c"
+    try level.addEntry(held, 1, 1, ta); // "a"
+    try level.addEntry(held, 2, 2, tb); // "b"
 
     // L1 sorts by smallest key ascending.
     const sk0 = level.tables.items[0].table.smallest.primary;
@@ -266,7 +301,7 @@ test "levels: overlapping tables L1" {
     defer held.release();
     defer level.deinit();
     for (tables, 0..) |t, i| {
-        try level.addEntry(held, @intCast(i + 1), t);
+        try level.addEntry(held, @intCast(i + 1), @intCast(i + 1), t);
     }
 
     // Query range c-g should overlap tables c-d, e-f, g-h → indices 1..4.
@@ -309,9 +344,9 @@ test "levels: overlapping tables L0" {
 
     defer held.release();
     defer level.deinit();
-    try level.addEntry(held, 1, t1);
-    try level.addEntry(held, 2, t2);
-    try level.addEntry(held, 3, t3);
+    try level.addEntry(held, 1, 1, t1);
+    try level.addEntry(held, 2, 2, t2);
+    try level.addEntry(held, 3, 3, t3);
 
     const ck = try (Key{ .primary = "x" }).marshal(alloc);
     defer alloc.free(ck);
@@ -349,8 +384,8 @@ test "levels: get L0 newest wins" {
 
     defer held.release();
     defer level.deinit();
-    try level.addEntry(held, 1, t1);
-    try level.addEntry(held, 2, t2);
+    try level.addEntry(held, 1, 1, t1);
+    try level.addEntry(held, 2, 2, t2);
 
     // Search with max ts to find the newest version.
     const item = try level.get(held.shared(), .{ .key = .{ .primary = "k" } });
@@ -388,9 +423,9 @@ test "levels: get L1 hit" {
 
     defer held.release();
     defer level.deinit();
-    try level.addEntry(held, 1, ta);
-    try level.addEntry(held, 2, tb);
-    try level.addEntry(held, 3, tc);
+    try level.addEntry(held, 1, 1, ta);
+    try level.addEntry(held, 2, 2, tb);
+    try level.addEntry(held, 3, 3, tc);
 
     const item = try level.get(held.shared(), .{ .key = .{ .primary = "b" } });
     try std.testing.expect(item != null);
@@ -418,7 +453,7 @@ test "levels: get miss" {
 
     defer held.release();
     defer level.deinit();
-    try level.addEntry(held, 1, ta);
+    try level.addEntry(held, 1, 1, ta);
 
     const item = try level.get(held.shared(), .{ .key = .{ .primary = "z" } });
     try std.testing.expect(item == null);
@@ -447,9 +482,9 @@ test "levels: open" {
         });
         defer tb2.deinit();
 
-        const p1 = try zdb.file_ids.sstPath(alloc, dir_path, 1);
+        const p1 = try zdb.sstPath(alloc, dir_path, 1);
         defer alloc.free(p1);
-        const p2 = try zdb.file_ids.sstPath(alloc, dir_path, 2);
+        const p2 = try zdb.sstPath(alloc, dir_path, 2);
         defer alloc.free(p2);
 
         try vfs.writeFile(p1, tb1.bytes);
@@ -458,10 +493,10 @@ test "levels: open" {
 
     // Create manifest with table 1 at L0, table 2 at L1.
     const test_tree_id: u64 = 1;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
-    try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
-    try ms.commit(&.{
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+    try manifest.commit(1, &.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
+    try manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0),
         createSSTableChange(2, 0, test_tree_id, 1),
     }, &.{});
@@ -469,7 +504,7 @@ test "levels: open" {
     const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(0));
@@ -494,8 +529,8 @@ test "levels: pick compact level" {
 
     // Create an empty manifest (no SST files needed for this test).
     const test_tree_id: u64 = 1;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     // Targets cascade from `tree_split_size`; setting it to a single byte
     // makes every level's target tiny so one table in L1 exceeds it and
@@ -507,7 +542,7 @@ test "levels: pick compact level" {
 
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     // Manually plant a large table in L1.
@@ -521,7 +556,7 @@ test "levels: pick compact level" {
     {
         const h = tree.mu.hold(.exclusive, @src());
         defer h.release();
-        try tree.levels[1].addEntry(h, 999, t);
+        try tree.levels[1].addEntry(h, 999, 999, t);
     }
     t.decrRef(); // now levels owns the table.
 
@@ -550,20 +585,20 @@ test "levels: doCompact L0 L1" {
     };
 
     const test_tree_id: u64 = 1;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     for (l0_data) |d| {
         var tb = try buildTable(alloc, &.{
             .{ .key = d.key, .ts = 1, .val = d.val },
         });
         defer tb.deinit();
-        const path = try zdb.file_ids.sstPath(alloc, dir_path, d.id);
+        const path = try zdb.sstPath(alloc, dir_path, d.id);
         defer alloc.free(path);
         try vfs.writeFile(path, tb.bytes);
     }
-    try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
-    try ms.commit(&.{
+    try manifest.commit(1, &.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
+    try manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0),
         createSSTableChange(2, 0, test_tree_id, 0),
         createSSTableChange(3, 0, test_tree_id, 0),
@@ -573,16 +608,14 @@ test "levels: doCompact L0 L1" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     // All three tables should be in L0 before compaction.
     try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(0));
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
 
-    var file_ids: zdb.file_ids.FileIds = .{};
-    file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
-    try tree.doCompact(0, &file_ids, 0);
+    try tree.doCompact(1, 0, 0);
 
     // After compaction L0 must be empty and keys must live in L1.
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(0));
@@ -610,8 +643,8 @@ test "levels: doCompact L0 L1 with dest overlap" {
     defer alloc.free(dir_path);
 
     const test_tree_id: u64 = 1;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     // L0 table 1: {aa→vaa}
     {
@@ -619,7 +652,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
             .{ .key = "aa", .ts = 1, .val = "vaa" },
         });
         defer tb.deinit();
-        const p = try zdb.file_ids.sstPath(alloc, dir_path, 1);
+        const p = try zdb.sstPath(alloc, dir_path, 1);
         defer alloc.free(p);
         try vfs.writeFile(p, tb.bytes);
     }
@@ -629,7 +662,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
             .{ .key = "cc", .ts = 1, .val = "vcc" },
         });
         defer tb.deinit();
-        const p = try zdb.file_ids.sstPath(alloc, dir_path, 2);
+        const p = try zdb.sstPath(alloc, dir_path, 2);
         defer alloc.free(p);
         try vfs.writeFile(p, tb.bytes);
     }
@@ -640,12 +673,12 @@ test "levels: doCompact L0 L1 with dest overlap" {
             .{ .key = "dd", .ts = 1, .val = "vdd" },
         });
         defer tb.deinit();
-        const p = try zdb.file_ids.sstPath(alloc, dir_path, 3);
+        const p = try zdb.sstPath(alloc, dir_path, 3);
         defer alloc.free(p);
         try vfs.writeFile(p, tb.bytes);
     }
-    try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
-    try ms.commit(&.{
+    try manifest.commit(1, &.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
+    try manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0),
         createSSTableChange(2, 0, test_tree_id, 0),
         createSSTableChange(3, 0, test_tree_id, 1),
@@ -655,15 +688,13 @@ test "levels: doCompact L0 L1 with dest overlap" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(0));
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
 
-    var file_ids: zdb.file_ids.FileIds = .{};
-    file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
-    try tree.doCompact(0, &file_ids, 0);
+    try tree.doCompact(1, 0, 0);
 
     // L0 must be empty; L1 holds the merged result in a single table.
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(0));
@@ -699,8 +730,8 @@ test "levels: doCompact L1 L2" {
     // L1: {aa, bb}; L2: {cc} — non-overlapping, so compacting L1 doesn't
     // touch the L2 table; both survive in L2 after compaction.
     const test_tree_id: u64 = 1;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     {
         var tb1 = try buildTable(alloc, &.{
@@ -708,7 +739,7 @@ test "levels: doCompact L1 L2" {
             .{ .key = "bb", .ts = 1, .val = "vbb" },
         });
         defer tb1.deinit();
-        const p1 = try zdb.file_ids.sstPath(alloc, dir_path, 1);
+        const p1 = try zdb.sstPath(alloc, dir_path, 1);
         defer alloc.free(p1);
         try vfs.writeFile(p1, tb1.bytes);
 
@@ -716,12 +747,12 @@ test "levels: doCompact L1 L2" {
             .{ .key = "cc", .ts = 1, .val = "vcc" },
         });
         defer tb2.deinit();
-        const p2 = try zdb.file_ids.sstPath(alloc, dir_path, 2);
+        const p2 = try zdb.sstPath(alloc, dir_path, 2);
         defer alloc.free(p2);
         try vfs.writeFile(p2, tb2.bytes);
     }
-    try ms.commit(&.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
-    try ms.commit(&.{
+    try manifest.commit(1, &.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
+    try manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 1),
         createSSTableChange(2, 0, test_tree_id, 2),
     }, &.{});
@@ -730,15 +761,13 @@ test "levels: doCompact L1 L2" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 3 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(2));
 
-    var file_ids: zdb.file_ids.FileIds = .{};
-    file_ids.bind(1, 100, @ptrCast(&file_ids), noopPersist);
-    try tree.doCompact(1, &file_ids, 0);
+    try tree.doCompact(1, 1, 0);
 
     // L1 must be empty; L2 holds the original {cc} table plus new {aa, bb}.
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
@@ -773,13 +802,13 @@ test "levels: get L0 shadows L1" {
     defer alloc.free(dir_path);
 
     const test_tree_id: u64 = 1;
-    var ms = manifest.ForestState.init(alloc);
-    defer ms.deinit();
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
 
     const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &ms, &cache);
+    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     // Plant in-memory tables directly into the level handlers.
@@ -791,7 +820,7 @@ test "levels: get L0 shadows L1" {
     {
         const h = tree.mu.hold(.exclusive, @src());
         defer h.release();
-        try tree.levels[1].addEntry(h, 1, t_l1);
+        try tree.levels[1].addEntry(h, 1, 1, t_l1);
     }
     t_l1.decrRef();
 
@@ -803,7 +832,7 @@ test "levels: get L0 shadows L1" {
     {
         const h = tree.mu.hold(.exclusive, @src());
         defer h.release();
-        try tree.levels[0].addEntry(h, 2, t_l0);
+        try tree.levels[0].addEntry(h, 2, 2, t_l0);
     }
     t_l0.decrRef();
 
@@ -855,7 +884,7 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
 
     defer held.release();
     defer level.deinit();
-    try level.addEntry(held, 1, t);
+    try level.addEntry(held, 1, 1, t);
 
     // A src table {(a,10), (k,100), (k,90)} has smallest="a" and
     // biggest="k": the bounds name primaries, whatever versions sit
@@ -884,15 +913,14 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
 /// Open a one-tree forest-less Tree over `dir_path` with `max_levels`, holding
 /// a single L0 SST built from `entries`. Returns the tree; caller closes it.
 const TombstoneFixture = struct {
-    ms: manifest.ForestState,
+    manifest: _manifest.Manifest,
     cache: TableCache,
     tree: *Tree,
-    file_ids: zdb.file_ids.FileIds,
 
     fn deinit(self: *TombstoneFixture) void {
         self.tree.release();
         self.cache.deinit();
-        self.ms.deinit();
+        self.manifest.deinit();
     }
 };
 
@@ -904,20 +932,18 @@ fn setupTombstoneTree(
     entries: []const MetaEntry,
 ) !void {
     const tree_id: u64 = 1;
-    fx.ms = manifest.ForestState.init(alloc);
-    errdefer fx.ms.deinit();
-    try fx.ms.commit(&.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    fx.manifest = _manifest.Manifest.init(alloc);
+    errdefer fx.manifest.deinit();
+    try fx.manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
 
     var tb = try buildTableMeta(alloc, entries);
     defer tb.deinit();
-    try installTable(alloc, &fx.ms, dir_path, &tb, 1, tree_id, 0);
+    try installTable(alloc, &fx.manifest, dir_path, &tb, 1, tree_id, 0);
 
     const opts = config.Config{ .dir = dir_path, .max_levels = max_levels };
     fx.cache = TableCache.init(alloc, opts.dir);
     errdefer fx.cache.deinit();
-    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.ms, &fx.cache);
-    fx.file_ids = .{};
-    fx.file_ids.bind(1, 100, @ptrCast(&fx.file_ids), noopPersist);
+    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.manifest, &fx.cache);
 }
 
 test "compaction: bottom level drops a tombstone below the horizon and what it shadows" {
@@ -937,7 +963,7 @@ test "compaction: bottom level drops a tombstone below the horizon and what it s
 
     // Horizon above the tombstone: nothing can read at or below ts=100 any
     // more, so the tombstone and the version it shadows are both unreachable.
-    try fx.tree.doCompact(0, &fx.file_ids, 200);
+    try fx.tree.doCompact(1, 0, 200);
 
     try std.testing.expect((try fx.tree.get(.{
         .key = .{ .primary = "k" },
@@ -962,7 +988,7 @@ test "compaction: a tombstone above the horizon is retained with the state it sh
     // is the newest version and stays — and so does the state it shadows,
     // because the state@50 is the first terminal at or below the horizon (50),
     // i.e. the oldest version an allowed read can still resolve to.
-    try fx.tree.doCompact(0, &fx.file_ids, 50);
+    try fx.tree.doCompact(1, 0, 50);
 
     const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -999,7 +1025,7 @@ test "compaction: a non-bottom level never drops tombstones" {
 
     // Horizon is way above the tombstone — eligible on every count EXCEPT
     // that this compaction isn't writing into the bottom level.
-    try fx.tree.doCompact(0, &fx.file_ids, 200);
+    try fx.tree.doCompact(1, 0, 200);
 
     const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1023,7 +1049,7 @@ test "compaction: a put above the horizon survives a lower tombstone's drop" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 200);
+    try fx.tree.doCompact(1, 0, 200);
 
     // k@300 is above the horizon: still readable, untouched.
     const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
@@ -1059,7 +1085,7 @@ test "compaction: dropping one primary does not disturb its neighbours" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 200);
+    try fx.tree.doCompact(1, 0, 200);
 
     const j = try fx.tree.get(.{ .key = .{ .primary = "j" } }) orelse
         return error.TestExpectedItem;
@@ -1096,7 +1122,7 @@ test "compaction: bottom level drops shadowed versions once they reach the horiz
 
     // Horizon 600: all three are at or below it, so the two older versions are
     // collectable. The newest value (k@500) is the current value and stays.
-    try fx.tree.doCompact(0, &fx.file_ids, 600);
+    try fx.tree.doCompact(1, 0, 600);
 
     const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1129,7 +1155,7 @@ test "compaction: bottom level keeps a shadowed version above the horizon and co
     // Horizon 200: both versions are above it, so nothing is collected yet — a
     // read at 400 legitimately sees k@300, and it stays until the horizon
     // rises past 300.
-    try fx.tree.doCompact(0, &fx.file_ids, 200);
+    try fx.tree.doCompact(1, 0, 200);
 
     const cur = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1163,7 +1189,7 @@ test "compaction: a non-bottom level keeps everything but still counts stale" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 600); // horizon irrelevant: not bottom
+    try fx.tree.doCompact(1, 0, 600); // horizon irrelevant: not bottom
 
     // Both versions survive — a non-bottom compaction never drops.
     const cur = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
@@ -1200,7 +1226,7 @@ test "compaction: a delta above the newest state is live, not stale" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 0, 0);
 
     // All three survive (a non-bottom compaction drops nothing).
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
@@ -1238,21 +1264,19 @@ fn setupTreeWithCfg(
     entries: []const MetaEntry,
 ) !void {
     const tree_id: u64 = 1;
-    fx.ms = manifest.ForestState.init(alloc);
-    errdefer fx.ms.deinit();
-    try fx.ms.commit(&.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    fx.manifest = _manifest.Manifest.init(alloc);
+    errdefer fx.manifest.deinit();
+    try fx.manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
 
     var tb = try buildTableMeta(alloc, entries);
     defer tb.deinit();
-    try installTable(alloc, &fx.ms, dir_path, &tb, 1, tree_id, 0);
+    try installTable(alloc, &fx.manifest, dir_path, &tb, 1, tree_id, 0);
 
     var opts = cfg;
     opts.dir = dir_path;
     fx.cache = TableCache.init(alloc, opts.dir);
     errdefer fx.cache.deinit();
-    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.ms, &fx.cache);
-    fx.file_ids = .{};
-    fx.file_ids.bind(1, 100, @ptrCast(&fx.file_ids), noopPersist);
+    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.manifest, &fx.cache);
 }
 
 fn encodeDelta(
@@ -1332,7 +1356,7 @@ test "compaction: rollup folds a delta chain onto its in-inputs state" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 0, 0);
 
     // Newest version is now a synthetic state at the newest delta's
     // timestamp: {1,2} +{2,3} → {1,2,3}, then +{40}-{2} → {1,3,40}.
@@ -1387,7 +1411,7 @@ test "compaction: rollup leaves lone states and baseless chains alone" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 0, 0);
 
     const a = try fx.tree.get(.{ .key = .{ .primary = "a" } }) orelse
         return error.TestExpectedItem;
@@ -1421,7 +1445,7 @@ test "compaction: a mixed chain aborts the rollup and stays verbatim" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 0, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1456,7 +1480,7 @@ test "compaction: an empty fold emits a roaring tombstone" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 0, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1495,7 +1519,7 @@ test "compaction: bottom level collapses a rolled chain below the horizon" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 300);
+    try fx.tree.doCompact(1, 0, 300);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1540,7 +1564,7 @@ test "compaction: rollup gates — min_deltas and rollup_enabled" {
             &entries,
         );
         defer fx.deinit();
-        try fx.tree.doCompact(0, &fx.file_ids, 0);
+        try fx.tree.doCompact(1, 0, 0);
         const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
             return error.TestExpectedItem;
         defer top.free(alloc);
@@ -1562,7 +1586,7 @@ test "compaction: rollup gates — min_deltas and rollup_enabled" {
             &entries,
         );
         defer fx.deinit();
-        try fx.tree.doCompact(0, &fx.file_ids, 0);
+        try fx.tree.doCompact(1, 0, 0);
         const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
             return error.TestExpectedItem;
         defer top.free(alloc);
@@ -1583,23 +1607,21 @@ fn setupTreeMulti(
     tables: []const LevelTable,
 ) !void {
     const tree_id: u64 = 1;
-    fx.ms = manifest.ForestState.init(alloc);
-    errdefer fx.ms.deinit();
-    try fx.ms.commit(&.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    fx.manifest = _manifest.Manifest.init(alloc);
+    errdefer fx.manifest.deinit();
+    try fx.manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
 
     for (tables, 1..) |t, id| {
         var tb = try buildTableMeta(alloc, t.entries);
         defer tb.deinit();
-        try installTable(alloc, &fx.ms, dir_path, &tb, id, tree_id, t.level);
+        try installTable(alloc, &fx.manifest, dir_path, &tb, id, tree_id, t.level);
     }
 
     var opts = cfg;
     opts.dir = dir_path;
     fx.cache = TableCache.init(alloc, opts.dir);
     errdefer fx.cache.deinit();
-    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.ms, &fx.cache);
-    fx.file_ids = .{};
-    fx.file_ids.bind(1, 100, @ptrCast(&fx.file_ids), noopPersist);
+    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.manifest, &fx.cache);
 }
 
 test "compaction: shadowed delta chains are never re-rolled" {
@@ -1629,7 +1651,7 @@ test "compaction: shadowed delta chains are never re-rolled" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 0, 0);
 
     // The shadowed delta came through verbatim, not as a state.
     const mid = try fx.tree.get(.{
@@ -1666,7 +1688,7 @@ test "compaction: read-below rolls a baseless chain onto a deep state" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 1, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1709,7 +1731,7 @@ test "compaction: max_deltas forces read-below even at L1" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 0, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1742,7 +1764,7 @@ test "compaction: read-below with no state anywhere folds from empty" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 1, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1779,7 +1801,7 @@ test "compaction: read-below declined by triggers or mixed chains" {
             } },
         });
         defer fx.deinit();
-        try fx.tree.doCompact(1, &fx.file_ids, 0);
+        try fx.tree.doCompact(1, 1, 0);
         const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
             return error.TestExpectedItem;
         defer top.free(alloc);
@@ -1804,7 +1826,7 @@ test "compaction: read-below declined by triggers or mixed chains" {
             } },
         });
         defer fx.deinit();
-        try fx.tree.doCompact(1, &fx.file_ids, 0);
+        try fx.tree.doCompact(1, 1, 0);
         const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
             return error.TestExpectedItem;
         defer top.free(alloc);
@@ -1832,7 +1854,7 @@ test "compaction: rollup folds a chain terminated by a tombstone" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(0, &fx.file_ids, 0);
+    try fx.tree.doCompact(1, 0, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
