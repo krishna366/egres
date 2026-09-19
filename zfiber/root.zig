@@ -109,6 +109,8 @@ pub const sleepMs = @import("deadlines.zig").sleepMs;
 pub const fs = @import("fs.zig");
 pub const File = fs.File;
 pub const Dir = fs.Dir;
+pub const DirEntry = fs.Entry;
+pub const freeDirEntries = fs.freeEntries;
 
 // From fsops.zig — blocking-op offload pool (fsync + fs metadata) that parks
 // the calling fiber and wakes it when a pool thread finishes the syscall.

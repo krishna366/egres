@@ -257,3 +257,53 @@ test "fs: many fibers run full file lifecycles concurrently" {
 
     for (oks) |ok| try std.testing.expect(ok);
 }
+
+test "fs.Dir: list reports every entry with its kind" {
+    const alloc = std.testing.allocator;
+    const root = "/tmp/fiber_fs_test_list";
+    std.Io.Dir.cwd().deleteTree(fiber.context.g().io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(fiber.context.g().io, root ++ "/sub");
+    defer std.Io.Dir.cwd().deleteTree(fiber.context.g().io, root) catch {};
+
+    for ([_][]const u8{ root ++ "/a.txt", root ++ "/b.txt" }) |p| {
+        const f = try fiber.Dir.cwd().createFile(p, .{});
+        _ = try f.write("x", 0);
+        f.close();
+    }
+
+    const entries = try fiber.Dir.cwd().list(alloc, root);
+    defer fiber.freeDirEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+
+    var files: usize = 0;
+    var dirs: usize = 0;
+    for (entries) |e| switch (e.kind) {
+        .file => {
+            files += 1;
+            try std.testing.expect(std.mem.endsWith(u8, e.name, ".txt"));
+        },
+        .directory => {
+            dirs += 1;
+            try std.testing.expectEqualStrings("sub", e.name);
+        },
+        else => return error.TestUnexpectedKind,
+    };
+    try std.testing.expectEqual(@as(usize, 2), files);
+    try std.testing.expectEqual(@as(usize, 1), dirs);
+}
+
+test "fs.File: stat reports a fresh file's mtime as now" {
+    const path = "/tmp/fiber_fs_test_mtime";
+    fiber.Dir.cwd().deleteFile(path) catch {};
+    var file = try fiber.Dir.cwd().createFile(path, .{});
+    defer {
+        file.close();
+        fiber.Dir.cwd().deleteFile(path) catch {};
+    }
+    _ = try file.write("now", 0);
+
+    const now = fiber.timestampNow(.realtime, .secs);
+    const st = try file.stat();
+    const skew = @abs(now - st.mtime_s);
+    try std.testing.expect(skew < 10);
+}

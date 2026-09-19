@@ -1,5 +1,7 @@
 const std = @import("std");
+const fiber = @import("zfiber");
 const zdb = @import("zdb");
+const vfs = zdb.vfs;
 
 const _manifest = zdb.manifest;
 const ManifestError = _manifest.ManifestError;
@@ -405,6 +407,179 @@ test "manifest newFileId draws nonzero, distinct ids" {
     }
 }
 
+// -------------------------------------------------------------------------
+// Retire list: a file leaves the manifest at the index of the entry that
+// removed its last listing.
+// -------------------------------------------------------------------------
+
+test "manifest retires a file at the index that drops its last listing" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}),
+        createTreeChange(2, 0, &.{}, &.{}),
+    });
+
+    // Listed by tree 1 at index 2, shared with tree 2 at index 3.
+    try manifest.commit(2, &.{createSSTableChange(10, 0, 1, 0)}, &.{});
+    try manifest.commit(3, &.{createSSTableChange(10, 0, 2, 0)}, &.{});
+    try std.testing.expectEqual(@as(u32, 2), manifest.ssts.get(10).?.refs);
+
+    // The first delete leaves a listing standing: nothing to retire.
+    try manifest.commit(5, &.{deleteSSTableChange(10, 0, 1, 0)}, &.{});
+    try std.testing.expect(!manifest.to_delete.contains(10));
+
+    // The second takes the last one: retired at that entry's index.
+    try manifest.commit(7, &.{deleteSSTableChange(10, 0, 2, 0)}, &.{});
+    try std.testing.expectEqual(@as(u64, 7), manifest.to_delete.get(10).?);
+
+    // A sweep that has not reached index 7 takes nothing.
+    const early = try manifest.takeToDelete(alloc, 6);
+    defer alloc.free(early);
+    try std.testing.expectEqual(@as(usize, 0), early.len);
+    try std.testing.expectEqual(@as(u32, 1), manifest.to_delete.count());
+
+    // One that has takes the record, exactly once.
+    const taken = try manifest.takeToDelete(alloc, 7);
+    defer alloc.free(taken);
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqual(@as(u64, 10), taken[0].sst_id);
+    try std.testing.expectEqual(@as(u64, 7), taken[0].index);
+    try std.testing.expectEqual(@as(u32, 0), manifest.to_delete.count());
+}
+
+test "manifest tree delete retires every table of the tree" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try manifest.commit(4, &.{
+        createSSTableChange(11, 0, 1, 0),
+        createSSTableChange(12, 0, 1, 0),
+        createSSTableChange(13, 0, 1, 1),
+    }, &.{});
+
+    try manifest.commit(9, &.{}, &.{deleteTreeChange(1, 0)});
+
+    try std.testing.expectEqual(@as(u32, 3), manifest.to_delete.count());
+    for ([_]u64{ 11, 12, 13 }) |id|
+        try std.testing.expectEqual(@as(u64, 9), manifest.to_delete.get(id).?);
+}
+
+test "manifest restoreFrom leaves the retire list empty" {
+    const alloc = std.testing.allocator;
+    var src = _manifest.Manifest.init(alloc);
+    defer src.deinit();
+
+    try src.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try src.commit(4, &.{
+        createSSTableChange(10, 0, 1, 0),
+        createSSTableChange(20, 0, 1, 0),
+    }, &.{});
+    try src.commit(6, &.{deleteSSTableChange(20, 0, 1, 0)}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), src.to_delete.count());
+
+    const bytes = try src.serialize(alloc);
+    defer alloc.free(bytes);
+
+    var dst = _manifest.Manifest.init(alloc);
+    defer dst.deinit();
+    // Pre-load the destination with a retire of its own: restore replaces
+    // the whole state, so that record goes too.
+    try dst.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try dst.commit(2, &.{createSSTableChange(99, 0, 1, 0)}, &.{});
+    try dst.commit(3, &.{deleteSSTableChange(99, 0, 1, 0)}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), dst.to_delete.count());
+
+    try dst.restoreFrom(bytes);
+    try std.testing.expectEqual(@as(u32, 0), dst.to_delete.count());
+    try std.testing.expect(dst.ssts.contains(10));
+    try std.testing.expect(!dst.ssts.contains(20));
+}
+
+test "manifest knowsFile covers listed and retired ids" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try manifest.commit(4, &.{
+        createSSTableChange(10, 0, 1, 0),
+        createSSTableChange(20, 0, 1, 0),
+    }, &.{});
+    try manifest.commit(6, &.{deleteSSTableChange(20, 0, 1, 0)}, &.{});
+
+    try std.testing.expect(manifest.knowsFile(10)); // listed
+    try std.testing.expect(manifest.knowsFile(20)); // retired
+    try std.testing.expect(!manifest.knowsFile(30));
+
+    // A sweep of the retired id stops the manifest knowing it.
+    const taken = try manifest.takeToDelete(alloc, 6);
+    defer alloc.free(taken);
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expect(!manifest.knowsFile(20));
+    try std.testing.expect(manifest.knowsFile(10));
+}
+
+test "manifest unknownFiles picks SST-named files the manifest does not know" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try manifest.commit(4, &.{
+        createSSTableChange(0x10, 0, 1, 0),
+        createSSTableChange(0x20, 0, 1, 0),
+    }, &.{});
+    try manifest.commit(6, &.{deleteSSTableChange(0x20, 0, 1, 0)}, &.{});
+
+    // A `.names` listing: regular files only, no stat.
+    const entries = [_]vfs.ObjectInfo{
+        // Unknown SST names.
+        .{ .name = "00000000000000aa.sst", .stat = null },
+        .{ .name = "00000000000000bb.sst", .stat = null },
+        // Listed by a tree.
+        .{ .name = "0000000000000010.sst", .stat = null },
+        // ToDelete but not swept yet.
+        .{ .name = "0000000000000020.sst", .stat = null },
+        // Not an SST name at all.
+        .{ .name = "NOTES.txt", .stat = null },
+        .{ .name = "00001.wal", .stat = null },
+        // SST-shaped but not 16 hex digits.
+        .{ .name = "00000000000000zz.sst", .stat = null },
+    };
+
+    const unknown = try manifest.unknownFiles(alloc, &entries);
+    defer alloc.free(unknown);
+    try std.testing.expectEqualSlices(u64, &.{ 0xaa, 0xbb }, unknown);
+}
+
+test "manifest newFileId never draws a listed or retired id" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try manifest.commit(4, &.{
+        createSSTableChange(10, 0, 1, 0),
+        createSSTableChange(20, 0, 1, 0),
+    }, &.{});
+    // 20 leaves the manifest but stays in the retire list: its file may
+    // still be on disk under that name until the next sweep.
+    try manifest.commit(6, &.{deleteSSTableChange(20, 0, 1, 0)}, &.{});
+    try std.testing.expect(manifest.ssts.contains(10));
+    try std.testing.expect(manifest.to_delete.contains(20));
+
+    for (0..1000) |_| {
+        const id = manifest.newFileId();
+        try std.testing.expect(id != 0);
+        try std.testing.expect(!manifest.knowsFile(id));
+    }
+}
+
 test "manifest sst refs across create, share, and delete" {
     const alloc = std.testing.allocator;
     var manifest = _manifest.Manifest.init(alloc);
@@ -572,7 +747,7 @@ test "manifest apply drop_ns removes the namespace name" {
     try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
 }
 
-test "manifest takeUnlisted hands over ids whose last listing went, once" {
+test "manifest takeToEvict hands over ids whose last listing went, once" {
     const alloc = std.testing.allocator;
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
@@ -593,20 +768,54 @@ test "manifest takeUnlisted hands over ids whose last listing went, once" {
         deleteSSTableChange(20, 0, 1, 0),
     }, &.{});
     {
-        const gone = try manifest.takeUnlisted();
+        const gone = try manifest.takeToEvict();
         defer alloc.free(gone);
         try std.testing.expectEqualSlices(u64, &.{10}, gone);
     }
     // Drained: nothing until the next unlist.
     {
-        const none = try manifest.takeUnlisted();
+        const none = try manifest.takeToEvict();
         defer alloc.free(none);
         try std.testing.expectEqual(@as(usize, 0), none.len);
     }
     try manifest.commit(5, &.{deleteSSTableChange(20, 0, 2, 0)}, &.{});
     {
-        const gone = try manifest.takeUnlisted();
+        const gone = try manifest.takeToEvict();
         defer alloc.free(gone);
         try std.testing.expectEqualSlices(u64, &.{20}, gone);
     }
+}
+
+test "manifest split move in one entry keeps the file listed and unretired" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}),
+        createTreeChange(2, 0, &.{}, &.{}),
+    });
+    try manifest.commit(5, &.{createSSTableChange(77, 0, 1, 0)}, &.{});
+
+    // A split moves the file: the delete from the old tree is listed
+    // before the create in the new one, as buildSplit emits them.
+    try manifest.commit(9, &.{
+        deleteSSTableChange(77, 0, 1, 0),
+        createSSTableChange(77, 0, 2, 0),
+    }, &.{});
+    try std.testing.expectEqual(@as(u32, 1), manifest.ssts.get(77).?.refs);
+    try std.testing.expectEqual(@as(u64, 5), manifest.raftIndexOf(77));
+    try std.testing.expect(!manifest.to_delete.contains(77));
+    const to_evict = try manifest.takeToEvict();
+    defer alloc.free(to_evict);
+    try std.testing.expectEqual(@as(usize, 0), to_evict.len);
+
+    // The same pair through `apply` (the snapshot draft's path).
+    var scs = [_]_manifest.SSTableChange{
+        deleteSSTableChange(77, 0, 2, 0),
+        createSSTableChange(77, 0, 1, 0),
+    };
+    try manifest.apply(10, .{ .cmd = .tree_split, .sstable_changes = &scs });
+    try std.testing.expectEqual(@as(u32, 1), manifest.ssts.get(77).?.refs);
+    try std.testing.expect(!manifest.to_delete.contains(77));
 }

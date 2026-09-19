@@ -75,6 +75,11 @@ pub const Snapshot = schema.Table(.{
     // putting them into the placeholder memtable (where they'd be discarded
     // anyway). 0 means "skip nothing" — backward-compat default.
     .{ .id = 5, .name = "oldest_memtable_index", .ty = schema.U64 },
+    // HLC timestamp of the log entry at `index`: the moment, on the
+    // leader's clock, the state this snapshot captures was reached. 0 when
+    // unknown. The orphan scan reads it: a file written after this moment
+    // may belong to an entry the snapshot does not cover.
+    .{ .id = 6, .name = "timestamp", .ty = schema.U64 },
 });
 
 // tag 0 = .any: serves both as the safe default for an uninitialized byte and

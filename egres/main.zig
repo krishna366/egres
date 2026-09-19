@@ -545,7 +545,13 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // The replicated storage engine: builds the apply state machine + raft
     // runtime and installs the SM on the node. Owns all that node/forest
     // wiring.
-    const eng = try engine.Engine.open(allocator, node, forest, live_snapshot, &store);
+    const eng = try engine.Engine.open(
+        allocator,
+        node,
+        forest,
+        live_snapshot,
+        &store,
+    );
     defer deinitWithLog("engine", eng);
 
     // The admin protocol front-end over the engine.

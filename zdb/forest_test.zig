@@ -2344,6 +2344,11 @@ test "forest: index backfill installs bottom states below live deltas" {
     try roar.expectBitmap(f, alloc, "blue", 700, &.{ 1, 3, 5 });
 }
 
+// ---------------------------------------------------------------------------
+// File GC: retire on the last unlist, unlink once the snapshot index passes
+// ---------------------------------------------------------------------------
+
+/// Put one row into the current memtable.
 fn putRow(f: *Forest, primary: String, ts: u64, value: String) !void {
     const items = [_]zdb.kv.Item{.{
         .key = .{ .namespace = 1, .table_id = 0, .primary = primary },
@@ -2352,7 +2357,277 @@ fn putRow(f: *Forest, primary: String, ts: u64, value: String) !void {
     try f.put(&items);
 }
 
-test "forest: evictUnlisted evicts a compacted-away file; its blocks go with the table" {
+/// Whether `id`'s SST file is still on disk.
+fn sstExists(alloc: std.mem.Allocator, dir: String, id: u64) !bool {
+    const path = try zdb.sstPath(alloc, dir, id);
+    defer alloc.free(path);
+    vfs.access(path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+test "forest: deleteFiles unlinks compaction inputs at the retire index" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    _ = try f.createTree(1, 0, .{ .inf = true });
+
+    // Two flushes → two L0 SSTs, so the compaction below has real inputs.
+    try f.newMemtable(1);
+    try putRow(f, "a", 1, "one");
+    try f.newMemtable(2);
+    var flush_a = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush_a.changes.deinit(alloc);
+    try f.applyFlush(3, flush_a.changes.items, flush_a.memtable_id);
+
+    try putRow(f, "b", 2, "two");
+    try f.newMemtable(4);
+    var flush_b = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush_b.changes.deinit(alloc);
+    try f.applyFlush(5, flush_b.changes.items, flush_b.memtable_id);
+
+    const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    defer tree.release();
+
+    // Pin one input before the compaction takes it out of the level: the
+    // pin has to keep the table readable across the unlink below.
+    const pinned = blk: {
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        const ents = tree.levels[0].entries(held);
+        try std.testing.expectEqual(@as(usize, 2), ents.len);
+        ents[0].table.incrRef();
+        break :blk ents[0].table;
+    };
+    defer pinned.decrRef();
+
+    var comp = try tree.buildCompaction(0, 0);
+    defer comp.deinit(alloc);
+    try std.testing.expect(comp.items.len > 0);
+
+    var inputs: std.ArrayList(u64) = .empty;
+    defer inputs.deinit(alloc);
+    var outputs: std.ArrayList(u64) = .empty;
+    defer outputs.deinit(alloc);
+    for (comp.items) |c| {
+        if (c.op == .delete)
+            try inputs.append(alloc, c.sst_id)
+        else
+            try outputs.append(alloc, c.sst_id);
+    }
+    try std.testing.expectEqual(@as(usize, 2), inputs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), outputs.items.len);
+
+    const k: u64 = 20;
+    try tree.applyCompaction(k, comp.items);
+    // What the engine runs after every apply: the unlisted inputs leave
+    // the table cache.
+    try f.evictTables();
+
+    // Applying the compaction retires the inputs but leaves them on disk.
+    for (inputs.items) |id|
+        try std.testing.expect(try sstExists(alloc, dir_path, id));
+
+    // A snapshot index one short of the retire index unlinks nothing.
+    try f.deleteFiles(k - 1);
+    for (inputs.items) |id|
+        try std.testing.expect(try sstExists(alloc, dir_path, id));
+
+    // At the retire index the inputs go; the output stays.
+    try f.deleteFiles(k);
+    for (inputs.items) |id|
+        try std.testing.expect(!try sstExists(alloc, dir_path, id));
+    for (outputs.items) |id|
+        try std.testing.expect(try sstExists(alloc, dir_path, id));
+
+    // The compaction output still reads back through the forest.
+    {
+        const got = try f.getRaw(alloc, .{
+            .key = .{ .namespace = 1, .table_id = 0, .primary = "a" },
+        }) orelse return error.TestExpectedItem;
+        defer got.free(alloc);
+        try std.testing.expectEqualStrings("one", got.newest().value);
+    }
+
+    // And the pinned input still serves a read off its open descriptor,
+    // although the cache dropped it and the file is gone.
+    try std.testing.expect(!f.table_cache.contains(pinned.file_id));
+    {
+        var it = zdb.table.TableIterator.init(alloc, pinned, .p0);
+        defer it.deinit();
+        try it.seekRange(pinned.smallest, .{});
+        try std.testing.expect(it.itemRef() != null);
+    }
+}
+
+/// Backdate a file's mtime so the orphan scan sees it as old, without a
+/// test ever sleeping. Direct std.Io: setting times is a test-only need,
+/// so vfs carries no wrapper for it.
+fn backdate(path: String, secs: i64) !void {
+    try std.Io.Dir.cwd().setTimestamps(utils.context.g().io, path, .{
+        .modify_timestamp = .{ .new = .{ .nanoseconds = @as(i96, secs) * std.time.ns_per_s } },
+    });
+}
+
+test "table cache: a table loaded for an install survives an evict before it is installed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    try f.newMemtable(1);
+    try putRow(f, "a", 1, "one");
+    try f.newMemtable(2);
+    var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush.changes.deinit(alloc);
+    try f.applyFlush(3, flush.changes.items, flush.memtable_id);
+    const listed = flush.changes.items[0].sst_id;
+
+    // A real SST under an id the manifest has not heard of yet, pre-opened
+    // the way a follower's prefetch does: the cache's ref is its only one.
+    const pending: u64 = 0x5eed;
+    {
+        const read = f.readFile(alloc, listed) orelse return error.TestExpectedFile;
+        defer read.free();
+        f.writeFile(pending, read.data);
+    }
+    try std.testing.expect(f.table_cache.contains(pending));
+
+    // An apply looks the table up for its install...
+    var needs = [_]zdb.tree.TableNeed{.{ .id = pending, .level = 0 }};
+    try f.table_cache.loadTables(&needs);
+    const t = needs[0].table orelse return error.TestExpectedTable;
+
+    // ...and before it installs it, the orphan scan evicts that id: the
+    // manifest does not list it yet. The cache's ref goes.
+    f.table_cache.evict(pending);
+    try std.testing.expect(!f.table_cache.contains(pending));
+
+    // The loader's own ref keeps the table open and readable.
+    try std.testing.expectEqual(@as(i32, 1), t.ref.load(.acquire));
+    {
+        var it = zdb.table.TableIterator.init(alloc, t, .p0);
+        defer it.deinit();
+        try it.seekRange(t.smallest, .{});
+        try std.testing.expect(it.itemRef() != null);
+    }
+
+    // Releasing it is the last ref: the table is freed here, which the
+    // testing allocator checks.
+    zdb.tree.TableCache.decrRefs(&needs);
+    try std.testing.expect(needs[0].table == null);
+}
+
+test "forest: removeOrphans unlinks only unknown files at or before the cutoff" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+
+    _ = try f.createTree(1, 0, .{ .inf = true });
+    try f.newMemtable(1);
+    try putRow(f, "a", 1, "one");
+    try f.newMemtable(2);
+    var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush.changes.deinit(alloc);
+    try f.applyFlush(3, flush.changes.items, flush.memtable_id);
+    const listed = flush.changes.items[0].sst_id;
+
+    // Four SST-named files the manifest never heard of. Three are backdated
+    // two hours, one a minute — the young one stands in for a file written
+    // after the cutoff: some writer may still be working on it.
+    const now = fiber.timestampNow(.realtime, .secs);
+    const old_junk = [_]u64{ 0xdead, 0xbeef, 0xcafe };
+    const young_junk: u64 = 0xf00d;
+    for (old_junk ++ [_]u64{young_junk}, 0..) |id, i| {
+        const path = try zdb.sstPath(alloc, dir_path, id);
+        defer alloc.free(path);
+        try vfs.writeFile(path, "not a real sst");
+        const age_s: i64 = if (i < old_junk.len)
+            2 * std.time.s_per_hour
+        else
+            std.time.s_per_min;
+        try backdate(path, now - age_s);
+    }
+
+    // A file whose name is not an SST name at all.
+    const other = try std.fmt.allocPrint(alloc, "{s}/NOTES.txt", .{dir_path});
+    defer alloc.free(other);
+    try vfs.writeFile(other, "keep me");
+    try backdate(other, now - 2 * std.time.s_per_hour);
+
+    // A real SST pre-opened into the table cache for a create that never
+    // applies (the follower prefetch path): the scan must evict it, or
+    // its open fd keeps the unlinked file's blocks.
+    const prewarmed: u64 = 0xabcd;
+    {
+        const read = f.readFile(alloc, listed) orelse return error.TestExpectedFile;
+        defer read.free();
+        f.writeFile(prewarmed, read.data);
+        try std.testing.expect(f.table_cache.contains(prewarmed));
+        const path = try zdb.sstPath(alloc, dir_path, prewarmed);
+        defer alloc.free(path);
+        try backdate(path, now - 2 * std.time.s_per_hour);
+    }
+
+    // No snapshot yet (cutoff 0), or a cutoff older than every file:
+    // nothing is an orphan.
+    for ([_]i64{ 0, now - 3 * std.time.s_per_hour }) |cutoff_s| {
+        try f.removeOrphans(cutoff_s);
+        for (old_junk) |id|
+            try std.testing.expect(try sstExists(alloc, dir_path, id));
+        try std.testing.expect(try sstExists(alloc, dir_path, prewarmed));
+        try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
+    }
+
+    // A cutoff between the old files and the young one.
+    try f.removeOrphans(now - std.time.s_per_hour);
+
+    // Only the old unknown SSTs go, the pre-opened one with its cache entry.
+    for (old_junk) |id|
+        try std.testing.expect(!try sstExists(alloc, dir_path, id));
+    try std.testing.expect(!try sstExists(alloc, dir_path, prewarmed));
+    try std.testing.expect(!f.table_cache.contains(prewarmed));
+    try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
+    try std.testing.expect(try sstExists(alloc, dir_path, listed));
+    try vfs.access(other);
+
+    // A listed file is left alone however old it is.
+    {
+        const path = try zdb.sstPath(alloc, dir_path, listed);
+        defer alloc.free(path);
+        try backdate(path, now - 2 * std.time.s_per_hour);
+    }
+    try f.removeOrphans(now - std.time.s_per_hour);
+    try std.testing.expect(try sstExists(alloc, dir_path, listed));
+    try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
+
+    // Once the cutoff passes the young file it goes too, and still
+    // nothing the manifest lists.
+    try f.removeOrphans(now);
+    try std.testing.expect(!try sstExists(alloc, dir_path, young_junk));
+    try std.testing.expect(try sstExists(alloc, dir_path, listed));
+    try vfs.access(other);
+}
+
+test "forest: evictTables evicts a compacted-away file; its blocks go with the table" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2422,7 +2697,7 @@ test "forest: evictUnlisted evicts a compacted-away file; its blocks go with the
 
     // The apply unlisted both inputs; the purge evicts them.
     for (in_ids) |id| try std.testing.expect(f.table_cache.contains(id));
-    try f.evictUnlisted();
+    try f.evictTables();
     for (in_ids) |id| try std.testing.expect(!f.table_cache.contains(id));
 
     // What the last `decrRef` does: drop exactly this table's blocks.
@@ -2436,6 +2711,6 @@ test "forest: evictUnlisted evicts a compacted-away file; its blocks go with the
     for (comp.items) |c| if (c.op == .create) {
         out_id = c.sst_id;
     };
-    try f.evictUnlisted();
+    try f.evictTables();
     try std.testing.expect(f.table_cache.contains(out_id));
 }

@@ -5,21 +5,27 @@ const fiber = @import("zfiber");
 const m = @import("metrics");
 const flags = @import("flags");
 const utils = @import("raft").utils;
+const _hlc = utils.hlc;
 const String = utils.String;
 
-/// `--snapshot` — Raft snapshot triggers and polling cadence. The leader's
-/// snapshot loop reads these every iteration so operators can tune at
-/// runtime via the live flags channel.
+/// `--snapshot` — Raft snapshot triggers, polling cadence, and the SST
+/// file reclamation that hangs off snapshots. The snapshot loop reads
+/// these every iteration so operators can tune at runtime via the live
+/// flags channel.
 pub const SnapshotCfg = struct {
     min_bytes: u64 = 1 << 30, // 1 GiB
     min_age_seconds: u64 = 10 * 60, // 10 minutes
-    poll_interval_seconds: u64 = 5,
+    poll_interval_seconds: u64 = 60,
+    orphan_min_age_seconds: u64 = 30 * 60,
+    orphan_scan_interval_seconds: u64 = 30 * 60,
 
     pub const docs = .{
         .self = "Raft snapshot triggers. Leader proposes a snapshot when WAL tail bytes from head reach min_bytes OR an entry crosses min_age_seconds.",
         .min_bytes = "Snapshot triggers once WAL tail-bytes-from-head reach this. Default 1 GiB.",
         .min_age_seconds = "Snapshot triggers when an entry is at least this many seconds older than wall clock. Default 600 (10 min).",
-        .poll_interval_seconds = "How often the snapshot loop checks the criteria. Default 30s.",
+        .poll_interval_seconds = "How often the snapshot loop checks the criteria.",
+        .orphan_min_age_seconds = "SST files the manifest does not know are removed only once older than this and not written after the snapshot; must exceed one compaction's window from first output write to proposal. Default 1800 (30 min).",
+        .orphan_scan_interval_seconds = "How often the data directory is scanned for orphan SST files. Default 1800 (30 min).",
     };
 };
 
@@ -262,7 +268,7 @@ pub const StorageImpl = struct {
         // Whatever this change unlisted has no level pointing at it;
         // drop its blocks and its table cache entry now rather than
         // when the file goes.
-        try self.forest.evictUnlisted();
+        try self.forest.evictTables();
     }
 
     /// StateMachine hook behind the announce prefetch: a peer announced
@@ -771,6 +777,22 @@ pub const Engine = struct {
     /// and invokes `maybeProposeSnapshot`, which is a no-op until the WAL
     /// crosses the size or age threshold. Runs concurrently with `applyLoop` —
     /// DiskWAL/Forest are designed for concurrent reads.
+    ///
+    /// The loop also does file GC, on the leader only, like the proposal:
+    /// `waitForQuorum` below holds a node here until it is leader, and
+    /// every tick is skipped while it is not. Whenever the installed
+    /// snapshot index has advanced since the last tick the leader unlinks
+    /// the SSTs queued for deletion at or below it (`Forest.deleteFiles`),
+    /// and every `orphan_scan_interval_seconds` it rescans the data
+    /// directory for files the manifest does not know
+    /// (`Forest.removeOrphans`); the first tick as leader runs a scan.
+    ///
+    /// Leader-only because SST files are meant to live on shared storage,
+    /// where one node must own deletion (see the TODO in the loop). Both
+    /// calls unlink in this node's own data directory today, so a
+    /// follower's local copies, written by `Forest.writeFile`, are not
+    /// removed by anything while it stays a follower, and its `to_delete`
+    /// records accumulate until it becomes leader.
     pub fn runSnapshotLoop(self: *Engine) void {
         // Same barrier as runCompactionLoop — snapshot proposal would
         // race the WAL-tail replay otherwise.
@@ -779,15 +801,64 @@ pub const Engine = struct {
             return;
         };
 
+        // The barrier above means replay has reached the commit index, so
+        // the manifest now knows every file this node needs.
+        var last_scan_ms: i64 = 0;
+
+        // Sweep only when a snapshot has been installed since the last
+        // look: a retire becomes deletable only by the snapshot index
+        // passing it, so nothing changes in between.
+        var swept_upto: u64 = 0;
+
         while (!self.node.isShuttingDown()) {
             const cfg = self.snapshot_cfg.snapshot();
             if (self.node.shutdown.waitTimeout(cfg.poll_interval_seconds * 1000)) return;
             if (!self.node.isLeader()) continue;
 
+            // TODO: Only leader is allowed to delete files because
+            // they should be sitting on remote storage. But, the file accessors
+            // are intermixed local and remote. Need to clean it all up.
+
+            const snap_index = self.node.log.snapshot().index;
+            if (snap_index > swept_upto) {
+                self.forest.deleteFiles(snap_index) catch |err| {
+                    log.warn("deleteFiles: {s}", .{@errorName(err)});
+                };
+                swept_upto = snap_index;
+            }
+
+            const now_ms = fiber.coarseMs();
+            if (now_ms - last_scan_ms >= cfg.orphan_scan_interval_seconds * 1000) {
+                last_scan_ms = now_ms;
+                self.removeOrphans();
+            }
+
             self.maybeProposeSnapshot() catch |err| {
                 log.warn("maybeProposeSnapshot: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    /// Scan and remove orphan SSTables. A file the manifest does not know goes
+    /// only if it passes two gates, both on its modification time: not written
+    /// after the entry at this node's snapshot index, and at least
+    /// `orphan_min_age_seconds` old. The snapshot gate alone is not enough: the
+    /// byte trigger can pick a snapshot entry seconds behind the log head, and
+    /// a compaction's early outputs are older than that long before its
+    /// proposal applies. Failure is logged and dropped: the next scan retries
+    /// the whole directory.
+    fn removeOrphans(self: *Engine) void {
+        const cfg = self.snapshot_cfg.snapshot();
+        // Wall-clock seconds of the entry at the snapshot index; 0 with
+        // no snapshot yet, and then nothing counts as an orphan.
+        const snapshot_s = _hlc.HLC.fromU64(self.node.log.snapshot().timestamp).seconds;
+        const min_age_s: i64 = @intCast(cfg.orphan_min_age_seconds);
+        const now_s = fiber.timestampNow(.realtime, .secs);
+        const cutoff_s = @min(snapshot_s, now_s - min_age_s);
+
+        self.forest.removeOrphans(cutoff_s) catch |err| {
+            log.warn("removeOrphans: {s}", .{@errorName(err)});
+        };
     }
 
     /// Leader-only. Pick a target snapshot index from WAL size/age (capped by
@@ -906,11 +977,14 @@ pub const Engine = struct {
             return;
         }
 
+        // HLC timestamp of the entry at `target`, for `Snapshot.timestamp`.
+        var target_ts: u64 = 0;
         for (result.entries) |stored| {
             const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch |err| {
                 log.warn("maybeProposeSnapshot: parseRoot at index={d}: {s}", .{ stored.index, @errorName(err) });
                 continue;
             };
+            if (stored.index == target) target_ts = reader.timestamp();
             if (reader.entryType() != .manifest) continue;
 
             const payload = reader.data();
@@ -956,6 +1030,7 @@ pub const Engine = struct {
             // between the cap calc and now is unnecessary — `oldest` is
             // already pinned by the cap.)
             .oldest_memtable_index = oldest,
+            .timestamp = target_ts,
         });
         log.info("snapshot proposed: index={d} term={d} bytes={d}", .{ target, target_term, data.len });
     }
@@ -1211,11 +1286,11 @@ pub const Engine = struct {
             // Retried proposes and splits re-reference already-uploaded ids.
             if (try self.store.exists(name)) continue;
 
-            const data = self.forest.readFile(self.allocator, c.sst_id) orelse return error.FileNotFound;
-            defer self.allocator.free(data);
+            const read = self.forest.readFile(self.allocator, c.sst_id) orelse return error.FileNotFound;
+            defer read.free();
 
-            try self.store.put(name, data);
-            fe.info("node={d} event=store_put file_id={d} bytes={d}", .{ self.node.id, c.sst_id, data.len });
+            try self.store.put(name, read.data);
+            fe.info("node={d} event=store_put file_id={d} bytes={d}", .{ self.node.id, c.sst_id, read.data.len });
         }
         if (file_ids.items.len == 0) return;
         // One durability barrier for the whole batch (put syncs bytes;

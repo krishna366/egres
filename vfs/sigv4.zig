@@ -29,19 +29,19 @@ pub const AmzDate = struct {
     stamp: [16]u8,
 
     pub fn fromEpochSeconds(secs: u64) AmzDate {
-        const es = std.time.epoch.EpochSeconds{ .secs = secs };
-        const day = es.getEpochDay();
-        const year_day = day.calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
-        const day_secs = es.getDaySeconds();
+        const total: i64 = @intCast(secs);
+        const c = utils.date.civilFromDays(@divFloor(total, std.time.s_per_day));
+        const day_secs: u64 = @intCast(@mod(total, std.time.s_per_day));
         var self: AmzDate = undefined;
+        // Unsigned on purpose: a `0` fill on a signed integer prints an
+        // explicit `+` sign.
         _ = std.fmt.bufPrint(&self.stamp, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
-            year_day.year,
-            month_day.month.numeric(),
-            month_day.day_index + 1,
-            day_secs.getHoursIntoDay(),
-            day_secs.getMinutesIntoHour(),
-            day_secs.getSecondsIntoMinute(),
+            @as(u64, @intCast(c.year)),
+            @as(u64, @intCast(c.month)),
+            @as(u64, @intCast(c.day)),
+            day_secs / std.time.s_per_hour,
+            (day_secs / std.time.s_per_min) % 60,
+            day_secs % 60,
         }) catch unreachable;
         return self;
     }
@@ -64,28 +64,30 @@ pub fn authorization(
     region: String,
     method: String,
     path: String,
+    /// Canonical query string: parameters sorted by name, each name and
+    /// value URI-encoded, joined with `&`. Empty for a request with no
+    /// query (every object op). The caller builds it, because only the
+    /// caller knows which parameters it is sending.
+    query: String,
     host: String,
     payload_hash: String,
     amz: *const AmzDate,
 ) ![]u8 {
-    const canonical = try std.fmt.allocPrint(a,
-        "{s}\n{s}\n\nhost:{s}\nx-amz-content-sha256:{s}\nx-amz-date:{s}\n\n" ++
-            signed_headers ++ "\n{s}", .{
-        method, path, host, payload_hash, &amz.stamp, payload_hash,
+    const canonical = try std.fmt.allocPrint(a, "{s}\n{s}\n{s}\nhost:{s}\nx-amz-content-sha256:{s}\nx-amz-date:{s}\n\n" ++
+        signed_headers ++ "\n{s}", .{
+        method, path, query, host, payload_hash, &amz.stamp, payload_hash,
     });
     defer a.free(canonical);
 
     const canonical_hash = hashHex(canonical);
-    const sts = try std.fmt.allocPrint(a,
-        "AWS4-HMAC-SHA256\n{s}\n{s}/{s}/" ++ service ++ "/aws4_request\n{s}", .{
+    const sts = try std.fmt.allocPrint(a, "AWS4-HMAC-SHA256\n{s}\n{s}/{s}/" ++ service ++ "/aws4_request\n{s}", .{
         &amz.stamp, amz.date(), region, &canonical_hash,
     });
     defer a.free(sts);
 
     const sig = signature(secret_key, amz.date(), region, service, sts);
-    return std.fmt.allocPrint(a,
-        "AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/" ++ service ++
-            "/aws4_request, SignedHeaders=" ++ signed_headers ++ ", Signature={s}", .{
+    return std.fmt.allocPrint(a, "AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/" ++ service ++
+        "/aws4_request, SignedHeaders=" ++ signed_headers ++ ", Signature={s}", .{
         access_key, amz.date(), region, &sig,
     });
 }

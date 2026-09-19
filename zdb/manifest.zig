@@ -7,6 +7,7 @@ const TableKey = @import("kv.zig").TableKey;
 const treeTableId = @import("kv.zig").treeTableId;
 const fiber = @import("zfiber");
 const utils = @import("utils");
+const vfs = @import("vfs");
 const String = utils.String;
 
 /// The manifest lock. Shared for the name lookups on the query path and
@@ -78,17 +79,39 @@ pub const first_namespace: u64 = 16;
 /// produces the bytes that go into a Raft snapshot's `data` field;
 /// `restoreFrom` is the inverse, used by recovery to install the manifest
 /// before WAL replay.
+///
+/// The manifest also owns SST file lifetime: a file lives as long as some
+/// tree lists it, and the entry that removes its last listing retires it
+/// (see `to_delete`). `Forest.deleteFiles` unlinks a retired file once the
+/// node's durable snapshot index has passed that entry's index.
 pub const Manifest = struct {
     allocator: std.mem.Allocator,
     trees: std.AutoHashMap(TreeKey, TreeState),
     /// Per-SST records, keyed by sst_id. One entry per file any tree
     /// lists; guarded by `mu` like `trees`.
     ssts: std.AutoHashMap(u64, SstInfo),
-    /// Ids whose last listing went since the last `takeUnlisted`, in
-    /// order. The forest drains it after every apply to drop those files'
-    /// blocks from the block cache right away. Per-process; a draft
-    /// manifest's list dies with the draft.
-    unlisted: std.ArrayList(u64),
+    /// Files to delete from disk: every file that left the manifest,
+    /// keyed by sst_id → the log index of the entry whose apply removed
+    /// its last listing. `takeToDelete` hands them to
+    /// `Forest.deleteFiles`, which unlinks each one once the node's
+    /// durable snapshot index reaches that entry; until then a restart
+    /// may replay an entry that opens the file again.
+    ///
+    /// Not persisted, and not part of `serialize`/`restoreFrom`: a snapshot
+    /// manifest lists only live files, and recovery re-records every
+    /// entry above the snapshot index because replay re-applies them.
+    /// A record at or below the snapshot index is lost with the map, which
+    /// is what `Forest.removeOrphans` cleans up at startup.
+    to_delete: std.AutoHashMap(u64, u64),
+    /// Files to evict from memory: the ids whose last listing went since
+    /// the last `takeToEvict`, in order. Written at the same point as
+    /// `to_delete` (`decrSST`), for a different consumer: the forest
+    /// drains it after every apply (`Forest.evictTables`) and drops each
+    /// file's table cache entry right away, and the table's blocks go
+    /// with its last ref. Memory does not wait for the snapshot; the
+    /// file does. Per-process, like `to_delete`; a draft manifest's list
+    /// dies with the draft.
+    to_evict: std.ArrayList(u64),
     /// Per-namespace manifest state (see `Namespace`), snapshot-persisted and
     /// maintained by the apply paths on every node — so a re-elected leader
     /// never re-issues a table_id, and database-name resolution is native
@@ -135,7 +158,8 @@ pub const Manifest = struct {
             .allocator = allocator,
             .trees = std.AutoHashMap(TreeKey, TreeState).init(allocator),
             .ssts = std.AutoHashMap(u64, SstInfo).init(allocator),
-            .unlisted = .empty,
+            .to_delete = std.AutoHashMap(u64, u64).init(allocator),
+            .to_evict = .empty,
             .namespaces = std.AutoHashMap(u64, Namespace).init(allocator),
             .names = std.StringHashMap(u64).init(allocator),
         };
@@ -386,9 +410,9 @@ pub const Manifest = struct {
     /// for any number of files a cluster can hold. Zero is skipped — it
     /// is the "no id" sentinel. A draw that hits an id the manifest
     /// already lists is redrawn, which makes a collision with a known id
-    /// impossible rather than merely unlikely; `ssts` makes that one
-    /// lookup. A later change (the retire list) adds a second set to
-    /// the check.
+    /// impossible rather than merely unlikely. Both sets are checked:
+    /// `ssts` for a live file, `to_delete` for one whose file may still sit
+    /// on disk under that name until the next sweep.
     pub fn newFileId(self: *Manifest) u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
@@ -397,9 +421,90 @@ pub const Manifest = struct {
             var bytes: [8]u8 = undefined;
             utils.context.g().io.random(&bytes);
             const id = std.mem.readInt(u64, &bytes, .little);
+
             if (id == 0 or self.ssts.contains(id)) continue;
+            if (self.to_delete.contains(id)) continue;
             return id;
         }
+    }
+
+    /// Whether the manifest knows `id` at all — listed by some tree, or
+    /// retired and awaiting its unlink. `Forest.removeOrphans` asks this of
+    /// every SST-shaped filename it finds on disk; anything unknown is not
+    /// the manifest's file.
+    pub fn knowsFile(self: *Manifest, id: u64) bool {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        return self.ssts.contains(id) or self.to_delete.contains(id);
+    }
+
+    /// The ids of the SST-named regular files in `entries` that the
+    /// manifest does not know: neither listed by a tree nor retired and
+    /// awaiting its unlink. Caller frees the slice.
+    ///
+    /// Takes a `.names` listing, no stat: a data dir holds hundreds of
+    /// thousands of SSTs and nearly all of them are the manifest's, so
+    /// the caller stats just the few ids this returns. One shared hold
+    /// for the whole pass rather than a lock per name.
+    ///
+    /// Unknown is not yet orphan: a file some node is still writing, or
+    /// has written but not yet proposed, is in no manifest either. The
+    /// caller's cutoff (`Forest.removeOrphans`) decides that.
+    pub fn unknownFiles(
+        self: *Manifest,
+        alloc: std.mem.Allocator,
+        entries: []const vfs.ObjectInfo,
+    ) ![]u64 {
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(alloc);
+
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        for (entries) |entry| {
+            const id = parseSstName(entry.name) orelse continue;
+            if (self.ssts.contains(id) or self.to_delete.contains(id)) continue;
+            try out.append(alloc, id);
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// The file id in an SST filename (`<id:016x>.sst`), or null when the
+    /// name is not one — a WAL segment, a lock file, anything else a
+    /// directory holds. Those are never the manifest's files.
+    fn parseSstName(name: String) ?u64 {
+        const ext = ".sst";
+        if (name.len != 16 + ext.len) return null;
+        if (!std.mem.endsWith(u8, name, ext)) return null;
+        return std.fmt.parseInt(u64, name[0..16], 16) catch null;
+    }
+
+    /// One retired file: its id and the log index of the entry that removed
+    /// its last listing.
+    pub const ToDelete = struct { sst_id: u64, index: u64 };
+
+    /// Take every file retired at or below `max_index` out of the `to_delete` map.
+    /// Caller owns (and frees) the returned slice; an entry is handed out
+    /// exactly once, so the caller is the only one that can unlink it.
+    pub fn takeToDelete(
+        self: *Manifest,
+        alloc: std.mem.Allocator,
+        max_index: u64,
+    ) ![]ToDelete {
+        const held = self.mu.hold(.exclusive, @src());
+        defer held.release();
+
+        var out: std.ArrayList(ToDelete) = .empty;
+        errdefer out.deinit(alloc);
+        var it = self.to_delete.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* > max_index) continue;
+            try out.append(alloc, .{
+                .sst_id = kv.key_ptr.*,
+                .index = kv.value_ptr.*,
+            });
+        }
+        for (out.items) |r| _ = self.to_delete.remove(r.sst_id);
+        return out.toOwnedSlice(alloc);
     }
 
     /// A tree's manifest record, borrowed for as long as `held` is: the
@@ -428,7 +533,8 @@ pub const Manifest = struct {
         while (it.next()) |kv| self.freeTree(kv.value_ptr);
         self.trees.deinit();
         self.ssts.deinit();
-        self.unlisted.deinit(self.allocator);
+        self.to_delete.deinit();
+        self.to_evict.deinit(self.allocator);
         self.names.deinit(); // keys borrow the names owned below
         var nit = self.namespaces.valueIterator();
         while (nit.next()) |n| n.deinit(self.allocator);
@@ -479,7 +585,7 @@ pub const Manifest = struct {
             // Scan levels to find and remove the table.
             for (tree.levels.items) |*lm| {
                 if (lm.tables.remove(tc.sst_id)) {
-                    try self.decrSST(tc.sst_id);
+                    try self.decrSST(index, tc.sst_id);
                     break;
                 }
             }
@@ -487,25 +593,37 @@ pub const Manifest = struct {
     }
 
     /// Drop one listing of `id`, forgetting the file once the last one
-    /// goes. Caller holds the manifest lock exclusively.
-    fn decrSST(self: *Manifest, id: u64) !void {
+    /// goes. `index` is the log index of the entry being applied. This is
+    /// the single point at which a file is queued in `to_evict` and
+    /// `to_delete`: every path that can remove a listing (SST delete,
+    /// tree delete) goes through here, so a file can never leave the
+    /// manifest without both records.
+    /// Caller holds the manifest lock exclusively.
+    fn decrSST(self: *Manifest, index: u64, sst_id: u64) !void {
         // Every listed id has a record; a delete for an unknown id is a
         // bug in the change that carried it, not a case to tolerate.
-        const info = self.ssts.getPtr(id).?;
+        const info = self.ssts.getPtr(sst_id).?;
         std.debug.assert(info.refs > 0);
         info.refs -= 1;
         if (info.refs != 0) return;
-        _ = self.ssts.remove(id);
-        try self.unlisted.append(self.allocator, id);
-        // Part B appends the id to the retire list here.
+
+        _ = self.ssts.remove(sst_id);
+        try self.to_evict.append(self.allocator, sst_id);
+        // index 0 means "no raft entry behind this apply" (restoreFrom,
+        // and the single-node/test paths that pass 0 to `commit`). There
+        // is no snapshot index that can ever pass 0, so retiring the file
+        // would only pin it in the map forever; leave it to
+        // `Forest.removeOrphans`.
+        if (index == 0) return;
+        try self.to_delete.put(sst_id, index);
     }
 
     /// Hand over the ids unlisted since the last call, oldest first, and
     /// forget them. Freed by the caller with the manifest's allocator.
-    pub fn takeUnlisted(self: *Manifest) ![]u64 {
-        const held = self.mu.hold(.exclusive, @src());
-        defer held.release();
-        return self.unlisted.toOwnedSlice(self.allocator);
+    pub fn takeToEvict(self: *Manifest) ![]u64 {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        return self.to_evict.toOwnedSlice(self.allocator);
     }
 
     /// The log index of the entry that first listed `sst_id`. Asking for
@@ -523,12 +641,15 @@ pub const Manifest = struct {
     }
 
     /// Applies a tree CREATE, DELETE, or UPDATE.
-    /// DELETE automatically removes all tables owned by the tree.
-    /// UPDATE changes the tree's key range. Caller holds the manifest lock
+    /// DELETE automatically removes all tables owned by the tree, retiring
+    /// each one whose last listing this delete takes away. UPDATE changes
+    /// the tree's key range. `index` is the log index of the applying entry
+    /// (only the DELETE arm reads it). Caller holds the manifest lock
     /// exclusively — `held` is the proof.
     pub fn applyTreeChange(
         self: *Manifest,
         held: Lock.Exclusive,
+        index: u64,
         tc: TreeChange,
     ) !void {
         self.mu.assertHeld(held);
@@ -549,11 +670,13 @@ pub const Manifest = struct {
         } else if (tc.op == .delete) {
             if (self.trees.fetchRemove(key)) |kv| {
                 var tree = kv.value;
+                // The record is already out of the map, so its levels and
+                // keys go whether or not a retire below fails to record.
+                defer self.freeTree(&tree);
                 for (tree.levels.items) |lm| {
                     var tit = lm.tables.keyIterator();
-                    while (tit.next()) |id| try self.decrSST(id.*);
+                    while (tit.next()) |id| try self.decrSST(index, id.*);
                 }
-                self.freeTree(&tree);
             }
         } else if (tc.op == .update) {
             const tree = self.trees.getPtr(key) orelse
@@ -582,17 +705,18 @@ pub const Manifest = struct {
         const held = self.mu.hold(.exclusive, @src());
         defer held.release();
 
-        for (tree_changes) |tc| try self.applyTreeChange(held, tc);
+        for (tree_changes) |tc| try self.applyTreeChange(held, index, tc);
         try self.applySSTableChanges(held, index, table_changes);
     }
 
     /// Apply one entry's SST changes: every create, then every delete.
     /// A split lists a moved file twice in one entry, a delete from the
     /// old tree and a create in the new one. Applied in that order the
-    /// delete would take the refcount to zero and unlist a file the same
-    /// entry lists again. Creates first keep the record alive (refs
-    /// 1 -> 2 -> 1), so a file is unlisted only when an entry leaves it
-    /// with no listing at all.
+    /// delete would take the refcount to zero and retire the file, and
+    /// the create would re-list it with the retire record still standing:
+    /// the next sweep would unlink a listed file. Creates first keep the
+    /// record alive (refs 1 -> 2 -> 1), so a file is retired only when an
+    /// entry leaves it with no listing at all.
     fn applySSTableChanges(
         self: *Manifest,
         held: Lock.Exclusive,
@@ -629,7 +753,8 @@ pub const Manifest = struct {
         {
             const held = self.mu.hold(.exclusive, @src());
             defer held.release();
-            for (mc.tree_changes) |tc| try self.applyTreeChange(held, tc);
+            for (mc.tree_changes) |tc|
+                try self.applyTreeChange(held, index, tc);
             try self.applySSTableChanges(held, index, mc.sstable_changes);
         }
 
@@ -789,6 +914,10 @@ pub const Manifest = struct {
             while (it.next()) |kv| self.freeTree(kv.value_ptr);
             self.trees.clearRetainingCapacity();
             self.ssts.clearRetainingCapacity();
+            // A snapshot manifest lists only live files, so nothing is
+            // retired at restore time. Replay of the entries above the
+            // snapshot index re-records every retire above it.
+            self.to_delete.clearRetainingCapacity();
             self.names.clearRetainingCapacity(); // keys borrow the names below
             var nit = self.namespaces.valueIterator();
             while (nit.next()) |n| n.deinit(self.allocator);
@@ -799,7 +928,9 @@ pub const Manifest = struct {
             var i: u32 = 0;
             while (i < tc_len) : (i += 1) {
                 const tc = try reader.treeChangesAt(i);
-                try self.applyTreeChange(held, .{
+                // index 0: a serialized manifest carries only
+                // creates, so nothing here reaches `decrSST`.
+                try self.applyTreeChange(held, 0, .{
                     .op = tc.op(),
                     .tree_id = tc.treeId(),
                     .namespace_id = tc.namespaceId(),
@@ -861,7 +992,9 @@ pub const Manifest = struct {
 
     /// Deep-copy this Manifest into a fresh standalone copy. Used when
     /// building a snapshot draft so the live state is never mutated by the
-    /// snapshot pipeline.
+    /// snapshot pipeline. The copy's `to_delete` map starts empty — retires
+    /// belong to the live manifest that applied them, and the draft is
+    /// never the thing that sweeps.
     pub fn clone(
         self: *Manifest,
         allocator: std.mem.Allocator,

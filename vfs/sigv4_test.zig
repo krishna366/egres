@@ -71,14 +71,14 @@ test "sigv4: authorization header shape" {
         "us-east-1",
         "GET",
         "/bucket/0001_000000000001.sst",
+        "",
         "127.0.0.1:8333",
         &payload_hash,
         &amz,
     );
     defer a.free(auth);
-    try testing.expect(std.mem.startsWith(u8, auth,
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, " ++
-            "SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="));
+    try testing.expect(std.mem.startsWith(u8, auth, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, " ++
+        "SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="));
     // Signature is 64 hex chars.
     try testing.expectEqual(@as(usize, 64), auth.len - (std.mem.indexOf(u8, auth, "Signature=").? + "Signature=".len));
 }

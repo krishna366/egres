@@ -3,8 +3,9 @@
 //!   - **Data plane** (`read`/`write`/`preadBatch`): positional `pread`/
 //!     `pwrite` submitted to the current worker's libxev loop; the fiber
 //!     parks and the completion callback wakes it. Fully async.
-//!   - **Blocking ops** (`sync`, `setSize`, and the `Dir` path ops open/
-//!     create/access/rename/delete): libxev can't do these async, so they
+//!   - **Blocking ops** (`sync`, `setSize`, the `Dir` path ops open/
+//!     create/access/rename/delete, and `Dir.list`): libxev can't do these
+//!     async, so they
 //!     run on the `fsops` thread pool — the fiber parks, a pool thread runs
 //!     the syscall and wakes it. The worker thread stays free, and the big
 //!     path-buffer frames run on the pool thread's full-size OS stack.
@@ -36,6 +37,10 @@ fn sioFile(fd: SioFile.Handle) SioFile {
 
 pub const Stat = struct {
     size: u64,
+    /// Last modification time in whole seconds since the UTC epoch, on
+    /// the realtime clock — the same scale as
+    /// `timestampNow(.realtime, .secs)`, so an age is a subtraction.
+    mtime_s: i64,
 };
 
 /// Flags accepted by `File.sync` for zio API parity. Ignored — `std.Io`'s
@@ -139,11 +144,11 @@ pub const File = struct {
         return _fsops.run(setLengthImpl, .{ self.fd, length });
     }
 
-    /// Stat the open file (currently just its size). A fast `fstat` (cached
-    /// inode), so it runs inline.
+    /// Stat the open file: its size and modification time. A fast `fstat`
+    /// (cached inode), so it runs inline.
     pub fn stat(self: File) !Stat {
         const st = try sioFile(self.fd).stat(_fsops.io());
-        return .{ .size = st.size };
+        return .{ .size = st.size, .mtime_s = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s)) };
     }
 
     pub fn size(self: File) !u64 {
@@ -300,7 +305,51 @@ pub const Dir = struct {
         _ = flags;
         return _fsops.run(openImpl, .{path});
     }
+
+    /// Every entry of `path`, names duped out of `alloc`. Release the
+    /// result with `freeEntries`. Offloaded: libxev has no readdir op, and
+    /// the loop blocks once per getdents buffer — on the pool thread that
+    /// costs a worker nothing, and the iterator's ~1 KiB path frames run
+    /// on a full-size OS stack.
+    pub fn list(self: Dir, alloc: std.mem.Allocator, path: []const u8) ![]Entry {
+        _ = self;
+        return _fsops.run(listImpl, .{ alloc, path });
+    }
 };
+
+/// One directory entry: the name (owned by the caller's allocator) and
+/// what it is.
+pub const Entry = struct {
+    name: []const u8,
+    kind: Kind,
+};
+
+pub const Kind = SioFile.Kind;
+
+/// Free a slice returned by `Dir.list`, names included.
+pub fn freeEntries(alloc: std.mem.Allocator, entries: []const Entry) void {
+    for (entries) |e| alloc.free(e.name);
+    alloc.free(entries);
+}
+
+fn listImpl(alloc: std.mem.Allocator, path: []const u8) ![]Entry {
+    var dir = try SioDir.cwd().openDir(_fsops.io(), path, .{ .iterate = true });
+    defer dir.close(_fsops.io());
+
+    var out: std.ArrayList(Entry) = .empty;
+    errdefer {
+        for (out.items) |e| alloc.free(e.name);
+        out.deinit(alloc);
+    }
+
+    var it = dir.iterate();
+    while (try it.next(_fsops.io())) |entry| {
+        const name = try alloc.dupe(u8, entry.name);
+        errdefer alloc.free(name);
+        try out.append(alloc, .{ .name = name, .kind = entry.kind });
+    }
+    return out.toOwnedSlice(alloc);
+}
 
 fn accessImpl(path: []const u8) !void {
     return SioDir.cwd().access(_fsops.io(), path, .{});

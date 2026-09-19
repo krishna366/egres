@@ -86,6 +86,26 @@ pub const FileStore = union(enum) {
         }
     }
 
+    /// Every object in the store: its name, and with `.stat` its size and
+    /// modification time. Caller releases the result with
+    /// `_vfs.freeObjectInfos`.
+    ///
+    /// The dir backend lists only the regular files at the top of the
+    /// depot, so the `tmp/` staging directory (a directory, not a file)
+    /// and the partial puts inside it are skipped. The s3 backend pages
+    /// through ListObjectsV2 under the configured prefix.
+    pub fn list(
+        self: *FileStore,
+        alloc: std.mem.Allocator,
+        detail: _vfs.ListDetail,
+    ) ![]_vfs.ObjectInfo {
+        switch (self.*) {
+            .none => return error.NoFileStore,
+            .dir => |*d| return _vfs.listFiles(alloc, d.depot, detail),
+            .s3 => |*s| return s.list(alloc, detail),
+        }
+    }
+
     /// Open an object for ranged reads. error.FileNotFound if absent.
     pub fn open(self: *FileStore, name: String) !Object {
         switch (self.*) {
@@ -168,11 +188,11 @@ const S3Object = struct {
     sz: u64,
 };
 
-/// A shared write-once blob depot on a filesystem (local dir, NFS mount).
-/// NEVER a live data dir: nodes keep their own LSM dirs; only immutable
-/// blobs live here. put() is tmp+rename so a reader can never observe a
-/// partial object, and only the creating node ever writes a given name,
-/// so tmp names cannot collide across nodes.
+/// A write-once blob store on a filesystem: a shared depot today (local
+/// dir, NFS mount), and the home of a node's SSTs once SST operations move
+/// behind `FileStore` (see the egres todo). put() is tmp+rename so a
+/// reader can never observe a partial object, and only the creating node
+/// ever writes a given name, so tmp names cannot collide across nodes.
 pub const DirStore = struct {
     a: std.mem.Allocator,
     depot: String,

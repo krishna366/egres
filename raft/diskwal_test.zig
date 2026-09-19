@@ -121,12 +121,13 @@ fn checkLargePayload(reader: zen.LogEntryReader, index: u64, expected_len: usize
 }
 
 fn countWalFiles(path: String) !usize {
-    var it = try vfs.iterateDir(path);
-    defer it.deinit();
+    const alloc = std.testing.allocator;
+    const entries = try fiber.Dir.cwd().list(alloc, path);
+    defer fiber.freeDirEntries(alloc, entries);
     var count: usize = 0;
-    while (try it.next()) |entry_dir| {
-        if (entry_dir.kind != .file) continue;
-        if (std.mem.endsWith(u8, entry_dir.name, ".wal")) count += 1;
+    for (entries) |e| {
+        if (e.kind != .file) continue;
+        if (std.mem.endsWith(u8, e.name, ".wal")) count += 1;
     }
     return count;
 }
@@ -301,12 +302,12 @@ test "diskwal drops malformed trailing wal files on reopen" {
 
     // Corrupt the header of the last (current) file by flipping bytes in the magic.
     {
-        var iter = try vfs.iterateDir(wal_dir);
-        defer iter.deinit();
+        const entries = try fiber.Dir.cwd().list(alloc, wal_dir);
+        defer fiber.freeDirEntries(alloc, entries);
 
         // Find the highest fid file.
         var max_fid: u64 = 0;
-        while (try iter.next()) |e| {
+        for (entries) |e| {
             if (e.kind != .file) continue;
             const fid = raft.diskwal.wal.parseWalFid(e.name) orelse continue;
             if (fid > max_fid) max_fid = fid;
@@ -1098,10 +1099,11 @@ test "diskwal: no prezero (copy-on-write filesystem setting)" {
 }
 
 fn dirHas(path: String, name: String) !bool {
-    var it = try vfs.iterateDir(path);
-    defer it.deinit();
-    while (try it.next()) |entry_dir| {
-        if (std.mem.eql(u8, entry_dir.name, name)) return true;
+    const alloc = std.testing.allocator;
+    const entries = try fiber.Dir.cwd().list(alloc, path);
+    defer fiber.freeDirEntries(alloc, entries);
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.name, name)) return true;
     }
     return false;
 }

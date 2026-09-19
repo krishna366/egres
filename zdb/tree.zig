@@ -119,11 +119,33 @@ pub const TableCache = struct {
 
     /// loadTables serves each TableNeed from cache (read lock) or opens it
     /// concurrently via fibers (write lock per miss). On return, each
-    /// need's .table field points to an open *Table owned by the cache.
+    /// need's .table field points to an open *Table in the cache.
     /// The caller is responsible for installing these tables into levels
     /// (e.g. via Level.addEntry) — this keeps loadTables free of any
     /// level-layout assumptions.
+    ///
+    /// Each table comes with a ref for the caller, taken under the cache
+    /// lock at the moment it was found or inserted: release them with
+    /// `decrRefs` once the tables are installed (a level takes its
+    /// own ref). Without it only the cache's ref would stand between the
+    /// lookup and the install, and an `evict` of that id in between — the
+    /// orphan scan can name a file whose entry is just being applied, not
+    /// listed yet — would free the table under the caller. On error no
+    /// ref is left with the caller.
     pub fn loadTables(self: *TableCache, needed: []TableNeed) !void {
+        errdefer decrRefs(needed);
+        try self.loadTablesInner(needed);
+    }
+
+    /// Release the refs `loadTables` handed out, and forget the pointers.
+    pub fn decrRefs(needed: []TableNeed) void {
+        for (needed) |*n| {
+            if (n.table) |t| t.decrRef();
+            n.table = null;
+        }
+    }
+
+    fn loadTablesInner(self: *TableCache, needed: []TableNeed) !void {
         // Phase 1: serve cache hits under read lock; collect pointers for
         // misses.
         var misses: std.ArrayList(*TableNeed) = .empty;
@@ -133,7 +155,7 @@ pub const TableCache = struct {
             defer self.mu.unlockShared();
             for (needed) |*n| {
                 if (self.tables.get(n.id)) |t| {
-                    std.debug.assert(t.ref.load(.acquire) > 0);
+                    t.incrRef(); // the caller's, under the lock
                     n.table = t;
                 } else {
                     try misses.append(self.allocator, n);
@@ -204,6 +226,7 @@ pub const TableCache = struct {
         // Phase A: check under write lock (brief — no I/O).
         self.mu.lock(@src());
         if (self.tables.get(need.id)) |t| {
+            t.incrRef(); // the caller's, under the lock
             self.mu.unlock();
             need.table = t;
             return;
@@ -233,6 +256,7 @@ pub const TableCache = struct {
         self.mu.lock(@src());
         if (self.tables.get(need.id)) |existing| {
             // Another fiber opened the same table while we were in phase B.
+            existing.incrRef(); // the caller's, under the lock
             self.mu.unlock();
             need.table = existing;
             dropUnowned(t);
@@ -244,6 +268,7 @@ pub const TableCache = struct {
             dropUnowned(t);
             return;
         };
+        t.incrRef(); // the caller's, under the lock
         self.mu.unlock();
         need.table = t;
     }
@@ -390,6 +415,7 @@ pub const Tree = struct {
             }
         }
         try cache.loadTables(needed.items);
+        defer TableCache.decrRefs(needed.items);
 
         self.* = .{
             .allocator = allocator,
@@ -756,6 +782,7 @@ pub const Tree = struct {
             }
         }
         try self.cache.loadTables(needed.items);
+        defer TableCache.decrRefs(needed.items);
 
         // Manifest and levels change together, both in memory; the entry
         // itself is already durable in the raft log.

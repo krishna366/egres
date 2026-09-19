@@ -18,6 +18,7 @@ const utils = @import("utils");
 const String = utils.String;
 const _sigv4 = @import("sigv4.zig");
 const _lookahead = @import("lookahead.zig");
+const _vfs = @import("vfs.zig");
 
 const log = std.log.scoped(.s3);
 
@@ -25,7 +26,6 @@ const max_put_bytes: u64 = 5 << 30; // single-PUT ceiling (S3 hard limit)
 const attempts_max = 3; // connect/5xx retries per request
 const pool_cap = 8; // idle keep-alive connections held per store
 const idle_ttl_ms = 30_000; // drop idle conns older than this at checkout
-
 
 pub const S3Config = struct {
     /// Endpoint URL: `http://host[:port]` or `https://host[:port]`. The
@@ -212,13 +212,13 @@ pub const S3Store = struct {
 
     pub fn put(self: *S3Store, name: String, data: String) !void {
         if (data.len > max_put_bytes) return error.ObjectTooLarge;
-        var resp = try self.request("PUT", name, data, null, false);
+        var resp = try self.objectRequest("PUT", name, data, null, false);
         defer resp.deinit(self.a);
         if (resp.status != 200) return self.statusErr("PUT", name, &resp);
     }
 
     pub fn exists(self: *S3Store, name: String) !bool {
-        var resp = try self.request("HEAD", name, null, null, false);
+        var resp = try self.objectRequest("HEAD", name, null, null, false);
         defer resp.deinit(self.a);
 
         return switch (resp.status) {
@@ -229,7 +229,7 @@ pub const S3Store = struct {
     }
 
     pub fn delete(self: *S3Store, name: String) !void {
-        var resp = try self.request("DELETE", name, null, null, false);
+        var resp = try self.objectRequest("DELETE", name, null, null, false);
         defer resp.deinit(self.a);
         // S3 DELETE is idempotent: 204 whether or not the key existed.
         switch (resp.status) {
@@ -240,7 +240,7 @@ pub const S3Store = struct {
 
     /// HEAD for size + existence; ranged GETs happen per read().
     pub fn head(self: *S3Store, name: String) !u64 {
-        var resp = try self.request("HEAD", name, null, null, false);
+        var resp = try self.objectRequest("HEAD", name, null, null, false);
         defer resp.deinit(self.a);
 
         return switch (resp.status) {
@@ -252,7 +252,7 @@ pub const S3Store = struct {
 
     /// Ranged GET of [offset, offset+len). Caller owns the bytes.
     pub fn readRange(self: *S3Store, a: std.mem.Allocator, name: String, offset: u64, len: u64) ![]u8 {
-        var resp = try self.request("GET", name, null, .{ offset, len }, true);
+        var resp = try self.objectRequest("GET", name, null, .{ offset, len }, true);
         errdefer resp.deinit(self.a);
         switch (resp.status) {
             // 206 for a partial range; some servers reply 200 when the
@@ -280,6 +280,76 @@ pub const S3Store = struct {
         if (a.ptr == self.a.ptr) return body;
         defer self.a.free(body);
         return a.dupe(u8, body);
+    }
+
+    /// Every object under the configured prefix, paged through
+    /// ListObjectsV2 until the server stops truncating. Caller releases
+    /// the result with `_vfs.freeObjectInfos`. Names come back with the
+    /// prefix stripped, so they match what `put`/`open` take. ListObjectsV2
+    /// carries size and mtime whatever `detail` asks, so `stat` is always
+    /// set; the parameter exists for the shared `FileStore.list` shape.
+    pub fn list(
+        self: *S3Store,
+        alloc: std.mem.Allocator,
+        detail: _vfs.ListDetail,
+    ) ![]_vfs.ObjectInfo {
+        const path = try std.fmt.allocPrint(self.a, "/{s}", .{self.bucket});
+        defer self.a.free(path);
+
+        var out: std.ArrayList(_vfs.ObjectInfo) = .empty;
+        errdefer {
+            for (out.items) |i| alloc.free(i.name);
+            out.deinit(alloc);
+        }
+
+        var token: ?[]u8 = null;
+        defer if (token) |t| self.a.free(t);
+        while (true) {
+            const query = try self.listQuery(token);
+            defer self.a.free(query);
+
+            var resp = try self.request("GET", path, query, null, null, true);
+            defer resp.deinit(self.a);
+            if (resp.status != 200)
+                return self.statusErr("GET", path, &resp);
+            const body = resp.body orelse return error.MissingBody;
+
+            try appendListPage(alloc, body, self.prefix, detail, &out);
+
+            const next = xmlValue(body, "NextContinuationToken");
+            const truncated = std.mem.eql(
+                u8,
+                xmlValue(body, "IsTruncated") orelse "false",
+                "true",
+            );
+            if (!truncated or next == null) break;
+            if (token) |t| self.a.free(t);
+            token = try self.a.dupe(u8, next.?);
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// The canonical query string for one ListObjectsV2 page: parameters
+    /// sorted by name and URI-encoded, which is what SigV4 signs and what
+    /// goes on the request line. Caller frees.
+    fn listQuery(self: *S3Store, token: ?String) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.a);
+        // Sorted: continuation-token < list-type < prefix.
+        if (token) |t| {
+            try buf.appendSlice(self.a, "continuation-token=");
+            try uriEncode(self.a, &buf, t);
+            try buf.append(self.a, '&');
+        }
+        try buf.appendSlice(self.a, "list-type=2");
+        if (self.prefix.len > 0) {
+            try buf.appendSlice(self.a, "&prefix=");
+            try uriEncode(self.a, &buf, self.prefix);
+            // A prefix names a folder: match the keys under it, not one
+            // whose name merely starts with the same letters.
+            try uriEncode(self.a, &buf, "/");
+        }
+        return buf.toOwnedSlice(self.a);
     }
 
     fn statusErr(self: *S3Store, method: String, name: String, resp: *const Response) error{S3Error} {
@@ -313,7 +383,8 @@ pub const S3Store = struct {
     fn request(
         self: *S3Store,
         method: String,
-        name: String,
+        path: String,
+        query: String,
         body: ?String,
         range: ?[2]u64,
         want_body: bool,
@@ -322,14 +393,14 @@ pub const S3Store = struct {
         while (true) : (attempt += 1) {
             const conn = self.getConn(attempt > 0) catch |err| {
                 if (attempt + 1 >= attempts_max) return err;
-                log.warn("s3 {s} {s}: connect: {s}, retrying", .{ method, name, @errorName(err) });
+                log.warn("s3 {s} {s}: connect: {s}, retrying", .{ method, path, @errorName(err) });
                 fiber.sleepMs(100 * (attempt + 1));
                 continue;
             };
-            const resp = self.requestOnce(conn, method, name, body, range, want_body, null) catch |err| {
+            const resp = self.requestOnce(conn, method, path, query, body, range, want_body, null) catch |err| {
                 conn.deinit(self.a);
                 if (attempt + 1 >= attempts_max) return err;
-                log.warn("s3 {s} {s}: {s}, retrying", .{ method, name, @errorName(err) });
+                log.warn("s3 {s} {s}: {s}, retrying", .{ method, path, @errorName(err) });
                 fiber.sleepMs(100 * (attempt + 1));
                 continue;
             };
@@ -339,7 +410,7 @@ pub const S3Store = struct {
             if (resp.status >= 500 and attempt + 1 < attempts_max) {
                 var r = resp;
                 r.deinit(self.a);
-                log.warn("s3 {s} {s}: status={d}, retrying", .{ method, name, resp.status });
+                log.warn("s3 {s} {s}: status={d}, retrying", .{ method, path, resp.status });
                 fiber.sleepMs(100 * (attempt + 1));
                 continue;
             }
@@ -347,11 +418,41 @@ pub const S3Store = struct {
         }
     }
 
+    /// `request` against one object, whose key is `name` under the
+    /// bucket and the configured prefix. No query parameters.
+    fn objectRequest(
+        self: *S3Store,
+        method: String,
+        name: String,
+        body: ?String,
+        range: ?[2]u64,
+        want_body: bool,
+    ) !Response {
+        const path = try self.objectPath(name);
+        defer self.a.free(path);
+        return self.request(method, path, "", body, range, want_body);
+    }
+
+    /// The request path of object `name`: `/bucket[/prefix]/name`.
+    /// Caller frees.
+    fn objectPath(self: *S3Store, name: String) ![]u8 {
+        if (self.prefix.len > 0) return std.fmt.allocPrint(
+            self.a,
+            "/{s}/{s}/{s}",
+            .{ self.bucket, self.prefix, name },
+        );
+        return std.fmt.allocPrint(self.a, "/{s}/{s}", .{ self.bucket, name });
+    }
+
     fn requestOnce(
         self: *S3Store,
         conn: *Conn,
         method: String,
-        name: String,
+        path: String,
+        /// Canonical query string (sorted, URI-encoded), or empty. It is
+        /// both what SigV4 signs and what goes after the `?` on the
+        /// request line.
+        query: String,
         body: ?String,
         range: ?[2]u64,
         want_body: bool,
@@ -360,12 +461,6 @@ pub const S3Store = struct {
         ttfb_ns: ?*u64,
     ) !Response {
         const a = self.a;
-        const path = if (self.prefix.len > 0)
-            try std.fmt.allocPrint(a, "/{s}/{s}/{s}", .{ self.bucket, self.prefix, name })
-        else
-            try std.fmt.allocPrint(a, "/{s}/{s}", .{ self.bucket, name });
-        defer a.free(path);
-
         const amz = _sigv4.AmzDate.fromEpochSeconds(@intCast(@divTrunc(fiber.coarseMs(), 1000)));
         const payload_hash = _sigv4.hashHex(body orelse "");
         const auth = try _sigv4.authorization(
@@ -375,11 +470,18 @@ pub const S3Store = struct {
             self.region,
             method,
             path,
+            query,
             self.host_header,
             &payload_hash,
             &amz,
         );
         defer a.free(auth);
+
+        const target = if (query.len > 0)
+            try std.fmt.allocPrint(a, "{s}?{s}", .{ path, query })
+        else
+            try a.dupe(u8, path);
+        defer a.free(target);
 
         var head_buf: std.ArrayList(u8) = .empty;
         defer head_buf.deinit(a);
@@ -388,7 +490,7 @@ pub const S3Store = struct {
         try head_buf.print(a, "{s} {s} HTTP/1.1\r\n" ++
             "Host: {s}\r\nx-amz-date: {s}\r\nx-amz-content-sha256: {s}\r\n" ++
             "Authorization: {s}\r\nContent-Length: {d}\r\n", .{
-            method,                     path,          self.host_header,
+            method,                     target,        self.host_header,
             &amz.stamp,                 &payload_hash, auth,
             if (body) |b| b.len else 0,
         });
@@ -423,10 +525,12 @@ pub const S3Store = struct {
     /// One timed ranged GET of the calibration probe object — the
     /// measurement primitive behind lookahead.calibrate.
     pub fn probeRead(self: *S3Store, off: u64, len: u64) !_lookahead.Probe {
+        const path = try self.objectPath(_lookahead.probe_object);
+        defer self.a.free(path);
         const conn = try self.getConn(false);
         var ttfb: u64 = 0;
         const t0 = fiber.timestampNow(.monotonic, .nanos);
-        var resp = self.requestOnce(conn, "GET", _lookahead.probe_object, null, .{ off, len }, true, &ttfb) catch |err| {
+        var resp = self.requestOnce(conn, "GET", path, "", null, .{ off, len }, true, &ttfb) catch |err| {
             conn.deinit(self.a);
             return err;
         };
@@ -506,3 +610,86 @@ pub fn parseResponse(
     }
     return resp;
 }
+
+// ───────────────────────── ListObjectsV2 parsing ─────────────────────────
+//
+// The response is XML, and the three fields we read (`Key`, `Size`,
+// `LastModified`) are flat text elements inside each `<Contents>`. That is
+// small enough to scan for tags directly — an XML library would be a
+// dependency and a parse tree for three strings.
+
+/// The text between the first `<tag>` and its `</tag>` in `xml`, or null.
+/// Borrows `xml`.
+fn xmlValue(xml: String, comptime tag: String) ?String {
+    const open = "<" ++ tag ++ ">";
+    const close = "</" ++ tag ++ ">";
+    const a = std.mem.indexOf(u8, xml, open) orelse return null;
+    const from = a + open.len;
+    const b = std.mem.indexOfPos(u8, xml, from, close) orelse return null;
+    return xml[from..b];
+}
+
+/// Append one ListObjectsV2 page's objects to `out`. `prefix` is stripped
+/// from each key (with its `/` separator) so the names match what the
+/// store's other ops take. Names are duped out of `alloc`; the caller owns
+/// them and frees on error.
+fn appendListPage(
+    alloc: std.mem.Allocator,
+    body: String,
+    prefix: String,
+    _: _vfs.ListDetail,
+    out: *std.ArrayList(_vfs.ObjectInfo),
+) !void {
+    var rest = body;
+    while (std.mem.indexOf(u8, rest, "<Contents>")) |start| {
+        const from = start + "<Contents>".len;
+        const end = std.mem.indexOfPos(u8, rest, from, "</Contents>") orelse
+            return error.BadListResponse;
+        const item = rest[from..end];
+        rest = rest[end..];
+
+        const key = xmlValue(item, "Key") orelse return error.BadListResponse;
+        const size_txt = xmlValue(item, "Size") orelse return error.BadListResponse;
+        const when = xmlValue(item, "LastModified") orelse
+            return error.BadListResponse;
+
+        // A "key" that is just the prefix folder itself is not an object.
+        var name = key;
+        if (prefix.len > 0) {
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            if (key.len <= prefix.len + 1) continue;
+            name = key[prefix.len + 1 ..];
+        }
+
+        const stat: _vfs.FileStat = .{
+            .size = try std.fmt.parseInt(u64, size_txt, 10),
+            .mtime_s = @divFloor(try utils.date.parseTimestamp(when, true), std.time.us_per_s),
+        };
+
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        try out.append(alloc, .{ .name = owned, .stat = stat });
+    }
+}
+
+/// Percent-encode `s` into `buf` per SigV4's rules: the unreserved set
+/// (`A-Za-z0-9-_.~`) passes through, every other byte becomes `%XX` with
+/// uppercase hex. `/` is encoded too, which is what a query-parameter
+/// value wants.
+fn uriEncode(a: std.mem.Allocator, buf: *std.ArrayList(u8), s: String) !void {
+    for (s) |c| {
+        const unreserved = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.' or c == '~';
+        if (unreserved) {
+            try buf.append(a, c);
+        } else {
+            try buf.print(a, "%{X:0>2}", .{c});
+        }
+    }
+}
+
+// Pub for tests: canned ListObjectsV2 bodies, no network.
+pub const list_parsing_for_tests = struct {
+    pub const appendPage = appendListPage;
+    pub const encode = uriEncode;
+};

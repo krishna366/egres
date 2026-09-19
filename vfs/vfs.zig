@@ -565,37 +565,79 @@ pub fn readFile(path: String, allocator: std.mem.Allocator) ![]u8 {
 
 /// Stat a path for its size in bytes.
 pub fn fileSize(path: String) !u64 {
+    return (try fileStat(path)).size;
+}
+
+/// A file's size and its modification time in whole seconds since the
+/// UTC epoch on the realtime clock.
+pub const FileStat = struct { size: u64, mtime_s: i64 };
+
+/// Stat one path. For a caller that needs a few files out of a large
+/// directory: `listFiles(.stat)` stats every entry, this one only what is
+/// asked.
+pub fn fileStat(path: String) !FileStat {
     const f = try fiber.Dir.cwd().openFile(path, .{});
     defer f.close();
-    return (try f.stat()).size;
+    const st = try f.stat();
+    return .{ .size = st.size, .mtime_s = st.mtime_s };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Directory iteration
+// Directory listing
 // ═══════════════════════════════════════════════════════════════════════
-//
-// fiber.fs doesn't expose iteration today. We wrap std.Io.Dir's iterator
-// so callers don't have to thread `io` into every `next()` call.
 
-pub const DirIter = struct {
-    inner: std.Io.Dir,
-    iter: std.Io.Dir.Iterator,
-
-    pub const Entry = std.Io.Dir.Entry;
-
-    pub fn next(self: *DirIter) !?Entry {
-        return self.iter.next(utils.context.g().io);
-    }
-
-    pub fn deinit(self: *DirIter) void {
-        self.inner.close(utils.context.g().io);
-    }
+/// One regular file in a listed directory or one object in a store: its
+/// name (owned) and, when the listing was asked for it, its stat. The dir
+/// backend's listing and an S3 `ListObjectsV2` result are one type.
+pub const ObjectInfo = struct {
+    name: String,
+    /// Size and mtime. Null when the listing was taken with `.names`, so a
+    /// caller that needs them cannot read a zero by mistake.
+    stat: ?FileStat,
 };
 
-pub fn iterateDir(path: String) !DirIter {
-    const io = utils.context.g().io;
-    const d = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
-    return .{ .inner = d, .iter = d.iterate() };
+/// How much `listFiles` reports per entry. `names` is one readdir;
+/// `stat` adds an open + stat + close per file, which over a data dir of
+/// hundreds of thousands of SSTs is the whole cost of the listing.
+pub const ListDetail = enum { names, stat };
+
+/// Free a slice returned by `listFiles`, names included.
+pub fn freeObjectInfos(alloc: std.mem.Allocator, infos: []const ObjectInfo) void {
+    for (infos) |i| alloc.free(i.name);
+    alloc.free(infos);
+}
+
+/// Every regular file directly in `dir`. Anything that is not a regular
+/// file — a subdirectory, a symlink — is skipped, so a depot's `tmp/`
+/// staging directory never shows up. The one way to list a directory
+/// above zfiber: `fiber.Dir.list` is the readdir underneath, and only
+/// this function calls it. Caller releases the result with
+/// `freeObjectInfos`.
+///
+/// With `.stat`, an entry that vanishes between the listing and its stat
+/// is dropped, not an error: a concurrent writer is allowed.
+pub fn listFiles(alloc: std.mem.Allocator, dir: String, detail: ListDetail) ![]ObjectInfo {
+    const entries = try fiber.Dir.cwd().list(alloc, dir);
+    defer fiber.freeDirEntries(alloc, entries);
+
+    var out: std.ArrayList(ObjectInfo) = .empty;
+    errdefer freeObjectInfos(alloc, out.toOwnedSlice(alloc) catch &.{});
+
+    for (entries) |entry| {
+        if (entry.kind != .file) continue;
+
+        var stat: ?FileStat = null;
+        if (detail == .stat) {
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, entry.name });
+            defer alloc.free(path);
+            stat = fileStat(path) catch continue;
+        }
+
+        const name = try alloc.dupe(u8, entry.name);
+        errdefer alloc.free(name);
+        try out.append(alloc, .{ .name = name, .stat = stat });
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 /// Open a file according to `opts`. Honors `mode = .direct` (O_DIRECT,

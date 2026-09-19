@@ -927,6 +927,7 @@ pub const Forest = struct {
             });
         }
         try self.table_cache.loadTables(needed.items);
+        defer TableCache.decrRefs(needed.items);
 
         // Manifest and levels change together, both in memory; the entry
         // itself is already durable in the raft log.
@@ -1095,15 +1096,131 @@ pub const Forest = struct {
     /// the last ref, and the table frees itself, blocks in the block
     /// cache included. A reader or compaction that pinned such a table
     /// before the apply holds its own ref and keeps the open `Table`
-    /// until it releases. The files themselves are not touched.
-    pub fn evictUnlisted(self: *Forest) !void {
-        const ids = try self.manifest.takeUnlisted();
+    /// until it releases. The files themselves wait for `deleteFiles`.
+    pub fn evictTables(self: *Forest) !void {
+        const ids = try self.manifest.takeToEvict();
         defer self.allocator.free(ids);
 
         for (ids) |id| self.table_cache.evict(id);
         if (ids.len > 0) log.debug(
-            "evictUnlisted: evicted {d} unlisted file(s)",
+            "evictTables: evicted {d} unlisted file(s)",
             .{ids.len},
+        );
+    }
+
+    /// Unlink the SST files this node no longer needs: every file retired
+    /// at a log index at or below `snapshot_index`. A restart restores the
+    /// manifest of the durable snapshot at index I and replays the entries
+    /// above I, opening every file that manifest lists and every file an
+    /// entry above I creates — so a file whose last listing went away at
+    /// index K is needed by no future restart once I >= K. Local rule,
+    /// local inputs: every node sweeps its own copies off its own snapshot
+    /// index.
+    pub fn deleteFiles(self: *Forest, snapshot_index: u64) !void {
+        const to_delete = try self.manifest.takeToDelete(
+            self.allocator,
+            snapshot_index,
+        );
+        defer self.allocator.free(to_delete);
+        if (to_delete.len == 0) return;
+
+        for (to_delete) |r| {
+            // The table cache let go of the file when the manifest
+            // unlisted it (`evictTables`); only the file is left.
+            const path = try sstPath(self.allocator, self.opts.dir, r.sst_id);
+            defer self.allocator.free(path);
+            vfs.deleteFile(path) catch |err| switch (err) {
+                // Already gone — removeOrphans took it, or a previous
+                // sweep did and the process restarted mid-way.
+                error.FileNotFound => {},
+                else => {
+                    log.warn(
+                        "deleteFiles: unlink {s}: {s}",
+                        .{ path, @errorName(err) },
+                    );
+                    continue;
+                },
+            };
+        }
+        log.info(
+            "deleteFiles: unlinked {d} SST file(s) retired at or below " ++
+                "snapshot index {d}",
+            .{ to_delete.len, snapshot_index },
+        );
+    }
+
+    /// Unlink every SST-shaped file in the data dir that the manifest does
+    /// not know and that was last written at or before `cutoff_s`, whole
+    /// seconds on the realtime clock.
+    ///
+    /// The engine derives `cutoff_s` as the earlier of two moments
+    /// (`Engine.scanOrphans`):
+    ///   - the wall-clock time of the log entry at this node's snapshot
+    ///     index (`Snapshot.timestamp`), 0 before the first snapshot, and
+    ///     then the scan removes nothing. A file written after it may
+    ///     belong to an entry the snapshot does not cover.
+    ///   - now minus `SnapshotCfg.orphan_min_age_seconds`. A file this
+    ///     process is still writing, or one a leader is pushing to this
+    ///     follower, is in no manifest yet, so anything younger is
+    ///     assumed to be in flight. This has to exceed one compaction's
+    ///     window from its first output write to its proposal; the
+    ///     snapshot entry can be much more recent than that.
+    ///
+    /// It catches three kinds of leftovers: files retired at or below the
+    /// snapshot index before a crash (the `to_delete` map is not persisted, so
+    /// `deleteFiles` will never hear of them again), partial files from a
+    /// crash between writing an SST and proposing its manifest change, and
+    /// orphans from before file GC existed. The second kind is newer than
+    /// the cutoff when the node comes back, which is why the scan runs
+    /// periodically and not just at startup.
+    ///
+    /// The directory is listed by name only, and only the files the
+    /// manifest does not know are stat'ed: normally a handful out of
+    /// hundreds of thousands.
+    pub fn removeOrphans(self: *Forest, cutoff_s: i64) !void {
+        // TODO: Switch to using DirStore.
+
+        const unknowns = blk: {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const arloc = arena.allocator();
+
+            const entries = try vfs.listFiles(arloc, self.opts.dir, .names);
+            break :blk try self.manifest.unknownFiles(self.allocator, entries);
+        };
+        defer self.allocator.free(unknowns);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arloc = arena.allocator();
+
+        var removed: usize = 0;
+        for (unknowns) |id| {
+            const path = try sstPath(arloc, self.opts.dir, id);
+            // Gone between the listing and here: someone else's unlink.
+            const st = vfs.fileStat(path) catch continue;
+            if (st.mtime_s > cutoff_s) continue;
+
+            // A pre-opened table for a create that never applied sits in
+            // the cache with an open fd; unlinked without this, the file
+            // would keep its blocks until the process exits.
+            self.table_cache.evict(id);
+            vfs.deleteFile(path) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => {
+                    log.warn(
+                        "removeOrphans: unlink {s}: {s}",
+                        .{ path, @errorName(err) },
+                    );
+                    continue;
+                },
+            };
+            removed += 1;
+        }
+        if (removed > 0) log.info(
+            "removeOrphans: unlinked {d} of {d} unknown SST file(s) last " ++
+                "written at or before the cutoff",
+            .{ removed, unknowns.len },
         );
     }
 
@@ -1228,12 +1345,15 @@ pub const Forest = struct {
         t.decrRef();
     }
 
-    /// Read an SST file from disk. Caller owns the returned slice.
+    /// Read an SST file from disk. The bytes are `result.data`; the caller
+    /// releases them with `result.free()`, which knows the page-aligned
+    /// buffer behind the slice (a plain `allocator.free` on the slice frees
+    /// with the wrong alignment).
     pub fn readFile(
         self: *Forest,
         allocator: std.mem.Allocator,
         file_id: u64,
-    ) ?String {
+    ) ?vfs.ReadResult {
         const path = sstPath(
             self.allocator,
             self.opts.dir,
@@ -1242,13 +1362,12 @@ pub const Forest = struct {
         defer self.allocator.free(path);
         const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
         defer handle.close();
-        const result = handle.readAligned(
+        return handle.readAligned(
             allocator,
             0,
             @intCast(handle.file_size),
             .p1,
         ) catch return null;
-        return result.data;
     }
 
     // -----------------------------------------

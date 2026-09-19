@@ -354,8 +354,9 @@ pub fn buildDropTables(
 ///
 /// NOTE: dropped SST *files* are not eagerly unlinked from disk (Tree.close
 /// detaches, and the table cache holds its own ref). The data is immediately
-/// unqueryable (route + manifest gone); physical reclaim of orphaned SSTs is
-/// left to snapshot GC — a follow-up.
+/// unqueryable (route + manifest gone); the manifest apply below retires
+/// every file whose last listing the drop removes, and `Forest.deleteFiles`
+/// unlinks it once this node's snapshot index passes `index`.
 pub fn applyDropTree(
     self: *Forest,
     index: u64,
@@ -433,7 +434,8 @@ pub fn buildDropNamespace(
 
 /// applyNamespaceDrop is Phase B of DROP DATABASE: tear down every tree of
 /// the namespace (same per-tree semantics as applyDropTree — SSTs shared via
-/// refcount survive; physical reclaim is snapshot GC's job), then forget the
+/// refcount survive; the rest are retired here and unlinked by
+/// `Forest.deleteFiles`), then forget the
 /// namespace's manifest state (table_id counter + name, freeing the name
 /// for re-CREATE). Leftover memtable entries for the namespace are dropped
 /// at flush (buildFlush skips items with no route). Idempotent. drop_ns.

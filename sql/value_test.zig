@@ -5,6 +5,7 @@ const String = sql.value.String;
 const pgwire = @import("pgwire");
 const Type = sql.Type;
 const value = sql.value;
+const date = @import("utils").date;
 
 test "sql.value: fixedWidth and isVarlen per type" {
     try testing.expectEqual(@as(?u8, 1), Type.bool_.fixedWidth());
@@ -94,7 +95,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
         .{ .text = "9999-12-31 23:59:59", .us = 253_402_300_799_000_000 },
     };
     for (cases) |c| {
-        try testing.expectEqual(c.us, try value.parseTimestamp(c.text, false));
+        try testing.expectEqual(c.us, try date.parseTimestamp(c.text, false));
         const cell = try value.parseValue(.timestamp, c.text);
         try testing.expectEqual(c.us, cell.timestamp);
     }
@@ -108,12 +109,12 @@ test "sql.value: timestamps parse from and format to Postgres text" {
         "2026-09-12 10:00:00.5Z",
     };
     for (tz_cases) |text| {
-        try testing.expectEqual(sep12, try value.parseTimestamp(text, true));
+        try testing.expectEqual(sep12, try date.parseTimestamp(text, true));
     }
     const two_hours: i64 = 2 * 3_600_000_000;
     try testing.expectEqual(
         sep12 + two_hours,
-        try value.parseTimestamp(noon_plus2, false),
+        try date.parseTimestamp(noon_plus2, false),
     );
     const tz_cell = try value.parseValue(.timestamptz, noon_plus2);
     try testing.expectEqual(sep12, tz_cell.timestamptz);
@@ -134,7 +135,7 @@ test "sql.value: timestamps parse from and format to Postgres text" {
         "2026/09/12",
     };
     for (bad) |text| {
-        const res = value.parseTimestamp(text, true);
+        const res = date.parseTimestamp(text, true);
         try testing.expectError(error.InvalidTimestamp, res);
     }
 
@@ -159,8 +160,8 @@ test "sql.value: timestamps parse from and format to Postgres text" {
     while (day <= 2 * 366) : (day += 1) {
         var w = std.Io.Writer.fixed(&buf);
         const us = day * 86_400_000_000;
-        try value.formatTimestamp(&w, us, false);
-        const back = try value.parseTimestamp(w.buffered(), false);
+        try date.formatTimestamp(&w, us, false);
+        const back = try date.parseTimestamp(w.buffered(), false);
         try testing.expectEqual(us, back);
     }
 }
@@ -285,21 +286,21 @@ test "sql.value: string types share cells, OIDs and modifiers differ" {
 }
 
 test "sql.value: date parses and prints as YYYY-MM-DD" {
-    try testing.expectEqual(@as(i32, 0), try value.parseDate("1970-01-01"));
-    try testing.expectEqual(@as(i32, 1), try value.parseDate("1970-01-02"));
-    try testing.expectEqual(@as(i32, -1), try value.parseDate("1969-12-31"));
-    try testing.expectEqual(@as(i32, 9568), try value.parseDate("1996-03-13")); // a dbgen lineitem date
-    try testing.expectEqual(@as(i32, 10957), try value.parseDate("2000-01-01"));
-    try testing.expectEqual(@as(i32, 11016), try value.parseDate(" 2000-02-29 ")); // leap day
+    try testing.expectEqual(@as(i32, 0), try date.parseDate("1970-01-01"));
+    try testing.expectEqual(@as(i32, 1), try date.parseDate("1970-01-02"));
+    try testing.expectEqual(@as(i32, -1), try date.parseDate("1969-12-31"));
+    try testing.expectEqual(@as(i32, 9568), try date.parseDate("1996-03-13")); // a dbgen lineitem date
+    try testing.expectEqual(@as(i32, 10957), try date.parseDate("2000-01-01"));
+    try testing.expectEqual(@as(i32, 11016), try date.parseDate(" 2000-02-29 ")); // leap day
     // A timestamp literal keeps its day, as in Postgres; a zone is ignored.
-    try testing.expectEqual(@as(i32, 9568), try value.parseDate("1996-03-13 10:00"));
-    try testing.expectEqual(@as(i32, 9568), try value.parseDate("1996-03-13 23:59:59.999999+05"));
-    try testing.expectEqual(@as(i32, -1), try value.parseDate("1969-12-31 23:59:59"));
-    try testing.expectError(error.InvalidTimestamp, value.parseDate("2001-02-29"));
-    try testing.expectError(error.InvalidTimestamp, value.parseDate("1996-13-01"));
-    try testing.expectError(error.InvalidTimestamp, value.parseDate("96-03-13"));
-    try testing.expectError(error.InvalidTimestamp, value.parseDate("1996/03/13"));
-    try testing.expectError(error.InvalidTimestamp, value.parseDate(""));
+    try testing.expectEqual(@as(i32, 9568), try date.parseDate("1996-03-13 10:00"));
+    try testing.expectEqual(@as(i32, 9568), try date.parseDate("1996-03-13 23:59:59.999999+05"));
+    try testing.expectEqual(@as(i32, -1), try date.parseDate("1969-12-31 23:59:59"));
+    try testing.expectError(error.InvalidTimestamp, date.parseDate("2001-02-29"));
+    try testing.expectError(error.InvalidTimestamp, date.parseDate("1996-13-01"));
+    try testing.expectError(error.InvalidTimestamp, date.parseDate("96-03-13"));
+    try testing.expectError(error.InvalidTimestamp, date.parseDate("1996/03/13"));
+    try testing.expectError(error.InvalidTimestamp, date.parseDate(""));
 
     const v = try value.parseValue(.date, "1996-03-13");
     try testing.expectEqual(@as(i32, 9568), v.date);
@@ -309,7 +310,7 @@ test "sql.value: date parses and prints as YYYY-MM-DD" {
     const cases = [_]String{ "1970-01-01", "1969-12-31", "1996-03-13", "2000-02-29", "2024-12-31", "0001-01-01", "9999-12-31" };
     for (cases) |text| {
         var w: std.Io.Writer = .fixed(&buf);
-        try value.formatValue(&w, null, .{ .date = try value.parseDate(text) });
+        try value.formatValue(&w, null, .{ .date = try date.parseDate(text) });
         try testing.expectEqualStrings(text, w.buffered());
     }
 }

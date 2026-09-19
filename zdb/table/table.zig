@@ -251,7 +251,10 @@ pub const Table = struct {
     /// cache, a reader that pinned it), so whoever releases last frees it,
     /// and nobody destroys a table by hand.
     ///
-    /// This frees memory only; it never unlinks the SST file.
+    /// This frees memory only; it never unlinks the SST file. File
+    /// lifetime is the manifest's: the entry that removes a file's last
+    /// listing retires it (`Manifest.decrSST`), and `Forest.deleteFiles`
+    /// unlinks it once the node's snapshot index passes that entry.
     pub fn decrRef(self: *Table) void {
         const prev = self.ref.fetchSub(1, .acq_rel);
         if (prev <= 0) @panic("Table.decrRef below zero (double release)");

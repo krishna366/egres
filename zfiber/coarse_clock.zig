@@ -44,7 +44,7 @@ const std = @import("std");
 const _context = @import("context.zig");
 
 pub const ClockKind = enum { monotonic, realtime };
-pub const TimeUnit = enum { millis, micros, nanos };
+pub const TimeUnit = enum { secs, millis, micros, nanos };
 
 /// The current time on `kind`'s clock, in `unit`, via `std.Io.Timestamp.now`
 /// on the process io (`context.g().io`) — the same time source the rest of
@@ -64,6 +64,7 @@ pub fn timestampNow(comptime kind: ClockKind, comptime unit: TimeUnit) i64 {
         .realtime => .real,
     });
     return switch (unit) {
+        .secs => @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s)),
         .millis => ts.toMilliseconds(),
         .micros => ts.toMicroseconds(),
         .nanos => @intCast(ts.nanoseconds),
