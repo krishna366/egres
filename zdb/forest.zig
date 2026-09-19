@@ -9,6 +9,7 @@ const _ddl = @import("forest_ddl.zig");
 const _read = @import("read.zig");
 const _stats = @import("stats.zig");
 const _table = @import("table.zig");
+const _cache = @import("cache.zig");
 const vfs = @import("vfs");
 const _tree = @import("tree.zig");
 const _skl = @import("skl/skiplist.zig");
@@ -1087,6 +1088,25 @@ pub const Forest = struct {
         return true;
     }
 
+    /// Let go of every file the manifest unlisted since the last call:
+    /// the table cache drops its entry and its ref. Run after each
+    /// manifest apply: a compaction's inputs are dead for readers the
+    /// moment the apply removes them from the level, so this is usually
+    /// the last ref, and the table frees itself, blocks in the block
+    /// cache included. A reader or compaction that pinned such a table
+    /// before the apply holds its own ref and keeps the open `Table`
+    /// until it releases. The files themselves are not touched.
+    pub fn evictUnlisted(self: *Forest) !void {
+        const ids = try self.manifest.takeUnlisted();
+        defer self.allocator.free(ids);
+
+        for (ids) |id| self.table_cache.evict(id);
+        if (ids.len > 0) log.debug(
+            "evictUnlisted: evicted {d} unlisted file(s)",
+            .{ids.len},
+        );
+    }
+
     /// Write an SST file to disk and pre-open it into the table cache.
     /// Skips the write when the file is already cached, or already on disk with
     /// a matching size — file_id → content is deterministic in this system, and
@@ -1198,18 +1218,14 @@ pub const Forest = struct {
             );
             return;
         };
-        const adopted = self.table_cache.own(file_id, t) catch |err| blk: {
-            log.err(
-                "writeFile: table_cache.own failed for {d}: {s}",
-                .{ file_id, @errorName(err) },
-            );
-            break :blk false;
-        };
-        // The open-time ref is ours to drop: the cache holds its own once it
-        // adopted the table. Unadopted (the apply loop cached the same id
-        // first, or the insert failed), the struct is ours to free as well.
+        // `own` takes the cache's own ref when it adopts the table; when it
+        // does not (the apply loop cached the same id first, or the insert
+        // failed) the open-time ref below is the only one and frees it.
+        _ = self.table_cache.own(file_id, t) catch |err| log.err(
+            "writeFile: table_cache.own failed for {d}: {s}",
+            .{ file_id, @errorName(err) },
+        );
         t.decrRef();
-        if (!adopted) self.allocator.destroy(t);
     }
 
     /// Read an SST file from disk. Caller owns the returned slice.

@@ -252,14 +252,46 @@ pub fn Cache(comptime K: type) type {
             self.s_bytes += entry_bytes;
         }
 
+        /// Drop `key` now, whatever queue holds it: the map entry goes, the
+        /// cache's ref on the value is released (the bytes come back as
+        /// soon as any reader holding the value is done) and the queue's
+        /// byte count shrinks. The ring slot is left as it is — rings
+        /// cannot be spliced — and the eviction paths recognise it as
+        /// dead when they reach it: its key is no longer in the map, or
+        /// the map's entry for that key points at a newer slot. Returns
+        /// whether the key was present.
+        pub fn remove(self: *Self, key: K) bool {
+            const entry = self.map.fetchRemove(key) orelse return false;
+            const bytes = keySize(K, entry.key) + entry.value.val.data.len;
+            switch (entry.value.tag) {
+                .s_queue => self.s_bytes -= bytes,
+                .m_queue => self.m_bytes -= bytes,
+            }
+            entry.value.val.decrRef();
+            self.freeKey(entry.key);
+            return true;
+        }
+
+        /// Whether the ring slot `slot` of queue `tag`, holding `key`, still
+        /// backs a live entry. False for a slot left behind by `remove`,
+        /// and for one made stale by a remove followed by a re-put of the
+        /// same key (the map then points at the newer slot).
+        fn liveSlot(self: *Self, comptime tag: Tag, key: K, slot: usize) bool {
+            const entry = self.map.getPtr(key) orelse return false;
+            return entry.tag == tag and entry.slot == slot;
+        }
+
         /// Total live bytes in S + M.
         pub fn byteSize(self: *const Self) usize {
             return self.s_bytes + self.m_bytes;
         }
 
         /// Total live entry count (S + M).
+        /// Live entries. Not the ring occupancy: a slot left behind by
+        /// `remove` stays in its ring until eviction reaches it, but the
+        /// entry is gone.
         pub fn count(self: *const Self) usize {
-            return self.s_len + self.m_len;
+            return self.map.count();
         }
 
         // ----------------------------------------------------------------
@@ -296,9 +328,14 @@ pub fn Cache(comptime K: type) type {
             ring.expandToCapacity();
 
             if (tail > 0) {
+                // Move the entries up until the tail to live together with the
+                // rest in the doubled memory slot. See comment above.
                 @memcpy(ring.items[old_cap .. old_cap + tail], ring.items[0..tail]);
                 for (old_cap..old_cap + tail) |new_slot| {
-                    self.map.getPtr(ring.items[new_slot]).?.slot = new_slot;
+                    // A dead slot (see `remove`) has no entry to move.
+                    const old_slot = new_slot - old_cap;
+                    if (self.liveSlot(tag, ring.items[new_slot], old_slot))
+                        self.map.getPtr(ring.items[new_slot]).?.slot = new_slot;
                 }
             }
             if (tag == .s_queue) {
@@ -354,38 +391,48 @@ pub fn Cache(comptime K: type) type {
             self.m_bytes += entry_bytes;
         }
 
-        /// Evict the oldest S entry.  freq=true → promote to M (transferring
-        /// key ownership); freq=false → record hash in G and free key + value.
+        /// Evict the oldest live S entry.  freq=true → promote to M
+        /// (transferring key ownership); freq=false → record hash in G and
+        /// free key + value. Dead slots left by `remove` are skipped; if S
+        /// holds nothing live this returns having only reclaimed slots.
         fn evictSmall(self: *Self) !void {
             std.debug.assert(self.s_len > 0);
-            const key = self.s_ring.items[self.s_tail];
-            const entry = self.map.get(key).?;
-            _ = self.map.remove(key);
+            while (self.s_len > 0) {
+                const slot = self.s_tail;
+                const key = self.s_ring.items[slot];
+                self.s_tail = (self.s_tail + 1) % self.s_ring.items.len;
+                self.s_len -= 1;
+                if (!self.liveSlot(.s_queue, key, slot)) continue;
 
-            self.s_tail = (self.s_tail + 1) % self.s_ring.items.len;
-            self.s_len -= 1;
-            self.s_bytes -= keySize(K, key) + entry.val.data.len;
-            if (entry.freq.load(.acquire)) {
-                return self.pushMain(key, entry.val);
-            } else {
-                self.pushGhost(hashKey(K, key)) catch {}; // best-effort
-                self.freeKey(key);
-                entry.val.decrRef();
+                const entry = self.map.get(key).?;
+                _ = self.map.remove(key);
+                self.s_bytes -= keySize(K, key) + entry.val.data.len;
+                if (entry.freq.load(.acquire)) {
+                    return self.pushMain(key, entry.val);
+                } else {
+                    self.pushGhost(hashKey(K, key)) catch {}; // best-effort
+                    self.freeKey(key);
+                    entry.val.decrRef();
+                }
+                return;
             }
         }
 
-        /// Evict one entry from M.  Entries with freq=true are reinserted at
-        /// the M head with freq reset to false; the loop continues until a
-        /// freq=false entry is found and freed.
+        /// Evict one live entry from M.  Entries with freq=true are
+        /// reinserted at the M head with freq reset to false; the loop
+        /// continues until a freq=false entry is found and freed. Dead
+        /// slots left by `remove` are skipped; if M holds nothing live this
+        /// returns having only reclaimed slots.
         fn evictMain(self: *Self) void {
-            while (true) {
-                std.debug.assert(self.m_len > 0);
-                const key = self.m_ring.items[self.m_tail];
-                const entry = self.map.getPtr(key).?;
+            while (self.m_len > 0) {
+                const slot = self.m_tail;
+                const key = self.m_ring.items[slot];
 
                 // Advance tail as we already considered this slot.
                 self.m_tail = (self.m_tail + 1) % self.m_ring.items.len;
                 self.m_len -= 1;
+                if (!self.liveSlot(.m_queue, key, slot)) continue;
+                const entry = self.map.getPtr(key).?;
                 if (entry.freq.load(.acquire)) {
                     // Reinsert at head with freq=false (no net byte change).
                     const new_slot = self.m_head;
@@ -470,6 +517,14 @@ pub fn ShardedCache(comptime K: type) type {
             s.lock.lock(@src());
             defer s.lock.unlock();
             return s.cache.put(key, val);
+        }
+
+        /// See `Cache.remove`.
+        pub fn remove(self: *Self, key: K) bool {
+            const s = self.pickShard(key);
+            s.lock.lock(@src());
+            defer s.lock.unlock();
+            return s.cache.remove(key);
         }
 
         /// The bytes the small queues hold in all: what a burst of new

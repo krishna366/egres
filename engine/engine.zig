@@ -259,6 +259,10 @@ pub const StorageImpl = struct {
             .drop_tree => try self.forest.applyDropTree(index, mcs.*),
             else => log.err("unknown ManifestChange cmd={d}", .{@intFromEnum(mcs.cmd)}),
         }
+        // Whatever this change unlisted has no level pointing at it;
+        // drop its blocks and its table cache entry now rather than
+        // when the file goes.
+        try self.forest.evictUnlisted();
     }
 
     /// StateMachine hook behind the announce prefetch: a peer announced

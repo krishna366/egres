@@ -76,6 +76,13 @@ pub const Table = struct {
     // Use getPath() to read, claimPath() to atomically take ownership.
     path_ptr: std.atomic.Value(?[*]const u8),
     path_len: usize,
+    /// One bit per block: set when this table put the block into the
+    /// global block cache, so `purgeCachedBlocks` can drop exactly this
+    /// file's entries without walking the cache. A set bit for a block
+    /// the cache has since evicted on its own only costs a no-op remove.
+    /// Atomic words, since readers on different workers insert
+    /// concurrently.
+    cached: []std.atomic.Value(u64),
 
     pub fn fileSize(self: *const Table) u64 {
         return self.handle.file_size;
@@ -147,6 +154,12 @@ pub const Table = struct {
         // deinit frees only what the struct points at. Same call Table.deinit
         // makes on the success path.
         errdefer table_index.destroy(allocator);
+        const cached = try allocator.alloc(
+            std.atomic.Value(u64),
+            (table_index.blocks.len + 63) / 64,
+        );
+        errdefer allocator.free(cached);
+        for (cached) |*w| w.* = .init(0);
 
         // Refuse any SST whose entry encoding we don't speak. The block
         // checksums can't catch this: a stale table's blocks are internally
@@ -199,6 +212,7 @@ pub const Table = struct {
             .file_id = 0,
             .path_ptr = std.atomic.Value(?[*]const u8).init(null),
             .path_len = 0,
+            .cached = cached,
         };
         return t;
     }
@@ -211,18 +225,17 @@ pub const Table = struct {
     }
 
     fn deinit(self: *Table) void {
+        // The `cached` bits are the only record of which blocks this
+        // table put into the block cache, and they go with the table.
+        // Nobody can reach the table any more, so its blocks are dead
+        // weight: drop them now, while the bits still say which they are.
+        if (block_cache) |cache| _ = self.purgeCachedBlocks(cache);
+
         if (self.claimPath()) |p| self.allocator.free(p);
+        self.allocator.free(self.cached);
         self.index.destroy(self.allocator);
         if (self.binary_fuse) |*bf| bf.deinit(self.allocator);
         self.handle.close();
-    }
-
-    /// detach forgets the SST file path without deleting it.
-    /// Used by Level.deinit() (database close) so that the subsequent
-    /// decrRef at zero frees memory only, leaving the file on disk intact.
-    /// Thread-safe: concurrent calls race on an atomic swap; only the winner frees.
-    pub fn detach(self: *Table) void {
-        if (self.claimPath()) |p| self.allocator.free(p);
     }
 
     /// Increment the reference count. Call this when sharing a Table pointer.
@@ -231,29 +244,23 @@ pub const Table = struct {
         if (prev <= 0) @panic("Table.incrRef on a freed table");
     }
 
-    /// Decrement the reference count. When it reaches zero the table's
-    /// resources are freed.
+    /// Decrement the reference count. The last `decrRef` frees the table:
+    /// index, filter, file handle, path and the `*Table` allocation itself,
+    /// and the blocks it put into the block cache are dropped from it.
+    /// Every holder of a `*Table` holds a ref (the level entry, the table
+    /// cache, a reader that pinned it), so whoever releases last frees it,
+    /// and nobody destroys a table by hand.
     ///
-    /// FILE DELETION DISABLED: prior behavior was to also `unlink` the SST
-    /// file when refcount hit zero, but the in-memory refcount doesn't
-    /// reflect "still needed by an older Raft snapshot" or "still listed
-    /// by another in-flight compaction's view of the level". A live
-    /// compaction was hitting `FileNotFound` because an input SST had
-    /// been unlinked from under it. Until file lifetime is properly
-    /// coordinated with snapshot retention (TODO), leaving orphan SSTs
-    /// on disk is the safer of the two failure modes — disk usage grows
-    /// but nothing breaks.
+    /// This frees memory only; it never unlinks the SST file.
     pub fn decrRef(self: *Table) void {
         const prev = self.ref.fetchSub(1, .acq_rel);
         if (prev <= 0) @panic("Table.decrRef below zero (double release)");
         if (prev == 1) {
-            // Poison the count before freeing: a late take or release on
-            // this table then panics here instead of corrupting the heap.
-            self.ref.store(-0x4000_0000, .release);
-            if (self.claimPath()) |p| {
-                self.allocator.free(p);
-            }
+            // The last decrRef is run by TableCache. So, this table has already
+            // been evicted from that cache.
+            const allocator = self.allocator;
             self.deinit();
+            allocator.destroy(self);
         }
     }
 
@@ -307,6 +314,31 @@ pub const Table = struct {
         return (@as(u128, self.file_id) << 64) | @as(u128, block_idx);
     }
 
+    /// Record that block `idx` was put into the block cache.
+    fn setCachedBit(self: *const Table, idx: usize) void {
+        _ = self.cached[idx / 64].fetchOr(@as(u64, 1) << @intCast(idx % 64), .monotonic);
+    }
+
+    /// Drop every block this table put into `cache`. Run when the last
+    /// ref on the table goes (`deinit`): with the table freed, its cached
+    /// blocks would be dead weight until the queues happened to cycle
+    /// past them. Clears the bits it acted on. Returns how many entries
+    /// the cache still held.
+    pub fn purgeCachedBlocks(self: *const Table, cache: *_cache.ShardedCache(u128)) usize {
+        if (self.file_id == 0) return 0;
+
+        var removed: usize = 0;
+        for (self.cached, 0..) |*word, wi| {
+            var bits = word.swap(0, .monotonic);
+            while (bits != 0) {
+                const bit: usize = @ctz(bits);
+                bits &= bits - 1;
+                if (cache.remove(self.cacheKey(wi * 64 + bit))) removed += 1;
+            }
+        }
+        return removed;
+    }
+
     /// Decompress and checksum one block's raw bytes into a ref-counted
     /// Value; the one ref is the caller's.
     fn decodeBlock(self: *const Table, raw: String) Error!*_cache.Value {
@@ -357,7 +389,13 @@ pub const Table = struct {
 
         // Cache insert (best-effort); put incrRefs on success → ref=2
         if (block_cache != null and cache_key != 0) {
-            block_cache.?.put(cache_key, val) catch {};
+            if (block_cache.?.put(cache_key, val)) |_| {
+                self.setCachedBit(block_idx);
+            } else |err| {
+                log.warn("block cache put failed: {s}; file_id={d} block={d}", .{
+                    @errorName(err), self.file_id, block_idx,
+                });
+            }
         }
 
         return val; // caller holds ref (1 if not cached, or 1+cache_ref if cached)
@@ -414,10 +452,18 @@ pub const Table = struct {
 
         self.handle.batchRead(&arena, reqs.items, priority) catch
             return error.CorruptTable;
+
         for (reqs.items, wanted.items) |req, idx| {
             const val = try self.decodeBlock(req.data);
             defer val.decrRef(); // the cache holds its own ref
-            cache.put(self.cacheKey(idx), val) catch {};
+            //
+            if (cache.put(self.cacheKey(idx), val)) |_| {
+                self.setCachedBit(idx);
+            } else |err| {
+                log.warn("block cache put failed: {s}; file_id={d} block={d}", .{
+                    @errorName(err), self.file_id, idx,
+                });
+            }
         }
         return wanted.items.len;
     }

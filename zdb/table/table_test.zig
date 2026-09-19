@@ -13,11 +13,9 @@ const Builder = zdb.table.builder.Builder;
 const Table = zdb.table.Table;
 const TableIterator = zdb.table.TableIterator;
 
-/// Test helper: decrRef + destroy the Table allocation.
+/// Test helper: release the test's ref on a Table.
 fn destroyTable(t: *Table) void {
-    const allocator = t.allocator;
-    t.decrRef();
-    allocator.destroy(t);
+    t.decrRef(); // the test's ref is the last one; this frees the table
 }
 
 /// Test helper: create an in-memory FileHandle from a buffer (dupes the data).

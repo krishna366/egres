@@ -60,18 +60,9 @@ pub const TableCache = struct {
     }
 
     pub fn deinit(self: *TableCache) void {
+        // Release the cache's ref on each table; the last ref frees it.
         var it = self.tables.iterator();
-        while (it.next()) |kv| {
-            const table = kv.value_ptr.*;
-            // detach + decrRef mirrors Level.deinit: the path is cleared so
-            // the file isn't deleted, and decrRef at zero frees the index /
-            // binary_fuse / file handle (via Table.deinit). Without this,
-            // those allocations leak — `destroy(table)` only frees the
-            // *Table struct memory, not its owned fields.
-            table.detach();
-            table.decrRef();
-            self.allocator.destroy(table);
-        }
+        while (it.next()) |kv| kv.value_ptr.*.decrRef();
         self.tables.deinit();
         self.mu.deinit();
     }
@@ -101,39 +92,29 @@ pub const TableCache = struct {
         return true;
     }
 
-    /// Let go of a table nobody published: the open-time ref goes (index,
-    /// filter, file handle freed) and so does the struct, which only a
-    /// cache entry would otherwise own.
-    fn dropUnowned(allocator: std.mem.Allocator, t: *Table) void {
+    /// Let go of a table nobody published: the open-time ref was the only
+    /// one, so this frees it.
+    fn dropUnowned(t: *Table) void {
         std.debug.assert(t.ref.load(.acquire) == 1);
         t.decrRef();
-        allocator.destroy(t);
     }
 
-    /// Evict tables whose ref has reached zero. Since own() holds a cache ref,
-    /// a table only becomes evictable after its cache ref is explicitly
-    /// released (e.g. after a snapshot confirms no follower needs the SST
-    /// file).
-    pub fn clearStale(self: *TableCache) void {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
-
-        var to_evict: std.ArrayList(u64) = .empty;
-        defer to_evict.deinit(self.allocator);
-
-        var it = self.tables.iterator();
-        while (it.next()) |entry| {
-            const table = entry.value_ptr.*;
-            if (table.ref.load(.acquire) == 0) {
-                to_evict.append(self.allocator, entry.key_ptr.*) catch continue;
-            }
-        }
-
-        for (to_evict.items) |id| {
-            if (self.tables.fetchRemove(id)) |entry| {
-                self.allocator.destroy(entry.value);
-            }
-        }
+    /// Drop the cache's entry and its own ref on `id`, if it has one. The
+    /// `Table`, its file descriptor and its cached blocks go away when the
+    /// last ref goes: a reader or compaction that pinned the table keeps
+    /// it usable for the rest of its work and frees it when it releases.
+    /// For a file the manifest has just unlisted: no level points at it
+    /// any more, so nothing will ask the cache for it again.
+    pub fn evict(self: *TableCache, id: u64) void {
+        const t = blk: {
+            self.mu.lock(@src());
+            defer self.mu.unlock();
+            const entry = self.tables.fetchRemove(id) orelse return;
+            break :blk entry.value;
+        };
+        // Outside the lock: the last ref purges the table's blocks, which
+        // takes block cache shard locks.
+        t.decrRef();
     }
 
     /// loadTables serves each TableNeed from cache (read lock) or opens it
@@ -254,13 +235,13 @@ pub const TableCache = struct {
             // Another fiber opened the same table while we were in phase B.
             self.mu.unlock();
             need.table = existing;
-            dropUnowned(self.allocator, t);
+            dropUnowned(t);
             return;
         }
         self.tables.put(need.id, t) catch |err| {
             self.mu.unlock();
             tse.set(err);
-            dropUnowned(self.allocator, t);
+            dropUnowned(t);
             return;
         };
         self.mu.unlock();

@@ -39,9 +39,7 @@ const merge = zdb.table.merge_iterator;
 // importable from each other) ────────────────────────────────────────────
 
 fn destroyTable(t: *Table) void {
-    const allocator = t.allocator;
-    t.decrRef();
-    allocator.destroy(t);
+    t.decrRef(); // the bench's ref is the last one; this frees the table
 }
 
 fn fromBuf(alloc: std.mem.Allocator, buf: String) !vfs.FileHandle {

@@ -84,6 +84,11 @@ pub const Manifest = struct {
     /// Per-SST records, keyed by sst_id. One entry per file any tree
     /// lists; guarded by `mu` like `trees`.
     ssts: std.AutoHashMap(u64, SstInfo),
+    /// Ids whose last listing went since the last `takeUnlisted`, in
+    /// order. The forest drains it after every apply to drop those files'
+    /// blocks from the block cache right away. Per-process; a draft
+    /// manifest's list dies with the draft.
+    unlisted: std.ArrayList(u64),
     /// Per-namespace manifest state (see `Namespace`), snapshot-persisted and
     /// maintained by the apply paths on every node — so a re-elected leader
     /// never re-issues a table_id, and database-name resolution is native
@@ -130,6 +135,7 @@ pub const Manifest = struct {
             .allocator = allocator,
             .trees = std.AutoHashMap(TreeKey, TreeState).init(allocator),
             .ssts = std.AutoHashMap(u64, SstInfo).init(allocator),
+            .unlisted = .empty,
             .namespaces = std.AutoHashMap(u64, Namespace).init(allocator),
             .names = std.StringHashMap(u64).init(allocator),
         };
@@ -422,6 +428,7 @@ pub const Manifest = struct {
         while (it.next()) |kv| self.freeTree(kv.value_ptr);
         self.trees.deinit();
         self.ssts.deinit();
+        self.unlisted.deinit(self.allocator);
         self.names.deinit(); // keys borrow the names owned below
         var nit = self.namespaces.valueIterator();
         while (nit.next()) |n| n.deinit(self.allocator);
@@ -472,7 +479,7 @@ pub const Manifest = struct {
             // Scan levels to find and remove the table.
             for (tree.levels.items) |*lm| {
                 if (lm.tables.remove(tc.sst_id)) {
-                    self.unlistSst(tc.sst_id);
+                    try self.decrSST(tc.sst_id);
                     break;
                 }
             }
@@ -481,14 +488,24 @@ pub const Manifest = struct {
 
     /// Drop one listing of `id`, forgetting the file once the last one
     /// goes. Caller holds the manifest lock exclusively.
-    fn unlistSst(self: *Manifest, id: u64) void {
+    fn decrSST(self: *Manifest, id: u64) !void {
         // Every listed id has a record; a delete for an unknown id is a
         // bug in the change that carried it, not a case to tolerate.
         const info = self.ssts.getPtr(id).?;
         std.debug.assert(info.refs > 0);
         info.refs -= 1;
+        if (info.refs != 0) return;
+        _ = self.ssts.remove(id);
+        try self.unlisted.append(self.allocator, id);
         // Part B appends the id to the retire list here.
-        if (info.refs == 0) _ = self.ssts.remove(id);
+    }
+
+    /// Hand over the ids unlisted since the last call, oldest first, and
+    /// forget them. Freed by the caller with the manifest's allocator.
+    pub fn takeUnlisted(self: *Manifest) ![]u64 {
+        const held = self.mu.hold(.exclusive, @src());
+        defer held.release();
+        return self.unlisted.toOwnedSlice(self.allocator);
     }
 
     /// The log index of the entry that first listed `sst_id`. Asking for
@@ -534,7 +551,7 @@ pub const Manifest = struct {
                 var tree = kv.value;
                 for (tree.levels.items) |lm| {
                     var tit = lm.tables.keyIterator();
-                    while (tit.next()) |id| self.unlistSst(id.*);
+                    while (tit.next()) |id| try self.decrSST(id.*);
                 }
                 self.freeTree(&tree);
             }
@@ -566,7 +583,28 @@ pub const Manifest = struct {
         defer held.release();
 
         for (tree_changes) |tc| try self.applyTreeChange(held, tc);
-        for (table_changes) |tc| try self.applySSTableChange(held, index, tc);
+        try self.applySSTableChanges(held, index, table_changes);
+    }
+
+    /// Apply one entry's SST changes: every create, then every delete.
+    /// A split lists a moved file twice in one entry, a delete from the
+    /// old tree and a create in the new one. Applied in that order the
+    /// delete would take the refcount to zero and unlist a file the same
+    /// entry lists again. Creates first keep the record alive (refs
+    /// 1 -> 2 -> 1), so a file is unlisted only when an entry leaves it
+    /// with no listing at all.
+    fn applySSTableChanges(
+        self: *Manifest,
+        held: Lock.Exclusive,
+        index: u64,
+        table_changes: []const SSTableChange,
+    ) !void {
+        for (table_changes) |tc| {
+            if (tc.op == .create) try self.applySSTableChange(held, index, tc);
+        }
+        for (table_changes) |tc| {
+            if (tc.op != .create) try self.applySSTableChange(held, index, tc);
+        }
     }
 
     /// Apply one whole ManifestChange: its structural changes (trees, then
@@ -592,8 +630,7 @@ pub const Manifest = struct {
             const held = self.mu.hold(.exclusive, @src());
             defer held.release();
             for (mc.tree_changes) |tc| try self.applyTreeChange(held, tc);
-            for (mc.sstable_changes) |tc|
-                try self.applySSTableChange(held, index, tc);
+            try self.applySSTableChanges(held, index, mc.sstable_changes);
         }
 
         switch (mc.cmd) {

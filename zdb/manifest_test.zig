@@ -571,3 +571,42 @@ test "manifest apply drop_ns removes the namespace name" {
     try std.testing.expect(manifest.lookupNamespace("shop") == null);
     try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
 }
+
+test "manifest takeUnlisted hands over ids whose last listing went, once" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}),
+        createTreeChange(2, 0, &.{}, &.{}),
+    });
+    try manifest.commit(2, &.{
+        createSSTableChange(10, 0, 1, 0),
+        createSSTableChange(20, 0, 1, 0),
+    }, &.{});
+    // 20 is shared with tree 2: one delete leaves it listed.
+    try manifest.commit(3, &.{createSSTableChange(20, 0, 2, 0)}, &.{});
+
+    try manifest.commit(4, &.{
+        deleteSSTableChange(10, 0, 1, 0),
+        deleteSSTableChange(20, 0, 1, 0),
+    }, &.{});
+    {
+        const gone = try manifest.takeUnlisted();
+        defer alloc.free(gone);
+        try std.testing.expectEqualSlices(u64, &.{10}, gone);
+    }
+    // Drained: nothing until the next unlist.
+    {
+        const none = try manifest.takeUnlisted();
+        defer alloc.free(none);
+        try std.testing.expectEqual(@as(usize, 0), none.len);
+    }
+    try manifest.commit(5, &.{deleteSSTableChange(20, 0, 2, 0)}, &.{});
+    {
+        const gone = try manifest.takeUnlisted();
+        defer alloc.free(gone);
+        try std.testing.expectEqualSlices(u64, &.{20}, gone);
+    }
+}

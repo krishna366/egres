@@ -533,6 +533,10 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     if (data_cfg.memtable_size > 0) forest_opts.memtable_size = @intCast(data_cfg.memtable_size);
     var forest = try zdb.forest.Forest.open(allocator, forest_opts);
     defer {
+        // Closing the forest frees every table, and a table drops its
+        // blocks from the block cache as it goes. The whole cache is
+        // freed right after, so skip that per-block work.
+        zdb.table.table.block_cache = null;
         forest.close();
         log.info("deinit: forest done", .{});
     }

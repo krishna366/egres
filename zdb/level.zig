@@ -175,10 +175,7 @@ pub const Level = struct {
     /// Used by Tree.close(); detaches the path so decrRef at
     /// zero only frees memory.
     pub fn deinit(self: *Level) void {
-        for (self.tables.items) |e| {
-            e.table.detach(); // clear path → decrRef won't delete the file
-            e.table.decrRef();
-        }
+        for (self.tables.items) |e| e.table.decrRef();
         self.tables.deinit(self.allocator);
     }
 

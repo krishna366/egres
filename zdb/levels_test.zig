@@ -138,9 +138,7 @@ fn openTableOwned(alloc: std.mem.Allocator, tb: *_table.builder.TableBuffer) !*T
 }
 
 fn destroyTable(t: *Table) void {
-    const allocator = t.allocator;
-    t.decrRef();
-    allocator.destroy(t);
+    t.decrRef(); // the test's ref is the last one; this frees the table
 }
 
 // ---------------------------------------------------------------------------

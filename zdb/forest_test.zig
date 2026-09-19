@@ -2343,3 +2343,99 @@ test "forest: index backfill installs bottom states below live deltas" {
     try std.testing.expect(!try f.bottomLevelHas(1, 0, again.items));
     try roar.expectBitmap(f, alloc, "blue", 700, &.{ 1, 3, 5 });
 }
+
+fn putRow(f: *Forest, primary: String, ts: u64, value: String) !void {
+    const items = [_]zdb.kv.Item{.{
+        .key = .{ .namespace = 1, .table_id = 0, .primary = primary },
+        .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = value } },
+    }};
+    try f.put(&items);
+}
+
+test "forest: evictUnlisted evicts a compacted-away file; its blocks go with the table" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // A private block cache: never installed in the process-wide slot,
+    // since the runner executes tests in parallel and they would share
+    // it. Tables are asked to prefetch into it explicitly.
+    var cache = try zdb.cache.ShardedCache(u128).init(alloc, 64 << 20, 4);
+    defer cache.deinit();
+
+    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+
+    try f.newMemtable(1);
+    try putRow(f, "a", 1, "one");
+    try f.newMemtable(2);
+    var flush_a = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush_a.changes.deinit(alloc);
+    try f.applyFlush(3, flush_a.changes.items, flush_a.memtable_id);
+    try putRow(f, "b", 2, "two");
+    try f.newMemtable(4);
+    var flush_b = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush_b.changes.deinit(alloc);
+    try f.applyFlush(5, flush_b.changes.items, flush_b.memtable_id);
+
+    const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    defer tree.release();
+
+    // Both L0 inputs prefetch their first block into the cache.
+    var in_ids: [2]u64 = undefined;
+    {
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        const ents = tree.levels[0].entries(held);
+        try std.testing.expectEqual(@as(usize, 2), ents.len);
+        for (ents, 0..) |e, i| {
+            in_ids[i] = e.id;
+            const n = try e.table.prefetchBlocks(&cache, alloc, &.{0}, .p0);
+            try std.testing.expectEqual(@as(usize, 1), n);
+        }
+    }
+    for (in_ids) |id| {
+        const v = cache.get(@as(u128, id) << 64) orelse return error.TestExpectedCached;
+        v.decrRef();
+    }
+
+    // Pin the inputs the way a reader would, so they outlive the evict
+    // and the test can purge their blocks by hand. A freed table purges
+    // against the process-wide cache, which no test may install.
+    var pinned: [2]*zdb.table.Table = undefined;
+    {
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        for (tree.levels[0].entries(held), 0..) |e, i| {
+            e.table.incrRef();
+            pinned[i] = e.table;
+        }
+    }
+    defer for (pinned) |t| t.decrRef();
+
+    var comp = try tree.buildCompaction(0, 0);
+    defer comp.deinit(alloc);
+    try tree.applyCompaction(20, comp.items);
+
+    // The apply unlisted both inputs; the purge evicts them.
+    for (in_ids) |id| try std.testing.expect(f.table_cache.contains(id));
+    try f.evictUnlisted();
+    for (in_ids) |id| try std.testing.expect(!f.table_cache.contains(id));
+
+    // What the last `decrRef` does: drop exactly this table's blocks.
+    for (pinned) |t| try std.testing.expectEqual(@as(usize, 1), t.purgeCachedBlocks(&cache));
+    for (in_ids) |id|
+        try std.testing.expectEqual(@as(?*zdb.cache.Value, null), cache.get(@as(u128, id) << 64));
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
+
+    // The output is listed and untouched by a second purge.
+    var out_id: u64 = 0;
+    for (comp.items) |c| if (c.op == .create) {
+        out_id = c.sst_id;
+    };
+    try f.evictUnlisted();
+    try std.testing.expect(f.table_cache.contains(out_id));
+}

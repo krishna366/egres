@@ -339,3 +339,94 @@ test "Cache ring growth preserves all entries" {
     }
     try std.testing.expect(false); // fail -- the rings didn't increase in size
 }
+
+test "Cache remove frees the entry and eviction skips its dead slot" {
+    // S gets a tenth of the capacity. Entries are sized so exactly three
+    // fit in S: per-entry bytes are measured from the first put rather
+    // than assumed (a scalar key counts its own size).
+    var c = try Cache(u64).init(std.testing.allocator, 1000);
+    defer c.deinit();
+    const body = "x" ** 20;
+    const putOne = struct {
+        fn f(cache: *Cache(u64), k: u64) !void {
+            const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, body));
+            defer v.decrRef();
+            try cache.put(k, v);
+        }
+    }.f;
+    try putOne(&c, 1);
+    const per = c.byteSize();
+    try std.testing.expect(3 * per <= c.s_cap_bytes and 4 * per > c.s_cap_bytes);
+    try putOne(&c, 2);
+    try putOne(&c, 3);
+    try std.testing.expectEqual(@as(usize, 3), c.count());
+    try std.testing.expectEqual(3 * per, c.byteSize());
+
+    try std.testing.expect(c.remove(2));
+    try std.testing.expect(!c.remove(2));
+    try std.testing.expectEqual(@as(?*Value, null), c.get(2));
+    try std.testing.expectEqual(@as(usize, 2), c.count());
+    try std.testing.expectEqual(2 * per, c.byteSize());
+
+    // 4 fits beside 1 and 3. 5 pushes S over budget: the tail evicts 1,
+    // which is live. S's ring is now [dead 2, 3, 4, 5]. Presence is
+    // checked through `count` and by absence only: a `get` would mark
+    // its entry as reused and change what the next eviction does.
+    try putOne(&c, 4);
+    try putOne(&c, 5);
+    try std.testing.expectEqual(@as(?*Value, null), c.get(1));
+    try std.testing.expectEqual(@as(usize, 3), c.count());
+    try std.testing.expectEqual(3 * per, c.byteSize());
+
+    // 6 pushes S over budget again: the tail is 2's dead slot, which is
+    // skipped, and 3 is the one evicted.
+    try putOne(&c, 6);
+    try std.testing.expectEqual(@as(?*Value, null), c.get(3));
+    try std.testing.expectEqual(@as(usize, 3), c.count());
+    try std.testing.expectEqual(3 * per, c.byteSize());
+    for ([_]u64{ 4, 5, 6 }) |k| {
+        const got = c.get(k) orelse return error.Missing;
+        got.decrRef();
+    }
+}
+
+test "Cache remove then re-put of the same key leaves a stale slot that eviction skips" {
+    var c = try Cache(u64).init(std.testing.allocator, 1000);
+    defer c.deinit();
+    const body = "y" ** 20;
+    const putOne = struct {
+        fn f(cache: *Cache(u64), k: u64) !void {
+            const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, body));
+            defer v.decrRef();
+            try cache.put(k, v);
+        }
+    }.f;
+    try putOne(&c, 1);
+    const per = c.byteSize();
+    try std.testing.expect(3 * per <= c.s_cap_bytes and 4 * per > c.s_cap_bytes);
+    try std.testing.expect(c.remove(1));
+    // Re-put: the map now points at a newer slot; the old slot is stale.
+    try putOne(&c, 1);
+    try putOne(&c, 2);
+    try putOne(&c, 3);
+    // 4 pushes S over budget: the tail meets 1's stale slot first, must
+    // skip it, then evicts 1's live slot — not 2 or 3.
+    try putOne(&c, 4);
+    try std.testing.expectEqual(@as(?*Value, null), c.get(1));
+    for ([_]u64{ 2, 3, 4 }) |k| {
+        const got = c.get(k) orelse return error.Missing;
+        got.decrRef();
+    }
+    try std.testing.expectEqual(@as(usize, 3), c.count());
+}
+
+test "ShardedCache remove" {
+    var c = try ShardedCache(u64).init(std.testing.allocator, 4096, 4);
+    defer c.deinit();
+    const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "blob"));
+    defer v.decrRef();
+    try c.put(7, v);
+    try std.testing.expect(c.remove(7));
+    try std.testing.expect(!c.remove(7));
+    try std.testing.expectEqual(@as(?*Value, null), c.get(7));
+}
