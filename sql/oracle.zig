@@ -37,7 +37,7 @@ const zdb = @import("zdb");
 
 pub const Oracle = struct {
     allocator: std.mem.Allocator,
-    mu: fiber.Mutex(.tracked) = .{},
+    mu: fiber.RWMutex(.tracked) = .{},
     current: Generation = .{},
     previous: Generation = .{},
     /// See the module invariant. Only ever rises.
@@ -85,8 +85,8 @@ pub const Oracle = struct {
     /// `commitTs > read_ts` err toward seeing a conflict, never miss
     /// one.
     pub fn commitTs(self: *Oracle, h: u64) u64 {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
         return self.lookupLocked(h);
     }
 
@@ -95,8 +95,8 @@ pub const Oracle = struct {
     /// txn's full read set at once). Absent keys contribute
     /// `horizon_ts`, as in `commitTs`; an empty set answers 0.
     pub fn maxCommitTs(self: *Oracle, hashes: []const u64) u64 {
-        self.mu.lock(@src());
-        defer self.mu.unlock();
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
         var max: u64 = 0;
         for (hashes) |h| max = @max(max, self.lookupLocked(h));
         return max;
