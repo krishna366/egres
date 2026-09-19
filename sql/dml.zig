@@ -41,7 +41,7 @@ const replyLockErr = _server.replyLockErr;
 pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !void {
     const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.lookupTable(ns, ins.table) orelse
+    const table_id = eng.forest.manifest.lookupTable(ns, ins.table) orelse
         return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
 
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
@@ -156,7 +156,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
 pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !void {
     const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.lookupTable(ns, sel.table) orelse
+    const table_id = eng.forest.manifest.lookupTable(ns, sel.table) orelse
         return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
 
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
@@ -240,7 +240,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     const eng = self.srv.engine;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.lookupTable(ns, del.table) orelse
+    const table_id = eng.forest.manifest.lookupTable(ns, del.table) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.undefined_table,
@@ -319,7 +319,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     const eng = self.srv.engine;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.lookupTable(ns, up.table) orelse
+    const table_id = eng.forest.manifest.lookupTable(ns, up.table) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.undefined_table,
@@ -483,7 +483,7 @@ pub fn describeSelect(
 ) !void {
     const eng = self.srv.engine;
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.lookupTable(ns, sel.table) orelse
+    const table_id = eng.forest.manifest.lookupTable(ns, sel.table) orelse
         return replyErrorCode(
             state,
             pgwire.sqlstate.undefined_table,

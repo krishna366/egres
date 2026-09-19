@@ -5,6 +5,7 @@ const utils = @import("utils");
 const String = utils.String;
 const _config = @import("config.zig");
 const _manifest = @import("manifest.zig");
+const _ddl = @import("forest_ddl.zig");
 const _read = @import("read.zig");
 const _stats = @import("stats.zig");
 const _table = @import("table.zig");
@@ -492,29 +493,26 @@ pub const Forest = struct {
     pub const writeNamespaceStats = _stats.writeNamespaceStats;
     pub const writeBytes = _stats.writeBytes;
 
-    // Building and applying manifest changes, from manifest.zig.
-    pub const installTree = _manifest.installTree;
-    pub const collectMissingFileIds = _manifest.collectMissingFileIds;
-    pub const openTablesFromManifest = _manifest.openTablesFromManifest;
-    pub const createTree = _manifest.createTree;
-    pub const buildNamespaceCreate = _manifest.buildNamespaceCreate;
-    pub const CreateNamespaceResult = _manifest.CreateNamespaceResult;
-    pub const buildCreateNamespace = _manifest.buildCreateNamespace;
-    pub const lookupNamespace = _manifest.lookupNamespace;
-    pub const lookupTable = _manifest.lookupTable;
-    pub const applyNamespaceCreate = _manifest.applyNamespaceCreate;
-    pub const buildCreateTree = _manifest.buildCreateTree;
-    pub const CreateTablesResult = _manifest.CreateTablesResult;
-    pub const buildCreateTables = _manifest.buildCreateTables;
-    pub const applyCreateTree = _manifest.applyCreateTree;
-    pub const buildDropTables = _manifest.buildDropTables;
-    pub const applyDropTree = _manifest.applyDropTree;
-    pub const applyTreeDeletes = _manifest.applyTreeDeletes;
-    pub const buildDropNamespace = _manifest.buildDropNamespace;
-    pub const applyNamespaceDrop = _manifest.applyNamespaceDrop;
-    pub const buildSplit = _manifest.buildSplit;
-    pub const applySplit = _manifest.applySplit;
-    pub const splitTreeForTests = _manifest.splitTreeForTests;
+    // Building and applying manifest changes, from forest_ddl.zig.
+    pub const installTree = _ddl.installTree;
+    pub const collectMissingFileIds = _ddl.collectMissingFileIds;
+    pub const openTablesFromManifest = _ddl.openTablesFromManifest;
+    pub const createTree = _ddl.createTree;
+    pub const buildNamespaceCreate = _ddl.buildNamespaceCreate;
+    pub const CreateNamespaceResult = _ddl.CreateNamespaceResult;
+    pub const buildCreateNamespace = _ddl.buildCreateNamespace;
+    pub const applyNamespaceCreate = _ddl.applyNamespaceCreate;
+    pub const buildCreateTree = _ddl.buildCreateTree;
+    pub const CreateTablesResult = _ddl.CreateTablesResult;
+    pub const buildCreateTables = _ddl.buildCreateTables;
+    pub const applyCreateTree = _ddl.applyCreateTree;
+    pub const buildDropTables = _ddl.buildDropTables;
+    pub const applyDropTree = _ddl.applyDropTree;
+    pub const buildDropNamespace = _ddl.buildDropNamespace;
+    pub const applyNamespaceDrop = _ddl.applyNamespaceDrop;
+    pub const buildSplit = _ddl.buildSplit;
+    pub const applySplit = _ddl.applySplit;
+    pub const splitTreeForTests = _ddl.splitTreeForTests;
 
     /// Open a forest with empty in-memory state. Persistent state is restored
     /// later via `installManifest` (called by recovery if a Raft snapshot is

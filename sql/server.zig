@@ -430,7 +430,7 @@ pub const Handler = struct {
     pub fn onStartup(self: *Handler, state: *pgwire.ConnState, params: pgwire.proto.StartupParams) !void {
         _ = state;
         const requested = params.database orelse "";
-        self.namespace = self.srv.engine.forest.lookupNamespace(
+        self.namespace = self.srv.engine.forest.manifest.lookupNamespace(
             if (requested.len > 0) requested else default_database,
         ) orelse 0;
     }

@@ -922,8 +922,12 @@ pub const Engine = struct {
                         mcs.deinit(self.allocator);
                         self.allocator.destroy(mcs);
                     }
-                    try replayNames(&draft, mcs.*);
-                    try draft.commit(stored.index, mcs.sstable_changes, mcs.tree_changes);
+                    // apply, not commit: the draft must also pick up the
+                    // change's name and counter effects. The WAL below the
+                    // snapshot is gone after a restart, so a name missing
+                    // from the snapshot is lost and its database or table
+                    // becomes unreachable even though its rows are there.
+                    try draft.apply(stored.index, mcs.*);
                 },
                 else => continue,
             }
@@ -950,45 +954,6 @@ pub const Engine = struct {
             .oldest_memtable_index = oldest,
         });
         log.info("snapshot proposed: index={d} term={d} bytes={d}", .{ target, target_term, data.len });
-    }
-
-    /// The manifest-state effects of a change beyond its tree and table
-    /// lists — the namespace and table id counters and both name
-    /// registries — exactly as the live apply path produces them
-    /// (Forest.applyNamespaceCreate / applyCreateTree / applyDropTree /
-    /// applyNamespaceDrop). A snapshot draft must replay these too: the
-    /// WAL below the snapshot is gone after a restart, so a name that is
-    /// not in the snapshot is lost and its database or table becomes
-    /// unreachable even though its rows are all there.
-    ///
-    /// TODO: We probably should move table names over to the table schema, and
-    /// avoid storing them in the MANIFEST.
-    fn replayNames(
-        dst: *_manifest.Manifest,
-        mcs: _manifest.ManifestChange,
-    ) !void {
-        const treeTableId = zdb.kv.treeTableId;
-        switch (mcs.cmd) {
-            .create_ns => for (mcs.tree_changes) |tc| {
-                if (tc.op != .create) continue;
-                dst.advanceNamespace(tc.namespace_id);
-                try dst.registerNamespaceName(tc.namespace_id, tc.name);
-            },
-            .create_tree => for (mcs.tree_changes) |tc| {
-                if (tc.op != .create) continue;
-                const table_id = treeTableId(tc.tree_id);
-                try dst.advanceTableId(tc.namespace_id, table_id);
-                try dst.registerTableName(tc.namespace_id, table_id, tc.name);
-            },
-            .drop_tree => for (mcs.tree_changes) |tc| {
-                if (tc.op != .delete) continue;
-                dst.dropTable(tc.namespace_id, treeTableId(tc.tree_id));
-            },
-            .drop_ns => if (mcs.tree_changes.len > 0) {
-                dst.dropNamespace(mcs.tree_changes[0].namespace_id);
-            },
-            else => {},
-        }
     }
 
     /// Single-purpose loop: when leader, propose a `newMemtable` whenever

@@ -62,7 +62,7 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
 
     if (std.mem.eql(u8, name, default_database))
         return replyError(state, "cannot drop the default database");
-    const ns = eng.forest.lookupNamespace(name) orelse
+    const ns = eng.forest.manifest.lookupNamespace(name) orelse
         return replyError(state, "database does not exist");
 
     // Set `dropped` first, then take and release every table lock
@@ -110,7 +110,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    if (eng.forest.lookupTable(ns, ct.name) != null) {
+    if (eng.forest.manifest.lookupTable(ns, ct.name) != null) {
         if (ct.if_not_exists) return state.sendCommandComplete("CREATE TABLE");
         return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table already exists");
     }
@@ -257,7 +257,7 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     if (!try self.ddlReady(state)) return;
 
     const ns = try self.sessionNamespace(state) orelse return;
-    const table_id = eng.forest.lookupTable(ns, dt.name) orelse {
+    const table_id = eng.forest.manifest.lookupTable(ns, dt.name) orelse {
         if (dt.missing_ok) return state.sendCommandComplete("DROP TABLE");
         return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
     };

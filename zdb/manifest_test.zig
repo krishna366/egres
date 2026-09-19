@@ -456,3 +456,118 @@ test "manifest serialize round-trip preserves raft_index" {
     try std.testing.expectEqual(@as(u64, 6), dst.raftIndexOf(20));
     try std.testing.expectEqual(@as(u64, 8), dst.raftIndexOf(30));
 }
+
+// -------------------------------------------------------------------------
+// apply: structural changes plus the name and counter effects of `cmd`
+// -------------------------------------------------------------------------
+
+/// The ns_create change a namespace create proposes: one tree for the
+/// namespace's default table, carrying the database name.
+fn nsCreateChange(
+    tcs: *[1]_manifest.TreeChange,
+    namespace: u64,
+    name: []const u8,
+) _manifest.ManifestChange {
+    tcs[0] = createTreeChange(zdb.kv.makeTreeId(0, 0), namespace, &.{}, &.{});
+    tcs[0].name = name;
+    return .{ .tree_changes = tcs, .cmd = .create_ns };
+}
+
+/// The create_tree change a CREATE TABLE proposes: one tree at split 0 for
+/// `table_id`, carrying the table name.
+fn createTreeCmd(
+    tcs: *[1]_manifest.TreeChange,
+    namespace: u64,
+    table_id: u32,
+    name: []const u8,
+) _manifest.ManifestChange {
+    tcs[0] = createTreeChange(
+        zdb.kv.makeTreeId(table_id, 0),
+        namespace,
+        &.{},
+        &.{},
+    );
+    tcs[0].name = name;
+    return .{ .tree_changes = tcs, .cmd = .create_tree };
+}
+
+test "manifest apply create_ns registers the name and advances next_ns_id" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    var tcs: [1]_manifest.TreeChange = undefined;
+    try manifest.apply(5, nsCreateChange(&tcs, 100, "shop"));
+
+    try std.testing.expect(manifest.trees.contains(tk(100, 0)));
+    try std.testing.expectEqual(@as(?u64, 100), manifest.lookupNamespace("shop"));
+    // The counter moved past the created namespace, so the next allocation
+    // cannot re-issue it.
+    try std.testing.expectEqual(@as(u64, 101), manifest.nextNamespace());
+}
+
+test "manifest apply create_tree registers the name and advances the table id" {
+    const alloc = std.testing.allocator;
+    const first = _manifest.first_table_id;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    var tcs: [1]_manifest.TreeChange = undefined;
+    try manifest.apply(6, createTreeCmd(&tcs, 7, first, "users"));
+
+    try std.testing.expect(manifest.trees.contains(tk(7, zdb.kv.makeTreeId(first, 0))));
+    try std.testing.expectEqual(@as(?u32, first), manifest.lookupTable(7, "users"));
+    try std.testing.expectEqual(first + 1, try manifest.nextTableId(7));
+}
+
+test "manifest apply is idempotent for a re-applied create" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    // The WAL-replay-over-snapshot case: the same entry applied twice. The
+    // second must leave one tree and leak nothing (std.testing.allocator
+    // fails the test if the first tree's keys are dropped on the floor).
+    var tcs: [1]_manifest.TreeChange = undefined;
+    const mc = nsCreateChange(&tcs, 100, "shop");
+    try manifest.apply(5, mc);
+    try manifest.apply(5, mc);
+
+    try std.testing.expectEqual(@as(u32, 1), manifest.trees.count());
+    try std.testing.expectEqual(@as(?u64, 100), manifest.lookupNamespace("shop"));
+}
+
+test "manifest apply drop_tree removes the table name" {
+    const alloc = std.testing.allocator;
+    const first = _manifest.first_table_id;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    var tcs: [1]_manifest.TreeChange = undefined;
+    try manifest.apply(6, createTreeCmd(&tcs, 7, first, "users"));
+
+    var dtcs = [_]_manifest.TreeChange{
+        deleteTreeChange(zdb.kv.makeTreeId(first, 0), 7),
+    };
+    try manifest.apply(7, .{ .tree_changes = &dtcs, .cmd = .drop_tree });
+
+    try std.testing.expect(manifest.lookupTable(7, "users") == null);
+    try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
+    // The id is not rewound: ids are never reused.
+    try std.testing.expectEqual(first + 1, try manifest.nextTableId(7));
+}
+
+test "manifest apply drop_ns removes the namespace name" {
+    const alloc = std.testing.allocator;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    var tcs: [1]_manifest.TreeChange = undefined;
+    try manifest.apply(5, nsCreateChange(&tcs, 100, "shop"));
+
+    var dtcs = [_]_manifest.TreeChange{deleteTreeChange(0, 100)};
+    try manifest.apply(8, .{ .tree_changes = &dtcs, .cmd = .drop_ns });
+
+    try std.testing.expect(manifest.lookupNamespace("shop") == null);
+    try std.testing.expectEqual(@as(u32, 0), manifest.trees.count());
+}
