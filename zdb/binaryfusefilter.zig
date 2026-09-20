@@ -64,6 +64,22 @@ pub fn BinaryFuse(comptime T: type) type {
         ///
         /// `deinit()` must be called by the caller to free the memory.
         pub fn init(allocator: Allocator, size: usize) !Self {
+            return initExtra(allocator, size, 0);
+        }
+
+        /// `init` with `extra_segments` more segments than the size formula
+        /// gives. The formula rounds the segment count down, and for a
+        /// `size` just under a boundary (11,504 keys: 12 segments of 1,024
+        /// for a capacity of 14,313) the array is so tight that a seed
+        /// succeeds only a few percent of the time and `populate` can
+        /// exhaust its 100 attempts on an ordinary key set. One extra
+        /// segment builds such a set on the first seed; see `build`.
+        ///
+        /// https://github.com/FastFilter/xor_singleheader/issues/77
+        ///
+        /// Filed issue with the original C code. If it's fixed upstream, we can
+        /// remove this extra_segments workaround.
+        pub fn initExtra(allocator: Allocator, size: usize, extra_segments: u32) !Self {
             const arity: u32 = 3;
             var segment_length = calculateSegmentLength(arity, size);
             if (segment_length > 262144) {
@@ -80,6 +96,7 @@ pub fn BinaryFuse(comptime T: type) type {
             } else {
                 segment_count = segment_count - (arity - 1);
             }
+            segment_count += extra_segments;
             slice_length = (segment_count + arity - 1) * segment_length;
             const segment_count_length = segment_count * segment_length;
 
@@ -95,6 +112,28 @@ pub fn BinaryFuse(comptime T: type) type {
 
         pub inline fn deinit(self: *const Self, allocator: Allocator) void {
             allocator.free(self.fingerprints);
+        }
+
+        /// How many extra segments `build` is willing to add before giving
+        /// up. Each one costs `segment_length` fingerprints.
+        pub const max_extra_segments: u32 = 3;
+
+        /// Size and populate a filter for `keys`, growing the array by one
+        /// segment and retrying whenever `populate` runs out of seeds.
+        /// Returns `KeysLikelyNotUnique` only after `max_extra_segments`
+        /// growths have failed too, which for distinct keys does not
+        /// happen; duplicate keys fail every size.
+        pub fn build(allocator: Allocator, keys: []u64) Error!Self {
+            for (0..max_extra_segments + 1) |extra| {
+                var filter = try initExtra(allocator, keys.len, @intCast(extra));
+                filter.populate(allocator, keys) catch |err| {
+                    filter.deinit(allocator);
+                    if (err != Error.KeysLikelyNotUnique) return err;
+                    continue;
+                };
+                return filter;
+            }
+            return Error.KeysLikelyNotUnique;
         }
 
         /// reports the size in bytes of the filter.

@@ -355,6 +355,19 @@ pub const Builder = struct {
         }
     }
 
+    /// How many entries of `bf_hashes` repeat another one. Only for the
+    /// filter-failure error line. Sorts `bf_hashes` in place: the filter
+    /// build was their only reader and it has already failed.
+    fn sortedDupCheckForError(self: *Builder) usize {
+        const hashes = self.bf_hashes.items;
+        std.mem.sort(u64, hashes, {}, std.sort.asc(u64));
+        var dups: usize = 0;
+        for (hashes[0..hashes.len -| 1], hashes[@min(1, hashes.len)..]) |prev, cur| {
+            if (prev == cur) dups += 1;
+        }
+        return dups;
+    }
+
     pub fn finish(self: *Builder) Error!TableBuffer {
         // Flush the final in-progress block, if any.
         try self.finishBlock();
@@ -389,73 +402,37 @@ pub const Builder = struct {
 
         var binary_fuse_off: ?u32 = null;
         if (self.bf_hashes.items.len > 0) {
-            var filter = try _binaryfuse.BinaryFuse(u16).init(self.allocator, self.bf_hashes.items.len);
-            defer filter.deinit(self.allocator);
-            filter.populate(self.allocator, self.bf_hashes.items) catch |err| {
-                // Diagnose before failing the build: count duplicates in
-                // bf_hashes via a HashMap. If the input really has
-                // duplicate hashes, our caller is broken (we only append
-                // a hash once per primary in `add`). If they're all
-                // unique, the binary-fuse impl is failing to converge —
-                // a library bug we need to know about, not silently work
-                // around (lookups would still work without the filter,
-                // but skipping it masks the real bug).
-                var seen = std.AutoHashMap(u64, u32).init(self.allocator);
-                defer seen.deinit();
-                var dup_count: usize = 0;
-                for (self.bf_hashes.items) |h| {
-                    const gop = seen.getOrPut(h) catch continue;
-                    if (gop.found_existing) {
-                        gop.value_ptr.* += 1;
-                        dup_count += 1;
-                    } else {
-                        gop.value_ptr.* = 1;
-                    }
-                }
-                log.err(
-                    "binary fuse populate failed: {s} — n_hashes={d} unique={d} duplicates={d}",
-                    .{ @errorName(err), self.bf_hashes.items.len, seen.count(), dup_count },
-                );
-                // Dump the hashes for upstream-reproducible bug filing.
-                // One zero-padded 16-char hex u64 per line, fixed filename:
-                // only the first failure's hashes are captured per restart
-                // (subsequent failures overwrite — they're typically the
-                // same memtable retrying anyway).
-                const path = "/tmp/zdb/fuse_fail.txt";
-                // Render the whole dump into one heap buffer, then a single
-                // writeAll + fsync. Each line is exactly 17 bytes (16 hex
-                // + '\n'). After the dump is durable, panic so we don't
-                // keep rewriting the same file on every flush retry —
-                // this is a hard library bug that needs human attention.
-                const line_len: usize = 17;
-                const total = self.bf_hashes.items.len * line_len;
-                const b = self.allocator.alloc(u8, total) catch @panic("OOM during fuse-fail dump");
-                defer self.allocator.free(b);
-                var off: usize = 0;
-                for (self.bf_hashes.items) |h| {
-                    _ = std.fmt.bufPrint(b[off..][0..line_len], "{x:0>16}\n", .{h}) catch break;
-                    off += line_len;
-                }
-                const io = utils.context.g().io;
-                const file = std.Io.Dir.createFileAbsolute(io, path, .{}) catch |e| std.debug.panic("dump open: {s}", .{@errorName(e)});
-                file.writeStreamingAll(io, b[0..off]) catch |e| std.debug.panic("dump write: {s}", .{@errorName(e)});
-                file.sync(io) catch |e| std.debug.panic("dump sync: {s}", .{@errorName(e)});
-                file.close(io);
-                log.err("dumped {d} hashes (hex, one per line) to {s} — aborting", .{ self.bf_hashes.items.len, path });
-                std.debug.panic("binary fuse populate failed with {d} unique hashes; see {s}", .{ self.bf_hashes.items.len, path });
+            // `build` grows the filter by a segment and retries when the
+            // size formula leaves the array too tight for the seed loop
+            // (the 11,504-key case). A set of distinct hashes always
+            // builds within that; if it somehow does not, the table is
+            // written without a filter: lookups still work through the
+            // index, only the miss shortcut is lost. That is an error
+            // line, not a crash, since the failure is tied to the key set
+            // and a panic would repeat on every retry of the same
+            // compaction. Duplicate hashes fail every size, and only a
+            // caller bug produces them (`addItem` appends one hash per
+            // key), so the line says how many there were.
+            const filter = _binaryfuse.BinaryFuse(u16).build(self.allocator, self.bf_hashes.items) catch |err| blk: {
+                log.err("binary fuse build failed: {s}; n_hashes={d} duplicates={d}; writing table without a filter", .{
+                    @errorName(err), self.bf_hashes.items.len, self.sortedDupCheckForError(),
+                });
+                break :blk null;
             };
-
-            var bf_writer = try _buffers.BinaryFuseFilterWriter.initWithBuf(self.allocator, &index_bytes);
-            try bf_writer.set(.{
-                .seed = filter.seed,
-                .segment_length = filter.segment_length,
-                .segment_length_mask = filter.segment_length_mask,
-                .segment_count = filter.segment_count,
-                .segment_count_length = filter.segment_count_length,
-                .fingerprints = filter.fingerprints,
-            });
-            const bf_buf = try bf_writer.finish();
-            binary_fuse_off = bf_buf.offset;
+            if (filter) |f| {
+                defer f.deinit(self.allocator);
+                var bf_writer = try _buffers.BinaryFuseFilterWriter.initWithBuf(self.allocator, &index_bytes);
+                try bf_writer.set(.{
+                    .seed = f.seed,
+                    .segment_length = f.segment_length,
+                    .segment_length_mask = f.segment_length_mask,
+                    .segment_count = f.segment_count,
+                    .segment_count_length = f.segment_count_length,
+                    .fingerprints = f.fingerprints,
+                });
+                const bf_buf = try bf_writer.finish();
+                binary_fuse_off = bf_buf.offset;
+            }
         }
 
         try index_writer.set(.{
