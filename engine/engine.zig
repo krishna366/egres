@@ -20,12 +20,21 @@ pub const SnapshotCfg = struct {
     orphan_scan_interval_seconds: u64 = 30 * 60,
 
     pub const docs = .{
-        .self = "Raft snapshot triggers. Leader proposes a snapshot when WAL tail bytes from head reach min_bytes OR an entry crosses min_age_seconds.",
-        .min_bytes = "Snapshot triggers once WAL tail-bytes-from-head reach this. Default 1 GiB.",
-        .min_age_seconds = "Snapshot triggers when an entry is at least this many seconds older than wall clock. Default 600 (10 min).",
-        .poll_interval_seconds = "How often the snapshot loop checks the criteria.",
-        .orphan_min_age_seconds = "SST files the manifest does not know are removed only once older than this and not written after the snapshot; must exceed one compaction's window from first output write to proposal. Default 1800 (30 min).",
-        .orphan_scan_interval_seconds = "How often the data directory is scanned for orphan SST files. Default 1800 (30 min).",
+        .self = "Raft snapshot triggers. Leader proposes a snapshot when WAL" ++
+            " tail bytes from head reach min_bytes OR an entry crosses" ++
+            " min_age_seconds.",
+        .min_bytes = "Snapshot triggers once WAL tail-bytes-from-head reach" ++
+            " this.",
+        .min_age_seconds = "Snapshot triggers when an entry is at least this" ++
+            " many seconds older than wall clock.",
+        .poll_interval_seconds = "How often the snapshot loop checks the" ++
+            " criteria.",
+        .orphan_min_age_seconds = "SST files the manifest does not know are" ++
+            " removed only once older than this and not written after the" ++
+            " snapshot; must exceed one compaction's window from first" ++
+            " output write to proposal.",
+        .orphan_scan_interval_seconds = "How often the data directory is" ++
+            " scanned for orphan SST files.",
     };
 };
 

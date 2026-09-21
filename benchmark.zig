@@ -35,12 +35,19 @@ const Args = struct {
         .clients = "Concurrent writer fiber count.",
         .records = "Records to insert during load phase.",
         .ops = "Operations per client during run phase.",
-        .read_pct = "Read percentage [0..100]: 0=write-only, 50=YCSB-A, 95=YCSB-B, 100=YCSB-C.",
+        .read_pct = "Read percentage [0..100]: 0=write-only, 50=YCSB-A," ++
+            " 95=YCSB-B, 100=YCSB-C.",
         .value_size = "Value size in bytes.",
-        .namespaces = "Spread traffic across N namespaces; each must already exist (ns create <id>). Keys hash deterministically: k → (k % namespaces) + 1.",
-        .verify_clients = "Concurrent read-verifier fibers active during load phase (0 disables).",
-        .batch_size = "Writes per set-batch proposal (1 = no batching). Higher amortizes Raft commit cost.",
-        .phase = "Which phase(s) to run: \"load\" (writes only), \"run\" (mixed read/write workload over already-loaded data), or \"both\" (load then run).",
+        .namespaces = "Spread traffic across N namespaces; each must already" ++
+            " exist (ns create <id>). Keys hash deterministically: k → (k %" ++
+            " namespaces) + 1.",
+        .verify_clients = "Concurrent read-verifier fibers active during" ++
+            " load phase (0 disables).",
+        .batch_size = "Writes per set-batch proposal (1 = no batching)." ++
+            " Higher amortizes Raft commit cost.",
+        .phase = "Which phase(s) to run: \"load\" (writes only), \"run\"" ++
+            " (mixed read/write workload over already-loaded data), or" ++
+            " \"both\" (load then run).",
     };
 };
 

@@ -448,3 +448,72 @@ test "enum field: parsed by tag name, rejects anything else" {
     try live.update("mode=false");
     try std.testing.expectEqual(.false, live.snapshot().mode);
 }
+
+/// Prose long enough to cross `help_width` however wide that is, and one
+/// word wider than it: the fixture tracks the width instead of assuming it.
+const long_prose = "wrapped text " ** (flags.help_width / "wrapped text ".len + 2);
+const long_word = "https://" ++ ("x" ** flags.help_width);
+
+const WrapCfg = struct {
+    cache_bytes: u64 = 1 << 30,
+    odd_bytes: u64 = 1500,
+    idle_seconds: u64 = 30 * 60,
+    lease_seconds: u64 = 2 * 3600,
+    tick_ms: i64 = 5000,
+    retries: u32 = 3,
+    endpoint: String = "",
+
+    pub const docs = .{
+        .self = "A module whose description is long enough that the help" ++
+            " renderer has to break it across more than one output line: " ++
+            long_prose,
+        .cache_bytes = "A byte count that is a whole number of GiB, with a" ++
+            " description that also needs wrapping to stay inside the width: " ++
+            long_prose,
+        .odd_bytes = "A byte count that is not a whole number of any unit.",
+        .idle_seconds = "A duration that is a whole number of minutes.",
+        .lease_seconds = "A duration that is a whole number of hours.",
+        .tick_ms = "A millisecond duration that is a whole number of seconds.",
+        .retries = "A plain count.",
+        .endpoint = "A word longer than the width is left whole: " ++ long_word,
+    };
+};
+
+test "writeHelp wraps at help_width and indents continuation lines" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try flags.writeHelp(WrapCfg, "wrap", &out, alloc);
+
+    var wrapped_module = false;
+    var wrapped_field = false;
+    var lines = std.mem.splitScalar(u8, out.items, '\n');
+    while (lines.next()) |line| {
+        // Only a single over-long word may pass the width.
+        if (line.len > flags.help_width) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "https://") != null);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, std.mem.trim(u8, line, " "), " ") + 1);
+        }
+        if (std.mem.startsWith(u8, line, "    ") and !std.mem.startsWith(u8, line, "     ")) wrapped_module = true;
+        if (std.mem.startsWith(u8, line, "          ")) wrapped_field = true;
+    }
+    try std.testing.expect(wrapped_module);
+    try std.testing.expect(wrapped_field);
+    // Nothing is lost in the wrap: the words of a doc string still appear in order.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "break it across") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "wrapped text wrapped text") != null);
+}
+
+test "writeHelp prints byte and duration defaults in readable units" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try flags.writeHelp(WrapCfg, "wrap", &out, alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "cache-bytes=1073741824 (u64, 1 GiB);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "odd-bytes=1500 (u64);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "idle-seconds=1800 (u64, 30 min);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "lease-seconds=7200 (u64, 2 h);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "tick-ms=5000 (duration, 5 s);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "retries=3 (u32);") != null);
+}

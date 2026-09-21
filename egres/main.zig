@@ -29,12 +29,17 @@ const ListenCfg = struct {
     offset: u16 = 0,
 
     pub const docs = .{
-        .self = "Where the server listens. raft, admin (client), and SQL ports each get +offset.",
+        .self = "Where the server listens. raft, admin (client), and SQL" ++
+            " ports each get +offset.",
         .host = "Hostname/IP to bind the raft, admin, and SQL listeners on.",
-        .raft_port = "Base port for raft peer connections. Actual port = raft_port + offset.",
-        .client_port = "Base port for the admin protocol. Actual port = client_port + offset.",
-        .sql_port = "Base port for the SQL listener (pgwire protocol). Actual port = sql_port + offset.",
-        .offset = "Added to every port. Convenient when running several servers on one host (e.g. offset=1 ⇒ raft=4211, admin=5211, sql=3211).",
+        .raft_port = "Base port for raft peer connections. Actual port =" ++
+            " raft_port + offset.",
+        .client_port = "Base port for the admin protocol. Actual port =" ++
+            " client_port + offset.",
+        .sql_port = "Base port for the SQL listener (pgwire protocol)." ++
+            " Actual port = sql_port + offset.",
+        .offset = "Added to every port. Convenient when running several" ++
+            " servers on one host: offset=1 moves every port up by one.",
     };
 };
 
@@ -51,7 +56,8 @@ const RaftCfg = struct {
         .self = "Raft identity and cluster wiring.",
         .id = "Raft node ID (required, must be > 0).",
         .cluster_id = "Cluster ID for handshake gating.",
-        .seeds = "Comma-separated raft addresses of existing peers. Empty = bootstrap as a single-node cluster.",
+        .seeds = "Comma-separated raft addresses of existing peers. Empty =" ++
+            " bootstrap as a single-node cluster.",
         .tick_ms = "Raft tick interval in milliseconds.",
     };
 };
@@ -62,13 +68,16 @@ const RaftCfg = struct {
 const DataCfg = struct {
     dir: String = "",
     wal_dir: String = "",
-    memtable_size: u64 = 0,
+    memtable_bytes: u64 = (zdb.config.Config{}).memtable_size,
 
     pub const docs = .{
-        .self = "Storage paths. WAL can live on a faster device than the LSM forest.",
+        .self = "Storage paths. WAL can live on a faster device than the LSM" ++
+            " forest.",
         .dir = "Directory holding the LSM forest. Required.",
         .wal_dir = "Directory holding the raft WAL. Empty = same as `dir`.",
-        .memtable_size = "Memtable size in bytes; 0 = zdb default (64 MiB). Small values force frequent flushes — useful for tests.",
+        .memtable_bytes = "Bytes of writes a memtable holds before it is" ++
+            " frozen and flushed. Small values force frequent flushes, useful" ++
+            " for tests.",
     };
 };
 
@@ -82,11 +91,11 @@ const CacheCfg = struct {
     block_mb: u64 = 0,
 
     pub const docs = .{
-        .self = "Cache memory. The budget is a cap, not a reservation: " ++
-            "memory is used as blocks are read.",
-        .total_mb = "All cache memory, in MiB. 0 = a quarter of host RAM " ++
-            "or of the cgroup limit, at least 64. Set it explicitly when " ++
-            "several nodes share one host.",
+        .self = "Cache memory. The budget is a cap, not a reservation:" ++
+            " memory is used as blocks are read.",
+        .total_mb = "All cache memory, in MiB. 0 = a quarter of host RAM or" ++
+            " of the cgroup limit, at least 64. Set it explicitly when" ++
+            " several nodes share one host.",
         .block_mb = "The SST block cache's share of total_mb. 0 = all of it.",
     };
 };
@@ -107,12 +116,19 @@ const StoreCfg = struct {
 
     pub const docs = .{
         .self = "Shared object store for SST distribution (multi-node).",
-        .kind = "Backend: '' (none, single-node only), 'dir' (shared write-once depot directory, e.g. an NFS mount), or 's3' (S3-compatible store; creds via AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).",
+        .kind = "Backend: '' (none, single-node only), 'dir' (shared" ++
+            " write-once depot directory, e.g. an NFS mount), or 's3'" ++
+            " (S3-compatible store; creds via" ++
+            " AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).",
         .path = "Depot directory when kind=dir.",
-        .s3_endpoint = "S3 endpoint URL: http://host[:port] or https://host[:port]. The scheme decides TLS; host may be a DNS name or IP literal. E.g. https://s3.us-east-005.backblazeb2.com or http://127.0.0.1:8333.",
+        .s3_endpoint = "S3 endpoint URL: http://host[:port] or" ++
+            " https://host[:port]. The scheme decides TLS; host may be a DNS" ++
+            " name or IP literal. E.g." ++
+            " https://s3.us-east-005.backblazeb2.com or http://127.0.0.1:8333.",
         .s3_bucket = "Bucket name when kind=s3.",
         .s3_region = "SigV4 signing region when kind=s3.",
-        .s3_prefix = "Optional key prefix inside the bucket (unreserved URI characters only).",
+        .s3_prefix = "Optional key prefix inside the bucket (unreserved URI" ++
+            " characters only).",
     };
 };
 
@@ -288,11 +304,11 @@ const WalCfg = struct {
 
     pub const docs = .{
         .self = "Raft WAL log files (see raft/diskwal.zig OpenOptions).",
-        .log_file_mib = "Log file size in MiB; a record that would cross " ++
-            "it rotates to a pre-created log file.",
-        .prezero = "Zero-fill a log file when it is created so appends " ++
-            "never grow the file: true for ext4/xfs, false for ZFS/btrfs/tmpfs, " ++
-            "auto decides by statfs.",
+        .log_file_mib = "Log file size in MiB; a record that would cross it" ++
+            " rotates to a pre-created log file.",
+        .prezero = "Zero-fill a log file when it is created so appends never" ++
+            " grow the file: true for ext4/xfs, false for ZFS/btrfs/tmpfs," ++
+            " auto decides by statfs.",
     };
 };
 
@@ -301,16 +317,15 @@ const RuntimeCfg = struct {
     poll_us: u64 = 20,
 
     pub const docs = .{
-        .self = "Fiber scheduler tunables (see zfiber runtime.zig). The " ++
-            "defaults are the measured best on a 32-thread box: pgbench " ++
-            "select-only +10% at 8 clients without lone-fiber steals, and " ++
-            "+23% at 1 and 8 clients with a 20 us poll before parking.",
-        .steal_lone = "A thief may take a worker's only ready fiber. " ++
-            "false (default): it waits for a ring of 2+, so a fiber about " ++
-            "to run on its own worker is not bounced between workers.",
-        .poll_us = "Microseconds a worker that had work within the last " ++
-            "ms polls its completion ring before blocking. 0 = block at " ++
-            "once; above ~100 the spinning starts to cost writes.",
+        .self = "Fiber scheduler tunables (see zfiber runtime.zig). The" ++
+            " defaults are the measured best on a 32-thread box (pgbench" ++
+            " select-only at 1 and 8 clients).",
+        .steal_lone = "A thief may take a worker's only ready fiber. When" ++
+            " false it waits for a ring of 2+, so a fiber about to run on" ++
+            " its own worker is not bounced between workers.",
+        .poll_us = "Microseconds a worker that had work within the last ms" ++
+            " polls its completion ring before blocking. 0 = block at once;" ++
+            " above ~100 the spinning starts to cost writes.",
     };
 };
 
@@ -530,7 +545,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // Open zdb forest.
     log.info("opening forest at {s}", .{data_cfg.dir});
     var forest_opts = zdb.config.Config{ .dir = data_cfg.dir };
-    if (data_cfg.memtable_size > 0) forest_opts.memtable_size = @intCast(data_cfg.memtable_size);
+    forest_opts.memtable_size = @intCast(data_cfg.memtable_bytes);
     var forest = try zdb.forest.Forest.open(allocator, forest_opts);
     defer {
         // Closing the forest frees every table, and a table drops its

@@ -102,7 +102,7 @@ expect "PK index name collision fails CREATE" "already exists" \
 # reach past the CREATE TABLE; the snapshot flags make the leader take
 # one within a second or two.
 stop_server
-./zig-out/bin/egres --raft="id=1" --data="dir=$DATA;memtable-size=4096" \
+./zig-out/bin/egres --raft="id=1" --data="dir=$DATA;memtable-bytes=4096" \
     --snapshot="min-bytes=1;min-age-seconds=1;poll-interval-seconds=1" \
     >"$LOG" 2>&1 &
 SERVER_PID=$!

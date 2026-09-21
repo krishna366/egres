@@ -183,6 +183,8 @@ fn isAllowedFieldType(comptime FT: type) bool {
 }
 
 fn validateShape(comptime T: type) void {
+    // The doc-string scan below walks every byte of every doc at comptime.
+    @setEvalBranchQuota(200_000);
     const info = @typeInfo(T);
     if (info != .@"struct") {
         @compileError("flags.Live requires a struct type, got " ++ @typeName(T));
@@ -214,6 +216,13 @@ fn validateShape(comptime T: type) void {
     inline for (info.@"struct".fields) |f| {
         if (!@hasField(DocsT, f.name)) {
             @compileError("flags.Live: '" ++ @typeName(T) ++ ".docs' is missing entry for field '" ++ f.name ++ "'");
+        }
+        // writeHelp prints the default from the struct itself, so a doc
+        // string that restates it can only drift from it. Any case: "0 =
+        // the default" and "false (default)" both name one.
+        if (std.ascii.indexOfIgnoreCase(@field(T.docs, f.name), "default") != null) {
+            @compileError("flags.Live: '" ++ @typeName(T) ++ ".docs." ++ f.name ++
+                "' states a default; help already prints the field's default");
         }
     }
     inline for (docs_info.@"struct".fields) |df| {
@@ -354,8 +363,13 @@ pub fn Live(comptime T: type) type {
 /// Renders a help block for one module, mirroring ristretto/z SuperFlagHelp:
 ///
 ///   <module> -- <T.docs.self>     (the "-- ..." part is omitted if absent)
-///       <field>=<default>; <field doc>
+///       <field>=<default> (<type>[, <default in human units>]); <field doc>
 ///       ...
+///
+/// Every line is wrapped at `help_width` columns; a continuation line is
+/// indented past the line it continues. The default comes from the struct's
+/// own field default, so doc strings never restate it (validateShape rejects
+/// one that does).
 pub fn writeHelp(
     comptime T: type,
     name: String,
@@ -364,27 +378,113 @@ pub fn writeHelp(
 ) Error!void {
     comptime validateShape(T);
 
-    try out.appendSlice(allocator, "  ");
-    try out.appendSlice(allocator, name);
+    var line: HelpLine = .{ .out = out, .allocator = allocator, .indent = 4 };
+    try line.start("  ");
+    try line.word(name);
     if (comptime selfDocFor(T)) |s| {
-        try out.appendSlice(allocator, " -- ");
-        try out.appendSlice(allocator, s);
+        try line.word("--");
+        try line.text(s);
     }
     try out.append(allocator, '\n');
 
     const fields = @typeInfo(T).@"struct".fields;
     const default_t: T = .{};
+    line.indent = 10;
     inline for (fields) |f| {
         const canonical = comptime comptimeCanonical(f.name);
-        try out.appendSlice(allocator, "      ");
-        try out.appendSlice(allocator, &canonical);
-        try out.append(allocator, '=');
-        try writeDefault(f.type, @field(default_t, f.name), out, allocator);
-        try out.appendSlice(allocator, " (");
-        try out.appendSlice(allocator, comptime humanType(f.type, f.name));
-        try out.appendSlice(allocator, "); ");
-        try out.appendSlice(allocator, comptime docFor(T, f.name));
+        var head: std.ArrayList(u8) = .empty;
+        defer head.deinit(allocator);
+
+        try head.appendSlice(allocator, &canonical);
+        try head.append(allocator, '=');
+        try writeDefault(f.type, @field(default_t, f.name), &head, allocator);
+        try line.start("      ");
+        try line.word(head.items);
+
+        head.clearRetainingCapacity();
+        try head.append(allocator, '(');
+        try head.appendSlice(allocator, comptime humanType(f.type, f.name));
+        try writeHumanDefault(f.type, f.name, @field(default_t, f.name), &head, allocator);
+        try head.appendSlice(allocator, ");");
+        try line.text(head.items);
+
+        try line.text(comptime docFor(T, f.name));
         try out.append(allocator, '\n');
+    }
+}
+
+/// Help output never runs past this column, except for a single word that is
+/// itself longer (a URL in a doc string).
+pub const help_width: usize = 1000;
+
+/// One logical help line being written into `out`, wrapped at `help_width`.
+const HelpLine = struct {
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    /// Spaces a continuation line starts with.
+    indent: usize,
+    /// Columns written on the current output line.
+    col: usize = 0,
+    /// Whether the next word needs a space before it.
+    spaced: bool = false,
+
+    fn start(self: *HelpLine, prefix: String) Error!void {
+        try self.out.appendSlice(self.allocator, prefix);
+        self.col = prefix.len;
+        self.spaced = false;
+    }
+
+    /// Append every space-separated word of `s`.
+    fn text(self: *HelpLine, s: String) Error!void {
+        var words = std.mem.tokenizeScalar(u8, s, ' ');
+        while (words.next()) |w| try self.word(w);
+    }
+
+    fn word(self: *HelpLine, w: String) Error!void {
+        // Columns, not bytes: doc strings carry the odd multi-byte character.
+        const width = std.unicode.utf8CountCodepoints(w) catch w.len;
+        const sep: usize = @intFromBool(self.spaced);
+        if (self.spaced and self.col + sep + width > help_width) {
+            try self.out.append(self.allocator, '\n');
+            try self.out.appendNTimes(self.allocator, ' ', self.indent);
+            self.col = self.indent;
+        } else if (self.spaced) {
+            try self.out.append(self.allocator, ' ');
+            self.col += 1;
+        }
+        try self.out.appendSlice(self.allocator, w);
+        self.col += width;
+        self.spaced = true;
+    }
+};
+
+/// For a byte count or a duration, append ", <value in a readable unit>":
+/// `min-bytes=1073741824 (u64, 1 GiB)`. The unit comes from the field name's
+/// suffix. Nothing is appended when the raw number already reads well (zero,
+/// or not a whole number of the next unit up).
+fn writeHumanDefault(
+    comptime FT: type,
+    comptime field_name: String,
+    value: FT,
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) Error!void {
+    if (@typeInfo(FT) != .int) return;
+    if (value <= 0) return;
+    const v: u64 = @intCast(value);
+    const Unit = struct { per: u64, name: String };
+    const units: []const Unit = comptime if (std.mem.endsWith(u8, field_name, "_bytes"))
+        &.{ .{ .per = 1 << 30, .name = "GiB" }, .{ .per = 1 << 20, .name = "MiB" }, .{ .per = 1 << 10, .name = "KiB" } }
+    else if (std.mem.endsWith(u8, field_name, "_seconds"))
+        &.{ .{ .per = 3600, .name = "h" }, .{ .per = 60, .name = "min" } }
+    else if (std.mem.endsWith(u8, field_name, "_ms"))
+        &.{ .{ .per = 60_000, .name = "min" }, .{ .per = 1000, .name = "s" } }
+    else
+        &.{};
+    for (units) |u| {
+        if (v % u.per != 0) continue;
+        try out.print(allocator, ", {d} {s}", .{ v / u.per, u.name });
+        return;
     }
 }
 
