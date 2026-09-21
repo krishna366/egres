@@ -740,7 +740,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         std.process.exit(1);
     }
 
-    const args = live.snapshot();
+    const args = live.cur();
     if (args.read_pct > 100) {
         std.log.err("--bench read_pct must be in [0..100]", .{});
         std.process.exit(1);

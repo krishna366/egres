@@ -56,7 +56,7 @@ for correctness runs, or when a `ReleaseFast` run crashes; see the
 top-level README) and start it on a fresh data directory:
 
     zig build -Doptimize=ReleaseFast egres
-    ./zig-out/bin/egres --raft="id=1" --data="dir=/data/egres"
+    ./zig-out/bin/egres --raft="id=1" --zdb="dir=/data/egres"
 
 Egres listens on port 3210, the database is `egres`, and TLS is not
 supported, so `sslmode=disable` is required. All three query modes

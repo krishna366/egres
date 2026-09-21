@@ -4,6 +4,7 @@ const std = @import("std");
 const utils = @import("utils");
 const String = utils.String;
 const zdb = @import("zdb");
+const flags = @import("flags");
 const vfs = zdb.vfs;
 const zroar = zdb.zroar;
 
@@ -11,6 +12,7 @@ const Key = zdb.kv.Key;
 const Item = zdb.kv.Item;
 const Meta = zdb.kv.Meta;
 const Forest = zdb.forest.Forest;
+const Config = zdb.config.Config;
 const Builder = zdb.table.builder.Builder;
 const _manifest = zdb.manifest;
 
@@ -28,6 +30,8 @@ const Fixture = struct {
     alloc: std.mem.Allocator,
     tmp: std.testing.TmpDir,
     dir: [:0]u8,
+    /// The forest reads its options through this; freed after it.
+    live: *flags.Live(Config),
     f: *Forest,
     tree_id: u64,
     /// Stands in for the raft log: every fixture step that would be its
@@ -40,12 +44,14 @@ const Fixture = struct {
             .alloc = alloc,
             .tmp = std.testing.tmpDir(.{}),
             .dir = undefined,
+            .live = undefined,
             .f = undefined,
             .tree_id = undefined,
             .next_index = 0,
         };
         self.dir = try tmpPath(alloc, &self.tmp);
-        self.f = try Forest.open(alloc, .{ .dir = self.dir });
+        self.live = try flags.Live(Config).create(alloc, .{ .dir = self.dir });
+        self.f = try Forest.open(alloc, self.live);
         self.tree_id = try self.f.createTree(ns, tid, .{ .inf = true });
         // Forest.open leaves an id-0 placeholder memtable that a swap
         // discards rather than freezes; start on a real one.
@@ -59,6 +65,7 @@ const Fixture = struct {
 
     fn teardown(self: *Fixture) void {
         self.f.close();
+        self.live.destroy();
         self.alloc.free(self.dir);
         self.tmp.cleanup();
     }

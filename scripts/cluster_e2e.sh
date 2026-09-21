@@ -51,7 +51,7 @@ start_node() {
     ./zig-out/bin/egres \
         --raft="id=$id$([ "$id" != 1 ] && echo ";seeds=127.0.0.1:4210")" \
         --listen="offset=$offset" \
-        --data="dir=$ROOT/n$id;memtable_bytes=262144" \
+        --zdb="dir=$ROOT/n$id;memtable_bytes=262144" \
         "$@" >"$LOGS/n$id.log" 2>&1 &
     PIDS+=($!)
 }
@@ -73,7 +73,8 @@ run_cluster() {
     # --- store enforcement ---------------------------------------------------
     # A seeded node refuses to start without a store.
     expect "seeded node without --store fails fast" "store is required" \
-        ./zig-out/bin/egres --raft="id=9;seeds=127.0.0.1:4210" --data="dir=$ROOT/n9"
+        ./zig-out/bin/egres --raft="id=9;seeds=127.0.0.1:4210" \
+            --zdb="dir=$ROOT/n9"
     # A storeless leader rejects joins.
     start_node 1 0
     wait_log "$LOGS/n1.log" "become-leader" || { bad "storeless node1 never led"; return; }

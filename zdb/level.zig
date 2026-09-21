@@ -133,6 +133,9 @@ pub const TableEntry = struct {
     /// (`Manifest.raftIndexOf`). L0 is ordered by it: file ids are random,
     /// so they say nothing about which table is newer.
     raft_index: u64,
+    /// The SST file's size, so a picker can weigh entries without the
+    /// table: the L0 job tests build entries with no table behind them.
+    size: u64,
     table: *Table,
 };
 
@@ -242,6 +245,7 @@ pub const Level = struct {
         try self.tables.append(self.allocator, .{
             .id = id,
             .raft_index = raft_index,
+            .size = t.fileSize(),
             .table = t,
         });
         t.incrRef();
@@ -256,6 +260,7 @@ pub const Level = struct {
         return self.deleteEntries(&.{.{
             .id = id,
             .raft_index = undefined,
+            .size = undefined,
             .table = undefined,
         }});
     }

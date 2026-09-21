@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const flags = @import("flags");
 const String = utils.String;
 const zdb = @import("zdb");
 
@@ -502,7 +503,9 @@ test "levels: open" {
     const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
+    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(0));
@@ -530,17 +533,19 @@ test "levels: pick compact level" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    // Targets cascade from `tree_split_size`; setting it to a single byte
-    // makes every level's target tiny so one table in L1 exceeds it and
-    // becomes the compaction candidate.
+    // Targets cascade from `lmax_target_bytes`; setting it to a single
+    // byte makes every level's target tiny so one table in L1 exceeds it
+    // and becomes the compaction candidate.
     const opts = config.Config{
         .dir = dir_path,
-        .tree_split_size = 1,
+        .lmax_target_bytes = 1,
     };
 
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
+    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     // Manually plant a large table in L1.
@@ -606,7 +611,9 @@ test "levels: doCompact L0 L1" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
+    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     // All three tables should be in L0 before compaction.
@@ -686,7 +693,9 @@ test "levels: doCompact L0 L1 with dest overlap" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
+    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(0));
@@ -759,7 +768,9 @@ test "levels: doCompact L1 L2" {
     const opts = config.Config{ .dir = dir_path, .max_levels = 3 };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
+    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
@@ -806,7 +817,9 @@ test "levels: get L0 shadows L1" {
     const opts = config.Config{ .dir = dir_path };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
-    const tree = try Tree.open(alloc, opts, 0, test_tree_id, &manifest, &cache);
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
+    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
     defer tree.release();
 
     // Plant in-memory tables directly into the level handlers.
@@ -913,11 +926,13 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
 const TombstoneFixture = struct {
     manifest: _manifest.Manifest,
     cache: TableCache,
+    live: flags.Live(config.Config),
     tree: *Tree,
 
     fn deinit(self: *TombstoneFixture) void {
         self.tree.release();
         self.cache.deinit();
+        self.live.deinit();
         self.manifest.deinit();
     }
 };
@@ -941,7 +956,9 @@ fn setupTombstoneTree(
     const opts = config.Config{ .dir = dir_path, .max_levels = max_levels };
     fx.cache = TableCache.init(alloc, opts.dir);
     errdefer fx.cache.deinit();
-    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.manifest, &fx.cache);
+    fx.live = flags.Live(config.Config).initFrom(alloc, opts);
+    errdefer fx.live.deinit();
+    fx.tree = try Tree.open(alloc, &fx.live, 0, tree_id, &fx.manifest, &fx.cache);
 }
 
 test "compaction: bottom level drops a tombstone below the horizon and what it shadows" {
@@ -1274,7 +1291,9 @@ fn setupTreeWithCfg(
     opts.dir = dir_path;
     fx.cache = TableCache.init(alloc, opts.dir);
     errdefer fx.cache.deinit();
-    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.manifest, &fx.cache);
+    fx.live = flags.Live(config.Config).initFrom(alloc, opts);
+    errdefer fx.live.deinit();
+    fx.tree = try Tree.open(alloc, &fx.live, 0, tree_id, &fx.manifest, &fx.cache);
 }
 
 fn encodeDelta(
@@ -1619,7 +1638,9 @@ fn setupTreeMulti(
     opts.dir = dir_path;
     fx.cache = TableCache.init(alloc, opts.dir);
     errdefer fx.cache.deinit();
-    fx.tree = try Tree.open(alloc, opts, 0, tree_id, &fx.manifest, &fx.cache);
+    fx.live = flags.Live(config.Config).initFrom(alloc, opts);
+    errdefer fx.live.deinit();
+    fx.tree = try Tree.open(alloc, &fx.live, 0, tree_id, &fx.manifest, &fx.cache);
 }
 
 test "compaction: shadowed delta chains are never re-rolled" {

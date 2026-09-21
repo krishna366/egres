@@ -15,6 +15,7 @@ const _tree = @import("tree.zig");
 const _skl = @import("skl/skiplist.zig");
 const _metrics = @import("metrics.zig");
 const zroar = @import("zroar");
+const flags = @import("flags");
 
 const Key = @import("kv.zig").Key;
 const TreeKey = @import("kv.zig").TreeKey;
@@ -28,7 +29,7 @@ const Table = _table.Table;
 const Item = _table.table.Item;
 const SkipList = _skl.SkipList;
 const Builder = _table.builder.Builder;
-const merge_iterator = _table.merge_iterator;
+const _mitr = _table.merge_iterator;
 
 /// Build the SST path for `file_id`. Filename layout is `<id:016x>.sst` —
 /// fixed-width hex, so directory listings sort by id lexicographically.
@@ -53,7 +54,7 @@ pub fn sstPath(allocator: std.mem.Allocator, dir: String, file_id: u64) ![]u8 {
 
 /// TableTrees holds the LSM trees of a single `{namespace, table_id}` table
 /// and maps a key to the tree that owns it. A table is one tree until it
-/// grows past `tree_split_size`, then splits at the primary-key median into
+/// grows past `Config.splitBytes`, then splits at the primary-key median into
 /// more trees; entries are kept sorted by range.left so we can binary-search.
 pub const TableTrees = struct {
     pub const Lock = fiber.RWMutex(.untracked);
@@ -250,51 +251,55 @@ pub const Memtables = struct {
         return self.current.memoryUsage();
     }
 
-    /// Get iterators for a scan merge: `pending` (a txn's private
-    /// write skiplist, when non-null) FIRST — src 0, the merge's
-    /// equal-key tie-break, so the txn sees its own writes — then the
-    /// active memtable, then the immutables newest-first (their
-    /// storage order). Each `skl.Iterator.init`
-    /// acquires the underlying skiplist — release happens via `deinit`
-    /// on the returned iterator (transitively from
-    /// `MergeIterator.deinit`). Doing the acquires under our shared
-    /// lock guarantees that even if a concurrent flush +
-    /// `popOldestIfMatches` releases the original ref a moment later,
-    /// the skiplist stays alive until the iterator drops its ref.
-    /// Caller frees the slice itself.
+    /// Which skiplists `getIterators` covers.
+    pub const Select = struct {
+        /// A txn's private write skiplist. It goes FIRST, as src 0, the
+        /// merge's equal-key tie-break, so the txn sees its own writes.
+        pending: ?*SkipList = null,
+        /// The active memtable, which writes still land in. A read wants
+        /// it; a flush must leave it out, so a flush's inputs are the
+        /// frozen memtables alone.
+        current: bool = true,
+    };
+
+    /// Iterators for a merge: `pending` when given, then the active
+    /// memtable when `current`, then the immutables newest-first (their
+    /// storage order). Each `skl.Iterator.init` acquires the
+    /// underlying skiplist — release happens via `deinit` on the returned
+    /// iterator (transitively from `MergeIterator.deinit`). Doing the
+    /// acquires under our shared lock guarantees that even if a
+    /// concurrent flush + `popOldestIfMatches` releases the original ref
+    /// a moment later, the skiplist stays alive until the iterator drops
+    /// its ref. Caller frees the slice itself.
     pub fn getIterators(
         self: *Memtables,
         allocator: std.mem.Allocator,
-        pending: ?*_skl.SkipList,
+        select: Select,
         limit: _skl.Iterator.Limit,
-    ) ![]merge_iterator.Iterator {
+    ) ![]_mitr.Iterator {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
 
-        const extra: usize = @intFromBool(pending != null);
-        const total = extra + 1 + self.immutables.items.len;
-        const out = try allocator.alloc(merge_iterator.Iterator, total);
-        errdefer allocator.free(out);
-
-        var made: usize = 0;
-        errdefer for (out[0..made]) |*it| it.deinit();
-        if (pending) |p| {
-            out[0] = .{
-                .skiplist = try _skl.Iterator.init(allocator, p, limit),
-            };
-            made += 1;
+        const imms = self.immutables.items;
+        var out: std.ArrayList(_mitr.Iterator) = .empty;
+        errdefer {
+            for (out.items) |*it| it.deinit();
+            out.deinit(allocator);
         }
-        out[extra] = .{
+        // Widen before adding: two `u1`s overflow at 2.
+        const extra: usize = @as(usize, @intFromBool(select.pending != null)) +
+            @intFromBool(select.current);
+        try out.ensureTotalCapacityPrecise(allocator, extra + imms.len);
+        if (select.pending) |p| out.appendAssumeCapacity(.{
+            .skiplist = try _skl.Iterator.init(allocator, p, limit),
+        });
+        if (select.current) out.appendAssumeCapacity(.{
             .skiplist = try _skl.Iterator.init(allocator, self.current, limit),
-        };
-        made += 1;
-        for (self.immutables.items, 0..) |imm, i| {
-            out[extra + 1 + i] = .{
-                .skiplist = try _skl.Iterator.init(allocator, imm, limit),
-            };
-            made += 1;
-        }
-        return out;
+        });
+        for (imms) |imm| out.appendAssumeCapacity(.{
+            .skiplist = try _skl.Iterator.init(allocator, imm, limit),
+        });
+        return out.toOwnedSlice(allocator);
     }
 
     /// id of the current memtable. 0 means the initial placeholder is still
@@ -366,17 +371,18 @@ pub const Memtables = struct {
         return self.current.raft_index;
     }
 
-    /// Drop any phantom immutables whose id is strictly less than
+    /// Release every immutable whose id is strictly less than
     /// `expected_id`, then pop+release the oldest IFF its id equals
     /// `expected_id`. No-op when the matched memtable isn't found.
     ///
-    /// Used by `applyFlush`. Three cases reflect leader/follower divergence
-    /// during recovery replay:
-    ///   - oldest.raft_index < expected_id  → phantom: flush already happened
-    ///     pre-snap on leader, SST is in snap.data, but we still have the
-    ///     local memtable (e.g., its `newMemtable` was post-snap and
-    ///     replayed, but its `flush` was pre-snap and compacted). Release
-    ///     and continue checking the next oldest.
+    /// Used by `applyFlush`. `expected_id` is the NEWEST memtable the
+    /// flush covered (`buildFlush` merges several), so:
+    ///   - oldest.raft_index < expected_id  → covered by the same flush,
+    ///     its data is in the SSTs just installed. Also the recovery
+    ///     phantom: the flush happened pre-snap on the leader, the SST is
+    ///     in snap.data, but we still have the local memtable (its
+    ///     `newMemtable` was post-snap and replayed, its `flush` was
+    ///     pre-snap and compacted). Release and check the next oldest.
     ///   - oldest.raft_index == expected_id → normal: pop and release.
     ///   - oldest.raft_index > expected_id  → flush's target memtable was popped on
     ///     the leader pre-snap and never re-created here (its `newMemtable`
@@ -393,13 +399,13 @@ pub const Memtables = struct {
             self.immutables.items[self.immutables.items.len - 1].raft_index <
                 expected_id)
         {
-            const phantom = self.immutables.pop().?;
-            log.info(
-                "popOldestIfMatches: releasing phantom immutable id={d} " ++
-                    "(expected_id={d})",
-                .{ phantom.raft_index, expected_id },
+            const last = self.immutables.pop().?;
+            log.debug(
+                "popOldestIfMatches: releasing immutable id={d} below " ++
+                    "expected_id={d}",
+                .{ last.raft_index, expected_id },
             );
-            phantom.release();
+            last.release();
         }
 
         if (self.immutables.items.len == 0) {
@@ -425,6 +431,13 @@ pub const Memtables = struct {
         imm.release();
     }
 
+    /// How many frozen memtables are waiting for a flush.
+    pub fn immutableCount(self: *Memtables) usize {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        return self.immutables.items.len;
+    }
+
     /// The oldest immutable memtable, with a ref for the caller (release
     /// when done). The ref is taken under the lock, as `getIterators`
     /// does: the apply loop's `popOldestIfMatches` may drop the list's ref
@@ -447,7 +460,11 @@ pub const Memtables = struct {
 
 pub const Forest = struct {
     allocator: std.mem.Allocator,
-    opts: _config.Config,
+    /// The options: the registered `--zdb` flag on a server. Read with
+    /// `cur()` once per flush, job or check, so an admin update reaches
+    /// the next one; the fields in `Config.fixed` never change. The
+    /// caller keeps it alive past `close`.
+    live: *flags.Live(_config.Config),
     manifest: _manifest.Manifest,
     /// One TableTrees per table, keyed by its `{namespace, table_id}` identity.
     /// The TableTreess own the live `*Tree` objects (in their sorted entries);
@@ -518,7 +535,11 @@ pub const Forest = struct {
     /// Open a forest with empty in-memory state. Persistent state is restored
     /// later via `installManifest` (called by recovery if a Raft snapshot is
     /// present); fresh starts go straight to `createTree` / Raft replay.
-    pub fn open(allocator: std.mem.Allocator, opts: _config.Config) !*Forest {
+    pub fn open(
+        allocator: std.mem.Allocator,
+        live: *flags.Live(_config.Config),
+    ) !*Forest {
+        const opts = live.cur();
         var manifest = _manifest.Manifest.init(allocator);
         errdefer manifest.deinit();
 
@@ -533,7 +554,7 @@ pub const Forest = struct {
 
         self.* = .{
             .allocator = allocator,
-            .opts = opts,
+            .live = live,
             .manifest = manifest,
             .tables = utils.SafeHashMap(TableKey, *TableTrees).init(allocator),
             .table_cache = TableCache.init(allocator, opts.dir),
@@ -602,19 +623,42 @@ pub const Forest = struct {
         try self.memtables.swapCurrentOut(log_index);
     }
 
-    /// buildFlush is Phase A of the memtable flush: iterates the oldest frozen
-    /// memtable, routes each key to its tree, builds one L0 SST per tree, and
-    /// returns the manifest changes. The caller proposes these through Raft.
+    /// buildFlush is Phase A of the memtable flush: merges every frozen
+    /// memtable waiting now, routes each key to its tree, builds one L0
+    /// SST per tree, and returns the manifest changes. The caller
+    /// proposes these through Raft. Null when nothing is waiting.
+    ///
+    /// `memtable_id` names the NEWEST memtable the flush covers. The apply
+    /// (`applyFlush` → `popOldestIfMatches`) releases that one and every
+    /// older one, which is exactly the set flushed here: memtables freeze
+    /// and flush in log order.
+    ///
+    /// Several memtables in one flush give each tree one larger table in
+    /// place of several small ones, and a key written in more than one of
+    /// them lands in that table once, with all its versions.
     pub const FlushResult = struct {
         changes: std.ArrayList(_manifest.SSTableChange),
         memtable_id: u64,
     };
 
     pub fn buildFlush(self: *Forest) !?FlushResult {
-        const mt = self.memtables.peekOldest() orelse return null;
-        defer mt.release();
-        var iter = try mt.iterator(self.allocator);
+        const opts = self.live.cur();
+        // One merge over every frozen memtable, newest first: an item is
+        // one key with every version of it across all of them, newest
+        // first. Each iterator holds its own ref on its skiplist; the
+        // merge takes them over.
+        const srcs = try self.memtables.getIterators(
+            self.allocator,
+            .{ .current = false },
+            .{},
+        );
+        defer self.allocator.free(srcs);
+        if (srcs.len == 0) return null;
+
+        const newest_id = srcs[0].skiplist.skiplist.raft_index;
+        var iter = try _mitr.MergeIterator.init(self.allocator, srcs);
         defer iter.deinit();
+        try iter.seekRange(.{}, .{});
 
         // Per-tree builders, keyed by the tree's global identity. Keys within
         // each tree are already in sorted order because the skiplist is
@@ -631,9 +675,9 @@ pub const Forest = struct {
             builders.deinit();
         }
 
-        const cfg = _table.builder.Config{
-            .target_block_size = self.opts.block_size,
-            .codec = self.opts.compression,
+        const bcfg = _table.builder.Config{
+            .target_block_size = opts.block_bytes,
+            .codec = opts.codecFor(0),
             .priority = .p0,
         };
 
@@ -660,7 +704,7 @@ pub const Forest = struct {
 
             const bld = if (builders.get(tk)) |b| b else blk: {
                 const b = try self.allocator.create(Builder);
-                b.* = Builder.init(self.allocator, cfg);
+                b.* = Builder.init(self.allocator, bcfg);
                 try builders.put(tk, b);
                 break :blk b;
             };
@@ -692,7 +736,7 @@ pub const Forest = struct {
             const file_id = self.manifest.newFileId();
             const path = try sstPath(
                 self.allocator,
-                self.opts.dir,
+                self.live.cur().dir,
                 file_id,
             );
 
@@ -711,12 +755,16 @@ pub const Forest = struct {
         if (flush_err.get()) |err| return err;
 
         // Best-effort directory sync.
-        if (self.opts.dir.len > 0) {
-            var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.opts.dir});
+        if (self.live.cur().dir.len > 0) {
+            var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.live.cur().dir});
             defer dir_sync.join();
         }
 
-        return .{ .changes = changes, .memtable_id = mt.raft_index };
+        if (srcs.len > 1) log.info(
+            "buildFlush: {d} memtables up to id={d} into {d} table(s)",
+            .{ srcs.len, newest_id, changes.items.len },
+        );
+        return .{ .changes = changes, .memtable_id = newest_id };
     }
 
     /// Writes table bytes to a new SST file, syncs, and closes.
@@ -786,7 +834,7 @@ pub const Forest = struct {
         errdefer changes.deinit(allocator);
         if (items.len == 0) return changes;
 
-        const bottom: u32 = @intCast(self.opts.max_levels - 1);
+        const bottom: u32 = @intCast(self.live.cur().max_levels - 1);
         const tk, const max_bytes = blk: {
             const tree = try self.singleTree(ns, table_id);
             defer tree.release();
@@ -805,9 +853,10 @@ pub const Forest = struct {
             g.deinit();
         }
 
+        const opts = self.live.cur();
         var bld = Builder.init(self.allocator, .{
-            .target_block_size = self.opts.block_size,
-            .codec = self.opts.compression,
+            .target_block_size = opts.block_bytes,
+            .codec = opts.codecFor(bottom),
             .priority = .p2,
         });
         defer bld.deinit();
@@ -827,8 +876,8 @@ pub const Forest = struct {
         }
         if (build_err.get()) |err| return err;
 
-        if (self.opts.dir.len > 0) {
-            var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.opts.dir});
+        if (self.live.cur().dir.len > 0) {
+            var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.live.cur().dir});
             defer dir_sync.join();
         }
         return changes;
@@ -851,7 +900,7 @@ pub const Forest = struct {
             return;
         }
         const file_id = self.manifest.newFileId();
-        const path = try sstPath(self.allocator, self.opts.dir, file_id);
+        const path = try sstPath(self.allocator, self.live.cur().dir, file_id);
         try g.spawn(.{}, writeAndSyncTable, .{
             self.allocator, tb, path, file_id, tk, lvl, err_out,
         });
@@ -1067,7 +1116,7 @@ pub const Forest = struct {
     }
 
     pub fn shouldFreeze(self: *Forest) bool {
-        return self.memtables.memoryUsage() >= self.opts.memtable_size;
+        return self.memtables.memoryUsage() >= self.live.cur().memtable_bytes;
     }
 
     /// Check if there are frozen memtables waiting to be flushed.
@@ -1081,7 +1130,7 @@ pub const Forest = struct {
     pub fn hasFile(self: *Forest, file_id: u64) bool {
         const path = sstPath(
             self.allocator,
-            self.opts.dir,
+            self.live.cur().dir,
             file_id,
         ) catch return false;
         defer self.allocator.free(path);
@@ -1127,7 +1176,7 @@ pub const Forest = struct {
         for (to_delete) |r| {
             // The table cache let go of the file when the manifest
             // unlisted it (`evictTables`); only the file is left.
-            const path = try sstPath(self.allocator, self.opts.dir, r.sst_id);
+            const path = try sstPath(self.allocator, self.live.cur().dir, r.sst_id);
             defer self.allocator.free(path);
             vfs.deleteFile(path) catch |err| switch (err) {
                 // Already gone — removeOrphans took it, or a previous
@@ -1185,7 +1234,7 @@ pub const Forest = struct {
             defer arena.deinit();
             const arloc = arena.allocator();
 
-            const entries = try vfs.listFiles(arloc, self.opts.dir, .names);
+            const entries = try vfs.listFiles(arloc, self.live.cur().dir, .names);
             break :blk try self.manifest.unknownFiles(self.allocator, entries);
         };
         defer self.allocator.free(unknowns);
@@ -1196,7 +1245,7 @@ pub const Forest = struct {
 
         var removed: usize = 0;
         for (unknowns) |id| {
-            const path = try sstPath(arloc, self.opts.dir, id);
+            const path = try sstPath(arloc, self.live.cur().dir, id);
             // Gone between the listing and here: someone else's unlink.
             const st = vfs.fileStat(path) catch continue;
             if (st.mtime_s > cutoff_s) continue;
@@ -1239,7 +1288,7 @@ pub const Forest = struct {
 
         const path = sstPath(
             self.allocator,
-            self.opts.dir,
+            self.live.cur().dir,
             file_id,
         ) catch return;
         defer self.allocator.free(path);
@@ -1356,7 +1405,7 @@ pub const Forest = struct {
     ) ?vfs.ReadResult {
         const path = sstPath(
             self.allocator,
-            self.opts.dir,
+            self.live.cur().dir,
             file_id,
         ) catch return null;
         defer self.allocator.free(path);

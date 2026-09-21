@@ -1,10 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
 const zdb = @import("zdb");
+const flags = @import("flags");
 const sql = @import("sql");
 const utils = @import("utils");
 
 const Forest = zdb.forest.Forest;
+const Config = zdb.config.Config;
 const Key = zdb.kv.Key;
 const Item = zdb.kv.Item;
 
@@ -26,7 +28,11 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     const ns: u64 = 16;
@@ -182,7 +188,11 @@ test "sql.table: load returns UndefinedTable when no catalog rows exist" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     const ns: u64 = 16;

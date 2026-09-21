@@ -166,7 +166,7 @@ def spawn_server(
         str(SERVER_BIN),
         f"--listen=raft-port={ports.raft_base}; client-port={ports.client_base}; offset={node}",
         f"--raft={raft}",
-        f"--data=dir={data_dir}",
+        f"--zdb=dir={data_dir}",
     ]
     log_file = open(log_path, "w")
     # start_new_session detaches the server into its own session so it

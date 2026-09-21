@@ -14,6 +14,8 @@ pub const Error = error{
     InvalidEnum,
     InvalidDuration,
     InvalidArgv,
+    /// A live update named a field the struct lists in `fixed`.
+    FixedOption,
 } || std.mem.Allocator.Error;
 
 const whitespace = " \t\r\n";
@@ -232,6 +234,27 @@ fn validateShape(comptime T: type) void {
                 "' has no matching field on " ++ @typeName(T));
         }
     }
+    // Optional `pub const fixed = .{ "field", ... }`: fields read once at
+    // startup. `update` refuses them and writeHelp says so; every name
+    // must be a real field.
+    if (@hasDecl(T, "fixed")) {
+        inline for (T.fixed) |name| {
+            if (!@hasField(T, name)) {
+                @compileError("flags.Live: '" ++ @typeName(T) ++ ".fixed' names '" ++
+                    name ++ "', which is not a field of " ++ @typeName(T));
+            }
+        }
+    }
+}
+
+/// Whether `field_name` is in `T.fixed`: set at startup, refused by
+/// `update`.
+fn isFixed(comptime T: type, comptime field_name: String) bool {
+    if (!@hasDecl(T, "fixed")) return false;
+    inline for (T.fixed) |name| {
+        if (std.mem.eql(u8, name, field_name)) return true;
+    }
+    return false;
 }
 
 /// Returns the doc string for `field_name`. Both T and the entry are
@@ -288,14 +311,14 @@ pub fn Live(comptime T: type) type {
         allocator: std.mem.Allocator,
         arena: std.heap.ArenaAllocator,
         mu: fiber.RWMutex(.untracked) = .{},
-        current: T = .{},
+        /// The value as of the last `update`.
+        latest: T = .{},
         version_val: u64 = 0,
 
         pub fn init(allocator: std.mem.Allocator, input: String) Error!Self {
             var self: Self = .{
                 .allocator = allocator,
                 .arena = std.heap.ArenaAllocator.init(allocator),
-                .current = .{},
             };
             errdefer self.arena.deinit();
             if (input.len > 0) {
@@ -303,10 +326,35 @@ pub fn Live(comptime T: type) type {
                 defer freeKvMap(allocator, &kv);
                 var it = kv.iterator();
                 while (it.next()) |entry| {
-                    try assignByKey(&self.current, entry.key_ptr.*, entry.value_ptr.*, self.arena.allocator());
+                    try assignByKey(&self.latest, entry.key_ptr.*, entry.value_ptr.*, self.arena.allocator());
                 }
             }
             return self;
+        }
+
+        /// A Live holding `value` as-is: for code that takes a Live but
+        /// is given a struct, such as a test opening a forest.
+        pub fn initFrom(allocator: std.mem.Allocator, value: T) Self {
+            return .{
+                .allocator = allocator,
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .latest = value,
+            };
+        }
+
+        /// `initFrom` on the heap, at an address that outlives the
+        /// caller's frame: what a Forest keeps a pointer to. `destroy`
+        /// releases it.
+        pub fn create(allocator: std.mem.Allocator, value: T) !*Self {
+            const self = try allocator.create(Self);
+            self.* = initFrom(allocator, value);
+            return self;
+        }
+
+        pub fn destroy(self: *Self) void {
+            const allocator = self.allocator;
+            self.deinit();
+            allocator.destroy(self);
         }
 
         pub fn deinit(self: *Self) void {
@@ -320,16 +368,35 @@ pub fn Live(comptime T: type) type {
             var kv = try parseFlagString(self.allocator, input);
             defer freeKvMap(self.allocator, &kv);
 
+            // A fixed field anywhere in the input refuses the whole
+            // update, before any live field in it is changed.
+            var keys = kv.keyIterator();
+            while (keys.next()) |key| {
+                if (fixedByKey(key.*)) return error.FixedOption;
+            }
+
             self.mu.lock(@src());
             defer self.mu.unlock();
 
-            var next: T = self.current;
+            var next: T = self.latest;
             var it = kv.iterator();
             while (it.next()) |entry| {
                 try assignByKey(&next, entry.key_ptr.*, entry.value_ptr.*, self.arena.allocator());
             }
-            self.current = next;
+            self.latest = next;
             self.version_val += 1;
+        }
+
+        /// Whether `key` (canonical, as parsed) names a field in `T.fixed`.
+        fn fixedByKey(key: String) bool {
+            @setEvalBranchQuota(20_000);
+            const fields = @typeInfo(T).@"struct".fields;
+            inline for (fields) |f| {
+                if (comptime !isFixed(T, f.name)) continue;
+                const canonical = comptime comptimeCanonical(f.name);
+                if (std.mem.eql(u8, &canonical, key)) return true;
+            }
+            return false;
         }
 
         pub fn version(self: *Self) u64 {
@@ -338,13 +405,20 @@ pub fn Live(comptime T: type) type {
             return self.version_val;
         }
 
-        pub fn snapshot(self: *Self) T {
+        /// The value now: one copy under the shared lock. Take it once
+        /// per unit of work, not per field. A field in `T.fixed` reads
+        /// the same at every call, since `update` refuses it.
+        pub fn cur(self: *Self) T {
             self.mu.lockShared(@src());
             defer self.mu.unlockShared();
-            return self.current;
+            return self.latest;
         }
 
         fn assignByKey(target: *T, key: String, value: String, arena: std.mem.Allocator) Error!void {
+            // One canonical name per field, computed a character at a
+            // time: a struct with a few dozen fields passes the default
+            // comptime branch budget.
+            @setEvalBranchQuota(20_000);
             const fields = @typeInfo(T).@"struct".fields;
             inline for (fields) |f| {
                 const canonical = comptime comptimeCanonical(f.name);
@@ -409,6 +483,7 @@ pub fn writeHelp(
         try line.text(head.items);
 
         try line.text(comptime docFor(T, f.name));
+        if (comptime isFixed(T, f.name)) try line.text("Fixed at startup.");
         try out.append(allocator, '\n');
     }
 }

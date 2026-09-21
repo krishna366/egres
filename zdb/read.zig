@@ -64,10 +64,11 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
     const alloc = mg.allocator;
     {
         // One usable version per key; deltas fold down to their state.
-        const srcs = try self.memtables.getIterators(alloc, mg.opts.pending, .{
-            .read_ts = mg.opts.read_ts,
-            .want = 1,
-        });
+        const srcs = try self.memtables.getIterators(
+            alloc,
+            .{ .pending = mg.opts.pending },
+            .{ .read_ts = mg.opts.read_ts, .want = 1 },
+        );
         defer {
             for (srcs) |*it| it.deinit(); // releases each source's skiplist ref
             alloc.free(srcs);
@@ -467,8 +468,9 @@ pub const MultiGet = struct {
         var pending: std.ArrayList(*Node) = .empty;
         try pending.appendSlice(arloc, run);
 
+        const max_levels = tree.live.cur().max_levels;
         var lvl = from_level;
-        while (lvl < tree.opts.max_levels) : (lvl += 1) {
+        while (lvl < max_levels) : (lvl += 1) {
             removeDone(&pending);
             const open = pending.items;
             if (open.len == 0) return;
@@ -968,7 +970,7 @@ pub const Cursor = struct {
             // src 0 — the merge's equal-key tie-break.
             const srcs = try self.forest.memtables.getIterators(
                 a,
-                self.opts.pending,
+                .{ .pending = self.opts.pending },
                 .{
                     .read_ts = self.opts.read_ts,
                     .want = self.want_versions,
@@ -1077,7 +1079,7 @@ pub fn maxKey(
     // Step 1: pin every memtable (active + immutables) — see the doc on
     // why this precedes the tree. `want = 1`: the walk needs keys, not
     // version chains.
-    const iters = try self.memtables.getIterators(allocator, null, .{ .want = 1 });
+    const iters = try self.memtables.getIterators(allocator, .{}, .{ .want = 1 });
     defer {
         for (iters) |*it| it.deinit();
         allocator.free(iters);

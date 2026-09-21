@@ -11,6 +11,7 @@ const _metrics = @import("metrics.zig");
 const _forest = @import("forest.zig");
 const zroar = @import("zroar");
 const _compaction = @import("compaction.zig");
+const flags = @import("flags");
 
 const Table = _table.Table;
 const TableIterator = _table.TableIterator;
@@ -289,7 +290,10 @@ pub const TableCache = struct {
 
 pub const Tree = struct {
     allocator: std.mem.Allocator,
-    opts: _config.Config,
+    /// The forest's options, read with `cur()` once per job, so an admin
+    /// update reaches the next one; the fields in `Config.fixed` never
+    /// change.
+    live: *flags.Live(_config.Config),
     namespace: u64,
     tree_id: u64,
     manifest: *_manifest.Manifest,
@@ -332,6 +336,8 @@ pub const Tree = struct {
     pub const doCompact = _compaction.doCompact;
     pub const Emitter = _compaction.Emitter;
     pub const buildCompaction = _compaction.buildCompaction;
+    pub const compactL0 = _compaction.compactL0;
+    pub const mergeAndWrite = _compaction.mergeAndWrite;
     pub const flushBuilderOutput = _compaction.flushBuilderOutput;
 
     pub fn acquire(self: *Tree) void {
@@ -363,12 +369,13 @@ pub const Tree = struct {
     /// publish it (`TableTrees.addTree`) before the first lock is taken.
     pub fn open(
         allocator: std.mem.Allocator,
-        opts: _config.Config,
+        live: *flags.Live(_config.Config),
         namespace: u64,
         tree_id: u64,
         manifest: *_manifest.Manifest,
         cache: *TableCache,
     ) !*Tree {
+        const opts = live.cur();
         const self = try allocator.create(Tree);
         errdefer allocator.destroy(self);
 
@@ -419,7 +426,7 @@ pub const Tree = struct {
 
         self.* = .{
             .allocator = allocator,
-            .opts = opts,
+            .live = live,
             .namespace = namespace,
             .tree_id = tree_id,
             .manifest = manifest,
@@ -650,7 +657,7 @@ pub const Tree = struct {
         // each table, skipping items[0] whose smallest is the level's
         // left boundary — using it would put nothing on the old side).
         // Bail if Lmax doesn't have enough tables for a meaningful split.
-        const lmax_idx = self.opts.max_levels - 1;
+        const lmax_idx = self.live.cur().max_levels - 1;
         var cand_keys: std.ArrayList(Key) = .empty;
         // Steps 1-2 read the level lists (keys are duped into the arena);
         // step 3 is arithmetic on the copies. No I/O anywhere, so one
@@ -805,13 +812,15 @@ pub const Tree = struct {
                     const n = needed.items[need_idx];
                     need_idx += 1;
                     std.debug.assert(c.sst_id == n.id);
-                    // A compaction or backfill output is a new file, so
-                    // the applying entry's index is exactly what the
-                    // manifest just stored for it.
+                    // A compaction output is a new file, listed under
+                    // the applying entry's index, which is exactly what
+                    // the manifest just stored for it. An L0→L0 merge's
+                    // output carries its own instead: the newest
+                    // input's, so it keeps their place in L0's order.
                     try self.levels[c.level].addEntry(
                         held,
                         n.id,
-                        index,
+                        if (c.raft_index != 0) c.raft_index else index,
                         n.table.?,
                     );
                     bytes_out += n.table.?.fileSize();
@@ -856,7 +865,7 @@ pub const Tree = struct {
         changes: []const _manifest.SSTableChange,
     ) !void {
         if (changes.len == 0) return;
-        const bottom: u32 = @intCast(self.opts.max_levels - 1);
+        const bottom: u32 = @intCast(self.live.cur().max_levels - 1);
         for (changes) |c| {
             std.debug.assert(c.op == .create);
             std.debug.assert(c.level == bottom);

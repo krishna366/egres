@@ -3,6 +3,7 @@ const fiber = @import("zfiber");
 const utils = @import("utils");
 const String = utils.String;
 const zdb = @import("zdb");
+const flags = @import("flags");
 const vfs = zdb.vfs;
 
 const Key = zdb.kv.Key;
@@ -33,6 +34,7 @@ fn treeCount(f: *Forest) usize {
 
 const _forest = zdb.forest;
 const Forest = _forest.Forest;
+const Config = zdb.config.Config;
 const TableTrees = _forest.TableTrees;
 
 const config = zdb.config;
@@ -113,7 +115,11 @@ test "forest: open close empty" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     f.close();
 }
 
@@ -128,7 +134,11 @@ test "forest: create tree and get" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     // Create a tree for namespace 1's default table (table_id 0). A fresh
@@ -177,7 +187,9 @@ test "forest: split tree" {
     // candidates from there. Install 10 single-key SSTs ("k01"…"k10")
     // directly into L3 (default max_levels=4 → lmax_idx=3) so the
     // splitter has a clean, evenly-sized Lmax to work with.
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    defer f_live.destroy();
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     // Default table (table_id 0) → derived tree_id 0.
@@ -259,7 +271,11 @@ test "forest: two-level routing isolates by table_id" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     // Three tables in namespace 2: table_id 0 (the default), 1, and 2. Each is its
@@ -325,7 +341,11 @@ test "forest: create_tree + drop_tree round-trip" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     // Create a new table (ns=2, table_id=100) via the manifest op.
@@ -382,7 +402,11 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     // Namespace 7 with five tables: the default + column + index catalogs
@@ -451,7 +475,11 @@ test "forest: drop_tree keeps an SST shared with another tree" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     // Two tables (tables 100 and 101) that share one SST file (id 1) — the
@@ -516,7 +544,11 @@ test "forest: buildCreateTables allocates and never reuses a dropped id" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     const first = _manifest.first_table_id;
@@ -555,7 +587,11 @@ test "forest: buildCreateNamespace allocates global namespace ids" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     const first = _manifest.first_namespace;
@@ -586,7 +622,11 @@ test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     const nc = try f.buildNamespaceCreate(alloc, 9, "nine");
@@ -613,7 +653,11 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     const ct = try f.buildCreateTables(alloc, 3, &.{"users"});
@@ -664,7 +708,9 @@ test "forest: snapshot manifest round-trip" {
     defer alloc.free(mk);
 
     const bytes = blk: {
-        const src = try Forest.open(alloc, .{ .dir = dir_path });
+        const src_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+        defer src_live.destroy();
+        const src = try Forest.open(alloc, src_live);
         defer src.close();
 
         // Tree in ns=42, range [a, m). Tree in ns=43, infinite. Both are the
@@ -689,7 +735,9 @@ test "forest: snapshot manifest round-trip" {
     defer alloc.free(bytes);
 
     // Phase 2: fresh forest, install snapshot, verify.
-    const dst = try Forest.open(alloc, .{ .dir = dir_path });
+    const dst_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    defer dst_live.destroy();
+    const dst = try Forest.open(alloc, dst_live);
     defer dst.close();
 
     try dst.manifest.restoreFrom(bytes);
@@ -828,7 +876,7 @@ test "forest: getIterators outlives a concurrent flush+pop" {
 
     // Snapshot under the lock — each skl.Iterator.init bumps
     // refcount before getIterators returns.
-    const iters = try mts.getIterators(alloc, null, .{});
+    const iters = try mts.getIterators(alloc, .{}, .{});
 
     // Simulate flush completion: drop M_5 from immutables (release fires
     // inside popOldestIfMatches). M_5's refcount goes from 2 → 1
@@ -869,7 +917,11 @@ test "forest: routes to correct tree" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     // Create two trees in different namespaces.
@@ -898,7 +950,11 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     const ns: u64 = 16;
@@ -941,7 +997,11 @@ test "forest: maxKey counts a tombstoned max key" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     const ns: u64 = 16;
@@ -994,7 +1054,11 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     _ = try f.createTree(1, 0, .{ .inf = true });
@@ -1085,7 +1149,11 @@ test "forest: a tombstone reads as absent" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -1139,7 +1207,11 @@ test "forest: globalMinRead rejects older reads and only moves forward" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -1234,7 +1306,11 @@ test "scan: by default emits one version per key and hides deleted keys" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1258,7 +1334,11 @@ test "scan: num_versions returns extra versions but still stops at a tombstone" 
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1289,7 +1369,11 @@ test "scan: include_deleted surfaces tombstones and the versions behind them" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1321,7 +1405,11 @@ test "scan: num_versions caps deleted runs too" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1344,7 +1432,11 @@ test "scan: num_versions 0 behaves as 1 rather than returning nothing" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1361,7 +1453,11 @@ test "scan: max_rows bounds emitted items, not versions walked" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1382,7 +1478,11 @@ test "scan: read_ts reports the world as of that timestamp" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1419,7 +1519,11 @@ test "scan: min_ts emits only what changed after it" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -1513,7 +1617,11 @@ test "scan: versions above read_ts do not consume num_versions" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1534,7 +1642,11 @@ test "scan: read_ts at the delete sees the key as gone" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1554,7 +1666,11 @@ test "scan: rejects a read_ts below globalMinRead" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1614,7 +1730,11 @@ test "cursor: agrees with scan under every option" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1643,7 +1763,11 @@ test "cursor: null is sticky and emitted counts hand-outs" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1678,7 +1802,11 @@ test "cursor: max_rows 0 opens exhausted without the min-read check" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
     _ = f.setGlobalMinRead(100);
@@ -1711,7 +1839,11 @@ test "cursor: deinit mid-walk releases the sources" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1735,7 +1867,11 @@ test "cursor: a flush between two next calls does not disturb the walk" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -1789,7 +1925,11 @@ test "cursor: pin_values holds handed-out values until releasePins" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -1906,7 +2046,11 @@ test "cursor: a split applied by another fiber mid-walk loses and repeats nothin
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     const tree_id = try seedTenKeyTable(alloc, f, dir_path);
 
@@ -1951,7 +2095,11 @@ test "split: a reader holding the old tree keeps its full range until it lets go
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     const tree_id = try seedTenKeyTable(alloc, f, dir_path);
 
@@ -1988,7 +2136,11 @@ test "cursor: hops across a split like scan does" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedSplitForest(alloc, f, dir_path);
 
@@ -2112,7 +2264,11 @@ test "forest: getBitmap folds deltas from memtable, L0, and history" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -2149,7 +2305,11 @@ test "forest: getBitmap tombstone resets, absent key is empty" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -2184,7 +2344,11 @@ test "forest: rollup is read-invariant across flush and compactions" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -2243,7 +2407,11 @@ test "forest: getBitmap rejects non-roaring chains and old reads" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -2288,7 +2456,11 @@ test "forest: index backfill installs bottom states below live deltas" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
     try f.newMemtable(1);
@@ -2375,7 +2547,11 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     _ = try f.createTree(1, 0, .{ .inf = true });
@@ -2484,7 +2660,11 @@ test "table cache: a table loaded for an install survives an evict before it is 
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     _ = try f.createTree(1, 0, .{ .inf = true });
@@ -2538,7 +2718,11 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
 
     _ = try f.createTree(1, 0, .{ .inf = true });
@@ -2640,7 +2824,11 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     var cache = try zdb.cache.ShardedCache(u128).init(alloc, 64 << 20, 4);
     defer cache.deinit();
 
-    const f = try Forest.open(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
     defer f.close();
     _ = try f.createTree(1, 0, .{ .inf = true });
 
@@ -2713,4 +2901,189 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     };
     try f.evictTables();
     try std.testing.expect(f.table_cache.contains(out_id));
+}
+
+// ---------------------------------------------------------------------------
+// Multi-memtable flush and L0→L0 merges
+// ---------------------------------------------------------------------------
+
+/// The newest value of `primary` visible at `read_ts`, checked against
+/// `want`.
+fn expectRowAt(f: *Forest, primary: String, read_ts: u64, want: String) !void {
+    const alloc = std.testing.allocator;
+    const got = try f.getRaw(alloc, .{
+        .key = .{ .namespace = 1, .table_id = 0, .primary = primary },
+        .read_ts = read_ts,
+    }) orelse return error.TestExpectedItem;
+    defer got.free(alloc);
+    try std.testing.expectEqualStrings(want, got.newest().value);
+}
+
+test "forest: one flush covers every waiting memtable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+
+    defer f_live.destroy();
+
+    const f = try Forest.open(alloc, f_live);
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+
+    // Three frozen memtables (ids 1, 2, 3); "a" is written in two of them.
+    try f.newMemtable(1);
+    try putRow(f, "a", 1, "a1");
+    try f.newMemtable(2);
+    try putRow(f, "a", 2, "a2");
+    try putRow(f, "b", 3, "b1");
+    try f.newMemtable(3);
+    try putRow(f, "c", 4, "c1");
+    try f.newMemtable(4);
+    try std.testing.expectEqual(@as(usize, 3), f.memtables.immutableCount());
+
+    var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush.changes.deinit(alloc);
+    // One table for the one tree, named after the newest memtable covered.
+    try std.testing.expectEqual(@as(usize, 1), flush.changes.items.len);
+    try std.testing.expectEqual(@as(u64, 3), flush.memtable_id);
+
+    try f.applyFlush(5, flush.changes.items, flush.memtable_id);
+    // The apply released all three, so nothing is left to flush.
+    try std.testing.expectEqual(@as(usize, 0), f.memtables.immutableCount());
+    try std.testing.expect((try f.buildFlush()) == null);
+
+    const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    defer tree.release();
+    {
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        const ents = tree.levels[0].entries(held);
+        try std.testing.expectEqual(@as(usize, 1), ents.len);
+        // Both versions of "a", and "b" and "c".
+        try std.testing.expectEqual(@as(u64, 4), ents[0].table.index.key_count);
+    }
+    try expectRowAt(f, "a", std.math.maxInt(u64), "a2");
+    try expectRowAt(f, "a", 1, "a1");
+    try expectRowAt(f, "b", std.math.maxInt(u64), "b1");
+    try expectRowAt(f, "c", std.math.maxInt(u64), "c1");
+}
+
+test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Four tables to a merge, so three ask for nothing below.
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path, .l0_merge_min_tables = 4 });
+    defer f_live.destroy();
+    const f = try Forest.open(alloc, f_live);
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+
+    // Five flushes, one small L0 table each. "k" is rewritten in every
+    // one; each flush also brings a key of its own.
+    const own = [_]String{ "r1", "r2", "r3", "r4", "r5" };
+    const vals = [_]String{ "k1", "k2", "k3", "k4", "k5" };
+    var index: u64 = 1;
+    try f.newMemtable(index);
+    for (own, vals, 0..) |own_key, val, i| {
+        try putRow(f, "k", 10 * (i + 1), val);
+        try putRow(f, own_key, 10 * (i + 1) + 1, val);
+        index += 1;
+        try f.newMemtable(index);
+        var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+        defer flush.changes.deinit(alloc);
+        index += 1;
+        try f.applyFlush(index, flush.changes.items, flush.memtable_id);
+        if (i == 2) {
+            // Three small tables: below l0_merge_min_tables, and L0 is
+            // within its bounds, so the tree asks for nothing.
+            const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+            defer tree.release();
+            try std.testing.expect(tree.compact_candidate == null);
+            var none = try tree.compactL0(0);
+            defer none.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 0), none.items.len);
+        }
+    }
+
+    const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    defer tree.release();
+
+    // Five small tables: the tree asks for an L0→L0 job.
+    const cand = tree.compact_candidate orelse return error.TestExpectedCandidate;
+    try std.testing.expectEqual(@as(u8, 0), cand.level);
+
+    var newest_index: u64 = 0;
+    {
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        const ents = tree.levels[0].entries(held);
+        try std.testing.expectEqual(@as(usize, 5), ents.len);
+        newest_index = ents[ents.len - 1].raft_index;
+    }
+
+    var merge = try tree.compactL0(0);
+    defer merge.deinit(alloc);
+    // Five L0 deletes and ONE L0 create, listed under the newest input's
+    // index so it stands where its inputs stood.
+    var n_delete: usize = 0;
+    var n_create: usize = 0;
+    for (merge.items) |c| {
+        try std.testing.expectEqual(@as(u32, 0), c.level);
+        if (c.op == .delete) n_delete += 1;
+        if (c.op == .create) {
+            n_create += 1;
+            try std.testing.expectEqual(newest_index, c.raft_index);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), n_delete);
+    try std.testing.expectEqual(@as(usize, 1), n_create);
+
+    // A flush lands between the build and the apply: newer than every
+    // input, so it must keep shadowing the merged table.
+    try putRow(f, "k", 100, "k-late");
+    index += 1;
+    try f.newMemtable(index);
+    var late = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer late.changes.deinit(alloc);
+    index += 1;
+    try f.applyFlush(index, late.changes.items, late.memtable_id);
+
+    index += 1;
+    try tree.applyCompaction(index, merge.items);
+    {
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        const ents = tree.levels[0].entries(held);
+        try std.testing.expectEqual(@as(usize, 2), ents.len);
+        // Oldest first: the merged table, then the late flush.
+        try std.testing.expectEqual(newest_index, ents[0].raft_index);
+        try std.testing.expect(ents[1].raft_index > newest_index);
+        // L1 was not touched.
+        try std.testing.expectEqual(@as(usize, 0), tree.levels[1].numTables(held));
+    }
+
+    // Reads: the late flush wins for "k"; below it, the merged table
+    // serves every version the five inputs held.
+    try expectRowAt(f, "k", std.math.maxInt(u64), "k-late");
+    try expectRowAt(f, "k", 99, "k5");
+    try expectRowAt(f, "k", 35, "k3");
+    try expectRowAt(f, "k", 10, "k1");
+    for (own, vals) |own_key, val|
+        try expectRowAt(f, own_key, std.math.maxInt(u64), val);
+
+    // The manifest stored the same index, so a restart rebuilds the
+    // same L0 order.
+    var merged_id: u64 = 0;
+    for (merge.items) |c| if (c.op == .create) {
+        merged_id = c.sst_id;
+    };
+    try std.testing.expectEqual(newest_index, f.manifest.ssts.get(merged_id).?.raft_index);
 }

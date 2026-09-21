@@ -396,7 +396,6 @@ pub const InFlight = struct {
     kind: Kind,
     tree_id: u64,
     src_level: u8 = 0,
-    dest_level: u8 = 0,
     src_tables: u32 = 0,
     /// Compaction id (`cid`) for `kind == .compaction`; 0 otherwise. Lets
     /// the watchdog log line cross-reference the per-compaction phase
@@ -676,7 +675,7 @@ pub const Engine = struct {
             return;
         };
 
-        const n_compactors = self.forest.opts.num_compactors;
+        const n_compactors = self.forest.live.cur().num_compactors;
         log.info("compaction loops started: num_compactors={d}", .{n_compactors});
 
         // All compaction loops self-exit via isShuttingDown() — no collective
@@ -735,8 +734,8 @@ pub const Engine = struct {
             for (self.in_flight.items) |it| {
                 const age_ms = now_ms - it.started_at_ms;
                 if (age_ms < stuck_threshold_ms) continue;
-                log.warn("in-flight stuck: kind={s} cid={d} tree={d} src_level={d} dest_level={d} age_ms={d}", .{
-                    @tagName(it.kind), it.cid, it.tree_id, it.src_level, it.dest_level, age_ms,
+                log.warn("in-flight stuck: kind={s} cid={d} tree={d} src_level={d} age_ms={d}", .{
+                    @tagName(it.kind), it.cid, it.tree_id, it.src_level, age_ms,
                 });
             }
         }
@@ -820,7 +819,7 @@ pub const Engine = struct {
         var swept_upto: u64 = 0;
 
         while (!self.node.isShuttingDown()) {
-            const cfg = self.snapshot_cfg.snapshot();
+            const cfg = self.snapshot_cfg.cur();
             if (self.node.shutdown.waitTimeout(cfg.poll_interval_seconds * 1000)) return;
             if (!self.node.isLeader()) continue;
 
@@ -857,7 +856,7 @@ pub const Engine = struct {
     /// proposal applies. Failure is logged and dropped: the next scan retries
     /// the whole directory.
     fn removeOrphans(self: *Engine) void {
-        const cfg = self.snapshot_cfg.snapshot();
+        const cfg = self.snapshot_cfg.cur();
         // Wall-clock seconds of the entry at the snapshot index; 0 with
         // no snapshot yet, and then nothing counts as an orphan.
         const snapshot_s = _hlc.HLC.fromU64(self.node.log.snapshot().timestamp).seconds;
@@ -946,7 +945,7 @@ pub const Engine = struct {
         const apply_cap = self.node.apply_index.load(.acquire);
 
         const wal = self.node.log;
-        const cfg = self.snapshot_cfg.snapshot();
+        const cfg = self.snapshot_cfg.cur();
         const found = wal.findIndexOlderThan(cfg.min_bytes, cfg.min_age_seconds) orelse return;
         const target = @min(@min(found, memtable_cap), apply_cap);
 
@@ -1046,7 +1045,7 @@ pub const Engine = struct {
 
     /// Single-purpose loop: when leader, propose a `newMemtable` whenever
     /// either (a) the placeholder is still current (id == 0) or (b) the
-    /// active memtable has hit `memtable_size`. Bootstrap and steady-state
+    /// active memtable has hit `memtable_bytes`. Bootstrap and steady-state
     /// freeze fall out of the same condition, so there's no separate
     /// startup phase.
     fn runMemtableLoop(self: *Engine) void {
@@ -1065,17 +1064,36 @@ pub const Engine = struct {
         }
     }
 
+    /// Leader-only. A flush covers every frozen memtable waiting at that
+    /// moment (`Forest.buildFlush`), so holding off lets them accumulate:
+    /// each tree gets one larger L0 table in place of several small ones.
+    /// Flush when `flush_min_memtables` are waiting, or when
+    /// `flush_max_age_seconds` have passed since the last flush and at
+    /// least one is. The first flush after start never waits.
     fn runFlushLoop(self: *Engine) void {
         const interval: u64 = 200;
+        var last_flush_ms: ?i64 = null;
         while (!self.node.isShuttingDown()) {
-            if (!self.node.isLeader() or !self.forest.hasFrozenMemtables()) {
+            if (!self.node.isLeader() or !self.flushDue(last_flush_ms)) {
                 if (self.node.shutdown.waitTimeout(interval)) return;
                 continue;
             }
             self.proposeFlush() catch |err| {
                 log.err("proposeFlush failed: {s}", .{@errorName(err)});
             };
+            last_flush_ms = fiber.coarseMs();
         }
+    }
+
+    fn flushDue(self: *Engine, last_flush_ms: ?i64) bool {
+        const opts = self.forest.live.cur();
+        const waiting = self.forest.memtables.immutableCount();
+        if (waiting == 0) return false;
+        if (waiting >= opts.flush_min_memtables) return true;
+
+        const last = last_flush_ms orelse return true;
+        const max_age_ms: i64 = @as(i64, opts.flush_max_age_seconds) * 1000;
+        return fiber.coarseMs() - last >= max_age_ms;
     }
 
     // TODO: This work can be done by a follower instead of the leader. Leader
@@ -1101,8 +1119,9 @@ pub const Engine = struct {
                 continue;
             };
             defer self.releaseCompactingTree(target.key);
-            // The candidate carries `needs_split=true` when the tree's
-            // Lmax has outgrown the split threshold. updateCompactCandidate
+            // The candidate carries `needs_split=true` when the tree has
+            // outgrown `Config.splitBytes`, its Lmax target plus the
+            // levels above it. updateCompactCandidate
             // sets this in the apply path (after every compaction/flush),
             // so the dispatch here always reflects the latest applied
             // state — no separate polling for splits is needed.
@@ -1166,16 +1185,14 @@ pub const Engine = struct {
             .kind = .compaction,
             .tree_id = target.key.tree_id,
             .src_level = @intCast(target.candidate.level),
-            .dest_level = @intCast(@as(usize, target.candidate.level) + 1),
             .cid = cid,
             .started_at_ms = fiber.coarseMs(),
         });
         defer self.removeInFlight(.compaction, target.key.tree_id, @intCast(target.candidate.level));
 
         const src = target.candidate.level;
-        const dst: usize = @as(usize, src) + 1;
         const t0 = fiber.coarseMs();
-        log.info("compact cid={d} start tree={d} L{d}->L{d}", .{ cid, target.key.tree_id, src, dst });
+        log.info("compact cid={d} start tree={d} L{d}", .{ cid, target.key.tree_id, src });
 
         // Resolve the tree now, by id: the target is an identity, and the
         // tree it named may have been split or dropped since the pick —
@@ -1185,12 +1202,19 @@ pub const Engine = struct {
             return;
         };
         defer tree.release();
-        var changes = try tree.buildCompaction(
-            src,
-            self.forest.globalMinRead(),
-        );
+        // L0 decides at build time whether it merges within itself or
+        // pushes into L1.
+        var changes = if (src == 0)
+            try tree.compactL0(self.forest.globalMinRead())
+        else
+            try tree.buildCompaction(src, self.forest.globalMinRead());
         defer changes.deinit(self.allocator);
+
         if (changes.items.len == 0) {
+            // The candidate went stale between the pick and the build
+            // (a flush changed which L0 run is worth merging). Refresh
+            // it so the next pick sees what the tree needs now.
+            tree.updateCompactCandidate() catch {};
             log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});
             return;
         }
@@ -1315,8 +1339,7 @@ pub const Engine = struct {
     /// namespace doesn't stall writes to other namespaces on the same node.
     /// See `Options.l0_backpressure_start_count` etc. for the curve.
     pub fn applyWriteBackpressure(self: *Engine, ns: u32) void {
-        const opts = self.forest.opts;
-        if (opts.l0_backpressure_start_count == 0) return;
+        const opts = self.forest.live.cur();
         const l0 = self.forest.maxL0TableCountForNs(ns);
         if (l0 <= opts.l0_backpressure_start_count) return;
         const excess: u64 = l0 - opts.l0_backpressure_start_count;
@@ -1347,8 +1370,8 @@ pub const Engine = struct {
             const age_ms = now - it.started_at_ms;
             switch (it.kind) {
                 .compaction => try w.print(
-                    "    compaction tree={d} L{d}->L{d} age_ms={d}\n",
-                    .{ it.tree_id, it.src_level, it.dest_level, age_ms },
+                    "    compaction tree={d} L{d} age_ms={d}\n",
+                    .{ it.tree_id, it.src_level, age_ms },
                 ),
                 .flush => try w.print("    flush age_ms={d}\n", .{age_ms}),
                 .split => try w.print("    split tree={d} age_ms={d}\n", .{ it.tree_id, age_ms }),

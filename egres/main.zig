@@ -62,25 +62,6 @@ const RaftCfg = struct {
     };
 };
 
-/// `--data` — on-disk locations. `dir` is required; `wal_dir` defaults to
-/// `dir` if empty (single-disk setup) but can be pointed at a faster
-/// device (e.g. NVMe) for write-ahead log throughput.
-const DataCfg = struct {
-    dir: String = "",
-    wal_dir: String = "",
-    memtable_bytes: u64 = (zdb.config.Config{}).memtable_size,
-
-    pub const docs = .{
-        .self = "Storage paths. WAL can live on a faster device than the LSM" ++
-            " forest.",
-        .dir = "Directory holding the LSM forest. Required.",
-        .wal_dir = "Directory holding the raft WAL. Empty = same as `dir`.",
-        .memtable_bytes = "Bytes of writes a memtable holds before it is" ++
-            " frozen and flushed. Small values force frequent flushes, useful" ++
-            " for tests.",
-    };
-};
-
 /// `--cache` — the memory Egres may hold in caches. `total_mb` is the
 /// budget for all of them; `block_mb` the share for SST blocks, today
 /// the only user. Both default to auto: total = a quarter of the memory
@@ -226,7 +207,7 @@ fn deinitWithLog(comptime msg: String, ptr: anytype) void {
 const Args = struct {
     listen: ListenCfg,
     raft: RaftCfg,
-    data: DataCfg,
+    data: zdb.config.Config,
     raft_addr: String,
     client_addr: String,
     seeds: []const String,
@@ -295,15 +276,20 @@ fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const String) void {
 
 /// Scheduler knobs for A/B runs; the defaults are the measured-best
 /// settings. See zfiber.Runtime.steal_lone / prepark_poll_us.
-/// `--wal` — raft WAL log file layout. The defaults suit a local SSD on
-/// any filesystem: `prezero=auto` zero-fills log files on ext4 and xfs
-/// and skips it on ZFS, btrfs and tmpfs.
+/// `--wal` — where the raft WAL lives and how its log files are laid
+/// out. `dir` defaults to the data dir; point it at a faster device for
+/// write-ahead throughput. The layout defaults suit a local SSD on any
+/// filesystem: `prezero=auto` zero-fills log files on ext4 and xfs and
+/// skips it on ZFS, btrfs and tmpfs.
 const WalCfg = struct {
+    dir: String = "",
     log_file_mib: u64 = 256,
     prezero: raft.diskwal.Prezero = .auto,
 
     pub const docs = .{
-        .self = "Raft WAL log files (see raft/diskwal.zig OpenOptions).",
+        .self = "Raft WAL location and log files (see raft/diskwal.zig" ++
+            " OpenOptions).",
+        .dir = "Directory holding the raft WAL. Empty = the data dir.",
         .log_file_mib = "Log file size in MiB; a record that would cross it" ++
             " rotates to a pre-created log file.",
         .prezero = "Zero-fill a log file when it is created so appends never" ++
@@ -334,7 +320,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     defer flags.deinitGlobal();
     const live_listen = try flags.g().register("listen", ListenCfg);
     const live_raft = try flags.g().register("raft", RaftCfg);
-    const live_data = try flags.g().register("data", DataCfg);
+    const live_zdb = try flags.g().register("zdb", zdb.config.Config);
     const live_store = try flags.g().register("store", StoreCfg);
     const live_cache = try flags.g().register("cache", CacheCfg);
     const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
@@ -359,25 +345,29 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         std.process.exit(1);
     };
     if (leftover.items.len != 0) {
-        std.log.err("unexpected positional '{s}' — config goes through --listen/--raft/--data flags", .{leftover.items[0]});
+        std.log.err(
+            "unexpected positional '{s}' — config goes through" ++
+                " --listen/--raft/--zdb flags",
+            .{leftover.items[0]},
+        );
         usage(allocator);
         std.process.exit(1);
     }
 
-    const listen = live_listen.snapshot();
-    const raft_cfg = live_raft.snapshot();
-    const data_cfg = live_data.snapshot();
-    const store_cfg = live_store.snapshot();
-    const cache_cfg = live_cache.snapshot();
-    const runtime_cfg = live_runtime.snapshot();
-    const wal_cfg = live_wal.snapshot();
-    const io_cfg = live_io.snapshot();
+    const listen = live_listen.cur();
+    const raft_cfg = live_raft.cur();
+    const zdb_cfg = live_zdb.cur();
+    const store_cfg = live_store.cur();
+    const cache_cfg = live_cache.cur();
+    const runtime_cfg = live_runtime.cur();
+    const wal_cfg = live_wal.cur();
+    const io_cfg = live_io.cur();
     // Scheduler tunables: the runtime is already up (main), so set them
     // on it directly, before any listener spawns a connection fiber.
     fiber.runtime().steal_lone = runtime_cfg.steal_lone;
     fiber.runtime().prepark_poll_us = runtime_cfg.poll_us;
-    if (raft_cfg.id == 0 or data_cfg.dir.len == 0) {
-        std.log.err("--raft requires id (>0); --data requires dir", .{});
+    if (raft_cfg.id == 0 or zdb_cfg.dir.len == 0) {
+        std.log.err("--raft requires id (>0); --zdb requires dir", .{});
         usage(allocator);
         std.process.exit(1);
     }
@@ -415,16 +405,16 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const sql_addr = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ listen.host, listen.sql_port + listen.offset });
     defer allocator.free(sql_addr);
 
-    // wal_dir defaults to data dir when empty — the common single-disk
-    // case. Setting it lets you put WAL on a faster device than the LSM.
-    const wal_dir = if (data_cfg.wal_dir.len > 0) data_cfg.wal_dir else data_cfg.dir;
+    // The WAL dir defaults to the data dir, the common single-disk case.
+    // Setting it puts the WAL on a faster device than the LSM.
+    const wal_dir = if (wal_cfg.dir.len > 0) wal_cfg.dir else zdb_cfg.dir;
 
     const seeds = try parseSeedList(raft_cfg.seeds, allocator);
     defer allocator.free(seeds);
     const args: Args = .{
         .listen = listen,
         .raft = raft_cfg,
-        .data = data_cfg,
+        .data = zdb_cfg,
         .raft_addr = raft_addr,
         .client_addr = client_addr,
         .seeds = seeds,
@@ -435,11 +425,11 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // pins it. The probe runs before the limiter exists (its own reads
     // and writes must not be throttled) and before anything else
     // touches the device.
-    const bw_config = try zdb.vfs.calibrate.bwConfig(allocator, io_cfg, data_cfg.dir);
+    const bw_config = try zdb.vfs.calibrate.bwConfig(allocator, io_cfg, zdb_cfg.dir);
     zdb.vfs.VFS.initGlobal(bw_config);
 
     log.info("starting egres id={d} cluster={d} raft={s} admin={s} sql={s} dir={s} wal={s} tick={d}ms seeds={d}", .{
-        raft_cfg.id, raft_cfg.cluster_id, raft_addr, client_addr, sql_addr, data_cfg.dir, wal_dir, raft_cfg.tick_ms, seeds.len,
+        raft_cfg.id, raft_cfg.cluster_id, raft_addr, client_addr, sql_addr, zdb_cfg.dir, wal_dir, raft_cfg.tick_ms, seeds.len,
     });
 
     // The shared object store (SST distribution). `.none` on single node.
@@ -461,8 +451,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // Size the future read-lookahead to this endpoint's latency knee.
     // Non-fatal: a probe hiccup shouldn't block boot; lookahead stays 0.
     if (store != .none) {
-        const block_size = (zdb.config.Config{}).block_size;
-        _ = store.calibrateLookahead(block_size) catch |err| {
+        _ = store.calibrateLookahead(zdb_cfg.block_bytes) catch |err| {
             log.warn("store lookahead calibration failed: {s}", .{@errorName(err)});
         };
     }
@@ -543,10 +532,12 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     );
 
     // Open zdb forest.
-    log.info("opening forest at {s}", .{data_cfg.dir});
-    var forest_opts = zdb.config.Config{ .dir = data_cfg.dir };
-    forest_opts.memtable_size = @intCast(data_cfg.memtable_bytes);
-    var forest = try zdb.forest.Forest.open(allocator, forest_opts);
+    log.info("opening forest at {s}", .{zdb_cfg.dir});
+    zdb_cfg.validate() catch |err| {
+        std.log.err("--zdb: invalid storage options: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    var forest = try zdb.forest.Forest.open(allocator, live_zdb);
     defer {
         // Closing the forest frees every table, and a table drops its
         // blocks from the block cache as it goes. The whole cache is

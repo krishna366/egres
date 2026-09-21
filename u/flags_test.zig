@@ -37,7 +37,7 @@ test "init with empty input uses defaults" {
     const alloc = std.testing.allocator;
     var live = try flags.Live(RaftCfg).init(alloc, "");
     defer live.deinit();
-    const c = live.snapshot();
+    const c = live.cur();
     try std.testing.expectEqualStrings("default", c.name);
     try std.testing.expectEqual(@as(u32, 3), c.retries);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), c.ratio, 1e-9);
@@ -49,7 +49,7 @@ test "init applies partial overrides" {
     const alloc = std.testing.allocator;
     var live = try flags.Live(RaftCfg).init(alloc, "retries=5;");
     defer live.deinit();
-    const c = live.snapshot();
+    const c = live.cur();
     try std.testing.expectEqual(@as(u32, 5), c.retries);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), c.ratio, 1e-9);
 }
@@ -59,7 +59,7 @@ test "update merges, leaves unspecified fields alone" {
     var live = try flags.Live(RaftCfg).init(alloc, "retries=5; ratio=0.9;");
     defer live.deinit();
     try live.update("tracing=true;");
-    const c = live.snapshot();
+    const c = live.cur();
     try std.testing.expectEqual(@as(u32, 5), c.retries);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), c.ratio, 1e-9);
     try std.testing.expect(c.tracing);
@@ -71,7 +71,7 @@ test "update rejects unknown key, leaves state intact" {
     defer live.deinit();
     const v_before = live.version();
     try std.testing.expectError(error.UnknownOption, live.update("mystery=1;"));
-    const c = live.snapshot();
+    const c = live.cur();
     try std.testing.expectEqual(@as(u32, 5), c.retries);
     try std.testing.expectEqual(v_before, live.version());
 }
@@ -81,37 +81,37 @@ test "update rejects malformed value, leaves state intact" {
     var live = try flags.Live(RaftCfg).init(alloc, "retries=5;");
     defer live.deinit();
     try std.testing.expectError(error.InvalidInt, live.update("retries=abc;"));
-    try std.testing.expectEqual(@as(u32, 5), live.snapshot().retries);
+    try std.testing.expectEqual(@as(u32, 5), live.cur().retries);
 }
 
 test "string field arena lifetime survives later updates" {
     const alloc = std.testing.allocator;
     var live = try flags.Live(RaftCfg).init(alloc, "name=first;");
     defer live.deinit();
-    const snap1 = live.snapshot();
+    const snap1 = live.cur();
     try std.testing.expectEqualStrings("first", snap1.name);
 
     try live.update("name=second;");
     try live.update("name=third;");
     // snap1 still references the original arena slice; it must still equal "first".
     try std.testing.expectEqualStrings("first", snap1.name);
-    try std.testing.expectEqualStrings("third", live.snapshot().name);
+    try std.testing.expectEqualStrings("third", live.cur().name);
 }
 
 test "_ms duration field accepts unit notation" {
     const alloc = std.testing.allocator;
     var live = try flags.Live(RaftCfg).init(alloc, "tick-interval-ms=500ms;");
     defer live.deinit();
-    try std.testing.expectEqual(@as(u32, 500), live.snapshot().tick_interval_ms);
+    try std.testing.expectEqual(@as(u32, 500), live.cur().tick_interval_ms);
 
     try live.update("tick-interval-ms=2s;");
-    try std.testing.expectEqual(@as(u32, 2000), live.snapshot().tick_interval_ms);
+    try std.testing.expectEqual(@as(u32, 2000), live.cur().tick_interval_ms);
 
     try live.update("tick-interval-ms=1h;");
-    try std.testing.expectEqual(@as(u32, 3_600_000), live.snapshot().tick_interval_ms);
+    try std.testing.expectEqual(@as(u32, 3_600_000), live.cur().tick_interval_ms);
 
     try live.update("tick-interval-ms=42;");
-    try std.testing.expectEqual(@as(u32, 42), live.snapshot().tick_interval_ms);
+    try std.testing.expectEqual(@as(u32, 42), live.cur().tick_interval_ms);
 }
 
 test "bool accepts short and long forms (case-insensitive)" {
@@ -123,14 +123,14 @@ test "bool accepts short and long forms (case-insensitive)" {
         defer alloc.free(opt);
         var live = try flags.Live(RaftCfg).init(alloc, opt);
         defer live.deinit();
-        try std.testing.expect(live.snapshot().tracing);
+        try std.testing.expect(live.cur().tracing);
     }
     for (falses) |v| {
         const opt = try std.fmt.allocPrint(alloc, "tracing={s};", .{v});
         defer alloc.free(opt);
         var live = try flags.Live(RaftCfg).init(alloc, opt);
         defer live.deinit();
-        try std.testing.expect(!live.snapshot().tracing);
+        try std.testing.expect(!live.cur().tracing);
     }
     var bad = try flags.Live(RaftCfg).init(alloc, "");
     defer bad.deinit();
@@ -148,7 +148,7 @@ test "key name mapping accepts all reasonable variants" {
     for (variants) |v| {
         var live = try flags.Live(RaftCfg).init(alloc, v);
         defer live.deinit();
-        try std.testing.expectEqual(@as(u32, 42), live.snapshot().tick_interval_ms);
+        try std.testing.expectEqual(@as(u32, 42), live.cur().tick_interval_ms);
     }
 }
 
@@ -185,7 +185,7 @@ const ConcurrentCtx = struct {
 /// finished so fast the readers never observed anything).
 fn readerLoop(ctx: ConcurrentCtx) void {
     while (!ctx.stop.load(.acquire)) {
-        const c = ctx.live.snapshot();
+        const c = ctx.live.cur();
         // Skip the initial "initial" value the test sets at init time —
         // we only validate the writer's "v{N}" encoding.
         if (c.name.len >= 2 and c.name[0] == 'v') {
@@ -262,10 +262,10 @@ test "registry: register returns Live pointer; dispatch routes to it" {
     try reg.update("raft", "tracing=true; retries=7;");
     try reg.update("net", "enable-tls=true;");
 
-    try std.testing.expect(raft.snapshot().tracing);
-    try std.testing.expectEqual(@as(u32, 7), raft.snapshot().retries);
-    try std.testing.expect(net.snapshot().enable_tls);
-    try std.testing.expectEqualStrings(":9000", net.snapshot().listen_addr);
+    try std.testing.expect(raft.cur().tracing);
+    try std.testing.expectEqual(@as(u32, 7), raft.cur().retries);
+    try std.testing.expect(net.cur().enable_tls);
+    try std.testing.expectEqualStrings(":9000", net.cur().listen_addr);
 }
 
 test "registry: duplicate name rejected" {
@@ -282,7 +282,7 @@ test "registry: unknown module returns error" {
     defer reg.deinit();
     const raft = try reg.register("raft", RaftCfg);
     try std.testing.expectError(error.UnknownModule, reg.update("ghost", "x=1;"));
-    try std.testing.expectEqual(@as(u32, 3), raft.snapshot().retries);
+    try std.testing.expectEqual(@as(u32, 3), raft.cur().retries);
 }
 
 test "registry: module name normalization" {
@@ -292,11 +292,11 @@ test "registry: module name normalization" {
     const raft = try reg.register("My_Module", RaftCfg);
 
     try reg.update("my-module", "retries=1;");
-    try std.testing.expectEqual(@as(u32, 1), raft.snapshot().retries);
+    try std.testing.expectEqual(@as(u32, 1), raft.cur().retries);
     try reg.update("MY_MODULE", "retries=2;");
-    try std.testing.expectEqual(@as(u32, 2), raft.snapshot().retries);
+    try std.testing.expectEqual(@as(u32, 2), raft.cur().retries);
     try reg.update("My-Module", "retries=3;");
-    try std.testing.expectEqual(@as(u32, 3), raft.snapshot().retries);
+    try std.testing.expectEqual(@as(u32, 3), raft.cur().retries);
 }
 
 test "registry: parseArgv happy path" {
@@ -315,8 +315,8 @@ test "registry: parseArgv happy path" {
         "data.db",
     };
     try reg.parseArgv(&argv, &leftover);
-    try std.testing.expectEqual(@as(u32, 7), raft.snapshot().retries);
-    try std.testing.expectEqualStrings(":8080", net.snapshot().listen_addr);
+    try std.testing.expectEqual(@as(u32, 7), raft.cur().retries);
+    try std.testing.expectEqualStrings(":8080", net.cur().listen_addr);
     try std.testing.expectEqual(@as(usize, 1), leftover.items.len);
     try std.testing.expectEqualStrings("data.db", leftover.items[0]);
 }
@@ -336,10 +336,10 @@ test "registry: parseArgv strips surviving outer quotes from payload" {
         "'listen-addr=:8080; enable-tls=true'",
     };
     try reg.parseArgv(&argv, &leftover);
-    try std.testing.expectEqual(@as(u32, 7), raft.snapshot().retries);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.6), raft.snapshot().ratio, 1e-9);
-    try std.testing.expectEqualStrings(":8080", net.snapshot().listen_addr);
-    try std.testing.expect(net.snapshot().enable_tls);
+    try std.testing.expectEqual(@as(u32, 7), raft.cur().retries);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), raft.cur().ratio, 1e-9);
+    try std.testing.expectEqualStrings(":8080", net.cur().listen_addr);
+    try std.testing.expect(net.cur().enable_tls);
 }
 
 test "registry: parseArgv unknown module" {
@@ -352,7 +352,7 @@ test "registry: parseArgv unknown module" {
     defer leftover.deinit(alloc);
     const argv = [_]String{ "--ghost=x=1;", "--raft=retries=2;" };
     try std.testing.expectError(error.UnknownModule, reg.parseArgv(&argv, &leftover));
-    try std.testing.expectEqual(@as(u32, 3), raft.snapshot().retries);
+    try std.testing.expectEqual(@as(u32, 3), raft.cur().retries);
 }
 
 test "registry: writeHelpAll renders both modules with their docs" {
@@ -384,7 +384,7 @@ test "global registry: initGlobal / g() / deinitGlobal" {
 
     const raft = try flags.g().register("raft", RaftCfg);
     try flags.g().update("raft", "retries=42;");
-    try std.testing.expectEqual(@as(u32, 42), raft.snapshot().retries);
+    try std.testing.expectEqual(@as(u32, 42), raft.cur().retries);
 }
 
 const MultiUpdaterCtx = struct {
@@ -437,16 +437,16 @@ test "enum field: parsed by tag name, rejects anything else" {
     const alloc = std.testing.allocator;
     var live = try flags.Live(ModeCfg).init(alloc, "");
     defer live.deinit();
-    try std.testing.expectEqual(.auto, live.snapshot().mode);
+    try std.testing.expectEqual(.auto, live.cur().mode);
     try live.update("mode=off");
-    try std.testing.expectEqual(.off, live.snapshot().mode);
+    try std.testing.expectEqual(.off, live.cur().mode);
     try std.testing.expectError(error.InvalidEnum, live.update("mode=maybe"));
-    try std.testing.expectEqual(.off, live.snapshot().mode);
+    try std.testing.expectEqual(.off, live.cur().mode);
     // `true` and `false` are ordinary tags when the enum declares them.
     try live.update("mode=true");
-    try std.testing.expectEqual(.true, live.snapshot().mode);
+    try std.testing.expectEqual(.true, live.cur().mode);
     try live.update("mode=false");
-    try std.testing.expectEqual(.false, live.snapshot().mode);
+    try std.testing.expectEqual(.false, live.cur().mode);
 }
 
 /// Prose long enough to cross `help_width` however wide that is, and one
@@ -516,4 +516,57 @@ test "writeHelp prints byte and duration defaults in readable units" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "lease-seconds=7200 (u64, 2 h);") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "tick-ms=5000 (duration, 5 s);") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "retries=3 (u32);") != null);
+}
+
+const FixedCfg = struct {
+    dir: String = "",
+    workers: u8 = 2,
+    poll_ms: u32 = 50,
+
+    pub const docs = .{
+        .dir = "Where the files live.",
+        .workers = "Worker fibers spawned at start.",
+        .poll_ms = "How often the loop wakes.",
+    };
+    pub const fixed = .{ "dir", "workers" };
+};
+
+test "fixed fields: set at init, refused by update, whole update dropped" {
+    const alloc = std.testing.allocator;
+    var live = try flags.Live(FixedCfg).init(alloc, "dir=/d;workers=4;poll_ms=10");
+    defer live.deinit();
+    try std.testing.expectEqualStrings("/d", live.cur().dir);
+    try std.testing.expectEqual(@as(u8, 4), live.cur().workers);
+
+    try std.testing.expectError(error.FixedOption, live.update("workers=8"));
+    try std.testing.expectError(error.FixedOption, live.update("dir=/e"));
+    // A live field in the same input is not applied either.
+    try std.testing.expectError(error.FixedOption, live.update("poll_ms=99;workers=8"));
+    try std.testing.expectEqual(@as(u8, 4), live.cur().workers);
+    try std.testing.expectEqual(@as(u32, 10), live.cur().poll_ms);
+
+    try live.update("poll_ms=99");
+    try std.testing.expectEqual(@as(u32, 99), live.cur().poll_ms);
+}
+
+test "writeHelp marks fixed fields" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try flags.writeHelp(FixedCfg, "fx", &out, alloc);
+
+    var lines = std.mem.splitScalar(u8, out.items, '\n');
+    var seen: u8 = 0;
+    while (lines.next()) |line| {
+        const fixed = std.mem.indexOf(u8, line, "Fixed at startup.") != null;
+        if (std.mem.indexOf(u8, line, "dir=") != null or
+            std.mem.indexOf(u8, line, "workers=") != null)
+        {
+            try std.testing.expect(fixed);
+            seen += 1;
+        } else {
+            try std.testing.expect(!fixed);
+        }
+    }
+    try std.testing.expectEqual(@as(u8, 2), seen);
 }

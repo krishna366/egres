@@ -55,7 +55,7 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
     }
 
     // Per-level aggregate (sum + max-with-tree).
-    const max_levels = self.opts.max_levels;
+    const max_levels = self.live.cur().max_levels;
     const Agg = struct {
         tables_total: u64 = 0,
         tables_max: u64 = 0,

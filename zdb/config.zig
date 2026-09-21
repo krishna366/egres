@@ -5,10 +5,11 @@ const String = utils.String;
 pub const Error = error{
     InvalidNumCompactors,
     InvalidMemtableSize,
-    InvalidNumMemtables,
     InvalidBlockSize,
     InvalidMaxLevels,
     InvalidDirForInMemory,
+    InvalidL0MergeMinTables,
+    InvalidL0BackpressureStartCount,
 };
 
 pub const Config = struct {
@@ -16,31 +17,42 @@ pub const Config = struct {
     in_memory: bool = false,
     read_only: bool = false,
 
-    memtable_size: usize = 64 * 1024 * 1024,
-    num_memtables: u32 = 15,
+    memtable_bytes: usize = 64 * 1024 * 1024,
 
-    block_size: usize = 64 * 1024,
-    compression: utils.compression.Codec = .lz4,
+    // When the leader flushes. A flush merges every immutable memtable
+    // waiting at that moment into one L0 table per tree (RocksDB's
+    // `min_write_buffer_number_to_merge`): fewer and larger L0 tables, and
+    // a key rewritten across those memtables reaches disk once. The flush
+    // loop fires when `flush_min_memtables` immutables have accumulated,
+    // or when `flush_max_age_seconds` have passed since the last flush
+    // and at least one is waiting, whichever comes first. 1 and 0 give
+    // the old behaviour: flush each memtable as soon as it is frozen.
+    flush_min_memtables: u32 = 4,
+    flush_max_age_seconds: u32 = 30,
+
+    block_bytes: usize = 64 * 1024,
     num_compactors: u8 = 2,
 
-    // Level sizes. Lmax target is derived from `tree_split_size`; upper
+    // Level sizes. `lmax_target_bytes` is the bottom level's target; upper
     // levels cascade by dividing by `level_size_multiplier`. There is no
-    // separate base-level-size knob — every tree caps at the split size.
+    // separate base-level-size knob. A tree splits once it holds five
+    // fourths of the Lmax target in total (`splitBytes`): the upper
+    // levels add about a quarter, so that is a tree whose Lmax is full.
     level_size_multiplier: i64 = 5,
     max_levels: u8 = 4,
 
     // Per-level SST file size. L0 inherits the memtable size. L1 uses
-    // `l1_table_size`; each level below ramps by `table_size_multiplier`
-    // up to `max_table_size`.
-    l1_table_size: i64 = 32 * 1024 * 1024,
+    // `l1_table_bytes`; each level below ramps by `table_size_multiplier`
+    // up to `max_table_bytes`.
+    l1_table_bytes: i64 = 32 * 1024 * 1024,
     table_size_multiplier: i64 = 2,
-    max_table_size: i64 = 128 * 1024 * 1024,
+    max_table_bytes: i64 = 128 * 1024 * 1024,
 
-    // Tree split threshold. Compared against the bottom level (Lmax) size
-    // after each compaction; when Lmax exceeds this, the tree splits at the
-    // median key into two trees. Lmax holds ~90% of an LSM tree's data, so
-    // this is effectively the per-tree size cap.
-    tree_split_size: i64 = 5 * 1024 * 1024 * 1024, // 5 GiB
+    // The bottom level's (Lmax's) byte target, and so the per-tree size:
+    // Lmax holds about 80% of a tree's data. After each compaction the
+    // tree's total size is compared against `splitBytes`, and past it
+    // the tree splits at its median key into two trees.
+    lmax_target_bytes: i64 = 10 * 1024 * 1024 * 1024, // 10 GiB
 
     // L0 backpressure (RocksDB-style write slowdown). When a tree's L0
     // table count exceeds `l0_backpressure_start_count`, mutations sleep
@@ -50,20 +62,49 @@ pub const Config = struct {
     // 10s-of-GiB monolithic compaction targets. This is a *trigger*, not
     // a cap — L0 may still grow past it; writes just slow down. With
     // defaults, a tree at the trigger imposes 0 ms; +10 tables ~10 ms;
-    // +100 tables hits the cap of 100 ms. Set
-    // `l0_backpressure_start_count = 0` to disable backpressure entirely.
-    l0_backpressure_start_count: u32 = 8,
+    // +100 tables hits the cap of 100 ms. There is no off switch: a
+    // start count of 0 is invalid, since the L0 score divides by it.
+    // The start count sits well above what L0 holds by design: a few
+    // finished tables plus up to three per size tier, some 20 at worst
+    // for a tree fed by very small flushes.
+    l0_backpressure_start_count: u32 = 32,
     l0_backpressure_step_us: u32 = 1000,
     l0_backpressure_max_us: u32 = 100_000,
 
-    // Per-compaction byte budget for L0→L1: the picker walks L0 oldest-
-    // first and stops once the total input bytes (sum of selected L0
-    // file sizes + their cumulative L1 overlap file sizes) would exceed
-    // this. Always picks at least one L0 table so a single oversized
-    // input still makes progress. Backpressure normally keeps L0 small;
-    // this is the safety bound that prevents a flush burst from landing
-    // in one multi-GiB compaction that blocks the loop for minutes.
+    // Per-job byte budget for the L0→L1 push: the picker walks L0
+    // oldest-first and stops once the total input bytes (selected L0
+    // file sizes plus their cumulative L1 overlap) would exceed this.
+    // Always picks at least one L0 table so a single oversized input
+    // still makes progress. A push starts once L0 reaches L1's target,
+    // well under this, so it binds only when compaction has fallen
+    // behind and L0 has backlogged: then it keeps one job from taking
+    // GiBs of L0 and blocking the loop for minutes. L0→L0 merges are
+    // bounded by their own rule and ignore it.
     l0_compaction_max_bytes: u64 = 1 << 30, // 1 GiB
+
+    // L0 is drained in two steps (RocksDB's intra-L0 compaction, made the
+    // preferred job). Small L0 tables are first merged among themselves:
+    // an L0→L0 job takes the tables after the newest finished one, in
+    // order, up to twice the L0 file size (the memtable size, 64 MiB),
+    // and writes ONE output table (see `pickL0Job`). It runs once that
+    // run has `l0_merge_min_tables` tables. A table that has reached the
+    // L0 file size is finished: it is never merged again and waits for
+    // the push to L1. So a byte is rewritten within L0 only until it
+    // sits in a finished table; an unfinished output is merged again
+    // with the flushes after it until it is one. L1 is not touched, so
+    // the job costs what its inputs weigh, where an L0→L1 job over the
+    // same tables rewrites every L1 table they overlap. 0 disables L0→L0.
+    //
+    // An L0→L1 job runs once L0 holds as many bytes as L1's target size
+    // (`levelTargets`; 410 MiB when Lmax targets 10 GiB). An L0→L1 job rewrites
+    // about all of L1, since L0 tables span the tree's range, so it costs
+    // (L0 + L1) / L0 bytes written per byte drained: about 2 when L0 has
+    // grown to L1's size, 10 and more when a few small tables are pushed.
+    // There is no table-count rule. The count bounds itself: fewer than
+    // `l0_merge_min_tables` unfinished tables sit after the newest
+    // finished one, and the finished ones number at most L1's target
+    // over the L0 file size.
+    l0_merge_min_tables: u32 = 3,
 
     // Roaring posting rollup (zdb/compaction.zig's VersionTracker).
     // Compaction folds a
@@ -94,15 +135,104 @@ pub const Config = struct {
     rollup_at_level: u8 = 2,
     rollup_max_deltas: u32 = 32,
 
+    /// `--zdb`: every field is a flag; the defaults above are what
+    /// `--help` prints. Read once when the forest opens.
+    pub const docs = .{
+        .self = "LSM forest storage: paths, memtable and flush policy," ++
+            " level shape, compaction and backpressure. Live: an update" ++
+            " reaches the next flush, compaction job or check.",
+        .dir = "Directory holding the LSM forest. Required.",
+        .in_memory = "Keep the forest in memory only; `dir` must be empty." ++
+            " For tests.",
+        .read_only = "Open the forest without writing to it.",
+        .memtable_bytes = "Bytes of writes a memtable holds before it is" ++
+            " frozen and flushed. Small values force frequent flushes," ++
+            " useful for tests.",
+        .flush_min_memtables = "Flush once this many frozen memtables are" ++
+            " waiting; one flush merges all of them into one L0 table per" ++
+            " tree. 1 flushes each memtable as soon as it is frozen.",
+        .flush_max_age_seconds = "Flush whatever is waiting once this long" ++
+            " has passed since the last flush.",
+        .block_bytes = "Target size of one SST data block, the unit of" ++
+            " reads and of the block cache.",
+        .num_compactors = "Compaction worker fibers. Must not be 1.",
+        .level_size_multiplier = "Each level's byte target is the next" ++
+            " deeper level's divided by this.",
+        .max_levels = "Levels per tree, L0 included.",
+        .l1_table_bytes = "SST file size at L1. L0 tables are memtable" ++
+            " sized.",
+        .table_size_multiplier = "Each level below L1 multiplies the SST" ++
+            " file size by this.",
+        .max_table_bytes = "Cap on the SST file size at any level.",
+        .lmax_target_bytes = "Byte target of a tree's bottom level. The" ++
+            " levels above are a fifth of the one below. A tree splits" ++
+            " at its median key into two once it holds five fourths of" ++
+            " this in total.",
+        .l0_backpressure_start_count = "L0 table count above which writes" ++
+            " to the tree are slowed. Must be above 0.",
+        .l0_backpressure_step_us = "Microseconds a write sleeps per L0" ++
+            " table above the start count.",
+        .l0_backpressure_max_us = "Longest backpressure sleep for one" ++
+            " write.",
+        .l0_compaction_max_bytes = "Input byte budget for one L0 to L1" ++
+            " compaction; at least one L0 table is always taken.",
+        .l0_merge_min_tables = "An L0 to L0 compaction merges the tables" ++
+            " after the newest one that reached the memtable size, up to" ++
+            " twice that size, into one table, once there are this many" ++
+            " of them. L0 is compacted into L1 once it holds as many bytes" ++
+            " as L1's target. 0 turns L0 to L0 compaction off.",
+        .rollup_enabled = "Fold a roaring posting's delta chain into one" ++
+            " bitmap during compaction.",
+        .rollup_min_deltas = "Shortest delta chain worth rolling up when" ++
+            " its base is among the compaction's inputs.",
+        .rollup_at_level = "Compactions into this level or deeper fetch a" ++
+            " missing base from below to roll the chain up.",
+        .rollup_max_deltas = "A chain this long is rolled up at any" ++
+            " level, fetching its base if needed.",
+    };
+
+    /// Read once when the forest opens: the paths and mode, the level
+    /// count (each tree's level array is sized by it) and the worker
+    /// count (the fibers are spawned then). A live update to one of
+    /// these is refused.
+    pub const fixed = .{
+        "dir",
+        "in_memory",
+        "read_only",
+        "max_levels",
+        "num_compactors",
+    };
+
+    /// The total size at which a tree splits: its Lmax target plus the
+    /// quarter the levels above add once every level is at target.
+    pub fn splitBytes(self: Config) i64 {
+        return @divTrunc(self.lmax_target_bytes * 5, 4);
+    }
+
+    /// The block codec for a table written into `level`. Not a flag: L0
+    /// and L1 are the churn levels (every L0 push rewrites about all of
+    /// L1) and hold the hot data, so they take lz4's speed; L2 and below
+    /// hold about 97% of a tree's bytes and are rewritten rarely, so
+    /// they take zstd's ratio. Each table records its codec in its index,
+    /// so readers never consult this.
+    pub fn codecFor(self: Config, level: usize) utils.compression.Codec {
+        _ = self;
+        return if (level >= 2) .zstd else .lz4;
+    }
+
     pub fn validate(self: Config) Error!void {
         // Badger semantics: exactly one compactor causes pathological level
         // behavior.
         if (self.num_compactors == 1) return error.InvalidNumCompactors;
-        if (self.memtable_size == 0) return error.InvalidMemtableSize;
-        if (self.num_memtables == 0) return error.InvalidNumMemtables;
-        if (self.block_size == 0) return error.InvalidBlockSize;
+        if (self.memtable_bytes == 0) return error.InvalidMemtableSize;
+        if (self.block_bytes == 0) return error.InvalidBlockSize;
         if (self.max_levels == 0) return error.InvalidMaxLevels;
         if (self.in_memory and
             self.dir.len != 0) return error.InvalidDirForInMemory;
+        // A merge of one table is a copy.
+        if (self.l0_merge_min_tables == 1) return error.InvalidL0MergeMinTables;
+        // The L0 score is a fraction of it.
+        if (self.l0_backpressure_start_count == 0)
+            return error.InvalidL0BackpressureStartCount;
     }
 };

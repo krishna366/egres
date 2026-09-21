@@ -28,7 +28,7 @@ const Tree = @import("tree.zig").Tree;
 pub fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
     const tree = try Tree.open(
         self.allocator,
-        self.opts,
+        self.live,
         namespace_id,
         tree_id,
         &self.manifest,
@@ -585,7 +585,7 @@ pub fn applySplit(
     // closes and frees it.
     const left = try Tree.open(
         self.allocator,
-        self.opts,
+        self.live,
         namespace_id,
         old_tree_id,
         &self.manifest,
@@ -594,7 +594,7 @@ pub fn applySplit(
     errdefer left.release();
     const right = try Tree.open(
         self.allocator,
-        self.opts,
+        self.live,
         namespace_id,
         new_tree_id,
         &self.manifest,

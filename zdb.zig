@@ -6,6 +6,7 @@ pub const buffers = @import("zdb/buffers.gen.zig");
 pub const manifest = @import("zdb/manifest.zig");
 pub const level = @import("zdb/level.zig");
 pub const tree = @import("zdb/tree.zig");
+pub const compaction = @import("zdb/compaction.zig");
 pub const forest = @import("zdb/forest.zig");
 pub const sstPath = forest.sstPath;
 pub const cache = @import("zdb/cache.zig");

@@ -107,7 +107,7 @@ When you want to poke at a running server yourself, start one directly. With
 rm -rf /data/egres/node1 && mkdir -p /data/egres/node1 /tmp/zdb
 ./zig-out/bin/egres \
     --raft="id=1; cluster-id=1" \
-    --data="dir=/data/egres/node1" \
+    --zdb="dir=/data/egres/node1" \
     --listen="client-port=5210; raft-port=4210" \
     > /tmp/zdb/server.log 2>&1 &
 ```

@@ -254,6 +254,7 @@ fn makeModules(
     zdb.addImport("vfs", vfs);
     zdb.addImport("metrics", metrics);
     zdb.addImport("zroar", zroar);
+    zdb.addImport("flags", flags);
 
     const pgwire = makeModule(b, target, optimize, "pgwire.zig");
     pgwire.addImport("zfiber", fiber);
