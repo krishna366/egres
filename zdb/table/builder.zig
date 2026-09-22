@@ -439,12 +439,11 @@ pub const Builder = struct {
 
         var binary_fuse_off: ?u32 = null;
         if (self.bf_hashes.items.len > 0) {
-            // `build` grows the filter by a segment and retries when the
-            // size formula leaves the array too tight for the seed loop
-            // (the 11,504-key case). A set of distinct hashes always
-            // builds within that; if it somehow does not, the table is
-            // written without a filter: lookups still work through the
-            // index, only the miss shortcut is lost. That is an error
+            // A set of distinct hashes builds on the first attempt (see
+            // `BinaryFuse.init` for the sizing that once made ~11.5k-key
+            // sets fail); if it somehow does not, the table is written
+            // without a filter: lookups still work through the index,
+            // only the miss shortcut is lost. That is an error
             // line, not a crash, since the failure is tied to the key set
             // and a panic would repeat on every retry of the same
             // compaction. Duplicate hashes fail every size, and only a
