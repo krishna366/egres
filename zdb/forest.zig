@@ -475,15 +475,22 @@ pub const Forest = struct {
     tables: utils.SafeHashMap(TableKey, *TableTrees),
     table_cache: TableCache,
     memtables: Memtables,
-    /// The oldest timestamp any reader is still allowed to ask for. Reads
-    /// below it are rejected (`error.ReadBelowMinRead`), which is exactly what
-    /// makes data below it unobservable and therefore safe to discard: bottom-
-    /// level compaction drops a tombstone older than this along with every
-    /// version it shadows (see `Tree.buildCompaction`).
+    /// The read floor: the oldest timestamp a reader may ask for. Every
+    /// version below it that a newer version shadows may already be gone,
+    /// since a bottom-level compaction discards under it (`VersionTracker`,
+    /// fed the floor by `Engine.proposeCompaction`), and the read entry
+    /// points refuse a `read_ts` below it.
     ///
-    /// ZDB does not derive this itself — it has no reader registry. The
-    /// embedder (egres) owns the value and pushes it in via
-    /// `setGlobalMinRead`. It only ever moves forward.
+    /// It is the timestamp of the installed raft snapshot
+    /// (`Snapshot.timestamp`), raised through `setGlobalMinRead` when the
+    /// snapshot entry applies and at recovery, so every node raises it at
+    /// the same point in the log: a compaction the leader builds after
+    /// that entry discards below it, and a follower applies that
+    /// compaction after the same entry. It never moves back. No new read
+    /// starts below it — a new read_ts is the applied timestamp, and the
+    /// snapshot entry applied earlier. A read open across the install is
+    /// refused from then on rather than answered from a table missing
+    /// its versions.
     ///
     /// 0 means "nothing is droppable", the safe default: no timestamp is
     /// below it, so no read is rejected and no row is ever dropped.
@@ -683,7 +690,7 @@ pub const Forest = struct {
 
         // Route each key to a tree and add to the appropriate builder.
         while (iter.itemRef()) |item| {
-            const tk = blk: {
+            const tk, const key_kind = blk: {
                 const trees = self.getTable(
                     item.key.namespace,
                     item.key.table_id,
@@ -696,15 +703,17 @@ pub const Forest = struct {
                     continue;
                 };
                 defer tree.release();
-                break :blk TreeKey{
+                break :blk .{ TreeKey{
                     .namespace = item.key.namespace,
                     .tree_id = tree.tree_id,
-                };
+                }, tree.key_kind };
             };
 
             const bld = if (builders.get(tk)) |b| b else blk: {
                 const b = try self.allocator.create(Builder);
-                b.* = Builder.init(self.allocator, bcfg);
+                var tree_cfg = bcfg;
+                tree_cfg.key_kind = key_kind;
+                b.* = Builder.init(self.allocator, tree_cfg);
                 try builders.put(tk, b);
                 break :blk b;
             };

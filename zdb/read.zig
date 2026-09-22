@@ -264,7 +264,7 @@ pub const MultiGet = struct {
     /// storage `pins` hold.
     pub const Node = struct {
         key: String,
-        /// bloomHash(key), once per key: every table probe reuses it.
+        /// kv.bloomHash(key), once per key: every table probe reuses it.
         hash: u64,
         versions: std.ArrayList(kv.Version) = .empty,
         pins: std.ArrayList(Pin) = .empty,
@@ -310,7 +310,7 @@ pub const MultiGet = struct {
         for (keys, all) |key, *node| {
             node.* = .{
                 .key = key,
-                .hash = (Key{ .primary = key }).bloomHash(),
+                .hash = kv.bloomHash(key),
             };
         }
         // Unstable is fine (equal keys are interchangeable) and, unlike
@@ -532,7 +532,7 @@ pub const MultiGet = struct {
         utils.clearRetainCap(&self.accepted);
         for (nodes[lo..hi]) |node| {
             if (node.done()) continue;
-            if (!tbl.containsHash(node.hash)) continue;
+            if (!tbl.containsPrimaryHash(node.key, node.hash)) continue;
             try self.accepted.append(arloc, node);
         }
         if (self.accepted.items.len == 0) return;

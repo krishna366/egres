@@ -424,7 +424,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     defer alloc.free(sys.tree_changes);
     try f.applyCreateTree(1, sys);
 
-    const ct = try f.buildCreateTables(alloc, 7, &.{"users"});
+    const ct = try f.buildCreateTables(alloc, 7, &.{"users"}, &.{.bytes});
     defer alloc.free(ct.table_ids);
     defer alloc.free(ct.change.tree_changes);
     try f.applyCreateTree(1, ct.change);
@@ -461,7 +461,7 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const nc2 = try f.buildNamespaceCreate(alloc, 7, "seven");
     defer alloc.free(nc2.tree_changes);
     try f.applyNamespaceCreate(1, nc2);
-    const ct2 = try f.buildCreateTables(alloc, 7, &.{"users"});
+    const ct2 = try f.buildCreateTables(alloc, 7, &.{"users"}, &.{.bytes});
     defer alloc.free(ct2.table_ids);
     defer alloc.free(ct2.change.tree_changes);
     try std.testing.expectEqual(_manifest.first_table_id, ct2.table_ids[0]);
@@ -555,14 +555,14 @@ test "forest: buildCreateTables allocates and never reuses a dropped id" {
 
     // First user table in namespace 2 gets first_table_id; second gets +1.
     // (Unnamed — id allocation is what's under test here.)
-    const r1 = try f.buildCreateTables(alloc, 2, &.{""});
+    const r1 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.bytes});
     defer alloc.free(r1.table_ids);
     defer alloc.free(r1.change.tree_changes);
     try std.testing.expectEqual(first, r1.table_ids[0]);
     try f.applyCreateTree(1, r1.change);
     try std.testing.expect(f.hasTable(2, first));
 
-    const r2 = try f.buildCreateTables(alloc, 2, &.{""});
+    const r2 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.bytes});
     defer alloc.free(r2.table_ids);
     defer alloc.free(r2.change.tree_changes);
     try std.testing.expectEqual(first + 1, r2.table_ids[0]);
@@ -574,7 +574,7 @@ test "forest: buildCreateTables allocates and never reuses a dropped id" {
     try f.applyDropTree(1, dc);
     try std.testing.expect(!f.hasTable(2, r1.table_ids[0]));
 
-    const r3 = try f.buildCreateTables(alloc, 2, &.{""});
+    const r3 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.bytes});
     defer alloc.free(r3.table_ids);
     defer alloc.free(r3.change.tree_changes);
     try std.testing.expectEqual(first + 2, r3.table_ids[0]);
@@ -660,14 +660,14 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     const f = try Forest.open(alloc, f_live);
     defer f.close();
 
-    const ct = try f.buildCreateTables(alloc, 3, &.{"users"});
+    const ct = try f.buildCreateTables(alloc, 3, &.{"users"}, &.{.bytes});
     defer alloc.free(ct.table_ids);
     defer alloc.free(ct.change.tree_changes);
     try f.applyCreateTree(1, ct.change);
     try std.testing.expectEqual(@as(?u32, ct.table_ids[0]), f.manifest.lookupTable(3, "users"));
 
     // A taken name is rejected at build; re-applying the create is a no-op.
-    try std.testing.expectError(error.NameExists, f.buildCreateTables(alloc, 3, &.{"users"}));
+    try std.testing.expectError(error.NameExists, f.buildCreateTables(alloc, 3, &.{"users"}, &.{.bytes}));
     try f.applyCreateTree(1, ct.change);
     try std.testing.expectEqual(@as(?u32, ct.table_ids[0]), f.manifest.lookupTable(3, "users"));
 
@@ -677,7 +677,7 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     try f.applyDropTree(1, dc);
     try std.testing.expect(f.manifest.lookupTable(3, "users") == null);
 
-    const ct2 = try f.buildCreateTables(alloc, 3, &.{"users"});
+    const ct2 = try f.buildCreateTables(alloc, 3, &.{"users"}, &.{.bytes});
     defer alloc.free(ct2.table_ids);
     defer alloc.free(ct2.change.tree_changes);
     try f.applyCreateTree(1, ct2.change);
@@ -1243,6 +1243,93 @@ test "forest: globalMinRead rejects older reads and only moves forward" {
     try std.testing.expectEqual(@as(u64, 100), f.setGlobalMinRead(50));
     try std.testing.expectEqual(@as(u64, 100), f.globalMinRead());
     try std.testing.expectEqual(@as(u64, 150), f.setGlobalMinRead(150));
+}
+
+test "forest: a bottom-level compaction discards under the read floor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Two levels, so L0->L1 is the bottom and may discard.
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path, .max_levels = 2 });
+    defer f_live.destroy();
+    const f = try Forest.open(alloc, f_live);
+    defer f.close();
+    _ = try f.createTree(1, 0, .{ .inf = true });
+
+    // "k" at ts 10, 20 and 30, one flush each, so the versions sit in
+    // three L0 tables.
+    var index: u64 = 1;
+    try f.newMemtable(index);
+    for ([_]u64{ 10, 20, 30 }) |ts| {
+        var buf: [8]u8 = undefined;
+        const val = try std.fmt.bufPrint(&buf, "v{d}", .{ts});
+        try putRow(f, "k", ts, val);
+        index += 1;
+        try f.newMemtable(index);
+        var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+        defer flush.changes.deinit(alloc);
+        index += 1;
+        try f.applyFlush(index, flush.changes.items, flush.memtable_id);
+    }
+
+    const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
+    defer tree.release();
+
+    // Floor 15, as a snapshot at that timestamp would set: v10 is the
+    // version a read at 15 sees, so it is kept; nothing is shadowed by
+    // a version at or below the floor.
+    _ = f.setGlobalMinRead(15);
+    {
+        var comp = try tree.buildCompaction(0, f.globalMinRead());
+        defer comp.deinit(alloc);
+        index += 1;
+        try tree.applyCompaction(index, comp.items);
+    }
+    try expectRowAt(f, "k", 15, "v10");
+    try expectRowAt(f, "k", 25, "v20");
+    try expectRowAt(f, "k", std.math.maxInt(u64), "v30");
+
+    // Floor 25: v20 is at or below it and shadows v10, so the next
+    // bottom-level compaction discards v10. A read at 15 is refused
+    // rather than answered from a table missing its version.
+    _ = f.setGlobalMinRead(25);
+    {
+        try putRow(f, "k", 40, "v40");
+        index += 1;
+        try f.newMemtable(index);
+        var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+        defer flush.changes.deinit(alloc);
+        index += 1;
+        try f.applyFlush(index, flush.changes.items, flush.memtable_id);
+        var comp = try tree.buildCompaction(0, f.globalMinRead());
+        defer comp.deinit(alloc);
+        index += 1;
+        try tree.applyCompaction(index, comp.items);
+    }
+    try std.testing.expectError(error.ReadBelowMinRead, f.get(alloc, .{
+        .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
+        .read_ts = 15,
+    }));
+    try expectRowAt(f, "k", 25, "v20");
+    try expectRowAt(f, "k", 35, "v30");
+    try expectRowAt(f, "k", std.math.maxInt(u64), "v40");
+    {
+        // The bottom table holds three versions of "k" now, not four:
+        // v10 is gone.
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        const ents = tree.levels[1].entries(held);
+        try std.testing.expectEqual(@as(usize, 1), ents.len);
+        var it = zdb.table.TableIterator.init(alloc, ents[0].table, .p0);
+        defer it.deinit();
+        try it.seekRange(ents[0].table.smallest, .{});
+        const item = it.itemRef() orelse return error.TestExpectedItem;
+        try std.testing.expectEqual(@as(usize, 3), item.versions.len());
+        try std.testing.expectEqual(@as(u64, 20), item.versions.slice()[2].ts);
+    }
 }
 
 // ---------------------------------------------------------------------------

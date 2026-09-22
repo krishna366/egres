@@ -109,7 +109,18 @@ pub const StorageImpl = struct {
             .applyFn = &applyEntry,
             .ensureFilesFn = &ensureFiles,
             .isReadyFn = &isReady,
+            .snapshotInstallFn = &snapshotInstall,
         };
+    }
+
+    /// A snapshot entry applied: its timestamp becomes the read floor,
+    /// on every node at this same point in the log (see
+    /// `Forest.global_min_read`). The leader's compactions from here on
+    /// discard below it; no read may ask below it.
+    fn snapshotInstall(ctx: *anyopaque, snap: *const raft.buffers.SnapshotStruct) void {
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+        const floor = self.forest.setGlobalMinRead(snap.timestamp);
+        log.info("read floor: snapshot index={d} timestamp={d} floor={d}", .{ snap.index, snap.timestamp, floor });
     }
 
     /// Cheap check: SM is ready for a data proposal once `recoverFromSnapshot`
@@ -764,6 +775,9 @@ pub const Engine = struct {
         log.info("recovery: restoring manifest from snapshot index={d} bytes={d}", .{ snap.index, snap.data.len });
         try self.forest.manifest.restoreFrom(snap.data);
         oldest_idx = snap.oldest_memtable_index;
+        // The read floor is the installed snapshot's timestamp
+        // (`snapshotInstalled` keeps it so from here on).
+        _ = self.forest.setGlobalMinRead(snap.timestamp);
 
         // Download every missing SST from the shared object store before
         // proceeding — opening a partial forest would start a node with
@@ -1202,12 +1216,16 @@ pub const Engine = struct {
             return;
         };
         defer tree.release();
+        // What this build may discard below: the read floor, the
+        // installed snapshot's timestamp. Every node raised it when that
+        // snapshot entry applied, before this compaction's entry.
+        const min_read = self.forest.globalMinRead();
         // L0 decides at build time whether it merges within itself or
         // pushes into L1.
         var changes = if (src == 0)
-            try tree.compactL0(self.forest.globalMinRead())
+            try tree.compactL0(min_read)
         else
-            try tree.buildCompaction(src, self.forest.globalMinRead());
+            try tree.buildCompaction(src, min_read);
         defer changes.deinit(self.allocator);
 
         if (changes.items.len == 0) {

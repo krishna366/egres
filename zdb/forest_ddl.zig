@@ -255,7 +255,11 @@ pub fn buildCreateTables(
     alloc: std.mem.Allocator,
     namespace_id: u64,
     names: []const String,
+    /// One per name: what that tree's keys are (`buffers.KeyKind`). A SQL
+    /// base table's rows are keyed by egid; everything else is bytes.
+    kinds: []const _manifest.KeyKind,
 ) !CreateTablesResult {
+    std.debug.assert(kinds.len == names.len);
     for (names) |name|
         if (name.len > 0 and self.manifest.lookupTable(namespace_id, name) != null)
             return error.NameExists;
@@ -276,6 +280,7 @@ pub fn buildCreateTables(
             "",
         );
         tree_changes[i].name = @constCast(name);
+        tree_changes[i].key_kind = kinds[i];
     }
     return .{
         .table_ids = table_ids,
@@ -479,6 +484,10 @@ pub fn buildSplit(
         .namespace = namespace_id,
         .tree_id = tree_id,
     }) orelse return null;
+    const old_kind = self.manifest.treeKeyKind(.{
+        .namespace = namespace_id,
+        .tree_id = tree_id,
+    }) orelse return null;
     const new_tree_id = self.nextTreeId(namespace_id, treeTableId(tree_id));
 
     // Classify tables per level and build manifest changes.
@@ -536,6 +545,7 @@ pub fn buildSplit(
         split_raw,
         right_right_raw_key,
     );
+    tree_changes[1].key_kind = old_kind;
 
     return .{
         .sstable_changes = try table_changes.toOwnedSlice(alloc),

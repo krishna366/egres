@@ -1072,6 +1072,7 @@ pub fn mergeAndWrite(
         .target_block_size = opts.block_bytes,
         .codec = opts.codecFor(dest),
         .priority = prio,
+        .key_kind = self.key_kind,
     };
     const file_sz = job.file_sz;
 

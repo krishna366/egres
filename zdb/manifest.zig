@@ -49,7 +49,12 @@ pub const TreeState = struct {
     levels: std.ArrayList(LevelState),
     left: Key = .{},
     right: Key = .{},
+    /// See `buffers.KeyKind`. Set at create, inherited by a split's new
+    /// tree, kept by the snapshot manifest.
+    key_kind: KeyKind = .bytes,
 };
+
+pub const KeyKind = _zen.KeyKindEnum;
 
 /// table_ids 0–15 are reserved per namespace (0 = raw-KV / default table,
 /// 1 = the namespace's SQL catalog, the rest for future system tables); user
@@ -351,6 +356,15 @@ pub const Manifest = struct {
     /// frees the very bytes a stored `TreeState` borrows — so a caller off
     /// that loop copies under the lock instead of holding a `TreeState`
     /// across its own work. Null if the tree is not listed.
+    /// What the tree's keys are, null for a tree the manifest does not
+    /// list.
+    pub fn treeKeyKind(self: *Manifest, key: TreeKey) ?KeyKind {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+        const tree = self.trees.getPtr(key) orelse return null;
+        return tree.key_kind;
+    }
+
     pub fn treeRange(
         self: *Manifest,
         alloc: std.mem.Allocator,
@@ -666,6 +680,7 @@ pub const Manifest = struct {
                 .levels = std.ArrayList(LevelState).empty,
                 .left = try Key.initAlloc(self.allocator, tc.left_key),
                 .right = try Key.initAlloc(self.allocator, tc.right_key),
+                .key_kind = tc.key_kind,
             });
         } else if (tc.op == .delete) {
             if (self.trees.fetchRemove(key)) |kv| {
@@ -848,6 +863,7 @@ pub const Manifest = struct {
                 left_raw,
                 right_raw,
             );
+            change.key_kind = tree.key_kind;
             // Only the table's FIRST tree carries the name — exactly one
             // tree per table has the open left bound (splits leave it with
             // the leftmost child), so a heavily-split table doesn't copy

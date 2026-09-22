@@ -388,7 +388,7 @@ pub const Level = struct {
             while (ri > 0) {
                 ri -= 1;
                 const e = self.tables.items[ri];
-                if (!e.table.containsKey(search_key)) continue;
+                if (!e.table.containsPrimary(search_key.primary)) continue;
                 try out.append(allocator, e);
                 e.table.incrRef();
             }
@@ -409,7 +409,7 @@ pub const Level = struct {
         // smallest primary is greater than the search primary cannot hold
         // the key at any timestamp.
         if (e.table.smallest.order(search_key) == .gt) return;
-        if (!e.table.containsKey(search_key)) return;
+        if (!e.table.containsPrimary(search_key.primary)) return;
 
         try out.append(allocator, e);
         e.table.incrRef();

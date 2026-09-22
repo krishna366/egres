@@ -1,4 +1,5 @@
 const std = @import("std");
+const kv = @import("../kv.zig");
 const zbuf = @import("zbuf").zbuf;
 const Key = @import("../kv.zig").Key;
 const Meta = @import("../kv.zig").Meta;
@@ -10,6 +11,7 @@ const utils = @import("utils");
 const String = utils.String;
 const compress = utils.compression;
 const _binaryfuse = @import("../binaryfusefilter.zig");
+const zroar = @import("zroar");
 const vfs = @import("vfs");
 const _cache = @import("../cache.zig");
 const Builder = @import("builder.zig").Builder;
@@ -64,7 +66,10 @@ pub const Table = struct {
     handle: vfs.FileHandle,
     index: *_buffers.TableIndexStruct,
     codec: compress.Codec,
+    /// The table's filter, one of the two (see `builder.Config.key_kind`),
+    /// or neither for a table written without one.
     binary_fuse: ?_binaryfuse.BinaryFuse(u16),
+    egid_bm: ?zroar.Bitmap,
     ref: std.atomic.Value(i32),
     smallest: Key,
     biggest: Key,
@@ -193,6 +198,18 @@ pub const Table = struct {
             break :blk filter;
         } else null;
 
+        // Copied out of the decoded field: zroar wants its buffer 8-byte
+        // aligned, and a decoded field is not. The field's own copy is
+        // then dead weight for the table's lifetime, so it is freed here
+        // and left empty for index.deinit, as with the fingerprints.
+        const egid_bm: ?zroar.Bitmap = if (table_index.egid_bitmap.len > 0)
+            try zroar.Bitmap.fromBufferCopy(allocator, table_index.egid_bitmap)
+        else
+            null;
+        errdefer if (egid_bm) |*bm| @constCast(bm).deinit();
+        allocator.free(table_index.egid_bitmap);
+        table_index.egid_bitmap = &.{};
+
         const smallest_raw = if (table_index.blocks.len > 0) table_index.blocks[0].key else &.{};
         t.* = .{
             .allocator = allocator,
@@ -200,6 +217,7 @@ pub const Table = struct {
             .index = table_index,
             .codec = codec,
             .binary_fuse = binary_fuse,
+            .egid_bm = egid_bm,
             .smallest = if (smallest_raw.len >= min_key_len)
                 Key.init(smallest_raw)
             else
@@ -235,6 +253,7 @@ pub const Table = struct {
         self.allocator.free(self.cached);
         self.index.destroy(self.allocator);
         if (self.binary_fuse) |*bf| bf.deinit(self.allocator);
+        if (self.egid_bm) |*bm| bm.deinit();
         self.handle.close();
     }
 
@@ -271,13 +290,32 @@ pub const Table = struct {
         return &self.index;
     }
 
-    pub fn containsKey(self: *const Table, key: Key) bool {
-        return self.containsHash(key.bloomHash());
+    /// Whether the table may hold the row with this primary key:
+    /// certain for an `egid` table, probabilistic (no false negatives)
+    /// for a `bytes` one, always true for a table without a filter.
+    pub fn containsPrimary(self: *const Table, primary: String) bool {
+        if (self.egid_bm) |*bm| return containsEgid(bm, primary);
+        return self.containsHash(kv.bloomHash(primary));
     }
 
-    /// `containsKey` for a caller that hashed the key once
-    /// (Key.bloomHash) and probes many tables with it.
-    pub fn containsHash(self: *const Table, hash: u64) bool {
+    /// `containsPrimary` for a caller that hashed the primary once
+    /// (kv.bloomHash) and probes many tables with it.
+    pub fn containsPrimaryHash(
+        self: *const Table,
+        primary: String,
+        hash: u64,
+    ) bool {
+        if (self.egid_bm) |*bm| return containsEgid(bm, primary);
+        return self.containsHash(hash);
+    }
+
+    fn containsEgid(bm: *const zroar.Bitmap, primary: String) bool {
+        // Not an egid at all: an `egid` table cannot hold it.
+        if (primary.len != 8) return false;
+        return bm.contains(std.mem.readInt(u64, primary[0..8], .big));
+    }
+
+    fn containsHash(self: *const Table, hash: u64) bool {
         if (self.binary_fuse) |bf| return bf.contain(hash);
         return true;
     }

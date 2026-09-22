@@ -21,6 +21,12 @@ pub const OpEnum = enum(u8) {
     _,
 };
 
+pub const KeyKindEnum = enum(u8) {
+    bytes = 0,
+    egid = 1,
+    _,
+};
+
 pub const CommandEnum = enum(u8) {
     none = 0,
     new_memtable = 1,
@@ -335,6 +341,7 @@ pub const BlockIndexWriter = struct {
 
 pub const TableIndexStruct = struct {
     pub const TABLE_ID: u16 = 46594;
+    format_version: u32 = 0,
     max_version: u64 = 0,
     key_count: u32 = 0,
     uncompressed_size: u32 = 0,
@@ -344,7 +351,7 @@ pub const TableIndexStruct = struct {
     last_key: []const u8 = &.{},
     blocks: []BlockIndexStruct = &.{},
     binary_fuse: ?BinaryFuseFilterStruct = null,
-    format_version: u32 = 0,
+    egid_bitmap: []const u8 = &.{},
     pub fn deinit(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.last_key);
         self.last_key = &.{};
@@ -353,6 +360,8 @@ pub const TableIndexStruct = struct {
         self.blocks = &.{};
         if (self.binary_fuse) |*_bf| _bf.deinit(alloc);
         self.binary_fuse = null;
+        alloc.free(self.egid_bitmap);
+        self.egid_bitmap = &.{};
     }
 
     pub fn destroy(self: *TableIndexStruct, alloc: std.mem.Allocator) void {
@@ -362,16 +371,17 @@ pub const TableIndexStruct = struct {
 
     fn cloneValue(self: TableIndexStruct, alloc: std.mem.Allocator) Error!TableIndexStruct {
         var s = TableIndexStruct{
+            .format_version = self.format_version,
             .max_version = self.max_version,
             .key_count = self.key_count,
             .uncompressed_size = self.uncompressed_size,
             .compressed_size = self.compressed_size,
             .stale_data_size = self.stale_data_size,
             .compression = self.compression,
-            .format_version = self.format_version,
         };
         errdefer s.deinit(alloc);
         s.last_key = try alloc.dupe(u8, self.last_key);
+        s.egid_bitmap = try alloc.dupe(u8, self.egid_bitmap);
         {
             s.blocks = try alloc.alloc(BlockIndexStruct, self.blocks.len);
             @memset(s.blocks, .{});
@@ -394,6 +404,7 @@ pub const TableIndexStruct = struct {
 
     pub fn marshalTo(self: TableIndexStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try TableIndexWriter.initWithBuf(alloc, out);
+        try writer.setFormatVersion(self.format_version);
         try writer.setMaxVersion(self.max_version);
         try writer.setKeyCount(self.key_count);
         try writer.setUncompressedSize(self.uncompressed_size);
@@ -413,7 +424,7 @@ pub const TableIndexStruct = struct {
             const child_off = try child.marshalTo(alloc, out);
             try writer.setBinaryFuse(child_off);
         }
-        try writer.setFormatVersion(self.format_version);
+        try writer.setEgidBitmap(self.egid_bitmap);
         const result = try writer.finish();
         return result.offset;
     }
@@ -426,7 +437,7 @@ pub const TableIndexReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46594;
-    pub const SIZE_BYTES: u16 = 51;
+    pub const SIZE_BYTES: u16 = 59;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -442,65 +453,72 @@ pub const TableIndexReader = struct {
         return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
     }
 
-    pub fn maxVersion(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 10;
+    pub fn formatVersion(self: Self) u32 {
+        const slot_end = @as(u32, self.base) + 6;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
     }
 
-    pub fn keyCount(self: Self) u32 {
+    pub fn maxVersion(self: Self) u64 {
         const slot_end = @as(u32, self.base) + 14;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch 0;
+        return zbuf.readU64(self.buf, @as(usize, self.base + 6)) catch 0;
     }
 
-    pub fn uncompressedSize(self: Self) u32 {
+    pub fn keyCount(self: Self) u32 {
         const slot_end = @as(u32, self.base) + 18;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch 0;
     }
 
-    pub fn compressedSize(self: Self) u32 {
+    pub fn uncompressedSize(self: Self) u32 {
         const slot_end = @as(u32, self.base) + 22;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU32(self.buf, @as(usize, self.base + 18)) catch 0;
     }
 
-    pub fn staleDataSize(self: Self) u32 {
+    pub fn compressedSize(self: Self) u32 {
         const slot_end = @as(u32, self.base) + 26;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return 0;
         return zbuf.readU32(self.buf, @as(usize, self.base + 22)) catch 0;
     }
 
+    pub fn staleDataSize(self: Self) u32 {
+        const slot_end = @as(u32, self.base) + 30;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return 0;
+        return zbuf.readU32(self.buf, @as(usize, self.base + 26)) catch 0;
+    }
+
     pub fn compression(self: Self) CompressionEnum {
-        const slot_end = @as(u32, self.base) + 27;
+        const slot_end = @as(u32, self.base) + 31;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return @enumFromInt(0);
-        const v = zbuf.readU8(self.buf, @as(usize, self.base + 26)) catch 0;
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 30)) catch 0;
         return @enumFromInt(v);
     }
 
     pub fn lastKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 35;
+        const slot_end = @as(u32, self.base) + 39;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 27)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 35)) catch 0;
         if (data_len == 0) return &[_]u8{};
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
     fn blocksSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 43;
+        const slot_end = @as(u32, self.base) + 47;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 35)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 39)) catch return &.{};
+        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 39)) catch return &.{};
+        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 43)) catch return &.{};
         if (elem_count == 0) return &.{};
         const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
         if (end > self.buf.len) return &.{};
@@ -520,23 +538,27 @@ pub const TableIndexReader = struct {
     }
 
     pub fn binaryFuse(self: Self) ?BinaryFuseFilterReader {
-        const slot_end = @as(u32, self.base) + 47;
+        const slot_end = @as(u32, self.base) + 51;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return null;
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 43)) catch 0;
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 47)) catch 0;
         if (off == zbuf.NullOffset) return null;
         return BinaryFuseFilterReader.init(self.buf, off) catch null;
     }
 
-    pub fn formatVersion(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 51;
+    pub fn egidBitmap(self: Self) []const u8 {
+        const slot_end = @as(u32, self.base) + 59;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 47)) catch 0;
+        if (slot_end > header_end) return &[_]u8{};
+        const off = zbuf.readU32(self.buf, @as(usize, self.base + 51)) catch 0;
+        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 55)) catch 0;
+        if (data_len == 0) return &[_]u8{};
+        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try TableIndexWriter.initWithBuf(alloc, out);
+        try writer.setFormatVersion(self.formatVersion());
         try writer.setMaxVersion(self.maxVersion());
         try writer.setKeyCount(self.keyCount());
         try writer.setUncompressedSize(self.uncompressedSize());
@@ -559,7 +581,7 @@ pub const TableIndexReader = struct {
             const child_off = try child.cloneInto(alloc, out);
             try writer.setBinaryFuse(child_off);
         }
-        try writer.setFormatVersion(self.formatVersion());
+        try writer.setEgidBitmap(self.egidBitmap());
         const result = try writer.finish();
         return result.offset;
     }
@@ -567,18 +589,18 @@ pub const TableIndexReader = struct {
     pub fn verify(self: Self) Error!void {
         if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
         const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_27 = @as(u32, self.base) + 35;
-        if (slot_end_27 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 27));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 31));
+        const slot_end_31 = @as(u32, self.base) + 39;
+        if (slot_end_31 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 31));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 35));
             if (data_len > 0) {
                 _ = try zbuf.sliceAt(self.buf, off, data_len);
             }
         }
-        const slot_end_arr_35 = @as(u32, self.base) + 43;
-        if (slot_end_arr_35 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 35));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 39));
+        const slot_end_arr_39 = @as(u32, self.base) + 47;
+        if (slot_end_arr_39 <= header_end) {
+            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 39));
+            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 43));
             if (elem_count > 0) {
                 const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
                 if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
@@ -593,19 +615,28 @@ pub const TableIndexReader = struct {
         if (self.binaryFuse()) |child_view| {
             try child_view.verify();
         }
+        const slot_end_51 = @as(u32, self.base) + 59;
+        if (slot_end_51 <= header_end) {
+            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 51));
+            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 55));
+            if (data_len > 0) {
+                _ = try zbuf.sliceAt(self.buf, off, data_len);
+            }
+        }
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableIndexStruct {
         var s = TableIndexStruct{
+            .format_version = self.formatVersion(),
             .max_version = self.maxVersion(),
             .key_count = self.keyCount(),
             .uncompressed_size = self.uncompressedSize(),
             .compressed_size = self.compressedSize(),
             .stale_data_size = self.staleDataSize(),
             .compression = self.compression(),
-            .format_version = self.formatVersion(),
         };
         errdefer s.deinit(alloc);
         s.last_key = try alloc.dupe(u8, self.lastKey());
+        s.egid_bitmap = try alloc.dupe(u8, self.egidBitmap());
         {
             const _cnt = self.blocksLen();
             s.blocks = try alloc.alloc(BlockIndexStruct, @intCast(_cnt));
@@ -663,7 +694,7 @@ pub const TableIndexWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46594;
-    pub const SIZE_BYTES: u16 = 51;
+    pub const SIZE_BYTES: u16 = 59;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -672,7 +703,7 @@ pub const TableIndexWriter = struct {
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
         const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
         try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        try zbuf.patchU32(buf.items, base + 43, zbuf.NullOffset);
+        try zbuf.patchU32(buf.items, base + 47, zbuf.NullOffset);
         return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
     }
 
@@ -682,74 +713,87 @@ pub const TableIndexWriter = struct {
         errdefer alloc.destroy(owned);
         const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
         try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        try zbuf.patchU32(owned.items, base + 43, zbuf.NullOffset);
+        try zbuf.patchU32(owned.items, base + 47, zbuf.NullOffset);
         return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+    }
+
+    pub fn setFormatVersion(self: *Self, v: u32) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU32(out.items, self.base + 2, v);
     }
 
     pub fn setMaxVersion(self: *Self, v: u64) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 2, v);
+        try zbuf.patchU64(out.items, self.base + 6, v);
     }
 
     pub fn setKeyCount(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 10, v);
+        try zbuf.patchU32(out.items, self.base + 14, v);
     }
 
     pub fn setUncompressedSize(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 14, v);
+        try zbuf.patchU32(out.items, self.base + 18, v);
     }
 
     pub fn setCompressedSize(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 18, v);
+        try zbuf.patchU32(out.items, self.base + 22, v);
     }
 
     pub fn setStaleDataSize(self: *Self, v: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 22, v);
+        try zbuf.patchU32(out.items, self.base + 26, v);
     }
 
     pub fn setCompression(self: *Self, v: CompressionEnum) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU8(out.items, self.base + 26, @intFromEnum(v));
+        try zbuf.patchU8(out.items, self.base + 30, @intFromEnum(v));
     }
 
     pub fn setLastKey(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
         if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 27, 0);
             try zbuf.patchU32(out.items, self.base + 31, 0);
+            try zbuf.patchU32(out.items, self.base + 35, 0);
             return;
         }
         const abs_off = try zbuf.appendBytes(out, self.alloc, data);
         const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 27, off);
-        try zbuf.patchU32(out.items, self.base + 31, @as(u32, @intCast(data.len)));
+        try zbuf.patchU32(out.items, self.base + 31, off);
+        try zbuf.patchU32(out.items, self.base + 35, @as(u32, @intCast(data.len)));
     }
 
     pub fn setBlocks(self: *Self, values: []const u32) Error!void {
         const out = self.bufMut();
         if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 35, 0);
             try zbuf.patchU32(out.items, self.base + 39, 0);
+            try zbuf.patchU32(out.items, self.base + 43, 0);
             return;
         }
         const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
         const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 35, index_off);
-        try zbuf.patchU32(out.items, self.base + 39, @as(u32, @intCast(values.len)));
+        try zbuf.patchU32(out.items, self.base + 39, index_off);
+        try zbuf.patchU32(out.items, self.base + 43, @as(u32, @intCast(values.len)));
     }
 
     pub fn setBinaryFuse(self: *Self, child_off: u32) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 43, child_off);
+        try zbuf.patchU32(out.items, self.base + 47, child_off);
     }
 
-    pub fn setFormatVersion(self: *Self, v: u32) Error!void {
+    pub fn setEgidBitmap(self: *Self, data: []const u8) Error!void {
         const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 47, v);
+        if (data.len == 0) {
+            try zbuf.patchU32(out.items, self.base + 51, 0);
+            try zbuf.patchU32(out.items, self.base + 55, 0);
+            return;
+        }
+        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
+        const off = abs_off;
+        try zbuf.patchU32(out.items, self.base + 51, off);
+        try zbuf.patchU32(out.items, self.base + 55, @as(u32, @intCast(data.len)));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -757,6 +801,7 @@ pub const TableIndexWriter = struct {
         if (@typeInfo(Values) != .@"struct") {
             @compileError("set() expects a struct literal like .{ .field = value }");
         }
+        if (@hasField(Values, "format_version")) try self.setFormatVersion(@field(values, "format_version"));
         if (@hasField(Values, "max_version")) try self.setMaxVersion(@field(values, "max_version"));
         if (@hasField(Values, "key_count")) try self.setKeyCount(@field(values, "key_count"));
         if (@hasField(Values, "uncompressed_size")) try self.setUncompressedSize(@field(values, "uncompressed_size"));
@@ -766,7 +811,7 @@ pub const TableIndexWriter = struct {
         if (@hasField(Values, "last_key")) try self.setLastKey(@field(values, "last_key"));
         if (@hasField(Values, "blocks")) try self.setBlocks(@field(values, "blocks"));
         if (@hasField(Values, "binary_fuse")) try self.setBinaryFuse(@field(values, "binary_fuse"));
-        if (@hasField(Values, "format_version")) try self.setFormatVersion(@field(values, "format_version"));
+        if (@hasField(Values, "egid_bitmap")) try self.setEgidBitmap(@field(values, "egid_bitmap"));
     }
 
     pub fn finish(self: *Self) Error!TableIndexBuffer {
@@ -1142,6 +1187,7 @@ pub const TreeChangeStruct = struct {
     left_key: []const u8 = &.{},
     right_key: []const u8 = &.{},
     name: []const u8 = &.{},
+    key_kind: KeyKindEnum = @enumFromInt(0),
     pub fn deinit(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.left_key);
         self.left_key = &.{};
@@ -1161,6 +1207,7 @@ pub const TreeChangeStruct = struct {
             .op = self.op,
             .namespace_id = self.namespace_id,
             .tree_id = self.tree_id,
+            .key_kind = self.key_kind,
         };
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.left_key);
@@ -1184,6 +1231,7 @@ pub const TreeChangeStruct = struct {
         try writer.setLeftKey(self.left_key);
         try writer.setRightKey(self.right_key);
         try writer.setName(self.name);
+        try writer.setKeyKind(self.key_kind);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1196,7 +1244,7 @@ pub const TreeChangeReader = struct {
     size_bytes: u16,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 43;
+    pub const SIZE_BYTES: u16 = 44;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         const tail = try zbuf.readMessageTail(buf);
@@ -1264,6 +1312,14 @@ pub const TreeChangeReader = struct {
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
+    pub fn keyKind(self: Self) KeyKindEnum {
+        const slot_end = @as(u32, self.base) + 44;
+        const header_end = @as(u32, self.base) + self.size_bytes;
+        if (slot_end > header_end) return @enumFromInt(0);
+        const v = zbuf.readU8(self.buf, @as(usize, self.base + 43)) catch 0;
+        return @enumFromInt(v);
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try TreeChangeWriter.initWithBuf(alloc, out);
         try writer.setOp(self.op());
@@ -1272,6 +1328,7 @@ pub const TreeChangeReader = struct {
         try writer.setLeftKey(self.leftKey());
         try writer.setRightKey(self.rightKey());
         try writer.setName(self.name());
+        try writer.setKeyKind(self.keyKind());
         const result = try writer.finish();
         return result.offset;
     }
@@ -1309,6 +1366,7 @@ pub const TreeChangeReader = struct {
             .op = self.op(),
             .namespace_id = self.namespaceId(),
             .tree_id = self.treeId(),
+            .key_kind = self.keyKind(),
         };
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.leftKey());
@@ -1359,7 +1417,7 @@ pub const TreeChangeWriter = struct {
     base: u32,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 43;
+    pub const SIZE_BYTES: u16 = 44;
 
     fn bufMut(self: *Self) *std.ArrayList(u8) {
         return self.buf orelse @panic("zbuf writer missing buffer");
@@ -1434,6 +1492,11 @@ pub const TreeChangeWriter = struct {
         try zbuf.patchU32(out.items, self.base + 39, @as(u32, @intCast(data.len)));
     }
 
+    pub fn setKeyKind(self: *Self, v: KeyKindEnum) Error!void {
+        const out = self.bufMut();
+        try zbuf.patchU8(out.items, self.base + 43, @intFromEnum(v));
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -1445,6 +1508,7 @@ pub const TreeChangeWriter = struct {
         if (@hasField(Values, "left_key")) try self.setLeftKey(@field(values, "left_key"));
         if (@hasField(Values, "right_key")) try self.setRightKey(@field(values, "right_key"));
         if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
+        if (@hasField(Values, "key_kind")) try self.setKeyKind(@field(values, "key_kind"));
     }
 
     pub fn finish(self: *Self) Error!TreeChangeBuffer {

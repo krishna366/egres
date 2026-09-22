@@ -183,6 +183,10 @@ pub const Node = struct {
         /// memtable exists". Must be non-blocking. When null, the gate is
         /// treated as always-ready.
         isReadyFn: ?*const fn (*anyopaque) bool = null,
+        /// A snapshot entry was just installed on this node, in log order
+        /// with the applies around it. The state machine reads what it
+        /// needs off the snapshot (its `timestamp` is the read floor).
+        snapshotInstallFn: ?*const fn (*anyopaque, *const zen.SnapshotStruct) void = null,
 
         pub fn apply(self: *StateMachine, entry: Entry, data: String) anyerror!void {
             try self.applyFn(self.ctx, entry, data);
@@ -193,6 +197,9 @@ pub const Node = struct {
         pub fn isReady(self: *StateMachine) bool {
             if (self.isReadyFn) |f| return f(self.ctx);
             return true;
+        }
+        pub fn snapshotInstall(self: *StateMachine, snap: *const zen.SnapshotStruct) void {
+            if (self.snapshotInstallFn) |f| f(self.ctx, snap);
         }
     };
 
@@ -834,8 +841,9 @@ pub const Node = struct {
     /// Apply a `.snapshot` log entry: parse the marshalled SnapshotStruct,
     /// install via `setSnapshot`, then trim log files below it. Idempotent —
     /// skips if the snapshot index is at or below the current snapshot.
-    /// Bypasses the state machine (Forest is updated by normal `.manifest`
-    /// apply; this only affects WAL state).
+    /// The state machine's data is not touched (the Forest is updated by
+    /// the normal `.manifest` applies; this only affects WAL state), but
+    /// it is told (`snapshotInstalled`), in log order.
     fn applySnapshotEntry(self: *Node, payload: String) !void {
         const new_snap = try zen.SnapshotReader.parseRoot(payload);
         const cur = self.log.snapshot();
@@ -853,6 +861,7 @@ pub const Node = struct {
         raft_log.info("snapshot installed: index={d} term={d} bytes={d}", .{
             snap_ptr.index, snap_ptr.term, snap_ptr.data.len,
         });
+        if (self.state_machine) |sm| sm.snapshotInstall(snap_ptr);
     }
 
     pub fn confState(self: *Node) !_raftwal.ConfState {

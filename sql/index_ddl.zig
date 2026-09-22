@@ -149,6 +149,7 @@ pub fn createIndex(
         arloc,
         ns,
         &.{name},
+        &.{.bytes},
     ) catch |err| switch (err) {
         error.NameExists => return replyErrorCode(
             state,

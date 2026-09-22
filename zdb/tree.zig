@@ -301,6 +301,10 @@ pub const Tree = struct {
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
     key_range: KeyRange,
+    /// What this tree's keys are (`buffers.KeyKind`): read off the
+    /// manifest record at open, fixed for the tree's life. Picks the SST
+    /// filter every flush and compaction output of this tree carries.
+    key_kind: _manifest.KeyKind,
     /// Holders of this object. One is the `TableTrees` entry that lists it;
     /// `TableTrees.getTree` hands out another per reader, released with
     /// `release` when the reader is done. The last release closes and frees
@@ -387,6 +391,7 @@ pub const Tree = struct {
         errdefer for (levels) |*l| l.deinit();
 
         var kr: KeyRange = .{};
+        var key_kind: _manifest.KeyKind = .bytes;
         errdefer {
             kr.left.free(allocator);
             kr.right.free(allocator);
@@ -406,6 +411,7 @@ pub const Tree = struct {
             })) |tree| {
                 kr.left = try tree.left.dupe(allocator);
                 kr.right = try tree.right.dupe(allocator);
+                key_kind = tree.key_kind;
                 if (kr.left.len() == 0 and kr.right.len() == 0) {
                     kr.inf = true;
                 }
@@ -433,6 +439,7 @@ pub const Tree = struct {
             .cache = cache,
             .levels = levels,
             .key_range = kr,
+            .key_kind = key_kind,
         };
         // Unpublished, so uncontended — but the levels take the token, and
         // the tree is at its final address, so the lock is simply taken.

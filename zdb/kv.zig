@@ -396,15 +396,16 @@ pub const Key = struct {
         return 12 + self.primary.len;
     }
 
-    /// Hash of the primary key only: the per-table SST bloom-filter
-    /// hash (namespace/table are implied by the table). NOT a row
-    /// identity: use identityHash for locks and conflict tracking.
-    pub fn bloomHash(self: Key) u64 {
-        return std.hash.Wyhash.hash(0, self.primary);
-    }
-
     /// Same primary key, ignoring namespace/table_id.
     pub fn equalPrimary(self: Key, other: Key) bool {
         return std.mem.eql(u8, self.primary, other.primary);
     }
 };
+
+/// Hash of a primary key alone: what a `bytes` table's SST filter is
+/// built on and probed with (namespace and table are implied by the
+/// table). NOT a row identity: use Key.identityHash for locks and
+/// conflict tracking.
+pub fn bloomHash(primary: String) u64 {
+    return std.hash.Wyhash.hash(0, primary);
+}

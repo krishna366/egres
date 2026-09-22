@@ -28,18 +28,23 @@ pub const Compression = schema.EnumDef(.{
 });
 
 pub const TableIndex = schema.Table(.{
-    .{ .id = 1, .name = "max_version", .ty = schema.U64 },
-    .{ .id = 2, .name = "key_count", .ty = schema.U32 },
-    .{ .id = 3, .name = "uncompressed_size", .ty = schema.U32 },
-    .{ .id = 4, .name = "compressed_size", .ty = schema.U32 },
-    .{ .id = 5, .name = "stale_data_size", .ty = schema.U32 },
-    .{ .id = 6, .name = "compression", .ty = schema.Enum(Compression) },
-    .{ .id = 7, .name = "last_key", .ty = schema.Bytes },
-    .{ .id = 8, .name = "blocks", .ty = schema.Array(BlockIndex) },
-    .{ .id = 9, .name = "binary_fuse", .ty = BinaryFuseFilter },
     // Bumped whenever the per-entry block encoding changes (table/builder.zig
     // is the source of truth for that layout).
-    .{ .id = 10, .name = "format_version", .ty = schema.U32 },
+    .{ .id = 1, .name = "format_version", .ty = schema.U32 },
+    .{ .id = 2, .name = "max_version", .ty = schema.U64 },
+    .{ .id = 3, .name = "key_count", .ty = schema.U32 },
+    .{ .id = 4, .name = "uncompressed_size", .ty = schema.U32 },
+    .{ .id = 5, .name = "compressed_size", .ty = schema.U32 },
+    .{ .id = 6, .name = "stale_data_size", .ty = schema.U32 },
+    .{ .id = 7, .name = "compression", .ty = schema.Enum(Compression) },
+    .{ .id = 8, .name = "last_key", .ty = schema.Bytes },
+    .{ .id = 9, .name = "blocks", .ty = schema.Array(BlockIndex) },
+    .{ .id = 10, .name = "binary_fuse", .ty = BinaryFuseFilter },
+    // The filter of an `egid` tree's table: a roaring bitmap
+    // (zroar buffer) of every key in the table. Exact, so a miss is
+    // certain and a hit is certain. Absent on a `bytes` tree's table,
+    // which carries `binary_fuse` instead.
+    .{ .id = 11, .name = "egid_bitmap", .ty = schema.Bytes },
 });
 
 pub const Op = schema.EnumDef(.{
@@ -58,6 +63,15 @@ pub const Op = schema.EnumDef(.{
 // ns_create (its tree_id-0 change, live and in snapshots), a table's name on
 // a create_tree (future). Empty everywhere else (splits, drops, legacy admin
 // namespaces).
+/// What a tree's primary keys are. The builder picks the SST filter by
+/// it: an `egid` tree's keys are 8-byte big-endian row ids, kept exactly
+/// in a roaring bitmap; a `bytes` tree's keys go through a hash into a
+/// binary fuse filter.
+pub const KeyKind = schema.EnumDef(.{
+    .{ .name = "bytes", .tag = 0 },
+    .{ .name = "egid", .tag = 1 },
+});
+
 pub const TreeChange = schema.Table(.{
     // 0=CREATE, 1=DELETE, 2=UPDATE
     .{ .id = 1, .name = "op", .ty = schema.Enum(Op) },
@@ -66,6 +80,8 @@ pub const TreeChange = schema.Table(.{
     .{ .id = 4, .name = "left_key", .ty = schema.Bytes },
     .{ .id = 5, .name = "right_key", .ty = schema.Bytes },
     .{ .id = 6, .name = "name", .ty = schema.Bytes },
+    // create only: fixed for the tree's life, inherited by a split.
+    .{ .id = 7, .name = "key_kind", .ty = schema.Enum(KeyKind) },
 });
 
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a

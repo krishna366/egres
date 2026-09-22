@@ -130,6 +130,11 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     const columns = try a.alloc(_schema.LogicalColumn, ct.columns.len);
     var names: std.ArrayList(String) = .empty;
     try names.append(a, ct.name);
+    // The base table's rows are keyed by egid; its unique-index trees
+    // are keyed by the indexed values.
+    var kinds: std.ArrayList(zdb.manifest.KeyKind) = .empty;
+    try kinds.append(a, .egid);
+
     var unique_cols: std.ArrayList(u32) = .empty;
     for (ct.columns, columns, 1..) |c, *lc, id| {
         lc.* = .{
@@ -154,12 +159,14 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             try std.fmt.allocPrint(a, "{s}_pkey", .{ct.name})
         else
             try std.fmt.allocPrint(a, "{s}_{s}_key", .{ ct.name, c.name }));
+        try kinds.append(a, .bytes);
     }
 
     const created = eng.forest.buildCreateTables(
         a,
         ns,
         names.items,
+        kinds.items,
     ) catch |err| switch (err) {
         error.NameExists => return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table or index name already exists"),
         else => |e| {

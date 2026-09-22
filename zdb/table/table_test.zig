@@ -227,14 +227,89 @@ test "table binary fuse contains keys" {
     defer destroyTable(t);
 
     // Sample present keys.
-    try std.testing.expect(t.containsKey(.{ .primary = "k000000" }));
-    try std.testing.expect(t.containsKey(.{ .primary = "k000500" }));
-    try std.testing.expect(t.containsKey(.{ .primary = "k001023" }));
+    try std.testing.expect(t.containsPrimary("k000000"));
+    try std.testing.expect(t.containsPrimary("k000500"));
+    try std.testing.expect(t.containsPrimary("k001023"));
 
-    // Absent keys — BF should reject (containsKey returns false).
-    try std.testing.expect(!t.containsKey(.{ .primary = "missing-1" }));
-    try std.testing.expect(!t.containsKey(.{ .primary = "missing-2" }));
-    try std.testing.expect(!t.containsKey(.{ .primary = "missing-3" }));
+    // Absent keys — BF should reject (containsPrimary returns false).
+    try std.testing.expect(!t.containsPrimary("missing-1"));
+    try std.testing.expect(!t.containsPrimary("missing-2"));
+    try std.testing.expect(!t.containsPrimary("missing-3"));
+}
+
+test "table egid filter is exact and replaces the fuse filter" {
+    const alloc = std.testing.allocator;
+
+    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024, .key_kind = .egid });
+    defer b.deinit();
+
+    // Every third egid from 3 to 3000, ascending as a base table's rows
+    // come.
+    var key_buf: [8]u8 = undefined;
+    var egid: u64 = 3;
+    while (egid <= 3000) : (egid += 3) {
+        std.mem.writeInt(u64, &key_buf, egid, .big);
+        try b.add(.{ .primary = &key_buf }, egid, "v");
+    }
+
+    var tb = try b.finish();
+    defer tb.deinit();
+
+    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(t);
+    try std.testing.expect(t.egid_bm != null);
+    try std.testing.expect(t.binary_fuse == null);
+
+    // Exact: every present id hits, every absent one misses. A fuse
+    // filter could only promise the first.
+    egid = 1;
+    while (egid <= 3003) : (egid += 1) {
+        std.mem.writeInt(u64, &key_buf, egid, .big);
+        const want = egid % 3 == 0 and egid <= 3000;
+        try std.testing.expectEqual(want, t.containsPrimary(&key_buf));
+        try std.testing.expectEqual(
+            want,
+            t.containsPrimaryHash(&key_buf, zdb.kv.bloomHash(&key_buf)),
+        );
+    }
+    // Not an egid at all: certainly not in an egid table.
+    try std.testing.expect(!t.containsPrimary("k000003"));
+}
+
+test "table egid filter of dense ids is far smaller than a fuse filter" {
+    const alloc = std.testing.allocator;
+
+    // 70,000 contiguous egids, a flush table's worth of rows: two 64k
+    // chunks, each one 8 KiB bitmap container. A fuse filter is about
+    // two bytes per key, 140 KiB here.
+    var b = Builder.init(alloc, .{ .target_block_size = 64 * 1024, .key_kind = .egid });
+    defer b.deinit();
+    var key_buf: [8]u8 = undefined;
+    var egid: u64 = 1;
+    while (egid <= 70_000) : (egid += 1) {
+        std.mem.writeInt(u64, &key_buf, egid, .big);
+        try b.add(.{ .primary = &key_buf }, egid, "v");
+    }
+    var tb = try b.finish();
+    defer tb.deinit();
+
+    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(t);
+    // The bitmap's buffer is the filter as stored; the index struct's
+    // copy of it is released on open.
+    try std.testing.expect(t.egid_bm.?.toBuffer().len < 20 * 1024);
+    try std.testing.expectEqual(0, t.index.egid_bitmap.len);
+    std.mem.writeInt(u64, &key_buf, 70_000, .big);
+    try std.testing.expect(t.containsPrimary(&key_buf));
+    std.mem.writeInt(u64, &key_buf, 70_001, .big);
+    try std.testing.expect(!t.containsPrimary(&key_buf));
+}
+
+test "table egid builder rejects a key that is not an egid" {
+    const alloc = std.testing.allocator;
+    var b = Builder.init(alloc, .{ .key_kind = .egid });
+    defer b.deinit();
+    try std.testing.expectError(error.KeyNotEgid, b.add(.{ .primary = "k000001" }, 1, "v"));
 }
 
 test "table binary fuse large keyset contains sampled keys" {
@@ -267,7 +342,7 @@ test "table binary fuse large keyset contains sampled keys" {
         const idx = rnd.uintAtMost(u64, n - 1);
         var key_buf: [16]u8 = undefined;
         const key_no_ts = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{idx});
-        try std.testing.expect(t.containsKey(.{ .primary = key_no_ts }));
+        try std.testing.expect(t.containsPrimary(key_no_ts));
     }
 
     var non_added_matches: usize = 0;
@@ -276,7 +351,7 @@ test "table binary fuse large keyset contains sampled keys" {
         const idx = @as(u64, n) + rnd.uintAtMost(u64, n - 1);
         var key_buf: [16]u8 = undefined;
         const key_no_ts = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{idx});
-        if (t.containsKey(.{ .primary = key_no_ts })) {
+        if (t.containsPrimary(key_no_ts)) {
             non_added_matches += 1;
         }
     }
@@ -1152,19 +1227,24 @@ test "table: SST written before format_version is rejected" {
     var tb = try buildTestTable(alloc, "foo", 10, 4096);
     defer tb.deinit();
 
-    // Rewind the index to look like one written before field id 10 existed:
-    // shrink its size_bytes so formatVersion() reads back 0 from a slot past
-    // the header. Then repair the index checksum, because the whole point is
-    // that checksums do NOT catch a stale entry format — only this gate does.
+    // Make the index look like one written under an older entry
+    // encoding: format_version is field id 1, a u32 in the slot right
+    // after the 2-byte header size, so zero that slot and formatVersion()
+    // reads 0. Then repair the index checksum, because the whole point is
+    // that checksums do NOT catch a stale entry format; only this gate
+    // does.
     const bytes = tb.bytes;
     const trailer_at = bytes.len - 12;
     const index_len = std.mem.readInt(u32, bytes[trailer_at..][0..4], .little);
     const index_at = trailer_at - index_len;
     const index_bytes = bytes[index_at..trailer_at];
 
-    const cur_size = std.mem.readInt(u16, index_bytes[0..2], .little);
-    try std.testing.expectEqual(@as(u16, 51), cur_size);
-    std.mem.writeInt(u16, index_bytes[0..2], 47, .little);
+    const version_slot = index_bytes[2..6];
+    try std.testing.expectEqual(
+        zdb.table.index.format_version,
+        std.mem.readInt(u32, version_slot, .little),
+    );
+    std.mem.writeInt(u32, version_slot, 0, .little);
     std.mem.writeInt(u64, bytes[trailer_at + 4 ..][0..8], zbuf.hash(index_bytes), .little);
 
     try std.testing.expectError(

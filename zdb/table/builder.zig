@@ -1,4 +1,5 @@
 const std = @import("std");
+const kv = @import("../kv.zig");
 const Key = @import("../kv.zig").Key;
 const Item = @import("../kv.zig").Item;
 const Version = @import("../kv.zig").Version;
@@ -8,6 +9,7 @@ const utils = @import("utils");
 const String = utils.String;
 const compress = utils.compression;
 const _binaryfuse = @import("../binaryfusefilter.zig");
+const zroar = @import("zroar");
 const vfs = @import("vfs");
 const zbuf = @import("zbuf").zbuf;
 
@@ -99,12 +101,22 @@ pub const Error = error{
     ValueTooLarge,
     TooManyBlocks,
     IntegerOverflow,
+    /// A key of an `egid` tree that is not an 8-byte egid.
+    KeyNotEgid,
 } || _buffers.Error || compress.Error || std.mem.Allocator.Error || _binaryfuse.Error;
 
 pub const Config = struct {
     target_block_size: usize = 32 * 1024,
     codec: compress.Codec = .none,
     priority: vfs.Priority = .p2,
+    /// The filter the table carries (`buffers.KeyKind`, the tree's). An
+    /// `egid` table keeps its keys, 8-byte big-endian row ids, exactly in
+    /// a roaring bitmap: a miss is certain, a hit is certain, and a
+    /// table of dense ids costs 8 KiB per 64k-id chunk, against about
+    /// two bytes per key for a fuse filter (sparse ids cost the same two
+    /// bytes each). A `bytes` table hashes its keys into a binary fuse
+    /// filter.
+    key_kind: _buffers.KeyKindEnum = .bytes,
 };
 
 const BlockInfo = struct {
@@ -142,7 +154,12 @@ pub const Builder = struct {
     cur_base_key: std.ArrayList(u8),
     block_infos: std.ArrayList(BlockInfo),
     last_key: std.ArrayList(u8),
+    /// For the table's filter, one entry per key: `bf_hashes` the key
+    /// hashes of a `bytes` table, `egids` the keys themselves of an
+    /// `egid` table, kept as the bitmap the index stores. Only one is
+    /// filled; `egids` is created on the first egid key.
     bf_hashes: std.ArrayList(u64),
+    egid_bm: ?zroar.Bitmap,
     key_count: u32,
     max_version: u64,
     uncompressed_size: u32,
@@ -169,6 +186,7 @@ pub const Builder = struct {
             .block_infos = .empty,
             .last_key = .empty,
             .bf_hashes = .empty,
+            .egid_bm = null,
             .key_count = 0,
             .max_version = 0,
             .uncompressed_size = 0,
@@ -184,6 +202,7 @@ pub const Builder = struct {
         self.block_infos.deinit(self.allocator);
         self.last_key.deinit(self.allocator);
         self.bf_hashes.deinit(self.allocator);
+        if (self.egid_bm) |*bm| bm.deinit();
         self.cur_base_key.deinit(self.allocator);
         self.cur_offsets.deinit(self.allocator);
         self.cur_entries.deinit(self.allocator);
@@ -201,6 +220,10 @@ pub const Builder = struct {
         self.block_infos.clearRetainingCapacity();
         self.last_key.clearRetainingCapacity();
         self.bf_hashes.clearRetainingCapacity();
+        // A bitmap cannot be emptied in place; the next egid key makes
+        // a new one.
+        if (self.egid_bm) |*bm| bm.deinit();
+        self.egid_bm = null;
         self.cur_base_key.clearRetainingCapacity();
         self.cur_offsets.clearRetainingCapacity();
         self.cur_entries.clearRetainingCapacity();
@@ -272,7 +295,21 @@ pub const Builder = struct {
                 return error.KeyOrderViolation;
             }
         }
-        try self.bf_hashes.append(self.allocator, key.bloomHash());
+        switch (self.cfg.key_kind) {
+            .bytes => try self.bf_hashes.append(
+                self.allocator,
+                kv.bloomHash(key.primary),
+            ),
+            .egid => {
+                if (key.primary.len != 8) return error.KeyNotEgid;
+                if (self.egid_bm == null) {
+                    self.egid_bm = try zroar.Bitmap.init(self.allocator);
+                }
+                const egid = std.mem.readInt(u64, key.primary[0..8], .big);
+                _ = try self.egid_bm.?.set(egid);
+            },
+            _ => return error.KeyNotEgid,
+        }
 
         // Marshal into last_key scratch buffer for prefix compression.
         self.last_key.clearRetainingCapacity();
@@ -448,6 +485,12 @@ pub const Builder = struct {
         try index_writer.setCompression(@enumFromInt(@intFromEnum(self.cfg.codec)));
         if (binary_fuse_off) |off| {
             try index_writer.setBinaryFuse(off);
+        }
+        // The egid filter: the keys, exactly, as the bitmap `addItem`
+        // filled.
+        if (self.egid_bm) |*bm| {
+            try bm.compact();
+            try index_writer.setEgidBitmap(bm.toBuffer());
         }
 
         _ = try index_writer.finish();
