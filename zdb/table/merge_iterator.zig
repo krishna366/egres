@@ -315,7 +315,8 @@ pub const MergeIterator = struct {
 pub const ConcatIterator = struct {
     iters: []_table.TableIterator, // caller-owned slice; sorted by smallest key
     current: usize, // == iters.len when exhausted
-    end: Key = .{}, // upper bound carried over from `seekRange` for lazy seeking
+    /// Upper bound carried over from `seekRange` for lazy seeking.
+    end: Key = Key.inf,
 
     pub fn init(iters: []_table.TableIterator) ConcatIterator {
         return .{ .iters = iters, .current = 0 };
@@ -333,13 +334,13 @@ pub const ConcatIterator = struct {
         self.end = end;
         if (self.iters.len == 0) return;
 
-        if (start.len() == 0) {
+        if (start.isInf()) {
             self.current = 0;
         } else {
             // First table whose biggest key >= start.
             self.current = utils.search(_table.TableIterator, self.iters, start, struct {
                 fn f(sk: Key, it: _table.TableIterator) bool {
-                    return it.table.biggest.order(sk) != .lt;
+                    return it.table.biggest.orderPrimary(sk) != .lt;
                 }
             }.f);
             if (self.current >= self.iters.len) return;
@@ -367,7 +368,7 @@ pub const ConcatIterator = struct {
         while (self.iters[self.current].itemRef() == null) {
             self.current += 1;
             if (self.current >= self.iters.len) return;
-            try self.iters[self.current].seekRange(.{}, self.end);
+            try self.iters[self.current].seekRange(Key.inf, self.end);
         }
     }
 };

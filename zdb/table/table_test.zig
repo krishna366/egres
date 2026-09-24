@@ -4,6 +4,10 @@ const String = utils.String;
 const zdb = @import("zdb");
 const zbuf = @import("zbuf").zbuf;
 const Key = zdb.kv.Key;
+const TableKey = zdb.kv.TableKey;
+/// The ids stamped on keys by tests that read a table on its own: an
+/// SST stores primaries only, so any table key works.
+const zero_table_key: TableKey = .{ .namespace = 0, .table_id = 0 };
 const Item = zdb.kv.Item;
 const Meta = zdb.kv.Meta;
 const Version = zdb.kv.Version;
@@ -132,12 +136,12 @@ test "table builder/reader roundtrip and seek" {
     try std.testing.expectEqual(@as(u64, 9), r.index.max_version);
     try std.testing.expect(r.blockCount() >= 1);
 
-    var it = TableIterator.init(std.testing.allocator, r, .p0);
+    var it = TableIterator.init(std.testing.allocator, r, .p0, zero_table_key);
     defer it.deinit();
-    try it.seekRange(.{}, .{});
+    try it.seekRange(Key.inf, Key.inf);
     try std.testing.expectEqualStrings("va9", it.itemRef().?.newest().value);
 
-    try it.seekRange(.{ .primary = "b" }, .{});
+    try it.seekRange(.{ .primary = "b" }, Key.inf);
     try std.testing.expectEqualStrings("vb3", it.itemRef().?.newest().value);
 }
 
@@ -167,12 +171,12 @@ test "seekGe: prefix-length and version ordering" {
     // One block, so every seek exercises the in-block search.
     try std.testing.expectEqual(@as(usize, 1), t.blockCount());
 
-    var it = TableIterator.init(alloc, t, .p0);
+    var it = TableIterator.init(alloc, t, .p0, zero_table_key);
     defer it.deinit();
 
     // Stored order is the seek order, one item per key.
     const want = [_]String{ "a5", "ab9", "abc1", "b7" };
-    try it.seekRange(.{}, .{});
+    try it.seekRange(Key.inf, Key.inf);
     for (want) |v| {
         try std.testing.expectEqualStrings(v, it.itemRef().?.newest().value);
         try it.next();
@@ -190,21 +194,148 @@ test "seekGe: prefix-length and version ordering" {
         .{ .k = .{ .primary = "az" }, .want = "b7" },
     };
     for (cases) |c| {
-        try it.seekRange(c.k, .{});
+        try it.seekRange(c.k, Key.inf);
         const got = it.itemRef().?.newest().value;
         try std.testing.expectEqualStrings(c.want, got);
     }
 
     // A key's item carries its older versions after the newest one.
-    try it.seekRange(.{ .primary = "ab" }, .{});
+    try it.seekRange(.{ .primary = "ab" }, Key.inf);
     const ab = it.itemRef().?;
     try std.testing.expectEqualStrings("ab3", ab.versions.slice()[1].value);
     try it.next();
     try std.testing.expectEqualStrings("abc1", it.itemRef().?.newest().value);
 
     // Past every key: nothing left.
-    try it.seekRange(.{ .primary = "c" }, .{});
+    try it.seekRange(.{ .primary = "c" }, Key.inf);
     try std.testing.expect(it.itemRef() == null);
+}
+
+test "table stores primaries only and the iterator stamps the tree's ids" {
+    const alloc = std.testing.allocator;
+
+    // Keys written with one namespace and table_id...
+    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    defer b.deinit();
+    for (0..300) |i| {
+        var key_buf: [16]u8 = undefined;
+        const primary = try std.fmt.bufPrint(&key_buf, "k{d:0>6}", .{i});
+        try b.add(.{ .namespace = 7, .table_id = 3, .primary = primary }, @intCast(i + 1), "v");
+    }
+    var tb = try b.finish();
+    defer tb.deinit();
+
+    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(t);
+
+    // ...leave no trace of them in the file: the bounds and the block
+    // base keys are primaries.
+    try std.testing.expectEqual(@as(u64, 0), t.smallest.namespace);
+    try std.testing.expectEqual(@as(u32, 0), t.smallest.table_id);
+    try std.testing.expectEqualStrings("k000000", t.smallest.primary);
+    try std.testing.expectEqualStrings("k000299", t.biggest.primary);
+    try std.testing.expectEqualStrings("k000000", try t.blockBaseKey(0));
+    try std.testing.expect(t.blockCount() > 1);
+    try std.testing.expect(std.mem.startsWith(u8, try t.blockBaseKey(1), "k"));
+
+    // A tree that lists the file opens it with its own ids, and every
+    // key comes back with them, whatever the writer's were. Seeks use
+    // the primary, so a full key of that tree lands.
+    for ([_]TableKey{
+        .{ .namespace = 7, .table_id = 3 },
+        .{ .namespace = 9, .table_id = 40 },
+    }) |owner| {
+        var it = TableIterator.init(alloc, t, .p0, owner);
+        defer it.deinit();
+        try it.seekRange(.{
+            .namespace = owner.namespace,
+            .table_id = owner.table_id,
+            .primary = "k000150",
+        }, .{
+            .namespace = owner.namespace,
+            .table_id = owner.table_id,
+            .primary = "k000153",
+        });
+        var n: usize = 0;
+        while (it.itemRef()) |item| : (try it.next()) {
+            try std.testing.expectEqual(owner.namespace, item.key.namespace);
+            try std.testing.expectEqual(owner.table_id, item.key.table_id);
+            var want_buf: [16]u8 = undefined;
+            const want = try std.fmt.bufPrint(&want_buf, "k{d:0>6}", .{150 + n});
+            try std.testing.expectEqualStrings(want, item.key.primary);
+            n += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), n);
+    }
+}
+
+test "table iterator reads the table's infinity as no bound" {
+    const alloc = std.testing.allocator;
+
+    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    defer b.deinit();
+    for (0..50) |i| {
+        var key_buf: [16]u8 = undefined;
+        const primary = try std.fmt.bufPrint(&key_buf, "k{d:0>3}", .{i});
+        try b.add(.{ .primary = primary }, @intCast(i + 1), "v");
+    }
+    var tb = try b.finish();
+    defer tb.deinit();
+    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    defer destroyTable(t);
+
+    const count = struct {
+        fn f(a: std.mem.Allocator, tbl: *Table, start: Key, end: Key) !usize {
+            var it = TableIterator.init(
+                a,
+                tbl,
+                .p0,
+                .{ .namespace = 5, .table_id = 20 },
+            );
+            defer it.deinit();
+            try it.seekRange(start, end);
+            var n: usize = 0;
+            while (it.itemRef() != null) : (try it.next()) n += 1;
+            return n;
+        }
+    }.f;
+    const own = struct {
+        fn key(primary: String) Key {
+            return .{ .namespace = 5, .table_id = 20, .primary = primary };
+        }
+    };
+
+    // A whole-table scan, as `KeyRange.limitToTable` builds it: between
+    // the table's edges. An edge's primary is empty, but it is a bound
+    // for a memtable, and no bound here.
+    const left = Key.tableLeft(.{ .namespace = 5, .table_id = 20 });
+    const end = Key.tableRight(.{ .namespace = 5, .table_id = 20 });
+    try std.testing.expect(!end.isInf());
+    try std.testing.expectEqual(
+        @as(usize, 50),
+        try count(alloc, t, left, end),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 50),
+        try count(alloc, t, own.key("\x00"), end),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 50),
+        try count(alloc, t, Key.inf, Key.inf),
+    );
+    // Within the table, primaries decide.
+    try std.testing.expectEqual(@as(usize, 10), try count(alloc, t, own.key("k010"), own.key("k020")));
+    try std.testing.expectEqual(
+        @as(usize, 40),
+        try count(alloc, t, own.key("k010"), end),
+    );
+    // The edges sort outside every key of their table and inside the
+    // neighbouring tables' keys.
+    try std.testing.expect(left.order(own.key("\x00")) == .lt);
+    try std.testing.expect(own.key("k049").order(end) == .lt);
+    const next_table = Key{ .namespace = 5, .table_id = 21, .primary = "\x00" };
+    try std.testing.expect(end.order(next_table) == .lt);
+    try std.testing.expect(end.orderPrimary(own.key("zzz")) == .gt);
 }
 
 test "table binary fuse contains keys" {
@@ -401,14 +532,24 @@ test "merge iterator merges sorted streams" {
     defer destroyTable(r2);
 
     var iters = [_]zdb.table.merge_iterator.Iterator{
-        .{ .table = TableIterator.init(std.testing.allocator, r1, .p0) },
-        .{ .table = TableIterator.init(std.testing.allocator, r2, .p0) },
+        .{ .table = TableIterator.init(
+            std.testing.allocator,
+            r1,
+            .p0,
+            zero_table_key,
+        ) },
+        .{ .table = TableIterator.init(
+            std.testing.allocator,
+            r2,
+            .p0,
+            zero_table_key,
+        ) },
     };
     const MergeIterator = zdb.table.merge_iterator.MergeIterator;
     var m = try MergeIterator.init(std.testing.allocator, iters[0..]);
     defer m.deinit();
 
-    try m.seekRange(.{}, .{});
+    try m.seekRange(Key.inf, Key.inf);
     try std.testing.expectEqualStrings("a5", m.itemRef().?.newest().value);
     try m.next();
     try std.testing.expectEqualStrings("b4", m.itemRef().?.newest().value);
@@ -458,14 +599,14 @@ test "merge iterator gathers one primary from every source" {
     defer destroyTable(r3);
 
     var iters = [_]zdb.table.merge_iterator.Iterator{
-        .{ .table = TableIterator.init(alloc, r1, .p0) },
-        .{ .table = TableIterator.init(alloc, r2, .p0) },
-        .{ .table = TableIterator.init(alloc, r3, .p0) },
+        .{ .table = TableIterator.init(alloc, r1, .p0, zero_table_key) },
+        .{ .table = TableIterator.init(alloc, r2, .p0, zero_table_key) },
+        .{ .table = TableIterator.init(alloc, r3, .p0, zero_table_key) },
     };
     var m = try zdb.table.merge_iterator.MergeIterator.init(alloc, iters[0..]);
     defer m.deinit();
 
-    try m.seekRange(.{}, .{});
+    try m.seekRange(Key.inf, Key.inf);
     const a = m.itemRef().?;
     try std.testing.expectEqualStrings("a", a.key.primary);
     try std.testing.expectEqual(@as(usize, 1), a.versions.len());
@@ -540,9 +681,9 @@ test "packed: one entry holds every version of a key" {
     try std.testing.expectEqual(@as(u32, 46), t.index.key_count);
     try std.testing.expectEqual(@as(u64, 1000), t.index.max_version);
 
-    var it = TableIterator.init(alloc, t, .p0);
+    var it = TableIterator.init(alloc, t, .p0, zero_table_key);
     defer it.deinit();
-    try it.seekRange(.{}, .{});
+    try it.seekRange(Key.inf, Key.inf);
     for (items) |want| {
         const got = it.itemRef().?;
         try std.testing.expectEqualStrings(want.key.primary, got.key.primary);
@@ -586,9 +727,9 @@ test "packed: a chain past the block target is still one entry" {
     const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(t);
 
-    var it = TableIterator.init(alloc, t, .p0);
+    var it = TableIterator.init(alloc, t, .p0, zero_table_key);
     defer it.deinit();
-    try it.seekRange(.{ .primary = "chain" }, .{});
+    try it.seekRange(.{ .primary = "chain" }, Key.inf);
     const got = it.itemRef().?;
     try std.testing.expectEqual(@as(usize, 64), got.versions.len());
     try std.testing.expectEqualStrings(wide, got.versions.slice()[63].value);
@@ -665,11 +806,11 @@ test "table iterator: forward scan" {
         const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
         defer destroyTable(tbl);
 
-        var it = TableIterator.init(alloc, tbl, .p0);
+        var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
         defer it.deinit();
 
         var count: usize = 0;
-        try it.seekRange(.{}, .{});
+        try it.seekRange(Key.inf, Key.inf);
         while (it.itemRef()) |entry| : (count += 1) {
             var key_buf: [32]u8 = undefined;
             const expected_key_no_ts = try std.fmt.bufPrint(&key_buf, "key{d:0>4}", .{count});
@@ -698,10 +839,10 @@ test "seek to first" {
         const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
         defer destroyTable(tbl);
 
-        var it = TableIterator.init(alloc, tbl, .p0);
+        var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
         defer it.deinit();
 
-        try it.seekRange(.{}, .{});
+        try it.seekRange(Key.inf, Key.inf);
         const entry = it.itemRef() orelse return error.UnexpectedNull;
         try std.testing.expectEqualStrings("0", entry.newest().value);
         try std.testing.expectEqualStrings("key0000", entry.key.primary);
@@ -719,7 +860,7 @@ test "seek: various targets" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(tbl);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
 
     const Case = struct { in: String, valid: bool, out: String };
@@ -734,7 +875,7 @@ test "seek: various targets" {
     };
 
     for (cases) |c| {
-        try it.seekRange(.{ .primary = c.in }, .{});
+        try it.seekRange(.{ .primary = c.in }, Key.inf);
         if (!c.valid) {
             try std.testing.expect(it.itemRef() == null);
             continue;
@@ -756,11 +897,11 @@ test "iterate from start: full scan" {
         const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
         defer destroyTable(tbl);
 
-        var it = TableIterator.init(alloc, tbl, .p0);
+        var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
         defer it.deinit();
 
         var count: usize = 0;
-        try it.seekRange(.{}, .{});
+        try it.seekRange(Key.inf, Key.inf);
         while (it.itemRef() != null) : (count += 1) {
             try it.next();
         }
@@ -779,11 +920,11 @@ test "table: seek and iterate to end" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(tbl);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
 
     // Seek to key1010, iterate to end — should visit keys 1010..9999.
-    try it.seekRange(.{ .primary = "key1010" }, .{});
+    try it.seekRange(.{ .primary = "key1010" }, Key.inf);
     var kid: usize = 1010;
     while (it.itemRef()) |entry| : (kid += 1) {
         var buf: [32]u8 = undefined;
@@ -794,11 +935,11 @@ test "table: seek and iterate to end" {
     try std.testing.expectEqual(@as(usize, 10000), kid);
 
     // Seek past end → invalid.
-    try it.seekRange(.{ .primary = "key99999" }, .{});
+    try it.seekRange(.{ .primary = "key99999" }, Key.inf);
     try std.testing.expect(it.itemRef() == null);
 
     // Seek before start → first key.
-    try it.seekRange(.{ .primary = "aaa" }, .{});
+    try it.seekRange(.{ .primary = "aaa" }, Key.inf);
     const first = it.itemRef() orelse return error.UnexpectedNull;
     try std.testing.expectEqualStrings("key0000", first.key.primary);
 }
@@ -877,9 +1018,9 @@ test "table: big values" {
 
     try std.testing.expectEqual(@as(u32, n), tbl.index.key_count);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
-    try it.seekRange(.{}, .{});
+    try it.seekRange(Key.inf, Key.inf);
 
     var count: usize = 0;
     while (it.itemRef()) |entry| : (count += 1) {
@@ -904,11 +1045,11 @@ test "seekRange: end truncates iteration" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(tbl);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
 
     // Stop before k0050.
-    try it.seekRange(.{}, .{ .primary = "k0050" });
+    try it.seekRange(Key.inf, .{ .primary = "k0050" });
 
     var count: usize = 0;
     while (it.itemRef()) |_| : (count += 1) {
@@ -924,10 +1065,10 @@ test "seekRange: end after all keys returns everything" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(tbl);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
 
-    try it.seekRange(.{}, .{ .primary = "z" });
+    try it.seekRange(Key.inf, .{ .primary = "z" });
 
     var count: usize = 0;
     while (it.itemRef()) |_| : (count += 1) {
@@ -943,10 +1084,10 @@ test "seekRange: end before all keys returns nothing" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(tbl);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
 
-    try it.seekRange(.{}, .{ .primary = "a" });
+    try it.seekRange(Key.inf, .{ .primary = "a" });
 
     try std.testing.expect(it.itemRef() == null);
 }
@@ -958,12 +1099,12 @@ test "seekRange: no end restores full iteration" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(tbl);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
 
     // Set a bound, then clear it with a new seekRange.
-    try it.seekRange(.{}, .{ .primary = "k0010" });
-    try it.seekRange(.{}, .{});
+    try it.seekRange(Key.inf, .{ .primary = "k0010" });
+    try it.seekRange(Key.inf, Key.inf);
 
     var count: usize = 0;
     while (it.itemRef()) |_| : (count += 1) {
@@ -979,7 +1120,7 @@ test "seekRange: start + end combined" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(tbl);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
 
     // Iterate only k0020..k0029.
@@ -1010,7 +1151,7 @@ test "seekRange: multiple blocks within a single table" {
     // Sanity: we have more than one block.
     try std.testing.expect(tbl.blockCount() > 1);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
 
     // Range: k0050..k0150 (exclusive), spanning multiple blocks.
@@ -1049,9 +1190,9 @@ test "seekRange: ConcatIterator across multiple tables" {
     defer destroyTable(tbl2);
 
     var table_iters = [_]TableIterator{
-        TableIterator.init(alloc, tbl0, .p0),
-        TableIterator.init(alloc, tbl1, .p0),
-        TableIterator.init(alloc, tbl2, .p0),
+        TableIterator.init(alloc, tbl0, .p0, zero_table_key),
+        TableIterator.init(alloc, tbl1, .p0, zero_table_key),
+        TableIterator.init(alloc, tbl2, .p0, zero_table_key),
     };
 
     var concat = merge_iterator.ConcatIterator.init(&table_iters);
@@ -1082,11 +1223,11 @@ test "seekRange: ConcatIterator across multiple tables" {
     try std.testing.expectEqual(@as(usize, 60), count);
 
     // Range past all tables.
-    try concat.seekRange(.{ .primary = "z" }, .{});
+    try concat.seekRange(.{ .primary = "z" }, Key.inf);
     try std.testing.expect(concat.itemRef() == null);
 
     // Range before all tables with end inside first table.
-    try concat.seekRange(.{}, .{ .primary = "k0010" });
+    try concat.seekRange(Key.inf, .{ .primary = "k0010" });
     count = 0;
     while (concat.itemRef()) |_| : (count += 1) {
         try concat.next();
@@ -1098,7 +1239,7 @@ test "seekRange: ConcatIterator across multiple tables" {
     // up-front; once `next()` exhausted iters[0] and advanced to
     // iters[1], `itemRef()` returned null (never seeked) and the
     // ConcatIterator declared itself done after just the first table.
-    try concat.seekRange(.{}, .{});
+    try concat.seekRange(Key.inf, Key.inf);
     count = 0;
     while (concat.itemRef()) |entry| : (count += 1) {
         var buf: [32]u8 = undefined;
@@ -1164,9 +1305,9 @@ test "table: meta round-trips through builder and iterator" {
     const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(tbl);
 
-    var it = TableIterator.init(alloc, tbl, .p0);
+    var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
     defer it.deinit();
-    try it.seekRange(.{}, .{});
+    try it.seekRange(Key.inf, Key.inf);
 
     var count: usize = 0;
     while (it.itemRef()) |item| {
@@ -1212,9 +1353,9 @@ test "table: meta survives random access via seekGe" {
         var key_buf: [32]u8 = undefined;
         const key_str = try std.fmt.bufPrint(&key_buf, "k:{d:0>4}", .{target});
 
-        var it = TableIterator.init(alloc, tbl, .p0);
+        var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
         defer it.deinit();
-        try it.seekRange(.{ .primary = key_str }, .{});
+        try it.seekRange(.{ .primary = key_str }, Key.inf);
 
         const item = it.itemRef() orelse return error.TestExpectedItem;
         try std.testing.expectEqualStrings(key_str, item.key.primary);

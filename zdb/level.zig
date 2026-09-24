@@ -1,5 +1,7 @@
 const std = @import("std");
 const Key = @import("kv.zig").Key;
+const TableKey = @import("kv.zig").TableKey;
+const KeyRange = @import("kv.zig").KeyRange;
 const _table = @import("table.zig");
 const vfs = @import("vfs");
 const utils = @import("utils");
@@ -11,117 +13,6 @@ const Item = _table.table.Item;
 const Lookup = @import("read.zig").Lookup;
 
 pub const Error = _table.table.Error;
-
-// ---------------------------------------------------------------------------
-// KeyRange
-// ---------------------------------------------------------------------------
-
-// Low sentinel for a table's start: an EMPTY primary reads as fully-open, so
-// table-scoped bounds use this non-empty minimum instead. Static so
-// `limitToTable` can hand out slices into it.
-const table_lo = [_]u8{0};
-
-pub const KeyRange = struct {
-    left: Key = .{},
-    right: Key = .{},
-    inf: bool = false,
-
-    /// This range CLAMPED to one table's key window `[table_start, table_end)`
-    /// (table_end = the next table_id's start, exclusive) — i.e. intersect with
-    /// the table range. A left below the table (a lower namespace/table, or
-    /// empty) is raised to table_start; a right at/above the end (or empty =
-    /// open) is lowered to table_end; a left/right genuinely inside the table is
-    /// kept. So a scan over the namespace-wide memtable stays within the table
-    /// instead of grafting one key's primary onto another.
-    pub fn limitToTable(self: KeyRange, ns: u64, table_id: u32) KeyRange {
-        return self.intersect(.{
-            .left = .{
-                .namespace = ns,
-                .table_id = table_id,
-                .primary = &table_lo,
-            },
-            .right = .{
-                .namespace = ns,
-                .table_id = table_id +| 1,
-                .primary = &table_lo,
-            },
-        });
-    }
-
-    pub fn isEmpty(self: KeyRange) bool {
-        return self.left.primary.len == 0 and self.right.primary.len == 0 and !self.inf;
-    }
-
-    /// Deep copy: dupes the underlying primary bytes for both bounds
-    /// using `allocator`. The original Keys may borrow from
-    /// short-lived storage (e.g. manifest entries protected by a
-    /// lock); duping into an allocator the caller controls keeps the
-    /// range usable after that storage is released.
-    pub fn dupe(self: KeyRange, allocator: std.mem.Allocator) !KeyRange {
-        return .{
-            .left = try self.left.dupe(allocator),
-            .right = try self.right.dupe(allocator),
-            .inf = self.inf,
-        };
-    }
-
-    pub fn overlapsWith(self: KeyRange, other: KeyRange) bool {
-        if (self.isEmpty()) return true;
-        if (other.isEmpty()) return false;
-        if (self.inf or other.inf) return true;
-        // [other.left, other.right] ... [self.left, self.right]
-        if (other.right.order(self.left) == .lt) return false;
-        // [self.left, self.right] ... [other.left, other.right]
-        if (self.right.order(other.left) == .lt) return false;
-        return true;
-    }
-
-    pub fn extend(self: *KeyRange, other: KeyRange) void {
-        if (other.isEmpty()) return;
-        if (self.isEmpty()) {
-            self.* = other;
-            return;
-        }
-        if (self.left.primary.len == 0 or other.left.order(self.left) == .lt) {
-            self.left = other.left;
-        }
-        if (self.right.primary.len == 0 or other.right.order(self.right) == .gt) {
-            self.right = other.right;
-        }
-        if (other.inf) self.inf = true;
-    }
-
-    /// Tighten `self` against `other` and return the overlap. Empty
-    /// primary on either bound is treated as "open" (no constraint
-    /// from that side), so this composes naturally with caller-supplied
-    /// open scan bounds and tree-stored ranges. `inf` survives only
-    /// when BOTH sides are unbounded after tightening.
-    pub fn intersect(self: KeyRange, other: KeyRange) KeyRange {
-        const lhs = tighter_left(self.left, other.left);
-        const rhs = tighter_right(self.right, other.right);
-        return .{
-            .left = lhs,
-            .right = rhs,
-            .inf = lhs.primary.len == 0 and rhs.primary.len == 0,
-        };
-    }
-
-    /// Pick the "rightmost" lower bound (= max). An empty primary
-    /// means "unbounded on the left" — the OTHER bound wins.
-    fn tighter_left(a: Key, b: Key) Key {
-        if (a.primary.len == 0) return b;
-        if (b.primary.len == 0) return a;
-        return if (a.order(b) == .gt) a else b;
-    }
-
-    /// Pick the "leftmost" upper bound (= min). An empty primary means
-    /// "unbounded on the right" — the OTHER bound wins.
-    fn tighter_right(a: Key, b: Key) Key {
-        if (a.primary.len == 0) return b;
-        if (b.primary.len == 0) return a;
-        return if (a.order(b) == .lt) a else b;
-    }
-};
 
 // ---------------------------------------------------------------------------
 // TableEntry
@@ -197,7 +88,7 @@ pub const Level = struct {
     /// initEntries bulk-sets entries, sorts them, and recomputes total_size.
     pub fn initEntries(self: *Level, held: Lock.Exclusive, new_entries: []const TableEntry) !void {
         self.mu.assertHeld(held);
-        self.tables.clearRetainingCapacity();
+        utils.clearRetainCap(&self.tables);
         try self.tables.appendSlice(self.allocator, new_entries);
         self.sortEntries();
 
@@ -227,7 +118,7 @@ pub const Level = struct {
         } else {
             std.mem.sort(TableEntry, self.tables.items, {}, struct {
                 fn lt(_: void, a: TableEntry, b: TableEntry) bool {
-                    return a.table.smallest.order(b.table.smallest) == .lt;
+                    return a.table.smallest.orderPrimary(b.table.smallest) == .lt;
                 }
             }.lt);
         }
@@ -317,26 +208,26 @@ pub const Level = struct {
         const items = self.tables.items;
         const slice: []TableEntry = if (self.level == 0)
             items
-        else if (kr.isEmpty())
-            items[0..0]
         else blk: {
+            // The bounds are this tree's keys (the caller's contract), so
+            // primaries decide; an unbounded side or a table edge
+            // reaches the end on its side.
             // First table where kr.left <= biggest (could overlap on the left).
-            const left = utils.search(TableEntry, items, kr.left, struct {
-                fn f(kl: Key, e: TableEntry) bool {
-                    return kl.order(e.table.biggest) != .gt;
-                }
-            }.f);
+            const left = if (kr.left.isInf())
+                0
+            else
+                utils.search(TableEntry, items, kr.left, struct {
+                    fn f(kl: Key, e: TableEntry) bool {
+                        return kl.orderPrimary(e.table.biggest) != .gt;
+                    }
+                }.f);
             // First table where kr.right < smallest (no longer overlapping).
-            // An empty kr.right means "no upper bound" — sweep to end.
-            // Without this, the binary search would treat the empty primary
-            // as smaller than every table's smallest key and return 0,
-            // making the slice empty even when the left bound is well-formed.
-            const right = if (kr.right.primary.len == 0)
+            const right = if (kr.right.isInf() or kr.right.isTableEdge())
                 items.len
             else
                 utils.search(TableEntry, items, kr.right, struct {
                     fn f(right_key: Key, e: TableEntry) bool {
-                        return right_key.order(e.table.smallest) == .lt;
+                        return right_key.orderPrimary(e.table.smallest) == .lt;
                     }
                 }.f);
             break :blk items[left..right];
@@ -398,7 +289,7 @@ pub const Level = struct {
         // First table whose biggest key >= search_key.
         const lo = utils.search(TableEntry, self.tables.items, search_key, struct {
             fn f(sk: Key, e: TableEntry) bool {
-                return e.table.biggest.order(sk) != .lt;
+                return e.table.biggest.orderPrimary(sk) != .lt;
             }
         }.f);
         if (lo >= self.tables.items.len) return;
@@ -408,7 +299,7 @@ pub const Level = struct {
         // Verify the key can actually be in this table: a table whose
         // smallest primary is greater than the search primary cannot hold
         // the key at any timestamp.
-        if (e.table.smallest.order(search_key) == .gt) return;
+        if (e.table.smallest.orderPrimary(search_key) == .gt) return;
         if (!e.table.containsPrimary(search_key.primary)) return;
 
         try out.append(allocator, e);
@@ -424,12 +315,19 @@ pub const Level = struct {
         t: *Table,
         lookup: Lookup,
     ) Error!?Item {
-        var it = TableIterator.init(allocator, t, lookup.priority);
+        var it = TableIterator.init(
+            allocator,
+            t,
+            lookup.priority,
+            lookup.key.tableKey(),
+        );
         defer it.deinit();
 
-        try it.seekRange(lookup.key, .{});
+        try it.seekRange(lookup.key, Key.inf);
+
         const found = it.itemRef() orelse return null;
         if (found.key.order(lookup.key) != .eq) return null;
+
         const vis = found.visibleAt(lookup.read_ts) orelse return null;
         return try vis.dupe(allocator);
     }

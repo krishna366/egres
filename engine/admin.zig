@@ -978,22 +978,21 @@ pub const AdminServer = struct {
 
         // Scan range = [start, end). The bounds name primaries;
         // visibility is decided by read_ts, not by them. An empty
-        // primary on either side means "open."
-        const scan_start = Key{
+        // primary on either side means no bound on that side.
+        const scan_start: Key = if (req.start_key.len == 0) Key.inf else .{
             .namespace = req.ns,
             .primary = req.start_key,
         };
-        const scan_end: Key = if (req.end_key.len == 0) .{} else .{
+        const scan_end: Key = if (req.end_key.len == 0) Key.inf else .{
             .namespace = req.ns,
             .primary = req.end_key,
         };
-        // Admin scans the raw-KV table (table_id 0); limitToTable confines it
-        // to (req.ns, 0) across the namespace-wide memtable.
-        const scan_range = (zdb.level.KeyRange{
+        // Admin scans the raw-KV table (table_id 0); the cursor confines
+        // the range to (req.ns, 0) across the namespace-wide memtable.
+        const scan_range = zdb.kv.KeyRange{
             .left = scan_start,
             .right = scan_end,
-            .inf = req.start_key.len == 0 and req.end_key.len == 0,
-        }).limitToTable(req.ns, 0);
+        };
 
         // 4 KiB buffered writer — 1-2 items fit per drain at the bench's
         // 4 KiB value size; smaller modes pack many items per drain.
@@ -1028,6 +1027,7 @@ pub const AdminServer = struct {
 
         const emitted = self.engine.forest.scan(
             self.engine.allocator,
+            .{ .namespace = req.ns, .table_id = 0 },
             scan_range,
             .{
                 .max_rows = req.max_count,

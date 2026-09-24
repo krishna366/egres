@@ -103,7 +103,10 @@ const Fixture = struct {
         errdefer f_live.destroy();
         const f = try Forest.open(testing.allocator, f_live);
         errdefer f.close();
-        _ = try f.createTree(ns, tid, .{ .inf = true });
+        _ = try f.createTree(.{
+            .namespace = ns,
+            .table_id = tid,
+        }, .{});
         if (on_disk) {
             // The id-0 placeholder memtable is released, never flushed:
             // write into a real one.

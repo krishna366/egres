@@ -193,7 +193,10 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             .unique = true,
         };
     }
-    writeCatalogRows(self, a, ns, table_id, columns, indexes) catch |err| {
+    writeCatalogRows(self, a, .{
+        .namespace = ns,
+        .table_id = table_id,
+    }, columns, indexes) catch |err| {
         log.err("create table '{s}': catalog rows: {s}", .{ ct.name, @errorName(err) });
         return replyError(state, "create table failed writing catalog rows");
     };
@@ -213,8 +216,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
 pub fn writeCatalogRows(
     self: *Handler,
     a: std.mem.Allocator,
-    ns: u64,
-    table_id: u32,
+    table_key: zdb.kv.TableKey,
     columns: []const _schema.LogicalColumn,
     indexes: []const _catalog.IndexDef,
 ) !void {
@@ -226,11 +228,14 @@ pub fn writeCatalogRows(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(eng.allocator);
     for (columns, 0..) |lc, i| {
-        const cells = _catalog.encodeColumn(table_id, lc);
+        const cells = _catalog.encodeColumn(table_key.table_id, lc);
         const bytes = try _row.marshalRow(eng.allocator, &self.srv.catalog_ps, &cells, &buf);
-        const primary = _catalog.encodeKey(table_id, lc.column_id);
+        const primary = _catalog.encodeKey(
+            table_key.table_id,
+            lc.column_id,
+        );
         const k = zdb.kv.Key{
-            .namespace = ns,
+            .namespace = table_key.namespace,
             .table_id = _catalog.table_id,
             .primary = &primary,
         };
@@ -248,13 +253,13 @@ pub fn writeCatalogRows(
         );
         const primary = _catalog.encodeIndexKey(idx.base_table_id, idx.index_table_id);
         const k = zdb.kv.Key{
-            .namespace = ns,
+            .namespace = table_key.namespace,
             .table_id = _catalog.index_table_id,
             .primary = &primary,
         };
         kvs[i] = .{ .key = try k.marshal(a), .value = try a.dupe(u8, bytes) };
     }
-    try eng.proposeWrites(ns, kvs, .apply);
+    try eng.proposeWrites(table_key.namespace, kvs, .apply);
 }
 
 pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable) !void {
@@ -277,7 +282,10 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     // name an index (reject), and which index trees belong to it (drop
     // with the base below). Safe pre-lock: ddl_mu serializes every
     // catalog mutation; the table locks only fence in-flight DML.
-    var scan = _table.scanIndexKeys(a, eng.forest, ns, table_id) catch |err| {
+    var scan = _table.scanIndexKeys(a, eng.forest, .{
+        .namespace = ns,
+        .table_id = table_id,
+    }) catch |err| {
         log.err("drop table '{s}': index scan: {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table failed");
     };
@@ -313,7 +321,7 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     // Evict the cached Table (safe: we hold the exclusive table
     // table lock, and DML holds its Table only under the shared one).
     // Index table_ids are never cached — they have no columns.
-    try self.srv.forgetTable(ns, table_id);
+    try self.srv.forgetTable(.{ .namespace = ns, .table_id = table_id });
 
     log.info("dropped table '{s}' (ns={d} table_id={d} indexes={d})", .{ dt.name, ns, table_id, scan.table_ids.items.len - 1 });
     try state.sendCommandComplete("DROP TABLE");

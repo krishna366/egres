@@ -41,7 +41,10 @@ const Fixture = struct {
         errdefer f_live.destroy();
         const f = try Forest.open(testing.allocator, f_live);
         errdefer f.close();
-        _ = try f.createTree(ns, tid, .{ .inf = true });
+        _ = try f.createTree(.{
+            .namespace = ns,
+            .table_id = tid,
+        }, .{});
         try f.put(rows);
 
         return .{
@@ -513,7 +516,10 @@ test "txn: opposite posting ops annihilate; a later op re-opens" {
 test "txn: flattened postings fold through the forest into a bitmap" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();
-    _ = try fx.forest.createTree(ns, itid, .{ .inf = true });
+    _ = try fx.forest.createTree(.{
+        .namespace = ns,
+        .table_id = itid,
+    }, .{});
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
@@ -571,7 +577,10 @@ fn putWire(
 test "txn: overlayPostings applies pending ops onto a committed bitmap" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();
-    _ = try fx.forest.createTree(ns, itid, .{ .inf = true });
+    _ = try fx.forest.createTree(.{
+        .namespace = ns,
+        .table_id = itid,
+    }, .{});
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 

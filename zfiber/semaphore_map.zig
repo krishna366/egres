@@ -115,7 +115,9 @@ pub const SemaphoreMap = struct {
 
         /// Drop the previous walk, keep its capacity.
         fn restart(self: *Dfs) void {
-            self.stack.clearRetainingCapacity();
+            // Not clearRetainingCapacity (see utils.clearRetainCap):
+            // it memsets the retained items in safe builds.
+            self.stack.items.len = 0;
             self.visited.clearRetainingCapacity();
         }
 
@@ -374,8 +376,9 @@ pub const SemaphoreMap = struct {
             e.waiters.capacity > max_kept_capacity)
             return self.destroyEntry(e);
         e.rw = .{};
-        e.holders.clearRetainingCapacity();
-        e.waiters.clearRetainingCapacity();
+        // As above: keep the buffers without the safe-build memset.
+        e.holders.items.len = 0;
+        e.waiters.items.len = 0;
         // Capacity for max_pooled is reserved at init; the length guard
         // above makes this infallible.
         self.pool.appendAssumeCapacity(e);

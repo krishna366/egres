@@ -475,7 +475,7 @@ pub fn writeHelp(
         try line.start("      ");
         try line.word(head.items);
 
-        head.clearRetainingCapacity();
+        utils.clearRetainCap(&head);
         try head.append(allocator, '(');
         try head.appendSlice(allocator, comptime humanType(f.type, f.name));
         try writeHumanDefault(f.type, f.name, @field(default_t, f.name), &head, allocator);

@@ -193,9 +193,9 @@ pub const TableTrees = struct {
         var hi: usize = self.entries.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.entries.items[mid].key_range.left.order(
-                search_key,
-            ) != .gt) {
+            // The first tree's left is unbounded: below every key.
+            const left = self.entries.items[mid].key_range.left;
+            if (left.isInf() or left.order(search_key) != .gt) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -203,12 +203,8 @@ pub const TableTrees = struct {
         }
         if (lo == 0) return null;
         const candidate = self.entries.items[lo - 1];
-        if (candidate.key_range.inf) return candidate;
-        if (candidate.key_range.right.primary.len > 0 and
-            search_key.order(candidate.key_range.right) == .gt)
-        {
-            return null;
-        }
+        const right = candidate.key_range.right;
+        if (!right.isInf() and search_key.order(right) == .gt) return null;
         return candidate;
     }
 };
@@ -665,7 +661,7 @@ pub const Forest = struct {
         const newest_id = srcs[0].skiplist.skiplist.raft_index;
         var iter = try _mitr.MergeIterator.init(self.allocator, srcs);
         defer iter.deinit();
-        try iter.seekRange(.{}, .{});
+        try iter.seekRange(Key.inf, Key.inf);
 
         // Per-tree builders, keyed by the tree's global identity. Keys within
         // each tree are already in sorted order because the skiplist is
@@ -691,10 +687,7 @@ pub const Forest = struct {
         // Route each key to a tree and add to the appropriate builder.
         while (iter.itemRef()) |item| {
             const tk, const key_kind = blk: {
-                const trees = self.getTable(
-                    item.key.namespace,
-                    item.key.table_id,
-                ) orelse {
+                const trees = self.getTable(item.key.tableKey()) orelse {
                     try iter.next();
                     continue;
                 };
@@ -835,8 +828,7 @@ pub const Forest = struct {
     pub fn buildBottomTable(
         self: *Forest,
         allocator: std.mem.Allocator,
-        ns: u64,
-        table_id: u32,
+        table_key: TableKey,
         items: []const Item,
     ) !std.ArrayList(_manifest.SSTableChange) {
         var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
@@ -845,12 +837,15 @@ pub const Forest = struct {
 
         const bottom: u32 = @intCast(self.live.cur().max_levels - 1);
         const tk, const max_bytes = blk: {
-            const tree = try self.singleTree(ns, table_id);
+            const tree = try self.singleTree(table_key);
             defer tree.release();
             var targets = try tree.levelTargets();
             defer targets.deinit();
             break :blk .{
-                TreeKey{ .namespace = ns, .tree_id = tree.tree_id },
+                TreeKey{
+                    .namespace = table_key.namespace,
+                    .tree_id = tree.tree_id,
+                },
                 @as(usize, @intCast(targets.file_sz[bottom])),
             };
         };
@@ -915,7 +910,7 @@ pub const Forest = struct {
         });
     }
 
-    /// Whether every CREATE in `changes` is now a table of `table_id`'s
+    /// Whether every CREATE in `changes` is now a table of `table_key`'s
     /// bottom level — CREATE INDEX's post-install verification.
     /// applyBackfill skips, deterministically on every node, when the
     /// bottom level was not empty; a table count cannot tell a skip
@@ -923,8 +918,7 @@ pub const Forest = struct {
     /// the proposed sst ids are looked for by name.
     pub fn bottomLevelHas(
         self: *Forest,
-        ns: u64,
-        table_id: u32,
+        table_key: TableKey,
         changes: []const _manifest.SSTableChange,
     ) !bool {
         // The proposed ids as a set (a few files), built before the
@@ -935,7 +929,7 @@ pub const Forest = struct {
         defer wanted.deinit();
         for (changes) |c| _ = try wanted.set(c.sst_id);
 
-        const tree = try self.singleTree(ns, table_id);
+        const tree = try self.singleTree(table_key);
         defer tree.release();
         const held = tree.mu.hold(.shared, @src());
         defer held.release();
@@ -950,8 +944,8 @@ pub const Forest = struct {
     /// a freshly created index table cannot have split (splits never
     /// touch an empty tree, and ddl_mu serializes DDL against drops).
     /// Returned with a ref; the caller releases it.
-    fn singleTree(self: *Forest, ns: u64, table_id: u32) !*Tree {
-        const trees = self.getTable(ns, table_id) orelse
+    fn singleTree(self: *Forest, table_key: TableKey) !*Tree {
+        const trees = self.getTable(table_key) orelse
             return error.TreeNotFound;
         const held = trees.mu.hold(.shared, @src());
         defer held.release();
@@ -1440,26 +1434,26 @@ pub const Forest = struct {
     pub fn hasNamespace(self: *Forest, namespace_id: u64) bool {
         // A namespace exists iff its default table (table_id 0) has trees —
         // ns_create always installs it, drop_ns removes them.
-        return self.hasTable(namespace_id, 0);
+        return self.hasTable(.{ .namespace = namespace_id, .table_id = 0 });
     }
 
     /// Get a tree by its global identity (namespace + namespace-local
     /// tree_id): find the table (high 32 bits of tree_id), scan its trees.
     /// Returned with a ref for the caller — `tree.release()` when done.
     pub fn getTree(self: *Forest, namespace_id: u64, tree_id: u64) ?*Tree {
-        const trees = self.getTable(
-            namespace_id,
-            treeTableId(tree_id),
-        ) orelse return null;
+        const trees = self.getTable(.{
+            .namespace = namespace_id,
+            .table_id = treeTableId(tree_id),
+        }) orelse return null;
         return trees.getTreeById(tree_id);
     }
 
     /// True iff the tree is currently listed (idempotency checks).
     pub fn hasTree(self: *Forest, namespace_id: u64, tree_id: u64) bool {
-        const trees = self.getTable(
-            namespace_id,
-            treeTableId(tree_id),
-        ) orelse return false;
+        const trees = self.getTable(.{
+            .namespace = namespace_id,
+            .table_id = treeTableId(tree_id),
+        }) orelse return false;
         const held = trees.mu.hold(.shared, @src());
         defer held.release();
         return trees.byId(held, tree_id) != null;
@@ -1474,9 +1468,10 @@ pub const Forest = struct {
     /// can still race a publish already in flight — they are a raft round
     /// trip apart, which no local lock covers — and the apply-side
     /// `hasTree` check absorbs the duplicate.
-    pub fn nextTreeId(self: *Forest, namespace_id: u64, table_id: u32) u64 {
-        var max_tree_id: u64 = makeTreeId(table_id, 0); // table's first tree_id
-        if (self.getTable(namespace_id, table_id)) |trees| {
+    pub fn nextTreeId(self: *Forest, table_key: TableKey) u64 {
+        // The table's first tree_id.
+        var max_tree_id: u64 = makeTreeId(table_key.table_id, 0);
+        if (self.getTable(table_key)) |trees| {
             const held = trees.mu.hold(.shared, @src());
             defer held.release();
             for (trees.list(held)) |e| {
@@ -1490,37 +1485,28 @@ pub const Forest = struct {
     /// Returns null if the table was never created. No lock: the map guards
     /// itself and a TableTrees is never freed, so the pointer stays good —
     /// though a dropped table's is empty (`hasTrees`).
-    pub fn getTable(
-        self: *Forest,
-        namespace_id: u64,
-        table_id: u32,
-    ) ?*TableTrees {
-        return self.tables.get(.{
-            .namespace = namespace_id,
-            .table_id = table_id,
-        });
+    pub fn getTable(self: *Forest, table_key: TableKey) ?*TableTrees {
+        return self.tables.get(table_key);
     }
 
     /// True iff a table exists for (namespace, table_id), i.e. has trees.
     /// Used by catalog bootstrap to make create_tree idempotent across
     /// restarts.
-    pub fn hasTable(self: *Forest, namespace_id: u64, table_id: u32) bool {
-        const trees = self.getTable(namespace_id, table_id) orelse return false;
+    pub fn hasTable(self: *Forest, table_key: TableKey) bool {
+        const trees = self.getTable(table_key) orelse return false;
         return trees.hasTrees();
     }
 
     pub fn getOrCreateTable(
         self: *Forest,
-        namespace_id: u64,
-        table_id: u32,
+        table_key: TableKey,
     ) !*TableTrees {
-        const key = TableKey{ .namespace = namespace_id, .table_id = table_id };
-        if (self.tables.get(key)) |trees| return trees;
+        if (self.tables.get(table_key)) |trees| return trees;
 
         const fresh = try self.allocator.create(TableTrees);
         errdefer self.allocator.destroy(fresh);
         fresh.* = TableTrees.init(self.allocator);
-        const stored = try self.tables.getOrPut(key, fresh);
+        const stored = try self.tables.getOrPut(table_key, fresh);
         if (stored != fresh) {
             fresh.deinit();
             self.allocator.destroy(fresh);

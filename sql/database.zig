@@ -195,7 +195,10 @@ pub const Database = struct {
 
         // Covers snapshot SSTs the apply observer never saw. Empty
         // table → start at 1.
-        if (try forest.maxKey(self.allocator, self.ns, table_id)) |mk| {
+        if (try forest.maxKey(self.allocator, .{
+            .namespace = self.ns,
+            .table_id = table_id,
+        })) |mk| {
             defer mk.free(self.allocator);
             fresh.raiseNextEgid((_key.decodeEgid(mk.primary) orelse 0) + 1);
         } else {

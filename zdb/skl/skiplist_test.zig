@@ -173,7 +173,7 @@ test "skiplist: a parked reader keeps its values while the writer inserts" {
     try testing.expectEqual(@as(usize, 2), before_vers.len);
 
     // A fresh position sees the whole chain.
-    try it.seekRange(.{ .primary = "k" }, .{});
+    try it.seekRange(.{ .primary = "k" }, Key.inf);
     const after = it.itemRef().?;
     const after_vers = after.versions.slice();
     const want_ts = [_]u64{ 30, 20, 15, 10, 5 };
@@ -239,7 +239,7 @@ test "skiplist iterator ordering and seek" {
 
     var seek_it = try sl.iterator(testing.allocator);
     defer seek_it.deinit();
-    try seek_it.seekRange(.{ .primary = "4" }, .{});
+    try seek_it.seekRange(.{ .primary = "4" }, Key.inf);
     try testing.expectEqualStrings("5", seek_it.itemRef().?.key.primary);
     try seek_it.next();
     try testing.expectEqualStrings("8", seek_it.itemRef().?.key.primary);
@@ -410,7 +410,7 @@ test "skiplist: meta reaches the iterator" {
 
     var it = try sl.iterator(testing.allocator);
     defer it.deinit();
-    try it.seekRange(.{}, .{});
+    try it.seekRange(Key.inf, Key.inf);
 
     const first = it.itemRef() orelse return error.TestExpectedItem;
     try testing.expectEqualStrings("a", first.key.primary);
@@ -433,7 +433,7 @@ fn expectVersions(
 ) !void {
     var it = try skiplist.Iterator.init(testing.allocator, sl, limit);
     defer it.deinit();
-    try it.seekRange(.{}, .{});
+    try it.seekRange(Key.inf, Key.inf);
     const item = it.itemRef() orelse return error.TestExpectedItem;
     const vers = item.versions.slice();
     try testing.expectEqual(want.len, vers.len);

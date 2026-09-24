@@ -30,8 +30,9 @@ const Level = _level_handler.Level;
 const Lock = _level_handler.Lock;
 pub const TableEntry = _level_handler.TableEntry;
 const Key = @import("kv.zig").Key;
+const TableKey = @import("kv.zig").TableKey;
 const Version = @import("kv.zig").Version;
-const KeyRange = _level_handler.KeyRange;
+const KeyRange = @import("kv.zig").KeyRange;
 const MergeIterator = _table.merge_iterator.MergeIterator;
 const ConcatIterator = _table.merge_iterator.ConcatIterator;
 const Iterator = _table.merge_iterator.Iterator;
@@ -282,7 +283,7 @@ pub const VersionTracker = struct {
             .meta = .{ .kind = .state, .encoding = .roaring },
             .value = bm.toBuffer(),
         };
-        t.rolled.clearRetainingCapacity();
+        utils.clearRetainCap(&t.rolled);
         try t.rolled.append(t.allocator, synthetic);
         try t.rolled.appendSlice(t.allocator, item.versions.slice()[1..]);
         try e.emitOne(.{
@@ -773,7 +774,7 @@ pub const Emitter = struct {
     fn emitOne(e: *Emitter, item: Item) !void {
         const t = &e.tracker;
         t.startItem();
-        t.kept.clearRetainingCapacity();
+        utils.clearRetainCap(&t.kept);
         var stale_bytes: usize = 0;
         for (item.versions.slice()) |ver| {
             const nbytes = item.key.primary.len + ver.value.len;
@@ -862,15 +863,17 @@ fn pickSourceTables(
     }
 
     const budget = self.live.cur().l0_compaction_max_bytes;
-    var union_kr = KeyRange{};
+    // The union of the tables taken so far; null until the first.
+    var union_kr: ?KeyRange = null;
     var l0_bytes: u64 = 0;
     var n: usize = 0;
     while (n < src_snapshot.len) {
         const e = src_snapshot[n];
-        union_kr.extend(.{
+        const tkr = KeyRange{
             .left = e.table.smallest,
             .right = e.table.biggest,
-        });
+        };
+        if (union_kr) |*u| u.extend(tkr) else union_kr = tkr;
         l0_bytes += e.table.fileSize();
         n += 1;
 
@@ -880,7 +883,7 @@ fn pickSourceTables(
             break :ov try self.levels[dest].overlappingTables(
                 held,
                 self.allocator,
-                union_kr,
+                union_kr.?,
             );
         };
         defer Level.releaseTables(self.allocator, overlap);
@@ -926,13 +929,13 @@ pub fn buildCompaction(
     defer Level.releaseTables(self.allocator, src_entries_slice);
 
     // --- compute union key range of all src tables ---
-    var kr = KeyRange{};
+    var kr: ?KeyRange = null;
     for (src_entries_slice) |e| {
         const tkr = KeyRange{
             .left = e.table.smallest,
             .right = e.table.biggest,
         };
-        kr.extend(tkr);
+        if (kr) |*r| r.extend(tkr) else kr = tkr;
     }
 
     // --- collect overlapping dest (bot) entries ---
@@ -942,7 +945,7 @@ pub fn buildCompaction(
         break :blk try self.levels[dest].overlappingTables(
             held,
             self.allocator,
-            kr,
+            kr orelse return .empty,
         );
     };
     defer Level.releaseTables(self.allocator, bot_entries_slice);
@@ -1045,12 +1048,26 @@ pub fn mergeAndWrite(
     );
     defer self.allocator.free(all_iters);
 
+    const table_key: TableKey = .{
+        .namespace = self.namespace,
+        .table_id = self.tableId(),
+    };
     for (src_entries_slice, 0..) |e, i|
         all_iters[i] = .{
-            .table = TableIterator.init(self.allocator, e.table, prio),
+            .table = TableIterator.init(
+                self.allocator,
+                e.table,
+                prio,
+                table_key,
+            ),
         };
     for (bot_entries_slice, 0..) |e, i|
-        bot_iters[i] = TableIterator.init(self.allocator, e.table, prio);
+        bot_iters[i] = TableIterator.init(
+            self.allocator,
+            e.table,
+            prio,
+            table_key,
+        );
     all_iters[src_entries_slice.len] = .{
         .concat = ConcatIterator.init(bot_iters),
     };

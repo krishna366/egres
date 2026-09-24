@@ -97,7 +97,11 @@ pub fn createIndex(
             pgwire.sqlstate.undefined_table,
             "table does not exist",
         );
-    const t = self.srv.openTable(ns, base_tid) catch |err| {
+    const base_key: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = base_tid,
+    };
+    const t = self.srv.openTable(base_key) catch |err| {
         logCreateIndexErr(ci.table, "load schema", err);
         return replyError(state, "failed to load table schema");
     };
@@ -202,11 +206,11 @@ pub fn createIndex(
 
     // TODO: This can return the timestamp the catalog was written at, so we
     // don't need to run build.readTs.
-    writeCatalogRows(self, arloc, ns, base_tid, &.{}, &.{def}) catch |err| {
+    writeCatalogRows(self, arloc, base_key, &.{}, &.{def}) catch |err| {
         logCreateIndexErr(name, "catalog row", err);
         return replyError(state, "create index failed");
     };
-    self.srv.forgetTable(ns, base_tid) catch |err|
+    self.srv.forgetTable(base_key) catch |err|
         return build.fail("forget table", err);
     build.read_ts = build.readTs() catch |err|
         return build.fail("read read_ts", err);
@@ -295,13 +299,13 @@ pub const RowIndexKeys = struct {
         try self.v2.put(self.a, egid, keys);
     }
 
-    /// v1 as bottom-level items at `ts` for `index_tid`, in key
-    /// order: per key a roaring state of its egids, or the one egid.
+    /// v1 as bottom-level items at `ts` for the index table `table_key`,
+    /// in key order: per key a roaring state of its egids, or the one
+    /// egid.
     /// A unique key with two rows is error.DuplicateKey.
     pub fn items(
         self: *RowIndexKeys,
-        ns: u64,
-        index_tid: u32,
+        table_key: zdb.kv.TableKey,
         ts: u64,
     ) ![]zdb.kv.Item {
         var pairs: std.ArrayList(Pair) = .empty;
@@ -325,8 +329,8 @@ pub const RowIndexKeys = struct {
             defer i = end;
 
             const item_key = zdb.kv.Key{
-                .namespace = ns,
-                .table_id = index_tid,
+                .namespace = table_key.namespace,
+                .table_id = table_key.table_id,
                 .primary = key,
             };
             if (self.unique) {
@@ -554,8 +558,7 @@ const IndexBuild = struct {
         idx: *const _table.Index,
     } {
         const tbl = try self.handler.srv.openTable(
-            self.ns,
-            self.def.base_table_id,
+            .{ .namespace = self.ns, .table_id = self.def.base_table_id },
         );
         for (tbl.indexes) |*idx| {
             if (idx.index_table_id == self.def.index_table_id)
@@ -596,7 +599,8 @@ const IndexBuild = struct {
         var ctx = Scan{ .build = self, .at = at, .rows = &rows };
         _ = try eng.forest.scan(
             self.a,
-            self.baseRange(),
+            self.baseKey(),
+            .all,
             .{ .read_ts = self.read_ts, .priority = .p2 },
             &ctx,
             Scan.emit,
@@ -644,7 +648,8 @@ const IndexBuild = struct {
         var ctx = Scan{ .build = self, .at = at, .rows = rows };
         _ = try eng.forest.scan(
             self.a,
-            self.baseRange(),
+            self.baseKey(),
+            .all,
             .{
                 .read_ts = eng.node.appliedTs(),
                 .min_ts = self.read_ts,
@@ -666,9 +671,9 @@ const IndexBuild = struct {
         );
     }
 
-    fn baseRange(self: *const IndexBuild) zdb.level.KeyRange {
-        return (zdb.level.KeyRange{})
-            .limitToTable(self.ns, self.def.base_table_id);
+    /// The base table whose rows the index is built from.
+    fn baseKey(self: *const IndexBuild) zdb.kv.TableKey {
+        return .{ .namespace = self.ns, .table_id = self.def.base_table_id };
     }
 
     /// Step 7, outside the barrier: v1 as BOTTOM-level SSTs at ts =
@@ -684,12 +689,15 @@ const IndexBuild = struct {
         const eng = self.handler.srv.engine;
         if (rows.count() == 0) return;
         const index_tid = self.def.index_table_id;
+        const index_key: zdb.kv.TableKey = .{
+            .namespace = self.ns,
+            .table_id = index_tid,
+        };
 
-        const items = try rows.items(self.ns, index_tid, self.read_ts);
+        const items = try rows.items(index_key, self.read_ts);
         var changes = try eng.forest.buildBottomTable(
             self.a,
-            self.ns,
-            index_tid,
+            index_key,
             items,
         );
         defer changes.deinit(self.a);
@@ -707,8 +715,7 @@ const IndexBuild = struct {
         // entries. The proposed files themselves are looked for: a
         // table count is non-zero after a skip too.
         const landed = try eng.forest.bottomLevelHas(
-            self.ns,
-            index_tid,
+            index_key,
             changes.items,
         );
         if (!landed) return error.BackfillSkipped;
@@ -723,15 +730,18 @@ const IndexBuild = struct {
     fn markValid(self: *IndexBuild) !void {
         var vdef = self.def;
         vdef.valid_ts = self.valid_ts;
+        const base_key: zdb.kv.TableKey = .{
+            .namespace = self.ns,
+            .table_id = self.def.base_table_id,
+        };
         try writeCatalogRows(
             self.handler,
             self.a,
-            self.ns,
-            self.def.base_table_id,
+            base_key,
             &.{},
             &.{vdef},
         );
-        try self.handler.srv.forgetTable(self.ns, self.def.base_table_id);
+        try self.handler.srv.forgetTable(base_key);
     }
 };
 
@@ -767,8 +777,7 @@ pub fn dropIndex(
     var scan = _table.scanIndexKeys(
         a,
         eng.forest,
-        ns,
-        index_tid,
+        .{ .namespace = ns, .table_id = index_tid },
     ) catch |err| {
         logDropIndexErr(di.name, "scan catalog", err);
         return replyError(state, "drop index failed");
@@ -782,7 +791,10 @@ pub fn dropIndex(
         );
     const base_tid = scan.base_table_id.?;
 
-    const tbl = self.srv.openTable(ns, base_tid) catch |err| {
+    const tbl = self.srv.openTable(.{
+        .namespace = ns,
+        .table_id = base_tid,
+    }) catch |err| {
         logDropIndexErr(di.name, "load schema", err);
         return replyError(state, "drop index failed");
     };
@@ -849,7 +861,7 @@ fn removeIndex(
 
     const mc = try eng.forest.buildDropTables(a, ns, &.{index_tid});
     try eng.proposeMC(mc, .apply);
-    try self.srv.forgetTable(ns, base_tid);
+    try self.srv.forgetTable(.{ .namespace = ns, .table_id = base_tid });
 }
 
 fn logCreateIndexErr(name: String, what: String, err: anyerror) void {

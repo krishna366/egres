@@ -8,6 +8,7 @@
 //! shared storage before commit; rollback just drops the skiplist.
 
 const std = @import("std");
+const utils = @import("utils");
 const fiber = @import("zfiber");
 const zdb = @import("zdb");
 
@@ -40,7 +41,7 @@ const ReadSet = struct {
 
     /// Discard everything — on restart, or after merging into `prev`.
     fn clear(self: *ReadSet) void {
-        self.reads.clearRetainingCapacity();
+        utils.clearRetainCap(&self.reads);
         self.ran_scan = false;
     }
 
@@ -201,7 +202,7 @@ pub const Txn = struct {
     /// bookkeeping until the block ends.
     pub fn releaseLocks(self: *Txn) void {
         for (self.held_rows.items) |key| self.db.row_locks.release(key, self.id);
-        self.held_rows.clearRetainingCapacity();
+        utils.clearRetainCap(&self.held_rows);
         // Tables after the rows, in reverse acquisition order.
         var i = self.held_tables.items.len;
         while (i > 0) {
@@ -212,7 +213,7 @@ pub const Txn = struct {
                 .exclusive => h.mutex.unlock(),
             }
         }
-        self.held_tables.clearRetainingCapacity();
+        utils.clearRetainCap(&self.held_tables);
     }
 
     pub const LockError = error{ Deadlock, Upgrade, OutOfMemory };
@@ -439,7 +440,7 @@ pub const Txn = struct {
         };
         // The seek lands on the key's item, or on the next key when it
         // has none. A version's ts is the egid here.
-        try it.seekRange(probe, .{});
+        try it.seekRange(probe, Key.inf);
         const item = it.itemRef() orelse return;
         if (item.key.order(probe) != .eq) return;
         for (item.versions.slice()) |ver| {
@@ -478,7 +479,10 @@ pub const Txn = struct {
             .table_id = table_id,
             .primary = key,
         });
-        return self.forest.multiGet(self.allocator, self.ns, table_id, keys, .{
+        return self.forest.multiGet(self.allocator, .{
+            .namespace = self.ns,
+            .table_id = table_id,
+        }, keys, .{
             .read_ts = self.read_ts,
             .pending = self.writes,
         });

@@ -9,6 +9,7 @@
 //! projection touches only the bytes it asks for.
 
 const std = @import("std");
+const utils = @import("utils");
 const _value = @import("value.zig");
 const String = _value.String;
 const _schema = @import("schema.zig");
@@ -34,7 +35,7 @@ pub fn marshalRow(
     // Zero-fill the fixed-size prefix: version + null bitmap + fixed region
     // + varlen directory. Fixed values and directory entries are patched in
     // place; varlen payloads append after it.
-    buf.clearRetainingCapacity();
+    utils.clearRetainCap(buf);
     try buf.appendNTimes(alloc, 0, ps.var_data_start);
     std.mem.writeInt(u16, buf.items[0..2], ps.version, .little);
 

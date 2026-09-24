@@ -20,7 +20,8 @@ const _catalog = @import("catalog.zig");
 
 const Forest = zdb.forest.Forest;
 const Key = zdb.kv.Key;
-const KeyRange = zdb.level.KeyRange;
+const TableKey = zdb.kv.TableKey;
+const KeyRange = zdb.kv.KeyRange;
 const Item = zdb.kv.Item;
 
 pub const Error = error{UndefinedTable};
@@ -177,22 +178,20 @@ pub const Table = struct {
 };
 
 /// The scan window selecting every catalog row owned by `owner_id` in
-/// catalog tree `catalog_tid`. Keys are (owner_id, member_id) BE pairs and
+/// the catalog table `table_key`. Keys are (owner_id, member_id) BE pairs and
 /// member ids are 1-based, so the window is [owner.0, (owner+1).0) — an
 /// exclusive right edge no real key equals — with the upper bound dropped
 /// at owner_id maxInt. The struct owns the boundary key bytes: keep it
 /// alive (and in place) for the whole scan, since range() borrows them.
 const CatalogWindow = struct {
-    ns: u64,
-    catalog_tid: u32,
+    table_key: TableKey,
     has_upper: bool,
     left: [8]u8,
     right: [8]u8,
 
-    fn init(ns: u64, catalog_tid: u32, owner_id: u32) CatalogWindow {
+    fn init(table_key: TableKey, owner_id: u32) CatalogWindow {
         return .{
-            .ns = ns,
-            .catalog_tid = catalog_tid,
+            .table_key = table_key,
             .has_upper = owner_id != std.math.maxInt(u32),
             .left = _catalog.encodeKey(owner_id, 0),
             .right = _catalog.encodeKey(owner_id +% 1, 0),
@@ -200,18 +199,18 @@ const CatalogWindow = struct {
     }
 
     fn range(self: *const CatalogWindow) KeyRange {
-        return (KeyRange{
+        return .{
             .left = .{
-                .namespace = self.ns,
-                .table_id = self.catalog_tid,
+                .namespace = self.table_key.namespace,
+                .table_id = self.table_key.table_id,
                 .primary = &self.left,
             },
             .right = if (self.has_upper) .{
-                .namespace = self.ns,
-                .table_id = self.catalog_tid,
+                .namespace = self.table_key.namespace,
+                .table_id = self.table_key.table_id,
                 .primary = &self.right,
-            } else .{},
-        }).limitToTable(self.ns, self.catalog_tid);
+            } else Key.inf,
+        };
     }
 };
 
@@ -251,7 +250,7 @@ const LoadCtx = struct {
     }
 };
 
-/// Load a user table's schema from namespace `ns`'s catalog. `catalog_ps` is
+/// Load `table_key`'s schema from its namespace's catalog. `catalog_ps` is
 /// the caller's compiled catalog layout (Server.catalog_ps). Returns
 /// `error.UndefinedTable` if the table has no catalog rows.
 pub fn loadTableSchema(
@@ -259,8 +258,7 @@ pub fn loadTableSchema(
     forest: *Forest,
     catalog_ps: *const _schema.PhysicalSchema,
     index_catalog_ps: *const _schema.PhysicalSchema,
-    ns: u64,
-    table_id: u32,
+    table_key: TableKey,
 ) !Table {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
@@ -268,11 +266,21 @@ pub fn loadTableSchema(
 
     // Scan the catalog tree for this table's column rows; `win` owns the
     // boundary key bytes, so it lives for the whole synchronous scan below.
-    const win = CatalogWindow.init(ns, _catalog.table_id, table_id);
+    const win = CatalogWindow.init(.{
+        .namespace = table_key.namespace,
+        .table_id = _catalog.table_id,
+    }, table_key.table_id);
     var ctx = LoadCtx{ .a = a, .catalog_ps = catalog_ps };
     // scan uses `alloc` for its own transient arena (freed at scan end); the
     // callback dupes anything it keeps into `a` (the Table's arena).
-    _ = try forest.scan(alloc, win.range(), .{}, &ctx, LoadCtx.emit);
+    _ = try forest.scan(
+        alloc,
+        win.table_key,
+        win.range(),
+        .{},
+        &ctx,
+        LoadCtx.emit,
+    );
     if (ctx.err) |e| return e;
     if (ctx.all.items.len == 0) return error.UndefinedTable;
 
@@ -305,7 +313,7 @@ pub fn loadTableSchema(
     // an index naming a column the table doesn't have is corrupt
     // catalog state. The pointers target the arena-owned `columns`
     // slice, so they survive the Table being moved into the cache.
-    const defs = try loadIndexes(a, forest, index_catalog_ps, ns, table_id);
+    const defs = try loadIndexes(a, forest, index_catalog_ps, table_key);
     const indexes = try a.alloc(Index, defs.len);
     for (defs, indexes) |def, *idx| {
         const col = for (columns) |*c| {
@@ -353,21 +361,31 @@ const IndexLoadCtx = struct {
     }
 };
 
-/// Load every index of `base_table_id` from namespace `ns`'s index catalog
-/// (table 2), prefix-scanned by base_table_id (empty if none). The returned
+/// Load every index of the base table `table_key` from its namespace's
+/// index catalog (table 2), prefix-scanned by its table_id (empty if
+/// none). The returned
 /// slice and its contents are allocated with `alloc`.
 pub fn loadIndexes(
     alloc: std.mem.Allocator,
     forest: *Forest,
     index_catalog_ps: *const _schema.PhysicalSchema,
-    ns: u64,
-    base_table_id: u32,
+    table_key: TableKey,
 ) ![]_catalog.IndexDef {
     var ctx = IndexLoadCtx{ .a = alloc, .ips = index_catalog_ps };
     errdefer ctx.out.deinit(alloc);
 
-    const win = CatalogWindow.init(ns, _catalog.index_table_id, base_table_id);
-    _ = try forest.scan(alloc, win.range(), .{}, &ctx, IndexLoadCtx.emit);
+    const win = CatalogWindow.init(.{
+        .namespace = table_key.namespace,
+        .table_id = _catalog.index_table_id,
+    }, table_key.table_id);
+    _ = try forest.scan(
+        alloc,
+        win.table_key,
+        win.range(),
+        .{},
+        &ctx,
+        IndexLoadCtx.emit,
+    );
 
     ctx.scratch.deinit(alloc);
     if (ctx.err) |e| return e;
@@ -418,20 +436,22 @@ pub const IndexScan = struct {
     table_ids: std.ArrayList(u32),
 };
 
-/// One full scan of namespace `ns`'s small index catalog, classifying
-/// `table_id` per IndexScan. Key-only: no row decode, no schema needed.
+/// One full scan of `table_key`'s namespace's small index catalog,
+/// classifying `table_key`'s table per IndexScan. Key-only: no row
+/// decode, no schema needed.
 /// `tids` is allocated with `alloc`.
 pub fn scanIndexKeys(
     alloc: std.mem.Allocator,
     forest: *Forest,
-    ns: u64,
-    table_id: u32,
+    table_key: TableKey,
 ) !IndexScan {
-    var ctx = IndexKeyCtx{ .a = alloc, .target = table_id };
+    var ctx = IndexKeyCtx{ .a = alloc, .target = table_key.table_id };
     errdefer ctx.table_ids.deinit(alloc);
-    const range = (KeyRange{}).limitToTable(ns, _catalog.index_table_id);
-
-    _ = try forest.scan(alloc, range, .{}, &ctx, IndexKeyCtx.emit);
+    const index_key = TableKey{
+        .namespace = table_key.namespace,
+        .table_id = _catalog.index_table_id,
+    };
+    _ = try forest.scan(alloc, index_key, .all, .{}, &ctx, IndexKeyCtx.emit);
     if (ctx.err) |e| return e;
     return .{
         .is_index = ctx.is_index,

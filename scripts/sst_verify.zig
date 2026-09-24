@@ -32,9 +32,16 @@ fn verifyOne(allocator: std.mem.Allocator, path: String) bool {
     const file_size = t.handle.file_size;
     const fid = t.file_id;
 
-    var it = TableIterator.init(allocator, t, .p2);
+    // The file carries no namespace or table_id; a standalone check
+    // stamps 0 and 0, and only the primaries are looked at.
+    var it = TableIterator.init(
+        allocator,
+        t,
+        .p2,
+        .{ .namespace = 0, .table_id = 0 },
+    );
     defer it.deinit();
-    it.seekRange(.{}, .{}) catch |err| {
+    it.seekRange(Key.inf, Key.inf) catch |err| {
         std.debug.print("FAIL {s} size={d} fid={d} seek={s}\n", .{ base, file_size, fid, @errorName(err) });
         return false;
     };

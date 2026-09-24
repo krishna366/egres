@@ -12,7 +12,8 @@ const std = @import("std");
 const utils = @import("utils");
 const String = utils.String;
 const _manifest = @import("manifest.zig");
-const KeyRange = @import("level.zig").KeyRange;
+const KeyRange = @import("kv.zig").KeyRange;
+const TableKey = @import("kv.zig").TableKey;
 const makeTreeId = @import("kv.zig").makeTreeId;
 const treeTableId = @import("kv.zig").treeTableId;
 const Forest = @import("forest.zig").Forest;
@@ -36,10 +37,10 @@ pub fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
     );
     errdefer tree.release();
 
-    const tbl_trees = try self.getOrCreateTable(
-        namespace_id,
-        treeTableId(tree_id),
-    );
+    const tbl_trees = try self.getOrCreateTable(.{
+        .namespace = namespace_id,
+        .table_id = treeTableId(tree_id),
+    });
     const held = tbl_trees.mu.hold(.exclusive, @src());
     defer held.release();
     try tbl_trees.addTree(held, tree);
@@ -84,11 +85,10 @@ pub fn openTablesFromManifest(self: *Forest) !void {
 /// derived from the table's next free split index.
 pub fn createTree(
     self: *Forest,
-    namespace_id: u64,
-    table_id: u32,
+    table_key: TableKey,
     range: KeyRange,
 ) !u64 {
-    const tree_id = self.nextTreeId(namespace_id, table_id);
+    const tree_id = self.nextTreeId(table_key);
 
     const left_raw = try range.left.marshal(self.allocator);
     defer self.allocator.free(left_raw);
@@ -99,12 +99,12 @@ pub fn createTree(
     try self.manifest.commit(0, &.{}, &.{
         _manifest.createTreeChange(
             tree_id,
-            namespace_id,
+            table_key.namespace,
             left_raw,
             right_raw,
         ),
     });
-    try self.installTree(namespace_id, tree_id);
+    try self.installTree(table_key.namespace, tree_id);
     return tree_id;
 }
 
@@ -217,12 +217,16 @@ pub fn applyNamespaceCreate(
 pub fn buildCreateTree(
     self: *Forest,
     alloc: std.mem.Allocator,
-    namespace_id: u64,
-    table_id: u32,
+    table_key: TableKey,
 ) !_manifest.ManifestChange {
-    const tree_id = self.nextTreeId(namespace_id, table_id);
+    const tree_id = self.nextTreeId(table_key);
     const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
-    tree_changes[0] = _manifest.createTreeChange(tree_id, namespace_id, "", "");
+    tree_changes[0] = _manifest.createTreeChange(
+        tree_id,
+        table_key.namespace,
+        "",
+        "",
+    );
     return .{
         .tree_changes = tree_changes,
         .sstable_changes = &.{},
@@ -272,7 +276,10 @@ pub fn buildCreateTables(
     for (names, 0..) |name, i| {
         const table_id = try self.manifest.nextTableId(namespace_id);
         table_ids[i] = table_id;
-        const tree_id = self.nextTreeId(namespace_id, table_id);
+        const tree_id = self.nextTreeId(.{
+            .namespace = namespace_id,
+            .table_id = table_id,
+        });
         tree_changes[i] = _manifest.createTreeChange(
             tree_id,
             namespace_id,
@@ -333,7 +340,10 @@ pub fn buildDropTables(
     var ids: std.ArrayList(u64) = .empty;
     defer ids.deinit(alloc);
     for (table_ids) |table_id|
-        if (self.getTable(namespace_id, table_id)) |trees| {
+        if (self.getTable(.{
+            .namespace = namespace_id,
+            .table_id = table_id,
+        })) |trees| {
             const held = trees.mu.hold(.shared, @src());
             defer held.release();
             for (trees.list(held)) |e| try ids.append(alloc, e.tree_id);
@@ -389,7 +399,10 @@ fn applyTreeDeletes(self: *Forest, mc: _manifest.ManifestChange) void {
         // as soon as the readers that already hold it let go. The
         // TableTrees itself stays in the map, empty: table ids are never
         // reused, and a reader may still be holding its pointer.
-        if (self.getTable(tc.namespace_id, treeTableId(tc.tree_id))) |trees| {
+        if (self.getTable(.{
+            .namespace = tc.namespace_id,
+            .table_id = treeTableId(tc.tree_id),
+        })) |trees| {
             const gone = blk: {
                 const held = trees.mu.hold(.exclusive, @src());
                 defer held.release();
@@ -472,10 +485,7 @@ pub fn buildSplit(
     defer left_tree.release();
 
     // Find split key from the lowest level in old tree.
-    const split_key = try left_tree.findSplitKey(alloc);
-    if (split_key.len() == 0) {
-        return null;
-    }
+    const split_key = (try left_tree.findSplitKey(alloc)) orelse return null;
 
     // The old tree's bounds, copied out under the manifest lock: this
     // runs on the split-propose fiber while the apply loop may commit
@@ -488,7 +498,10 @@ pub fn buildSplit(
         .namespace = namespace_id,
         .tree_id = tree_id,
     }) orelse return null;
-    const new_tree_id = self.nextTreeId(namespace_id, treeTableId(tree_id));
+    const new_tree_id = self.nextTreeId(.{
+        .namespace = namespace_id,
+        .table_id = treeTableId(tree_id),
+    });
 
     // Classify tables per level and build manifest changes.
     var table_changes: std.ArrayList(_manifest.SSTableChange) = .empty;
@@ -497,7 +510,7 @@ pub fn buildSplit(
     defer held.release();
     for (left_tree.levels, 0..) |*llv, llv_idx| {
         for (llv.entries(held)) |tbe| {
-            if (tbe.table.smallest.order(split_key) != .lt) { // .eq or .gt
+            if (tbe.table.smallest.orderPrimary(split_key) != .lt) { // .eq or .gt
                 // Right-only: remove from old tree, add to new tree.
                 try table_changes.append(alloc, _manifest.deleteSSTableChange(
                     tbe.id,
@@ -511,7 +524,7 @@ pub fn buildSplit(
                     new_tree_id,
                     @intCast(llv_idx),
                 ));
-            } else if (tbe.table.biggest.order(
+            } else if (tbe.table.biggest.orderPrimary(
                 split_key,
             ) != .lt) { // .eq or .gt
                 // order: smallest key < split key <= biggest key
@@ -624,7 +637,10 @@ pub fn applySplit(
     // 32 bits of the tree_id). Capacity is reserved first so the two
     // adds cannot fail between the old tree leaving and them landing.
     std.debug.assert(treeTableId(new_tree_id) == treeTableId(old_tree_id));
-    const trees = self.getTable(namespace_id, treeTableId(old_tree_id)) orelse {
+    const trees = self.getTable(.{
+        .namespace = namespace_id,
+        .table_id = treeTableId(old_tree_id),
+    }) orelse {
         left.release();
         right.release();
         return;

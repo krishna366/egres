@@ -165,16 +165,28 @@ pub const Server = struct {
     /// statement's lookup and not the apply fiber. `next_egid` stays 0
     /// until publishTable seeds it.
     fn loadTable(self: *Server, db: *Database, table_id: u32) !*_table.Table {
-        var loaded = try _table.loadTableSchema(self.engine.allocator, self.engine.forest, &self.catalog_ps, &self.index_catalog_ps, db.ns, table_id);
+        var loaded = try _table.loadTableSchema(
+            self.engine.allocator,
+            self.engine.forest,
+            &self.catalog_ps,
+            &self.index_catalog_ps,
+            .{ .namespace = db.ns, .table_id = table_id },
+        );
         errdefer loaded.deinit();
         const t = try self.engine.allocator.create(_table.Table);
         t.* = loaded;
         return t;
     }
 
-    /// The cached Table for (namespace, table_id) — schema for INSERT/SELECT.
-    pub fn openTable(self: *Server, ns: u64, table_id: u32) !*_table.Table {
-        return self.openTableIn(try self.database(ns), table_id);
+    /// The cached Table for `table_key` — schema for INSERT/SELECT.
+    pub fn openTable(
+        self: *Server,
+        table_key: zdb.kv.TableKey,
+    ) !*_table.Table {
+        return self.openTableIn(
+            try self.database(table_key.namespace),
+            table_key.table_id,
+        );
     }
 
     /// `openTable` for a caller that already holds the Database — the
@@ -201,16 +213,20 @@ pub const Server = struct {
     }
 
     /// Evict `table_id`'s cached Table (see Database.forgetTable).
-    pub fn forgetTable(self: *Server, ns: u64, table_id: u32) !void {
-        (try self.database(ns)).forgetTable(table_id);
+    pub fn forgetTable(self: *Server, table_key: zdb.kv.TableKey) !void {
+        (try self.database(table_key.namespace))
+            .forgetTable(table_key.table_id);
     }
 
     /// Reserve the next egid for a table (leader path). newTxn already ran
     /// the catch-up barrier, so `next_egid` reflects the applied committed
     /// tail (onDataApplied only advances it) — the id handed out is past
     /// every committed row.
-    pub fn allocEgid(self: *Server, ns: u64, table_id: u32) !u64 {
-        return self.allocEgidIn(try self.database(ns), table_id);
+    pub fn allocEgid(self: *Server, table_key: zdb.kv.TableKey) !u64 {
+        return self.allocEgidIn(
+            try self.database(table_key.namespace),
+            table_key.table_id,
+        );
     }
 
     /// `allocEgid` with the Database in hand (see openTableIn). A hit
@@ -717,15 +733,24 @@ pub const Handler = struct {
         return d;
     }
 
-    /// The cached Table for (ns, table_id), through the session's
+    /// The cached Table for `table_key`, through the session's
     /// Database — the per-statement schema lookup.
-    pub fn openTable(self: *Handler, ns: u64, table_id: u32) !*_table.Table {
-        return self.srv.openTableIn(try self.sessionDb(ns), table_id);
+    pub fn openTable(
+        self: *Handler,
+        table_key: zdb.kv.TableKey,
+    ) !*_table.Table {
+        return self.srv.openTableIn(
+            try self.sessionDb(table_key.namespace),
+            table_key.table_id,
+        );
     }
 
     /// Reserve the next egid for a table (see Server.allocEgid).
-    pub fn allocEgid(self: *Handler, ns: u64, table_id: u32) !u64 {
-        return self.srv.allocEgidIn(try self.sessionDb(ns), table_id);
+    pub fn allocEgid(self: *Handler, table_key: zdb.kv.TableKey) !u64 {
+        return self.srv.allocEgidIn(
+            try self.sessionDb(table_key.namespace),
+            table_key.table_id,
+        );
     }
 
     pub fn newTxn(self: *Handler, ns: u64) !*_txn.Txn {
@@ -777,15 +802,14 @@ pub const Handler = struct {
     pub fn dmlTxn(
         self: *Handler,
         state: *pgwire.ConnState,
-        ns: u64,
-        table_id: u32,
+        table_key: zdb.kv.TableKey,
     ) !?*_txn.Txn {
-        const tx = try self.statementTxn(ns);
-        tx.lockTable(table_id, .shared) catch |err| {
+        const tx = try self.statementTxn(table_key.namespace);
+        tx.lockTable(table_key.table_id, .shared) catch |err| {
             try replyLockErr(state, err);
             return null;
         };
-        const db = try self.sessionDb(ns);
+        const db = try self.sessionDb(table_key.namespace);
         if (db.dropped.load(.acquire)) {
             try replyErrorCode(
                 state,

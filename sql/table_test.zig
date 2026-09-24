@@ -38,8 +38,14 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     const ns: u64 = 16;
     const user_table_id: u32 = 16;
     const pkey_index_id: u32 = 17;
-    _ = try f.createTree(ns, catalog.table_id, .{ .inf = true });
-    _ = try f.createTree(ns, catalog.index_table_id, .{ .inf = true });
+    _ = try f.createTree(.{
+        .namespace = ns,
+        .table_id = catalog.table_id,
+    }, .{});
+    _ = try f.createTree(.{
+        .namespace = ns,
+        .table_id = catalog.index_table_id,
+    }, .{});
 
     var catalog_ps = try schema.compile(alloc, catalog.logical_schema, catalog.logical_schema.current_version);
     defer catalog_ps.deinit(alloc);
@@ -105,7 +111,10 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     }
     try f.put(items.items);
 
-    var t = try sql.table.loadTableSchema(alloc, f, &catalog_ps, &index_ps, ns, user_table_id);
+    var t = try sql.table.loadTableSchema(alloc, f, &catalog_ps, &index_ps, .{
+        .namespace = ns,
+        .table_id = user_table_id,
+    });
     defer t.deinit();
 
     try testing.expectEqual(@as(usize, 2), t.columns.len);
@@ -120,11 +129,17 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
 
     // scanIndexKeys classifies both directions: the index knows its
     // base; the base lists its index.
-    var as_index = try sql.table.scanIndexKeys(alloc, f, ns, pkey_index_id);
+    var as_index = try sql.table.scanIndexKeys(alloc, f, .{
+        .namespace = ns,
+        .table_id = pkey_index_id,
+    });
     defer as_index.table_ids.deinit(alloc);
     try testing.expect(as_index.is_index);
     try testing.expectEqual(user_table_id, as_index.base_table_id.?);
-    var as_base = try sql.table.scanIndexKeys(alloc, f, ns, user_table_id);
+    var as_base = try sql.table.scanIndexKeys(alloc, f, .{
+        .namespace = ns,
+        .table_id = user_table_id,
+    });
     defer as_base.table_ids.deinit(alloc);
     try testing.expect(!as_base.is_index);
     try testing.expectEqual(null, as_base.base_table_id);
@@ -196,12 +211,21 @@ test "sql.table: load returns UndefinedTable when no catalog rows exist" {
     defer f.close();
 
     const ns: u64 = 16;
-    _ = try f.createTree(ns, catalog.table_id, .{ .inf = true });
+    _ = try f.createTree(.{
+        .namespace = ns,
+        .table_id = catalog.table_id,
+    }, .{});
 
     var catalog_ps = try schema.compile(alloc, catalog.logical_schema, catalog.logical_schema.current_version);
     defer catalog_ps.deinit(alloc);
     var index_ps = try schema.compile(alloc, catalog.index_logical_schema, catalog.index_logical_schema.current_version);
     defer index_ps.deinit(alloc);
 
-    try testing.expectError(error.UndefinedTable, sql.table.loadTableSchema(alloc, f, &catalog_ps, &index_ps, ns, 999));
+    try testing.expectError(error.UndefinedTable, sql.table.loadTableSchema(
+        alloc,
+        f,
+        &catalog_ps,
+        &index_ps,
+        .{ .namespace = ns, .table_id = 999 },
+    ));
 }

@@ -363,7 +363,7 @@ pub const Iterator = struct {
     skiplist: *SkipList,
     node: ?*SkipList.Node,
     vers: std.ArrayList(Version) = .empty,
-    end_key: Key = .{},
+    end_key: Key = Key.inf,
     limit: Limit,
 
     /// How much of a key's chain a reader needs. `fill` walks the
@@ -401,11 +401,11 @@ pub const Iterator = struct {
     }
 
     /// Position at the first key >= `start` (inclusive). Empty
-    /// `start.primary` means "first node." `end` is an exclusive upper
-    /// bound; empty means "no upper bound."
+    /// `Key.inf` as `start` means "first node." `end` is an exclusive
+    /// upper bound; `Key.inf` means "no upper bound."
     pub fn seekRange(self: *Iterator, start: Key, end: Key) !void {
         self.end_key = end;
-        if (start.primary.len == 0) {
+        if (start.isInf()) {
             self.node = self.skiplist.head.next[0].load(.acquire);
         } else {
             self.node = self.skiplist.findNode(start, null).node;
@@ -430,7 +430,7 @@ pub const Iterator = struct {
     }
 
     fn checkEnd(self: *Iterator) void {
-        if (self.end_key.primary.len == 0) return;
+        if (self.end_key.isInf()) return;
         const node = self.node orelse return;
         if (Key.init(node.key).order(self.end_key) != .lt) self.node = null;
     }

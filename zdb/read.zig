@@ -18,7 +18,8 @@ const DeltaReader = @import("buffers.gen.zig").RoaringDeltaReader;
 const Forest = @import("forest.zig").Forest;
 const kv = @import("kv.zig");
 const Key = kv.Key;
-const KeyRange = _level.KeyRange;
+const TableKey = kv.TableKey;
+const KeyRange = kv.KeyRange;
 const Level = _level.Level;
 const Item = _table.table.Item;
 const Table = _table.Table;
@@ -36,15 +37,14 @@ const Pin = merge_iterator.Pin;
 pub fn multiGet(
     self: *Forest,
     allocator: std.mem.Allocator,
-    ns: u64,
-    table_id: u32,
+    table_key: TableKey,
     keys: []const String,
     opts: MultiGet.Options,
 ) !MultiGet {
     if (opts.read_ts < self.globalMinRead()) {
         return error.ReadBelowMinRead;
     }
-    var mg = try MultiGet.init(allocator, ns, table_id, keys, opts);
+    var mg = try MultiGet.init(allocator, table_key, keys, opts);
     errdefer mg.deinit();
     try fillMultiGet(self, &mg);
     return mg;
@@ -85,7 +85,7 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
 
     // Keys ascend, so a tree covers a contiguous run of the pending
     // nodes; the run ends at the first node another tree owns.
-    const trees = self.getTable(mg.ns, mg.table_id) orelse return;
+    const trees = self.getTable(mg.table_key) orelse return;
     const pend = mg.pending.items;
     var i: usize = 0;
     while (i < pend.len) {
@@ -157,8 +157,7 @@ fn getOne(
     const keys = [_]String{lookup.key.primary};
     var mg = try MultiGet.init(
         allocator,
-        lookup.key.namespace,
-        lookup.key.table_id,
+        lookup.key.tableKey(),
         &keys,
         .{
             .read_ts = lookup.read_ts,
@@ -196,8 +195,7 @@ pub fn getBitmap(
     const keys = [_]String{lookup.key.primary};
     var mg = try MultiGet.init(
         allocator,
-        lookup.key.namespace,
-        lookup.key.table_id,
+        lookup.key.tableKey(),
         &keys,
         .{ .read_ts = lookup.read_ts, .priority = lookup.priority },
     );
@@ -229,8 +227,7 @@ pub const MultiGet = struct {
     /// Nodes, versions and the pending list: freed together.
     arena: std.heap.ArenaAllocator,
     opts: Options,
-    ns: u64,
-    table_id: u32,
+    table_key: TableKey,
     nodes: []Node,
     /// The nodes not yet done, in key order. Rebuilt from itself
     /// after every source, so each source sees only what the ones
@@ -297,8 +294,7 @@ pub const MultiGet = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        ns: u64,
-        table_id: u32,
+        table_key: TableKey,
         keys: []const String,
         opts: Options,
     ) !MultiGet {
@@ -338,8 +334,7 @@ pub const MultiGet = struct {
             .allocator = allocator,
             .arena = arena,
             .opts = opts,
-            .ns = ns,
-            .table_id = table_id,
+            .table_key = table_key,
             .nodes = nodes,
             .pending = pending,
         };
@@ -433,8 +428,8 @@ pub const MultiGet = struct {
     /// `node`'s key as a full Key.
     pub fn keyAt(self: *const MultiGet, node: *const Node) Key {
         return .{
-            .namespace = self.ns,
-            .table_id = self.table_id,
+            .namespace = self.table_key.namespace,
+            .table_id = self.table_key.table_id,
             .primary = node.key,
         };
     }
@@ -542,6 +537,7 @@ pub const MultiGet = struct {
             self.allocator,
             tbl,
             self.opts.priority,
+            self.table_key,
         ) };
         defer it.deinit();
         for (self.accepted.items) |node| {
@@ -590,7 +586,7 @@ pub const MultiGet = struct {
         // copies that key's whole version chain before the key compare
         // below can reject it; after a table's last row that neighbour
         // is a hot row of the next table with thousands of versions.
-        try it.seekRange(start, keyAfter(start));
+        try it.seekRange(start, start.after());
         while (it.itemRef()) |found| {
             if (found.key.order(start) != .eq) return;
             if (found.visibleAt(node.maxTs(read_ts))) |vis| {
@@ -600,17 +596,6 @@ pub const MultiGet = struct {
             }
             try it.next();
         }
-    }
-
-    /// The range end that admits only `key`: the same key with `after`
-    /// set (see `Key.after`). Borrows `key.primary`; nothing is copied.
-    fn keyAfter(key: Key) Key {
-        return .{
-            .namespace = key.namespace,
-            .table_id = key.table_id,
-            .primary = key.primary,
-            .after = true,
-        };
     }
 
     /// Append `wanted`'s versions, holding the storage behind them.
@@ -727,11 +712,12 @@ pub const ScanOptions = struct {
     pin_values: bool = false,
 };
 
-/// Forward scan over a table-limited `scan_range` — a KeyRange run through
-/// `KeyRange.limitToTable`, so its bounds are full keys confined to one
-/// `(namespace, table_id)` (which ride the `left` bound). That confinement
-/// keeps the scan from spilling across the namespace-wide memtable into an
-/// adjacent table.
+/// Forward scan over `range` within the table `table_key`. The bounds
+/// name primaries of that table, or are `Key.inf` for no bound on that
+/// side (`KeyRange.all` for the whole table). The cursor confines the
+/// range to the table (`KeyRange.limitToTable`), which keeps the scan
+/// from spilling across the namespace-wide memtable into an adjacent
+/// table.
 ///
 /// `opts` carries everything else: how many items to return, the view
 /// (as-of timestamp, versions per key, deletions as data or absence), and
@@ -749,12 +735,13 @@ pub const ScanOptions = struct {
 pub fn scan(
     self: *Forest,
     allocator: std.mem.Allocator,
-    scan_range: KeyRange,
+    table_key: TableKey,
+    range: KeyRange,
     opts: ScanOptions,
     ctx: anytype,
     comptime cb: fn (@TypeOf(ctx), Item) anyerror!bool,
 ) !u64 {
-    var cur = try self.openCursor(allocator, scan_range, opts);
+    var cur = try self.openCursor(allocator, table_key, range, opts);
     defer cur.deinit();
     while (try cur.next()) |item| {
         if (!try cb(ctx, item)) break;
@@ -770,7 +757,8 @@ pub fn scan(
 pub fn openCursor(
     self: *Forest,
     allocator: std.mem.Allocator,
-    scan_range: KeyRange,
+    table_key: TableKey,
+    range: KeyRange,
     opts: ScanOptions,
 ) !Cursor {
     if (opts.max_rows != 0 and opts.read_ts < self.globalMinRead()) {
@@ -780,13 +768,12 @@ pub fn openCursor(
         .forest = self,
         .allocator = allocator,
         .arena = std.heap.ArenaAllocator.init(allocator),
-        .key_range = scan_range,
+        // Confined to the table here, so the memtable walk, which holds
+        // every table's keys, never sees an unbounded side.
+        .key_range = range.limitToTable(table_key),
         .opts = opts,
         .want_versions = @max(opts.num_versions, 1),
-        // The range is already table-limited; ns + table_id ride its left
-        // bound.
-        .ns = scan_range.left.namespace,
-        .table_id = scan_range.left.table_id,
+        .table_key = table_key,
     };
 }
 
@@ -817,14 +804,14 @@ pub const Cursor = struct {
     /// ref is released once the hop's merge is open, and a split
     /// retires the tree, so the range cannot borrow from it).
     arena: std.heap.ArenaAllocator,
-    /// The window still to visit: the scan's range at open, its left
-    /// bound advanced past each drained tree's snapshotted right edge.
+    /// The window still to visit: the scan's range at open, confined
+    /// to the table, its left bound advanced past each drained tree's
+    /// snapshotted right edge.
     key_range: KeyRange,
     opts: ScanOptions,
     /// `opts.num_versions` clamped up to 1 (see ScanOptions).
     want_versions: u32,
-    ns: u64,
-    table_id: u32,
+    table_key: TableKey,
     /// The open tree's merge; null between trees (a hop is pending)
     /// and once `done`.
     merge: ?merge_iterator.MergeIterator = null,
@@ -891,11 +878,11 @@ pub const Cursor = struct {
             }
 
             // This tree is drained: close it and move the window past
-            // its snapshotted right edge. Empty primary = unbounded
-            // right (rightmost tree) → done.
+            // its snapshotted right edge. An unbounded right is the
+            // rightmost tree → done.
             merge.deinit();
             self.merge = null;
-            if (self.tree_range.right.primary.len == 0) {
+            if (self.tree_range.right.isInf()) {
                 self.done = true;
                 return null;
             }
@@ -951,7 +938,7 @@ pub const Cursor = struct {
         const a = self.arena.allocator();
 
         const visit_range = blk: {
-            const trees = self.forest.getTable(self.ns, self.table_id) orelse {
+            const trees = self.forest.getTable(self.table_key) orelse {
                 self.done = true;
                 return;
             };
@@ -1073,8 +1060,7 @@ pub const Cursor = struct {
 pub fn maxKey(
     self: *Forest,
     allocator: std.mem.Allocator,
-    ns: u64,
-    table_id: u32,
+    table_key: TableKey,
 ) !?Key {
     // Step 1: pin every memtable (active + immutables) — see the doc on
     // why this precedes the tree. `want = 1`: the walk needs keys, not
@@ -1090,10 +1076,10 @@ pub fn maxKey(
     // tree yet — the memtables may still hold rows).
     var floor: ?Key = null;
     errdefer if (floor) |f| f.free(allocator);
-    if (self.getTable(ns, table_id)) |trees| {
+    if (self.getTable(table_key)) |trees| {
         if (trees.getRightmostTree()) |tree| {
             defer tree.release();
-            var best_sst: Key = .{};
+            var best_sst: ?Key = null;
             const held = tree.mu.hold(.shared, @src());
             defer held.release();
             for (tree.levels) |*lv| {
@@ -1103,11 +1089,13 @@ pub fn maxKey(
                 const b = items[items.len - 1].table.biggest; // rightmost
                 if (b.primary.len == 0) continue;
 
-                if (best_sst.primary.len == 0 or
-                    b.order(best_sst) == .gt) best_sst = b;
+                if (best_sst == null or b.orderPrimary(best_sst.?) == .gt) {
+                    best_sst = b;
+                }
             }
-            // Dupe out from under the tables — they may close once locks drop.
-            if (best_sst.primary.len > 0) floor = try best_sst.dupe(allocator);
+            // Dupe out from under the tables — they may close once locks
+            // drop — and stamp the tree's ids: a table bound has none.
+            if (best_sst) |b| floor = tree.stamp(try b.dupe(allocator));
         }
     }
 
@@ -1116,8 +1104,8 @@ pub fn maxKey(
     // keep the largest key. `best` borrows a skiplist node; the pins from
     // step 1 keep it alive until it is duped below.
     const range = (KeyRange{
-        .left = floor orelse Key{},
-    }).limitToTable(ns, table_id);
+        .left = floor orelse Key.inf,
+    }).limitToTable(table_key);
     var best: ?Key = null;
     for (iters) |*it| {
         try it.seekRange(range.left, range.right);

@@ -217,18 +217,18 @@ pub const Builder = struct {
             self.allocator.free(info.base_key);
         }
 
-        self.block_infos.clearRetainingCapacity();
-        self.last_key.clearRetainingCapacity();
-        self.bf_hashes.clearRetainingCapacity();
+        utils.clearRetainCap(&self.block_infos);
+        utils.clearRetainCap(&self.last_key);
+        utils.clearRetainCap(&self.bf_hashes);
         // A bitmap cannot be emptied in place; the next egid key makes
         // a new one.
         if (self.egid_bm) |*bm| bm.deinit();
         self.egid_bm = null;
-        self.cur_base_key.clearRetainingCapacity();
-        self.cur_offsets.clearRetainingCapacity();
-        self.cur_entries.clearRetainingCapacity();
-        self.block_buf.clearRetainingCapacity();
-        self.table_bytes.clearRetainingCapacity();
+        utils.clearRetainCap(&self.cur_base_key);
+        utils.clearRetainCap(&self.cur_offsets);
+        utils.clearRetainCap(&self.cur_entries);
+        utils.clearRetainCap(&self.block_buf);
+        utils.clearRetainCap(&self.table_bytes);
         self.key_count = 0;
         self.max_version = 0;
         self.uncompressed_size = 0;
@@ -237,9 +237,10 @@ pub const Builder = struct {
     }
 
     /// The key of the last entry written.
+    /// The last key added, as a primary-only key (the table stores no
+    /// namespace or table_id).
     pub fn lastKey(self: *Builder) Key {
-        if (self.last_key.items.len == 0) return .{};
-        return Key.init(self.last_key.items);
+        return .{ .primary = self.last_key.items };
     }
 
     /// Record `n` bytes of shadowed data in the table being built. Saturates
@@ -271,12 +272,11 @@ pub const Builder = struct {
         const key = item.key;
         const vers = item.versions.slice();
 
-        // A real row, never a bound sentinel: an empty primary marshals to
-        // zero bytes (Key.marshalTo), which would leave last_key empty and
-        // quietly disarm both the ordering check below and the base-key
-        // comparison further down.
-        std.debug.assert(key.len() > 0);
-        if (key.len() > std.math.maxInt(u16)) return error.KeyTooLarge;
+        // A real row, never a bound sentinel: an empty primary would leave
+        // last_key empty and quietly disarm both the ordering check below
+        // and the base-key comparison further down.
+        std.debug.assert(key.primary.len > 0);
+        if (key.primary.len > std.math.maxInt(u16)) return error.KeyTooLarge;
 
         var prev_ts: ?u64 = null;
         var packed_len = 4 + ver_hdr_len * vers.len;
@@ -290,8 +290,10 @@ pub const Builder = struct {
         // Every offset is a u32 into the bytes region.
         if (packed_len > std.math.maxInt(u32)) return error.ValueTooLarge;
 
+        // Keys of one table are keys of one tree, so their primaries
+        // alone order them.
         if (self.last_key.items.len > 0) {
-            if (key.order(self.lastKey()) != .gt) {
+            if (key.orderPrimary(self.lastKey()) != .gt) {
                 return error.KeyOrderViolation;
             }
         }
@@ -311,9 +313,12 @@ pub const Builder = struct {
             _ => return error.KeyNotEgid,
         }
 
-        // Marshal into last_key scratch buffer for prefix compression.
-        self.last_key.clearRetainingCapacity();
-        _ = try key.marshalTo(self.allocator, &self.last_key);
+        // The stored key is the primary alone: the namespace and table_id
+        // are the tree's, and the iterator a tree opens stamps them back
+        // on (`TableIterator.init`). Kept in last_key for prefix
+        // compression.
+        utils.clearRetainCap(&self.last_key);
+        try self.last_key.appendSlice(self.allocator, key.primary);
         const entry_key = self.last_key.items;
 
         // Overlap against the base key currently in force. Only used to
@@ -527,7 +532,7 @@ pub const Builder = struct {
         const len = self.table_bytes.items.len;
         const bytes = try self.allocator.alignedAlloc(u8, vfs.page_alignment, len);
         @memcpy(bytes, self.table_bytes.items);
-        self.table_bytes.clearRetainingCapacity();
+        utils.clearRetainCap(&self.table_bytes);
         return .{ .allocator = self.allocator, .bytes = bytes };
     }
 
@@ -561,7 +566,7 @@ pub const Builder = struct {
         const header_len = 8 + 4 + n * 4;
 
         const out = &self.block_buf;
-        out.clearRetainingCapacity();
+        utils.clearRetainCap(out);
 
         try appendU64(out, self.allocator, 0); // crc, backpatched below
         try appendU32(out, self.allocator, @intCast(n));
@@ -602,9 +607,9 @@ pub const Builder = struct {
         });
 
         // Reuse capacity for the next block to avoid re-allocating every time.
-        self.cur_entries.clearRetainingCapacity();
-        self.cur_offsets.clearRetainingCapacity();
-        self.cur_base_key.clearRetainingCapacity();
+        utils.clearRetainCap(&self.cur_entries);
+        utils.clearRetainCap(&self.cur_offsets);
+        utils.clearRetainCap(&self.cur_base_key);
     }
 };
 

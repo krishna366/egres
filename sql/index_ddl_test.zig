@@ -17,6 +17,7 @@ const Txn = sql.txn.Txn;
 const ns: u64 = 16;
 const base_tid: u32 = 16;
 const index_tid: u32 = 17;
+const index_key: zdb.kv.TableKey = .{ .namespace = ns, .table_id = index_tid };
 const read_ts: u64 = 100;
 
 /// A Table with one index on `a` (unique or not), the lock map,
@@ -146,7 +147,7 @@ test "sql.index_ddl: v1 inverts into sorted items, one per key" {
     try rows.setV1(4, &.{}); // no key: not an entry
     try testing.expectEqual(@as(usize, 3), rows.count());
 
-    const items = try rows.items(ns, index_tid, read_ts);
+    const items = try rows.items(index_key, read_ts);
     try testing.expectEqual(@as(usize, 2), items.len);
     const key4 = (try fx.keys(4))[0];
     try testing.expectEqualSlices(u8, key4, items[0].key.primary);
@@ -169,7 +170,7 @@ test "sql.index_ddl: a unique v1 with two rows on one key is a duplicate" {
 
     try rows.setV1(1, try fx.keys(5));
     try rows.setV1(2, try fx.keys(4));
-    const items = try rows.items(ns, index_tid, read_ts);
+    const items = try rows.items(index_key, read_ts);
     try testing.expectEqual(@as(usize, 2), items.len);
     try testing.expect(!items[0].newest().meta.isRoaring());
     const egid = sql.key.decodeEgid(items[0].newest().value).?;
@@ -178,7 +179,7 @@ test "sql.index_ddl: a unique v1 with two rows on one key is a duplicate" {
     try rows.setV1(3, try fx.keys(5));
     try testing.expectError(
         error.DuplicateKey,
-        rows.items(ns, index_tid, read_ts),
+        rows.items(index_key, read_ts),
     );
 }
 
@@ -195,7 +196,7 @@ test "sql.index_ddl: posting delta is a remove and an add per moved key" {
     try rows.setV1(1, try fx.keys(5));
     try rows.setV1(2, try fx.keys(5));
     try rows.setV1(3, try fx.keys(4));
-    _ = try rows.items(ns, index_tid, read_ts);
+    _ = try rows.items(index_key, read_ts);
     try rows.setV2(1, try fx.keys(4));
     try rows.setV2(2, &.{});
     try rows.setV2(3, try fx.keys(4));
@@ -253,7 +254,7 @@ test "sql.index_ddl: unique delta moves, deletes, and takes over keys" {
     try rows.setV1(1, try fx.keys(7));
     try rows.setV1(2, try fx.keys(8));
     try rows.setV1(5, try fx.keys(6));
-    _ = try rows.items(ns, index_tid, read_ts);
+    _ = try rows.items(index_key, read_ts);
     try rows.setV2(1, try fx.keys(9));
     try rows.setV2(2, &.{});
     try rows.setV2(3, try fx.keys(7));
@@ -283,7 +284,7 @@ test "sql.index_ddl: unique delta finds both kinds of duplicate" {
         var tx = fx.txn();
         defer tx.deinit();
         try rows.setV1(1, try fx.keys(7));
-        _ = try rows.items(ns, index_tid, read_ts);
+        _ = try rows.items(index_key, read_ts);
         try rows.setV2(3, try fx.keys(7));
         try testing.expectError(
             error.DuplicateKey,
@@ -295,7 +296,7 @@ test "sql.index_ddl: unique delta finds both kinds of duplicate" {
         var rows = fx.rows();
         var tx = fx.txn();
         defer tx.deinit();
-        _ = try rows.items(ns, index_tid, read_ts);
+        _ = try rows.items(index_key, read_ts);
         try rows.setV2(3, try fx.keys(7));
         try rows.setV2(4, try fx.keys(7));
         try testing.expectError(
@@ -309,7 +310,7 @@ test "sql.index_ddl: unique delta finds both kinds of duplicate" {
         var tx = fx.txn();
         defer tx.deinit();
         try rows.setV1(1, try fx.keys(7));
-        _ = try rows.items(ns, index_tid, read_ts);
+        _ = try rows.items(index_key, read_ts);
         try rows.setV2(1, try fx.keys(7));
         try rows.setV2(3, try fx.keys(7));
         try testing.expectError(

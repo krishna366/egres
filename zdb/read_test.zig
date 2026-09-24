@@ -18,6 +18,7 @@ const _manifest = zdb.manifest;
 
 const ns: u64 = 1;
 const tid: u32 = 0;
+const table_key: zdb.kv.TableKey = .{ .namespace = ns, .table_id = tid };
 
 fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
     return tmp.dir.realPathFileAlloc(utils.context.g().io, ".", alloc);
@@ -52,7 +53,7 @@ const Fixture = struct {
         self.dir = try tmpPath(alloc, &self.tmp);
         self.live = try flags.Live(Config).create(alloc, .{ .dir = self.dir });
         self.f = try Forest.open(alloc, self.live);
-        self.tree_id = try self.f.createTree(ns, tid, .{ .inf = true });
+        self.tree_id = try self.f.createTree(table_key, .{});
         // Forest.open leaves an id-0 placeholder memtable that a swap
         // discards rather than freezes; start on a real one.
         try self.f.newMemtable(self.nextIndex());
@@ -213,7 +214,7 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
         "k09", "k03", "k01", "k04", "k05", "k06", "k07", "k08", "k02", "k99",
         "k03",
     };
-    var mg = try fx.f.multiGet(alloc, ns, tid, &keys, .{
+    var mg = try fx.f.multiGet(alloc, table_key, &keys, .{
         .read_ts = read_ts,
         .pending = pending,
     });
@@ -234,7 +235,7 @@ test "multiget: rows resolve across pending writes, memtables, L0 and L1" {
     try expectRow(&fx, &mg, read_ts, "k99", null);
 
     // include_deleted hands the tombstone back.
-    var raw = try fx.f.multiGet(alloc, ns, tid, &.{"k02"}, .{
+    var raw = try fx.f.multiGet(alloc, table_key, &.{"k02"}, .{
         .read_ts = read_ts,
         .include_deleted = true,
     });
@@ -262,7 +263,10 @@ test "multiget: other tables in the memtables and pending writes are skipped" {
 
     // The memtable spans the namespace: the same primary in table 7
     // sits next to table 0's rows.
-    _ = try fx.f.createTree(ns, 7, .{ .inf = true });
+    _ = try fx.f.createTree(
+        .{ .namespace = ns, .table_id = 7 },
+        .{},
+    );
     try fx.put("a", 10, "a-t0");
     try fx.put("z", 1, "z-ts1");
     const other = [_]Item{
@@ -288,7 +292,7 @@ test "multiget: other tables in the memtables and pending writes are skipped" {
         } },
     });
 
-    var mg = try fx.f.multiGet(alloc, ns, tid, &.{ "a", "b", "z" }, .{
+    var mg = try fx.f.multiGet(alloc, table_key, &.{ "a", "b", "z" }, .{
         .read_ts = 100,
         .pending = pending,
     });
@@ -311,7 +315,7 @@ test "multiget: read_ts hides the versions above it" {
     try fx.putMeta("b", 30, "", .{ .kind = .deleted });
     try fx.put("c", 30, "c30");
 
-    var mg = try fx.f.multiGet(alloc, ns, tid, &.{ "a", "b", "c" }, .{
+    var mg = try fx.f.multiGet(alloc, table_key, &.{ "a", "b", "c" }, .{
         .read_ts = 20,
     });
     defer mg.deinit();
@@ -319,7 +323,7 @@ test "multiget: read_ts hides the versions above it" {
     try expectRow(&fx, &mg, 20, "b", .{ .value = "b10", .ts = 10 });
     try expectRow(&fx, &mg, 20, "c", null);
 
-    var now = try fx.f.multiGet(alloc, ns, tid, &.{ "a", "b", "c" }, .{});
+    var now = try fx.f.multiGet(alloc, table_key, &.{ "a", "b", "c" }, .{});
     defer now.deinit();
     const latest = std.math.maxInt(u64);
     try expectRow(&fx, &now, latest, "a", .{ .value = "a30", .ts = 30 });
@@ -336,7 +340,7 @@ test "multiget: rejects a read_ts below globalMinRead" {
     _ = fx.f.setGlobalMinRead(50);
     try std.testing.expectError(
         error.ReadBelowMinRead,
-        fx.f.multiGet(alloc, ns, tid, &.{"a"}, .{ .read_ts = 10 }),
+        fx.f.multiGet(alloc, table_key, &.{"a"}, .{ .read_ts = 10 }),
     );
 }
 
@@ -391,7 +395,7 @@ test "multiget: keys across two trees and several bottom tables" {
     const asked = [_]String{
         "k10", "k01", "k05", "k06", "k00", "k11", "k03",
     };
-    var mg = try fx.f.multiGet(alloc, ns, tid, &asked, .{});
+    var mg = try fx.f.multiGet(alloc, table_key, &asked, .{});
     defer mg.deinit();
     for (asked) |k| {
         if (std.mem.eql(u8, k, "k00") or std.mem.eql(u8, k, "k11")) {
@@ -437,9 +441,9 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
 
     // blockFor names the block a seek opens.
     for ([_]String{ "r000", "r150", "r299" }) |k| {
-        var it = zdb.table.TableIterator.init(alloc, tbl, .p0);
+        var it = zdb.table.TableIterator.init(alloc, tbl, .p0, table_key);
         defer it.deinit();
-        try it.seekRange(Fixture.key(k), .{});
+        try it.seekRange(Fixture.key(k), Key.inf);
         try std.testing.expect(it.itemRef() != null);
         const want = tbl.blockFor(Fixture.key(k)).?;
         try std.testing.expectEqual(want, it.bpos);
@@ -477,6 +481,7 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
         alloc,
         val.data,
         try tbl.blockBaseKey(0),
+        .{ .namespace = 0, .table_id = 0 },
     );
     defer bi.deinit();
     try bi.seekToFirst();
@@ -560,7 +565,7 @@ test "multiget: postings fold across memtable, L0, tombstones and history" {
     try roar.putDelta(&fx, "r", 20, &.{3}, &.{1});
 
     const latest = std.math.maxInt(u64);
-    var mg = try fx.f.multiGet(alloc, ns, tid, &.{ "s", "r", "q", "p" }, .{});
+    var mg = try fx.f.multiGet(alloc, table_key, &.{ "s", "r", "q", "p" }, .{});
     defer mg.deinit();
     try roar.expectBitmap(&fx, &mg, latest, "p", &.{ 2, 3, 50 });
     try roar.expectBitmap(&fx, &mg, latest, "q", &.{});
@@ -568,7 +573,7 @@ test "multiget: postings fold across memtable, L0, tombstones and history" {
     try roar.expectBitmap(&fx, &mg, latest, "s", &.{});
 
     // History: p before its second delta, q before its tombstone.
-    var old = try fx.f.multiGet(alloc, ns, tid, &.{ "p", "q" }, .{
+    var old = try fx.f.multiGet(alloc, table_key, &.{ "p", "q" }, .{
         .read_ts = 12,
     });
     defer old.deinit();
@@ -577,7 +582,7 @@ test "multiget: postings fold across memtable, L0, tombstones and history" {
 
     // A row is read like any key; only its bitmap is refused.
     try fx.put("t", 10, "row");
-    var row = try fx.f.multiGet(alloc, ns, tid, &.{"t"}, .{});
+    var row = try fx.f.multiGet(alloc, table_key, &.{"t"}, .{});
     defer row.deinit();
     const row_val = row.item("t").?.newest().value;
     try std.testing.expectEqualStrings("row", row_val);

@@ -27,6 +27,9 @@ const zdb = @import("zdb");
 const bench = utils.bench;
 const Bench = bench.Bench;
 const Key = zdb.kv.Key;
+/// The ids stamped on keys: an SST stores primaries only, so a bench
+/// reading a table on its own can use any table key.
+const zero_table_key: zdb.kv.TableKey = .{ .namespace = 0, .table_id = 0 };
 const vfs = zdb.vfs;
 
 const Builder = zdb.table.builder.Builder;
@@ -130,12 +133,14 @@ fn benchMergeScan(b: *Bench) !void {
     while (i < b.n) : (i += 1) {
         var iters: [num_tables]merge.Iterator = undefined;
         for (tables, 0..) |t, j| {
-            iters[j] = .{ .table = TableIterator.init(a, t, .p0) };
+            iters[j] = .{
+                .table = TableIterator.init(a, t, .p0, zero_table_key),
+            };
         }
         var m = try merge.MergeIterator.init(a, iters[0..]);
         defer m.deinit();
 
-        try m.seekRange(.{}, .{});
+        try m.seekRange(Key.inf, Key.inf);
         var count: usize = 0;
         while (m.itemRef()) |item| : (count += 1) {
             b.addBytes(item.key.primary.len + item.newest().value.len);
@@ -199,12 +204,14 @@ fn benchMergeScanShared(b: *Bench) !void {
     while (i < b.n) : (i += 1) {
         var iters: [shared_sources]merge.Iterator = undefined;
         for (tables, 0..) |t, j| {
-            iters[j] = .{ .table = TableIterator.init(a, t, .p0) };
+            iters[j] = .{
+                .table = TableIterator.init(a, t, .p0, zero_table_key),
+            };
         }
         var m = try merge.MergeIterator.init(a, iters[0..]);
         defer m.deinit();
 
-        try m.seekRange(.{}, .{});
+        try m.seekRange(Key.inf, Key.inf);
         var count: usize = 0;
         while (m.itemRef()) |item| : (count += 1) {
             if (item.versions.slice().len != shared_sources * shared_vers) return error.LostVersion;
@@ -220,7 +227,7 @@ fn benchPointSeeks(b: *Bench) !void {
     const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, .p0);
+    var it = TableIterator.init(a, t, .p0, zero_table_key);
     defer it.deinit();
 
     b.resetTimer();
@@ -232,7 +239,7 @@ fn benchPointSeeks(b: *Bench) !void {
         j = (j + 40503) % single_keys;
         var kb: [16]u8 = undefined;
         const p = try keyAt(&kb, j);
-        try it.seekRange(.{ .primary = p }, .{});
+        try it.seekRange(.{ .primary = p }, Key.inf);
         if (it.itemRef() != null) hits += 1;
     }
     std.mem.doNotOptimizeAway(hits);
@@ -250,7 +257,7 @@ fn benchBlockSeekGe(b: *Bench) !void {
     defer block.decrRef();
     const base_raw = try t.blockBaseKey(bpos);
 
-    var bi = try BlockIterator.init(a, block.data, base_raw);
+    var bi = try BlockIterator.init(a, block.data, base_raw, zero_table_key);
     defer bi.deinit();
 
     // Spread targets over the block: entry 0's key is the base key, and
@@ -297,7 +304,7 @@ fn benchBlockKeyWalk(b: *Bench, val_len: usize) !void {
     defer block.decrRef();
     const base_raw = try t.blockBaseKey(bpos);
 
-    var bi = try BlockIterator.init(a, block.data, base_raw);
+    var bi = try BlockIterator.init(a, block.data, base_raw, zero_table_key);
     defer bi.deinit();
     const n = bi.layout.entry_count;
 
@@ -325,13 +332,13 @@ fn benchKeyScan(b: *Bench, val_len: usize) !void {
     const t = try openStriped(a, 0, 1, single_keys, 64 * 1024, val_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, .p0);
+    var it = TableIterator.init(a, t, .p0, zero_table_key);
     defer it.deinit();
 
     b.resetTimer();
     var i: u64 = 0;
     while (i < b.n) : (i += 1) {
-        try it.seekRange(.{}, .{});
+        try it.seekRange(Key.inf, Key.inf);
         var count: usize = 0;
         while (it.itemRef()) |item| : (count += 1) {
             b.addBytes(item.key.primary.len);
@@ -346,13 +353,13 @@ fn benchFullScan(b: *Bench) !void {
     const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, .p0);
+    var it = TableIterator.init(a, t, .p0, zero_table_key);
     defer it.deinit();
 
     b.resetTimer();
     var i: u64 = 0;
     while (i < b.n) : (i += 1) {
-        try it.seekRange(.{}, .{});
+        try it.seekRange(Key.inf, Key.inf);
         var count: usize = 0;
         while (it.itemRef()) |item| : (count += 1) {
             b.addBytes(item.key.primary.len + item.newest().value.len);

@@ -185,13 +185,19 @@ test "Key: marshal round trip carries no timestamp" {
 
     const other_tid = Key{ .namespace = 9, .table_id = 5, .primary = "a" };
     try expectEqual(std.math.Order.lt, key.order(other_tid));
-    // An empty primary is a bound, not a row: it marshals to nothing.
-    try expectEqual(@as(usize, 0), (Key{ .namespace = 9 }).len());
+    // `inf` is the one bound with a stored form: nothing, and it reads
+    // back as `inf`. The bound decides, not the primary's length.
+    try expectEqual(@as(usize, 0), Key.inf.len());
+    const raw_inf = try Key.inf.marshal(alloc);
+    defer alloc.free(raw_inf);
+    try expectEqual(@as(usize, 0), raw_inf.len);
+    try std.testing.expect(Key.init(raw_inf).isInf());
+    try expectEqual(@as(usize, 12), (Key{ .namespace = 9 }).len());
 }
 
 test "Key: after sorts past its primary and before every longer one" {
     const k: Key = .{ .table_id = 7, .primary = "k" };
-    const k_end: Key = .{ .table_id = 7, .primary = "k", .after = true };
+    const k_end = (Key{ .table_id = 7, .primary = "k" }).after();
     const k_nul: Key = .{ .table_id = 7, .primary = "k\x00" };
     const ka: Key = .{ .table_id = 7, .primary = "ka" };
     const j: Key = .{ .table_id = 7, .primary = "j" };
@@ -205,4 +211,25 @@ test "Key: after sorts past its primary and before every longer one" {
     // Never crosses a table or namespace boundary.
     const other: Key = .{ .table_id = 8, .primary = "a" };
     try std.testing.expectEqual(std.math.Order.lt, k_end.order(other));
+}
+
+test "Key: table edges sort outside every key of their table" {
+    const tk: zdb.kv.TableKey = .{ .namespace = 1, .table_id = 7 };
+    const left = Key.tableLeft(tk);
+    const right = Key.tableRight(tk);
+    const lowest: Key = .{ .namespace = 1, .table_id = 7, .primary = "\x00" };
+    const high: Key = .{ .namespace = 1, .table_id = 7, .primary = "\xff\xff" };
+    const prev: Key = .{ .namespace = 1, .table_id = 6, .primary = "\xff" };
+    const next: Key = .{ .namespace = 1, .table_id = 8, .primary = "" };
+    try std.testing.expectEqual(std.math.Order.lt, left.order(lowest));
+    try std.testing.expectEqual(std.math.Order.lt, left.order(right));
+    try std.testing.expectEqual(std.math.Order.gt, right.order(high));
+    try std.testing.expectEqual(std.math.Order.gt, right.order(high.after()));
+    try std.testing.expectEqual(std.math.Order.eq, left.order(left));
+    try std.testing.expectEqual(std.math.Order.eq, right.order(right));
+    // Between the neighbouring tables' keys, never among them.
+    try std.testing.expectEqual(std.math.Order.gt, left.order(prev));
+    try std.testing.expectEqual(std.math.Order.lt, right.order(next));
+    try std.testing.expect(left.isTableEdge() and right.isTableEdge());
+    try std.testing.expect(!lowest.isTableEdge() and !Key.inf.isTableEdge());
 }

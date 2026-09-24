@@ -6,6 +6,7 @@
 //! again. plan.zig builds the trees; dml.zig drives them.
 
 const std = @import("std");
+const utils = @import("utils");
 const zdb = @import("zdb");
 
 const _key = @import("key.zig");
@@ -18,7 +19,7 @@ const log = std.log.scoped(.sql);
 const Forest = zdb.forest.Forest;
 const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
-const KeyRange = zdb.level.KeyRange;
+const KeyRange = zdb.kv.KeyRange;
 const Pred = _pred.Pred;
 const Txn = _txn.Txn;
 const zroar = zdb.zroar;
@@ -91,10 +92,8 @@ pub const Batch = struct {
 
     /// Empty the batch; capacity stays (it never shrinks).
     pub fn reset(self: *Batch) void {
-        // Not clearRetainingCapacity: in ReleaseSafe it memsets
-        // the used items with undefined on every batch.
-        self.rows.items.len = 0;
-        self.bytes.items.len = 0;
+        utils.clearRetainCap(&self.rows);
+        utils.clearRetainCap(&self.bytes);
         self.sel = Selection.initEmpty();
         self.no_space = false;
         self.counted = 0;
@@ -405,7 +404,8 @@ pub const SeqScan = struct {
             ctx.tx.recordScan();
             self.cursor = try ctx.tx.forest.openCursor(
                 ctx.tx.allocator,
-                (KeyRange{}).limitToTable(ctx.tx.ns, ctx.table_id),
+                .{ .namespace = ctx.tx.ns, .table_id = ctx.table_id },
+                .all,
                 .{
                     .read_ts = ctx.tx.read_ts,
                     .pending = ctx.tx.writes,

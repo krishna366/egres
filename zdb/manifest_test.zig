@@ -175,7 +175,7 @@ test "manifest serialize/restoreFrom round-trip" {
         createTreeChange(zdb.kv.makeTreeId(16, 0), 7, &.{}, m_raw),
         createTreeChange(zdb.kv.makeTreeId(16, 1), 7, m_raw, &.{}),
     });
-    try src.registerTableName(7, 16, "users");
+    try src.registerTableName(.{ .namespace = 7, .table_id = 16 }, "users");
     try src.commit(2, &.{
         createSSTableChange(10, 7, 1, 0),
         createSSTableChange(11, 7, 1, 0),
@@ -243,7 +243,7 @@ test "manifest restoreFrom replaces existing state" {
     defer dst.deinit();
     try dst.commit(3, &.{}, &.{createTreeChange(99, 0, &.{}, &.{})});
     try dst.commit(4, &.{createSSTableChange(999, 0, 99, 0)}, &.{});
-    try dst.registerTableName(0, 55, "stale");
+    try dst.registerTableName(.{ .namespace = 0, .table_id = 55 }, "stale");
     try std.testing.expect(dst.trees.contains(tk(0, 99)));
 
     try dst.restoreFrom(bytes);
@@ -264,30 +264,45 @@ test "manifest table names: register/lookup/drop" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.registerTableName(5, 16, "users");
+    try manifest.registerTableName(
+        .{ .namespace = 5, .table_id = 16 },
+        "users",
+    );
     try std.testing.expectEqual(@as(?u32, 16), manifest.lookupTable(5, "users"));
 
     // Idempotent re-apply; a collision (build-side bug) is skipped, never
     // clobbered.
-    try manifest.registerTableName(5, 16, "users");
-    try manifest.registerTableName(5, 17, "users");
+    try manifest.registerTableName(
+        .{ .namespace = 5, .table_id = 16 },
+        "users",
+    );
+    try manifest.registerTableName(
+        .{ .namespace = 5, .table_id = 17 },
+        "users",
+    );
     try std.testing.expectEqual(@as(?u32, 16), manifest.lookupTable(5, "users"));
 
     // Empty names record nothing; lookups are namespace-scoped.
-    try manifest.registerTableName(5, 18, "");
+    try manifest.registerTableName(.{ .namespace = 5, .table_id = 18 }, "");
     try std.testing.expect(manifest.lookupTable(5, "") == null);
     try std.testing.expect(manifest.lookupTable(6, "users") == null);
 
     // dropTable frees the name for a re-register at a fresh id; idempotent.
-    manifest.dropTable(5, 16);
+    manifest.dropTable(.{ .namespace = 5, .table_id = 16 });
     try std.testing.expect(manifest.lookupTable(5, "users") == null);
-    manifest.dropTable(5, 16);
-    try manifest.registerTableName(5, 19, "users");
+    manifest.dropTable(.{ .namespace = 5, .table_id = 16 });
+    try manifest.registerTableName(
+        .{ .namespace = 5, .table_id = 19 },
+        "users",
+    );
     try std.testing.expectEqual(@as(?u32, 19), manifest.lookupTable(5, "users"));
 
     // dropNamespace forgets every table name (leak-checked by the test
     // allocator).
-    try manifest.registerTableName(5, 20, "orders");
+    try manifest.registerTableName(
+        .{ .namespace = 5, .table_id = 20 },
+        "orders",
+    );
     manifest.dropNamespace(5);
     try std.testing.expect(manifest.lookupTable(5, "users") == null);
     try std.testing.expect(manifest.lookupTable(5, "orders") == null);
@@ -339,10 +354,10 @@ test "manifest table_id counter allocate/advance/persist" {
 
     // advanceTableId only ever raises: an id below the current high-water-mark
     // is ignored (next = first+1 < the counter, which is already at first+2)...
-    try manifest.advanceTableId(16, first);
+    try manifest.advanceTableId(.{ .namespace = 16, .table_id = first });
     try std.testing.expectEqual(first + 2, try manifest.nextTableId(16));
     // ...but a higher id jumps the counter forward.
-    try manifest.advanceTableId(16, 1000);
+    try manifest.advanceTableId(.{ .namespace = 16, .table_id = 1000 });
     try std.testing.expectEqual(@as(u32, 1001), try manifest.nextTableId(16));
 
     // Counters survive serialize → restore (the snapshot path).
@@ -649,16 +664,15 @@ fn nsCreateChange(
 }
 
 /// The create_tree change a CREATE TABLE proposes: one tree at split 0 for
-/// `table_id`, carrying the table name.
+/// `table_key`'s table, carrying the table name.
 fn createTreeCmd(
     tcs: *[1]_manifest.TreeChange,
-    namespace: u64,
-    table_id: u32,
+    table_key: zdb.kv.TableKey,
     name: []const u8,
 ) _manifest.ManifestChange {
     tcs[0] = createTreeChange(
-        zdb.kv.makeTreeId(table_id, 0),
-        namespace,
+        zdb.kv.makeTreeId(table_key.table_id, 0),
+        table_key.namespace,
         &.{},
         &.{},
     );
@@ -688,7 +702,11 @@ test "manifest apply create_tree registers the name and advances the table id" {
     defer manifest.deinit();
 
     var tcs: [1]_manifest.TreeChange = undefined;
-    try manifest.apply(6, createTreeCmd(&tcs, 7, first, "users"));
+    try manifest.apply(6, createTreeCmd(
+        &tcs,
+        .{ .namespace = 7, .table_id = first },
+        "users",
+    ));
 
     try std.testing.expect(manifest.trees.contains(tk(7, zdb.kv.makeTreeId(first, 0))));
     try std.testing.expectEqual(@as(?u32, first), manifest.lookupTable(7, "users"));
@@ -719,7 +737,11 @@ test "manifest apply drop_tree removes the table name" {
     defer manifest.deinit();
 
     var tcs: [1]_manifest.TreeChange = undefined;
-    try manifest.apply(6, createTreeCmd(&tcs, 7, first, "users"));
+    try manifest.apply(6, createTreeCmd(
+        &tcs,
+        .{ .namespace = 7, .table_id = first },
+        "users",
+    ));
 
     var dtcs = [_]_manifest.TreeChange{
         deleteTreeChange(zdb.kv.makeTreeId(first, 0), 7),

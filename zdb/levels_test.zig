@@ -19,7 +19,7 @@ const createTreeChange = _manifest.createTreeChange;
 const _level = zdb.level;
 const Level = _level.Level;
 const TableEntry = _level.TableEntry;
-const KeyRange = _level.KeyRange;
+const KeyRange = zdb.kv.KeyRange;
 
 const Tree = zdb.tree.Tree;
 const TableCache = zdb.tree.TableCache;

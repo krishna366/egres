@@ -288,16 +288,109 @@ pub inline fn treeSplitId(tree_id: u64) u32 {
 }
 
 pub const Key = struct {
+    /// Where a key sits relative to its primary. Stored keys are
+    /// `exact`; the other bounds are query-side only, never stored or
+    /// marshaled. `orderPrimary` places them; declaration order does
+    /// not matter.
+    pub const Bound = enum {
+        /// An ordinary key, compared by its primary bytes.
+        exact,
+        /// Just past `primary`: sorts after every stored entry of that
+        /// primary and before any longer one, so `[k, k.after()]` is
+        /// exactly the entries of `k` with nothing copied.
+        after,
+        /// The two edges of one table, no primary: `table_left` sorts
+        /// before every key of the same namespace and table_id and
+        /// after any key of a lower one; `table_right` after every key
+        /// of the table and before any key of a higher one. A
+        /// whole-table range runs between them (`KeyRange.limitToTable`):
+        /// a memtable holds every table's keys in one order and stops
+        /// at them, while a tree, whose keys are all one table's, reads
+        /// each as no bound on its side. Neither is ever stored nor
+        /// equal to a stored key, so inclusive and exclusive do not
+        /// apply to them, and they mean the same walking a range in
+        /// either direction.
+        table_left,
+        table_right,
+        /// No bound at all, on whichever side of a range it sits. Never
+        /// compared: the range helpers check for it first. The stored
+        /// form of an unbounded range side is empty bytes (`init`).
+        inf,
+    };
+
     namespace: u64 = 0,
     table_id: u32 = 0,
     primary: String = "",
-    /// Range-end sentinel: a key with `after` set sorts just past every
-    /// stored key with the same primary and before any longer one, so
-    /// `[k, k.after]` is exactly the entries of `k` with nothing copied.
-    /// Query-side only: it is never set on a stored key and `marshal`
-    /// does not write it. Only `order` honours it; a raw compare of
-    /// `primary` bytes does not see it.
-    after: bool = false,
+    bound: Bound = .exact,
+
+    /// The unbounded range side.
+    pub const inf: Key = .{ .bound = .inf };
+
+    pub inline fn isInf(self: Key) bool {
+        return self.bound == .inf;
+    }
+
+    /// The left edge of `table_key`: below every key of the table.
+    pub fn tableLeft(table_key: TableKey) Key {
+        return .{
+            .namespace = table_key.namespace,
+            .table_id = table_key.table_id,
+            .bound = .table_left,
+        };
+    }
+
+    /// The right edge of `table_key`: past every key of the table.
+    pub fn tableRight(table_key: TableKey) Key {
+        return .{
+            .namespace = table_key.namespace,
+            .table_id = table_key.table_id,
+            .bound = .table_right,
+        };
+    }
+
+    /// Whether this is one of the table edges, which carry no primary.
+    pub inline fn isTableEdge(self: Key) bool {
+        return self.bound == .table_left or self.bound == .table_right;
+    }
+
+    /// The range end that admits only this key (`Bound.after`). Borrows
+    /// `primary`; nothing is copied.
+    pub fn after(self: Key) Key {
+        std.debug.assert(self.bound == .exact);
+        var k = self;
+        k.bound = .after;
+        return k;
+    }
+
+    /// The table this key belongs to.
+    pub inline fn tableKey(self: Key) TableKey {
+        return .{ .namespace = self.namespace, .table_id = self.table_id };
+    }
+
+    /// A key may be compared only if it is not `inf`. A table edge
+    /// carries no primary and an exact or after key always has one:
+    /// a zero key (`Key{}`) is uninitialized, not a bound.
+    inline fn assertComparable(self: Key) void {
+        switch (self.bound) {
+            .exact, .after => std.debug.assert(self.primary.len > 0),
+            .table_left, .table_right => {
+                std.debug.assert(self.primary.len == 0);
+            },
+            .inf => unreachable,
+        }
+    }
+
+    /// Where a key sits among its table's keys before primaries are
+    /// looked at: the left edge, then every stored key, then the right
+    /// edge.
+    inline fn edgeRank(self: Key) u8 {
+        return switch (self.bound) {
+            .table_left => 0,
+            .exact, .after => 1,
+            .table_right => 2,
+            .inf => unreachable,
+        };
+    }
 
     /// Parse a marshaled key: [ns:u64 BE][tid:u32 BE][primary]. A key
     /// names a row, not a version: a version's timestamp lives in
@@ -305,8 +398,9 @@ pub const Key = struct {
     /// For keys without the prefix, construct Key directly via
     /// Key{ .primary = ... }.
     pub fn init(raw: String) Key {
+        // Empty bytes are how a stored range writes an unbounded side.
         if (raw.len == 0) {
-            return .{};
+            return inf;
         }
         return .{
             .namespace = std.mem.readInt(u64, raw[0..8], .big),
@@ -333,8 +427,12 @@ pub const Key = struct {
         }
     }
 
+    /// The stored form: `[ns][tid][primary]` for an exact key, empty
+    /// for `inf` (how a stored range writes an unbounded side). The
+    /// other bounds are never stored.
     pub fn marshal(self: Key, allocator: std.mem.Allocator) !String {
-        if (self.primary.len == 0) {
+        std.debug.assert(self.bound == .exact or self.bound == .inf);
+        if (self.bound == .inf) {
             return allocator.alloc(u8, 0);
         }
         const buf = try allocator.alloc(u8, self.len());
@@ -347,7 +445,8 @@ pub const Key = struct {
         allocator: std.mem.Allocator,
         data: *std.ArrayList(u8),
     ) !String {
-        if (self.primary.len == 0) {
+        std.debug.assert(self.bound == .exact or self.bound == .inf);
+        if (self.bound == .inf) {
             return allocator.alloc(u8, 0);
         }
         const start = data.items.len;
@@ -383,22 +482,130 @@ pub const Key = struct {
         if (ns_ord != .eq) return ns_ord;
         const tid_ord = std.math.order(self.table_id, other.table_id);
         if (tid_ord != .eq) return tid_ord;
-        const p_ord = std.mem.order(u8, self.primary, other.primary);
-        if (p_ord != .eq) return p_ord;
-        return std.math.order(@intFromBool(self.after), @intFromBool(other.after));
+        return self.orderPrimary(other);
     }
 
-    /// Length of the marshaled key; 0 for an empty primary.
+    /// Primary bytes, then `after`, ignoring namespace and table_id: the
+    /// order of two keys of one tree. An SST stores primaries only (its
+    /// tree owns the prefix), so its bounds and block base keys are
+    /// compared this way against a search key, which by contract is a
+    /// key of that tree (`Tree.openMerge` asserts it).
+    pub fn orderPrimary(self: Key, other: Key) std.math.Order {
+        self.assertComparable();
+        other.assertComparable();
+        // The table edges sort outside every primary; among equal
+        // primaries, `after` sorts past `exact`.
+        const edge_ord = std.math.order(self.edgeRank(), other.edgeRank());
+        if (edge_ord != .eq) return edge_ord;
+        const p_ord = std.mem.order(u8, self.primary, other.primary);
+        if (p_ord != .eq) return p_ord;
+        return std.math.order(
+            @intFromBool(self.bound == .after),
+            @intFromBool(other.bound == .after),
+        );
+    }
+
+    /// Length of the marshaled key: 0 for `inf`, the prefix plus the
+    /// primary otherwise.
     pub inline fn len(self: Key) usize {
-        if (self.primary.len == 0) {
-            return 0;
-        }
+        if (self.bound == .inf) return 0;
         return 12 + self.primary.len;
     }
 
     /// Same primary key, ignoring namespace/table_id.
     pub fn equalPrimary(self: Key, other: Key) bool {
         return std.mem.eql(u8, self.primary, other.primary);
+    }
+};
+
+/// A range of keys, `[left, right)`. A bound of `Key.inf` is no bound
+/// on that side, so the default range is everything (`all`). There is
+/// no empty range: a caller that accumulates one starts from null.
+pub const KeyRange = struct {
+    left: Key = Key.inf,
+    right: Key = Key.inf,
+
+    pub const all: KeyRange = .{};
+
+    /// This range CLAMPED to one table's key window: intersected with
+    /// the table's edges (`Key.tableLeft`, `Key.tableRight`). A left
+    /// below the table (a lower namespace/table, or unbounded) is raised
+    /// to the left edge; a right past the table (or unbounded) is
+    /// lowered to the right edge; a left/right genuinely inside the
+    /// table is kept. So a scan over the namespace-wide memtable stays
+    /// within the table, and a tree of that table reads each edge as no
+    /// bound on its side.
+    pub fn limitToTable(self: KeyRange, table_key: TableKey) KeyRange {
+        return self.intersect(.{
+            .left = Key.tableLeft(table_key),
+            .right = Key.tableRight(table_key),
+        });
+    }
+
+    /// Deep copy: dupes the underlying primary bytes for both bounds
+    /// using `allocator`. The original Keys may borrow from
+    /// short-lived storage (e.g. manifest entries protected by a
+    /// lock); duping into an allocator the caller controls keeps the
+    /// range usable after that storage is released.
+    pub fn dupe(self: KeyRange, allocator: std.mem.Allocator) !KeyRange {
+        return .{
+            .left = try self.left.dupe(allocator),
+            .right = try self.right.dupe(allocator),
+        };
+    }
+
+    pub fn overlapsWith(self: KeyRange, other: KeyRange) bool {
+        // [other.left, other.right] ... [self.left, self.right]
+        if (!other.right.isInf() and !self.left.isInf() and
+            other.right.order(self.left) == .lt) return false;
+        // [self.left, self.right] ... [other.left, other.right]
+        if (!self.right.isInf() and !other.left.isInf() and
+            self.right.order(other.left) == .lt) return false;
+        return true;
+    }
+
+    /// Widen `self` to cover `other` too. An unbounded side absorbs.
+    pub fn extend(self: *KeyRange, other: KeyRange) void {
+        self.left = looser_left(self.left, other.left);
+        self.right = looser_right(self.right, other.right);
+    }
+
+    /// Tighten `self` against `other` and return the overlap. An
+    /// unbounded side is no constraint from that side, so this composes
+    /// naturally with caller-supplied scan bounds and tree-stored ranges.
+    pub fn intersect(self: KeyRange, other: KeyRange) KeyRange {
+        return .{
+            .left = tighter_left(self.left, other.left),
+            .right = tighter_right(self.right, other.right),
+        };
+    }
+
+    /// The "leftmost" lower bound (= min); an unbounded one wins.
+    fn looser_left(a: Key, b: Key) Key {
+        if (a.isInf() or b.isInf()) return Key.inf;
+        return if (a.order(b) == .lt) a else b;
+    }
+
+    /// The "rightmost" upper bound (= max); an unbounded one wins.
+    fn looser_right(a: Key, b: Key) Key {
+        if (a.isInf() or b.isInf()) return Key.inf;
+        return if (a.order(b) == .gt) a else b;
+    }
+
+    /// Pick the "rightmost" lower bound (= max). An unbounded one means
+    /// no constraint — the OTHER bound wins.
+    fn tighter_left(a: Key, b: Key) Key {
+        if (a.isInf()) return b;
+        if (b.isInf()) return a;
+        return if (a.order(b) == .gt) a else b;
+    }
+
+    /// Pick the "leftmost" upper bound (= min). An unbounded one means
+    /// no constraint — the OTHER bound wins.
+    fn tighter_right(a: Key, b: Key) Key {
+        if (a.isInf()) return b;
+        if (b.isInf()) return a;
+        return if (a.order(b) == .lt) a else b;
     }
 };
 

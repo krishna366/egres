@@ -1,7 +1,7 @@
 const std = @import("std");
 const _zen = @import("buffers.gen.zig");
 const Key = @import("kv.zig").Key;
-const KeyRange = @import("level.zig").KeyRange;
+const KeyRange = @import("kv.zig").KeyRange;
 const TreeKey = @import("kv.zig").TreeKey;
 const TableKey = @import("kv.zig").TableKey;
 const treeTableId = @import("kv.zig").treeTableId;
@@ -47,8 +47,8 @@ pub const TreeState = struct {
     // The SQL table is derived from the tree_id (Key.treeTableId), not
     // stored — the tree_id is the map key alongside namespace_id (Key.TreeKey).
     levels: std.ArrayList(LevelState),
-    left: Key = .{},
-    right: Key = .{},
+    left: Key = Key.inf,
+    right: Key = Key.inf,
     /// See `buffers.KeyKind`. Set at create, inherited by a split's new
     /// tree, kept by the snapshot manifest.
     key_kind: KeyKind = .bytes,
@@ -211,23 +211,23 @@ pub const Manifest = struct {
         return id;
     }
 
-    /// Raise `namespace`'s counter past `table_id` (apply path, all nodes).
-    /// Idempotent; never lowers it (so re-applying or applying a low system
-    /// table leaves a higher user counter untouched). Floors at first_table_id.
+    /// Raise the table's namespace counter past its table_id (apply path,
+    /// all nodes). Idempotent; never lowers it (so re-applying or applying
+    /// a low system table leaves a higher user counter untouched). Floors
+    /// at first_table_id.
     pub fn advanceTableId(
         self: *Manifest,
-        namespace: u64,
-        table_id: u32,
+        table_key: TableKey,
     ) !void {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        const slot = try self.namespaces.getOrPut(namespace);
+        const slot = try self.namespaces.getOrPut(table_key.namespace);
         if (!slot.found_existing) slot.value_ptr.* = .{};
 
         // Floor the current counter, then raise it past table_id; never lowers.
         const floor = @max(slot.value_ptr.next_table_id, first_table_id);
-        slot.value_ptr.next_table_id = @max(floor, table_id +| 1);
+        slot.value_ptr.next_table_id = @max(floor, table_key.table_id +| 1);
     }
 
     /// Record `namespace`'s database name (ns_create apply path, all nodes).
@@ -278,8 +278,7 @@ pub const Manifest = struct {
     /// (system trees, splits).
     pub fn registerTableName(
         self: *Manifest,
-        namespace: u64,
-        table_id: u32,
+        table_key: TableKey,
         name: String,
     ) !void {
         if (name.len == 0) return;
@@ -287,21 +286,30 @@ pub const Manifest = struct {
         self.mu.lock(@src());
         defer self.mu.unlock();
 
-        const slot = try self.namespaces.getOrPut(namespace);
+        const slot = try self.namespaces.getOrPut(table_key.namespace);
         if (!slot.found_existing) slot.value_ptr.* = .{};
 
         if (slot.value_ptr.tables.get(name)) |owner| {
-            if (owner != table_id)
+            if (owner != table_key.table_id)
                 std.log.err(
                     "table name '{s}' in ns={d} already owned by " ++
                         "table_id={d}, not renaming table_id={d}",
-                    .{ name, namespace, owner, table_id },
+                    .{
+                        name,
+                        table_key.namespace,
+                        owner,
+                        table_key.table_id,
+                    },
                 );
             return;
         }
         const owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned);
-        try slot.value_ptr.tables.put(self.allocator, owned, table_id);
+        try slot.value_ptr.tables.put(
+            self.allocator,
+            owned,
+            table_key.table_id,
+        );
     }
 
     /// Resolve a table name to its table_id within a namespace (per-query
@@ -322,13 +330,13 @@ pub const Manifest = struct {
     /// reused; freeing the name is by design (DROP TABLE then CREATE TABLE
     /// of the same name works). Reverse lookup walks the map — drops are
     /// rare, name resolution is the hot path. Idempotent.
-    pub fn dropTable(self: *Manifest, namespace: u64, table_id: u32) void {
+    pub fn dropTable(self: *Manifest, table_key: TableKey) void {
         self.mu.lock(@src());
         defer self.mu.unlock();
-        const ns = self.namespaces.getPtr(namespace) orelse return;
+        const ns = self.namespaces.getPtr(table_key.namespace) orelse return;
         var it = ns.tables.iterator();
         while (it.next()) |kv| {
-            if (kv.value_ptr.* != table_id) continue;
+            if (kv.value_ptr.* != table_key.table_id) continue;
             const owned = kv.key_ptr.*;
             ns.tables.removeByPtr(kv.key_ptr);
             self.allocator.free(owned);
@@ -373,11 +381,7 @@ pub const Manifest = struct {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         const tree = self.trees.getPtr(key) orelse return null;
-        const range = KeyRange{
-            .left = tree.left,
-            .right = tree.right,
-            .inf = tree.left.len() == 0 and tree.right.len() == 0,
-        };
+        const range = KeyRange{ .left = tree.left, .right = tree.right };
         return try range.dupe(alloc);
     }
 
@@ -781,15 +785,21 @@ pub const Manifest = struct {
             },
             .create_tree => for (mc.tree_changes) |tc| {
                 if (tc.op != .create) continue;
-                const table_id = treeTableId(tc.tree_id);
-                try self.advanceTableId(tc.namespace_id, table_id);
-                try self.registerTableName(tc.namespace_id, table_id, tc.name);
+                const table_key: TableKey = .{
+                    .namespace = tc.namespace_id,
+                    .table_id = treeTableId(tc.tree_id),
+                };
+                try self.advanceTableId(table_key);
+                try self.registerTableName(table_key, tc.name);
             },
             .drop_tree => for (mc.tree_changes) |tc| {
                 if (tc.op != .delete) continue;
                 // The first delete of a multi-tree table removes the name;
                 // the rest are no-ops.
-                self.dropTable(tc.namespace_id, treeTableId(tc.tree_id));
+                self.dropTable(.{
+                    .namespace = tc.namespace_id,
+                    .table_id = treeTableId(tc.tree_id),
+                });
             },
             .drop_ns => if (mc.tree_changes.len > 0) {
                 // Frees the whole namespace map, table names included, so
@@ -868,7 +878,7 @@ pub const Manifest = struct {
             // tree per table has the open left bound (splits leave it with
             // the leftmost child), so a heavily-split table doesn't copy
             // its name into every TreeChange.
-            if (tree.left.primary.len == 0) {
+            if (tree.left.isInf()) {
                 if (tnames.get(.{
                     .namespace = tk.namespace,
                     .table_id = treeTableId(tk.tree_id),
@@ -992,11 +1002,10 @@ pub const Manifest = struct {
         while (i < tc_len) : (i += 1) {
             const tc = try reader.treeChangesAt(i);
             if (tc.op() == .create)
-                try self.registerTableName(
-                    tc.namespaceId(),
-                    treeTableId(tc.treeId()),
-                    tc.name(),
-                );
+                try self.registerTableName(.{
+                    .namespace = tc.namespaceId(),
+                    .table_id = treeTableId(tc.treeId()),
+                }, tc.name());
         }
         const ns_len = reader.namespacesLen();
         i = 0;

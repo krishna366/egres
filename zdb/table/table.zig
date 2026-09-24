@@ -2,6 +2,7 @@ const std = @import("std");
 const kv = @import("../kv.zig");
 const zbuf = @import("zbuf").zbuf;
 const Key = @import("../kv.zig").Key;
+const TableKey = @import("../kv.zig").TableKey;
 const Meta = @import("../kv.zig").Meta;
 pub const Item = @import("../kv.zig").Item;
 const Version = @import("../kv.zig").Version;
@@ -39,13 +40,14 @@ pub const Error = _idx.Error || _buffers.Error || compress.Error ||
 
 const log = std.log.scoped(.table);
 
-/// A block's base key as a Key.
+/// A block's base key as a primary-only Key: an SST stores no namespace
+/// or table_id (see `TableIterator.init`).
 inline fn baseKeyOf(b: _buffers.BlockIndexStruct) Key {
-    return Key.init(b.key);
+    return .{ .primary = b.key };
 }
 
-/// The smallest stored key: a 12-byte ns/tid prefix and one primary byte.
-const min_key_len: usize = 13;
+/// The smallest stored key: one primary byte.
+const min_key_len: usize = 1;
 
 /// An entry's fixed header: [u16 overlap][u16 diff_len].
 const entry_hdr_len: usize = 4;
@@ -71,6 +73,8 @@ pub const Table = struct {
     binary_fuse: ?_binaryfuse.BinaryFuse(u16),
     egid_bm: ?zroar.Bitmap,
     ref: std.atomic.Value(i32),
+    /// The table's key bounds, primary only (namespace and table_id 0):
+    /// compare them with `Key.orderPrimary`.
     smallest: Key,
     biggest: Key,
     /// The id the manifest lists this file under, supplied by the caller
@@ -219,11 +223,11 @@ pub const Table = struct {
             .binary_fuse = binary_fuse,
             .egid_bm = egid_bm,
             .smallest = if (smallest_raw.len >= min_key_len)
-                Key.init(smallest_raw)
+                Key{ .primary = smallest_raw }
             else
                 .{},
             .biggest = if (table_index.last_key.len >= min_key_len)
-                Key.init(table_index.last_key)
+                Key{ .primary = table_index.last_key }
             else
                 .{},
             .ref = std.atomic.Value(i32).init(1),
@@ -341,7 +345,7 @@ pub const Table = struct {
         const Base = _buffers.BlockIndexStruct;
         const above = utils.search(Base, blocks, target, struct {
             fn f(sk: Key, b: Base) bool {
-                return baseKeyOf(b).order(sk) == .gt;
+                return baseKeyOf(b).orderPrimary(sk) == .gt;
             }
         }.f);
         return if (above > 0) above - 1 else 0;
@@ -515,8 +519,10 @@ pub const Table = struct {
 /// caller-owned; key_buf and vers are self-owned.
 pub const BlockIterator = struct {
     alloc: std.mem.Allocator,
-    /// The current entry's stored key.
+    /// The current entry's stored key: the primary.
     key_buf: std.ArrayList(u8),
+    /// Stamped onto every emitted key: the tree this block is read for.
+    table_key: TableKey,
     block: String,
     /// The entries region, sliced once at init. Entry offsets stored in
     /// the block are relative to this, not to the block.
@@ -559,6 +565,7 @@ pub const BlockIterator = struct {
         alloc: std.mem.Allocator,
         block: String,
         base_key: String,
+        table_key: TableKey,
     ) !BlockIterator {
         // See Table Layout diagram in builder.zig.
         // This should be a copy of that. If not, use builder.zig as the source of truth.
@@ -583,6 +590,7 @@ pub const BlockIterator = struct {
         return .{
             .alloc = alloc,
             .key_buf = .empty,
+            .table_key = table_key,
             .block = block,
             .layout = layout,
             .entries_region = block[layout.entries_off..],
@@ -647,10 +655,9 @@ pub const BlockIterator = struct {
         };
     }
 
-    /// Order entry i against a marshaled target, per Key.order: the
-    /// [ns|tid|primary] bytes, bytewise (ns and tid are fixed-width
-    /// big-endian, so bytewise IS field order, and only primary can
-    /// differ in length, where shorter-is-less is what we want).
+    /// Order entry i against a target primary, bytewise: `Key.orderPrimary`
+    /// without `after` (only primaries are stored, and they can differ in
+    /// length, where shorter-is-less is what we want).
     ///
     /// `shared` is how many leading bytes the TARGET shares with
     /// base_key. Bytes below it that the entry also takes from base_key
@@ -680,9 +687,9 @@ pub const BlockIterator = struct {
     }
 
     /// Binary search for the first entry with key >= target. `traw` is
-    /// `target` marshaled (Key.marshalTo): the caller marshals once per
-    /// seek, then probes compare raw bytes and only the landing entry is
-    /// materialized.
+    /// Seek to the first entry whose primary is at or past `target_key`,
+    /// a primary. Probes compare stored bytes in place; only the landing
+    /// entry is materialized.
     pub fn seekGe(self: *BlockIterator, target_key: String) Error!void {
         return self.seekGeFrom(target_key, 0);
     }
@@ -726,12 +733,16 @@ pub const BlockIterator = struct {
 
     pub fn itemRef(self: *const BlockIterator) ?Item {
         if (!self.is_valid) return null;
-        // Parsed per call rather than cached in setIdx: Key.init is three
-        // loads off a hot key_buf, where caching costs a 40-byte store plus
-        // a reload, and every caller reads it about once per position.
-        // Measured: caching made a key walk ~20% SLOWER.
+        // Built per call rather than cached in setIdx: a few loads off a
+        // hot key_buf, where caching costs a 40-byte store plus a reload,
+        // and every caller reads it about once per position. Measured:
+        // caching made a key walk ~20% SLOWER.
         return .{
-            .key = Key.init(self.key_buf.items),
+            .key = .{
+                .namespace = self.table_key.namespace,
+                .table_id = self.table_key.table_id,
+                .primary = self.key_buf.items,
+            },
             .versions = .{ .many = self.vers.items },
         };
     }
@@ -833,9 +844,17 @@ pub const BlockIterator = struct {
 };
 
 /// TableIterator navigates all entries across all blocks in a table.
+/// Walks one table's entries for one tree. An SST stores primaries only:
+/// a file can be listed by more than one tree (a split shares them), so
+/// the tree opening the iterator says which namespace and table_id its
+/// keys carry, and every emitted key is stamped with them. Seeks take
+/// keys of that tree (asserted) and use their primaries; a table edge
+/// (`Key.tableLeft`/`tableRight`) is no bound on its side.
 pub const TableIterator = struct {
     allocator: std.mem.Allocator,
     table: *Table,
+    /// Stamped onto every emitted key.
+    table_key: TableKey,
     bpos: usize,
     bi: ?BlockIterator,
     current_block: ?*_cache.Value = null,
@@ -844,16 +863,17 @@ pub const TableIterator = struct {
     /// Exclusive upper bound, borrowed from the caller of `seekRange`.
     end_key: ?Key = null,
     end_bpos: usize = 0, // block index where end_key lives
-    /// Reusable scratch for the marshaled seek target — BlockIterator's
-    /// binary search compares against raw bytes, so we build them once
-    /// per seek rather than once per probe.
-    seek_buf: std.ArrayList(u8) = .empty,
-
-    pub fn init(allocator: std.mem.Allocator, table: *Table, priority: vfs.Priority) TableIterator {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        table: *Table,
+        priority: vfs.Priority,
+        table_key: TableKey,
+    ) TableIterator {
         table.incrRef();
         return .{
             .allocator = allocator,
             .table = table,
+            .table_key = table_key,
             .bpos = 0,
             .bi = null,
             .current_block = null,
@@ -863,7 +883,6 @@ pub const TableIterator = struct {
     }
 
     pub fn deinit(self: *TableIterator) void {
-        self.seek_buf.deinit(self.allocator);
         self.table.decrRef();
         if (self.bi) |*bi| bi.deinit();
         if (self.current_block) |b| b.decrRef();
@@ -874,23 +893,23 @@ pub const TableIterator = struct {
     /// `end` is borrowed, checked on every `next`: its primary must
     /// outlive the iterator's use of it, as the skiplist iterator's must.
     pub fn seekRange(self: *TableIterator, start: Key, end: Key) !void {
-        // Set up end bound.
+        // Set up end bound: none when inf or a table edge.
         self.end_key = null;
-
-        if (end.len() > 0) {
-            if (end.order(self.table.smallest) != .gt) {
+        if (!end.isInf()) self.assertOwn(end);
+        if (!end.isInf() and !end.isTableEdge()) {
+            if (end.orderPrimary(self.table.smallest) != .gt) {
                 // end <= smallest: nothing to return.
                 self.valid = false;
                 return;
             }
-            if (end.order(self.table.biggest) != .gt) {
+            if (end.orderPrimary(self.table.biggest) != .gt) {
                 // The end key is within this table's key range.
                 self.end_key = end;
                 // Find the block containing end_key: last block with base key <= end.
                 const blocks = self.table.index.blocks;
                 const ei = utils.search(_buffers.BlockIndexStruct, blocks, end, struct {
                     fn f(ek: Key, b: _buffers.BlockIndexStruct) bool {
-                        return baseKeyOf(b).order(ek) == .gt;
+                        return baseKeyOf(b).orderPrimary(ek) == .gt;
                     }
                 }.f);
                 self.end_bpos = if (ei > 0) ei - 1 else 0;
@@ -900,12 +919,20 @@ pub const TableIterator = struct {
         // Seek. The landing item can be past `end` (start beyond the
         // last in-range key lands on whatever follows), so the bound
         // applies here just as it does after every next().
-        if (start.len() == 0) {
+        if (!start.isInf()) self.assertOwn(start);
+        if (start.isInf() or start.isTableEdge()) {
             try self.seekToFirst();
         } else {
             try self.seekForward(start);
         }
         self.checkEndKey();
+    }
+
+    /// A seek key must be a key of the tree this iterator reads for; one
+    /// of another table is a caller's bug, never a case to handle.
+    fn assertOwn(self: *const TableIterator, key: Key) void {
+        std.debug.assert(key.namespace == self.table_key.namespace and
+            key.table_id == self.table_key.table_id);
     }
 
     fn seekToFirst(self: *TableIterator) Error!void {
@@ -923,9 +950,8 @@ pub const TableIterator = struct {
         const blocks = self.table.index.blocks;
         const lo = self.table.blockFor(target) orelse return;
 
-        // Marshal once; the in-block search compares against these bytes.
-        utils.clearRetainCap(&self.seek_buf);
-        const traw = try target.marshalTo(self.allocator, &self.seek_buf);
+        // The in-block search compares stored primaries against this.
+        const traw = target.primary;
 
         // The block is still open from the last seek: search it in
         // place, with no cache lookup and no iterator rebuild, and from
@@ -933,7 +959,7 @@ pub const TableIterator = struct {
         var from: usize = 0;
         if (self.bi != null and self.bpos == lo) {
             if (self.bi.?.itemRef()) |cur| {
-                if (cur.key.order(target) != .gt) from = self.bi.?.entry_idx;
+                if (cur.key.orderPrimary(target) != .gt) from = self.bi.?.entry_idx;
             }
         } else {
             try self.setBlock(lo);
@@ -1019,7 +1045,12 @@ pub const TableIterator = struct {
         self.current_block = val;
 
         const base_key = try self.table.blockBaseKey(bpos);
-        self.bi = try BlockIterator.init(self.allocator, val.data, base_key);
+        self.bi = try BlockIterator.init(
+            self.allocator,
+            val.data,
+            base_key,
+            self.table_key,
+        );
         self.bpos = bpos;
     }
 };

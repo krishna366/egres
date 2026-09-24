@@ -19,8 +19,9 @@ const Item = _table.table.Item;
 const Level = _level_handler.Level;
 const Lock = _level_handler.Lock;
 const TableEntry = _level_handler.TableEntry;
-const Key = @import("kv.zig").Key;
-const KeyRange = _level_handler.KeyRange;
+const _kv = @import("kv.zig");
+const Key = _kv.Key;
+const KeyRange = _kv.KeyRange;
 const MergeIterator = _table.merge_iterator.MergeIterator;
 const ConcatIterator = _table.merge_iterator.ConcatIterator;
 const Iterator = _table.merge_iterator.Iterator;
@@ -344,6 +345,20 @@ pub const Tree = struct {
     pub const mergeAndWrite = _compaction.mergeAndWrite;
     pub const flushBuilderOutput = _compaction.flushBuilderOutput;
 
+    /// The SQL table this tree is part of, from the tree id.
+    pub fn tableId(self: *const Tree) u32 {
+        return _kv.treeTableId(self.tree_id);
+    }
+
+    /// `key` as a key of this tree: a table bound carries no namespace
+    /// or table_id, and gets the tree's before it is used as one.
+    pub fn stamp(self: *const Tree, key: Key) Key {
+        var out = key;
+        out.namespace = self.namespace;
+        out.table_id = self.tableId();
+        return out;
+    }
+
     pub fn acquire(self: *Tree) void {
         const prev = self.refs.fetchAdd(1, .acquire);
         std.debug.assert(prev > 0);
@@ -412,9 +427,6 @@ pub const Tree = struct {
                 kr.left = try tree.left.dupe(allocator);
                 kr.right = try tree.right.dupe(allocator);
                 key_kind = tree.key_kind;
-                if (kr.left.len() == 0 and kr.right.len() == 0) {
-                    kr.inf = true;
-                }
                 for (tree.levels.items, 0..) |lm, level_idx| {
                     if (level_idx >= opts.max_levels) continue;
                     var tit = lm.tables.keyIterator();
@@ -479,8 +491,7 @@ pub const Tree = struct {
         const keys = [_]String{lookup.key.primary};
         var mg = try MultiGet.init(
             self.allocator,
-            lookup.key.namespace,
-            lookup.key.table_id,
+            lookup.key.tableKey(),
             &keys,
             .{
                 .read_ts = lookup.read_ts,
@@ -555,6 +566,17 @@ pub const Tree = struct {
 
         try iters.appendSlice(allocator, extras);
 
+        // The range's bounds are this tree's keys, or open: a table
+        // edge (`Key.tableLeft`/`tableRight`) is a key of its table, and
+        // the levels and iterators below compare primaries on that
+        // basis.
+        std.debug.assert(range.left.isInf() or
+            (range.left.namespace == self.namespace and
+                range.left.table_id == self.tableId()));
+        std.debug.assert(range.right.isInf() or
+            (range.right.namespace == self.namespace and
+                range.right.table_id == self.tableId()));
+
         const held = self.mu.hold(.shared, @src());
         defer held.release();
         for (self.levels, 0..) |*lv, level_idx| {
@@ -577,6 +599,10 @@ pub const Tree = struct {
                             allocator,
                             e.table,
                             priority,
+                            .{
+                                .namespace = self.namespace,
+                                .table_id = self.tableId(),
+                            },
                         ),
                     });
                 }
@@ -585,7 +611,15 @@ pub const Tree = struct {
                 for (overlapping) |e| {
                     if (e.table.index.max_version <= min_ts) continue;
                     const tbl = e.table;
-                    const sub = TableIterator.init(allocator, tbl, priority);
+                    const sub = TableIterator.init(
+                        allocator,
+                        tbl,
+                        priority,
+                        .{
+                            .namespace = self.namespace,
+                            .table_id = self.tableId(),
+                        },
+                    );
                     try subs.append(allocator, sub);
                 }
                 if (subs.items.len == 0) continue;
@@ -651,7 +685,9 @@ pub const Tree = struct {
     /// candidate K — they go to BOTH children in `buildSplit`, so
     /// they cost the same on each side and don't differentiate
     /// candidates. Only strict-left and strict-right bytes count.
-    pub fn findSplitKey(self: *Tree, allocator: std.mem.Allocator) !Key {
+    /// Null when the tree is not worth splitting: Lmax too small, or
+    /// no candidate.
+    pub fn findSplitKey(self: *Tree, allocator: std.mem.Allocator) !?Key {
         // Use a per-call arena for keys we collect under each level's
         // read lock — once the lock drops, the source Table could be
         // freed by a concurrent delete, so we must not keep raw
@@ -674,7 +710,7 @@ pub const Tree = struct {
         {
             const lv = &self.levels[lmax_idx];
             const lmax = lv.entries(held);
-            if (lmax.len < min_lmax_tables_for_split) return .{};
+            if (lmax.len < min_lmax_tables_for_split) return null;
             for (lmax[1..]) |tbe| {
                 try cand_keys.append(a, try tbe.table.smallest.dupe(a));
             }
@@ -703,9 +739,9 @@ pub const Tree = struct {
             var left: u64 = 0;
             var right: u64 = 0;
             for (all_entries.items) |e| {
-                if (e.biggest.order(k) == .lt) {
+                if (e.biggest.orderPrimary(k) == .lt) {
                     left += e.size;
-                } else if (e.smallest.order(k) != .lt) {
+                } else if (e.smallest.orderPrimary(k) != .lt) {
                     right += e.size;
                 }
                 // else: straddles K → goes to BOTH children → skip.
@@ -717,12 +753,14 @@ pub const Tree = struct {
             }
         }
 
-        const chosen = best_key orelse return .{};
+        const chosen = best_key orelse return null;
         // Re-dupe into the caller's allocator (arena dies on return).
         // Tree bounds name primaries, so every version of the split key
-        // goes to the right tree: no primary is split across trees.
-        const key = try chosen.dupe(allocator);
-        std.debug.assert(key.len() > 0);
+        // goes to the right tree: no primary is split across trees. The
+        // table bounds it came from carry no namespace or table_id; the
+        // tree's go on, since the key becomes a tree bound.
+        const key = self.stamp(try chosen.dupe(allocator));
+        std.debug.assert(key.primary.len > 0);
         return key;
     }
 
@@ -759,8 +797,7 @@ pub const Tree = struct {
         const keys = [_]String{lookup.key.primary};
         var mg = try MultiGet.init(
             allocator,
-            lookup.key.namespace,
-            lookup.key.table_id,
+            lookup.key.tableKey(),
             &keys,
             .{ .read_ts = lookup.read_ts, .priority = lookup.priority },
         );

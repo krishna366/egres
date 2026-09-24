@@ -9,6 +9,7 @@
 //! Free functions over `*Handler` — see the note in ddl.zig.
 
 const std = @import("std");
+const utils = @import("utils");
 const engine = @import("engine");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
@@ -43,17 +44,21 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     const ns = try self.sessionNamespace(state) orelse return;
     const table_id = eng.forest.manifest.lookupTable(ns, ins.table) orelse
         return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
+    const table_key: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = table_id,
+    };
 
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
     const arloc = arena.allocator();
 
-    const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
+    const tx = (try self.dmlTxn(state, table_key)) orelse return;
 
     // Open AFTER the table lock: a statement that parked behind
     // DDL holding the table lock exclusively (CREATE/DROP INDEX)
     // must see the reloaded schema, not a stale cached Table.
-    const tbl = self.openTable(ns, table_id) catch |err| {
+    const tbl = self.openTable(table_key) catch |err| {
         log.err("insert into '{s}': load schema: {s}", .{ ins.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
@@ -134,7 +139,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     // on this session sees the rows.
     const egids = try arloc.alloc(u64, num_rows);
     for (row_bytes, egids) |bytes, *egid| {
-        egid.* = self.allocEgid(ns, table_id) catch |err| switch (err) {
+        egid.* = self.allocEgid(table_key) catch |err| switch (err) {
             error.NotLeader => return replyError(state, "not the leader"),
             else => {
                 log.err("insert into '{s}': alloc egid: {s}", .{ ins.table, @errorName(err) });
@@ -158,15 +163,19 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     const ns = try self.sessionNamespace(state) orelse return;
     const table_id = eng.forest.manifest.lookupTable(ns, sel.table) orelse
         return replyErrorCode(state, pgwire.sqlstate.undefined_table, "table does not exist");
+    const table_key: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = table_id,
+    };
 
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
     const arloc = arena.allocator();
 
-    const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
+    const tx = (try self.dmlTxn(state, table_key)) orelse return;
 
     // Open AFTER the table lock — see insert's comment.
-    const tbl = self.openTable(ns, table_id) catch |err| {
+    const tbl = self.openTable(table_key) catch |err| {
         log.err("select from '{s}': load schema: {s}", .{ sel.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
@@ -246,14 +255,18 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
             pgwire.sqlstate.undefined_table,
             "table does not exist",
         );
+    const table_key: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = table_id,
+    };
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
     const arloc = arena.allocator();
 
-    const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
+    const tx = (try self.dmlTxn(state, table_key)) orelse return;
 
     // Open AFTER the table lock — see insert's comment.
-    const tbl = self.openTable(ns, table_id) catch |err| {
+    const tbl = self.openTable(table_key) catch |err| {
         logDeleteErr(del.table, "load schema", err);
         return replyError(state, "failed to load table schema");
     };
@@ -325,14 +338,18 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
             pgwire.sqlstate.undefined_table,
             "table does not exist",
         );
+    const table_key: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = table_id,
+    };
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
     const arloc = arena.allocator();
 
-    const tx = (try self.dmlTxn(state, ns, table_id)) orelse return;
+    const tx = (try self.dmlTxn(state, table_key)) orelse return;
 
     // Open AFTER the table lock — see insert's comment.
-    const tbl = self.openTable(ns, table_id) catch |err| {
+    const tbl = self.openTable(table_key) catch |err| {
         log.err("update '{s}': load schema: {s}", .{ up.table, @errorName(err) });
         return replyError(state, "failed to load table schema");
     };
@@ -489,6 +506,10 @@ pub fn describeSelect(
             pgwire.sqlstate.undefined_table,
             "table does not exist",
         );
+    const table_key: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = table_id,
+    };
 
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
@@ -496,7 +517,7 @@ pub fn describeSelect(
 
     const db = try self.sessionDb(ns);
     const hold = db.holdTable(table_id) orelse
-        return describeSelectLoad(self, state, arloc, ns, table_id, sel);
+        return describeSelectLoad(self, state, arloc, table_key, sel);
 
     const resolved = blk: {
         // state.send* can block below. Release the table hold here itself.
@@ -522,13 +543,12 @@ fn describeSelectLoad(
     self: *Handler,
     state: *pgwire.ConnState,
     arloc: std.mem.Allocator,
-    ns: u64,
-    table_id: u32,
+    table_key: zdb.kv.TableKey,
     sel: _parse.Select,
 ) !void {
     defer self.endImplicit();
-    _ = (try self.dmlTxn(state, ns, table_id)) orelse return;
-    const tbl = self.openTable(ns, table_id) catch |err| {
+    _ = (try self.dmlTxn(state, table_key)) orelse return;
+    const tbl = self.openTable(table_key) catch |err| {
         log.err(
             "describe select from '{s}': load schema: {s}",
             .{ sel.table, @errorName(err) },
@@ -973,7 +993,7 @@ fn probeUnique(
     var i: usize = 0;
     while (i < probes.len) {
         const index_table_id = probes[i].idx.index_table_id;
-        names.clearRetainingCapacity();
+        utils.clearRetainCap(&names);
 
         while (i < probes.len and
             probes[i].idx.index_table_id == index_table_id) : (i += 1)
