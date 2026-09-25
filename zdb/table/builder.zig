@@ -101,22 +101,25 @@ pub const Error = error{
     ValueTooLarge,
     TooManyBlocks,
     IntegerOverflow,
-    /// A key of an `egid` tree that is not an 8-byte egid.
+    /// A key of a rows tree that is not an 8-byte egid.
     KeyNotEgid,
+    UnknownTreeKind,
 } || _buffers.Error || compress.Error || std.mem.Allocator.Error || _binaryfuse.Error;
 
 pub const Config = struct {
     target_block_size: usize = 32 * 1024,
     codec: compress.Codec = .none,
     priority: vfs.Priority = .p2,
-    /// The filter the table carries (`buffers.KeyKind`, the tree's). An
-    /// `egid` table keeps its keys, 8-byte big-endian row ids, exactly in
-    /// a roaring bitmap: a miss is certain, a hit is certain, and a
-    /// table of dense ids costs 8 KiB per 64k-id chunk, against about
-    /// two bytes per key for a fuse filter (sparse ids cost the same two
-    /// bytes each). A `bytes` table hashes its keys into a binary fuse
-    /// filter.
-    key_kind: _buffers.KeyKindEnum = .bytes,
+    /// The tree the table is built for (`buffers.TreeKind`), which
+    /// picks its filter. A rows table keeps its keys, 8-byte big-endian
+    /// egids, exactly in a roaring bitmap: a miss is certain, a hit is
+    /// certain, and a table of dense ids costs 8 KiB per 64k-id chunk,
+    /// against about two bytes per key for a fuse filter (sparse ids
+    /// cost the same two bytes each). An index table hashes its keys
+    /// into a binary fuse filter, the default: a table built for no
+    /// tree in particular (tests, tools) gets the filter that holds
+    /// for any key.
+    kind: _buffers.TreeKindEnum = .posting_index,
 };
 
 const BlockInfo = struct {
@@ -297,12 +300,12 @@ pub const Builder = struct {
                 return error.KeyOrderViolation;
             }
         }
-        switch (self.cfg.key_kind) {
-            .bytes => try self.bf_hashes.append(
+        switch (self.cfg.kind) {
+            .unique_index, .posting_index => try self.bf_hashes.append(
                 self.allocator,
                 kv.bloomHash(key.primary),
             ),
-            .egid => {
+            .rows => {
                 if (key.primary.len != 8) return error.KeyNotEgid;
                 if (self.egid_bm == null) {
                     self.egid_bm = try zroar.Bitmap.init(self.allocator);
@@ -310,7 +313,9 @@ pub const Builder = struct {
                 const egid = std.mem.readInt(u64, key.primary[0..8], .big);
                 _ = try self.egid_bm.?.set(egid);
             },
-            _ => return error.KeyNotEgid,
+            // Unset, or a kind this build does not know (the wire enum
+            // is open): no filter it can write.
+            .unknown, _ => return error.UnknownTreeKind,
         }
 
         // The stored key is the primary alone: the namespace and table_id

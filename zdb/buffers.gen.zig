@@ -21,9 +21,11 @@ pub const OpEnum = enum(u8) {
     _,
 };
 
-pub const KeyKindEnum = enum(u8) {
-    bytes = 0,
-    egid = 1,
+pub const TreeKindEnum = enum(u8) {
+    unknown = 0,
+    rows = 1,
+    unique_index = 2,
+    posting_index = 3,
     _,
 };
 
@@ -1187,7 +1189,7 @@ pub const TreeChangeStruct = struct {
     left_key: []const u8 = &.{},
     right_key: []const u8 = &.{},
     name: []const u8 = &.{},
-    key_kind: KeyKindEnum = @enumFromInt(0),
+    kind: TreeKindEnum = @enumFromInt(0),
     pub fn deinit(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.left_key);
         self.left_key = &.{};
@@ -1207,7 +1209,7 @@ pub const TreeChangeStruct = struct {
             .op = self.op,
             .namespace_id = self.namespace_id,
             .tree_id = self.tree_id,
-            .key_kind = self.key_kind,
+            .kind = self.kind,
         };
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.left_key);
@@ -1231,7 +1233,7 @@ pub const TreeChangeStruct = struct {
         try writer.setLeftKey(self.left_key);
         try writer.setRightKey(self.right_key);
         try writer.setName(self.name);
-        try writer.setKeyKind(self.key_kind);
+        try writer.setKind(self.kind);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1312,7 +1314,7 @@ pub const TreeChangeReader = struct {
         return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
     }
 
-    pub fn keyKind(self: Self) KeyKindEnum {
+    pub fn kind(self: Self) TreeKindEnum {
         const slot_end = @as(u32, self.base) + 44;
         const header_end = @as(u32, self.base) + self.size_bytes;
         if (slot_end > header_end) return @enumFromInt(0);
@@ -1328,7 +1330,7 @@ pub const TreeChangeReader = struct {
         try writer.setLeftKey(self.leftKey());
         try writer.setRightKey(self.rightKey());
         try writer.setName(self.name());
-        try writer.setKeyKind(self.keyKind());
+        try writer.setKind(self.kind());
         const result = try writer.finish();
         return result.offset;
     }
@@ -1366,7 +1368,7 @@ pub const TreeChangeReader = struct {
             .op = self.op(),
             .namespace_id = self.namespaceId(),
             .tree_id = self.treeId(),
-            .key_kind = self.keyKind(),
+            .kind = self.kind(),
         };
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.leftKey());
@@ -1492,7 +1494,7 @@ pub const TreeChangeWriter = struct {
         try zbuf.patchU32(out.items, self.base + 39, @as(u32, @intCast(data.len)));
     }
 
-    pub fn setKeyKind(self: *Self, v: KeyKindEnum) Error!void {
+    pub fn setKind(self: *Self, v: TreeKindEnum) Error!void {
         const out = self.bufMut();
         try zbuf.patchU8(out.items, self.base + 43, @intFromEnum(v));
     }
@@ -1508,7 +1510,7 @@ pub const TreeChangeWriter = struct {
         if (@hasField(Values, "left_key")) try self.setLeftKey(@field(values, "left_key"));
         if (@hasField(Values, "right_key")) try self.setRightKey(@field(values, "right_key"));
         if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
-        if (@hasField(Values, "key_kind")) try self.setKeyKind(@field(values, "key_kind"));
+        if (@hasField(Values, "kind")) try self.setKind(@field(values, "kind"));
     }
 
     pub fn finish(self: *Self) Error!TreeChangeBuffer {

@@ -824,9 +824,9 @@ pub const AdminServer = struct {
         }, "DEL");
     }
 
-    /// Propose a single KV through Raft and block until it commits. `verb` is
-    /// only used to label log lines, so `set` and `del` stay distinguishable
-    /// in the log while sharing one code path.
+    /// Propose a single KV through Raft and block until it commits. `verb`
+    /// is only used to label log lines, so `set` and `del` stay
+    /// distinguishable in the log while sharing one code path.
     fn proposeOneKV(
         self: *AdminServer,
         stream: fiber.net.Stream,
@@ -842,7 +842,6 @@ pub const AdminServer = struct {
             try writeUnknownNamespace(stream, ns);
             return;
         }
-        self.engine.applyWriteBackpressure(ns);
         // Encode as a single-item Mutations batch — the wire format is the
         // same regardless of batch size, so the apply path doesn't need to
         // know whether this write came from a `set` or a `set_batch`.
@@ -854,36 +853,33 @@ pub const AdminServer = struct {
         var kvs = [_]zdb_bufs.KeyValueStruct{
             .{ .key = wire_key, .value = kv.value, .meta = kv.meta.toByte() },
         };
-        const proposal_bytes = try Engine.encodeMutations(alloc, ns, &kvs);
-        defer alloc.free(proposal_bytes);
+        try self.proposeKvs(stream, ns, &kvs, verb);
+    }
 
-        // TODO: Fire callback at commit time (quorum achieved) instead of after apply.
-        // Currently the client blocks until both commit + apply are done. To fix:
-        // 1. Move callback fire before on_apply in applyCommits
-        // 2. For reads, track applied_timestamp in StorageApplier and block reads
-        //    until applied_timestamp >= read timestamp for linearizability.
-        var w: raft.ProposalWaiter = .{};
-        self.engine.node.proposeDataChange(proposal_bytes, &w) catch |err| {
-            log.err("propose failed: {s}", .{@errorName(err)});
-            try proto.writeErr(stream, "propose failed");
-            return;
-        };
-        const status = w.wait();
-        switch (status) {
-            .committed => {
-                log.debug(verb ++ " committed", .{});
-                try proto.writeOk(stream);
-            },
-            .not_leader => {
+    /// The one way an admin write reaches raft: `Engine.proposeWrites`,
+    /// which every data proposal in the process goes through (so the
+    /// L0 brake applies here too), waiting for commit. Replies OK, not
+    /// leader, or the error's name.
+    fn proposeKvs(
+        self: *AdminServer,
+        stream: fiber.net.Stream,
+        ns: u32,
+        kvs: []zdb_bufs.KeyValueStruct,
+        comptime verb: String,
+    ) !void {
+        self.engine.proposeWrites(ns, kvs, .commit) catch |err| switch (err) {
+            error.NotLeader => {
                 const leader = self.engine.node.getLeaderId() orelse 0;
                 log.info(verb ++ " rejected: not leader (leader={d})", .{leader});
-                try proto.writeNotLeader(stream, leader);
+                return proto.writeNotLeader(stream, leader);
             },
             else => {
-                log.err(verb ++ " failed: status={s}", .{@tagName(status)});
-                try proto.writeErr(stream, @tagName(status));
+                log.err(verb ++ " failed: {s}", .{@errorName(err)});
+                return proto.writeErr(stream, @errorName(err));
             },
-        }
+        };
+        log.debug(verb ++ " committed", .{});
+        try proto.writeOk(stream);
     }
 
     /// Tokenize `count * 2` whitespace-delimited tokens from the buffered
@@ -895,7 +891,6 @@ pub const AdminServer = struct {
             try writeUnknownNamespace(stream, batch.ns);
             return;
         }
-        self.engine.applyWriteBackpressure(batch.ns);
         // Wire keys are full marshaled keys (raw-KV table_id 0); the
         // arena owns them until the payload is encoded.
         var arena = std.heap.ArenaAllocator.init(self.engine.allocator);
@@ -907,24 +902,7 @@ pub const AdminServer = struct {
             .value = src.value,
             .meta = src.meta.toByte(),
         };
-        const proposal_bytes = try Engine.encodeMutations(self.engine.allocator, batch.ns, kvs);
-        defer self.engine.allocator.free(proposal_bytes);
-
-        var w: raft.ProposalWaiter = .{};
-        self.engine.node.proposeDataChange(proposal_bytes, &w) catch |err| {
-            log.err("batch propose failed: {s}", .{@errorName(err)});
-            try proto.writeErr(stream, "propose failed");
-            return;
-        };
-        const status = w.wait();
-        switch (status) {
-            .committed => try proto.writeOk(stream),
-            .not_leader => {
-                const leader = self.engine.node.getLeaderId() orelse 0;
-                try proto.writeNotLeader(stream, leader);
-            },
-            else => try proto.writeErr(stream, @tagName(status)),
-        }
+        try self.proposeKvs(stream, batch.ns, kvs, "set_batch");
     }
 
     fn handleGet(self: *AdminServer, stream: fiber.net.Stream, req: proto.GetCmd) !void {

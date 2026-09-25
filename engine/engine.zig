@@ -125,7 +125,7 @@ pub const StorageImpl = struct {
 
     /// Cheap check: SM is ready for a data proposal once `recoverFromSnapshot`
     /// has finished AND a real memtable (raft_index != 0) is current. The leader
-    /// polls this in `Node.proposeDataChange`; without the memtable gate, a
+    /// polls this in `Node.propose`; without the memtable gate, a
     /// write that races startup would land in the placeholder and be dropped
     /// by the first `swapCurrentOut`.
     fn isReady(ctx: *anyopaque) bool {
@@ -1133,13 +1133,13 @@ pub const Engine = struct {
                 continue;
             };
             defer self.releaseCompactingTree(target.key);
-            // The candidate carries `needs_split=true` when the tree has
-            // outgrown `Config.splitBytes`, its Lmax target plus the
-            // levels above it. updateCompactCandidate
-            // sets this in the apply path (after every compaction/flush),
-            // so the dispatch here always reflects the latest applied
-            // state — no separate polling for splits is needed.
-            if (target.candidate.needs_split) {
+            // The candidate's job is a split when the tree has outgrown
+            // `Config.splitBytes`, its Lmax target plus the levels above
+            // it. updateCompactCandidate sets this in the apply path
+            // (after every compaction/flush), so the dispatch here
+            // always reflects the latest applied state — no separate
+            // polling for splits is needed.
+            if (target.candidate.job == .split) {
                 self.proposeSplit(target.key) catch |err| {
                     log.err("proposeSplit failed for tree {d}: {s}", .{ target.key.tree_id, @errorName(err) });
                 };
@@ -1220,12 +1220,7 @@ pub const Engine = struct {
         // installed snapshot's timestamp. Every node raised it when that
         // snapshot entry applied, before this compaction's entry.
         const min_read = self.forest.globalMinRead();
-        // L0 decides at build time whether it merges within itself or
-        // pushes into L1.
-        var changes = if (src == 0)
-            try tree.compactL0(min_read)
-        else
-            try tree.buildCompaction(src, min_read);
+        var changes = try tree.buildCompaction(min_read);
         defer changes.deinit(self.allocator);
 
         if (changes.items.len == 0) {
@@ -1278,7 +1273,7 @@ pub const Engine = struct {
             // us here was stale — refresh it so the next levels-loop
             // iteration picks a different (real) candidate instead of
             // hammering this tree forever. Without this, the loop spins
-            // on the same `needs_split=true` tree and starves every
+            // on the same split-wanting tree and starves every
             // other tree's pending compactions.
             if (self.forest.getTree(key.namespace, key.tree_id)) |t| {
                 defer t.release();
@@ -1351,21 +1346,32 @@ pub const Engine = struct {
     }
 
     /// L0 backpressure: sleep proportional to how many L0 tables the
-    /// destination namespace's worst tree currently has. Bound writes from
-    /// out-running flush + compaction so L0 doesn't grow into a 10s-of-GiB
-    /// monolithic compaction target. Per-namespace (not global) so a hot
-    /// namespace doesn't stall writes to other namespaces on the same node.
-    /// See `Options.l0_backpressure_start_count` etc. for the curve.
-    pub fn applyWriteBackpressure(self: *Engine, ns: u32) void {
+    /// trees these writes land in currently have, the worst of them.
+    /// Bounds writes from out-running flush + compaction so L0 doesn't
+    /// grow into a 10s-of-GiB monolithic compaction target. Per tree,
+    /// so a backlog behind one table's tail does not stall writes to
+    /// anything else on the node. See `Options.l0_backpressure_start_count`
+    /// etc. for the curve. `kvs` are the batch's marshaled keys.
+    pub fn applyWriteBackpressure(self: *Engine, kvs: []const zdb_bufs.KeyValueStruct) void {
         const opts = self.forest.live.cur();
-        const l0 = self.forest.maxL0TableCountForNs(ns);
+        var keys_buf: [64]String = undefined;
+        const n = @min(kvs.len, keys_buf.len);
+        // A batch is one commit: its keys share a few trees, so a
+        // prefix of them finds the same trees at a bounded cost.
+        for (kvs[0..n], keys_buf[0..n]) |kv, *k| k.* = kv.key;
+
+        const l0 = self.forest.maxL0TableCountForKeys(keys_buf[0..n]);
         if (l0 <= opts.l0_backpressure_start_count) return;
+
         const excess: u64 = l0 - opts.l0_backpressure_start_count;
         const delay_us: u64 = @min(
             excess * opts.l0_backpressure_step_us,
             @as(u64, opts.l0_backpressure_max_us),
         );
         if (delay_us == 0) return;
+        // The sleep itself is the cost; record it so a slow write path
+        // can be told apart from a braked one.
+        metrics.g().write_backpressure_ms.observe(delay_us / 1000);
         fiber.sleepMs(delay_us / 1000);
     }
 
@@ -1466,6 +1472,10 @@ pub const Engine = struct {
     /// `.apply` when the writes must be locally readable on return
     /// (catalog rows), `.commit` when durable + ordered is enough.
     pub fn proposeWrites(self: *Engine, namespace: u64, kvs: []zdb_bufs.KeyValueStruct, wait_for: Wait) !void {
+        // Every data proposal enters here: row commits, catalog rows,
+        // index builds, the admin set and set_batch. The brake is applied
+        // once, for all of them.
+        self.applyWriteBackpressure(kvs);
         const payload = try encodeMutations(self.allocator, namespace, kvs);
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload, .data, wait_for);
@@ -1481,7 +1491,7 @@ pub const Engine = struct {
     }
 };
 
-/// Encode a ManifestChange into a zbuf-serialized payload for proposeDataChange.
+/// Encode a ManifestChange into a zbuf-serialized payload to propose.
 fn encodeManifestChange(
     allocator: std.mem.Allocator,
     cmd: _manifest.Command,

@@ -209,8 +209,8 @@ pub fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tk: TreeKey) !void {
     }
     if (candidate) |c| {
         try w.print(
-            "  compact_candidate: L{d} score={d:.2}\n",
-            .{ c.level, c.score },
+            "  compact_candidate: L{d} {t} score={d:.2}\n",
+            .{ c.level, c.job, c.score },
         );
     }
 }

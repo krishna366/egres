@@ -5,6 +5,7 @@ const sql = @import("sql");
 const String = sql.value.String;
 const utils = @import("utils");
 const zdb = @import("zdb");
+const createTree = @import("../zdb/testing.zig").createTree;
 const flags = @import("flags");
 
 const exec = sql.exec;
@@ -99,14 +100,17 @@ const Fixture = struct {
         );
         errdefer testing.allocator.free(dir_path);
 
-        const f_live = try flags.Live(Config).create(testing.allocator, .{ .dir = dir_path });
+        const f_live = try flags.Live(Config).create(
+            testing.allocator,
+            .{ .dir = dir_path },
+        );
         errdefer f_live.destroy();
         const f = try Forest.open(testing.allocator, f_live);
         errdefer f.close();
-        _ = try f.createTree(.{
+        _ = try createTree(f, .{
             .namespace = ns,
             .table_id = tid,
-        }, .{});
+        }, .{}, .posting_index);
         if (on_disk) {
             // The id-0 placeholder memtable is released, never flushed:
             // write into a real one.

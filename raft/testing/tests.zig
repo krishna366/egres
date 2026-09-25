@@ -246,7 +246,7 @@ pub fn testProposalCallbackFiresOnCommit() !void {
     try node.becomeLeader();
 
     var w: raft.ProposalWaiter = .{};
-    try node.proposeDataChange("hello", &w);
+    try node.propose("hello", .data, &w);
     _ = try node.processProposalRequests();
     node.advance(); // commits, and finishes the waiter right there
     node.applyCommits();
@@ -325,7 +325,7 @@ pub fn testTransportProcessesProposal() !void {
     try group.spawn(.{}, runRaftRuntime, .{&rt});
 
     var w: raft.ProposalWaiter = .{};
-    try node.proposeDataChange("transport-cb", &w);
+    try node.propose("transport-cb", .data, &w);
     try std.testing.expectEqual(raft.CommitStatus.committed, w.wait());
     node.shutdown.start();
 }
@@ -380,7 +380,7 @@ pub fn testProposeAfterShutdownReturnsQueueClosed() !void {
     var w: raft.ProposalWaiter = .{};
     try std.testing.expectError(
         raft.RaftError.QueueClosed,
-        node.proposeDataChange("x", &w),
+        node.propose("x", .data, &w),
     );
 }
 

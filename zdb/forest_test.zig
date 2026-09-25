@@ -3,6 +3,7 @@ const fiber = @import("zfiber");
 const utils = @import("utils");
 const String = utils.String;
 const zdb = @import("zdb");
+const createTree = @import("testing.zig").createTree;
 const flags = @import("flags");
 const vfs = zdb.vfs;
 
@@ -17,6 +18,33 @@ const Builder = _table.builder.Builder;
 const Table = _table.Table;
 
 const _manifest = zdb.manifest;
+
+/// A create of one tree for a NEW table at `table_key`, as one manifest
+/// change to run through `applyCreateTree`: the tree_id a fresh table
+/// starts at (split 0, so table_id << 32), infinite range within its
+/// table. Lets a test pick the table_id, which `buildCreateTables`
+/// allocates itself. Caller owns the change's tree_changes.
+fn buildCreateTree(
+    f: *Forest,
+    alloc: std.mem.Allocator,
+    table_key: TableKey,
+    kind: _manifest.TreeKind,
+) !_manifest.ManifestChange {
+    const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
+    tree_changes[0] = _manifest.createTreeChange(
+        f.nextTreeId(table_key),
+        table_key.namespace,
+        "",
+        "",
+        kind,
+    );
+    return .{
+        .tree_changes = tree_changes,
+        .sstable_changes = &.{},
+        .cmd = .create_tree,
+        .memtable_id = 0,
+    };
+}
 const KeyRange = zdb.kv.KeyRange;
 const Tree = zdb.tree.Tree;
 
@@ -43,6 +71,11 @@ const Config = zdb.config.Config;
 const TableTrees = _forest.TableTrees;
 
 const config = zdb.config;
+
+/// A bottom target of one byte makes a push L0's job at any size
+/// (`pickL0Job`), so compacting L0 pushes into L1 as the tests
+/// that compact L0 expect.
+const push_lmax: i64 = 1;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -148,7 +181,7 @@ test "forest: create tree and get" {
 
     // Create a tree for namespace 1's default table (table_id 0). A fresh
     // table starts at split 0, so the derived tree_id is 0.
-    const tree_id = try f.createTree(ns1_table0, .{});
+    const tree_id = try createTree(f, ns1_table0, .{}, .posting_index);
     try std.testing.expectEqual(@as(u64, 0), tree_id);
 
     // Verify the tree exists.
@@ -198,7 +231,7 @@ test "forest: split tree" {
     defer f.close();
 
     // Default table (table_id 0) → derived tree_id 0.
-    const tree_id = try f.createTree(ns42_table0, .{});
+    const tree_id = try createTree(f, ns42_table0, .{}, .posting_index);
     try std.testing.expectEqual(@as(u64, 0), tree_id);
 
     const table_keys = [_]String{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
@@ -285,21 +318,23 @@ test "forest: two-level routing isolates by table_id" {
 
     // Three tables in namespace 2: table_id 0 (the default), 1, and 2. Each is its
     // own tree, so the same primary key "row" lives independently in each.
-    const t0 = try f.createTree(.{
+    const t0 = try createTree(f, .{
         .namespace = 2,
         .table_id = 0,
-    }, .{});
-    const t1 = try f.createTree(.{
+    }, .{}, .posting_index);
+    const t1 = try createTree(f, .{
         .namespace = 2,
         .table_id = 1,
-    }, .{});
-    const t2 = try f.createTree(.{
+    }, .{}, .posting_index);
+    const t2 = try createTree(f, .{
         .namespace = 2,
         .table_id = 2,
-    }, .{});
+    }, .{}, .posting_index);
     try std.testing.expect(t0 != t1 and t1 != t2 and t0 != t2);
     // An unrouted table_id has no table.
-    try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 3 }) == null);
+    try std.testing.expect(
+        f.tables.get(.{ .namespace = 2, .table_id = 3 }) == null,
+    );
 
     // One SST per table: same primary, distinct value, installed at L1.
     const Case = struct { tid: u32, tree: u64, val: String };
@@ -363,14 +398,16 @@ test "forest: create_tree + drop_tree round-trip" {
     defer f.close();
 
     // Create a new table (ns=2, table_id=100) via the manifest op.
-    const mc = try f.buildCreateTree(alloc, .{
+    const mc = try buildCreateTree(f, alloc, .{
         .namespace = 2,
         .table_id = 100,
-    });
+    }, .posting_index);
     defer alloc.free(mc.tree_changes);
     try f.applyCreateTree(1, mc);
     const tree_id = mc.tree_changes[0].tree_id;
-    try std.testing.expect(f.tables.get(.{ .namespace = 2, .table_id = 100 }) != null);
+    try std.testing.expect(
+        f.tables.get(.{ .namespace = 2, .table_id = 100 }) != null,
+    );
 
     // Install one SST and confirm the row reads back through routing.
     const path = try zdb.sstPath(alloc, dir_path, 1);
@@ -441,21 +478,32 @@ test "forest: drop_ns removes every table and forgets the id counter" {
         .namespace = 7,
         .table_id = _manifest.index_catalog_table_id,
     }));
-    try std.testing.expectEqual(@as(?u64, 7), f.manifest.lookupNamespace("seven"));
+    try std.testing.expectEqual(
+        @as(?u64, 7),
+        f.manifest.lookupNamespace("seven"),
+    );
 
-    const sys = try f.buildCreateTree(alloc, .{
+    const sys = try buildCreateTree(f, alloc, .{
         .namespace = 7,
         .table_id = 3,
-    });
+    }, .posting_index);
     defer alloc.free(sys.tree_changes);
     try f.applyCreateTree(1, sys);
 
-    const ct = try f.buildCreateTables(alloc, 7, &.{"users"}, &.{.bytes});
+    const ct = try f.buildCreateTables(
+        alloc,
+        7,
+        &.{"users"},
+        &.{.posting_index},
+    );
     defer alloc.free(ct.table_ids);
     defer alloc.free(ct.change.tree_changes);
     try f.applyCreateTree(1, ct.change);
     try std.testing.expectEqual(_manifest.first_table_id, ct.table_ids[0]);
-    try std.testing.expectEqual(@as(?u32, ct.table_ids[0]), f.manifest.lookupTable(7, "users"));
+    try std.testing.expectEqual(
+        @as(?u32, ct.table_ids[0]),
+        f.manifest.lookupTable(7, "users"),
+    );
 
     // Drop the namespace: one delete per tree across all five tables.
     const dc = try f.buildDropNamespace(alloc, 7);
@@ -493,11 +541,19 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const nc2 = try f.buildNamespaceCreate(alloc, 7, "seven");
     defer alloc.free(nc2.tree_changes);
     try f.applyNamespaceCreate(1, nc2);
-    const ct2 = try f.buildCreateTables(alloc, 7, &.{"users"}, &.{.bytes});
+    const ct2 = try f.buildCreateTables(
+        alloc,
+        7,
+        &.{"users"},
+        &.{.posting_index},
+    );
     defer alloc.free(ct2.table_ids);
     defer alloc.free(ct2.change.tree_changes);
     try std.testing.expectEqual(_manifest.first_table_id, ct2.table_ids[0]);
-    try std.testing.expectEqual(@as(?u64, 7), f.manifest.lookupNamespace("seven"));
+    try std.testing.expectEqual(
+        @as(?u64, 7),
+        f.manifest.lookupNamespace("seven"),
+    );
 }
 
 test "forest: drop_tree keeps an SST shared with another tree" {
@@ -516,18 +572,18 @@ test "forest: drop_tree keeps an SST shared with another tree" {
 
     // Two tables (tables 100 and 101) that share one SST file (id 1) — the
     // shape a cheap CLONE produces: the same *Table referenced by both trees.
-    const mcA = try f.buildCreateTree(alloc, .{
+    const mcA = try buildCreateTree(f, alloc, .{
         .namespace = 2,
         .table_id = 100,
-    });
+    }, .posting_index);
     defer alloc.free(mcA.tree_changes);
     try f.applyCreateTree(1, mcA);
     const treeA = mcA.tree_changes[0].tree_id;
 
-    const mcB = try f.buildCreateTree(alloc, .{
+    const mcB = try buildCreateTree(f, alloc, .{
         .namespace = 2,
         .table_id = 101,
-    });
+    }, .posting_index);
     defer alloc.free(mcB.tree_changes);
     try f.applyCreateTree(1, mcB);
     const treeB = mcB.tree_changes[0].tree_id;
@@ -593,14 +649,14 @@ test "forest: buildCreateTables allocates and never reuses a dropped id" {
 
     // First user table in namespace 2 gets first_table_id; second gets +1.
     // (Unnamed — id allocation is what's under test here.)
-    const r1 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.bytes});
+    const r1 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.posting_index});
     defer alloc.free(r1.table_ids);
     defer alloc.free(r1.change.tree_changes);
     try std.testing.expectEqual(first, r1.table_ids[0]);
     try f.applyCreateTree(1, r1.change);
     try std.testing.expect(f.hasTable(.{ .namespace = 2, .table_id = first }));
 
-    const r2 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.bytes});
+    const r2 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.posting_index});
     defer alloc.free(r2.table_ids);
     defer alloc.free(r2.change.tree_changes);
     try std.testing.expectEqual(first + 1, r2.table_ids[0]);
@@ -615,7 +671,7 @@ test "forest: buildCreateTables allocates and never reuses a dropped id" {
         .table_id = r1.table_ids[0],
     }));
 
-    const r3 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.bytes});
+    const r3 = try f.buildCreateTables(alloc, 2, &.{""}, &.{.posting_index});
     defer alloc.free(r3.table_ids);
     defer alloc.free(r3.change.tree_changes);
     try std.testing.expectEqual(first + 2, r3.table_ids[0]);
@@ -651,9 +707,18 @@ test "forest: buildCreateNamespace allocates global namespace ids" {
     try std.testing.expect(f.hasNamespace(first + 1));
 
     // Names resolve to their namespaces; a taken name is rejected at build.
-    try std.testing.expectEqual(@as(?u64, first), f.manifest.lookupNamespace("one"));
-    try std.testing.expectEqual(@as(?u64, first + 1), f.manifest.lookupNamespace("two"));
-    try std.testing.expectError(error.NameExists, f.buildCreateNamespace(alloc, "one"));
+    try std.testing.expectEqual(
+        @as(?u64, first),
+        f.manifest.lookupNamespace("one"),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, first + 1),
+        f.manifest.lookupNamespace("two"),
+    );
+    try std.testing.expectError(
+        error.NameExists,
+        f.buildCreateNamespace(alloc, "one"),
+    );
 }
 
 test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
@@ -713,16 +778,30 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     const f = try Forest.open(alloc, f_live);
     defer f.close();
 
-    const ct = try f.buildCreateTables(alloc, 3, &.{"users"}, &.{.bytes});
+    const ct = try f.buildCreateTables(
+        alloc,
+        3,
+        &.{"users"},
+        &.{.posting_index},
+    );
     defer alloc.free(ct.table_ids);
     defer alloc.free(ct.change.tree_changes);
     try f.applyCreateTree(1, ct.change);
-    try std.testing.expectEqual(@as(?u32, ct.table_ids[0]), f.manifest.lookupTable(3, "users"));
+    try std.testing.expectEqual(
+        @as(?u32, ct.table_ids[0]),
+        f.manifest.lookupTable(3, "users"),
+    );
 
     // A taken name is rejected at build; re-applying the create is a no-op.
-    try std.testing.expectError(error.NameExists, f.buildCreateTables(alloc, 3, &.{"users"}, &.{.bytes}));
+    try std.testing.expectError(
+        error.NameExists,
+        f.buildCreateTables(alloc, 3, &.{"users"}, &.{.posting_index}),
+    );
     try f.applyCreateTree(1, ct.change);
-    try std.testing.expectEqual(@as(?u32, ct.table_ids[0]), f.manifest.lookupTable(3, "users"));
+    try std.testing.expectEqual(
+        @as(?u32, ct.table_ids[0]),
+        f.manifest.lookupTable(3, "users"),
+    );
 
     // DROP frees the name for a re-CREATE, which gets a fresh id.
     const dc = try f.buildDropTables(alloc, 3, &.{ct.table_ids[0]});
@@ -730,12 +809,20 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     try f.applyDropTree(1, dc);
     try std.testing.expect(f.manifest.lookupTable(3, "users") == null);
 
-    const ct2 = try f.buildCreateTables(alloc, 3, &.{"users"}, &.{.bytes});
+    const ct2 = try f.buildCreateTables(
+        alloc,
+        3,
+        &.{"users"},
+        &.{.posting_index},
+    );
     defer alloc.free(ct2.table_ids);
     defer alloc.free(ct2.change.tree_changes);
     try f.applyCreateTree(1, ct2.change);
     try std.testing.expect(ct2.table_ids[0] > ct.table_ids[0]);
-    try std.testing.expectEqual(@as(?u32, ct2.table_ids[0]), f.manifest.lookupTable(3, "users"));
+    try std.testing.expectEqual(
+        @as(?u32, ct2.table_ids[0]),
+        f.manifest.lookupTable(3, "users"),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +848,10 @@ test "forest: snapshot manifest round-trip" {
     defer alloc.free(mk);
 
     const bytes = blk: {
-        const src_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+        const src_live = try flags.Live(Config).create(
+            alloc,
+            .{ .dir = dir_path },
+        );
         defer src_live.destroy();
         const src = try Forest.open(alloc, src_live);
         defer src.close();
@@ -769,14 +859,14 @@ test "forest: snapshot manifest round-trip" {
         // Tree in ns=42, range [a, m). Tree in ns=43, infinite. Both are the
         // default table (table_id 0) of their namespace → tree_id 0, distinct
         // because the namespace is part of the tree's global identity.
-        _ = try src.createTree(ns42_table0, .{
+        _ = try createTree(src, ns42_table0, .{
             .left = Key.init(ak),
             .right = Key.init(mk),
-        });
-        _ = try src.createTree(.{
+        }, .posting_index);
+        _ = try createTree(src, .{
             .namespace = 43,
             .table_id = 0,
-        }, .{});
+        }, .{}, .posting_index);
         try src.manifest.registerNamespaceName(42, "answers");
 
         // Drop one SST into the ns=42 tree's L1, both on disk and in the manifest.
@@ -806,12 +896,19 @@ test "forest: snapshot manifest round-trip" {
     try std.testing.expectEqual(@as(usize, 2), treeCount(dst));
     try std.testing.expect(dst.hasTree(42, 0));
     // Database names ride the snapshot.
-    try std.testing.expectEqual(@as(?u64, 42), dst.manifest.lookupNamespace("answers"));
+    try std.testing.expectEqual(
+        @as(?u64, 42),
+        dst.manifest.lookupNamespace("answers"),
+    );
     try std.testing.expect(dst.hasTree(43, 0));
 
     // Namespace routes wired.
-    try std.testing.expect(dst.tables.contains(.{ .namespace = 42, .table_id = 0 }));
-    try std.testing.expect(dst.tables.contains(.{ .namespace = 43, .table_id = 0 }));
+    try std.testing.expect(
+        dst.tables.contains(.{ .namespace = 42, .table_id = 0 }),
+    );
+    try std.testing.expect(
+        dst.tables.contains(.{ .namespace = 43, .table_id = 0 }),
+    );
     {
         const t42 = dst.tables.get(.{ .namespace = 42, .table_id = 0 }).?;
         const held = t42.mu.hold(.shared, @src());
@@ -881,7 +978,10 @@ test "forest: popOldestIfMatches greater" {
     defer mts.deinit();
     mts.popOldestIfMatches(5); // skip — oldest > expected
     try std.testing.expectEqual(@as(usize, 1), mts.immutables.items.len);
-    try std.testing.expectEqual(@as(u64, 7), mts.immutables.items[0].raft_index);
+    try std.testing.expectEqual(
+        @as(u64, 7),
+        mts.immutables.items[0].raft_index,
+    );
 }
 
 test "forest: popOldestIfMatches phantom" {
@@ -984,12 +1084,21 @@ test "forest: routes to correct tree" {
     defer f.close();
 
     // Create two trees in different namespaces.
-    _ = try f.createTree(ns1_table0, .{});
-    _ = try f.createTree(.{ .namespace = 2, .table_id = 0 }, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
+    _ = try createTree(
+        f,
+        .{ .namespace = 2, .table_id = 0 },
+        .{},
+        .posting_index,
+    );
 
     // Both namespaces should have a route table.
-    try std.testing.expect(f.tables.contains(.{ .namespace = 1, .table_id = 0 }));
-    try std.testing.expect(f.tables.contains(.{ .namespace = 2, .table_id = 0 }));
+    try std.testing.expect(
+        f.tables.contains(.{ .namespace = 1, .table_id = 0 }),
+    );
+    try std.testing.expect(
+        f.tables.contains(.{ .namespace = 2, .table_id = 0 }),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,10 +1127,10 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
 
     const ns: u64 = 16;
     const tid: u32 = 16;
-    _ = try f.createTree(.{
+    _ = try createTree(f, .{
         .namespace = ns,
         .table_id = tid,
-    }, .{});
+    }, .{}, .posting_index);
 
     // No keys yet → null (tree exists but is empty).
     try std.testing.expect((try f.maxKey(alloc, .{
@@ -1055,7 +1164,10 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
 
     const mk = (try f.maxKey(alloc, .{ .namespace = ns, .table_id = tid })).?;
     defer mk.free(alloc);
-    try std.testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, mk.primary[0..8], .big));
+    try std.testing.expectEqual(
+        @as(u64, 5),
+        std.mem.readInt(u64, mk.primary[0..8], .big),
+    );
 }
 
 test "forest: maxKey counts a tombstoned max key" {
@@ -1074,10 +1186,10 @@ test "forest: maxKey counts a tombstoned max key" {
 
     const ns: u64 = 16;
     const tid: u32 = 16;
-    _ = try f.createTree(.{
+    _ = try createTree(f, .{
         .namespace = ns,
         .table_id = tid,
-    }, .{});
+    }, .{}, .posting_index);
 
     // Seed egids 1/3/5, then tombstone the max (5) at a higher timestamp — as
     // a DELETE would. maxKey must still report 5: seeding next_egid from a
@@ -1125,14 +1237,17 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{
+        .dir = dir_path,
+        .lmax_target_bytes = push_lmax,
+    });
 
     defer f_live.destroy();
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
 
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
     // Forest.open leaves an id-0 placeholder memtable, and swapCurrentOut
     // releases rather than freezes that one — writes into it would be dropped
@@ -1190,7 +1305,7 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     // Builder, so meta has to survive the merge iterator and the re-encode.
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
     defer tree.release();
-    var comp = try tree.buildCompaction(0, 0);
+    var comp = try tree.buildCompaction(0);
     defer comp.deinit(alloc);
     // Guard against the compaction being a silent no-op, which would make the
     // assertions below vacuous.
@@ -1226,7 +1341,7 @@ test "forest: a tombstone reads as absent" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     // Write a value, then delete it at a later timestamp.
@@ -1284,7 +1399,7 @@ test "forest: globalMinRead rejects older reads and only moves forward" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     // Default 0 means nothing is rejected and nothing is droppable.
@@ -1324,11 +1439,18 @@ test "forest: a bottom-level compaction discards under the read floor" {
     defer alloc.free(dir_path);
 
     // Two levels, so L0->L1 is the bottom and may discard.
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path, .max_levels = 2 });
+    const f_live = try flags.Live(Config).create(
+        alloc,
+        .{
+            .dir = dir_path,
+            .max_levels = 2,
+            .lmax_target_bytes = push_lmax,
+        },
+    );
     defer f_live.destroy();
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
     // "k" at ts 10, 20 and 30, one flush each, so the versions sit in
     // three L0 tables.
@@ -1354,7 +1476,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
     // a version at or below the floor.
     _ = f.setGlobalMinRead(15);
     {
-        var comp = try tree.buildCompaction(0, f.globalMinRead());
+        var comp = try tree.buildCompaction(f.globalMinRead());
         defer comp.deinit(alloc);
         index += 1;
         try tree.applyCompaction(index, comp.items);
@@ -1375,7 +1497,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
         defer flush.changes.deinit(alloc);
         index += 1;
         try f.applyFlush(index, flush.changes.items, flush.memtable_id);
-        var comp = try tree.buildCompaction(0, f.globalMinRead());
+        var comp = try tree.buildCompaction(f.globalMinRead());
         defer comp.deinit(alloc);
         index += 1;
         try tree.applyCompaction(index, comp.items);
@@ -1434,7 +1556,7 @@ const ScanCollector = struct {
 ///   b@20=tombstone, b@10="b1"     (deleted, one version behind it)
 ///   c@10="c1"                     (one live version)
 fn seedVersionedForest(f: *Forest) !void {
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     const rows = [_]struct { p: String, ts: u64, v: String, m: zdb.kv.Meta }{
@@ -1541,7 +1663,12 @@ test "scan: include_deleted surfaces tombstones and the versions behind them" {
 
     var col = ScanCollector{ .alloc = alloc };
     defer col.deinit();
-    const n = try runScan(alloc, f, .{ .num_versions = 10, .include_deleted = true }, &col);
+    const n = try runScan(
+        alloc,
+        f,
+        .{ .num_versions = 10, .include_deleted = true },
+        &col,
+    );
 
     // Everything, one item per key: a with a@20 and a@10, b with its
     // tombstone at 20 and b@10 behind it, c with c@10.
@@ -1577,7 +1704,12 @@ test "scan: num_versions caps deleted runs too" {
 
     var col = ScanCollector{ .alloc = alloc };
     defer col.deinit();
-    const n = try runScan(alloc, f, .{ .num_versions = 1, .include_deleted = true }, &col);
+    const n = try runScan(
+        alloc,
+        f,
+        .{ .num_versions = 1, .include_deleted = true },
+        &col,
+    );
 
     // One version each: a@20, b@20 (the tombstone), c@10. b@10 is cut by the
     // version cap, not by the tombstone rule.
@@ -1687,7 +1819,7 @@ test "scan: min_ts emits only what changed after it" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     // Three SST generations plus a memtable: the base at @10 (an SST
@@ -1791,7 +1923,12 @@ test "scan: versions above read_ts do not consume num_versions" {
     defer col.deinit();
     // a@20 is invisible at ts=15. With num_versions=1, the one version we
     // return must be a@10 — the invisible a@20 must not have spent the quota.
-    const n = try runScan(alloc, f, .{ .num_versions = 1, .read_ts = 15 }, &col);
+    const n = try runScan(
+        alloc,
+        f,
+        .{ .num_versions = 1, .read_ts = 15 },
+        &col,
+    );
     try std.testing.expectEqual(@as(u64, 3), n);
     try std.testing.expectEqualStrings("a1", col.got.items[0].newest().value);
     try std.testing.expectEqual(@as(u64, 10), col.got.items[0].newest().ts);
@@ -1840,7 +1977,10 @@ test "scan: rejects a read_ts below globalMinRead" {
 
     var col = ScanCollector{ .alloc = alloc };
     defer col.deinit();
-    try std.testing.expectError(error.ReadBelowMinRead, runScan(alloc, f, .{ .read_ts = 99 }, &col));
+    try std.testing.expectError(
+        error.ReadBelowMinRead,
+        runScan(alloc, f, .{ .read_ts = 99 }, &col),
+    );
 
     // At the horizon is fine, and the default (latest) is always fine.
     _ = try runScan(alloc, f, .{ .read_ts = 100 }, &col);
@@ -1869,7 +2009,8 @@ fn expectCursorMatchesScan(
     defer via_scan.deinit();
     const n = try f.scan(
         alloc,
-        table_key, .all,
+        table_key,
+        .all,
         opts,
         &via_scan,
         ScanCollector.emit,
@@ -1882,7 +2023,10 @@ fn expectCursorMatchesScan(
     try drainCursor(&cur, &via_cursor);
 
     try std.testing.expectEqual(n, cur.emitted);
-    try std.testing.expectEqual(via_scan.got.items.len, via_cursor.got.items.len);
+    try std.testing.expectEqual(
+        via_scan.got.items.len,
+        via_cursor.got.items.len,
+    );
     for (via_scan.got.items, via_cursor.got.items) |a, b| {
         try std.testing.expectEqualStrings(a.key.primary, b.key.primary);
         try std.testing.expectEqual(a.newest().ts, b.newest().ts);
@@ -1956,7 +2100,8 @@ test "cursor: null is sticky and emitted counts hand-outs" {
     {
         var cur = try f.openCursor(
             alloc,
-            ns1_table0, .all,
+            ns1_table0,
+            .all,
             .{ .max_rows = 1 },
         );
         defer cur.deinit();
@@ -1987,7 +2132,8 @@ test "cursor: max_rows 0 opens exhausted without the min-read check" {
     // Below the horizon is refused at open — unless nothing will be read.
     try std.testing.expectError(error.ReadBelowMinRead, f.openCursor(
         alloc,
-        ns1_table0, .all,
+        ns1_table0,
+        .all,
         .{ .read_ts = 99 },
     ));
     {
@@ -2003,7 +2149,8 @@ test "cursor: max_rows 0 opens exhausted without the min-read check" {
     {
         var cur = try f.openCursor(
             alloc,
-            ns1_table0, .all,
+            ns1_table0,
+            .all,
             .{ .read_ts = 100 },
         );
         defer cur.deinit();
@@ -2060,7 +2207,7 @@ test "cursor: a flush between two next calls does not disturb the walk" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     const primaries = [_]String{ "a", "b", "c", "d", "e" };
@@ -2118,7 +2265,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     // 200 rows of 1 KiB, value[0] = the row number: one memtable arena
@@ -2197,7 +2344,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
 /// Ten one-key L3 SSTs k01..k10 in (namespace 42, table 0), value = the
 /// key, in one tree. Returns its id.
 fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: String) !u64 {
-    const tree_id = try f.createTree(ns42_table0, .{});
+    const tree_id = try createTree(f, ns42_table0, .{}, .posting_index);
     const keys = [_]String{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
     for (keys, 1..) |k, tbl_id| {
         const path = try zdb.sstPath(alloc, dir_path, tbl_id);
@@ -2247,13 +2394,18 @@ test "cursor: a split applied by another fiber mid-walk loses and repeats nothin
     defer got.deinit();
     var cur = try f.openCursor(alloc, ns42_table0, .all, .{});
     defer cur.deinit();
-    for (0..3) |_| _ = try got.emit((try cur.next()) orelse return error.TestExpectedItem);
+    for (0..3) |_| _ = try got.emit(
+        (try cur.next()) orelse return error.TestExpectedItem,
+    );
 
     // The split runs on another fiber, as raft apply would: fresh objects
     // for both halves swapped in, the old one retired.
     const Split = struct {
         fn run(forest: *Forest, id: u64) void {
-            forest.splitTreeForTests(42, id) catch |e| std.debug.panic("split: {}", .{e});
+            forest.splitTreeForTests(42, id) catch |e| std.debug.panic(
+                "split: {}",
+                .{e},
+            );
         }
     };
     var h = try fiber.spawn(.{}, Split.run, .{ f, tree_id });
@@ -2457,7 +2609,7 @@ test "forest: getBitmap folds deltas from memtable, L0, and history" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     // History of posting "p": base state at t10, then deltas layering
@@ -2482,7 +2634,13 @@ test "forest: getBitmap folds deltas from memtable, L0, and history" {
 
     // New deltas in the fresh memtable fold onto the flushed history.
     try roar.putDelta(f, alloc, "p", 40, &.{100}, &.{3});
-    try roar.expectBitmap(f, alloc, "p", std.math.maxInt(u64), &.{ 2, 50, 100 });
+    try roar.expectBitmap(
+        f,
+        alloc,
+        "p",
+        std.math.maxInt(u64),
+        &.{ 2, 50, 100 },
+    );
 }
 
 test "forest: getBitmap tombstone resets, absent key is empty" {
@@ -2498,7 +2656,7 @@ test "forest: getBitmap tombstone resets, absent key is empty" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     // State, then a tombstone (the index key was cleared), then a new
@@ -2531,13 +2689,16 @@ test "forest: rollup is read-invariant across flush and compactions" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{
+        .dir = dir_path,
+        .lmax_target_bytes = push_lmax,
+    });
 
     defer f_live.destroy();
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     // "p" has a full chain (base in inputs → rolls up at L0→L1);
@@ -2569,8 +2730,8 @@ test "forest: rollup is read-invariant across flush and compactions" {
 
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
     defer tree.release();
-    for ([_]u8{ 0, 1 }) |src| {
-        var comp = try tree.buildCompaction(src, 0);
+    for (0..2) |_| {
+        var comp = try tree.buildCompaction(0);
         defer comp.deinit(alloc);
         try std.testing.expect(comp.items.len > 0);
         try tree.applyCompaction(1, comp.items);
@@ -2600,7 +2761,7 @@ test "forest: getBitmap rejects non-roaring chains and old reads" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     const raw = [_]zdb.kv.Item{.{
@@ -2649,7 +2810,7 @@ test "forest: index backfill installs bottom states below live deltas" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
 
     // The backfill product: one roaring STATE per index key at the
@@ -2734,14 +2895,17 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{
+        .dir = dir_path,
+        .lmax_target_bytes = push_lmax,
+    });
 
     defer f_live.destroy();
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
 
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
     // Two flushes → two L0 SSTs, so the compaction below has real inputs.
     try f.newMemtable(1);
@@ -2772,7 +2936,7 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     };
     defer pinned.decrRef();
 
-    var comp = try tree.buildCompaction(0, 0);
+    var comp = try tree.buildCompaction(0);
     defer comp.deinit(alloc);
     try std.testing.expect(comp.items.len > 0);
 
@@ -2854,7 +3018,7 @@ test "table cache: a table loaded for an install survives an evict before it is 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
 
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
     try putRow(f, "a", 1, "one");
     try f.newMemtable(2);
@@ -2912,7 +3076,7 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
 
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
     try putRow(f, "a", 1, "one");
     try f.newMemtable(2);
@@ -3011,13 +3175,16 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     var cache = try zdb.cache.ShardedCache(u128).init(alloc, 64 << 20, 4);
     defer cache.deinit();
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{
+        .dir = dir_path,
+        .lmax_target_bytes = push_lmax,
+    });
 
     defer f_live.destroy();
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
     try f.newMemtable(1);
     try putRow(f, "a", 1, "one");
@@ -3066,7 +3233,7 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     }
     defer for (pinned) |t| t.decrRef();
 
-    var comp = try tree.buildCompaction(0, 0);
+    var comp = try tree.buildCompaction(0);
     defer comp.deinit(alloc);
     try tree.applyCompaction(20, comp.items);
 
@@ -3076,9 +3243,15 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     for (in_ids) |id| try std.testing.expect(!f.table_cache.contains(id));
 
     // What the last `decrRef` does: drop exactly this table's blocks.
-    for (pinned) |t| try std.testing.expectEqual(@as(usize, 1), t.purgeCachedBlocks(&cache));
+    for (pinned) |t| try std.testing.expectEqual(
+        @as(usize, 1),
+        t.purgeCachedBlocks(&cache),
+    );
     for (in_ids) |id|
-        try std.testing.expectEqual(@as(?*zdb.cache.Value, null), cache.get(@as(u128, id) << 64));
+        try std.testing.expectEqual(
+            @as(?*zdb.cache.Value, null),
+            cache.get(@as(u128, id) << 64),
+        );
     try std.testing.expectEqual(@as(usize, 0), cache.count());
 
     // The output is listed and untouched by a second purge.
@@ -3119,7 +3292,7 @@ test "forest: one flush covers every waiting memtable" {
 
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
     // Three frozen memtables (ids 1, 2, 3); "a" is written in two of them.
     try f.newMemtable(1);
@@ -3167,11 +3340,14 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
     defer alloc.free(dir_path);
 
     // Four tables to a merge, so three ask for nothing below.
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path, .l0_merge_min_tables = 4 });
+    const f_live = try flags.Live(Config).create(
+        alloc,
+        .{ .dir = dir_path, .l0_merge_min_tables = 4 },
+    );
     defer f_live.destroy();
     const f = try Forest.open(alloc, f_live);
     defer f.close();
-    _ = try f.createTree(ns1_table0, .{});
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
     // Five flushes, one small L0 table each. "k" is rewritten in every
     // one; each flush also brings a key of its own.
@@ -3194,7 +3370,7 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
             const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
             defer tree.release();
             try std.testing.expect(tree.compact_candidate == null);
-            var none = try tree.compactL0(0);
+            var none = try tree.buildCompaction(0);
             defer none.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 0), none.items.len);
         }
@@ -3216,7 +3392,7 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
         newest_index = ents[ents.len - 1].raft_index;
     }
 
-    var merge = try tree.compactL0(0);
+    var merge = try tree.buildCompaction(0);
     defer merge.deinit(alloc);
     // Five L0 deletes and ONE L0 create, listed under the newest input's
     // index so it stands where its inputs stood.
@@ -3254,7 +3430,10 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
         try std.testing.expectEqual(newest_index, ents[0].raft_index);
         try std.testing.expect(ents[1].raft_index > newest_index);
         // L1 was not touched.
-        try std.testing.expectEqual(@as(usize, 0), tree.levels[1].numTables(held));
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            tree.levels[1].numTables(held),
+        );
     }
 
     // Reads: the late flush wins for "k"; below it, the merged table
@@ -3272,5 +3451,8 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
     for (merge.items) |c| if (c.op == .create) {
         merged_id = c.sst_id;
     };
-    try std.testing.expectEqual(newest_index, f.manifest.ssts.get(merged_id).?.raft_index);
+    try std.testing.expectEqual(
+        newest_index,
+        f.manifest.ssts.get(merged_id).?.raft_index,
+    );
 }

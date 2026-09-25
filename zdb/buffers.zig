@@ -67,9 +67,16 @@ pub const Op = schema.EnumDef(.{
 /// it: an `egid` tree's keys are 8-byte big-endian row ids, kept exactly
 /// in a roaring bitmap; a `bytes` tree's keys go through a hash into a
 /// binary fuse filter.
-pub const KeyKind = schema.EnumDef(.{
-    .{ .name = "bytes", .tag = 0 },
-    .{ .name = "egid", .tag = 1 },
+// What a tree holds, fixed at create. The key encoding follows from
+// it: rows are keyed by egid, both index kinds by the indexed bytes.
+// Only a posting index holds roaring states and deltas. Tag 0 is the
+// unset value of a change that never named a kind: `unknown`, which
+// the manifest refuses at create.
+pub const TreeKind = schema.EnumDef(.{
+    .{ .name = "unknown", .tag = 0 },
+    .{ .name = "rows", .tag = 1 },
+    .{ .name = "unique_index", .tag = 2 },
+    .{ .name = "posting_index", .tag = 3 },
 });
 
 pub const TreeChange = schema.Table(.{
@@ -81,7 +88,7 @@ pub const TreeChange = schema.Table(.{
     .{ .id = 5, .name = "right_key", .ty = schema.Bytes },
     .{ .id = 6, .name = "name", .ty = schema.Bytes },
     // create only: fixed for the tree's life, inherited by a split.
-    .{ .id = 7, .name = "key_kind", .ty = schema.Enum(KeyKind) },
+    .{ .id = 7, .name = "kind", .ty = schema.Enum(TreeKind) },
 });
 
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a

@@ -35,8 +35,8 @@ const no_run: ?[]const TableEntry = null;
 fn mergeRun(opts: Config, tables: []const TableEntry) ?[]const TableEntry {
     const job = compaction.pickL0Job(opts, tables) orelse return null;
     return switch (job) {
-        .merge => |run| run,
-        .push => null,
+        .merge_l0 => |run| run,
+        else => null,
     };
 }
 
@@ -105,29 +105,29 @@ test "pickL0Job: push once L0 holds L1's target, else merge, else wait" {
     try std.testing.expectEqual(@as(i64, 4 * gib / 25), compaction.levelTarget(opts, 1));
 
     // Nothing in L0.
-    try std.testing.expectEqual(@as(?compaction.L0Job, null), compaction.pickL0Job(opts, &.{}));
+    try std.testing.expectEqual(@as(?compaction.Job, null), compaction.pickL0Job(opts, &.{}));
 
     // Below L1's target with too few tables to merge: L0 is left to fill.
     const few = tablesOf(&.{ 40 * mib, 40 * mib, 40 * mib });
-    try std.testing.expectEqual(@as(?compaction.L0Job, null), compaction.pickL0Job(opts, &few));
+    try std.testing.expectEqual(@as(?compaction.Job, null), compaction.pickL0Job(opts, &few));
 
     // Small tables merge, however many there are: no table count pushes.
     const small = tablesOf(&(.{30 * kib} ** 40));
-    try std.testing.expect(compaction.pickL0Job(opts, &small).? == .merge);
+    try std.testing.expect(compaction.pickL0Job(opts, &small).? == .merge_l0);
 
     // Too few unfinished tables after the newest finished one, below
     // L1's target: left alone, although there are four tables.
     const waiting = tablesOf(&.{ 64 * mib, 40 * mib, 10 * mib, 10 * mib });
     try std.testing.expectEqual(no_run, mergeRun(opts, &waiting));
-    try std.testing.expectEqual(@as(?compaction.L0Job, null), compaction.pickL0Job(opts, &waiting));
+    try std.testing.expectEqual(@as(?compaction.Job, null), compaction.pickL0Job(opts, &waiting));
 
     // L1's target reached: push, even though six unfinished tables
     // would merge. Merging them first would write them twice.
     const full = tablesOf(&(.{30 * mib} ** 6));
-    try std.testing.expect(compaction.pickL0Job(opts, &full).? == .push);
+    try std.testing.expect(compaction.pickL0Job(opts, &full).? == .merge_down);
     // Three finished tables do it too.
     const done = tablesOf(&.{ 64 * mib, 64 * mib, 64 * mib });
-    try std.testing.expect(compaction.pickL0Job(opts, &done).? == .push);
+    try std.testing.expect(compaction.pickL0Job(opts, &done).? == .merge_down);
 }
 
 test "config: a merge needs at least two tables" {

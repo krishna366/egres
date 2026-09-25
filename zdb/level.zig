@@ -193,53 +193,64 @@ pub const Level = struct {
         self.sortEntries();
     }
 
-    /// overlappingTables returns a heap-allocated slice of TableEntry whose key
-    /// range overlaps kr. The caller must free the slice when done.
-    /// L0: always all tables; L≥1: binary search on both ends.
+    /// The level's tables whose key range meets `kr`, as a view into
+    /// the level's own list: no allocation, no pins, valid only while
+    /// `held` is. L0: always every table; L1+: a binary search on both
+    /// ends of the sorted run.
     ///
     /// Both bounds are inclusive and name primaries, so a table holding
-    /// any version of a boundary primary is returned. That is what every
+    /// any version of a boundary primary is included. That is what every
     /// caller (compaction src/dest selection, openMerge) needs.
-    ///
-    /// The returned tables are pinned, so the caller can release the lock
-    /// and read them after.
-    pub fn overlappingTables(self: *Level, held: Lock.Shared, allocator: std.mem.Allocator, kr: KeyRange) ![]TableEntry {
+    pub fn overlapping(
+        self: *Level,
+        held: Lock.Shared,
+        kr: KeyRange,
+    ) []TableEntry {
         self.mu.assertHeld(held);
         const items = self.tables.items;
-        const slice: []TableEntry = if (self.level == 0)
-            items
-        else blk: {
-            // The bounds are this tree's keys (the caller's contract), so
-            // primaries decide; an unbounded side or a table edge
-            // reaches the end on its side.
-            // First table where kr.left <= biggest (could overlap on the left).
-            const left = if (kr.left.isInf())
-                0
-            else
-                utils.search(TableEntry, items, kr.left, struct {
-                    fn f(kl: Key, e: TableEntry) bool {
-                        return kl.orderPrimary(e.table.biggest) != .gt;
-                    }
-                }.f);
-            // First table where kr.right < smallest (no longer overlapping).
-            const right = if (kr.right.isInf() or kr.right.isTableEdge())
-                items.len
-            else
-                utils.search(TableEntry, items, kr.right, struct {
-                    fn f(right_key: Key, e: TableEntry) bool {
-                        return right_key.orderPrimary(e.table.smallest) == .lt;
-                    }
-                }.f);
-            break :blk items[left..right];
-        };
+        if (self.level == 0) return items;
+        // The bounds are this tree's keys (the caller's contract), so
+        // primaries decide; an unbounded side or a table edge reaches
+        // the end on its side.
+        // First table where kr.left <= biggest (could overlap on the left).
+        const left = if (kr.left.isInf())
+            0
+        else
+            utils.search(TableEntry, items, kr.left, struct {
+                fn f(kl: Key, e: TableEntry) bool {
+                    return kl.orderPrimary(e.table.biggest) != .gt;
+                }
+            }.f);
+        // First table where kr.right < smallest (no longer overlapping).
+        const right = if (kr.right.isInf() or kr.right.isTableEdge())
+            items.len
+        else
+            utils.search(TableEntry, items, kr.right, struct {
+                fn f(right_key: Key, e: TableEntry) bool {
+                    return right_key.orderPrimary(e.table.smallest) == .lt;
+                }
+            }.f);
+        return items[left..right];
+    }
 
-        // Pin every returned table while the caller's lock is still held.
-        // The *Table pointers must survive a concurrent applyCompaction
-        // deleting these entries (decrRef at zero frees the Table; the
-        // file stays). Callers release with `releaseTables` once done —
-        // TableIterator.init takes its own ref, so iterators outlive the
-        // release.
-        const out = try allocator.dupe(TableEntry, slice);
+    /// Whether any table of the level meets `kr`.
+    pub fn overlapsAny(self: *Level, held: Lock.Shared, kr: KeyRange) bool {
+        return self.overlapping(held, kr).len > 0;
+    }
+
+    /// `overlapping`, copied and pinned so the caller can release the
+    /// lock and read the tables after. The *Table pointers must survive
+    /// a concurrent applyCompaction deleting these entries (decrRef at
+    /// zero frees the Table; the file stays). Callers release with
+    /// `releaseTables` once done; TableIterator.init takes its own ref,
+    /// so iterators outlive the release.
+    pub fn overlappingTables(
+        self: *Level,
+        held: Lock.Shared,
+        allocator: std.mem.Allocator,
+        kr: KeyRange,
+    ) ![]TableEntry {
+        const out = try allocator.dupe(TableEntry, self.overlapping(held, kr));
         for (out) |e| e.table.incrRef();
         return out;
     }

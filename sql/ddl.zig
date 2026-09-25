@@ -130,10 +130,10 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     const columns = try a.alloc(_schema.LogicalColumn, ct.columns.len);
     var names: std.ArrayList(String) = .empty;
     try names.append(a, ct.name);
-    // The base table's rows are keyed by egid; its unique-index trees
-    // are keyed by the indexed values.
-    var kinds: std.ArrayList(zdb.manifest.KeyKind) = .empty;
-    try kinds.append(a, .egid);
+    // The base table's rows tree, then a unique index tree per primary
+    // key or UNIQUE column.
+    var kinds: std.ArrayList(zdb.manifest.TreeKind) = .empty;
+    try kinds.append(a, .rows);
 
     var unique_cols: std.ArrayList(u32) = .empty;
     for (ct.columns, columns, 1..) |c, *lc, id| {
@@ -159,7 +159,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
             try std.fmt.allocPrint(a, "{s}_pkey", .{ct.name})
         else
             try std.fmt.allocPrint(a, "{s}_{s}_key", .{ ct.name, c.name }));
-        try kinds.append(a, .bytes);
+        try kinds.append(a, .unique_index);
     }
 
     const created = eng.forest.buildCreateTables(

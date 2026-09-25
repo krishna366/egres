@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const zdb = @import("zdb");
+const createTree = @import("../zdb/testing.zig").createTree;
 const flags = @import("flags");
 const sql = @import("sql");
 const utils = @import("utils");
@@ -38,16 +39,20 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     const ns: u64 = 16;
     const user_table_id: u32 = 16;
     const pkey_index_id: u32 = 17;
-    _ = try f.createTree(.{
+    _ = try createTree(f, .{
         .namespace = ns,
         .table_id = catalog.table_id,
-    }, .{});
-    _ = try f.createTree(.{
+    }, .{}, .posting_index);
+    _ = try createTree(f, .{
         .namespace = ns,
         .table_id = catalog.index_table_id,
-    }, .{});
+    }, .{}, .posting_index);
 
-    var catalog_ps = try schema.compile(alloc, catalog.logical_schema, catalog.logical_schema.current_version);
+    var catalog_ps = try schema.compile(
+        alloc,
+        catalog.logical_schema,
+        catalog.logical_schema.current_version,
+    );
     defer catalog_ps.deinit(alloc);
     var index_ps = try schema.compile(alloc, catalog.index_logical_schema, catalog.index_logical_schema.current_version);
     defer index_ps.deinit(alloc);
@@ -211,12 +216,16 @@ test "sql.table: load returns UndefinedTable when no catalog rows exist" {
     defer f.close();
 
     const ns: u64 = 16;
-    _ = try f.createTree(.{
+    _ = try createTree(f, .{
         .namespace = ns,
         .table_id = catalog.table_id,
-    }, .{});
+    }, .{}, .posting_index);
 
-    var catalog_ps = try schema.compile(alloc, catalog.logical_schema, catalog.logical_schema.current_version);
+    var catalog_ps = try schema.compile(
+        alloc,
+        catalog.logical_schema,
+        catalog.logical_schema.current_version,
+    );
     defer catalog_ps.deinit(alloc);
     var index_ps = try schema.compile(alloc, catalog.index_logical_schema, catalog.index_logical_schema.current_version);
     defer index_ps.deinit(alloc);

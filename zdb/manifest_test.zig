@@ -28,7 +28,9 @@ test "manifest commit applies tree + table changes" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(2, &.{
         createSSTableChange(1, 0, tree_id, 0),
         createSSTableChange(2, 0, tree_id, 1),
@@ -51,7 +53,10 @@ test "manifest tree create and delete" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.commit(1, &.{}, &.{ createTreeChange(1, 0, &.{}, &.{}), createTreeChange(2, 0, &.{}, &.{}) });
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+        createTreeChange(2, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(2, &.{
         createSSTableChange(10, 0, 1, 0),
         createSSTableChange(20, 0, 2, 0),
@@ -64,7 +69,9 @@ test "manifest tree create and delete" {
     try std.testing.expect(manifest.trees.contains(tk(0, 1)));
     try std.testing.expect(!manifest.trees.contains(tk(0, 2)));
     try std.testing.expectEqual(@as(u32, 1), manifest.tableCount());
-    try std.testing.expect(manifest.trees.get(tk(0, 1)).?.levels.items[0].tables.contains(10));
+    try std.testing.expect(
+        manifest.trees.get(tk(0, 1)).?.levels.items[0].tables.contains(10),
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -76,7 +83,10 @@ test "manifest multi-tree table" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.commit(1, &.{}, &.{ createTreeChange(1, 0, &.{}, &.{}), createTreeChange(2, 0, &.{}, &.{}) });
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+        createTreeChange(2, 0, &.{}, &.{}, .posting_index),
+    });
 
     // Same table_id=100 belongs to both trees (post-split shared SST scenario).
     try manifest.commit(2, &.{
@@ -86,8 +96,12 @@ test "manifest multi-tree table" {
 
     // Delete from tree 1 — table should still exist in tree 2.
     try manifest.commit(3, &.{deleteSSTableChange(100, 0, 1, 0)}, &.{});
-    try std.testing.expect(!manifest.trees.get(tk(0, 1)).?.levels.items[0].tables.contains(100));
-    try std.testing.expect(manifest.trees.get(tk(0, 2)).?.levels.items[0].tables.contains(100));
+    try std.testing.expect(
+        !manifest.trees.get(tk(0, 1)).?.levels.items[0].tables.contains(100),
+    );
+    try std.testing.expect(
+        manifest.trees.get(tk(0, 2)).?.levels.items[0].tables.contains(100),
+    );
 
     // Delete from tree 2 — now table should be gone from all trees.
     try manifest.commit(4, &.{deleteSSTableChange(100, 0, 2, 0)}, &.{});
@@ -116,14 +130,20 @@ test "manifest tree key range update" {
     const right_raw = try right.marshal(alloc);
     defer alloc.free(right_raw);
 
-    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, left_raw, mid_raw)});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, left_raw, mid_raw, .posting_index),
+    });
     {
         const tree = manifest.trees.get(tk(0, 1)).?;
         try std.testing.expectEqualStrings("aaa", tree.left.primary);
         try std.testing.expectEqualStrings("mmm", tree.right.primary);
     }
 
-    try manifest.commit(2, &.{}, &.{updateTreeChange(1, 0, left_raw, right_raw)});
+    try manifest.commit(
+        2,
+        &.{},
+        &.{updateTreeChange(1, 0, left_raw, right_raw)},
+    );
     {
         const tree = manifest.trees.get(tk(0, 1)).?;
         try std.testing.expectEqualStrings("aaa", tree.left.primary);
@@ -166,14 +186,29 @@ test "manifest serialize/restoreFrom round-trip" {
     const z_raw = try (Key{ .primary = "zzz" }).marshal(alloc);
     defer alloc.free(z_raw);
 
+    // Tree 2 is keyed by egids; the kind must survive the round-trip,
+    // or a restored rows tree writes fuse filters and never moves.
+    const egid_tree = createTreeChange(2, 7, m_raw, z_raw, .rows);
     try src.commit(1, &.{}, &.{
-        createTreeChange(1, 7, a_raw, m_raw),
-        createTreeChange(2, 7, m_raw, z_raw),
+        createTreeChange(1, 7, a_raw, m_raw, .posting_index),
+        egid_tree,
         // A named user table, split into two trees — the name must survive
         // the round-trip via its FIRST tree (the one with the open left
         // bound; serialize stamps only that one).
-        createTreeChange(zdb.kv.makeTreeId(16, 0), 7, &.{}, m_raw),
-        createTreeChange(zdb.kv.makeTreeId(16, 1), 7, m_raw, &.{}),
+        createTreeChange(
+            zdb.kv.makeTreeId(16, 0),
+            7,
+            &.{},
+            m_raw,
+            .posting_index,
+        ),
+        createTreeChange(
+            zdb.kv.makeTreeId(16, 1),
+            7,
+            m_raw,
+            &.{},
+            .posting_index,
+        ),
     });
     try src.registerTableName(.{ .namespace = 7, .table_id = 16 }, "users");
     try src.commit(2, &.{
@@ -219,6 +254,8 @@ test "manifest serialize/restoreFrom round-trip" {
     try std.testing.expectEqualStrings("zzz", t2.right.primary);
     try std.testing.expect(t2.levels.items[2].tables.contains(20));
     try std.testing.expect(t2.levels.items[3].tables.contains(50));
+    try std.testing.expectEqual(_manifest.TreeKind.rows, t2.kind);
+    try std.testing.expectEqual(_manifest.TreeKind.posting_index, t1.kind);
 
     // The table name rode the snapshot (stamped on its tree's change).
     try std.testing.expectEqual(@as(?u32, 16), dst.lookupTable(7, "users"));
@@ -233,7 +270,9 @@ test "manifest restoreFrom replaces existing state" {
 
     var src = _manifest.Manifest.init(alloc);
     defer src.deinit();
-    try src.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try src.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+    });
     try src.commit(2, &.{createSSTableChange(10, 0, 1, 0)}, &.{});
     const bytes = try src.serialize(alloc);
     defer alloc.free(bytes);
@@ -241,7 +280,9 @@ test "manifest restoreFrom replaces existing state" {
     // Fill `dst` with garbage that should disappear after restore.
     var dst = _manifest.Manifest.init(alloc);
     defer dst.deinit();
-    try dst.commit(3, &.{}, &.{createTreeChange(99, 0, &.{}, &.{})});
+    try dst.commit(3, &.{}, &.{
+        createTreeChange(99, 0, &.{}, &.{}, .posting_index),
+    });
     try dst.commit(4, &.{createSSTableChange(999, 0, 99, 0)}, &.{});
     try dst.registerTableName(.{ .namespace = 0, .table_id = 55 }, "stale");
     try std.testing.expect(dst.trees.contains(tk(0, 99)));
@@ -268,7 +309,10 @@ test "manifest table names: register/lookup/drop" {
         .{ .namespace = 5, .table_id = 16 },
         "users",
     );
-    try std.testing.expectEqual(@as(?u32, 16), manifest.lookupTable(5, "users"));
+    try std.testing.expectEqual(
+        @as(?u32, 16),
+        manifest.lookupTable(5, "users"),
+    );
 
     // Idempotent re-apply; a collision (build-side bug) is skipped, never
     // clobbered.
@@ -280,7 +324,10 @@ test "manifest table names: register/lookup/drop" {
         .{ .namespace = 5, .table_id = 17 },
         "users",
     );
-    try std.testing.expectEqual(@as(?u32, 16), manifest.lookupTable(5, "users"));
+    try std.testing.expectEqual(
+        @as(?u32, 16),
+        manifest.lookupTable(5, "users"),
+    );
 
     // Empty names record nothing; lookups are namespace-scoped.
     try manifest.registerTableName(.{ .namespace = 5, .table_id = 18 }, "");
@@ -295,7 +342,10 @@ test "manifest table names: register/lookup/drop" {
         .{ .namespace = 5, .table_id = 19 },
         "users",
     );
-    try std.testing.expectEqual(@as(?u32, 19), manifest.lookupTable(5, "users"));
+    try std.testing.expectEqual(
+        @as(?u32, 19),
+        manifest.lookupTable(5, "users"),
+    );
 
     // dropNamespace forgets every table name (leak-checked by the test
     // allocator).
@@ -317,7 +367,9 @@ test "manifest clone is independent of source" {
 
     var src = _manifest.Manifest.init(alloc);
     defer src.deinit();
-    try src.commit(1, &.{}, &.{createTreeChange(1, 5, &.{}, &.{})});
+    try src.commit(1, &.{}, &.{
+        createTreeChange(1, 5, &.{}, &.{}, .posting_index),
+    });
     try src.commit(2, &.{createSSTableChange(10, 5, 1, 0)}, &.{});
 
     var copy = try src.clone(alloc);
@@ -327,8 +379,12 @@ test "manifest clone is independent of source" {
     try src.commit(3, &.{createSSTableChange(11, 5, 1, 0)}, &.{});
     try std.testing.expectEqual(@as(u32, 2), src.tableCount());
     try std.testing.expectEqual(@as(u32, 1), copy.tableCount());
-    try std.testing.expect(copy.trees.get(tk(5, 1)).?.levels.items[0].tables.contains(10));
-    try std.testing.expect(!copy.trees.get(tk(5, 1)).?.levels.items[0].tables.contains(11));
+    try std.testing.expect(
+        copy.trees.get(tk(5, 1)).?.levels.items[0].tables.contains(10),
+    );
+    try std.testing.expect(
+        !copy.trees.get(tk(5, 1)).?.levels.items[0].tables.contains(11),
+    );
 
     // Mutating copy must not affect src.
     try copy.commit(4, &.{}, &.{deleteTreeChange(1, 5)});
@@ -405,7 +461,9 @@ test "manifest newFileId draws nonzero, distinct ids" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(2, &.{
         createSSTableChange(10, 0, tree_id, 0),
         createSSTableChange(20, 0, tree_id, 1),
@@ -433,8 +491,8 @@ test "manifest retires a file at the index that drops its last listing" {
     defer manifest.deinit();
 
     try manifest.commit(1, &.{}, &.{
-        createTreeChange(1, 0, &.{}, &.{}),
-        createTreeChange(2, 0, &.{}, &.{}),
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+        createTreeChange(2, 0, &.{}, &.{}, .posting_index),
     });
 
     // Listed by tree 1 at index 2, shared with tree 2 at index 3.
@@ -470,7 +528,9 @@ test "manifest tree delete retires every table of the tree" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(4, &.{
         createSSTableChange(11, 0, 1, 0),
         createSSTableChange(12, 0, 1, 0),
@@ -489,7 +549,9 @@ test "manifest restoreFrom leaves the retire list empty" {
     var src = _manifest.Manifest.init(alloc);
     defer src.deinit();
 
-    try src.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try src.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+    });
     try src.commit(4, &.{
         createSSTableChange(10, 0, 1, 0),
         createSSTableChange(20, 0, 1, 0),
@@ -504,7 +566,9 @@ test "manifest restoreFrom leaves the retire list empty" {
     defer dst.deinit();
     // Pre-load the destination with a retire of its own: restore replaces
     // the whole state, so that record goes too.
-    try dst.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try dst.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+    });
     try dst.commit(2, &.{createSSTableChange(99, 0, 1, 0)}, &.{});
     try dst.commit(3, &.{deleteSSTableChange(99, 0, 1, 0)}, &.{});
     try std.testing.expectEqual(@as(u32, 1), dst.to_delete.count());
@@ -520,7 +584,9 @@ test "manifest knowsFile covers listed and retired ids" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(4, &.{
         createSSTableChange(10, 0, 1, 0),
         createSSTableChange(20, 0, 1, 0),
@@ -544,7 +610,9 @@ test "manifest unknownFiles picks SST-named files the manifest does not know" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(4, &.{
         createSSTableChange(0x10, 0, 1, 0),
         createSSTableChange(0x20, 0, 1, 0),
@@ -577,7 +645,9 @@ test "manifest newFileId never draws a listed or retired id" {
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
-    try manifest.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(4, &.{
         createSSTableChange(10, 0, 1, 0),
         createSSTableChange(20, 0, 1, 0),
@@ -601,8 +671,8 @@ test "manifest sst refs across create, share, and delete" {
     defer manifest.deinit();
 
     try manifest.commit(1, &.{}, &.{
-        createTreeChange(1, 0, &.{}, &.{}),
-        createTreeChange(2, 0, &.{}, &.{}),
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+        createTreeChange(2, 0, &.{}, &.{}, .posting_index),
     });
 
     // One file listed by tree 1 at index 5.
@@ -630,7 +700,9 @@ test "manifest serialize round-trip preserves raft_index" {
     var src = _manifest.Manifest.init(alloc);
     defer src.deinit();
 
-    try src.commit(1, &.{}, &.{createTreeChange(1, 0, &.{}, &.{})});
+    try src.commit(1, &.{}, &.{
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+    });
     try src.commit(4, &.{createSSTableChange(10, 0, 1, 0)}, &.{});
     try src.commit(6, &.{createSSTableChange(20, 0, 1, 0)}, &.{});
     try src.commit(8, &.{createSSTableChange(30, 0, 1, 1)}, &.{});
@@ -658,7 +730,13 @@ fn nsCreateChange(
     namespace: u64,
     name: []const u8,
 ) _manifest.ManifestChange {
-    tcs[0] = createTreeChange(zdb.kv.makeTreeId(0, 0), namespace, &.{}, &.{});
+    tcs[0] = createTreeChange(
+        zdb.kv.makeTreeId(0, 0),
+        namespace,
+        &.{},
+        &.{},
+        .posting_index,
+    );
     tcs[0].name = name;
     return .{ .tree_changes = tcs, .cmd = .create_ns };
 }
@@ -675,6 +753,7 @@ fn createTreeCmd(
         table_key.namespace,
         &.{},
         &.{},
+        .posting_index,
     );
     tcs[0].name = name;
     return .{ .tree_changes = tcs, .cmd = .create_tree };
@@ -689,7 +768,10 @@ test "manifest apply create_ns registers the name and advances next_ns_id" {
     try manifest.apply(5, nsCreateChange(&tcs, 100, "shop"));
 
     try std.testing.expect(manifest.trees.contains(tk(100, 0)));
-    try std.testing.expectEqual(@as(?u64, 100), manifest.lookupNamespace("shop"));
+    try std.testing.expectEqual(
+        @as(?u64, 100),
+        manifest.lookupNamespace("shop"),
+    );
     // The counter moved past the created namespace, so the next allocation
     // cannot re-issue it.
     try std.testing.expectEqual(@as(u64, 101), manifest.nextNamespace());
@@ -708,8 +790,13 @@ test "manifest apply create_tree registers the name and advances the table id" {
         "users",
     ));
 
-    try std.testing.expect(manifest.trees.contains(tk(7, zdb.kv.makeTreeId(first, 0))));
-    try std.testing.expectEqual(@as(?u32, first), manifest.lookupTable(7, "users"));
+    try std.testing.expect(
+        manifest.trees.contains(tk(7, zdb.kv.makeTreeId(first, 0))),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, first),
+        manifest.lookupTable(7, "users"),
+    );
     try std.testing.expectEqual(first + 1, try manifest.nextTableId(7));
 }
 
@@ -727,7 +814,10 @@ test "manifest apply is idempotent for a re-applied create" {
     try manifest.apply(5, mc);
 
     try std.testing.expectEqual(@as(u32, 1), manifest.trees.count());
-    try std.testing.expectEqual(@as(?u64, 100), manifest.lookupNamespace("shop"));
+    try std.testing.expectEqual(
+        @as(?u64, 100),
+        manifest.lookupNamespace("shop"),
+    );
 }
 
 test "manifest apply drop_tree removes the table name" {
@@ -775,8 +865,8 @@ test "manifest takeToEvict hands over ids whose last listing went, once" {
     defer manifest.deinit();
 
     try manifest.commit(1, &.{}, &.{
-        createTreeChange(1, 0, &.{}, &.{}),
-        createTreeChange(2, 0, &.{}, &.{}),
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+        createTreeChange(2, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(2, &.{
         createSSTableChange(10, 0, 1, 0),
@@ -814,8 +904,8 @@ test "manifest split move in one entry keeps the file listed and unretired" {
     defer manifest.deinit();
 
     try manifest.commit(1, &.{}, &.{
-        createTreeChange(1, 0, &.{}, &.{}),
-        createTreeChange(2, 0, &.{}, &.{}),
+        createTreeChange(1, 0, &.{}, &.{}, .posting_index),
+        createTreeChange(2, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(5, &.{createSSTableChange(77, 0, 1, 0)}, &.{});
 

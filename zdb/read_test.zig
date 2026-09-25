@@ -4,6 +4,7 @@ const std = @import("std");
 const utils = @import("utils");
 const String = utils.String;
 const zdb = @import("zdb");
+const createTree = @import("testing.zig").createTree;
 const flags = @import("flags");
 const vfs = zdb.vfs;
 const zroar = zdb.zroar;
@@ -51,9 +52,14 @@ const Fixture = struct {
             .next_index = 0,
         };
         self.dir = try tmpPath(alloc, &self.tmp);
-        self.live = try flags.Live(Config).create(alloc, .{ .dir = self.dir });
+        // A bottom target of one byte makes a push L0's job at any
+        // size (`pickL0Job`), so `compactL0` below pushes into L1.
+        self.live = try flags.Live(Config).create(alloc, .{
+            .dir = self.dir,
+            .lmax_target_bytes = 1,
+        });
         self.f = try Forest.open(alloc, self.live);
-        self.tree_id = try self.f.createTree(table_key, .{});
+        self.tree_id = try createTree(self.f, table_key, .{}, .posting_index);
         // Forest.open leaves an id-0 placeholder memtable that a swap
         // discards rather than freezes; start on a real one.
         try self.f.newMemtable(self.nextIndex());
@@ -114,7 +120,11 @@ const Fixture = struct {
         var fl = (try self.f.buildFlush()) orelse
             return error.TestExpectedFlush;
         defer fl.changes.deinit(self.alloc);
-        try self.f.applyFlush(self.nextIndex(), fl.changes.items, fl.memtable_id);
+        try self.f.applyFlush(
+            self.nextIndex(),
+            fl.changes.items,
+            fl.memtable_id,
+        );
     }
 
     /// Compact every L0 table into L1.
@@ -122,7 +132,7 @@ const Fixture = struct {
         const tree = self.f.getTree(ns, self.tree_id) orelse
             return error.TestExpectedTree;
         defer tree.release();
-        var comp = try tree.buildCompaction(0, 0);
+        var comp = try tree.buildCompaction(0);
         defer comp.deinit(self.alloc);
         try std.testing.expect(comp.items.len > 0);
         try tree.applyCompaction(self.nextIndex(), comp.items);
@@ -263,9 +273,11 @@ test "multiget: other tables in the memtables and pending writes are skipped" {
 
     // The memtable spans the namespace: the same primary in table 7
     // sits next to table 0's rows.
-    _ = try fx.f.createTree(
+    _ = try createTree(
+        fx.f,
         .{ .namespace = ns, .table_id = 7 },
         .{},
+        .posting_index,
     );
     try fx.put("a", 10, "a-t0");
     try fx.put("z", 1, "z-ts1");

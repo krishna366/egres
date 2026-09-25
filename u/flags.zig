@@ -361,7 +361,19 @@ pub fn Live(comptime T: type) type {
             self.arena.deinit();
         }
 
+        /// A live change, after startup: refuses any field in `T.fixed`.
         pub fn update(self: *Self, input: String) Error!void {
+            return self.apply(input, false);
+        }
+
+        /// The startup assignment (the command line): every field may
+        /// be set, fixed ones included. Fixed means fixed once the
+        /// process is running, not absent from the command line.
+        pub fn set(self: *Self, input: String) Error!void {
+            return self.apply(input, true);
+        }
+
+        fn apply(self: *Self, input: String, allow_fixed: bool) Error!void {
             // Parse the input outside any lock — that work touches no shared
             // state. The coerce-and-install phase runs under the exclusive
             // write lock so the arena (not thread-safe) is single-writer.
@@ -370,9 +382,11 @@ pub fn Live(comptime T: type) type {
 
             // A fixed field anywhere in the input refuses the whole
             // update, before any live field in it is changed.
-            var keys = kv.keyIterator();
-            while (keys.next()) |key| {
-                if (fixedByKey(key.*)) return error.FixedOption;
+            if (!allow_fixed) {
+                var keys = kv.keyIterator();
+                while (keys.next()) |key| {
+                    if (fixedByKey(key.*)) return error.FixedOption;
+                }
             }
 
             self.mu.lock(@src());
@@ -601,6 +615,7 @@ fn writeDefault(comptime FT: type, value: FT, out: *std.ArrayList(u8), allocator
 const Entry = struct {
     live_ptr: *anyopaque,
     update_fn: *const fn (*anyopaque, String) Error!void,
+    set_fn: *const fn (*anyopaque, String) Error!void,
     help_fn: *const fn (*anyopaque, String, *std.ArrayList(u8), std.mem.Allocator) Error!void,
     deinit_fn: *const fn (*anyopaque, std.mem.Allocator) void,
 };
@@ -640,6 +655,10 @@ pub const Registry = struct {
                 const l: *Live(T) = @ptrCast(@alignCast(p));
                 return l.update(input);
             }
+            fn set(p: *anyopaque, input: String) Error!void {
+                const l: *Live(T) = @ptrCast(@alignCast(p));
+                return l.set(input);
+            }
             fn help(p: *anyopaque, module_name: String, out: *std.ArrayList(u8), alloc: std.mem.Allocator) Error!void {
                 _ = p;
                 return writeHelp(T, module_name, out, alloc);
@@ -667,25 +686,35 @@ pub const Registry = struct {
         try self.entries.put(key, .{
             .live_ptr = @ptrCast(live),
             .update_fn = Wrappers.update,
+            .set_fn = Wrappers.set,
             .help_fn = Wrappers.help,
             .deinit_fn = Wrappers.deinit,
         });
         return live;
     }
 
+    /// A live change to one module: `Live.update`, so a fixed field is
+    /// refused.
     pub fn update(self: *Registry, name: String, input: String) Error!void {
+        const entry = try self.lookup(name);
+        return entry.update_fn(entry.live_ptr, input);
+    }
+
+    /// The startup assignment to one module: `Live.set`, fixed fields
+    /// included. What `parseArgv` uses.
+    pub fn set(self: *Registry, name: String, input: String) Error!void {
+        const entry = try self.lookup(name);
+        return entry.set_fn(entry.live_ptr, input);
+    }
+
+    fn lookup(self: *Registry, name: String) Error!Entry {
         var name_buf: [256]u8 = undefined;
         if (name.len > name_buf.len) return error.UnknownModule;
         const key = normalizeKeyInto(name, &name_buf);
 
         self.mu.lock(@src());
-        const entry = self.entries.get(key) orelse {
-            self.mu.unlock();
-            return error.UnknownModule;
-        };
-        self.mu.unlock();
-
-        return entry.update_fn(entry.live_ptr, input);
+        defer self.mu.unlock();
+        return self.entries.get(key) orelse error.UnknownModule;
     }
 
     /// Walk a CLI argv slice and dispatch each `--<module>` arg to its
@@ -731,12 +760,12 @@ pub const Registry = struct {
                 // Form 1: --<name>=<payload>. Split on the FIRST `=` only —
                 // the payload itself contains its own `=` separators.
                 // Strip any surviving outer quotes around the payload.
-                try self.update(body[0..eq], stripSurroundingQuotes(body[eq + 1 ..]));
+                try self.set(body[0..eq], stripSurroundingQuotes(body[eq + 1 ..]));
             } else {
                 // Form 2: --<name> <payload>. Consume the next arg as payload;
                 // a trailing --<name> with no follow-up is a malformed argv.
                 if (i + 1 >= argv.len) return error.InvalidArgv;
-                try self.update(body, stripSurroundingQuotes(argv[i + 1]));
+                try self.set(body, stripSurroundingQuotes(argv[i + 1]));
                 i += 1;
             }
         }

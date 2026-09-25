@@ -80,34 +80,6 @@ pub fn openTablesFromManifest(self: *Forest) !void {
     for (keys) |tk| try self.installTree(tk.namespace, tk.tree_id);
 }
 
-/// Create a new tree for the given namespace, table, and key range.
-/// Single-node path (no Raft) — used by tests. Returns the new tree_id,
-/// derived from the table's next free split index.
-pub fn createTree(
-    self: *Forest,
-    table_key: TableKey,
-    range: KeyRange,
-) !u64 {
-    const tree_id = self.nextTreeId(table_key);
-
-    const left_raw = try range.left.marshal(self.allocator);
-    defer self.allocator.free(left_raw);
-    const right_raw = try range.right.marshal(self.allocator);
-    defer self.allocator.free(right_raw);
-
-    // Single-node path: no raft entry behind this, so index 0.
-    try self.manifest.commit(0, &.{}, &.{
-        _manifest.createTreeChange(
-            tree_id,
-            table_key.namespace,
-            left_raw,
-            right_raw,
-        ),
-    });
-    try self.installTree(table_key.namespace, tree_id);
-    return tree_id;
-}
-
 /// buildNamespaceCreate is Phase A of the Raft-replicated namespace create:
 /// returns a ManifestChange with one TreeChange per system table
 /// (manifest.namespace_system_table_ids) — the namespace's default
@@ -135,12 +107,15 @@ pub fn buildNamespaceCreate(
     // (ns, table_id) has no tree.
     const ids = _manifest.namespace_system_table_ids;
     const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.len);
+    // Bytes keys, and the raw-KV table takes roaring values from the
+    // admin protocol: a posting index for both.
     for (ids, tree_changes) |table_id, *tc|
         tc.* = _manifest.createTreeChange(
             makeTreeId(table_id, 0),
             namespace_id,
             "",
             "",
+            .posting_index,
         );
     // table_id 0 carries the namespace's name.
     tree_changes[0].name = @constCast(name);
@@ -208,33 +183,6 @@ pub fn applyNamespaceCreate(
     }
 }
 
-/// buildCreateTree is Phase A of a per-table tree create: derive the tree_id
-/// for a NEW table (Key.table_id) in an existing namespace — a fresh
-/// table starts at split 0, so tree_id = (table_id << 32). The tree is
-/// infinite-range *within* its table — routing isolates by
-/// (namespace, table_id), so no key-range bound is needed. No state mutates, so
-/// a failed propose costs nothing. create_tree. Caller owns the returned slice.
-pub fn buildCreateTree(
-    self: *Forest,
-    alloc: std.mem.Allocator,
-    table_key: TableKey,
-) !_manifest.ManifestChange {
-    const tree_id = self.nextTreeId(table_key);
-    const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
-    tree_changes[0] = _manifest.createTreeChange(
-        tree_id,
-        table_key.namespace,
-        "",
-        "",
-    );
-    return .{
-        .tree_changes = tree_changes,
-        .sstable_changes = &.{},
-        .cmd = .create_tree,
-        .memtable_id = 0,
-    };
-}
-
 /// Result of buildCreateTables: one allocated table_id per requested name
 /// (same order) plus the single create_tree ManifestChange creating them
 /// all. Caller owns `table_ids` and `change.tree_changes`.
@@ -259,9 +207,9 @@ pub fn buildCreateTables(
     alloc: std.mem.Allocator,
     namespace_id: u64,
     names: []const String,
-    /// One per name: what that tree's keys are (`buffers.KeyKind`). A SQL
-    /// base table's rows are keyed by egid; everything else is bytes.
-    kinds: []const _manifest.KeyKind,
+    /// One per name: what that tree holds (`buffers.TreeKind`). A SQL
+    /// base table's rows tree, then its index trees.
+    kinds: []const _manifest.TreeKind,
 ) !CreateTablesResult {
     std.debug.assert(kinds.len == names.len);
     for (names) |name|
@@ -285,9 +233,9 @@ pub fn buildCreateTables(
             namespace_id,
             "",
             "",
+            kinds[i],
         );
         tree_changes[i].name = @constCast(name);
-        tree_changes[i].key_kind = kinds[i];
     }
     return .{
         .table_ids = table_ids,
@@ -494,7 +442,7 @@ pub fn buildSplit(
         .namespace = namespace_id,
         .tree_id = tree_id,
     }) orelse return null;
-    const old_kind = self.manifest.treeKeyKind(.{
+    const old_kind = self.manifest.treeKind(.{
         .namespace = namespace_id,
         .tree_id = tree_id,
     }) orelse return null;
@@ -557,8 +505,8 @@ pub fn buildSplit(
         namespace_id,
         split_raw,
         right_right_raw_key,
+        old_kind,
     );
-    tree_changes[1].key_kind = old_kind;
 
     return .{
         .sstable_changes = try table_changes.toOwnedSlice(alloc),
@@ -626,7 +574,7 @@ pub fn applySplit(
     errdefer right.release();
 
     // Fresh candidates against the post-split state. Without this the
-    // left half would carry the old tree's `{needs_split=true}` verdict
+    // left half would carry the old tree's split verdict
     // even though half its tables just moved out, and the next
     // levels-loop iteration would fire another split.
     try left.updateCompactCandidate();

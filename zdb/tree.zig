@@ -302,10 +302,11 @@ pub const Tree = struct {
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
     key_range: KeyRange,
-    /// What this tree's keys are (`buffers.KeyKind`): read off the
-    /// manifest record at open, fixed for the tree's life. Picks the SST
-    /// filter every flush and compaction output of this tree carries.
-    key_kind: _manifest.KeyKind,
+    /// What this tree holds (`buffers.TreeKind`): read off the manifest
+    /// record at open, fixed for the tree's life. Picks the SST filter
+    /// its tables carry, whether they may move down without a rewrite,
+    /// and whether they can hold roaring chains to roll up.
+    kind: _manifest.TreeKind,
     /// Holders of this object. One is the `TableTrees` entry that lists it;
     /// `TableTrees.getTree` hands out another per reader, released with
     /// `release` when the reader is done. The last release closes and frees
@@ -337,11 +338,10 @@ pub const Tree = struct {
     // Compaction, from compaction.zig.
     pub const levelTargets = _compaction.levelTargets;
     pub const updateCompactCandidate = _compaction.updateCompactCandidate;
-    pub const computeCompactCandidate = _compaction.computeCompactCandidate;
-    pub const doCompact = _compaction.doCompact;
+    pub const updateCompactCandidate_ = _compaction.updateCompactCandidate_;
+    pub const clearCandidate = _compaction.clearCandidate;
     pub const Emitter = _compaction.Emitter;
     pub const buildCompaction = _compaction.buildCompaction;
-    pub const compactL0 = _compaction.compactL0;
     pub const mergeAndWrite = _compaction.mergeAndWrite;
     pub const flushBuilderOutput = _compaction.flushBuilderOutput;
 
@@ -406,7 +406,7 @@ pub const Tree = struct {
         errdefer for (levels) |*l| l.deinit();
 
         var kr: KeyRange = .{};
-        var key_kind: _manifest.KeyKind = .bytes;
+        var kind: _manifest.TreeKind = .unknown;
         errdefer {
             kr.left.free(allocator);
             kr.right.free(allocator);
@@ -426,7 +426,7 @@ pub const Tree = struct {
             })) |tree| {
                 kr.left = try tree.left.dupe(allocator);
                 kr.right = try tree.right.dupe(allocator);
-                key_kind = tree.key_kind;
+                kind = tree.kind;
                 for (tree.levels.items, 0..) |lm, level_idx| {
                     if (level_idx >= opts.max_levels) continue;
                     var tit = lm.tables.keyIterator();
@@ -451,7 +451,7 @@ pub const Tree = struct {
             .cache = cache,
             .levels = levels,
             .key_range = kr,
-            .key_kind = key_kind,
+            .kind = kind,
         };
         // Unpublished, so uncontended — but the levels take the token, and
         // the tree is at its final address, so the lock is simply taken.
@@ -477,6 +477,7 @@ pub const Tree = struct {
     fn close(self: *Tree) void {
         for (self.levels) |*h| h.deinit();
         self.allocator.free(self.levels);
+        self.clearCandidate();
         self.key_range.left.free(self.allocator);
         self.key_range.right.free(self.allocator);
         self.mu.deinit();
@@ -867,7 +868,11 @@ pub const Tree = struct {
                         if (c.raft_index != 0) c.raft_index else index,
                         n.table.?,
                     );
-                    bytes_out += n.table.?.fileSize();
+                    // A moved file (deleted from another level in this
+                    // entry) was written once already: no new bytes.
+                    if (!deletedIn(changes, c.sst_id)) {
+                        bytes_out += n.table.?.fileSize();
+                    }
                     dest_level = @intCast(c.level);
                 }
             }
@@ -890,6 +895,15 @@ pub const Tree = struct {
         }
 
         try self.updateCompactCandidate();
+    }
+
+    /// Whether `changes` unlists `id` somewhere: a create of the same id
+    /// in that entry is a trivial move, not a new file.
+    fn deletedIn(changes: []const _manifest.SSTableChange, id: u64) bool {
+        for (changes) |c| {
+            if (c.op == .delete and c.sst_id == id) return true;
+        }
+        return false;
     }
 
     /// Install a CREATE INDEX backfill: bottom-level CREATEs only

@@ -153,7 +153,7 @@ pub fn createIndex(
         arloc,
         ns,
         &.{name},
-        &.{.bytes},
+        &.{if (ci.unique) .unique_index else .posting_index},
     ) catch |err| switch (err) {
         error.NameExists => return replyErrorCode(
             state,

@@ -68,7 +68,7 @@ pub const Table = struct {
     handle: vfs.FileHandle,
     index: *_buffers.TableIndexStruct,
     codec: compress.Codec,
-    /// The table's filter, one of the two (see `builder.Config.key_kind`),
+    /// The table's filter, one of the two (see `builder.Config.kind`),
     /// or neither for a table written without one.
     binary_fuse: ?_binaryfuse.BinaryFuse(u16),
     egid_bm: ?zroar.Bitmap,

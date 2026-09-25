@@ -5,6 +5,7 @@ const sql = @import("sql");
 const String = sql.value.String;
 const utils = @import("utils");
 const zdb = @import("zdb");
+const createTree = @import("../zdb/testing.zig").createTree;
 const flags = @import("flags");
 
 const Txn = sql.txn.Txn;
@@ -37,14 +38,17 @@ const Fixture = struct {
         );
         errdefer testing.allocator.free(dir_path);
 
-        const f_live = try flags.Live(Config).create(testing.allocator, .{ .dir = dir_path });
+        const f_live = try flags.Live(Config).create(
+            testing.allocator,
+            .{ .dir = dir_path },
+        );
         errdefer f_live.destroy();
         const f = try Forest.open(testing.allocator, f_live);
         errdefer f.close();
-        _ = try f.createTree(.{
+        _ = try createTree(f, .{
             .namespace = ns,
             .table_id = tid,
-        }, .{});
+        }, .{}, .posting_index);
         try f.put(rows);
 
         return .{
@@ -516,10 +520,10 @@ test "txn: opposite posting ops annihilate; a later op re-opens" {
 test "txn: flattened postings fold through the forest into a bitmap" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();
-    _ = try fx.forest.createTree(.{
+    _ = try createTree(fx.forest, .{
         .namespace = ns,
         .table_id = itid,
-    }, .{});
+    }, .{}, .posting_index);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
@@ -577,10 +581,10 @@ fn putWire(
 test "txn: overlayPostings applies pending ops onto a committed bitmap" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();
-    _ = try fx.forest.createTree(.{
+    _ = try createTree(fx.forest, .{
         .namespace = ns,
         .table_id = itid,
-    }, .{});
+    }, .{}, .posting_index);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 

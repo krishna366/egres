@@ -527,6 +527,13 @@ pub const KeyRange = struct {
 
     pub const all: KeyRange = .{};
 
+    /// Whether `key` is inside `[left, right)`.
+    pub fn contains(self: KeyRange, key: Key) bool {
+        if (!self.left.isInf() and key.order(self.left) == .lt) return false;
+        if (!self.right.isInf() and key.order(self.right) != .lt) return false;
+        return true;
+    }
+
     /// This range CLAMPED to one table's key window: intersected with
     /// the table's edges (`Key.tableLeft`, `Key.tableRight`). A left
     /// below the table (a lower namespace/table, or unbounded) is raised

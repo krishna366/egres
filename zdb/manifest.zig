@@ -49,12 +49,12 @@ pub const TreeState = struct {
     levels: std.ArrayList(LevelState),
     left: Key = Key.inf,
     right: Key = Key.inf,
-    /// See `buffers.KeyKind`. Set at create, inherited by a split's new
+    /// See `buffers.TreeKind`. Set at create, inherited by a split's new
     /// tree, kept by the snapshot manifest.
-    key_kind: KeyKind = .bytes,
+    kind: TreeKind = .unknown,
 };
 
-pub const KeyKind = _zen.KeyKindEnum;
+pub const TreeKind = _zen.TreeKindEnum;
 
 /// table_ids 0–15 are reserved per namespace (0 = raw-KV / default table,
 /// 1 = the namespace's SQL catalog, the rest for future system tables); user
@@ -364,13 +364,12 @@ pub const Manifest = struct {
     /// frees the very bytes a stored `TreeState` borrows — so a caller off
     /// that loop copies under the lock instead of holding a `TreeState`
     /// across its own work. Null if the tree is not listed.
-    /// What the tree's keys are, null for a tree the manifest does not
-    /// list.
-    pub fn treeKeyKind(self: *Manifest, key: TreeKey) ?KeyKind {
+    /// What the tree holds, null for a tree the manifest does not list.
+    pub fn treeKind(self: *Manifest, key: TreeKey) ?TreeKind {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         const tree = self.trees.getPtr(key) orelse return null;
-        return tree.key_kind;
+        return tree.kind;
     }
 
     pub fn treeRange(
@@ -600,6 +599,16 @@ pub const Manifest = struct {
         } else if (tc.op == .delete) {
             const tree = self.trees.getPtr(key) orelse
                 return ManifestError.TreeNotFound;
+            // The named level first: a trivial move lists the file at
+            // two levels of one tree while its entry applies (creates go
+            // first), and the delete must drop the source listing, not
+            // whichever level a scan meets first.
+            if (tc.level < tree.levels.items.len and
+                tree.levels.items[tc.level].tables.remove(tc.sst_id))
+            {
+                try self.decrSST(index, tc.sst_id);
+                return;
+            }
             // Scan levels to find and remove the table.
             for (tree.levels.items) |*lm| {
                 if (lm.tables.remove(tc.sst_id)) {
@@ -676,6 +685,9 @@ pub const Manifest = struct {
             .tree_id = tc.tree_id,
         };
         if (tc.op == .create) {
+            // Every create names what the tree holds; the filter, move
+            // and rollup rules all read it.
+            std.debug.assert(tc.kind != .unknown);
             // A re-apply during WAL replay over snapshot-restored state is a
             // no-op: putting over the existing record would leak its keys.
             if (self.trees.contains(key)) return;
@@ -684,7 +696,7 @@ pub const Manifest = struct {
                 .levels = std.ArrayList(LevelState).empty,
                 .left = try Key.initAlloc(self.allocator, tc.left_key),
                 .right = try Key.initAlloc(self.allocator, tc.right_key),
-                .key_kind = tc.key_kind,
+                .kind = tc.kind,
             });
         } else if (tc.op == .delete) {
             if (self.trees.fetchRemove(key)) |kv| {
@@ -872,8 +884,8 @@ pub const Manifest = struct {
                 tk.namespace,
                 left_raw,
                 right_raw,
+                tree.kind,
             );
-            change.key_kind = tree.key_kind;
             // Only the table's FIRST tree carries the name — exactly one
             // tree per table has the open left bound (splits leave it with
             // the leftmost child), so a heavily-split table doesn't copy
@@ -962,6 +974,9 @@ pub const Manifest = struct {
                     .namespace_id = tc.namespaceId(),
                     .left_key = @constCast(tc.leftKey()),
                     .right_key = @constCast(tc.rightKey()),
+                    // Without this a restored rows tree came back as an
+                    // index: fuse filters from then on, no moves.
+                    .kind = tc.kind(),
                 });
             }
 
@@ -1077,6 +1092,7 @@ pub fn createTreeChange(
     namespace_id: u64,
     left_key: String,
     right_key: String,
+    kind: TreeKind,
 ) TreeChange {
     return .{
         .op = .create,
@@ -1084,6 +1100,7 @@ pub fn createTreeChange(
         .namespace_id = namespace_id,
         .left_key = @constCast(left_key),
         .right_key = @constCast(right_key),
+        .kind = kind,
     };
 }
 

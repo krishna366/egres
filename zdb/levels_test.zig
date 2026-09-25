@@ -26,6 +26,20 @@ const TableCache = zdb.tree.TableCache;
 
 const config = zdb.config;
 
+/// A bottom target of one byte makes a push L0's job at any size
+/// (`pickL0Job`), so compacting L0 here pushes into L1 as the tests
+/// expect, instead of L0 asking for nothing or merging within itself.
+const push_lmax: i64 = 1;
+
+/// Build the compaction the tree wants (`compact_candidate`) and apply
+/// it, listed under log index `index`: what the engine does across a
+/// proposal.
+fn compact(tree: *Tree, index: u64, min_read: u64) !void {
+    var changes = try tree.buildCompaction(min_read);
+    defer changes.deinit(tree.allocator);
+    try tree.applyCompaction(index, changes.items);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -109,7 +123,11 @@ fn installTable(
     try vfs.writeFile(path, tb.bytes);
     // No raft here: the id doubles as the log index, so the fixtures
     // install in id order and L0 sorts the way each test expects.
-    try manifest.commit(id, &.{createSSTableChange(id, 0, tree_id, level)}, &.{});
+    try manifest.commit(
+        id,
+        &.{createSSTableChange(id, 0, tree_id, level)},
+        &.{},
+    );
 }
 
 /// Sum of stale_data_size across a level's tables. buildCompaction records it
@@ -309,7 +327,11 @@ test "levels: overlapping tables L1" {
     const gk = try (Key{ .primary = "g" }).marshal(alloc);
     defer alloc.free(gk);
 
-    const result = try level.overlappingTables(held.shared(), alloc, .{ .left = Key.init(ck), .right = Key.init(gk) });
+    const result = try level.overlappingTables(
+        held.shared(),
+        alloc,
+        .{ .left = Key.init(ck), .right = Key.init(gk) },
+    );
     defer Level.releaseTables(alloc, result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
 }
@@ -351,7 +373,11 @@ test "levels: overlapping tables L0" {
     defer alloc.free(ck);
 
     // L0 always returns all tables regardless of the query.
-    const result = try level.overlappingTables(held.shared(), alloc, .{ .left = Key.init(ck), .right = Key.init(ck) });
+    const result = try level.overlappingTables(
+        held.shared(),
+        alloc,
+        .{ .left = Key.init(ck), .right = Key.init(ck) },
+    );
     defer Level.releaseTables(alloc, result);
     try std.testing.expectEqual(@as(usize, 3), result.len);
 }
@@ -494,7 +520,9 @@ test "levels: open" {
     const test_tree_id: u64 = 1;
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
-    try manifest.commit(1, &.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0),
         createSSTableChange(2, 0, test_tree_id, 1),
@@ -505,7 +533,14 @@ test "levels: open" {
     defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
+    const tree = try Tree.open(
+        alloc,
+        &live,
+        0,
+        test_tree_id,
+        &manifest,
+        &cache,
+    );
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(0));
@@ -545,7 +580,14 @@ test "levels: pick compact level" {
     defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
+    const tree = try Tree.open(
+        alloc,
+        &live,
+        0,
+        test_tree_id,
+        &manifest,
+        &cache,
+    );
     defer tree.release();
 
     // Manually plant a large table in L1.
@@ -569,10 +611,10 @@ test "levels: pick compact level" {
 }
 
 // ---------------------------------------------------------------------------
-// 10. do compact L0→L1
+// 10. compact L0→L1
 // ---------------------------------------------------------------------------
 
-test "levels: doCompact L0 L1" {
+test "levels: compact L0 L1" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -600,27 +642,40 @@ test "levels: doCompact L0 L1" {
         defer alloc.free(path);
         try vfs.writeFile(path, tb.bytes);
     }
-    try manifest.commit(1, &.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0),
         createSSTableChange(2, 0, test_tree_id, 0),
         createSSTableChange(3, 0, test_tree_id, 0),
     }, &.{});
 
-    // Use max_levels=2 so base_level=1 and doCompact(0) goes L0→L1.
-    const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
+    // Use max_levels=2 so base_level=1 and the compaction goes L0→L1.
+    const opts = config.Config{
+        .dir = dir_path,
+        .max_levels = 2,
+        .lmax_target_bytes = push_lmax,
+    };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
+    const tree = try Tree.open(
+        alloc,
+        &live,
+        0,
+        test_tree_id,
+        &manifest,
+        &cache,
+    );
     defer tree.release();
 
     // All three tables should be in L0 before compaction.
     try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(0));
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
 
-    try tree.doCompact(1, 0, 0);
+    try compact(tree, 1, 0);
 
     // After compaction L0 must be empty and keys must live in L1.
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(0));
@@ -639,7 +694,7 @@ test "levels: doCompact L0 L1" {
 // 11. do compact L0→L1 with dest overlap
 // ---------------------------------------------------------------------------
 
-test "levels: doCompact L0 L1 with dest overlap" {
+test "levels: compact L0 L1 with dest overlap" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -682,7 +737,9 @@ test "levels: doCompact L0 L1 with dest overlap" {
         defer alloc.free(p);
         try vfs.writeFile(p, tb.bytes);
     }
-    try manifest.commit(1, &.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 0),
         createSSTableChange(2, 0, test_tree_id, 0),
@@ -690,18 +747,29 @@ test "levels: doCompact L0 L1 with dest overlap" {
     }, &.{});
 
     // max_levels=2: L0 compacts directly to L1 (base_level=1).
-    const opts = config.Config{ .dir = dir_path, .max_levels = 2 };
+    const opts = config.Config{
+        .dir = dir_path,
+        .max_levels = 2,
+        .lmax_target_bytes = push_lmax,
+    };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
+    const tree = try Tree.open(
+        alloc,
+        &live,
+        0,
+        test_tree_id,
+        &manifest,
+        &cache,
+    );
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(0));
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
 
-    try tree.doCompact(1, 0, 0);
+    try compact(tree, 1, 0);
 
     // L0 must be empty; L1 holds the merged result in a single table.
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(0));
@@ -726,7 +794,7 @@ test "levels: doCompact L0 L1 with dest overlap" {
 // 12. do compact L1→L2
 // ---------------------------------------------------------------------------
 
-test "levels: doCompact L1 L2" {
+test "levels: compact L1 L2" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -735,15 +803,21 @@ test "levels: doCompact L1 L2" {
     defer alloc.free(dir_path);
 
     // L1: {aa, bb}; L2: {cc} — non-overlapping, so compacting L1 doesn't
-    // touch the L2 table; both survive in L2 after compaction.
+    // touch the L2 table; both survive in L2 after compaction. L1's
+    // values are padded so its file outweighs L2's: a level's score is
+    // dampened by the fullness of the level below, and under the
+    // one-byte target that is the ratio of their sizes. Files are 4 KiB
+    // multiples, so the padding has to carry L1 past one.
+    const vaa = "vaa" ++ "." ** 3072;
+    const vbb = "vbb" ++ "." ** 3072;
     const test_tree_id: u64 = 1;
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
 
     {
         var tb1 = try buildTable(alloc, &.{
-            .{ .key = "aa", .ts = 1, .val = "vaa" },
-            .{ .key = "bb", .ts = 1, .val = "vbb" },
+            .{ .key = "aa", .ts = 1, .val = vaa },
+            .{ .key = "bb", .ts = 1, .val = vbb },
         });
         defer tb1.deinit();
         const p1 = try zdb.sstPath(alloc, dir_path, 1);
@@ -758,33 +832,47 @@ test "levels: doCompact L1 L2" {
         defer alloc.free(p2);
         try vfs.writeFile(p2, tb2.bytes);
     }
-    try manifest.commit(1, &.{}, &.{createTreeChange(test_tree_id, 0, &.{}, &.{})});
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
+    });
     try manifest.commit(2, &.{
         createSSTableChange(1, 0, test_tree_id, 1),
         createSSTableChange(2, 0, test_tree_id, 2),
     }, &.{});
 
-    // max_levels=3: doCompact(1) goes L1→L2 (dest = src + 1 = 2).
-    const opts = config.Config{ .dir = dir_path, .max_levels = 3 };
+    // max_levels=3, and a one-byte bottom target puts L1 over its
+    // target: L1 is the candidate, so it goes L1→L2.
+    const opts = config.Config{
+        .dir = dir_path,
+        .max_levels = 3,
+        .lmax_target_bytes = push_lmax,
+    };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
+    const tree = try Tree.open(
+        alloc,
+        &live,
+        0,
+        test_tree_id,
+        &manifest,
+        &cache,
+    );
     defer tree.release();
 
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
     try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(2));
 
-    try tree.doCompact(1, 1, 0);
+    try compact(tree, 1, 0);
 
     // L1 must be empty; L2 holds the original {cc} table plus new {aa, bb}.
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
     try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(2));
 
     const expected = [_]struct { key: String, val: String }{
-        .{ .key = "aa", .val = "vaa" },
-        .{ .key = "bb", .val = "vbb" },
+        .{ .key = "aa", .val = vaa },
+        .{ .key = "bb", .val = vbb },
         .{ .key = "cc", .val = "vcc" },
     };
     for (expected) |e| {
@@ -819,12 +907,22 @@ test "levels: get L0 shadows L1" {
     defer cache.deinit();
     var live = flags.Live(config.Config).initFrom(alloc, opts);
     defer live.deinit();
-    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
+    const tree = try Tree.open(
+        alloc,
+        &live,
+        0,
+        test_tree_id,
+        &manifest,
+        &cache,
+    );
     defer tree.release();
 
     // Plant in-memory tables directly into the level handlers.
     // L1: foo at ts=1 (old version).
-    var tb_l1 = try buildTable(alloc, &.{.{ .key = "foo", .ts = 1, .val = "l1_val" }});
+    var tb_l1 = try buildTable(
+        alloc,
+        &.{.{ .key = "foo", .ts = 1, .val = "l1_val" }},
+    );
     defer tb_l1.deinit();
     const t_l1 = try openTableOwned(alloc, &tb_l1);
     _ = try cache.own(1, t_l1);
@@ -836,7 +934,10 @@ test "levels: get L0 shadows L1" {
     t_l1.decrRef();
 
     // L0: foo at ts=5 (newer version; higher ts sorts earlier in byte order).
-    var tb_l0 = try buildTable(alloc, &.{.{ .key = "foo", .ts = 5, .val = "l0_val" }});
+    var tb_l0 = try buildTable(
+        alloc,
+        &.{.{ .key = "foo", .ts = 5, .val = "l0_val" }},
+    );
     defer tb_l0.deinit();
     const t_l0 = try openTableOwned(alloc, &tb_l0);
     _ = try cache.own(2, t_l0);
@@ -947,18 +1048,374 @@ fn setupTombstoneTree(
     const tree_id: u64 = 1;
     fx.manifest = _manifest.Manifest.init(alloc);
     errdefer fx.manifest.deinit();
-    try fx.manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    try fx.manifest.commit(1, &.{}, &.{
+        createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
+    });
 
     var tb = try buildTableMeta(alloc, entries);
     defer tb.deinit();
     try installTable(alloc, &fx.manifest, dir_path, &tb, 1, tree_id, 0);
 
-    const opts = config.Config{ .dir = dir_path, .max_levels = max_levels };
+    const opts = config.Config{
+        .dir = dir_path,
+        .max_levels = max_levels,
+        .lmax_target_bytes = push_lmax,
+    };
     fx.cache = TableCache.init(alloc, opts.dir);
     errdefer fx.cache.deinit();
     fx.live = flags.Live(config.Config).initFrom(alloc, opts);
     errdefer fx.live.deinit();
-    fx.tree = try Tree.open(alloc, &fx.live, 0, tree_id, &fx.manifest, &fx.cache);
+    fx.tree = try Tree.open(
+        alloc,
+        &fx.live,
+        0,
+        tree_id,
+        &fx.manifest,
+        &fx.cache,
+    );
+}
+
+/// One SST for `setupPlacedTree`: its id (also the log index it is listed
+/// at, so L0 sorts by id), its level, and its egids, each at ts 1 with
+/// the egid's decimal text as the value.
+const PlacedTable = struct { id: u64, level: u32, egids: []const u64 };
+
+fn egidKey(egid: u64) [8]u8 {
+    var k: [8]u8 = undefined;
+    std.mem.writeInt(u64, &k, egid, .big);
+    return k;
+}
+
+/// A Tree of `kind` with `max_levels`, holding `tables` where they
+/// say.
+fn setupPlacedTree(
+    alloc: std.mem.Allocator,
+    fx: *TombstoneFixture,
+    dir_path: String,
+    max_levels: u8,
+    kind: _manifest.TreeKind,
+    tables: []const PlacedTable,
+) !void {
+    return setupPlacedTreeCfg(alloc, fx, dir_path, .{
+        .dir = dir_path,
+        .max_levels = max_levels,
+        .lmax_target_bytes = push_lmax,
+    }, kind, tables);
+}
+
+fn setupPlacedTreeCfg(
+    alloc: std.mem.Allocator,
+    fx: *TombstoneFixture,
+    dir_path: String,
+    opts: config.Config,
+    kind: _manifest.TreeKind,
+    tables: []const PlacedTable,
+) !void {
+    const tree_id: u64 = 1;
+    fx.manifest = _manifest.Manifest.init(alloc);
+    errdefer fx.manifest.deinit();
+    const tc = createTreeChange(tree_id, 0, &.{}, &.{}, kind);
+    try fx.manifest.commit(1, &.{}, &.{tc});
+    for (tables) |pt| {
+        var b = Builder.init(alloc, .{
+            .target_block_size = 4 * 1024,
+            .kind = kind,
+        });
+        defer b.deinit();
+        for (pt.egids) |egid| {
+            const k = egidKey(egid);
+            var vbuf: [20]u8 = undefined;
+            const v = try std.fmt.bufPrint(&vbuf, "{d}", .{egid});
+            try b.add(.{ .primary = &k }, 1, v);
+        }
+        var tb = try b.finish();
+        defer tb.deinit();
+        try installTable(
+            alloc,
+            &fx.manifest,
+            dir_path,
+            &tb,
+            pt.id,
+            tree_id,
+            pt.level,
+        );
+    }
+    fx.cache = TableCache.init(alloc, opts.dir);
+    errdefer fx.cache.deinit();
+    fx.live = flags.Live(config.Config).initFrom(alloc, opts);
+    errdefer fx.live.deinit();
+    fx.tree = try Tree.open(
+        alloc,
+        &fx.live,
+        0,
+        tree_id,
+        &fx.manifest,
+        &fx.cache,
+    );
+}
+
+/// The SST ids a level lists, ascending.
+fn levelIds(alloc: std.mem.Allocator, tree: *Tree, level: usize) ![]u64 {
+    const items = tree.levels[level].tables.items;
+    const ids = try alloc.alloc(u64, items.len);
+    for (items, ids) |e, *id| id.* = e.id;
+    std.mem.sortUnstable(u64, ids, {}, std.sort.asc(u64));
+    return ids;
+}
+
+fn expectEgids(alloc: std.mem.Allocator, tree: *Tree, egids: []const u64) !void {
+    for (egids) |egid| {
+        const k = egidKey(egid);
+        const item = try tree.get(.{ .key = .{ .primary = &k } });
+        try std.testing.expect(item != null);
+        defer item.?.free(alloc);
+        var vbuf: [20]u8 = undefined;
+        const want = try std.fmt.bufPrint(&vbuf, "{d}", .{egid});
+        try std.testing.expectEqualStrings(want, item.?.newest().value);
+    }
+}
+
+test "compaction: a push that overlaps nothing below moves its oldest table" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Disjoint L0 tables of rows over an empty L1 that is not the
+    // bottom: the same files end up in L1, none written, none retired.
+    // One per compaction, oldest first, so L1 never holds a version
+    // younger than one still in L0.
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTree(alloc, &fx, dir_path, 3, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{1} },
+        .{ .id = 3, .level = 0, .egids = &.{ 2, 3 } },
+        .{ .id = 4, .level = 0, .egids = &.{4} },
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 10, 0);
+    {
+        const l0 = try levelIds(alloc, fx.tree, 0);
+        defer alloc.free(l0);
+        try std.testing.expectEqualSlices(u64, &.{ 3, 4 }, l0);
+        const l1 = try levelIds(alloc, fx.tree, 1);
+        defer alloc.free(l1);
+        try std.testing.expectEqualSlices(u64, &.{2}, l1);
+    }
+
+    try compact(fx.tree, 11, 0);
+    try compact(fx.tree, 12, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), fx.tree.numTablesAt(0));
+    const ids = try levelIds(alloc, fx.tree, 1);
+    defer alloc.free(ids);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3, 4 }, ids);
+    try std.testing.expectEqual(@as(u32, 0), fx.manifest.to_delete.count());
+    try expectEgids(alloc, fx.tree, &.{ 1, 2, 3, 4 });
+}
+
+test "compaction: a unique index tree moves like a rows tree" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // One row key per entry, no roaring chains: nothing a rewrite above
+    // the bottom would do, so the file moves as it is.
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTree(alloc, &fx, dir_path, 3, .unique_index, &.{
+        .{ .id = 2, .level = 0, .egids = &.{1} },
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 10, 0);
+
+    const ids = try levelIds(alloc, fx.tree, 1);
+    defer alloc.free(ids);
+    try std.testing.expectEqualSlices(u64, &.{2}, ids);
+    try std.testing.expectEqual(@as(u32, 0), fx.manifest.to_delete.count());
+    try expectEgids(alloc, fx.tree, &.{1});
+}
+
+test "compaction: overlapping L0 tables are merged, not moved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // The oldest meets nothing in an empty L1 and moves; the next one
+    // then meets it there and is merged into it. The bottom holds more
+    // than L1 will, so L1's dampened score does not outrank L0's push.
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTree(alloc, &fx, dir_path, 3, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{ 1, 3 } },
+        .{ .id = 3, .level = 0, .egids = &.{ 2, 4 } },
+        .{ .id = 4, .level = 2, .egids = &egidRun(100, 50) },
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 10, 0);
+    {
+        const l1 = try levelIds(alloc, fx.tree, 1);
+        defer alloc.free(l1);
+        try std.testing.expectEqualSlices(u64, &.{2}, l1);
+    }
+
+    try compact(fx.tree, 11, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), fx.tree.numTablesAt(0));
+    const ids = try levelIds(alloc, fx.tree, 1);
+    defer alloc.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expect(ids[0] != 2 and ids[0] != 3);
+    try expectEgids(alloc, fx.tree, &.{ 1, 2, 3, 4 });
+}
+
+test "compaction: a table overlapping nothing below moves down a middle level" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTree(alloc, &fx, dir_path, 4, .rows, &.{
+        .{ .id = 2, .level = 1, .egids = &.{ 1, 2 } },
+        .{ .id = 3, .level = 2, .egids = &.{5} },
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 10, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), fx.tree.numTablesAt(1));
+    const ids = try levelIds(alloc, fx.tree, 2);
+    defer alloc.free(ids);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, ids);
+    try std.testing.expectEqual(@as(u32, 0), fx.manifest.to_delete.count());
+    try expectEgids(alloc, fx.tree, &.{ 1, 2, 5 });
+}
+
+test "compaction: a push into the bottom level is rewritten, not moved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // The bottom rewrite is where the floor's discards happen, so it is
+    // kept even when nothing below overlaps.
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTree(alloc, &fx, dir_path, 2, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{1} },
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 10, 0);
+
+    const ids = try levelIds(alloc, fx.tree, 1);
+    defer alloc.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expect(ids[0] != 2);
+    try expectEgids(alloc, fx.tree, &.{1});
+}
+
+/// Scoring fixture: L1 and L2 both over target, L2 more so in bytes
+/// but less so in score, so L1's dampened score is about 1.67 and L0's
+/// (four tables, start count 2) is 4. Dampened by L1, L0 would score
+/// 0.04 and L1 would win; exempt, L0 wins.
+const score_cfg = config.Config{
+    .max_levels = 3,
+    .lmax_target_bytes = 1000, // L1 target 200 B
+    .l0_backpressure_start_count = 2,
+    .l0_merge_min_tables = 0,
+};
+
+fn egidRun(comptime first: u64, comptime n: usize) [n]u64 {
+    var out: [n]u64 = undefined;
+    for (&out, 0..) |*e, i| e.* = first + i;
+    return out;
+}
+
+test "compaction: an L0 push that meets nothing in L1 is not held back by a full L1" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    var cfg = score_cfg;
+    cfg.dir = dir_path;
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{1} },
+        .{ .id = 3, .level = 0, .egids = &.{2} },
+        .{ .id = 4, .level = 0, .egids = &.{3} },
+        .{ .id = 5, .level = 0, .egids = &.{4} },
+        .{ .id = 6, .level = 1, .egids = &egidRun(100, 50) },
+        .{ .id = 7, .level = 2, .egids = &egidRun(200, 50) },
+        .{ .id = 8, .level = 2, .egids = &egidRun(300, 50) },
+        .{ .id = 9, .level = 2, .egids = &egidRun(400, 50) },
+    });
+    defer fx.deinit();
+
+    try fx.tree.updateCompactCandidate();
+    const cand = fx.tree.compact_candidate orelse return error.TestExpectedCandidate;
+    try std.testing.expectEqual(@as(u8, 0), cand.level);
+}
+
+test "compaction: an L0 push that overlaps L1 waits for room below" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Same shape, but L1's table spans L0's keys: the push would
+    // rewrite it, so L1's fullness dampens L0 and L1 compacts first.
+    var cfg = score_cfg;
+    cfg.dir = dir_path;
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{101} },
+        .{ .id = 3, .level = 0, .egids = &.{102} },
+        .{ .id = 4, .level = 0, .egids = &.{103} },
+        .{ .id = 5, .level = 0, .egids = &.{104} },
+        .{ .id = 6, .level = 1, .egids = &egidRun(100, 50) },
+        .{ .id = 7, .level = 2, .egids = &egidRun(200, 50) },
+        .{ .id = 8, .level = 2, .egids = &egidRun(300, 50) },
+        .{ .id = 9, .level = 2, .egids = &egidRun(400, 50) },
+    });
+    defer fx.deinit();
+
+    try fx.tree.updateCompactCandidate();
+    const cand = fx.tree.compact_candidate orelse return error.TestExpectedCandidate;
+    try std.testing.expectEqual(@as(u8, 1), cand.level);
+}
+
+test "compaction: a posting index's push is rewritten, not moved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Its tables may hold roaring chains only a rewrite rolls up.
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTree(alloc, &fx, dir_path, 3, .posting_index, &.{
+        .{ .id = 2, .level = 0, .egids = &.{1} },
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 10, 0);
+
+    const ids = try levelIds(alloc, fx.tree, 1);
+    defer alloc.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expect(ids[0] != 2);
+    try expectEgids(alloc, fx.tree, &.{1});
 }
 
 test "compaction: bottom level drops a tombstone below the horizon and what it shadows" {
@@ -978,7 +1435,7 @@ test "compaction: bottom level drops a tombstone below the horizon and what it s
 
     // Horizon above the tombstone: nothing can read at or below ts=100 any
     // more, so the tombstone and the version it shadows are both unreachable.
-    try fx.tree.doCompact(1, 0, 200);
+    try compact(fx.tree, 1, 200);
 
     try std.testing.expect((try fx.tree.get(.{
         .key = .{ .primary = "k" },
@@ -1003,7 +1460,7 @@ test "compaction: a tombstone above the horizon is retained with the state it sh
     // is the newest version and stays — and so does the state it shadows,
     // because the state@50 is the first terminal at or below the horizon (50),
     // i.e. the oldest version an allowed read can still resolve to.
-    try fx.tree.doCompact(1, 0, 50);
+    try compact(fx.tree, 1, 50);
 
     const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1040,7 +1497,7 @@ test "compaction: a non-bottom level never drops tombstones" {
 
     // Horizon is way above the tombstone — eligible on every count EXCEPT
     // that this compaction isn't writing into the bottom level.
-    try fx.tree.doCompact(1, 0, 200);
+    try compact(fx.tree, 1, 200);
 
     const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1064,7 +1521,7 @@ test "compaction: a put above the horizon survives a lower tombstone's drop" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 200);
+    try compact(fx.tree, 1, 200);
 
     // k@300 is above the horizon: still readable, untouched.
     const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
@@ -1100,7 +1557,7 @@ test "compaction: dropping one primary does not disturb its neighbours" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 200);
+    try compact(fx.tree, 1, 200);
 
     const j = try fx.tree.get(.{ .key = .{ .primary = "j" } }) orelse
         return error.TestExpectedItem;
@@ -1137,7 +1594,7 @@ test "compaction: bottom level drops shadowed versions once they reach the horiz
 
     // Horizon 600: all three are at or below it, so the two older versions are
     // collectable. The newest value (k@500) is the current value and stays.
-    try fx.tree.doCompact(1, 0, 600);
+    try compact(fx.tree, 1, 600);
 
     const got = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1150,7 +1607,10 @@ test "compaction: bottom level drops shadowed versions once they reach the horiz
     });
     try std.testing.expect(below == null);
     // Only the newest survived → nothing shadowed remains → no stale data.
-    try std.testing.expectEqual(@as(u64, 0), levelStaleBytes(&fx.tree.levels[1]));
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        levelStaleBytes(&fx.tree.levels[1]),
+    );
 }
 
 test "compaction: bottom level keeps a shadowed version above the horizon and counts it stale" {
@@ -1170,7 +1630,7 @@ test "compaction: bottom level keeps a shadowed version above the horizon and co
     // Horizon 200: both versions are above it, so nothing is collected yet — a
     // read at 400 legitimately sees k@300, and it stays until the horizon
     // rises past 300.
-    try fx.tree.doCompact(1, 0, 200);
+    try compact(fx.tree, 1, 200);
 
     const cur = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1184,7 +1644,10 @@ test "compaction: bottom level keeps a shadowed version above the horizon and co
     try std.testing.expectEqualStrings("v300", mid.newest().value);
     // k@300 is shadowed by the newer full row k@500 → counted stale: primary
     // "k" (1) + value "v300" (4). Reclaimed once the horizon rises past 500.
-    try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
+    try std.testing.expectEqual(
+        @as(u64, 5),
+        levelStaleBytes(&fx.tree.levels[1]),
+    );
 }
 
 test "compaction: a non-bottom level keeps everything but still counts stale" {
@@ -1204,7 +1667,7 @@ test "compaction: a non-bottom level keeps everything but still counts stale" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 600); // horizon irrelevant: not bottom
+    try compact(fx.tree, 1, 600); // horizon irrelevant: not bottom
 
     // Both versions survive — a non-bottom compaction never drops.
     const cur = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
@@ -1218,7 +1681,10 @@ test "compaction: a non-bottom level keeps everything but still counts stale" {
     defer mid.free(alloc);
     try std.testing.expectEqualStrings("v300", mid.newest().value);
     // The shadowed k@300 is counted stale even though nothing was dropped.
-    try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
+    try std.testing.expectEqual(
+        @as(u64, 5),
+        levelStaleBytes(&fx.tree.levels[1]),
+    );
 }
 
 test "compaction: a delta above the newest state is live, not stale" {
@@ -1241,7 +1707,7 @@ test "compaction: a delta above the newest state is live, not stale" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 0);
+    try compact(fx.tree, 1, 0);
 
     // All three survive (a non-bottom compaction drops nothing).
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
@@ -1257,7 +1723,10 @@ test "compaction: a delta above the newest state is live, not stale" {
 
     // Only k@100 sits below the newest terminal (state@200) → stale: "k" (1) +
     // "s100" (4). The delta and its base state are NOT counted.
-    try std.testing.expectEqual(@as(u64, 5), levelStaleBytes(&fx.tree.levels[1]));
+    try std.testing.expectEqual(
+        @as(u64, 5),
+        levelStaleBytes(&fx.tree.levels[1]),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,7 +1750,9 @@ fn setupTreeWithCfg(
     const tree_id: u64 = 1;
     fx.manifest = _manifest.Manifest.init(alloc);
     errdefer fx.manifest.deinit();
-    try fx.manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    try fx.manifest.commit(1, &.{}, &.{
+        createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
+    });
 
     var tb = try buildTableMeta(alloc, entries);
     defer tb.deinit();
@@ -1293,7 +1764,14 @@ fn setupTreeWithCfg(
     errdefer fx.cache.deinit();
     fx.live = flags.Live(config.Config).initFrom(alloc, opts);
     errdefer fx.live.deinit();
-    fx.tree = try Tree.open(alloc, &fx.live, 0, tree_id, &fx.manifest, &fx.cache);
+    fx.tree = try Tree.open(
+        alloc,
+        &fx.live,
+        0,
+        tree_id,
+        &fx.manifest,
+        &fx.cache,
+    );
 }
 
 fn encodeDelta(
@@ -1366,14 +1844,17 @@ test "compaction: rollup folds a delta chain onto its in-inputs state" {
 
     // Non-bottom (4 levels): the retained chain must survive.
     var fx: TombstoneFixture = undefined;
-    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
         .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
         .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 0);
+    try compact(fx.tree, 1, 0);
 
     // Newest version is now a synthetic state at the newest delta's
     // timestamp: {1,2} +{2,3} → {1,2,3}, then +{40}-{2} → {1,3,40}.
@@ -1422,13 +1903,16 @@ test "compaction: rollup leaves lone states and baseless chains alone" {
     // "a": already rolled (lone state). "b": delta with no base among
     // the inputs — read-below isn't wired yet, so it stays a delta.
     var fx: TombstoneFixture = undefined;
-    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .key = "a", .ts = 100, .val = s100, .meta = roaring_state },
         .{ .key = "b", .ts = 200, .val = d200, .meta = roaring_delta },
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 0);
+    try compact(fx.tree, 1, 0);
 
     const a = try fx.tree.get(.{ .key = .{ .primary = "a" } }) orelse
         return error.TestExpectedItem;
@@ -1456,13 +1940,16 @@ test "compaction: a mixed chain aborts the rollup and stays verbatim" {
     // A raw state under a roaring delta: not ours to fold. Both
     // versions must come out byte-identical.
     var fx: TombstoneFixture = undefined;
-    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
         .{ .key = "k", .ts = 200, .val = "raw-state", .meta = .{} },
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 0);
+    try compact(fx.tree, 1, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1491,13 +1978,16 @@ test "compaction: an empty fold emits a roaring tombstone" {
     defer alloc.free(s100);
 
     var fx: TombstoneFixture = undefined;
-    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
         .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 0);
+    try compact(fx.tree, 1, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1530,13 +2020,16 @@ test "compaction: bottom level collapses a rolled chain below the horizon" {
     // max_levels=2 → dest L1 IS the bottom; horizon above the whole
     // chain lets the synthetic state's discard boundary drop the rest.
     var fx: TombstoneFixture = undefined;
-    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 2 }, &.{
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{
+        .max_levels = 2,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
         .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 300);
+    try compact(fx.tree, 1, 300);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1577,11 +2070,15 @@ test "compaction: rollup gates — min_deltas and rollup_enabled" {
             alloc,
             &fx,
             dir_path,
-            .{ .max_levels = 4, .rollup_min_deltas = 2 },
+            .{
+                .max_levels = 4,
+                .rollup_min_deltas = 2,
+                .lmax_target_bytes = push_lmax,
+            },
             &entries,
         );
         defer fx.deinit();
-        try fx.tree.doCompact(1, 0, 0);
+        try compact(fx.tree, 1, 0);
         const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
             return error.TestExpectedItem;
         defer top.free(alloc);
@@ -1599,11 +2096,15 @@ test "compaction: rollup gates — min_deltas and rollup_enabled" {
             alloc,
             &fx,
             dir_path,
-            .{ .max_levels = 4, .rollup_enabled = false },
+            .{
+                .max_levels = 4,
+                .rollup_enabled = false,
+                .lmax_target_bytes = push_lmax,
+            },
             &entries,
         );
         defer fx.deinit();
-        try fx.tree.doCompact(1, 0, 0);
+        try compact(fx.tree, 1, 0);
         const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
             return error.TestExpectedItem;
         defer top.free(alloc);
@@ -1626,12 +2127,22 @@ fn setupTreeMulti(
     const tree_id: u64 = 1;
     fx.manifest = _manifest.Manifest.init(alloc);
     errdefer fx.manifest.deinit();
-    try fx.manifest.commit(1, &.{}, &.{createTreeChange(tree_id, 0, &.{}, &.{})});
+    try fx.manifest.commit(1, &.{}, &.{
+        createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
+    });
 
     for (tables, 1..) |t, id| {
         var tb = try buildTableMeta(alloc, t.entries);
         defer tb.deinit();
-        try installTable(alloc, &fx.manifest, dir_path, &tb, id, tree_id, t.level);
+        try installTable(
+            alloc,
+            &fx.manifest,
+            dir_path,
+            &tb,
+            id,
+            tree_id,
+            t.level,
+        );
     }
 
     var opts = cfg;
@@ -1640,7 +2151,14 @@ fn setupTreeMulti(
     errdefer fx.cache.deinit();
     fx.live = flags.Live(config.Config).initFrom(alloc, opts);
     errdefer fx.live.deinit();
-    fx.tree = try Tree.open(alloc, &fx.live, 0, tree_id, &fx.manifest, &fx.cache);
+    fx.tree = try Tree.open(
+        alloc,
+        &fx.live,
+        0,
+        tree_id,
+        &fx.manifest,
+        &fx.cache,
+    );
 }
 
 test "compaction: shadowed delta chains are never re-rolled" {
@@ -1663,14 +2181,17 @@ test "compaction: shadowed delta chains are never re-rolled" {
     // that would repeat the fold + write amp on every compaction
     // until GC collapses the chain.
     var fx: TombstoneFixture = undefined;
-    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .key = "k", .ts = 400, .val = s400, .meta = roaring_state },
         .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
         .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 0);
+    try compact(fx.tree, 1, 0);
 
     // The shadowed delta came through verbatim, not as a state.
     const mid = try fx.tree.get(.{
@@ -1697,7 +2218,10 @@ test "compaction: read-below rolls a baseless chain onto a deep state" {
     // Delta at L1, its base two levels down at L3. Compacting L1→L2
     // (dest=2 >= rollup_at_level=2) peeks below and regenerates.
     var fx: TombstoneFixture = undefined;
-    try setupTreeMulti(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+    try setupTreeMulti(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .level = 1, .entries = &.{
             .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
         } },
@@ -1707,7 +2231,7 @@ test "compaction: read-below rolls a baseless chain onto a deep state" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 1, 0);
+    try compact(fx.tree, 1, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1733,24 +2257,26 @@ test "compaction: max_deltas forces read-below even at L1" {
 
     // Level trigger disabled (rollup_at_level way above max_levels);
     // the 2-delta chain hits rollup_max_deltas=2 and forces the peek
-    // from an L0→L1 compaction.
+    // from an L0→L1 compaction. The state sits at the bottom, which
+    // never scores, so L0 is the candidate.
     var fx: TombstoneFixture = undefined;
     try setupTreeMulti(alloc, &fx, dir_path, .{
         .max_levels = 4,
         .rollup_at_level = 200,
         .rollup_max_deltas = 2,
+        .lmax_target_bytes = push_lmax,
     }, &.{
         .{ .level = 0, .entries = &.{
             .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
             .{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta },
         } },
-        .{ .level = 2, .entries = &.{
+        .{ .level = 3, .entries = &.{
             .{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state },
         } },
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 0);
+    try compact(fx.tree, 1, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1773,7 +2299,10 @@ test "compaction: read-below with no state anywhere folds from empty" {
     defer alloc.free(d100);
 
     var fx: TombstoneFixture = undefined;
-    try setupTreeMulti(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+    try setupTreeMulti(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .level = 1, .entries = &.{
             .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
         } },
@@ -1783,7 +2312,7 @@ test "compaction: read-below with no state anywhere folds from empty" {
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 1, 0);
+    try compact(fx.tree, 1, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
@@ -1811,6 +2340,7 @@ test "compaction: read-below declined by triggers or mixed chains" {
             .max_levels = 4,
             .rollup_at_level = 200,
             .rollup_max_deltas = 200,
+            .lmax_target_bytes = push_lmax,
         }, &.{
             .{ .level = 1, .entries = &.{
                 .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
@@ -1820,7 +2350,7 @@ test "compaction: read-below declined by triggers or mixed chains" {
             } },
         });
         defer fx.deinit();
-        try fx.tree.doCompact(1, 1, 0);
+        try compact(fx.tree, 1, 0);
         const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
             return error.TestExpectedItem;
         defer top.free(alloc);
@@ -1836,7 +2366,10 @@ test "compaction: read-below declined by triggers or mixed chains" {
         const dir_path = try tmpPath(alloc, &tmp);
         defer alloc.free(dir_path);
         var fx: TombstoneFixture = undefined;
-        try setupTreeMulti(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+        try setupTreeMulti(alloc, &fx, dir_path, .{
+            .max_levels = 4,
+            .lmax_target_bytes = push_lmax,
+        }, &.{
             .{ .level = 1, .entries = &.{
                 .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
             } },
@@ -1845,7 +2378,7 @@ test "compaction: read-below declined by triggers or mixed chains" {
             } },
         });
         defer fx.deinit();
-        try fx.tree.doCompact(1, 1, 0);
+        try compact(fx.tree, 1, 0);
         const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
             return error.TestExpectedItem;
         defer top.free(alloc);
@@ -1867,13 +2400,16 @@ test "compaction: rollup folds a chain terminated by a tombstone" {
     // A raw tombstone terminates a roaring chain (the index key was
     // cleared, then a new delta arrived): fold = {} + {9}.
     var fx: TombstoneFixture = undefined;
-    try setupTreeWithCfg(alloc, &fx, dir_path, .{ .max_levels = 4 }, &.{
+    try setupTreeWithCfg(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .lmax_target_bytes = push_lmax,
+    }, &.{
         .{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta },
         .{ .key = "k", .ts = 200, .val = "", .meta = .{ .kind = .deleted } },
     });
     defer fx.deinit();
 
-    try fx.tree.doCompact(1, 0, 0);
+    try compact(fx.tree, 1, 0);
 
     const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;

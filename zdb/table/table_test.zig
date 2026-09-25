@@ -371,7 +371,7 @@ test "table binary fuse contains keys" {
 test "table egid filter is exact and replaces the fuse filter" {
     const alloc = std.testing.allocator;
 
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024, .key_kind = .egid });
+    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024, .kind = .rows });
     defer b.deinit();
 
     // Every third egid from 3 to 3000, ascending as a base table's rows
@@ -413,7 +413,7 @@ test "table egid filter of dense ids is far smaller than a fuse filter" {
     // 70,000 contiguous egids, a flush table's worth of rows: two 64k
     // chunks, each one 8 KiB bitmap container. A fuse filter is about
     // two bytes per key, 140 KiB here.
-    var b = Builder.init(alloc, .{ .target_block_size = 64 * 1024, .key_kind = .egid });
+    var b = Builder.init(alloc, .{ .target_block_size = 64 * 1024, .kind = .rows });
     defer b.deinit();
     var key_buf: [8]u8 = undefined;
     var egid: u64 = 1;
@@ -438,7 +438,7 @@ test "table egid filter of dense ids is far smaller than a fuse filter" {
 
 test "table egid builder rejects a key that is not an egid" {
     const alloc = std.testing.allocator;
-    var b = Builder.init(alloc, .{ .key_kind = .egid });
+    var b = Builder.init(alloc, .{ .kind = .rows });
     defer b.deinit();
     try std.testing.expectError(error.KeyNotEgid, b.add(.{ .primary = "k000001" }, 1, "v"));
 }

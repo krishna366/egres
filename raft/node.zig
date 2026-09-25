@@ -178,7 +178,7 @@ pub const Node = struct {
         /// prefetch: raft only relays ids, never file bytes. Single attempt
         /// — the caller reports failure (announce fail-ack).
         ensureFilesFn: ?*const fn (*anyopaque, []const u64) anyerror!void = null,
-        /// Cheap predicate the leader checks in `proposeDataChange` before
+        /// Cheap predicate the leader checks in `propose` before
         /// queuing a `.data` proposal — typically "recovery done AND a real
         /// memtable exists". Must be non-blocking. When null, the gate is
         /// treated as always-ready.
@@ -1460,10 +1460,6 @@ pub const Node = struct {
 
     /// Propose a data change (normal mutation) through the raft proposal
     /// queue; `w` wakes at commit.
-    pub fn proposeDataChange(self: *Node, data: String, w: ?*ProposalWaiter) RaftError!void {
-        return self.propose(data, .data, w);
-    }
-
     /// Synchronous propose-and-block-until-applied wrapper. The wait doubles
     /// as a rate-limit: the caller fiber stays parked until commit + apply,
     /// so it can't pile up more than one in-flight proposal. `proposal_type`
@@ -1476,7 +1472,7 @@ pub const Node = struct {
     /// at commit instead let the loop see the same memtable still queued and
     /// re-flush it, producing two L0 SSTs with identical (primary, ts) data
     /// → MergeIterator yields duplicates → builder rejects → KeyOrderViolation.
-    /// User-facing writes go through `proposeDataChange` (callback fires on
+    /// User-facing writes go through `Engine.proposeWrites` (waits on
     /// commit) and are unaffected.
     pub fn proposeAndWaitForApply(self: *Node, data: String, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);

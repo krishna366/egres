@@ -518,12 +518,10 @@ pub const Forest = struct {
     pub const installTree = _ddl.installTree;
     pub const collectMissingFileIds = _ddl.collectMissingFileIds;
     pub const openTablesFromManifest = _ddl.openTablesFromManifest;
-    pub const createTree = _ddl.createTree;
     pub const buildNamespaceCreate = _ddl.buildNamespaceCreate;
     pub const CreateNamespaceResult = _ddl.CreateNamespaceResult;
     pub const buildCreateNamespace = _ddl.buildCreateNamespace;
     pub const applyNamespaceCreate = _ddl.applyNamespaceCreate;
-    pub const buildCreateTree = _ddl.buildCreateTree;
     pub const CreateTablesResult = _ddl.CreateTablesResult;
     pub const buildCreateTables = _ddl.buildCreateTables;
     pub const applyCreateTree = _ddl.applyCreateTree;
@@ -686,7 +684,7 @@ pub const Forest = struct {
 
         // Route each key to a tree and add to the appropriate builder.
         while (iter.itemRef()) |item| {
-            const tk, const key_kind = blk: {
+            const tk, const kind = blk: {
                 const trees = self.getTable(item.key.tableKey()) orelse {
                     try iter.next();
                     continue;
@@ -699,13 +697,13 @@ pub const Forest = struct {
                 break :blk .{ TreeKey{
                     .namespace = item.key.namespace,
                     .tree_id = tree.tree_id,
-                }, tree.key_kind };
+                }, tree.kind };
             };
 
             const bld = if (builders.get(tk)) |b| b else blk: {
                 const b = try self.allocator.create(Builder);
                 var tree_cfg = bcfg;
-                tree_cfg.key_kind = key_kind;
+                tree_cfg.kind = kind;
                 b.* = Builder.init(self.allocator, tree_cfg);
                 try builders.put(tk, b);
                 break :blk b;
@@ -836,7 +834,7 @@ pub const Forest = struct {
         if (items.len == 0) return changes;
 
         const bottom: u32 = @intCast(self.live.cur().max_levels - 1);
-        const tk, const max_bytes = blk: {
+        const tk, const max_bytes, const kind = blk: {
             const tree = try self.singleTree(table_key);
             defer tree.release();
             var targets = try tree.levelTargets();
@@ -847,6 +845,7 @@ pub const Forest = struct {
                     .tree_id = tree.tree_id,
                 },
                 @as(usize, @intCast(targets.file_sz[bottom])),
+                tree.kind,
             };
         };
 
@@ -862,6 +861,7 @@ pub const Forest = struct {
             .target_block_size = opts.block_bytes,
             .codec = opts.codecFor(bottom),
             .priority = .p2,
+            .kind = kind,
         });
         defer bld.deinit();
         for (items) |item| {
@@ -1097,23 +1097,31 @@ pub const Forest = struct {
     /// hot namespace's bloated L0 throttles only its own writers, not
     /// every namespace on the node. After a tree split, a namespace can
     /// own multiple trees; we take the worst of them. Returns 0 if the
-    /// namespace doesn't exist (caller already rejected the write).
-    /// TODO: We should ideally do this based on the tree the keys are going to
-    /// hit, instead of any tree in the namespace — which would also drop the
-    /// scan below (the flat tables map has no per-namespace index).
-    pub fn maxL0TableCountForNs(self: *Forest, ns: u64) u32 {
+    /// The most L0 tables in any tree these marshaled keys land in: what
+    /// a write of them waits on (`Engine.applyWriteBackpressure`). Only
+    /// those trees: a backlog in one table's tail tree must not slow
+    /// writes to another table, or to the same table's other trees. A
+    /// key with no tree (a table not yet created) counts as 0; the
+    /// apply will drop it.
+    pub fn maxL0TableCountForKeys(self: *Forest, keys: []const String) u32 {
         var max_count: u32 = 0;
-        var it = self.tables.iterator();
-        defer it.deinit();
-        while (it.next()) |kv| {
-            if (kv.key_ptr.namespace != ns) continue;
-            const trees = kv.value_ptr.*;
-            const held = trees.mu.hold(.shared, @src());
-            defer held.release();
-            for (trees.list(held)) |tree| {
-                const n: u32 = @intCast(tree.numTablesAt(0));
-                if (n > max_count) max_count = n;
+        // Consecutive keys of one batch mostly share a tree (rows are
+        // keyed by increasing egids); skip the lookup when they do.
+        var last: ?*Tree = null;
+        defer if (last) |t| t.release();
+
+        for (keys) |raw| {
+            const key = Key.init(raw);
+            if (last) |ltree| {
+                if (ltree.key_range.contains(key)) continue;
+                ltree.release();
+                last = null;
             }
+            const trees = self.getTable(key.tableKey()) orelse continue;
+            const tree = trees.getTreeByKey(key) orelse continue;
+            last = tree;
+            const n: u32 = @intCast(tree.numTablesAt(0));
+            if (n > max_count) max_count = n;
         }
         return max_count;
     }

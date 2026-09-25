@@ -35,6 +35,14 @@ pub const BytesWrittenLabels = struct {
     level: u8 = 0,
 };
 
+// Millisecond buckets for the L0 write brake: the curve runs from one
+// step (a few ms) to `l0_backpressure_max_us`, and the tail says how
+// often writes hit the cap.
+const backpressure_buckets: []const u64 = &.{
+    1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,
+};
+pub const BackpressureHist = m.Histogram(u64, backpressure_buckets);
+
 /// Top-level handle. Construct once in main, pass to Forest/Tree/server.
 /// Adding a new metric is a one-line field here plus a call-site update.
 pub const Metrics = struct {
@@ -47,6 +55,10 @@ pub const Metrics = struct {
     rollups: m.CounterVec(u64, CompactionLabels),
     /// Bytes written, sliced by source + tree coordinates.
     bytes_written: m.CounterVec(u64, BytesWrittenLabels),
+    /// How long each write batch slept in the L0 brake
+    /// (`Engine.applyWriteBackpressure`); batches that did not sleep
+    /// are not observed, so the count is the number of braked batches.
+    write_backpressure_ms: BackpressureHist,
 
     pub fn init(allocator: std.mem.Allocator) !Metrics {
         const io = utils.context.g().io;
@@ -76,6 +88,12 @@ pub const Metrics = struct {
                 allocator,
                 io,
                 "zdb_bytes_written_total",
+                .{},
+                .{},
+            ),
+            // A comptime histogram: no allocator, nothing to deinit.
+            .write_backpressure_ms = BackpressureHist.init(
+                "zdb_write_backpressure_ms",
                 .{},
                 .{},
             ),

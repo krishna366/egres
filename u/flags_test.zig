@@ -549,6 +549,29 @@ test "fixed fields: set at init, refused by update, whole update dropped" {
     try std.testing.expectEqual(@as(u32, 99), live.cur().poll_ms);
 }
 
+test "fixed fields: set and parseArgv assign them at startup" {
+    const alloc = std.testing.allocator;
+    var live = try flags.Live(FixedCfg).init(alloc, "");
+    defer live.deinit();
+    try live.set("dir=/d;workers=4;poll_ms=10");
+    try std.testing.expectEqualStrings("/d", live.cur().dir);
+    try std.testing.expectEqual(@as(u8, 4), live.cur().workers);
+    // Once set, the field is still fixed to a live update.
+    try std.testing.expectError(error.FixedOption, live.update("workers=8"));
+
+    // The command line goes through `set`: the process's own startup.
+    var reg = flags.Registry.init(alloc);
+    defer reg.deinit();
+    const lp = try reg.register("fx", FixedCfg);
+    var leftover: std.ArrayList(String) = .empty;
+    defer leftover.deinit(alloc);
+    try reg.parseArgv(&.{ "--fx=dir=/argv;workers=2", "rest" }, &leftover);
+    try std.testing.expectEqualStrings("/argv", lp.cur().dir);
+    try std.testing.expectEqual(@as(u8, 2), lp.cur().workers);
+    try std.testing.expectEqual(@as(usize, 1), leftover.items.len);
+    try std.testing.expectError(error.FixedOption, reg.update("fx", "dir=/x"));
+}
+
 test "writeHelp marks fixed fields" {
     const alloc = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
