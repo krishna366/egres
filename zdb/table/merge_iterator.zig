@@ -130,6 +130,31 @@ pub const Iterator = union(enum) {
 /// `deinit`. `currentPins` names those pins for a caller that keeps a
 /// value longer.
 pub const MergeIterator = struct {
+    /// One current source's versions, newest first, as `build` takes
+    /// them.
+    const Run = struct {
+        versions: []const Version,
+
+        fn top(self: Run) ?Version {
+            return if (self.versions.len == 0) null else self.versions[0];
+        }
+
+        /// The head, taken.
+        fn next(self: *Run) Version {
+            const v = self.versions[0];
+            self.versions = self.versions[1..];
+            return v;
+        }
+
+        /// Drop the head for as long as it is at `ts`.
+        fn skip(self: *Run, ts: u64) void {
+            while (self.top()) |v| {
+                if (v.ts != ts) break;
+                self.versions = self.versions[1..];
+            }
+        }
+    };
+
     /// One input: its iterator, its current item (refreshed on every
     /// advance, null once exhausted), and its position among the inputs
     /// as given to `init`, the tie-break between equal keys.
@@ -151,6 +176,8 @@ pub const MergeIterator = struct {
     /// `vers` when the key is shared.
     cur: ?_table.Item = null,
     vers: std.ArrayList(Version) = .empty,
+    /// Scratch for `build`: what is left of each current source's run.
+    runs: std.ArrayList(Run) = .empty,
     /// Scratch for `currentPins`.
     pins: std.ArrayList(Pin) = .empty,
 
@@ -186,6 +213,7 @@ pub const MergeIterator = struct {
         self.allocator.free(self.srcs);
         self.live.deinit(self.allocator);
         self.vers.deinit(self.allocator);
+        self.runs.deinit(self.allocator);
         self.pins.deinit(self.allocator);
     }
 
@@ -281,34 +309,56 @@ pub const MergeIterator = struct {
             return;
         }
 
-        // The sources are in prio order, so a stable sort keeps the
-        // lower source's copy of an equal timestamp for the dedup to
-        // keep. Insertion sort: stable, in place, and right for the
-        // few versions a key has — `mem.sort` carries a 512-element
-        // scratch cache that a safe build poison-fills on every call,
-        // which was a third of a full-table scan once rows had versions
-        // in more than one source.
+        // Each source's run is already newest first, so the runs are
+        // merged, linear in the versions: a hot key can hold hundreds
+        // of thousands, and sorting their concatenation was quadratic
+        // (L0 sources arrive oldest first, the worst case). Each pass
+        // finds the lead, the run with the newest head, and the newest
+        // head among the others. The lead's versions newer than that
+        // come in a row, without another scan: one source usually holds
+        // a key's whole recent history. A head shared with another run
+        // is a repeated version (a flushed memtable and its L0 table, a
+        // txn's pending write over the committed version it read): the
+        // lead is the first run found holding it, the lower source, so
+        // its copy is taken and the others' dropped.
         utils.clearRetainCap(&self.vers);
-        for (self.live.items[0..self.n_cur]) |src| {
-            const vers = src.item.?.versions.slice();
-            try self.vers.appendSlice(self.allocator, vers);
+        try self.runs.resize(self.allocator, self.n_cur);
+        for (self.live.items[0..self.n_cur], self.runs.items) |src, *run|
+            run.* = .{ .versions = src.item.?.versions.slice() };
+
+        while (true) {
+            var lead: ?usize = null;
+            var lead_ts: u64 = 0;
+            var next_ts: ?u64 = null;
+            for (self.runs.items, 0..) |run, i| {
+                const ts = (run.top() orelse continue).ts;
+                if (lead == null or ts > lead_ts) {
+                    if (lead != null) next_ts = lead_ts;
+                    lead = i;
+                    lead_ts = ts;
+                } else if (next_ts == null or ts > next_ts.?) {
+                    next_ts = ts;
+                }
+            }
+            const run = &self.runs.items[lead orelse break];
+
+            if (next_ts != null and lead_ts == next_ts.?) {
+                // We found a duplicate version. Pick the lead. Advance all
+                // the rest. And re-calculate lead and next.
+                try self.vers.append(self.allocator, run.next());
+                for (self.runs.items) |*r| r.skip(lead_ts);
+                continue;
+            }
+
+            while (run.top()) |v| {
+                if (next_ts != null and v.ts <= next_ts.?) break;
+                try self.vers.append(self.allocator, run.next());
+            }
         }
-        std.sort.insertion(Version, self.vers.items, {}, newerFirst);
-        var kept: usize = 1;
-        for (self.vers.items[1..]) |ver| {
-            if (ver.ts == self.vers.items[kept - 1].ts) continue;
-            self.vers.items[kept] = ver;
-            kept += 1;
-        }
-        self.vers.items.len = kept;
         self.cur = .{
             .key = first.key,
             .versions = .{ .many = self.vers.items },
         };
-    }
-
-    fn newerFirst(_: void, a: Version, b: Version) bool {
-        return a.ts > b.ts;
     }
 };
 

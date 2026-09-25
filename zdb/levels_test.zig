@@ -1650,16 +1650,16 @@ test "compaction: bottom level keeps a shadowed version above the horizon and co
     );
 }
 
-test "compaction: a non-bottom level keeps everything but still counts stale" {
+test "compaction: a non-bottom level drops what a state below the horizon shadows" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    // max_levels=4 → L0's dest is L1, well above the bottom (L3). Nothing is
-    // dropped no matter how far the horizon has advanced, but the shadowed
-    // version is still accounted so a future trigger can see the garbage.
+    // max_levels=4 → L0's dest is L1, well above the bottom (L3). k@500
+    // is a state at or below the horizon (600): every read settles on it
+    // or newer, so k@300 is unreachable at any level and goes here.
     var fx: TombstoneFixture = undefined;
     try setupTombstoneTree(alloc, &fx, dir_path, 4, &.{
         .{ .key = "k", .ts = 500, .val = "v500" },
@@ -1667,20 +1667,42 @@ test "compaction: a non-bottom level keeps everything but still counts stale" {
     });
     defer fx.deinit();
 
-    try compact(fx.tree, 1, 600); // horizon irrelevant: not bottom
+    try compact(fx.tree, 1, 600);
 
-    // Both versions survive — a non-bottom compaction never drops.
     const cur = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
         return error.TestExpectedItem;
     defer cur.free(alloc);
     try std.testing.expectEqualStrings("v500", cur.newest().value);
+    // Below the horizon: nothing left (production refuses such reads).
+    const mid = try fx.tree.get(.{ .key = .{ .primary = "k" }, .read_ts = 350 });
+    try std.testing.expect(mid == null);
+    try std.testing.expectEqual(@as(u64, 0), levelStaleBytes(&fx.tree.levels[1]));
+}
+
+test "compaction: a non-bottom level keeps a shadowed version above the horizon and counts it stale" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // The shadowing state k@500 is above the horizon (400), so a read at
+    // 350..499 still needs k@300: kept, and counted stale.
+    var fx: TombstoneFixture = undefined;
+    try setupTombstoneTree(alloc, &fx, dir_path, 4, &.{
+        .{ .key = "k", .ts = 500, .val = "v500" },
+        .{ .key = "k", .ts = 300, .val = "v300" },
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 1, 400);
+
     const mid = try fx.tree.get(.{
         .key = .{ .primary = "k" },
         .read_ts = 350,
     }) orelse return error.TestExpectedItem;
     defer mid.free(alloc);
     try std.testing.expectEqualStrings("v300", mid.newest().value);
-    // The shadowed k@300 is counted stale even though nothing was dropped.
     try std.testing.expectEqual(
         @as(u64, 5),
         levelStaleBytes(&fx.tree.levels[1]),

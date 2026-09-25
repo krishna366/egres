@@ -139,11 +139,15 @@ pub const VersionTracker = struct {
                 self.stale_below = ver.ts;
             }
 
-            if (self.can_discard_versions and
-                ver.ts <= self.global_min_read_ts)
-            {
+            // A terminal at or below the read floor: every read settles
+            // on it or on something newer, so what it shadows is
+            // unreachable at every level and goes now. The tombstone
+            // itself waits for the bottom: dropped higher up, an older
+            // version below would come back.
+            if (ver.ts <= self.global_min_read_ts) {
                 self.discard_below = ver.ts;
-                if (ver.meta.isDeleted()) return .discard;
+                if (ver.meta.isDeleted() and self.can_discard_versions)
+                    return .discard;
             }
         }
 
@@ -1008,7 +1012,9 @@ pub fn buildCompaction(
     // Pinned under the hold: a remote-built applyCompaction landing
     // mid-build (leadership flip) must not free tables we're about to
     // read. decrRef at zero frees memory only — the file stays — so a
-    // pinned table remains readable.
+    // pinned table remains readable. The hold covers the lookup only:
+    // a build takes seconds to minutes, and the tree's exclusive holders
+    // (a flush's apply, on the raft apply loop) must not wait on it.
     const cand, const srcs = blk: {
         const held = self.mu.hold(.shared, @src());
         defer held.release();
