@@ -1,0 +1,93 @@
+# Benchmark runs
+
+One harness runs one server (Egres or PostgreSQL) through one workload:
+a load through the SQL port with readers alongside, then pgbench runs
+back to back, with Prometheus and Grafana drawing the whole run. The
+same commands rerun the same benchmark on any machine.
+
+## Pieces
+
+- `bench.py`: the command, and the tables that define the benchmarks:
+  `SERVERS` (ports, database, config) and `ENVS` (a workload, a
+  server, a memory cap). Four envs exist: `egres-big`, `postgres-big`,
+  `egres-orders`, `postgres-orders`.
+- `workloads.py`: each workload's schema, row generator, load size,
+  and pgbench scripts, with the read-only subset the readers run and
+  the full mix. `workloads.py <name> --ddl` prints a schema,
+  `workloads.py <name> <first> <last>` the rows.
+- `loader.py`: the load driver and the readers beside it.
+- `pgbench.py`: runs pgbench, publishes its progress lines as metrics,
+  parses its final report.
+- `watchdog.py`: the night operator. Restarts a dead server once,
+  dumps on a stall, starts the workload runs when the load ends,
+  records every run and incident, writes the summary.
+- `local.toml`: this machine (copy `local.example.toml`; ignored by
+  git). Roots for run output, data dirs and WAL dirs, the Postgres
+  binaries, the Egres binary.
+- `../monitor/`: the docker compose stack. Prometheus (:9090), Grafana
+  (:3000, dashboard "Egres run", anonymous viewer), node exporter
+  (host CPU, memory, disks, and a textfile collector), process
+  exporter, postgres exporter, and `bridge/exporter.py`, which serves
+  the Egres admin `zdb` counters, `zdb forest` gauges, the data dir
+  size and the capped server's cgroup memory at :9877.
+
+## A run
+
+```
+cp benchmarks/run/local.example.toml benchmarks/run/local.toml   # once
+zig build -Doptimize=ReleaseSafe                                  # Egres
+benchmarks/run/bench.py postgres-orders all
+benchmarks/run/bench.py postgres-orders status
+```
+
+`all` is `begin` (a new output dir, an empty data dir, monitoring up),
+`start` (the server; for Postgres, initdb with checksums and pg_wal on
+the WAL root, the env's config appended, the database created), `load`
+(the load driver, detached, with the readers) and `watch` (the
+watchdog, detached). The steps can be run one at a time; `stop` ends
+everything by pid.
+
+A run's output dir is `<out_root>/<env>-<start time>`;
+`<out_root>/<env>.latest` points at it, so no date is ever typed. In
+it: `env.json` (the resolved env the run used), `events.log` (what
+happened when), `load.log`, `watch.log`, `progress.md`,
+`results/pgbench-*.log` and `.summary`, `results/readers.log`,
+`scripts/` (the pgbench scripts as run), `textfile/*.prom`, `dumps/`,
+`INCIDENTS.md`, the server log, and `SUMMARY-auto.md` when the
+watchdog is done.
+
+A trial at small scale, beside a real run and without touching its
+monitoring:
+
+```
+benchmarks/run/bench.py egres-orders all --name trial --no-monitor \
+  --set load.last=120000 --set load.streams=4 --set readers=2 \
+  --set secs=15 --set clients=4 --set memory_max=none \
+  --set server.sql_port=3321 --set server.admin_port=5321
+```
+
+## What is measured, and why
+
+The load is measured with readers on it. A server that defers work to
+a later pass (Postgres: hint bits, the visibility map, freezing, set by
+vacuum) or does it as it goes (Egres: compaction) pays for it in the
+same numbers either way. Postgres runs with autovacuum tuned to keep up
+with the load, the setting a DBA would pick for a bulk load; no VACUUM
+is run by hand between the load and the workload.
+
+The workload starts the moment the load ends, and runs twice back to
+back: the second run shows the settled state each server reaches on
+its own. Inserts take ids past the loaded range, in a block per client
+and per run, so the runs never collide.
+
+Under a memory cap, the server runs in a systemd user scope with swap
+off, page cache included, so a 500 GiB table under 64 GB is mostly
+cache misses for both servers.
+
+## Restarts
+
+A planned restart mid-load: `stop`, then `start`, then
+`load --resume`, then `watch`. Between workload runs: `stop`, `start`,
+then `watch --runs-done N`.
+
+Grafana: http://127.0.0.1:3000/d/egres-run (admin/admin to edit).

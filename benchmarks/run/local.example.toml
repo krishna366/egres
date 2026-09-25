@@ -1,0 +1,18 @@
+# This machine's settings for the benchmarks. Copy to local.toml
+# (ignored by git) and edit. Every path is a root: a run adds its env
+# name.
+
+# Run output (logs, results, metrics), one dir per run.
+out_root = "/data"
+# Server data dirs: an Egres forest or a Postgres cluster. Put them on
+# the disk whose numbers you want.
+data_root = "/data"
+# Write-ahead logs, Egres raft and Postgres pg_wal alike. A disk with a
+# fast durable write matters more here than bandwidth.
+wal_root = "/data"
+# PostgreSQL 18 binaries: psql and pgbench drive both servers; initdb,
+# pg_ctl and postgres run the Postgres benchmarks.
+pgbin = "/usr/lib/postgresql/18/bin"
+# The Egres binary; build it first with
+# `zig build -Doptimize=ReleaseSafe`. Unset = the repo's zig-out/bin/egres.
+#egres_bin = "/path/to/egres"

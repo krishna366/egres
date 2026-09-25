@@ -1,0 +1,10 @@
+# One group per command name: the server, the load streams and pgbench.
+# Everything else on the host is left out of the metrics.
+process_names:
+  - name: "{{.Comm}}"
+    comm:
+      - egres
+      - postgres
+      - pgbench
+      - psql
+      - python3

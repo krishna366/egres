@@ -21,3 +21,8 @@ zig-pkg/
 timeout-stress.io
 
 patches/
+
+# Python bytecode and the monitor env file each run rewrites.
+__pycache__/
+benchmarks/monitor/.env
+benchmarks/run/local.toml

@@ -1,0 +1,107 @@
+# Monitoring for a long Egres run: Prometheus scrapes the host (node
+# exporter), the egres process (process exporter) and Egres's own admin
+# stats (the bridge), and Grafana draws them. Every service is on the
+# host network so the bridge reaches the admin port and the exporters
+# see the host. Egres itself runs on the host, not in a container.
+#
+# Paths come from `.env`, which benchmarks/run/lib.sh writes for the
+# current run (`docker compose up -d` then recreates what changed):
+#   EGRES_DATA_DIR  the data dir, mounted read-only for size/file counts
+#   TEXTFILE_DIR    where the load driver and pgbench parser drop *.prom
+#   CGROUP_PATH     the server's cgroup when it runs under a memory cap
+#   PG_CONN         the Postgres URL for the postgres exporter, if any
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=60d
+      - --web.listen-address=:9090
+
+  grafana:
+    image: grafana/grafana:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - ${TEXTFILE_DIR}:/textfile:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.textfile.directory=/textfile
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+)($$|/)
+      - --web.listen-address=:9100
+
+  process-exporter:
+    image: ncabatoff/process-exporter:latest
+    network_mode: host
+    pid: host
+    privileged: true
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - ./process-exporter.yml:/config/process-exporter.yml:ro
+    command:
+      - --procfs=/host/proc
+      - --config.path=/config/process-exporter.yml
+      - --web.listen-address=:9256
+
+  egres-bridge:
+    image: python:3.12-slim
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./bridge:/bridge:ro
+      - ${EGRES_DATA_DIR}:/egres-data:ro
+      - /sys/fs/cgroup:/host-cgroup:ro
+    command:
+      - python3
+      - /bridge/exporter.py
+      - --admin=127.0.0.1:5210
+      - --data=/egres-data
+      - --listen=9877
+      - --cgroup=${CGROUP_PATH:-}
+      - --cgroup-root=/host-cgroup
+
+  # Postgres runs: commits, database size, checkpoints, buffer hits.
+  # PG_CONN comes from .env; scrapes fail harmlessly while no Postgres
+  # is up.
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: ${PG_CONN:-postgresql://127.0.0.1:5432/postgres}
+      PG_EXPORTER_WEB_LISTEN_ADDRESS: ":9187"
+
+volumes:
+  prometheus-data:
+  grafana-data:
