@@ -170,6 +170,9 @@ pub const Worker = struct {
     /// OS thread running this worker. `null` for worker 0 (lives on
     /// the calling thread that invoked `Runtime.run`).
     thread: ?std.Thread = null,
+    /// The kernel thread id, set by `runMain` on Linux: the profiler
+    /// arms a CPU-clock timer per worker with it. 0 elsewhere.
+    tid: i32 = 0,
 
     pub fn init(w: *Worker, id: u8, allocator: std.mem.Allocator) !void {
         // Construct via a struct literal so every field with a declared
@@ -620,6 +623,7 @@ pub const Worker = struct {
         const prev = current_do_not_use_directly;
         current_do_not_use_directly = self;
         defer current_do_not_use_directly = prev;
+        if (builtin.os.tag == .linux) self.tid = std.os.linux.gettid();
 
         if (runtime().pin_workers) self.pinToCpu();
 

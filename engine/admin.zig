@@ -35,6 +35,7 @@ pub const Command = union(enum) {
     vfs: VfsCmd,
     locks: LocksCmd,
     workers: WorkersCmd,
+    profile: ProfileCmd,
     help: HelpCmd,
 };
 
@@ -43,6 +44,13 @@ pub const VfsCmd = struct {};
 pub const LocksCmd = struct {};
 
 pub const WorkersCmd = struct {};
+/// `profile cpu <secs> [hz] [top [N] | folded [lines]]`: run the
+/// sampling profiler for `secs` and reply with its output.
+pub const ProfileCmd = struct {
+    secs: u32,
+    hz: u32 = 200,
+    output: fiber.profile.Output = .{ .top = 20 },
+};
 
 pub const HelpCmd = struct {};
 
@@ -93,6 +101,12 @@ pub const help_text =
     \\                                  waiter count, last-waiter src
     \\  workers                         per-worker CPU histogram + imbalance
     \\                                  ratio (work distribution across workers)
+    \\  profile cpu <secs> [hz] [top [N] | folded [lines]]
+    \\                                  sample every worker's CPU for <secs>
+    \\                                  (default 200 Hz); reply with pprof's
+    \\                                  top table (N rows, default 20) or
+    \\                                  folded stacks for a flamegraph, by
+    \\                                  function or by file:line
     \\
 ;
 
@@ -377,6 +391,39 @@ pub fn readToken(r: *std.Io.Reader, buf: *std.ArrayList(u8)) !void {
     }
 }
 
+fn parseProfile(it: *std.mem.SplitIterator(u8, .scalar)) !Command {
+    const what = it.next() orelse return error.MissingArg;
+    if (!std.mem.eql(u8, what, "cpu")) return error.InvalidArg;
+    const secs_s = it.next() orelse return error.MissingArg;
+    var req: ProfileCmd = .{
+        .secs = std.fmt.parseInt(u32, secs_s, 10) catch return error.InvalidArg,
+    };
+    if (req.secs == 0 or req.secs > 3600) return error.InvalidArg;
+    var tok = it.next();
+    if (tok) |t| {
+        if (std.fmt.parseInt(u32, t, 10) catch null) |hz| {
+            if (hz == 0 or hz > 10_000) return error.InvalidArg;
+            req.hz = hz;
+            tok = it.next();
+        }
+    }
+    if (tok) |t| {
+        if (std.mem.eql(u8, t, "top")) {
+            if (it.next()) |n| {
+                req.output = .{ .top = std.fmt.parseInt(usize, n, 10) catch
+                    return error.InvalidArg };
+            }
+        } else if (std.mem.eql(u8, t, "folded")) {
+            req.output = .{ .folded = .{} };
+            if (it.next()) |l| {
+                if (!std.mem.eql(u8, l, "lines")) return error.InvalidArg;
+                req.output = .{ .folded = .{ .lines = true } };
+            }
+        } else return error.InvalidArg;
+    }
+    return .{ .profile = req };
+}
+
 pub fn parseLine(line: String) !Command {
     var it = std.mem.splitScalar(u8, line, ' ');
     const cmd = it.next() orelse return error.EmptyCommand;
@@ -541,6 +588,8 @@ pub fn parseLine(line: String) !Command {
         return .{ .locks = .{} };
     } else if (std.mem.eql(u8, cmd, "workers")) {
         return .{ .workers = .{} };
+    } else if (std.mem.eql(u8, cmd, "profile")) {
+        return parseProfile(&it);
     } else if (std.mem.eql(u8, cmd, "help")) {
         return .{ .help = .{} };
     } else {
@@ -799,6 +848,9 @@ pub const AdminServer = struct {
                 .workers => {
                     self.handleWorkers(stream) catch return;
                 },
+                .profile => |req| {
+                    self.handleProfile(stream, req) catch return;
+                },
                 .help => {
                     proto.writeHelp(stream) catch return;
                 },
@@ -1042,6 +1094,37 @@ pub const AdminServer = struct {
         var body: std.Io.Writer.Allocating = .init(self.engine.allocator);
         defer body.deinit();
         try fiber.dumpWorkerCpu(&body.writer);
+        try body.writer.writeByte('\n');
+        try stream.writeAll(body.writer.buffered());
+    }
+
+    /// Run the sampling profiler for the asked seconds and reply with
+    /// its output: the top table or folded stacks (see zfiber/profile).
+    /// One at a time: the sampler is process-wide.
+    fn handleProfile(
+        self: *AdminServer,
+        stream: fiber.net.Stream,
+        req: ProfileCmd,
+    ) !void {
+        fiber.profile.start(self.engine.allocator, .{
+            .hz = req.hz,
+            .secs = req.secs,
+        }) catch |err| {
+            log.err("profile start: {s}", .{@errorName(err)});
+            return proto.writeErr(stream, @errorName(err));
+        };
+        fiber.sleepMs(@as(u64, req.secs) * 1000);
+
+        var body: std.Io.Writer.Allocating = .init(self.engine.allocator);
+        defer body.deinit();
+        const report = fiber.profile.stop(&body.writer, req.output) catch |err|
+            {
+                log.err("profile stop: {s}", .{@errorName(err)});
+                return proto.writeErr(stream, @errorName(err));
+            };
+        log.info("profile cpu {d}s @ {d} Hz: {d} samples, {d} dropped", .{
+            req.secs, req.hz, report.samples, report.dropped,
+        });
         try body.writer.writeByte('\n');
         try stream.writeAll(body.writer.buffered());
     }

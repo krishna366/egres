@@ -50,6 +50,7 @@ pub const currentFiber = _rt.currentFiber;
 pub const currentFiberOrNull = _rt.currentFiberOrNull;
 pub const dumpFibers = _rt.dumpFibers;
 pub const dumpWorkerCpu = _rt.dumpWorkerCpu;
+pub const profile = @import("profile.zig");
 pub const tscNsPerCycleQ32 = _rt.tscNsPerCycleQ32;
 
 // Lower-level data structure used by `Deadlines`.
