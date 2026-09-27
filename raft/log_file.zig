@@ -241,7 +241,13 @@ pub const LogFile = struct {
         });
         errdefer handle.close();
 
-        var slots_list = try readHeader(alloc, handle);
+        var slots_list = readHeader(alloc, handle) catch |err| switch (err) {
+            error.InvalidLogHeader => {
+                handle.close();
+                return openScanned(vfs_inst, alloc, dir_path, fid);
+            },
+            else => return err,
+        };
         errdefer slots_list.deinit(alloc);
 
         var wo: u64 = log_file_offset;
@@ -545,8 +551,17 @@ pub const LogFile = struct {
     /// the format with `WalHeaderReader.parseRoot`, replacing the legacy
     /// magic/version check.
     pub fn writeHeader(self: *LogFile) !void {
+        const frame = try self.encodeHeader();
+        defer self.allocator.free(frame);
+        try self.handle.write(frame, 0, .p0);
+    }
+
+    /// The framed WalHeader for the slot table as it is now: what
+    /// `writeHeader` puts at offset 0. Caller frees. Built under the
+    /// lock at rotation so the write can happen without it.
+    pub fn encodeHeader(self: *const LogFile) ![]u8 {
         const hdr_region = try self.allocator.alloc(u8, log_file_offset);
-        defer self.allocator.free(hdr_region);
+        errdefer self.allocator.free(hdr_region);
 
         var msg_buf = std.ArrayList(u8).initBuffer(hdr_region[zbuf.Frame.hdr_size..]);
         var hdr_writer = try zen.WalHeaderWriter.initWithBuf(self.allocator, &msg_buf);
@@ -575,7 +590,45 @@ pub const LogFile = struct {
         try zbuf.Frame.write(hdr_region, msg_buf.items);
 
         const frame_len = @as(usize, zbuf.Frame.hdr_size) + msg_buf.items.len;
-        try self.handle.write(hdr_region[0..frame_len], 0, .p0);
+        // Shrink to the frame: the region is a 16 MiB reservation, the
+        // frame a few hundred KiB at most.
+        if (self.allocator.resize(hdr_region, frame_len)) {
+            return hdr_region[0..frame_len];
+        }
+        const frame = try self.allocator.dupe(u8, hdr_region[0..frame_len]);
+        self.allocator.free(hdr_region);
+        return frame;
+    }
+
+    /// Open a rotated file whose header is missing or torn: its slot
+    /// table comes from a scan of its records, as for the current file,
+    /// and the header is written again so the next open reads it. A
+    /// crash between a rotation and the writer's finalization of the
+    /// outgoing file leaves exactly this.
+    pub fn openScanned(
+        vfs_inst: *const _vfs.VFS,
+        alloc: std.mem.Allocator,
+        dir_path: String,
+        fid: u64,
+    ) !LogFile {
+        var name_buf: LogFile.NameBuf = undefined;
+        const path = try fullPath(alloc, dir_path, try fname(fid, &name_buf));
+        defer alloc.free(path);
+
+        var handle = try vfs_inst.openFile(alloc, path, .{
+            .mode = .default,
+            .flags = .{ .writable = true, .dsync = true },
+        });
+        errdefer handle.close();
+
+        var lf = try scanFrames(fid, handle, alloc);
+        errdefer lf.slots.deinit(alloc);
+
+        lf.is_current = false;
+        try lf.writeHeader();
+        try lf.truncateFile(lf.write_offset);
+        try lf.handle.syncData();
+        return lf;
     }
 };
 
@@ -741,23 +794,31 @@ pub const NextLog = struct {
 
 /// The batch write path. Records are framed into `write_buf` under the
 /// wal lock by `append`, which also wakes the writer fiber; the writer
-/// swaps the buffer out as `sync_buf` and writes it with the lock
-/// released, so appends keep landing while the disk is busy. It is the
-/// only fiber that writes batches: everyone else waits on `synced`,
-/// the highest log index on disk, to reach what they appended.
+/// takes the buffer as an `Item` and writes it with the lock released,
+/// so appends keep landing while the disk is busy. A rotation queues
+/// the outgoing file's leftovers as items ahead of `write_buf`. The
+/// writer is the only fiber that writes in steady state: everyone else
+/// waits on `synced`, the highest log index on disk, to reach what
+/// they appended.
 pub const LogBuf = struct {
     allocator: std.mem.Allocator,
     /// Buffered framed records for the current file. `addEntries`
     /// appends here without touching disk.
     write_buf: std.ArrayList(u8) = .empty,
-    /// The batch on its way to disk. Private to the writer between
-    /// `take` and the end of `write`; non-empty after a failed write
-    /// until the next `take` or `flush` puts it back in front of
-    /// `write_buf`.
-    sync_buf: std.ArrayList(u8) = .empty,
-    /// Running from `take` until the write returns. Anything that
-    /// writes, moves or truncates log files under the lock waits it out
-    /// (`waitInflight`); the writer marks it done without the lock.
+    /// Disk work the writer owes ahead of `write_buf`, in order: a
+    /// rotated-out file's last records and header. Under the wal lock,
+    /// like `write_buf`.
+    pending: std.ArrayList(Item) = .empty,
+    /// The buffer the writer hands back once an item is down: `take`
+    /// refills `write_buf` from it, so the steady state allocates
+    /// nothing. Touched by the writer, or under the lock with nothing
+    /// in flight; a rotation leaves it alone and lets `write_buf`
+    /// grow again.
+    spare: std.ArrayList(u8) = .empty,
+    /// Running while an item is being written: from `take` until the
+    /// writer's write returns, or across a lock-held write in `drain`
+    /// and `flush`. Anything that writes, moves or truncates log files
+    /// under the lock waits it out (`waitInflight`).
     inflight: fiber.Event = .{},
     /// Highest log index whose framed bytes are on disk: the leader's
     /// own vote toward commit, what `addEntries` consults before
@@ -776,16 +837,28 @@ pub const LogBuf = struct {
     writer: ?fiber.JoinHandle(void) = null,
     stopping: std.atomic.Value(bool) = .init(false),
 
-    /// A swapped-out batch: what `write` needs with the lock released.
-    /// `handle` is a copy, so a log file list that moves meanwhile
-    /// cannot dangle it (and nothing closes the current log file without
-    /// `waitInflight`).
-    pub const Batch = struct {
+    /// One unit of the writer's work: `buf` for a file at `offset` and,
+    /// for a file rotated out, its `header`: written at 0 once the
+    /// records are down, then the file is cut to its data end and
+    /// fsynced, after which it opens from the header rather than a
+    /// scan. `handle` is a copy, so a log file list that moves cannot
+    /// dangle it (nothing closes a file without `drain`).
+    pub const Item = struct {
         handle: _vfs.FileHandle,
         offset: u64,
-        bytes: String,
-        first_index: u64,
+        buf: std.ArrayList(u8),
+        /// What `synced` becomes once the item is down.
         last_index: u64,
+        header: ?[]u8 = null,
+
+        fn dataEnd(self: *const Item) u64 {
+            return self.offset + self.buf.items.len;
+        }
+
+        fn deinit(self: *Item, allocator: std.mem.Allocator) void {
+            self.buf.deinit(allocator);
+            if (self.header) |h| allocator.free(h);
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator) LogBuf {
@@ -798,8 +871,10 @@ pub const LogBuf = struct {
 
     pub fn deinit(self: *LogBuf) void {
         self.stop();
+        self.dropPending();
+        self.pending.deinit(self.allocator);
+        self.spare.deinit(self.allocator);
         self.write_buf.deinit(self.allocator);
-        self.sync_buf.deinit(self.allocator);
         self.synced.deinit();
         self.buffered.deinit();
     }
@@ -866,37 +941,73 @@ pub const LogBuf = struct {
     }
 
     /// Make everything appended so far durable, on the caller's fiber,
-    /// with the lock held: what rotation, truncation and cache eviction
-    /// need before they touch the log files.
+    /// with the lock held: what truncation and cache eviction need
+    /// before they touch the log files.
     pub fn flush(self: *LogBuf, current: *LogFile, last_index: u64) !void {
-        self.waitInflight();
-        self.reclaimFailed();
+        try self.drain();
         if (self.write_buf.items.len == 0) return;
 
-        try current.flushWriteBuffer(self.write_buf.items);
-        utils.clearRetainCap(&self.write_buf);
-        self.synced.advance(last_index);
+        var item = self.takeWriteBuf(current, last_index);
+        std.mem.swap(std.ArrayList(u8), &self.write_buf, &self.spare);
+        self.inflight.setRunning();
+        if (!self.blockingWrite(&item)) return error.Closed;
+    }
+
+    /// Rotation, lock held: what was buffered for `current` and the
+    /// file's finalization go on the writer's queue, so the only I/O
+    /// left under the lock is the swap itself. Two rotations within
+    /// one write are two items.
+    pub fn pushToPending(self: *LogBuf, current: *LogFile) !void {
+        try self.pending.ensureUnusedCapacity(self.allocator, 1);
+
+        const header = try current.encodeHeader();
+        const last = if (current.lastEntry()) |e| e.index else 0;
+        var item = self.takeWriteBuf(current, last);
+        item.header = header;
+        self.pending.appendAssumeCapacity(item);
+    }
+
+    /// Everything the writer owes, written: waits out the write in
+    /// flight and writes what it has not taken on the caller's fiber.
+    /// Lock held. What truncation, log file deletion and cache
+    /// eviction need before touching the files.
+    pub fn drain(self: *LogBuf) !void {
+        self.waitInflight();
+        while (self.pending.items.len > 0) {
+            var item = self.pending.orderedRemove(0);
+            self.inflight.setRunning();
+
+            if (!self.blockingWrite(&item)) return error.Closed;
+        }
     }
 
     /// Wait out the write in flight, drop what is buffered, nothing
     /// durable. For `wal.reset`.
     pub fn reset(self: *LogBuf) void {
         self.waitInflight();
-        utils.clearRetainCap(&self.sync_buf);
+        self.dropPending();
         utils.clearRetainCap(&self.write_buf);
         self.synced.reset(0);
         self.buffered.reset(0);
     }
 
-    /// The writer: drains everything pending one batch at a time, then
+    /// Free every queued item. Nothing in flight.
+    fn dropPending(self: *LogBuf) void {
+        for (self.pending.items) |*item| item.deinit(self.allocator);
+        utils.clearRetainCap(&self.pending);
+    }
+
+    /// The writer: drains everything pending one item at a time, then
     /// parks until `buffered` moves past `synced`. A truncation resets
     /// both, which wakes it to recompute the target rather than wait
-    /// for an index that may never come back. Exits when `stop` closes
-    /// `buffered`.
+    /// for an index that may never come back. Exits as soon as `stop`
+    /// is seen, leaving the rest for the closing flush.
     fn writerLoop(self: *LogBuf, dw: *DiskWAL) void {
         while (true) {
-            while (self.writeOne(dw)) {}
+            while (!self.stopping.load(.acquire) and self.writeOne(dw)) {}
+
             if (self.stopping.load(.acquire)) return;
+
             self.buffered.waitForOrReset(self.synced.load() + 1) catch |err| switch (err) {
                 error.Reset => continue,
                 error.Closed, error.OutOfMemory => return,
@@ -904,81 +1015,121 @@ pub const LogBuf = struct {
         }
     }
 
-    /// One batch: take under the lock, write with it released. False
-    /// when nothing was pending. A failed write is logged and retried
-    /// after a pause: the bytes stay in front, and nothing is durable
-    /// until they land.
+    /// One item: take under the lock, write with it released. False
+    /// when nothing was pending, or the item was dropped at stop.
     fn writeOne(self: *LogBuf, dw: *DiskWAL) bool {
-        dw.mu.lock(@src());
+        const held = dw.mu.hold(.exclusive, @src());
         const ws = &dw.wal_store;
-        const batch = self.take(ws.current, ws.lastIndex());
-        dw.mu.unlock();
+        const taken = self.take(held, ws.current, ws.lastIndex());
+        held.release();
 
-        const b = batch orelse return false;
+        var item = taken orelse return false;
+        const first_index = self.synced.load() + 1;
         const started = utils.timestampNow(.monotonic, .micros);
-        self.write(b) catch |err| {
-            std.log.err("raft/diskwal: batch write through index {d}: {s}", .{
-                b.last_index, @errorName(err),
-            });
-            if (self.stopping.load(.acquire)) return false;
-            fiber.sleepMs(100);
-            return true;
-        };
+        if (!self.blockingWrite(&item)) return false;
         const done = utils.timestampNow(.monotonic, .micros);
         if (dw.on_written) |hook| hook.call(hook.ctx, .{
-            .first_index = b.first_index,
-            .last_index = b.last_index,
+            .first_index = first_index,
+            .last_index = item.last_index,
             .started_us = started,
             .done_us = done,
         });
         return true;
     }
 
-    /// Swap the pending records out for the writer. Lock held; nothing
-    /// in flight, since only the writer takes. Null when nothing is
+    /// The next item for the writer: the queue's head, else the
+    /// records buffered for `current`. `held` is the wal lock; nothing
+    /// is in flight, since only the writer takes. Null when nothing is
     /// pending.
-    fn take(self: *LogBuf, current: *const LogFile, last_index: u64) ?Batch {
+    fn take(
+        self: *LogBuf,
+        held: DiskWAL.Lock.Exclusive,
+        current: *const LogFile,
+        last_index: u64,
+    ) ?Item {
+        held.mu.assertHeld(held);
         std.debug.assert(!self.isInflight());
 
-        self.reclaimFailed();
-        if (self.write_buf.items.len == 0) return null;
-
-        std.mem.swap(std.ArrayList(u8), &self.write_buf, &self.sync_buf);
+        var item: Item = undefined;
+        if (self.pending.items.len > 0) {
+            item = self.pending.orderedRemove(0);
+            //
+        } else if (self.write_buf.items.len > 0) {
+            item = self.takeWriteBuf(current, last_index);
+            std.mem.swap(std.ArrayList(u8), &self.write_buf, &self.spare);
+            //
+        } else {
+            return null;
+        }
         self.inflight.setRunning();
+        return item;
+    }
+
+    /// Moves `write_buf` out as an item for `current`, leaving an empty
+    /// buffer behind. Lock held.
+    fn takeWriteBuf(
+        self: *LogBuf,
+        current: *const LogFile,
+        last_index: u64,
+    ) Item {
+        const buf = self.write_buf;
+        self.write_buf = .empty;
         return .{
             .handle = current.handle,
-            .offset = current.write_offset - self.sync_buf.items.len,
-            .bytes = self.sync_buf.items,
-            .first_index = self.synced.load() + 1,
+            .offset = current.write_offset - buf.items.len,
+            .buf = buf,
             .last_index = last_index,
         };
     }
 
-    /// Write a taken batch with the lock released; the log file is
-    /// O_DSYNC, so the write returns durable. On error the bytes stay
-    /// in `sync_buf` for `reclaimFailed`.
-    fn write(self: *LogBuf, b: Batch) !void {
+    /// One item to disk, `inflight` set by the caller: retried after a
+    /// pause until it lands, logging every failure, since nothing is
+    /// durable until it does. The writer calls it with the lock
+    /// released, `drain` and `flush` with it held. False when the WAL
+    /// stopped meanwhile; the item is then dropped, nothing of it
+    /// having been acknowledged.
+    fn blockingWrite(self: *LogBuf, item: *Item) bool {
         defer self.inflight.setDone();
-        try b.handle.write(b.bytes, b.offset, .p0);
-
-        utils.clearRetainCap(&self.sync_buf);
-        self.synced.advance(b.last_index);
+        while (true) {
+            self.write_(item) catch |err| {
+                std.log.err("raft/diskwal: write through index {d}: {s}", .{
+                    item.last_index, @errorName(err),
+                });
+                if (self.stopping.load(.acquire)) {
+                    item.deinit(self.allocator);
+                    return false;
+                }
+                fiber.sleepMs(100);
+                continue;
+            };
+            // The buffer becomes the spare, or is freed when there is
+            // one already (a rotation's buffer, once written).
+            if (self.spare.capacity == 0) {
+                utils.clearRetainCap(&item.buf);
+                self.spare = item.buf;
+            } else item.buf.deinit(self.allocator);
+            return true;
+        }
     }
 
-    /// A failed write left its bytes in `sync_buf`; they precede
-    /// whatever was appended since, so they go back in front.
-    fn reclaimFailed(self: *LogBuf) void {
-        if (self.sync_buf.items.len == 0) return;
-        self.write_buf.insertSlice(
-            self.allocator,
-            0,
-            self.sync_buf.items,
-        ) catch |err| {
-            std.debug.panic("wal: cannot reclaim a failed batch: {s}", .{
-                @errorName(err),
-            });
-        };
-        utils.clearRetainCap(&self.sync_buf);
+    /// The I/O of one item; the log file is O_DSYNC, so a write
+    /// returns durable, and `synced` moves as soon as the records are
+    /// down: waiters need the records, not the header, and a crash
+    /// before the header opens the file from a scan. A failure leaves
+    /// the item whole for a retry: the writes are idempotent, the
+    /// watermark only rises, and the header is freed at the end.
+    fn write_(self: *LogBuf, item: *Item) !void {
+        const bytes = item.buf.items;
+        if (bytes.len > 0) try item.handle.write(bytes, item.offset, .p0);
+        self.synced.advance(item.last_index);
+
+        if (item.header) |header| {
+            try item.handle.write(header, 0, .p0);
+            try item.handle.truncate(item.dataEnd());
+            try item.handle.syncData();
+            self.allocator.free(header);
+            item.header = null;
+        }
     }
 };
 

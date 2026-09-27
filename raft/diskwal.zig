@@ -351,8 +351,11 @@ pub const wal = struct {
         // failures (corrupt header, can't parse).
         for (0..found_fids.items.len - 1) |idx| {
             const fid = found_fids.items[idx];
+            // A missing or torn header is rebuilt from the records
+            // inside openRotated; only a file whose records are
+            // corrupt drops the tail.
             const lf = LogFile.openRotated(vfs_inst, alloc, path, fid) catch |err| switch (err) {
-                error.InvalidLogHeader, error.CorruptLogFile => {
+                error.CorruptLogFile => {
                     first_bad = idx;
                     break;
                 },
@@ -420,7 +423,14 @@ pub const wal = struct {
     }
 
     pub fn deinit(self: *wal) void {
+        // The writer stops without draining, and it stops first: no
+        // lock is held here, so a flush beside a running writer would
+        // race it for the same bytes. What it has not written yet goes
+        // down here, a rotated file's leftovers included.
         self.buf.stop();
+        self.syncLocked() catch |err| {
+            std.log.err("raft/diskwal: flush at close: {s}", .{@errorName(err)});
+        };
         self.next.discard();
         self.cache.deinit();
         for (self.files.items) |*lf| lf.deinit();
@@ -632,16 +642,12 @@ pub const wal = struct {
         };
     }
 
-    /// Flush pending writes, write header to current file, then create a new file.
+    /// Queue the current file's last records and header for the writer
+    /// and swap the prepared next one in. The outgoing file's cut and
+    /// fsync happen on the writer with no lock held; until they land
+    /// the file opens from a scan of its records (`openScanned`).
     fn rotate(self: *wal) !void {
-        // Mid-batch rotation: everything buffered or in flight for the
-        // outgoing file lands before we move to a new one.
-        try self.syncLocked();
-
-        // Write header with slot metadata, truncate to actual data.
-        try self.current.writeHeader();
-        try self.current.truncateFile(self.current.write_offset);
-        try self.current.handle.syncData();
+        try self.buf.pushToPending(self.current);
         self.current.is_current = false;
 
         const nf = try self.next.swapIn();
@@ -714,7 +720,14 @@ pub const wal = struct {
     }
 
     pub fn deleteBefore(self: *wal, raft_index: u64) void {
-        self.buf.waitInflight();
+        // A rotated file's last records and header still queued for
+        // the writer must land before that file can be closed under it.
+        self.buf.drain() catch |err| {
+            std.log.err("raft/diskwal: drain before delete: {s}", .{
+                @errorName(err),
+            });
+            return;
+        };
         self.pins.waitFor(0, raft_index);
 
         const pos = self.slotGe(raft_index);
@@ -843,10 +856,14 @@ pub const DiskWAL = struct {
     /// Single rwlock guarding all DiskWAL state — covers both `meta` and
     /// `wal_store` since the public API (hardState/snapshot/append/...)
     /// can read/mutate either. Shared for reads, exclusive for writes.
-    mu: fiber.RWMutex(.tracked) = .{},
+    mu: Lock = .{},
     /// Called by the writer fiber after each batch, with the lock
     /// released: the raft node's timeline mark and wake-up.
     on_written: ?WrittenHook = null,
+
+    /// The lock's type, for `Lock.Exclusive` tokens that prove a
+    /// callee runs under it.
+    pub const Lock = fiber.RWMutex(.tracked);
 
     pub const WrittenHook = struct {
         ctx: *anyopaque,

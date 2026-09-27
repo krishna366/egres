@@ -538,6 +538,71 @@ test "BIG: diskwal truncate storage" {
     try checkRange(log, new_last - 100, new_last + 1);
 }
 
+test "diskwal rotated file with a torn header is rebuilt from its records" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    // 32 MiB files (16 MiB of records past the header region) and
+    // 1 MiB entries: 16 per file, so 40 entries make three files.
+    const opts: raft.diskwal.OpenOptions = .{ .log_file_size = 32 << 20 };
+    const payload = try alloc.alloc(u8, 1 << 20);
+    defer alloc.free(payload);
+    const total: u64 = 40;
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        var idx: u64 = 1;
+        while (idx <= total) : (idx += 1) {
+            fillLargePayload(payload, idx);
+            try appendEntry(alloc, &ds, idx, 1, payload);
+        }
+        try ds.sync();
+        try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
+    }
+
+    // A crash between the rotation and the writer's finalization of the
+    // outgoing file leaves its header unwritten: zero the first file's.
+    const first_path = try std.fmt.allocPrint(alloc, "{s}/00001.wal", .{wal_dir});
+    defer alloc.free(first_path);
+    const io = utils.context.g().io;
+    {
+        var file = try std.Io.Dir.cwd().openFile(io, first_path, .{
+            .mode = .read_write,
+        });
+        defer file.close(io);
+        const zeros = [_]u8{0} ** 4096;
+        try file.writePositionalAll(io, &zeros, 0);
+    }
+
+    // Reopen: every entry is there, the first file's from a scan.
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        try std.testing.expectEqual(total, ds.lastIndex());
+        var cross = try ds.entriesRange(.{ .lo = 1, .hi = total + 1 });
+        defer cross.deinit();
+        try std.testing.expectEqual(@as(usize, total), cross.entries.len);
+        for (cross.entries, 1..) |stored, i| {
+            try std.testing.expectEqual(i, stored.index);
+            const reader = try zen.LogEntryReader.parseRoot(stored.bytes);
+            fillLargePayload(payload, i);
+            try std.testing.expectEqualSlices(u8, payload, reader.data());
+        }
+    }
+
+    // The scan wrote the header back, so the next open reads it.
+    {
+        var file = try std.Io.Dir.cwd().openFile(io, first_path, .{});
+        defer file.close(io);
+        var prefix: [zbuf.Frame.hdr_size]u8 = undefined;
+        _ = try file.readPositionalAll(io, &prefix, 0);
+        try std.testing.expect(!std.mem.allEqual(u8, &prefix, 0));
+    }
+}
+
 test "BIG: diskwal large payload rotation" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);

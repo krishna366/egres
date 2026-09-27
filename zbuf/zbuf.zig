@@ -137,8 +137,10 @@ pub const Frame = struct {
         const prefix = try readPrefix(buf);
         const end = prefix.frameLen();
         if (end > buf.len) return Error.OutOfBounds;
+
         const payload = buf[hdr_size..end];
         if (hash(payload) != prefix.hash) return Error.Invalid;
+
         return payload;
     }
 };
