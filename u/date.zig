@@ -201,20 +201,7 @@ pub fn parseTimestamp(text: String, with_tz: bool) !i64 {
 /// without trailing zeros, plus `+00` for a timestamptz — exactly what
 /// Postgres prints in a UTC session.
 pub fn formatTimestamp(w: *std.Io.Writer, unix_us: i64, with_tz: bool) !void {
-    const c = civilFromDays(@divFloor(unix_us, us_per_day));
-    const day_us = @mod(unix_us, us_per_day);
-    const secs = @divFloor(day_us, us_per_sec);
-    const frac = @mod(day_us, us_per_sec);
-    // Unsigned on purpose: a `0` fill on a signed integer prints an
-    // explicit `+` sign (`0000+5`). Every field here is non-negative.
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-        @as(u64, @intCast(c.year)),
-        @as(u64, @intCast(c.month)),
-        @as(u64, @intCast(c.day)),
-        @as(u64, @intCast(@divFloor(secs, 3600))),
-        @as(u64, @intCast(@mod(@divFloor(secs, 60), 60))),
-        @as(u64, @intCast(@mod(secs, 60))),
-    });
+    const frac = try writeDateTime(w, unix_us, ' ');
     if (frac != 0) {
         var buf: [6]u8 = undefined;
         const digits = try std.fmt.bufPrint(&buf, "{d:0>6}", .{@as(u64, @intCast(frac))});
@@ -222,6 +209,34 @@ pub fn formatTimestamp(w: *std.Io.Writer, unix_us: i64, with_tz: bool) !void {
         try w.writeAll(std.mem.trimEnd(u8, digits, "0"));
     }
     if (with_tz) try w.writeAll("+00");
+}
+
+/// Render Unix µs as `YYYY-MM-DDTHH:MM:SS.ffffffZ`: the ISO 8601 form
+/// for logs and traces, fraction always six digits.
+pub fn formatTimestampUtc(w: *std.Io.Writer, unix_us: i64) !void {
+    const frac = try writeDateTime(w, unix_us, 'T');
+    try w.print(".{d:0>6}Z", .{@as(u64, @intCast(frac))});
+}
+
+/// The `YYYY-MM-DD<sep>HH:MM:SS` part shared by the formats above.
+/// Returns the leftover microseconds within the second, so the caller
+/// prints the fraction the way its format wants it.
+fn writeDateTime(w: *std.Io.Writer, unix_us: i64, sep: u8) !i64 {
+    const c = civilFromDays(@divFloor(unix_us, us_per_day));
+    const day_us = @mod(unix_us, us_per_day);
+    const secs = @divFloor(day_us, us_per_sec);
+    // Unsigned on purpose: a `0` fill on a signed integer prints an
+    // explicit `+` sign (`0000+5`). Every field here is non-negative.
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}{c}{d:0>2}:{d:0>2}:{d:0>2}", .{
+        @as(u64, @intCast(c.year)),
+        @as(u64, @intCast(c.month)),
+        @as(u64, @intCast(c.day)),
+        sep,
+        @as(u64, @intCast(@divFloor(secs, 3600))),
+        @as(u64, @intCast(@mod(@divFloor(secs, 60), 60))),
+        @as(u64, @intCast(@mod(secs, 60))),
+    });
+    return @mod(day_us, us_per_sec);
 }
 
 /// A cursor over the timestamp text: fixed-width digit fields and

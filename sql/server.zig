@@ -519,6 +519,12 @@ pub const Handler = struct {
         defer self.failBlockOnError(state);
 
         if (isEmptyQuery(sql_text)) return state.sendEmptyQueryResponse();
+        // The statement's context: everything below records into it
+        // through fiber.ctx(), and detach keeps the trace if it was slow.
+        var qctx = fiber.Ctx.init(sql_text);
+        qctx.attach();
+        defer qctx.detach();
+
         // Parse into an arena: the Stmt borrows its strings from the
         // libpg_query tree, and the arena reclaims all of it — tree and
         // borrowed statement alike — when this scope ends.
@@ -526,6 +532,7 @@ pub const Handler = struct {
         defer arena.deinit();
         const stmt = _parse.statement(arena.allocator(), sql_text) catch
             return replySyntaxError(state);
+        qctx.record("parsed", .{});
         try self.runStatement(state, stmt);
     }
 
@@ -566,9 +573,13 @@ pub const Handler = struct {
             );
         };
         if (isEmptyQuery(ctx.sql)) return state.sendEmptyQueryResponse();
+        var qctx = fiber.Ctx.init(ctx.sql);
+        qctx.attach();
+        defer qctx.detach();
 
         const stmt = (try self.cachedStatement(ctx.sql)) orelse
             return replySyntaxError(state);
+        qctx.record("bound {d} params", .{ctx.params.len});
         const needed = stmt.paramCount();
         if (needed != ctx.params.len) {
             var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
@@ -878,6 +889,7 @@ pub const Handler = struct {
     pub fn commitTxn(self: *Handler, a: std.mem.Allocator, tx: *_txn.Txn) !void {
         const kvs = try tx.wireKvs(a);
         if (kvs.len == 0) return;
+        fiber.ctx().record("{d} kvs on the wire", .{kvs.len});
         const node = self.srv.engine.node;
         if (!node.isLeader() or node.current_term != tx.term)
             return error.LeaderChanged;

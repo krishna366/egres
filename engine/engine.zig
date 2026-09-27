@@ -1487,6 +1487,7 @@ pub const Engine = struct {
         self.applyWriteBackpressure(kvs);
         const payload = try encodeMutations(self.allocator, namespace, kvs);
         defer self.allocator.free(payload);
+        fiber.ctx().record("mutations encoded, {d} bytes", .{payload.len});
         try self.proposeAndWait(payload, .data, wait_for);
     }
 

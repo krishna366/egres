@@ -1483,7 +1483,9 @@ pub const Node = struct {
         const start_ms = utils.coarseMs();
         var w: ProposalWaiter = .{ .wait_for = .apply };
         try self.propose(data, proposal_type, &w);
+        fiber.ctx().record("proposed", .{});
         const status = w.wait();
+        fiber.ctx().record("committed and applied", .{});
 
         const took_ms = utils.coarseMs() - start_ms;
         if (took_ms > 5_000) {

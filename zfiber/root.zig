@@ -25,6 +25,7 @@ pub const ReturnOf = _fb.ReturnOf;
 
 // From runtime.zig — the scheduler.
 const _rt = @import("runtime.zig");
+const _ctx = @import("ctx.zig");
 
 pub const Worker = _rt.Worker;
 pub const Runtime = _rt.Runtime;
@@ -46,6 +47,9 @@ pub const currentFiberOrNull = _rt.currentFiberOrNull;
 pub const dumpFibers = _rt.dumpFibers;
 pub const dumpWorkerCpu = _rt.dumpWorkerCpu;
 pub const profile = @import("profile.zig");
+pub const Ctx = _ctx.Ctx;
+pub const ctx = _ctx.current;
+pub const writeTraces = _ctx.writeTraces;
 pub const tscNsPerCycleQ32 = _rt.tscNsPerCycleQ32;
 
 // Lower-level data structure used by `Deadlines`.

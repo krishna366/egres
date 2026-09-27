@@ -1248,7 +1248,7 @@ pub const JoinHandle = _fb.JoinHandle;
 /// immediately is still freed. Returns the registered, runnable fiber. When
 /// `detached`, the caller must NOT touch the returned fiber: it may already have
 /// finished and been freed.
-fn spawnInner(
+fn spawn_(
     opts: SpawnOptions,
     comptime func: anytype,
     args: std.meta.ArgsTuple(@TypeOf(func)),
@@ -1276,6 +1276,13 @@ fn spawnInner(
     }
 
     if (detached) f.detached = true;
+    // A joinable helper is joined inside the statement's frame, so the
+    // Ctx it inherits outlives every slice it runs. A detached fiber
+    // has no such bound and gets only what the spawner vouches for.
+    f.ctx = opts.ctx;
+    if (f.ctx == null and !detached) {
+        if (currentFiberOrNull()) |parent| f.ctx = parent.ctx;
+    }
 
     try rt.appendFiber(f);
     f.state.store(@bitCast(State{ .tag = .ready, .awaken = false }), .release);
@@ -1306,13 +1313,14 @@ pub fn spawn(
     comptime func: anytype,
     args: std.meta.ArgsTuple(@TypeOf(func)),
 ) !JoinHandle(_fb.ReturnOf(func)) {
-    const f = try spawnInner(opts, func, args, false);
-    // Same comptime-generated Ctx type Fiber.init used to allocate `f.ctx`.
-    // Accessing `&ctx.state` by name lets Zig compute the offset — no dependence
-    // on field order in `Ctx`. Safe to deref: a non-detached fiber is freed only
-    // by `join()`, so it can't have freed itself even if it already ran.
-    const ctx: *_fb.Ctx(func) = @ptrCast(@alignCast(f.ctx));
-    return .{ .fiber = f, .state = &ctx.state };
+    const f = try spawn_(opts, func, args, false);
+    // Same comptime-generated Body type Fiber.init used to allocate
+    // `f.body`. Accessing `&body.state` by name lets Zig compute the
+    // offset — no dependence on field order in `Body`. Safe to deref: a
+    // non-detached fiber is freed only by `join()`, so it can't have
+    // freed itself even if it already ran.
+    const body: *_fb.Body(func) = @ptrCast(@alignCast(f.body));
+    return .{ .fiber = f, .state = &body.state };
 }
 
 /// Like `spawn`, but returns NO handle: the fiber frees itself (via
@@ -1324,7 +1332,7 @@ pub fn spawnDetached(
     comptime func: anytype,
     args: std.meta.ArgsTuple(@TypeOf(func)),
 ) !void {
-    _ = try spawnInner(opts, func, args, true);
+    _ = try spawn_(opts, func, args, true);
 }
 
 pub fn yield() void {

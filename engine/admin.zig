@@ -36,6 +36,7 @@ pub const Command = union(enum) {
     locks: LocksCmd,
     workers: WorkersCmd,
     profile: ProfileCmd,
+    traces: TracesCmd,
     help: HelpCmd,
 };
 
@@ -50,6 +51,12 @@ pub const ProfileCmd = struct {
     secs: u32,
     hz: u32 = 200,
     output: fiber.profile.Output = .{ .top = 20 },
+};
+
+/// `traces [min_ms]`: the statement traces the sampler kept, those
+/// that took at least `min_ms`.
+pub const TracesCmd = struct {
+    min_ms: u64 = 0,
 };
 
 pub const HelpCmd = struct {};
@@ -590,6 +597,13 @@ pub fn parseLine(line: String) !Command {
         return .{ .workers = .{} };
     } else if (std.mem.eql(u8, cmd, "profile")) {
         return parseProfile(&it);
+    } else if (std.mem.eql(u8, cmd, "traces")) {
+        var req: TracesCmd = .{};
+        if (it.next()) |ms| {
+            req.min_ms = std.fmt.parseInt(u64, ms, 10) catch
+                return error.InvalidArg;
+        }
+        return .{ .traces = req };
     } else if (std.mem.eql(u8, cmd, "help")) {
         return .{ .help = .{} };
     } else {
@@ -850,6 +864,9 @@ pub const AdminServer = struct {
                 },
                 .profile => |req| {
                     self.handleProfile(stream, req) catch return;
+                },
+                .traces => |req| {
+                    self.handleTraces(stream, req) catch return;
                 },
                 .help => {
                     proto.writeHelp(stream) catch return;
@@ -1125,6 +1142,20 @@ pub const AdminServer = struct {
         log.info("profile cpu {d}s @ {d} Hz: {d} samples, {d} dropped", .{
             req.secs, req.hz, report.samples, report.dropped,
         });
+        try body.writer.writeByte('\n');
+        try stream.writeAll(body.writer.buffered());
+    }
+
+    /// Reply with the kept statement traces (see zfiber/ctx).
+    fn handleTraces(
+        self: *AdminServer,
+        stream: fiber.net.Stream,
+        req: TracesCmd,
+    ) !void {
+        var body: std.Io.Writer.Allocating = .init(self.engine.allocator);
+        defer body.deinit();
+
+        try fiber.writeTraces(&body.writer, req.min_ms);
         try body.writer.writeByte('\n');
         try stream.writeAll(body.writer.buffered());
     }

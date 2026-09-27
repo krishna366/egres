@@ -52,3 +52,24 @@ test "parseTimestamp reads S3 LastModified stamps: T separator, Z, ms fraction" 
     try testing.expectEqual(1_709_164_800 * us_per_s + 100_000, try date.parseTimestamp("2024-02-29T00:00:00.1Z", true));
     try testing.expectError(error.InvalidTimestamp, date.parseTimestamp("nope", true));
 }
+
+test "formatTimestampUtc prints the ISO form with a full fraction" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    // 2026-09-27T10:11:12.345678Z
+    const days = date.daysFromCivil(2026, 9, 27);
+    const us: i64 = days * 86_400 * 1_000_000 +
+        (10 * 3600 + 11 * 60 + 12) * 1_000_000 + 345_678;
+    try date.formatTimestampUtc(&out.writer, us);
+    try testing.expectEqualStrings(
+        "2026-09-27T10:11:12.345678Z",
+        out.writer.buffered(),
+    );
+    // The epoch itself, so the zero fill shows.
+    out.clearRetainingCapacity();
+    try date.formatTimestampUtc(&out.writer, 0);
+    try testing.expectEqualStrings(
+        "1970-01-01T00:00:00.000000Z",
+        out.writer.buffered(),
+    );
+}

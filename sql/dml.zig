@@ -9,6 +9,7 @@
 //! Free functions over `*Handler` — see the note in ddl.zig.
 
 const std = @import("std");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const engine = @import("engine");
 const pgwire = @import("pgwire");
@@ -63,6 +64,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         return replyError(state, "failed to load table schema");
     };
     if (!try bumpToIndexes(state, tx, tbl)) return;
+    fiber.ctx().record("txn begun, table open", .{});
 
     // The column each VALUES position writes (its cell in `values` is
     // Column.pos). Positional insert is the live columns themselves;
@@ -129,8 +131,10 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         const marshalled = try _row.marshalRow(eng.allocator, ps, values, &buf);
         bytes.* = try arloc.dupe(u8, marshalled);
     }
+    fiber.ctx().record("{d} rows marshalled", .{num_rows});
 
     if (!try lockIndexKeys(state, tx, keys.items)) return;
+    fiber.ctx().record("{d} index keys locked", .{keys.items.len});
 
     // Phase 2: every lock is held — allocate egids and buffer each row,
     // then the index entries. No Restart can occur here (puts don't
@@ -149,6 +153,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
         const ekey = _key.encodeEgid(egid.*);
         try tx.put(table_id, &ekey, bytes, .{});
     }
+    fiber.ctx().record("rows buffered", .{});
     if (!try applyIndexKeys(state, tx, keys.items, egids)) return;
 
     if (tx.implicit) {
@@ -942,6 +947,7 @@ fn applyIndexKeys(
     }
 
     if (!try probeUnique(state, tx, probes.items)) return false;
+    fiber.ctx().record("{d} unique keys probed", .{probes.items.len});
     for (probes.items) |ik| {
         const ekey = _key.encodeEgid(egids[ik.row]);
         try tx.put(ik.idx.index_table_id, ik.key, &ekey, .{});
