@@ -190,7 +190,7 @@ fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
     var entry = try raft.buffers.LogEntryBuffer.initWithTail(allocator, data, .owned);
     defer entry.deinit();
 
-    try wal.append(&.{entry});
+    try wal.addEntries(&.{entry});
     try wal.sync();
     try wal.setHardState(.{ .commit_index = 1 });
     log.info("seeded genesis: database '{s}' -> ns={d}", .{ default_database, zdb.manifest.first_namespace });

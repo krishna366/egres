@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const _raftlog = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
 const _vfs = @import("vfs");
@@ -51,6 +50,151 @@ pub const tmp_suffix = _lf.tmp_suffix;
 
 pub const err_not_found = error{NotFound};
 
+pub const NodeId = u64;
+
+// Wire-format enums live in raft/buffers.zig; the Zig types are
+// re-exported so consumers can write `diskwal.ConfChangeType` instead
+// of reaching into the generated zbuf module directly.
+pub const ConfChangeType = zen.ChangeTypeEnum;
+
+pub const ConfChange = struct {
+    change_type: ConfChangeType,
+    node_id: NodeId,
+    addr: String = "",
+};
+pub const LogEntryBuffer = zen.LogEntryBuffer;
+pub const HardState = zen.HardStateStruct;
+
+/// Field-set update for HardState. Callers pass only the fields they want
+/// to change; the WAL reads the current HardState, merges, and writes
+/// atomically under its own write lock — eliminating the read-modify-write
+/// race that would exist if multiple writers (e.g. raft mainLoop bumping
+/// term/vote vs. commitPersistLoop bumping commit_index) each constructed
+/// a full HardState from a stale read.
+pub const HardStateUpdate = struct {
+    current_term: ?u64 = null,
+    voted_for: ?u64 = null,
+    raft_id: ?u64 = null,
+    checkpoint_index: ?u64 = null,
+    commit_index: ?u64 = null,
+};
+
+pub const Snapshot = zen.SnapshotStruct;
+pub const ConfState = zen.ConfStateStruct;
+pub const ConfStatePeer = zen.ConfStatePeerStruct;
+
+pub const StoredEntry = struct {
+    index: u64,
+    term: u64,
+    bytes: String = "",
+};
+
+pub const RaftLogError = error{
+    Compacted,
+    Unavailable,
+    Canceled,
+} || std.mem.Allocator.Error || zen.Error;
+
+pub const EntriesRangeOpts = struct {
+    lo: u64,
+    hi: u64 = std.math.maxInt(u64),
+    max_bytes: u64 = 64 * 1024 * 1024, // 64 MiB
+    /// `.any` (tag 0) is the wildcard: an entry's wire-encoded type is
+    /// never `.any`. Any other value returns only entries of that type,
+    /// decided from the in-memory slot table, so the entries skipped
+    /// are never read from disk.
+    ty: EntryType = .any,
+};
+
+/// Result of an entries range query. All entry bytes live in the arena.
+/// Caller must call deinit() when done.
+pub const EntriesResult = struct {
+    entries: []StoredEntry,
+    arena: std.heap.ArenaAllocator,
+    /// True if all matching entries in the range were returned (not
+    /// truncated by max_bytes).
+    eof: bool = true,
+
+    pub fn deinit(self: *EntriesResult) void {
+        self.arena.deinit();
+    }
+};
+
+pub fn deinitOwnedEntries(
+    alloc: std.mem.Allocator,
+    entries: []LogEntryBuffer,
+) void {
+    for (entries) |*entry_buf| {
+        entry_buf.deinit();
+    }
+    alloc.free(entries);
+}
+
+/// The index ranges that lock-free reads still need on disk, and the
+/// cuts of the log waiting for them to finish. Its own mutex rather
+/// than the wal lock, since a read unpins without holding that.
+const Pins = struct {
+    list: std.ArrayList(Pin) = .empty,
+    mu: fiber.Mutex(.untracked) = .{},
+    /// Broadcast on every unpin: a cut parked on an overlapping pin
+    /// wakes and re-checks. A read is disk round trips, milliseconds,
+    /// so the waiter parks rather than yields.
+    cv: fiber.Condition = .{},
+
+    /// One read's range.
+    pub const Pin = struct {
+        lo: u64,
+        hi: u64,
+
+        fn overlaps(a: Pin, b: Pin) bool {
+            return a.lo < b.hi and b.lo < a.hi;
+        }
+    };
+
+    fn deinit(self: *Pins, alloc: std.mem.Allocator) void {
+        self.list.deinit(alloc);
+    }
+
+    /// Registers a read's range: no cut of the log may take it away
+    /// until `unpin`.
+    fn pin(self: *Pins, alloc: std.mem.Allocator, p: Pin) !void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        try self.list.append(alloc, p);
+    }
+
+    /// Ends a read: the range may be cut again.
+    pub fn unpin(self: *Pins, p: Pin) void {
+        {
+            self.mu.lock(@src());
+            defer self.mu.unlock();
+            // Every pin is registered once and unpinned once, so the
+            // first equal entry is this read's.
+            const at = for (self.list.items, 0..) |q, i| {
+                if (std.meta.eql(q, p)) break i;
+            } else unreachable;
+            _ = self.list.swapRemove(at);
+        }
+        self.cv.broadcast();
+    }
+
+    /// Parks the caller until no in-flight read overlaps [lo, hi). Called
+    /// with the wal held exclusively, so no new read can start meanwhile;
+    /// only the reads already planned have to drain.
+    fn waitFor(self: *Pins, lo: u64, hi: u64) void {
+        const cut: Pin = .{ .lo = lo, .hi = hi };
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        while (self.anyOverlaps(cut)) self.cv.wait(&self.mu);
+    }
+
+    /// Caller holds `mu`.
+    fn anyOverlaps(self: *const Pins, cut: Pin) bool {
+        for (self.list.items) |p| if (Pin.overlaps(p, cut)) return true;
+        return false;
+    }
+};
+
 /// Inner WAL implementation. NOT internally synchronized — assumes the
 /// caller (`DiskWAL`) holds `DiskWAL.mu` in the appropriate mode (shared
 /// for reads, exclusive for mutations). Exposing `wal` directly without
@@ -67,6 +211,9 @@ pub const wal = struct {
     next: NextLog,
     /// The batch write path; see `LogBuf`.
     buf: LogBuf,
+    /// Range reads in flight with no wal lock held (see `planEntries`).
+    pins: Pins = .{},
+    pub const Pin = Pins.Pin;
 
     const Pos = struct {
         file_idx: usize,
@@ -279,6 +426,7 @@ pub const wal = struct {
         for (self.files.items) |*lf| lf.deinit();
         self.files.deinit(self.allocator);
         self.buf.deinit();
+        self.pins.deinit(self.allocator);
         self.allocator.free(self.dir_path);
     }
 
@@ -349,212 +497,138 @@ pub const wal = struct {
         return .{ .file_idx = lo, .slot_idx = self.files.items[lo].slotGe(raft_index) };
     }
 
-    fn seekEntry(self: *wal, raft_index: u64) (Error || _raftlog.RaftLogError || err_not_found)!entry {
+    fn seekEntry(
+        self: *wal,
+        raft_index: u64,
+    ) (Error || RaftLogError || err_not_found)!entry {
         if (raft_index == 0) {
-            return .{ .term = 0, .index = 0, .data_offset = 0, .data_len = 0, .entry_type = .any };
+            return .{
+                .term = 0,
+                .index = 0,
+                .data_offset = 0,
+                .data_len = 0,
+                .entry_type = .any,
+            };
         }
 
         const pos = self.slotGe(raft_index);
-        const slot_idx = pos.slot_idx orelse return _raftlog.RaftLogError.Compacted;
-        if (slot_idx >= no_slot) return _raftlog.RaftLogError.Unavailable;
+        const slot_idx = pos.slot_idx orelse return RaftLogError.Compacted;
+        if (slot_idx >= no_slot) return RaftLogError.Unavailable;
 
-        const lf = self.getEntryFile(pos.file_idx) orelse return _raftlog.RaftLogError.Unavailable;
-        const ent = lf.getEntry(slot_idx) orelse return _raftlog.RaftLogError.Unavailable;
+        const lf = self.getEntryFile(pos.file_idx) orelse
+            return RaftLogError.Unavailable;
+        const ent = lf.getEntry(slot_idx) orelse
+            return RaftLogError.Unavailable;
         if (ent.index != raft_index) return err_not_found.NotFound;
         return ent;
     }
 
-    pub fn term(self: *wal, idx: u64) (Error || _raftlog.RaftLogError || err_not_found)!u64 {
+    pub fn term(
+        self: *wal,
+        idx: u64,
+    ) (Error || RaftLogError || err_not_found)!u64 {
         const ent = try self.seekEntry(idx);
         return ent.term;
     }
 
-    const ReadPlan = struct {
-        scan_start: usize,
-        scan_end: usize,
-        match_count: usize,
-        disk_first_offset: u32,
-        disk_end_offset: u32,
-        disk_bytes: u64,
-        hit_hi: bool, // stopped because we reached opts.hi
-        hit_budget: bool, // stopped because of max_bytes
+    /// The disk reads of one file, issued after the wal lock is dropped.
+    /// A range read between its two halves: planned under the lock,
+    /// read without it. Each request names its file (the file list may
+    /// grow meanwhile, and the pin keeps the file from being deleted or
+    /// truncated under the read) and fills `sentries[sentry_offs[i]]`.
+    pub const PlannedRead = struct {
+        arena: std.heap.ArenaAllocator,
+        sentries: std.ArrayList(StoredEntry) = .empty,
+        reqs: std.ArrayList(_vfs.FileHandle.ReadRequest) = .empty,
+        sentry_offs: std.ArrayList(usize) = .empty,
+        eof: bool = true,
+        pin: Pin,
     };
 
-    /// Scan a file's in-memory slots to plan the read strategy.
-    /// Checks type filter, cache, and byte budget. No I/O.
-    fn planFileRead(
-        self: *wal,
-        lf: *const LogFile,
-        start: usize,
-        opts: _raftlog.EntriesRangeOpts,
-        bytes_so_far: u64,
-    ) ReadPlan {
-        var plan = ReadPlan{
-            .scan_start = start,
-            .scan_end = start, // scan_end points one past valid entry
-            .match_count = 0,
-            .disk_first_offset = 0,
-            .disk_end_offset = 0,
-            .disk_bytes = 0,
-            .hit_hi = false,
-            .hit_budget = false,
-        };
-
-        const last_slot = lf.firstEmptySlot();
-        var scan_idx = start;
-        while (scan_idx < last_slot) : (scan_idx += 1) {
-            const ent = lf.getEntry(scan_idx) orelse break;
-            if (ent.index >= opts.hi) {
-                plan.hit_hi = true;
-                break;
-            }
-
-            // Apply type filter.
-            if (opts.ty != .any and ent.entry_type != opts.ty) continue;
-
-            // Check budget before including this entry.
-            if (plan.match_count > 0 and opts.max_bytes > 0 and
-                bytes_so_far + plan.disk_bytes + ent.data_len > opts.max_bytes)
-            {
-                plan.hit_budget = true;
-                break;
-            }
-
-            plan.match_count += 1;
-
-            // Only count toward disk span if not in cache.
-            if (self.cache.lookup(ent.index) == null) {
-                const rec_end: u32 = ent.data_offset + @as(u32, zbuf.Frame.hdr_size) + ent.data_len;
-                if (plan.disk_bytes == 0) plan.disk_first_offset = ent.data_offset;
-                plan.disk_end_offset = rec_end;
-                plan.disk_bytes += ent.data_len;
-            }
-        }
-        plan.scan_end = scan_idx;
-
-        return plan;
-    }
-
-    /// Read entries matching opts. Returns EntriesResult backed by an arena.
-    /// Two-pass approach per file:
-    ///   1. Plan: scan in-memory slots, check cache, compute disk span.
-    ///   2. Read: bulk read if disk matches are dense (>= 50% of span),
-    ///      individual reads if sparse. Cache hits copied into arena.
-    /// Caller must call result.deinit() when done.
-    pub fn allEntries(
+    /// The first half of a range read, under the caller's lock: walks
+    /// the in-memory slot table for the entries `opts` asks for, copies
+    /// the ones the cache holds, and lists the disk reads. No
+    /// I/O happens here, so the lock is held for microseconds and an
+    /// append never waits on a reader. The pin registered here keeps
+    /// `deleteBefore` and `truncateFrom` off the range until `unpin`.
+    pub fn planEntries(
         self: *wal,
         parent_alloc: std.mem.Allocator,
-        opts: _raftlog.EntriesRangeOpts,
-    ) !_raftlog.EntriesResult {
-        var arena = std.heap.ArenaAllocator.init(parent_alloc);
-        errdefer arena.deinit();
-        const alloc = arena.allocator();
+        opts: EntriesRangeOpts,
+    ) !PlannedRead {
+        var planned: PlannedRead = .{
+            .arena = std.heap.ArenaAllocator.init(parent_alloc),
+            .pin = .{ .lo = opts.lo, .hi = opts.hi },
+        };
+        errdefer planned.arena.deinit();
+        const arloc = planned.arena.allocator();
 
-        var out = std.ArrayList(_raftlog.StoredEntry).empty;
-        var eof = true;
-
+        var total: u64 = 0;
         const pos = self.slotGe(opts.lo);
-        // null slot_idx means opts.lo lands before this file's range —
-        // start scanning from slot 0 of that file.
-        var total_size: u64 = 0;
+        // null = opts.lo lands before this file's range: start at slot 0.
         var file_idx = pos.file_idx;
         var slot_idx: usize = pos.slot_idx orelse 0;
-
-        outer: while (file_idx < self.files.items.len) {
+        outer: while (file_idx < self.files.items.len) : ({
+            file_idx += 1;
+            slot_idx = 0;
+        }) {
             const lf = &self.files.items[file_idx];
+            while (slot_idx < lf.firstEmptySlot()) : (slot_idx += 1) {
+                const ent = lf.getEntry(slot_idx) orelse break;
+                if (ent.index >= opts.hi) break :outer;
 
-            if (slot_idx >= lf.firstEmptySlot()) {
-                file_idx += 1;
-                slot_idx = 0;
-                continue;
-            }
-
-            // === Pass 1: Plan — scan this file's slots, check cache, compute disk span ===
-            const plan = self.planFileRead(lf, @intCast(slot_idx), opts, total_size);
-            if (plan.hit_budget) eof = false;
-
-            if (plan.match_count == 0) {
-                slot_idx = @intCast(plan.scan_end);
-                if (plan.hit_hi) break :outer;
-                continue;
-            }
-
-            // === Pass 2: Read — bulk or individual based on density of uncached entries ===
-            var bulk_buf: ?String = null;
-
-            if (plan.disk_bytes > 0) {
-                const span = plan.disk_end_offset - plan.disk_first_offset;
-                const use_bulk = (span <= 2 * plan.disk_bytes);
-                if (use_bulk) {
-                    // One read for the whole span of uncached entries.
-                    const result = try lf.handle.readAligned(alloc, plan.disk_first_offset, span, .p0);
-                    // result.buf (if any) lives in the arena, so no need to free.
-                    bulk_buf = result.data;
-                }
-            }
-
-            // Resolve cache/bulk hits and collect disk read requests in one pass.
-            var requests = std.ArrayList(_vfs.FileHandle.ReadRequest).empty;
-            for (plan.scan_start..plan.scan_end) |si| {
-                const ent = lf.getEntry(si) orelse continue;
+                // Skip all entries which don't match the type.
                 if (opts.ty != .any and ent.entry_type != opts.ty) continue;
 
-                // TODO: type-filtered (.ty != .any) reads via the bulk
-                // buffer return wrong bytes for some entries — manifests in
-                // particular fail `LogEntryReader.parseRoot` ~10-20% of
-                // the time with OutOfBounds. Probable cause is the
-                // `disk_first_offset` / `disk_end_offset` math in
-                // `planRange` not accounting for gaps left by skipped
-                // non-matching entries, so per-entry slicing here lands at
-                // the wrong offset. the engine's `maybeProposeSnapshot`
-                // workaround: ask for `.ty = .any` and filter user-side.
-                // Re-check budget (rounding safety).
-                if (out.items.len > 0 and opts.max_bytes > 0 and total_size + ent.data_len > opts.max_bytes) {
-                    eof = false;
+                // The budget never refuses the first entry, so a reader
+                // always makes progress.
+                if (planned.sentries.items.len > 0 and opts.max_bytes > 0 and
+                    total + ent.data_len > opts.max_bytes)
+                {
+                    planned.eof = false;
                     break :outer;
                 }
-                total_size += ent.data_len;
+                total += ent.data_len;
 
-                try out.append(alloc, .{ .index = ent.index, .term = ent.term });
-                const sep = &out.items[out.items.len - 1];
-
+                var stored: StoredEntry = .{
+                    .index = ent.index,
+                    .term = ent.term,
+                };
                 if (self.cache.lookup(ent.index)) |ce| {
-                    sep.bytes = try alloc.dupe(u8, ce.bytes);
-                } else if (bulk_buf) |buf| {
-                    sep.bytes = lf.readPayloadFromBuf(si, buf, plan.disk_first_offset) catch |err| {
-                        const e = lf.getEntry(si) orelse ent;
-                        std.log.err("readPayloadFromBuf failed si={d} idx={d} data_off={d} data_len={d} buf_off={d} buf_len={d} err={}", .{
-                            si, e.index, e.data_offset, e.data_len, plan.disk_first_offset, buf.len, err,
-                        });
-                        return err;
-                    };
+                    stored.bytes = try arloc.dupe(u8, ce.bytes);
                 } else {
-                    // Needs disk read. Append placeholder, queue a read request
-                    // with ctx pointing at the StoredEntry to fill later.
-                    try requests.append(alloc, .{
+                    try planned.reqs.append(arloc, .{
+                        .file = lf.handle.file.?,
                         .offset = ent.data_offset,
                         .len = zbuf.Frame.hdr_size + ent.data_len,
-                        .ctx = sep,
                     });
+                    const off = planned.sentries.items.len;
+                    try planned.sentry_offs.append(arloc, off);
                 }
+                try planned.sentries.append(arloc, stored);
             }
-
-            // Batch read all entries needing disk I/O.
-            if (requests.items.len > 0) {
-                try lf.handle.batchRead(&arena, requests.items, .p0);
-                for (requests.items) |req| {
-                    const se: *_raftlog.StoredEntry = @ptrCast(@alignCast(req.ctx.?));
-                    se.bytes = try zbuf.Frame.read(req.data);
-                }
-            }
-
-            slot_idx = @intCast(plan.scan_end);
-            if (plan.hit_hi) break :outer;
         }
+
+        try self.pins.pin(self.allocator, planned.pin);
+        return planned;
+    }
+
+    /// The second half: every disk read in one batch, whatever files
+    /// they span, then the frames are decoded in place. A frame whose
+    /// hash does not verify (an entry not yet on disk and no longer
+    /// cached) fails the read rather than returning bad bytes. No wal
+    /// lock is held; the caller unpins after.
+    pub fn readPlanned(self: *const wal, planned: *PlannedRead) !EntriesResult {
+        try self.vfs_inst.batchRead(&planned.arena, planned.reqs.items, .p0);
+
+        for (planned.reqs.items, planned.sentry_offs.items) |req, off| {
+            planned.sentries.items[off].bytes = try zbuf.Frame.read(req.data);
+        }
+        const alloc = planned.arena.allocator();
         return .{
-            .entries = try out.toOwnedSlice(alloc),
-            .arena = arena,
-            .eof = eof,
+            .entries = try planned.sentries.toOwnedSlice(alloc),
+            .arena = planned.arena,
+            .eof = planned.eof,
         };
     }
 
@@ -575,7 +649,7 @@ pub const wal = struct {
         self.current = &self.files.items[self.files.items.len - 1];
     }
 
-    pub fn addEntries(self: *wal, entries: []const _raftlog.LogEntryBuffer) !void {
+    pub fn addEntries(self: *wal, entries: []const LogEntryBuffer) !void {
         if (entries.len == 0) return;
 
         // If the leader is overwriting conflicting suffix entries,
@@ -590,7 +664,7 @@ pub const wal = struct {
         // The next expected index is one past the last entry seen in any
         // file; for an empty WAL it's 1 (start of log).
         const expected_first: u64 = if (self.lastSlot()) |s| s.index + 1 else 1;
-        if (first_index != expected_first) return _raftlog.RaftLogError.Invalid;
+        if (first_index != expected_first) return RaftLogError.Invalid;
 
         // Append into self.write_buf — the actual pwrite is deferred to
         // sync(). Cache + slot table get updated immediately so reads see
@@ -598,10 +672,10 @@ pub const wal = struct {
         var expected_index = first_index;
         for (entries) |entry_buf| {
             const reader = try entry_buf.initReader();
-            if (reader.index() != expected_index) return _raftlog.RaftLogError.Invalid;
+            if (reader.index() != expected_index) return RaftLogError.Invalid;
             expected_index += 1;
 
-            const bytes = entry_buf.bytes orelse return _raftlog.RaftLogError.Invalid;
+            const bytes = entry_buf.bytes orelse return RaftLogError.Invalid;
             // Rotate when the log file is full, or as soon as the prepared
             // file is ready if the current one was handed out unfilled
             // (every append into it costs a journal write). Rotation
@@ -641,6 +715,8 @@ pub const wal = struct {
 
     pub fn deleteBefore(self: *wal, raft_index: u64) void {
         self.buf.waitInflight();
+        self.pins.waitFor(0, raft_index);
+
         const pos = self.slotGe(raft_index);
         // null = raft_index falls before everything we have on disk —
         // nothing to drop.
@@ -727,6 +803,7 @@ pub const wal = struct {
         // O(n) and fiddly; sync gets the prefix on disk, then we truncate
         // disk + slots in one shot.
         try self.syncLocked();
+        self.pins.waitFor(from_index, std.math.maxInt(u64));
 
         const pos = self.slotGe(from_index);
         const slot_idx = pos.slot_idx orelse return;
@@ -812,16 +889,16 @@ pub const DiskWAL = struct {
         self.mu.deinit();
     }
 
-    fn mapToRaftLogError(err: anyerror) _raftlog.RaftLogError {
+    fn mapToRaftLogError(err: anyerror) RaftLogError {
         return switch (err) {
-            _raftlog.RaftLogError.Compacted => _raftlog.RaftLogError.Compacted,
-            _raftlog.RaftLogError.Unavailable => _raftlog.RaftLogError.Unavailable,
-            err_not_found.NotFound => _raftlog.RaftLogError.Unavailable,
+            RaftLogError.Compacted => RaftLogError.Compacted,
+            RaftLogError.Unavailable => RaftLogError.Unavailable,
+            err_not_found.NotFound => RaftLogError.Unavailable,
             error.OutOfMemory => error.OutOfMemory,
-            error.Closed => _raftlog.RaftLogError.Unavailable,
+            error.Closed => RaftLogError.Unavailable,
             else => {
                 std.log.err("mapToRaftLogError: unmapped error: {}", .{err});
-                return _raftlog.RaftLogError.Unavailable;
+                return RaftLogError.Unavailable;
             },
         };
     }
@@ -831,7 +908,7 @@ pub const DiskWAL = struct {
     // writes, _uncancelable for cheap struct-field reads where blocking
     // on cancellation isn't useful).
 
-    pub fn hardState(self: *DiskWAL) *const _raftlog.HardState {
+    pub fn hardState(self: *DiskWAL) *const HardState {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.meta.hardState();
@@ -842,7 +919,7 @@ pub const DiskWAL = struct {
     /// every other DiskWAL writer, so concurrent calls (e.g. raft
     /// mainLoop persisting term/vote, commitPersistLoop persisting
     /// commit_index) can't race-clobber each other's fields.
-    pub fn setHardState(self: *DiskWAL, update: _raftlog.HardStateUpdate) _raftlog.RaftLogError!void {
+    pub fn setHardState(self: *DiskWAL, update: HardStateUpdate) RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         var next = self.meta.hardState().*;
@@ -854,13 +931,13 @@ pub const DiskWAL = struct {
         self.meta.setHardState(next) catch |err| return mapToRaftLogError(err);
     }
 
-    pub fn snapshot(self: *DiskWAL) *const _raftlog.Snapshot {
+    pub fn snapshot(self: *DiskWAL) *const Snapshot {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         return self.meta.snapshotState();
     }
 
-    pub fn setSnapshot(self: *DiskWAL, snap: _raftlog.Snapshot) _raftlog.RaftLogError!void {
+    pub fn setSnapshot(self: *DiskWAL, snap: Snapshot) RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         self.meta.setSnapshot(snap) catch |err| return mapToRaftLogError(err);
@@ -931,24 +1008,41 @@ pub const DiskWAL = struct {
         return self.wal_store.term(last_idx) catch snap_term;
     }
 
-    pub fn term(self: *DiskWAL, idx: u64) _raftlog.RaftLogError!?u64 {
+    pub fn term(self: *DiskWAL, idx: u64) RaftLogError!?u64 {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         if (idx == 0) return 0;
         return self.wal_store.term(idx) catch |err| switch (err) {
-            _raftlog.RaftLogError.Compacted => null,
-            _raftlog.RaftLogError.Unavailable => null,
+            RaftLogError.Compacted => null,
+            RaftLogError.Unavailable => null,
             err_not_found.NotFound => null,
             else => return mapToRaftLogError(err),
         };
     }
 
-    pub fn entriesRange(self: *DiskWAL, opts: _raftlog.EntriesRangeOpts) _raftlog.RaftLogError!_raftlog.EntriesResult {
+    /// The lock covers the slot walk only; the disk reads run without
+    /// it, so an append never waits on a reader (a snapshot's read of
+    /// the manifest entries once held it for seconds).
+    pub fn entriesRange(
+        self: *DiskWAL,
+        opts: EntriesRangeOpts,
+    ) RaftLogError!EntriesResult {
+        var planned = try self.planEntries(opts);
+        errdefer planned.arena.deinit();
+
+        defer self.wal_store.pins.unpin(planned.pin);
+        return self.wal_store.readPlanned(&planned) catch |err|
+            return mapToRaftLogError(err);
+    }
+
+    fn planEntries(
+        self: *DiskWAL,
+        opts: EntriesRangeOpts,
+    ) RaftLogError!wal.PlannedRead {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
-        return self.wal_store.allEntries(self.allocator, opts) catch |err| {
+        return self.wal_store.planEntries(self.allocator, opts) catch |err|
             return mapToRaftLogError(err);
-        };
     }
 
     pub fn firstIndexOfTerm(self: *DiskWAL, term_value: u64) u64 {
@@ -963,7 +1057,10 @@ pub const DiskWAL = struct {
         return 0;
     }
 
-    pub fn append(self: *DiskWAL, entries: []const _raftlog.LogEntryBuffer) _raftlog.RaftLogError!void {
+    pub fn addEntries(
+        self: *DiskWAL,
+        entries: []const LogEntryBuffer,
+    ) RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.addEntries(entries) catch |err| return mapToRaftLogError(err);
@@ -982,13 +1079,13 @@ pub const DiskWAL = struct {
         };
     }
 
-    pub fn truncateFrom(self: *DiskWAL, from_index: u64) _raftlog.RaftLogError!void {
+    pub fn truncateFrom(self: *DiskWAL, from_index: u64) RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.truncateFrom(from_index) catch |err| return mapToRaftLogError(err);
     }
 
-    pub fn compactUntil(self: *DiskWAL, index: u64) _raftlog.RaftLogError!void {
+    pub fn compactUntil(self: *DiskWAL, index: u64) RaftLogError!void {
         self.mu.lock(@src());
         defer self.mu.unlock();
         self.wal_store.deleteBefore(index);
@@ -999,7 +1096,7 @@ pub const DiskWAL = struct {
     /// held. Returns early if the log is cut below the target meanwhile
     /// (a follower truncating a conflicting suffix): what was waited for
     /// is then gone, or is being re-appended and gets waited for anew.
-    pub fn sync(self: *DiskWAL) _raftlog.RaftLogError!void {
+    pub fn sync(self: *DiskWAL) RaftLogError!void {
         // MetaStore writes are durable inline (state.bin opens with O_DSYNC,
         // snapshot.bin uses tmp+rename+dir-sync), so only the WAL needs an
         // explicit sync here.

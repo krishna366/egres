@@ -86,49 +86,14 @@ pub const File = struct {
         return waiter.result;
     }
 
-    /// A single positional read request for `preadBatch`. `result` is
-    /// filled by the completion callback.
+    /// A single positional read request for `preadBatch`, on `file`.
+    /// `result` is filled by the completion callback.
     pub const BatchOp = struct {
+        file: File,
         buf: []u8,
         offset: u64,
         result: xev.ReadError!usize = 0,
     };
-
-    /// Submit every request in `ops` to the worker loop at once and park
-    /// a single time until all complete — one loop poll, one wake. The
-    /// kernel sees all SQEs in one submission (the batching that
-    /// `vfs.batchRead` relies on) without needing scatter-gather: each op
-    /// is an independent single-buffer pread at its own offset.
-    ///
-    /// `allocator` backs the transient completion + context arrays; they
-    /// only need to outlive this call (the fiber stays parked until the
-    /// last completion fires, so they survive across the park).
-    pub fn preadBatch(self: File, allocator: std.mem.Allocator, ops: []BatchOp) !void {
-        if (ops.len == 0) return;
-        const w = _rt.currentWorker();
-        const f = w.current_fiber.?;
-        const xf = xev.File.initFd(self.fd);
-
-        const comps = try allocator.alloc(xev.Completion, ops.len);
-        defer allocator.free(comps);
-        const ctxs = try allocator.alloc(BatchCtx, ops.len);
-        defer allocator.free(ctxs);
-
-        // Single shared waiter. Callbacks run on this worker's loop (one
-        // thread), so the `remaining` countdown needs no atomics.
-        var batch: BatchWaiter = .{ .fiber = f, .remaining = .init(ops.len) };
-        for (ops, comps, ctxs) |*op, *c, *ctx| {
-            ctx.* = .{ .batch = &batch, .op = op };
-            xf.pread(&w.loop, c, .{ .slice = op.buf }, op.offset, BatchCtx, ctx, batchCallback);
-        }
-        // Invariant: the LAST completion (which drives `remaining` to 0) is what
-        // wakes us, so on resume every CQE has been reaped and the stack `comps`
-        // (freed when this frame returns) safely outlived their ops. A resume
-        // with `remaining != 0` is a spurious wake — fail loud at the source.
-        _rt.park();
-        if (batch.remaining.load(.acquire) != 0)
-            @panic("fs.preadBatch: fiber woken before all reads completed — spurious wake");
-    }
 
     /// Flush data + metadata to disk (data only with `data_only`). libxev
     /// has no fsync op, so the blocking syscall runs on the `fsops` pool
@@ -227,6 +192,51 @@ fn pwriteCallback(
     w.done.store(true, .release);
     _rt.wake(w.fiber);
     return .disarm;
+}
+
+/// Submit every request in `ops` to the worker loop at once and park a
+/// single time until all complete — one loop poll, one wake. The kernel
+/// sees all SQEs in one submission (the batching that `vfs.batchRead`
+/// relies on) without needing scatter-gather: each op is an independent
+/// single-buffer pread at its own offset on its own file, so one batch
+/// can span files.
+///
+/// `allocator` backs the transient completion + context arrays; they
+/// only need to outlive this call (the fiber stays parked until the
+/// last completion fires, so they survive across the park).
+pub fn preadBatch(allocator: std.mem.Allocator, ops: []File.BatchOp) !void {
+    if (ops.len == 0) return;
+    const w = _rt.currentWorker();
+    const f = w.current_fiber.?;
+
+    const comps = try allocator.alloc(xev.Completion, ops.len);
+    defer allocator.free(comps);
+    const ctxs = try allocator.alloc(BatchCtx, ops.len);
+    defer allocator.free(ctxs);
+
+    // Single shared waiter. Callbacks run on this worker's loop (one
+    // thread), so the `remaining` countdown needs no atomics.
+    var batch: BatchWaiter = .{ .fiber = f, .remaining = .init(ops.len) };
+    for (ops, comps, ctxs) |*op, *c, *ctx| {
+        ctx.* = .{ .batch = &batch, .op = op };
+        const xf = xev.File.initFd(op.file.fd);
+        xf.pread(
+            &w.loop,
+            c,
+            .{ .slice = op.buf },
+            op.offset,
+            BatchCtx,
+            ctx,
+            batchCallback,
+        );
+    }
+    // Invariant: the LAST completion (which drives `remaining` to 0) is what
+    // wakes us, so on resume every CQE has been reaped and the stack `comps`
+    // (freed when this frame returns) safely outlived their ops. A resume
+    // with `remaining != 0` is a spurious wake — fail loud at the source.
+    _rt.park();
+    if (batch.remaining.load(.acquire) != 0)
+        @panic("fs.preadBatch: woken before all reads completed");
 }
 
 const BatchWaiter = struct {

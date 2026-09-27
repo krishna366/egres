@@ -103,7 +103,7 @@ pub const Txn = struct {
     /// accepted until the client ends the block.
     failed: bool = false,
     /// The snapshot every read in this txn sees. Starts at the initial
-    /// read_ts and only moves FORWARD, via the bump in `lockRow`: locking
+    /// read_ts and only moves FORWARD, via the bump in `lockRows`: locking
     /// a key another txn committed above our snapshot advances read_ts to
     /// that commit — after revalidating every prior read (see bump
     /// notes there) and forcing the current statement to restart at the
@@ -119,7 +119,7 @@ pub const Txn = struct {
     /// unit tests, which never evaluate it.
     start_us: i64 = 0,
     /// Reads settled by prior statements. Revalidated on a bump (see
-    /// lockRow). INVARIANT: all are valid as of the current read_ts —
+    /// lockRows). INVARIANT: all are valid as of the current read_ts —
     /// bump revalidates `prev`, restart re-runs `cur` — so COMMIT never
     /// validates anything.
     prev: ReadSet = .{},
@@ -201,7 +201,7 @@ pub const Txn = struct {
     /// the cycle alive); the txn object itself stays for the failed-state
     /// bookkeeping until the block ends.
     pub fn releaseLocks(self: *Txn) void {
-        for (self.held_rows.items) |key| self.db.row_locks.release(key, self.id);
+        self.db.row_locks.releaseMany(self.held_rows.items, self.id);
         utils.clearRetainCap(&self.held_rows);
         // Tables after the rows, in reverse acquisition order.
         var i = self.held_tables.items.len;
@@ -217,41 +217,50 @@ pub const Txn = struct {
     }
 
     pub const LockError = error{ Deadlock, Upgrade, OutOfMemory };
-    /// lockRow's additions: `Conflict` = a prior read is invalid at the
+    /// What the bump adds: `Conflict` = a prior read is invalid at the
     /// snapshot the bump needs (40001, the txn aborts); `Restart` = the
     /// bump succeeded and the CURRENT statement must re-run at the new
     /// read_ts (the statement driver retries; never client-visible).
     pub const RowLockError = LockError || error{ Conflict, Restart };
 
-    /// Block until this txn holds the row lock for (table_id, primary) —
-    /// FIFO, re-entrant, released at txn end. The lock key is the row's
-    /// identity hash (Key.identityHash — ts excluded): one identity per
-    /// row, every version, no allocation.
+    /// The row-lock and oracle key of a row: `Key.identityHash` over
+    /// this txn's namespace.
+    pub fn rowHash(self: *const Txn, table_id: u32, primary: String) u64 {
+        return (Key{
+            .namespace = self.ns,
+            .table_id = table_id,
+            .primary = primary,
+        }).identityHash();
+    }
+
+    /// Block until this txn holds the row lock for every row in
+    /// `hashes` (their `rowHash`es) — FIFO, re-entrant, released at
+    /// txn end. The lock key is the row's identity hash (ts excluded):
+    /// one identity per row, every version, no allocation. One round
+    /// on the lock map for the whole set.
     ///
-    /// A FRESH lock also runs the bump check: if the row committed
-    /// above our snapshot (oracle floor > read_ts), advance read_ts to
-    /// the floor so the statement can see that version — legal only if
-    /// everything already read stays valid at the new snapshot:
+    /// Then the bump check, one oracle read for the highest commit
+    /// among the keys: if any row committed above our snapshot, advance
+    /// read_ts to that commit so the statement can see it — legal only
+    /// if everything already read stays valid at the new snapshot:
     ///   - prior statements' scans: unverifiable by hash → Conflict;
     ///   - prior statements' point reads: one batch oracle probe; any
     ///     of them re-committed above the old snapshot → Conflict
     ///     (conservative: a commit even above the new floor aborts);
     ///   - the current statement's reads/scans: discarded and re-run —
     ///     Restart.
-    /// A re-entrant lock skips the check: we have held the key since
-    /// its first lock, so its floor cannot have moved.
-    pub fn lockRow(
-        self: *Txn,
-        table_id: u32,
-        primary: String,
-    ) RowLockError!void {
-        const h = (Key{
-            .namespace = self.ns,
-            .table_id = table_id,
-            .primary = primary,
-        }).identityHash();
-        if (!try self.lockKey(h, .exclusive)) return;
-        return self.bumpTo(self.db.oracle.commitTs(h));
+    /// Every key stays held through `Restart`/`Conflict`, so the retry
+    /// re-locks them re-entrantly; a key held since before cannot have
+    /// had its floor move, so the check is only ever run once per key.
+    pub fn lockRows(self: *Txn, hashes: []const u64) RowLockError!void {
+        try self.held_rows.ensureUnusedCapacity(self.allocator, hashes.len);
+        try self.db.row_locks.acquireMany(
+            hashes,
+            self.id,
+            .exclusive,
+            &self.held_rows,
+        );
+        return self.bumpTo(self.db.oracle.maxCommitTs(hashes));
     }
 
     /// Advance read_ts to `ts` so the statement can see state applied
@@ -259,7 +268,7 @@ pub const Txn = struct {
     /// completed at `Index.valid_ts`). No-op when already at or above
     /// it. Otherwise legal only if everything already read stays valid
     /// at the new snapshot — prior statements' reads are checked as
-    /// lockRow describes, Conflict if any moved — and then the current
+    /// lockRows describes, Conflict if any moved — and then the current
     /// statement is re-run from nothing: Restart. Needs no lock: `ts`
     /// names locally applied state, which cannot regress.
     pub fn bumpTo(self: *Txn, ts: u64) error{ Conflict, Restart }!void {
@@ -308,18 +317,6 @@ pub const Txn = struct {
             .mutex = mutex,
             .mode = mode,
         });
-    }
-
-    /// True = newly acquired (recorded in `held_rows`); false = re-entrant.
-    fn lockKey(
-        self: *Txn,
-        key: u64,
-        mode: fiber.SemaphoreMap.Mode,
-    ) LockError!bool {
-        try self.held_rows.ensureUnusedCapacity(self.allocator, 1);
-        if (!try self.db.row_locks.acquire(key, self.id, mode)) return false;
-        self.held_rows.appendAssumeCapacity(key);
-        return true;
     }
 
     /// Buffer a put — or a tombstone, via `meta` — of `primary` in

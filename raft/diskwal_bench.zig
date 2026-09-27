@@ -109,7 +109,7 @@ fn benchDurable(b: *Bench, count: usize, payload_len: usize) !void {
     defer w.freeBatches(batches);
     b.resetTimer();
     for (batches) |batch| {
-        try w.log.append(batch);
+        try w.log.addEntries(batch);
         try w.log.sync();
     }
     b.stopTimer();
@@ -125,7 +125,7 @@ fn benchAppendOnly(b: *Bench, count: usize, payload_len: usize) !void {
     const batches = try w.buildBatches(b.n, count, payload);
     defer w.freeBatches(batches);
     b.resetTimer();
-    for (batches) |batch| try w.log.append(batch);
+    for (batches) |batch| try w.log.addEntries(batch);
     b.stopTimer();
     try w.log.sync();
 }
@@ -179,7 +179,7 @@ test "BENCH: diskwal sustained 21 x 400 B across a rotation" {
     b.resetTimer();
     for (lat, built) |*l, batch| {
         const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
-        try w.log.append(batch);
+        try w.log.addEntries(batch);
         try w.log.sync();
         l.* = @intCast(std.Io.Timestamp.now(io, .real).nanoseconds - t0);
     }

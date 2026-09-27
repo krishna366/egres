@@ -44,37 +44,46 @@ test "fs.File: setSize truncates" {
     try std.testing.expectEqual(@as(u64, 4), try file.size());
 }
 
-test "fs.File: preadBatch reads independent offsets in one park" {
+test "fs.preadBatch reads offsets across two files in one park" {
     const path = "/tmp/fiber_fs_test_batch";
+    const path2 = "/tmp/fiber_fs_test_batch2";
     fiber.Dir.cwd().deleteFile(path) catch {};
+    fiber.Dir.cwd().deleteFile(path2) catch {};
     var file = try fiber.Dir.cwd().createFile(path, .{});
+    var file2 = try fiber.Dir.cwd().createFile(path2, .{});
     defer {
         file.close();
+        file2.close();
         fiber.Dir.cwd().deleteFile(path) catch {};
+        fiber.Dir.cwd().deleteFile(path2) catch {};
     }
 
-    // 256 bytes where byte[i] == i.
+    // 256 bytes where byte[i] == i; the second file holds 255 - i.
     var content: [256]u8 = undefined;
     for (&content, 0..) |*b, i| b.* = @intCast(i);
     _ = try file.write(&content, 0);
     try file.sync(.{});
+    for (&content, 0..) |*b, i| b.* = @intCast(255 - i);
+    _ = try file2.write(&content, 0);
+    try file2.sync(.{});
 
     var b0: [16]u8 = undefined;
     var b1: [16]u8 = undefined;
     var b2: [16]u8 = undefined;
+    var b3: [16]u8 = undefined;
     var ops = [_]fiber.File.BatchOp{
-        .{ .buf = &b0, .offset = 0 },
-        .{ .buf = &b1, .offset = 100 },
-        .{ .buf = &b2, .offset = 240 },
+        .{ .file = file, .buf = &b0, .offset = 0 },
+        .{ .file = file, .buf = &b1, .offset = 100 },
+        .{ .file = file2, .buf = &b2, .offset = 100 },
+        .{ .file = file, .buf = &b3, .offset = 240 },
     };
-    try file.preadBatch(std.testing.allocator, &ops);
+    try fiber.fs.preadBatch(std.testing.allocator, &ops);
 
-    try std.testing.expectEqual(@as(usize, 16), try ops[0].result);
-    try std.testing.expectEqual(@as(usize, 16), try ops[1].result);
-    try std.testing.expectEqual(@as(usize, 16), try ops[2].result);
+    for (ops) |op| try std.testing.expectEqual(@as(usize, 16), try op.result);
     try std.testing.expectEqual(@as(u8, 0), b0[0]);
     try std.testing.expectEqual(@as(u8, 100), b1[0]);
-    try std.testing.expectEqual(@as(u8, 240), b2[0]);
+    try std.testing.expectEqual(@as(u8, 155), b2[0]);
+    try std.testing.expectEqual(@as(u8, 240), b3[0]);
 }
 
 test "fs.Dir: openFile, access, deleteFile" {

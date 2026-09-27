@@ -980,18 +980,13 @@ pub const Engine = struct {
             try draft.restoreFrom(prev_snap.data);
         }
 
-        // TODO: fix the bulk-read path in diskwal.zig:entriesRange so that
-        // type-filtered queries (.ty != .any) correctly slice each matching
-        // entry out of the shared bulk buffer when there are gaps from
-        // skipped non-matching entries. Currently passing .ty=.manifest
-        // here causes ~10-20% of returned entries to fail `parseRoot` with
-        // OutOfBounds — likely a `disk_first_offset` math mismatch. As a
-        // workaround we ask for ALL entries in the range and filter by
-        // `reader.entryType()` in user space; correct, just heavier I/O.
+        // Only the manifest entries are read: the slot table knows each
+        // entry's type, so the data entries between them, the bulk of
+        // the log, are never touched.
         var result = try wal.entriesRange(.{
             .lo = prev_snap.index + 1,
             .hi = target + 1,
-            .ty = .any,
+            .ty = .manifest,
             .max_bytes = std.math.maxInt(u64),
         });
         defer result.deinit();

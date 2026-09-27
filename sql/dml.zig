@@ -133,7 +133,7 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     }
     fiber.ctx().record("{d} rows marshalled", .{num_rows});
 
-    if (!try lockIndexKeys(state, tx, keys.items)) return;
+    if (!try sortAndLockIndexKeys(state, tx, keys.items)) return;
     fiber.ctx().record("{d} index keys locked", .{keys.items.len});
 
     // Phase 2: every lock is held — allocate egids and buffer each row,
@@ -196,7 +196,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // One loop for both kinds of plan. Plain SELECT streams each fill
     // to the wire; under FOR UPDATE the root's first `next` gathers
     // every match (values included) and locks every one — none
-    // committed above read_ts (that lockRow would have bumped →
+    // committed above read_ts (that lockRows would have bumped →
     // restarted), so the rows it then serves are the newest versions,
     // frozen by our locks.
     // count(*) counts every match and keeps no row bytes; its LIMIT
@@ -219,7 +219,7 @@ pub fn select(self: *Handler, state: *pgwire.ConnState, sel: _parse.Select) !voi
     // The row description goes out after the first fill — after
     // whatever the root had to do to produce it. For a locking plan
     // that is the whole gather and every lock, so nothing reaches the
-    // wire before the last lockRow and a Restart re-runs a statement
+    // wire before the last lock and a Restart re-runs a statement
     // that has sent nothing. An empty result still gets its description.
     // On the extended path it is Describe's to send (describeSelect),
     // never Execute's.
@@ -321,7 +321,7 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
             try collectKeys(arloc, &keys, idx, cell, ri, .remove);
         }
     }
-    if (!try lockIndexKeys(state, tx, keys.items)) return;
+    if (!try sortAndLockIndexKeys(state, tx, keys.items)) return;
     if (!try applyIndexKeys(state, tx, keys.items, egids)) return;
     for (rows) |item|
         try tx.put(table_id, item.key.primary, "", .{ .kind = .deleted });
@@ -476,7 +476,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
         const marshalled = try _row.marshalRow(arloc, ps, row.cells(), &rbuf);
         bytes.* = try arloc.dupe(u8, marshalled);
     }
-    if (!try lockIndexKeys(state, tx, keys.items)) return;
+    if (!try sortAndLockIndexKeys(state, tx, keys.items)) return;
     if (!try applyIndexKeys(state, tx, keys.items, egids)) return;
     for (rows, rewritten) |item, bytes|
         try tx.put(table_id, item.key.primary, bytes, .{});
@@ -871,10 +871,10 @@ fn containsKey(keys: []const String, key: String) bool {
 }
 
 /// Sort the statement's index mutations into lock order and lock every
-/// unique key, all before any write (lockRow may Restart). Non-unique
+/// unique key, all before any write (lockRows may Restart). Non-unique
 /// entries are sorted with the rest but never locked: posting deltas
 /// commute. false = an error was replied.
-fn lockIndexKeys(
+fn sortAndLockIndexKeys(
     state: *pgwire.ConnState,
     tx: *_txn.Txn,
     keys: []IndexKey,
@@ -884,13 +884,18 @@ fn lockIndexKeys(
     // has one egid), so the unstable sort — no per-call scratch cache
     // to poison-fill — is fine here.
     std.mem.sortUnstable(IndexKey, keys, {}, IndexKey.lessThan);
+
+    var hashes: std.ArrayList(u64) = .empty;
+    defer hashes.deinit(tx.allocator);
     for (keys) |ik| {
         if (!ik.idx.unique) continue;
-        tx.lockRow(ik.idx.index_table_id, ik.key) catch |err| {
-            try replyLockErr(state, err);
-            return false;
-        };
+        const h = tx.rowHash(ik.idx.index_table_id, ik.key);
+        try hashes.append(tx.allocator, h);
     }
+    tx.lockRows(hashes.items) catch |err| {
+        try replyLockErr(state, err);
+        return false;
+    };
     return true;
 }
 

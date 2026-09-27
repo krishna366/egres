@@ -34,6 +34,24 @@ fn makeLogEntry(
     return writer.finishWithTail();
 }
 
+fn makeTypedEntry(
+    alloc: std.mem.Allocator,
+    index: u64,
+    ty: zen.EntryTypeEnum,
+    data: String,
+) !zen.LogEntryBuffer {
+    var writer = try zen.LogEntryWriter.init(alloc);
+    defer writer.deinit();
+    try writer.set(.{
+        .index = index,
+        .term = 1,
+        .data = data,
+        .entry_type = ty,
+        .conf_change = zen.NullOffset,
+    });
+    return writer.finishWithTail();
+}
+
 fn appendEntry(
     alloc: std.mem.Allocator,
     log: *raft.DiskWAL,
@@ -43,7 +61,7 @@ fn appendEntry(
 ) !void {
     var entry = try makeLogEntry(alloc, index, term, data);
     defer entry.deinit();
-    try log.append(&[_]zen.LogEntryBuffer{entry});
+    try log.addEntries(&[_]zen.LogEntryBuffer{entry});
 }
 
 fn appendRange(
@@ -76,7 +94,7 @@ fn appendRange(
                 .{ start, end, idx, appended },
             );
         }
-        try log.append(batch.items);
+        try log.addEntries(batch.items);
     }
 }
 
@@ -186,6 +204,66 @@ test "diskwal entriesRange max_bytes keeps at least one" {
     try std.testing.expectEqual(@as(usize, 1), limited.entries.len);
     const reader = try zen.LogEntryReader.parseRoot(limited.entries[0].bytes);
     try std.testing.expectEqualSlices(u8, "1111", reader.data());
+}
+
+test "diskwal entriesRange type filter reads only that type" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    // A cache of 8 entries: most of the log is read from disk, which
+    // is the path the filter has to get right.
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{
+        .cache_capacity = 8,
+    });
+    defer ds.deinit();
+
+    // Every 37th entry is a manifest; the rest are 4 KiB data entries.
+    const n: u64 = 300;
+    const big = "d" ** 4096;
+    var idx: u64 = 1;
+    while (idx <= n) : (idx += 1) {
+        var name_buf: [16]u8 = undefined;
+        const is_manifest = idx % 37 == 0;
+        const data = if (is_manifest)
+            try std.fmt.bufPrint(&name_buf, "m{d}", .{idx})
+        else
+            big;
+        const ty: zen.EntryTypeEnum = if (is_manifest) .manifest else .data;
+        var e = try makeTypedEntry(alloc, idx, ty, data);
+        defer e.deinit();
+        try ds.addEntries(&[_]zen.LogEntryBuffer{e});
+    }
+    try ds.sync();
+
+    var result = try ds.entriesRange(.{
+        .lo = 1,
+        .hi = n + 1,
+        .ty = .manifest,
+    });
+    defer result.deinit();
+    try std.testing.expect(result.eof);
+    try std.testing.expectEqual(n / 37, result.entries.len);
+    for (result.entries, 1..) |stored, i| {
+        try std.testing.expectEqual(i * 37, stored.index);
+        const reader = try zen.LogEntryReader.parseRoot(stored.bytes);
+        try std.testing.expectEqual(
+            zen.EntryTypeEnum.manifest,
+            reader.entryType(),
+        );
+        var want_buf: [16]u8 = undefined;
+        const want = try std.fmt.bufPrint(&want_buf, "m{d}", .{i * 37});
+        try std.testing.expectEqualStrings(want, reader.data());
+    }
+
+    // The unfiltered read still returns everything, cached or not.
+    var all = try ds.entriesRange(.{ .lo = 1, .hi = n + 1, .max_bytes = 0 });
+    defer all.deinit();
+    try std.testing.expectEqual(n, all.entries.len);
+    const last = try zen.LogEntryReader.parseRoot(all.entries[n - 1].bytes);
+    try std.testing.expectEqualStrings(big, last.data());
 }
 
 test "diskwal append overwrites conflicting suffix" {
@@ -925,7 +1003,7 @@ test "diskwal findIndexOlderThan bytes-only branch" {
     for (1..11) |i| {
         var entry = try makeLogEntryWithTimestamp(alloc, @intCast(i), 1, 0, payload);
         defer entry.deinit();
-        try ds.append(&[_]zen.LogEntryBuffer{entry});
+        try ds.addEntries(&[_]zen.LogEntryBuffer{entry});
     }
 
     // Threshold larger than the whole tail → null.
@@ -956,7 +1034,7 @@ test "diskwal findIndexOlderThan age-only branch" {
         const ts: u64 = (raft.utils.hlc.HLC{ .seconds = now_secs - age, .logical = 1 }).asU64();
         var entry = try makeLogEntryWithTimestamp(alloc, @intCast(i), 1, ts, "x");
         defer entry.deinit();
-        try ds.append(&[_]zen.LogEntryBuffer{entry});
+        try ds.addEntries(&[_]zen.LogEntryBuffer{entry});
     }
 
     // Need entries ≥ 60 s old. Walking newest-first: slot 3 (10s) no, slot 2
@@ -994,7 +1072,7 @@ test "diskwal findIndexOlderThan returns larger of bytes and age" {
         const ts: u64 = (raft.utils.hlc.HLC{ .seconds = now_secs - age, .logical = 1 }).asU64();
         var entry = try makeLogEntryWithTimestamp(alloc, @intCast(i), 1, ts, payload);
         defer entry.deinit();
-        try ds.append(&[_]zen.LogEntryBuffer{entry});
+        try ds.addEntries(&[_]zen.LogEntryBuffer{entry});
     }
 
     // Bytes: need ≥ 3 KiB. Walking back: slot 5 (1KiB), 4 (2KiB), 3 (3KiB) — fires at slot 3.

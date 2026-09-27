@@ -1,7 +1,7 @@
 //! SemaphoreMap: keyed reader/writer locks with owner tokens and
 //! block-time deadlock detection.
 //!
-//! `acquire(key, owner, mode)` blocks — FIFO, writer-preferred, all
+//! `acquireMany(keys, owner, mode)` blocks — FIFO, writer-preferred, all
 //! delegated to a per-entry `sync.RWMutex` — while conflicting owners
 //! hold `key`; it is a no-op for an owner re-acquiring at the same or
 //! weaker mode, and returns `error.Deadlock` when granting would close
@@ -10,13 +10,13 @@
 //! of them may release.
 //!
 //! There are NO timeouts. Every wait-for cycle has a last edge, and the
-//! requester inserting it runs a DFS over the graph under `sl` BEFORE
+//! requester inserting it runs a DFS over the graph under `mu` BEFORE
 //! parking — so deadlocks are refused at the door (victim = the
 //! edge-closer), no cycle can ever form among parked fibers, and no
 //! parked fiber ever needs interrupting.
 //!
 //! This file never touches fibers, parks, or deadlines: blocking is the
-//! entry RWMutex's job. `sl` guards the entry table and the wait-for
+//! entry RWMutex's job. `mu` guards the entry table and the wait-for
 //! graph (holders + registration-ordered waiters + `waiting`), which
 //! mirror the RWMutex state for detection but never replace it.
 //!
@@ -29,17 +29,20 @@
 
 const std = @import("std");
 const _sync = @import("sync.zig");
-const _spinlock = @import("spinlock.zig");
 
 pub const SemaphoreMap = struct {
     allocator: std.mem.Allocator,
-    /// A spinlock, not a parking mutex: every critical section under it
-    /// is a hash probe, a short list edit or the deadlock DFS — pure CPU,
-    /// never a park — and it is taken 4 times per SQL statement by every
-    /// connection. As a hand-off mutex it ran at 330k hand-offs/s under
-    /// pgbench, each one parking the waiter and waking it on another
-    /// worker while the map stayed locked.
-    sl: _spinlock.Spinlock = .{},
+    /// A parking mutex over the entry table and the wait-for graph.
+    /// Every critical section is a hash probe, a list edit or the
+    /// deadlock DFS, but `acquireMany` and `releaseMany` hold it for a
+    /// whole statement's keys at once, microseconds, long enough that
+    /// spinning contenders would burn their workers. (The per-key
+    /// version before batching was a spinlock for the opposite reason:
+    /// as a mutex it ran at 330k hand-offs/s under pgbench, each one a
+    /// park and a cross-worker wake; batching cut the holds to two per
+    /// statement.) A short spin before the park is the open question,
+    /// see the TODO in `Mutex.lock`.
+    mu: _sync.Mutex(.untracked) = .{},
     /// Held-or-contended keys only; an entry is created on first
     /// acquire and recycled by whichever release/abort leaves it with
     /// no holders and no waiters.
@@ -54,7 +57,7 @@ pub const SemaphoreMap = struct {
     /// entries are freed instead of held forever.
     pool: std.ArrayList(*Entry) = .empty,
     /// wouldDeadlock's walker, reused across runs. Only touched under
-    /// `sl`, which serializes detection.
+    /// `mu`, which serializes detection.
     dfs: Dfs,
 
     const max_pooled = 128;
@@ -165,64 +168,24 @@ pub const SemaphoreMap = struct {
         self.allocator.destroy(e);
     }
 
-    /// Block until `owner_id` holds `key` in `mode`. Returns true if
-    /// this call took (or strengthened nothing — took) the hold, false
-    /// if the owner already held it at this or a stronger mode
-    /// (re-entrant no-op) — callers pair exactly one release with each
-    /// true. `error.Deadlock` if blocking would close a wait cycle; the
-    /// requester never parks in that case. `error.Upgrade` if the owner
-    /// already holds `key` shared and asks for exclusive — the caller
-    /// decides how to treat that (this map does not upgrade in place).
-    pub fn acquire(
+    /// The contended path of `acquireMany`, entered with `mu` held and
+    /// `e` just seen refusing `owner_mode.mode`: publish the wait edge,
+    /// refuse if blocking would close a wait cycle, else park until the
+    /// hand-off and move waiter → holder. Returns with `mu` held again
+    /// so the caller's walk goes on; an error releases it. The edge
+    /// must be visible before we park so any later requester's DFS can
+    /// see it — that ordering is the completeness argument. `key` is
+    /// only for the rollback on OOM after the wake.
+    fn waitForLock(
         self: *SemaphoreMap,
         key: u64,
-        owner_id: u64,
-        mode: Mode,
-    ) error{ Deadlock, Upgrade, OutOfMemory }!bool {
-        const owner_mode = OwnerMode{ .owner_id = owner_id, .mode = mode };
-
-        self.sl.lock();
-        const e = self.entryFor(key) catch {
-            self.sl.unlock();
-            return error.OutOfMemory;
-        };
-
-        for (e.holders.items) |hold| {
-            if (hold.owner_id != owner_id) continue;
-            if (hold.mode == .exclusive or mode == .shared) {
-                // If we're already holding an exclusive lock, OR we just want a
-                // shared lock, we're good.
-                self.sl.unlock();
-                return false;
-            }
-            // Shared→exclusive upgrade in place would have to wait for
-            // the owner's own shared hold to drain — a self-deadlock,
-            // and two owners upgrading in lockstep deadlock classically.
-            // This map does not support it; hand the decision up.
-            self.sl.unlock();
-            return error.Upgrade;
-        }
-
-        // Fast path: uncontended. The probes only take rw's spinlock —
-        // safe under `sl` — and tryLockShared already defers to a
-        // pending writer, so preference is preserved.
-        if (e.tryLock(mode)) {
-            e.holders.append(self.allocator, owner_mode) catch {
-                // Roll the probe back; hand-off (if anyone was parked)
-                // and reclamation behave as a normal release would.
-                self.rollbackHold(key, e, mode);
-                self.sl.unlock();
-                return error.OutOfMemory;
-            };
-            self.sl.unlock();
-            return true;
-        }
-
-        // Contended: publish our wait edge, then refuse-or-park. The
-        // edge must be visible before we park so any later requester's
-        // DFS can see it — that ordering is the completeness argument.
+        e: *Entry,
+        owner_mode: OwnerMode,
+    ) error{ Deadlock, OutOfMemory }!void {
+        const owner_id = owner_mode.owner_id;
+        const mode = owner_mode.mode;
         e.waiters.append(self.allocator, owner_mode) catch {
-            self.sl.unlock();
+            self.mu.unlock();
             return error.OutOfMemory;
         };
         // An owner can only be waiting on exactly one key at any time.
@@ -231,21 +194,21 @@ pub const SemaphoreMap = struct {
             .mode = mode,
         }) catch {
             _ = removeOwner(&e.waiters, owner_id);
-            self.sl.unlock();
+            self.mu.unlock();
             return error.OutOfMemory;
         };
 
         const cyclic = self.wouldDeadlock(owner_id, e, mode) catch {
             self.deregisterWaiter(e, owner_id);
-            self.sl.unlock();
+            self.mu.unlock();
             return error.OutOfMemory;
         };
         if (cyclic) {
             self.deregisterWaiter(e, owner_id);
-            self.sl.unlock();
+            self.mu.unlock();
             return error.Deadlock;
         }
-        self.sl.unlock();
+        self.mu.unlock();
 
         e.lock(mode); // Block here waiting for lock.
 
@@ -253,21 +216,93 @@ pub const SemaphoreMap = struct {
         // in `waiters`, which is what keeps the entry alive across the
         // wake (release only frees an entry with no holders AND no
         // waiters).
-        self.sl.lock();
+        self.mu.lock(@src());
         self.deregisterWaiter(e, owner_id);
         e.holders.append(self.allocator, owner_mode) catch {
             self.rollbackHold(key, e, mode);
-            self.sl.unlock();
+            self.mu.unlock();
             return error.OutOfMemory;
         };
-        self.sl.unlock();
-        return true;
+    }
+
+    /// Whether `owner_id` already holds `e` in a mode that covers
+    /// `mode`: an exclusive hold covers both, a shared hold covers a
+    /// shared ask. `error.Upgrade` for shared held and exclusive asked:
+    /// an upgrade in place would wait for the owner's own shared hold
+    /// to drain, a self-deadlock, and two owners upgrading in lockstep
+    /// deadlock classically.
+    fn alreadyHeld(
+        e: *const Entry,
+        owner_id: u64,
+        req_mode: Mode,
+    ) error{Upgrade}!bool {
+        for (e.holders.items) |hold| {
+            if (hold.owner_id != owner_id) continue;
+            if (req_mode == .shared or hold.mode == .exclusive) return true;
+            return error.Upgrade;
+        }
+        return false;
+    }
+
+    /// Block until `owner_id` holds every key in `mode` — FIFO,
+    /// writer-preferred, re-entrant. Every uncontended key is taken under
+    /// one hold of `mu`: a statement locking hundreds of rows costs one
+    /// round on the map lock instead of one per key, which is what 16
+    /// connections doing that at once spent most of their CPU on. A
+    /// contended key goes to `waitForLock` with `mu` still held, which
+    /// parks, detects deadlocks and comes back with `mu` re-taken; the
+    /// walk resumes after it. Keys `owner_id` already holds are
+    /// skipped. Each key newly held is appended to `newly`, whose
+    /// capacity the caller has reserved for `keys.len`, so the caller
+    /// releases exactly what it got.
+    /// `error.Deadlock` if a wait would close a cycle, `error.Upgrade`
+    /// if a key is held shared and asked exclusive (the map does not
+    /// upgrade in place). On an error the keys taken so far stay held
+    /// and are in `newly`.
+    pub fn acquireMany(
+        self: *SemaphoreMap,
+        keys: []const u64,
+        owner_id: u64,
+        mode: Mode,
+        newly: *std.ArrayList(u64),
+    ) error{ Deadlock, Upgrade, OutOfMemory }!void {
+        const owner_mode = OwnerMode{ .owner_id = owner_id, .mode = mode };
+
+        // One hold of `mu` for the whole walk; only a park on a
+        // contended key lets go of it, and waitForLock re-takes it
+        // before returning, so the walk never re-locks itself.
+        self.mu.lock(@src());
+        for (keys) |key| {
+            const e = self.entryFor(key) catch {
+                self.mu.unlock();
+                return error.OutOfMemory;
+            };
+            const held = alreadyHeld(e, owner_id, mode) catch |err| {
+                self.mu.unlock();
+                return err;
+            };
+            if (held) continue;
+            if (!e.tryLock(mode)) {
+                // Contended: the entry was just probed, so no second
+                // lookup or hold check on the way in.
+                try self.waitForLock(key, e, owner_mode);
+                newly.appendAssumeCapacity(key);
+                continue;
+            }
+            e.holders.append(self.allocator, owner_mode) catch {
+                self.rollbackHold(key, e, mode);
+                self.mu.unlock();
+                return error.OutOfMemory;
+            };
+            newly.appendAssumeCapacity(key);
+        }
+        self.mu.unlock();
     }
 
     /// Undo a granted-but-unrecorded rw hold (OOM recording it): unlock
-    /// the rw — waking any parked contender; they re-take `sl`, which we
+    /// the rw — waking any parked contender; they re-take `mu`, which we
     /// hold, so they simply queue behind us — and reclaim the entry if
-    /// that left it unused. Caller holds `sl`.
+    /// that left it unused. Caller holds `mu`.
     fn rollbackHold(
         self: *SemaphoreMap,
         key: u64,
@@ -278,48 +313,45 @@ pub const SemaphoreMap = struct {
         self.maybeRecycle(key, e);
     }
 
-    /// Release `owner_id`'s hold on `key`. Frees the entry when nothing
-    /// holds or waits on it; otherwise the RWMutex hands off (writer
-    /// first, else all readers). Releasing a key the owner doesn't hold
-    /// is a caller bookkeeping bug (one release per acquire that
-    /// returned true), so it panics; a caller that legitimately may or
-    /// may not hold the key uses `tryRelease`.
-    pub fn release(self: *SemaphoreMap, key: u64, owner_id: u64) void {
-        if (!self.tryRelease(key, owner_id))
-            std.debug.panic(
-                "SemaphoreMap.release: owner {d} does not hold key {x}",
-                .{ owner_id, key },
-            );
+    /// Release `owner_id`'s holds on `keys` under one hold of `mu`; the
+    /// pair of `acquireMany`. Each entry is freed when nothing holds or
+    /// waits on it any more; otherwise its RWMutex hands off (writer
+    /// first, else all readers). Releasing a key the owner does not
+    /// hold is a caller bookkeeping bug (a txn releases exactly the
+    /// keys `acquireMany` gave it), so it panics.
+    pub fn releaseMany(
+        self: *SemaphoreMap,
+        keys: []const u64,
+        owner_id: u64,
+    ) void {
+        self.mu.lock(@src());
+        defer self.mu.unlock();
+        for (keys) |key| {
+            if (!self.releaseLocked(key, owner_id))
+                std.debug.panic(
+                    "SemaphoreMap.releaseMany: owner {d} does not hold key {x}",
+                    .{ owner_id, key },
+                );
+        }
     }
 
-    /// `release` for a caller that may not hold `key`: releases and
-    /// returns true when it does, else a no-op returning false. For a
-    /// hold that is taken and dropped more than once over its life (a
-    /// DDL barrier retaken for the finish, and by its failure path),
-    /// where the map is the one place that knows the current state.
-    pub fn tryRelease(self: *SemaphoreMap, key: u64, owner_id: u64) bool {
-        self.sl.lock();
-        const kv = self.entries.getEntry(key) orelse {
-            self.sl.unlock();
-            return false;
-        };
+    /// The release itself; caller holds `mu`. False when `owner_id`
+    /// does not hold `key`.
+    fn releaseLocked(self: *SemaphoreMap, key: u64, owner_id: u64) bool {
+        const kv = self.entries.getEntry(key) orelse return false;
         const e = kv.value_ptr.*;
-        const mode = removeOwner(&e.holders, owner_id) orelse {
-            self.sl.unlock();
-            return false;
-        };
+        const mode = removeOwner(&e.holders, owner_id) orelse return false;
         if (e.holders.items.len == 0 and e.waiters.items.len == 0) {
-            // We hold `sl` and just proved the entry drained, so drop it
+            // We hold `mu` and just proved the entry drained, so drop it
             // straight from the map — no need for reclaimLocked's
             // defensive re-lookup (that guards the error paths, which
             // don't keep a `key_ptr`). The still-locked rw needs no
             // unlock before recycling — `recycle` resets it.
             self.entries.removeByPtr(kv.key_ptr);
             self.recycle(e);
-            self.sl.unlock();
             return true;
         }
-        // Unlock the rw while still holding `sl`. Once `sl` is dropped a
+        // Unlock the rw while still holding `mu`. Once `mu` is dropped a
         // concurrent release can drain and recycle `e` — reset its rw, or
         // free it outright when a contention spike grew its lists — and
         // an rw unlock after that lands on a reset lock or freed memory
@@ -327,12 +359,11 @@ pub const SemaphoreMap = struct {
         // double free under a 64-client pgbench). The wake this may
         // issue costs a peer at most a short spin.
         e.unlock(mode);
-        self.sl.unlock();
         return true;
     }
 
     /// The entry for `key`, pulled from the pool (or created) on first
-    /// use. Caller holds `sl`.
+    /// use. Caller holds `mu`.
     fn entryFor(self: *SemaphoreMap, key: u64) !*Entry {
         const gop = try self.entries.getOrPut(self.allocator, key);
         if (gop.found_existing) return gop.value_ptr.*;
@@ -350,7 +381,7 @@ pub const SemaphoreMap = struct {
         return e;
     }
 
-    /// Drop an entry with no holders and no waiters. Caller holds `sl`.
+    /// Drop an entry with no holders and no waiters. Caller holds `mu`.
     /// Looks the entry up by key and compares pointers BEFORE any
     /// deref: callers on error paths may hold an `e` that a concurrent
     /// release already recycled (and the key may even map to a fresh
@@ -369,7 +400,7 @@ pub const SemaphoreMap = struct {
     /// the pool is full or a contention spike ballooned its lists.
     /// The rw may still be locked (release skips the unlock on the
     /// reclaim path); nothing references it anymore, so a plain reset
-    /// is sound. Caller holds `sl`.
+    /// is sound. Caller holds `mu`.
     fn recycle(self: *SemaphoreMap, e: *Entry) void {
         if (self.pool.items.len >= max_pooled or
             e.holders.capacity > max_kept_capacity or
@@ -386,7 +417,7 @@ pub const SemaphoreMap = struct {
 
     /// Pull `owner_id`'s published wait edge: its slot in the entry's
     /// waiter list and its entry in the `waiting` graph. Caller holds
-    /// `sl`.
+    /// `mu`.
     fn deregisterWaiter(self: *SemaphoreMap, e: *Entry, owner_id: u64) void {
         _ = removeOwner(&e.waiters, owner_id);
         _ = self.waiting.remove(owner_id);
@@ -406,7 +437,7 @@ pub const SemaphoreMap = struct {
     /// through `start` itself? Walks the wait-for graph from start's
     /// own blockers outward (iteratively — fiber stacks are small): if
     /// following "waits for" edges leads back to `start`, granting the
-    /// wait would deadlock. Runs under `sl`. A cycle NOT through
+    /// wait would deadlock. Runs under `mu`. A cycle NOT through
     /// `start` is impossible here — its own closing edge was refused
     /// when it was requested.
     fn wouldDeadlock(

@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const _raftlog = @import("raftwal.zig");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
 const _vfs = @import("vfs");
@@ -134,7 +133,7 @@ pub const Error = error{
     std.Io.File.StatError || std.Io.File.SetLengthError ||
     std.mem.Allocator.Error || std.fmt.BufPrintError || zen.Error;
 
-pub const EntryType = _raftlog.EntryType;
+pub const EntryType = zen.EntryTypeEnum;
 
 /// In-memory slot entry. Same shape as the on-disk zbuf format
 /// (`zen.WalSlotStruct`) so we can read the disk slot directly with no
@@ -533,26 +532,6 @@ pub const LogFile = struct {
     pub fn flushWriteBuffer(self: *LogFile, buf: String) !void {
         if (buf.len == 0) return;
         try self.handle.write(buf, self.write_offset - buf.len, .p0);
-    }
-
-    /// Extract and verify a single entry's payload from a pre-read buffer.
-    /// `buf` starts at `buf_offset` in the file. Returns a slice into `buf` (no copy).
-    pub fn readPayloadFromBuf(
-        self: *const LogFile,
-        slot_index: usize,
-        buf: String,
-        buf_offset: u64,
-    ) !String {
-        const ent = self.getEntry(slot_index) orelse return error.InvalidLogOffset;
-
-        const rec_start = ent.data_offset - @as(u32, @intCast(buf_offset));
-        const rec_end = rec_start + zbuf.Frame.hdr_size + ent.data_len;
-        if (rec_end > buf.len) return error.InvalidLogOffset;
-
-        // Frame.read validates the hash over the payload bytes; mismatched
-        // bytes (e.g. partial torn write captured in our pre-read) surface
-        // here as zbuf.Error.Invalid instead of silently returning bad data.
-        return zbuf.Frame.read(buf[rec_start..rec_end]) catch error.CrcMismatch;
     }
 
     /// Build the WAL header as a single WalHeader zbuf message and write

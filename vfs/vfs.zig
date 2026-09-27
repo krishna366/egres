@@ -157,83 +157,20 @@ pub const FileHandle = struct {
         len: usize,
         data: String = "", // filled by batchRead
         ctx: ?*anyopaque = null, // opaque pointer for caller use
+        /// The file to read; `FileHandle.batchRead` fills it in,
+        /// `VFS.batchRead` callers set it per request.
+        file: fiber.File = undefined,
     };
 
-    /// Batch multiple reads into a single io_uring submission.
-    /// Allocates page-aligned buffers from the arena for O_DIRECT compatibility.
-    /// Fills each request's .data field with the read result.
-    /// Arena owns all internal buffers — no manual cleanup needed.
-    // Max requests per io_uring submission. Must stay under the default SQ depth (256)
-    // to avoid a race where flushing the SQ mid-add triggers completions that prematurely
-    // signal the group.
-    // Must stay under io_uring SQ depth (default 256). getSqe retries once
-    // on SubmissionQueueFull, but if all SQEs are still in-flight, the retry
-    // also fails. Keep a margin below 256 for other concurrent I/O.
-    const max_batch_size: usize = 200;
-
+    /// `VFS.batchRead` over this one file: every request reads it.
     pub fn batchRead(
         self: FileHandle,
         arena: *std.heap.ArenaAllocator,
         requests: []ReadRequest,
         priority: Priority,
     ) !void {
-        if (requests.len == 0) return;
-
-        // Process in chunks to stay within io_uring SQ depth.
-        var offset: usize = 0;
-        while (offset < requests.len) {
-            const end = @min(offset + max_batch_size, requests.len);
-            try self.batchReadChunk(arena, requests[offset..end], priority);
-            offset = end;
-        }
-    }
-
-    fn batchReadChunk(
-        self: FileHandle,
-        arena: *std.heap.ArenaAllocator,
-        requests: []ReadRequest,
-        priority: Priority,
-    ) !void {
-        const alloc = arena.allocator();
-
-        // Bandwidth: acquire total bytes for this chunk before submitting.
-        {
-            var total: usize = 0;
-            for (requests) |r| total += r.len;
-            var s = self.vfs.bw.spinner(priority, total, .read);
-            defer s.deinit();
-            while (true) {
-                if (s.acquireBytes() == 0) break;
-            }
-        }
-
-        const f = self.file.?;
-
-        // One BatchOp + page-aligned buffer per request, heap-allocated from
-        // the arena (fiber stacks are small). `preadBatch` submits them all
-        // in a single libxev submission and parks once until every read
-        // completes.
-        const ops = try alloc.alloc(fiber.File.BatchOp, requests.len);
-        const bufs = try alloc.alloc([]u8, requests.len);
-
-        for (requests, 0..) |*req, i| {
-            // Page-aligned offset and size for O_DIRECT compatibility.
-            const aligned_offset = req.offset & ~@as(u64, page_size - 1);
-            const prefix: usize = @intCast(req.offset - aligned_offset);
-            const aligned_size = std.mem.alignForward(usize, prefix + req.len, page_size);
-
-            bufs[i] = try alloc.alignedAlloc(u8, page_alignment, aligned_size);
-            ops[i] = .{ .buf = bufs[i], .offset = aligned_offset };
-        }
-
-        try f.preadBatch(alloc, ops);
-
-        // Fill request .data fields from the aligned read buffers.
-        for (requests, 0..) |*req, i| {
-            _ = try ops[i].result;
-            const prefix: usize = @intCast(req.offset & (page_size - 1));
-            req.data = bufs[i][prefix .. prefix + req.len];
-        }
+        for (requests) |*req| req.file = self.file.?;
+        return self.vfs.batchRead(arena, requests, priority);
     }
 
     pub fn write(
@@ -327,6 +264,87 @@ pub const VFS = struct {
     bw: *bandwidth.Limiter,
 
     pub const Config = bandwidth.Config;
+
+    /// Batch reads, across any files, into io_uring submissions of at
+    /// most `max_batch_size` requests each. Allocates page-aligned
+    /// buffers from the arena for O_DIRECT compatibility and fills each
+    /// request's .data with the read result. Arena owns all internal
+    /// buffers — no manual cleanup needed.
+    // Max requests per io_uring submission. Must stay under the default
+    // SQ depth (256) to avoid a race where flushing the SQ mid-add
+    // triggers completions that prematurely signal the group.
+    // Must stay under io_uring SQ depth (default 256). getSqe retries once
+    // on SubmissionQueueFull, but if all SQEs are still in-flight, the retry
+    // also fails. Keep a margin below 256 for other concurrent I/O.
+    const max_batch_size: usize = 200;
+
+    pub fn batchRead(
+        self: *const VFS,
+        arena: *std.heap.ArenaAllocator,
+        requests: []FileHandle.ReadRequest,
+        priority: Priority,
+    ) !void {
+        if (requests.len == 0) return;
+
+        // Process in chunks to stay within io_uring SQ depth.
+        var offset: usize = 0;
+        while (offset < requests.len) {
+            const end = @min(offset + max_batch_size, requests.len);
+            try self.batchReadChunk(arena, requests[offset..end], priority);
+            offset = end;
+        }
+    }
+
+    fn batchReadChunk(
+        self: *const VFS,
+        arena: *std.heap.ArenaAllocator,
+        requests: []FileHandle.ReadRequest,
+        priority: Priority,
+    ) !void {
+        const alloc = arena.allocator();
+
+        // Bandwidth: acquire total bytes for this chunk before submitting.
+        {
+            var total: usize = 0;
+            for (requests) |r| total += r.len;
+            var s = self.bw.spinner(priority, total, .read);
+            defer s.deinit();
+            while (true) {
+                if (s.acquireBytes() == 0) break;
+            }
+        }
+
+        // One BatchOp + page-aligned buffer per request, heap-allocated from
+        // the arena (fiber stacks are small). `preadBatch` submits them all
+        // in a single libxev submission, whatever files they name, and
+        // parks once until every read completes.
+        const ops = try alloc.alloc(fiber.File.BatchOp, requests.len);
+        const bufs = try alloc.alloc([]u8, requests.len);
+
+        for (requests, 0..) |*req, i| {
+            // Page-aligned offset and size for O_DIRECT compatibility.
+            const aligned_offset = req.offset & ~@as(u64, page_size - 1);
+            const prefix: usize = @intCast(req.offset - aligned_offset);
+            const aligned_size =
+                std.mem.alignForward(usize, prefix + req.len, page_size);
+
+            bufs[i] = try alloc.alignedAlloc(u8, page_alignment, aligned_size);
+            ops[i] = .{
+                .file = req.file,
+                .buf = bufs[i],
+                .offset = aligned_offset,
+            };
+        }
+
+        try fiber.fs.preadBatch(alloc, ops);
+
+        // Fill request .data fields from the aligned read buffers.
+        for (requests, 0..) |*req, i| {
+            _ = try ops[i].result;
+            const prefix: usize = @intCast(req.offset & (page_size - 1));
+            req.data = bufs[i][prefix .. prefix + req.len];
+        }
+    }
 
     /// Initialize the global VFS instance with a specific bandwidth config.
     pub fn initGlobal(config: Config) void {

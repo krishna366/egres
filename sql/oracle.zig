@@ -37,7 +37,7 @@ const zdb = @import("zdb");
 
 pub const Oracle = struct {
     allocator: std.mem.Allocator,
-    mu: fiber.RWMutex(.tracked) = .{},
+    mu: fiber.RWMutex(.untracked) = .{},
     current: Generation = .{},
     previous: Generation = .{},
     /// See the module invariant. Only ever rises.

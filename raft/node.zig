@@ -1,6 +1,6 @@
 const std = @import("std");
 const fiber = @import("zfiber");
-const _raftwal = @import("raftwal.zig");
+const _diskwal = @import("diskwal.zig");
 const zen = @import("buffers_gen");
 const utils = @import("utils");
 const String = utils.String;
@@ -11,15 +11,15 @@ const Serial = _serial.Serial;
 const _metrics = @import("metrics.zig");
 const raft_log = std.log.scoped(.raft);
 
-pub const NodeId = _raftwal.NodeId;
+pub const NodeId = _diskwal.NodeId;
 pub const State = enum {
     follower,
     candidate,
     leader,
     learner,
 };
-pub const ConfChange = _raftwal.ConfChange;
-pub const ConfChangeType = _raftwal.ConfChangeType;
+pub const ConfChange = _diskwal.ConfChange;
+pub const ConfChangeType = _diskwal.ConfChangeType;
 
 pub const PeerRole = zen.RoleEnum;
 
@@ -63,7 +63,7 @@ pub const ConfigError = error{
 pub const Watermark = fiber.Watermark;
 
 pub const DiskWAL = @import("diskwal.zig").DiskWAL;
-pub const RaftLogError = _raftwal.RaftLogError;
+pub const RaftLogError = _diskwal.RaftLogError;
 
 pub const RaftError = error{
     NotLeader,
@@ -868,9 +868,9 @@ pub const Node = struct {
         if (self.state_machine) |sm| sm.snapshotInstall(snap_ptr);
     }
 
-    pub fn confState(self: *Node) !_raftwal.ConfState {
+    pub fn confState(self: *Node) !_diskwal.ConfState {
         const total = self.peers.count() + 1; // +1 for self
-        var cs_peers = try self.allocator.alloc(_raftwal.ConfStatePeer, total);
+        var cs_peers = try self.allocator.alloc(_diskwal.ConfStatePeer, total);
         errdefer self.allocator.free(cs_peers);
         @memset(cs_peers, .{});
 
@@ -1374,7 +1374,7 @@ pub const Node = struct {
             }
             if (entries_to_append.items.len > 0) {
                 dbg("node {d}: appending {d} entries to log", .{ self.id, entries_to_append.items.len });
-                try self.log.append(entries_to_append.items);
+                try self.log.addEntries(entries_to_append.items);
                 // TODO: Follower can be optimized to not run sync, and reply
                 // back with synced index. In fact, as synced index advances, it
                 // can reply back to leader without a trigger.
@@ -1455,7 +1455,7 @@ pub const Node = struct {
     /// through the raft queue with `entry_type=.snapshot`. Followers receive
     /// the byte-identical proposal via AppendEntries; on apply, every node
     /// (leader included) installs via `Node.applySnapshotEntry`.
-    pub fn proposeSnapshot(self: *Node, snap: _raftwal.Snapshot) RaftError!void {
+    pub fn proposeSnapshot(self: *Node, snap: _diskwal.Snapshot) RaftError!void {
         const buf = try zen.marshalRoot(self.allocator, snap);
         defer self.allocator.free(buf);
 
@@ -1686,7 +1686,7 @@ pub const Node = struct {
         // records into one pwrite. The fdatasync is no longer issued here;
         // mainLoop spawns it in a fiber so it can overlap with broadcast.
         const t_persist = utils.coarseMs();
-        try self.log.append(entries.items);
+        try self.log.addEntries(entries.items);
         _metrics.g().observePhase("log_append", t_persist);
 
         if (has_conf) self.pending_conf_change = true;
@@ -2088,7 +2088,7 @@ pub const Node = struct {
     }
 
     pub fn persistLog(self: *Node, entries: []const zen.LogEntryBuffer) RaftError!void {
-        try self.log.append(entries);
+        try self.log.addEntries(entries);
         try self.log.sync();
     }
 
@@ -2493,7 +2493,7 @@ pub const Node = struct {
         var entry = try writer.finishWithTail();
         defer entry.deinit();
 
-        try self.log.append(&[_]zen.LogEntryBuffer{entry});
+        try self.log.addEntries(&[_]zen.LogEntryBuffer{entry});
         try self.log.sync();
         self.advance();
         self.maybeBroadcast(true);

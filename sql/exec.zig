@@ -35,7 +35,7 @@ pub const ExecCtx = struct {
     table_id: u32,
     /// Take row locks — on the OUTPUT: Materialize gathers every row
     /// and locks them after its drain, so a row a filter discarded is
-    /// never locked and sources never lock at all. lockRow may raise
+    /// never locked and sources never lock at all. lockRows may raise
     /// Restart, so nothing reaches the wire before the last lock.
     /// Without this Materialize streams.
     lock: bool,
@@ -654,7 +654,7 @@ pub const Materialize = struct {
     /// discarded is ever locked — in (table, key) order, the order that
     /// keeps concurrent statements from cycling, taken from a separate
     /// sorted key list so the rows keep their order; and this returns
-    /// only once EVERY lock is held (lockRow may Restart the statement,
+    /// only once EVERY lock is held (lockRows may Restart the statement,
     /// which is safe exactly because nothing was written or sent yet).
     /// `batch` is scratch to drive the child.
     pub fn gatherAndLockRows(
@@ -689,7 +689,11 @@ pub const Materialize = struct {
         // Keys are distinct rows, so stability is moot; the unstable
         // sort has no scratch cache to poison-fill per statement.
         std.mem.sortUnstable(Key, keys, {}, lessThanKey);
-        for (keys) |key| try ctx.tx.lockRow(key.table_id, key.primary);
+        const hashes = try ctx.arloc.alloc(u64, keys.len);
+        for (keys, hashes) |key, *h| {
+            h.* = ctx.tx.rowHash(key.table_id, key.primary);
+        }
+        try ctx.tx.lockRows(hashes);
     }
 
     fn lessThanKey(_: void, a: Key, b: Key) bool {

@@ -153,6 +153,14 @@ pub fn Mutex(comptime track: Track) type {
                 return;
             }
 
+            // TODO: spin on `tryAcquire` for a bounded number of
+            // iterations before the slow path. `unlock` hands the lock
+            // straight to a parked waiter, so a spinner can only win
+            // while the queue is empty and never starves one; for a
+            // holder that is about to finish (SemaphoreMap's walks,
+            // microseconds) that turns a park and a cross-worker wake
+            // into a short wait. Needs a benchmark to size the bound.
+            //
             // Slow path: serialize with a concurrent `unlock` via the
             // spinlock. The re-check under sl closes the lost-wakeup
             // race — if `unlock` ran between our fast-CAS-fail and

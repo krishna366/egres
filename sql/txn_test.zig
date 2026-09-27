@@ -16,6 +16,11 @@ const Meta = zdb.kv.Meta;
 
 const ns: u64 = 16;
 const tid: u32 = 16;
+
+/// One row through `lockRows`, the way a statement locks its set.
+fn lockOne(tx: *Txn, primary: String) Txn.RowLockError!void {
+    return tx.lockRows(&.{tx.rowHash(tid, primary)});
+}
 const read_ts: u64 = 500;
 
 /// A Forest in a tmpdir with one tree for (ns, tid) and the given
@@ -178,16 +183,16 @@ test "txn: same-key re-put is last-write-wins" {
     try testing.expect(!Meta.fromByte(kvs[0].meta).isDeleted());
 }
 
-test "txn: lockRow is re-entrant and deinit releases every held lock" {
+test "txn: lockRows is re-entrant and deinit releases every held lock" {
     var fx = try Fixture.setup(&.{});
     defer fx.teardown();
     var tx = fx.txn();
 
-    try tx.lockRow(tid, "r1");
-    try tx.lockRow(tid, "r2");
+    try lockOne(&tx, "r1");
+    try lockOne(&tx, "r2");
     // Re-lock of a held row: the map answers "already yours", no second
     // hold is recorded.
-    try tx.lockRow(tid, "r1");
+    try lockOne(&tx, "r1");
     try testing.expectEqual(2, tx.held_rows.items.len);
     try testing.expectEqual(2, fx.db.row_locks.entries.count());
 
@@ -204,12 +209,12 @@ test "txn: fresh lock on a newer-committed row bumps and restarts" {
 
     // The row committed above our snapshot (read_ts 500).
     try fx.commit("r1", 600);
-    try testing.expectError(error.Restart, tx.lockRow(tid, "r1"));
+    try testing.expectError(error.Restart, lockOne(&tx, "r1"));
     // The bump happened AND the lock is held — a restart re-runs the
     // statement with both intact; the re-lock is a re-entrant no-op
     // with no second bump check.
     try testing.expectEqual(600, tx.read_ts);
-    try tx.lockRow(tid, "r1");
+    try lockOne(&tx, "r1");
     try testing.expectEqual(1, tx.held_rows.items.len);
 }
 
@@ -245,7 +250,7 @@ test "txn: bump after a prior statement's scan is a conflict" {
     tx.recordScan();
     try tx.beginStatement(); // the scan is now a PRIOR statement's
     try fx.commit("r1", 600);
-    try testing.expectError(error.Conflict, tx.lockRow(tid, "r1"));
+    try testing.expectError(error.Conflict, lockOne(&tx, "r1"));
     try testing.expectEqual(read_ts, tx.read_ts); // no bump happened
 }
 
@@ -263,7 +268,7 @@ test "txn: bump revalidates prior point reads" {
     // the prior read of k1 went stale → conflict, not a silent bump.
     try fx.commit("k1", 550);
     try fx.commit("r1", 600);
-    try testing.expectError(error.Conflict, tx.lockRow(tid, "r1"));
+    try testing.expectError(error.Conflict, lockOne(&tx, "r1"));
 }
 
 test "txn: bump with clean prior reads succeeds" {
@@ -277,7 +282,7 @@ test "txn: bump with clean prior reads succeeds" {
     try tx.beginStatement();
 
     try fx.commit("r1", 600);
-    try testing.expectError(error.Restart, tx.lockRow(tid, "r1"));
+    try testing.expectError(error.Restart, lockOne(&tx, "r1"));
     try testing.expectEqual(600, tx.read_ts);
 }
 
@@ -300,7 +305,7 @@ test "txn: bump revalidates a recorded posting read by its index key" {
         try tx.beginStatement();
 
         try fx.commit("r1", 600);
-        try testing.expectError(error.Restart, tx.lockRow(tid, "r1"));
+        try testing.expectError(error.Restart, lockOne(&tx, "r1"));
         try testing.expectEqual(600, tx.read_ts);
     }
     // Same shape, but a posting delta commits under "blue" itself —
@@ -317,7 +322,7 @@ test "txn: bump revalidates a recorded posting read by its index key" {
             .versions = .{ .one = .{ .ts = 550, .meta = .{}, .value = "" } },
         }});
         try fx.commit("r1", 600);
-        try testing.expectError(error.Conflict, tx.lockRow(tid, "r1"));
+        try testing.expectError(error.Conflict, lockOne(&tx, "r1"));
     }
 }
 
@@ -352,7 +357,7 @@ test "txn: wireKvs dedups a key re-put across a bump" {
     defer tx.deinit();
 
     try tx.put(tid, "k1", "v1", .{});
-    tx.read_ts = 600; // as a lockRow bump would
+    tx.read_ts = 600; // as a lockRows bump would
     try tx.put(tid, "k1", "v2", .{});
 
     // Two pending versions (ts 500 and 600) — the wire payload carries
@@ -375,7 +380,7 @@ test "txn: lockTable coexists with row locks and is re-entrant" {
     // A shared table lock and a row lock in the same table live
     // apart: the table lock on its RWMutex, the row in the map.
     try tx.lockTable(tid, .shared);
-    try tx.lockRow(tid, "r1");
+    try lockOne(&tx, "r1");
     try testing.expectEqual(1, tx.held_tables.items.len);
     try testing.expectEqual(1, tx.held_rows.items.len);
     try testing.expectEqual(1, fx.db.row_locks.entries.count());
