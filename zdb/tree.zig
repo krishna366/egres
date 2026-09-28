@@ -199,14 +199,14 @@ pub const TableCache = struct {
         completed: *std.atomic.Value(usize),
         done: *fiber.Watermark,
     ) void {
-        const start = fiber.coarseMs();
+        const start = utils.coarseMs();
         var last_warn = start;
         while (completed.load(.acquire) < total) {
             done.waitFor(total, 500) catch |err| switch (err) {
                 error.Timeout => {},
                 else => return,
             };
-            const now = fiber.coarseMs();
+            const now = utils.coarseMs();
             if (now - last_warn >= 15_000) {
                 log.warn(
                     "loadTables watchdog: {d}/{d} opens completed after {d}manifest",

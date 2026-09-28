@@ -23,8 +23,8 @@
 //! and reports `ns/op` (+ `MiB/s` when `setBytes` was called).
 
 const std = @import("std");
-const fiber = @import("zfiber");
-const context = fiber.context;
+const _rt = @import("runtime.zig");
+const context = @import("utils").context;
 
 inline fn nowNs() i128 {
     return std.Io.Timestamp.now(context.g().io, .real).nanoseconds;
@@ -125,14 +125,14 @@ pub fn deinitRegistry() void {
 }
 
 pub fn register(b: *Bench) void {
-    const task = fiber.currentFiberOrNull() orelse return;
+    const task = _rt.currentFiberOrNull() orelse return;
     mapLock();
     defer mapUnlock();
     if (map) |*m| m.put(@intFromPtr(task), b) catch {};
 }
 
 pub fn unregister() void {
-    const task = fiber.currentFiberOrNull() orelse return;
+    const task = _rt.currentFiberOrNull() orelse return;
     mapLock();
     defer mapUnlock();
     if (map) |*m| _ = m.remove(@intFromPtr(task));
@@ -141,7 +141,8 @@ pub fn unregister() void {
 /// Fetch the current fiber's `Bench` handle. The runner sets this up
 /// before calling each `BENCH: …` test. Panics if called outside one.
 pub fn current() *Bench {
-    const task = fiber.currentFiberOrNull() orelse @panic("bench.current() requires a fiber context");
+    const task = _rt.currentFiberOrNull() orelse
+        @panic("bench.current() requires a fiber context");
     mapLock();
     defer mapUnlock();
     if (map) |*m| {

@@ -23,7 +23,7 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const utils = @import("utils");
-const bench = utils.bench;
+const bench = fiber.bench;
 const Bench = bench.Bench;
 
 const Fiber = fiber.Fiber;

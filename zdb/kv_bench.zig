@@ -18,9 +18,10 @@
 
 const std = @import("std");
 const utils = @import("utils");
+const fiber = @import("zfiber");
 const String = utils.String;
 const zdb = @import("zdb");
-const bench = utils.bench;
+const bench = fiber.bench;
 const Bench = bench.Bench;
 const Key = zdb.kv.Key;
 

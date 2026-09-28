@@ -936,7 +936,7 @@ pub const LogBuf = struct {
         dw.mu.unlock();
 
         const b = batch orelse return false;
-        const started = fiber.timestampNow(.monotonic, .micros);
+        const started = utils.timestampNow(.monotonic, .micros);
         self.write(b) catch |err| {
             std.log.err("raft/diskwal: batch write through index {d}: {s}", .{
                 b.last_index, @errorName(err),
@@ -945,7 +945,7 @@ pub const LogBuf = struct {
             fiber.sleepMs(100);
             return true;
         };
-        const done = fiber.timestampNow(.monotonic, .micros);
+        const done = utils.timestampNow(.monotonic, .micros);
         if (dw.on_written) |hook| hook.call(hook.ctx, .{
             .first_index = b.first_index,
             .last_index = b.last_index,

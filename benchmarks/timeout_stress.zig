@@ -159,7 +159,7 @@ fn next(state: *u64) u64 {
 }
 
 fn monoMs() i64 {
-    return fiber.timestampNow(.monotonic, .millis);
+    return utils.timestampNow(.monotonic, .millis);
 }
 
 /// Random index in `[0, n)` (bridges the u64 RNG and the usize length).
@@ -327,7 +327,7 @@ fn printWorkerCpu() void {
 /// the op rate over the last window. Also doubles as a liveness proof between
 /// the start banner and the final summary.
 fn heartbeat(sh: *const Shared, elapsed_ms: i64, win_ms: i64, win_ops: u64, live_fibers: usize) void {
-    const rt_ms = fiber.timestampNow(.realtime, .millis);
+    const rt_ms = utils.timestampNow(.realtime, .millis);
     const day: u64 = @intCast(@mod(@divFloor(rt_ms, 1000), 86400));
     const el_s: u64 = @intCast(@divFloor(elapsed_ms, 1000));
     const rate: u64 = if (win_ms > 0) win_ops * 1000 / @as(u64, @intCast(win_ms)) else 0;

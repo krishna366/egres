@@ -164,7 +164,7 @@ pub const S3Store = struct {
             self.pool_mu.lock(@src());
             defer self.pool_mu.unlock();
 
-            const now = fiber.coarseMs();
+            const now = utils.coarseMs();
             while (self.idle.pop()) |c| {
                 if (now - c.since_ms > idle_ttl_ms) {
                     c.conn.deinit(self.a);
@@ -187,7 +187,7 @@ pub const S3Store = struct {
         // anyway. Comptime integer math (7/10 of 30s = 21s exactly), so
         // the i64 time comparison never touches floats.
         const displace_age_ms = idle_ttl_ms * 7 / 10;
-        const now = fiber.coarseMs();
+        const now = utils.coarseMs();
         if (self.idle.items.len >= pool_cap) {
             for (self.idle.items, 0..) |prev, i| {
                 if (now - prev.since_ms < displace_age_ms) {
@@ -461,7 +461,8 @@ pub const S3Store = struct {
         ttfb_ns: ?*u64,
     ) !Response {
         const a = self.a;
-        const amz = _sigv4.AmzDate.fromEpochSeconds(@intCast(@divTrunc(fiber.coarseMs(), 1000)));
+        const now_s: u64 = @intCast(@divTrunc(utils.coarseMs(), 1000));
+        const amz = _sigv4.AmzDate.fromEpochSeconds(now_s);
         const payload_hash = _sigv4.hashHex(body orelse "");
         const auth = try _sigv4.authorization(
             a,
@@ -506,9 +507,9 @@ pub const S3Store = struct {
 
         const reader = conn.rd();
         if (ttfb_ns) |out| {
-            const sent = fiber.timestampNow(.monotonic, .nanos);
+            const sent = utils.timestampNow(.monotonic, .nanos);
             _ = reader.peekByte() catch return error.BadResponse;
-            out.* = @intCast(fiber.timestampNow(.monotonic, .nanos) - sent);
+            out.* = @intCast(utils.timestampNow(.monotonic, .nanos) - sent);
         }
         return parseResponse(reader, a, method, want_body);
     }
@@ -529,12 +530,13 @@ pub const S3Store = struct {
         defer self.a.free(path);
         const conn = try self.getConn(false);
         var ttfb: u64 = 0;
-        const t0 = fiber.timestampNow(.monotonic, .nanos);
+        const t0 = utils.timestampNow(.monotonic, .nanos);
         var resp = self.requestOnce(conn, "GET", path, "", null, .{ off, len }, true, &ttfb) catch |err| {
             conn.deinit(self.a);
             return err;
         };
-        const total: u64 = @intCast(fiber.timestampNow(.monotonic, .nanos) - t0);
+        const total: u64 =
+            @intCast(utils.timestampNow(.monotonic, .nanos) - t0);
         if (resp.conn_close) conn.deinit(self.a) else self.putConn(conn);
         defer resp.deinit(self.a);
         if (resp.status != 200 and resp.status != 206) return error.S3Error;

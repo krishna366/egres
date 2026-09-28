@@ -1,6 +1,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const fiber = @import("zfiber");
+const utils = @import("utils");
 const linux = std.os.linux;
 
 const BLOCK_SIZE: usize = 4096;
@@ -42,7 +43,7 @@ fn blockingUnlink(path: [*:0]const u8) void {
 }
 
 /// Monotonic nanoseconds. 0.16 removed `std.time.nanoTimestamp`; this is
-/// the direct CLOCK_MONOTONIC read (same pattern as `fiber.timestampNow`)
+/// the direct CLOCK_MONOTONIC read (same pattern as `utils.timestampNow`)
 /// — and monotonic is the right base for measuring op latencies anyway.
 fn nowNs() i64 {
     var tp: std.posix.timespec = undefined;
@@ -439,7 +440,7 @@ const usage =
 pub fn main(init: std.process.Init) !void {
     // The fiber runtime's coarse clock reads time via `context.g().io`, so the
     // process context must be initialized before any `fiber.Runtime.init`.
-    fiber.context.initGlobal(init);
+    utils.context.initGlobal(init);
 
     const allocator = std.heap.smp_allocator;
     const num_cores = std.Thread.getCpuCount() catch 4;

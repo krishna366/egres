@@ -13,7 +13,7 @@ pub const PhaseLabels = struct {
     phase: String,
 };
 
-// Millisecond bucket boundaries. fiber.coarseMs ticks ~every 1 ms, so any
+// Millisecond bucket boundaries. utils.coarseMs ticks ~every 1 ms, so any
 // sub-ms phase lands in the lowest bucket — a tail above ~10 ms points
 // at fsync stalls or scheduling hazards. Last bucket = 1 s.
 const phase_buckets: []const u64 = &.{ 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000 };
@@ -95,12 +95,12 @@ pub const Metrics = struct {
         return m.initializeNoop(Metrics);
     }
 
-    /// Observe `fiber.coarseMs() - start_ms` on the named phase. Errors
+    /// Observe `utils.coarseMs() - start_ms` on the named phase. Errors
     /// from the underlying allocator (only possible the first time a new
     /// label is seen) are swallowed — losing one sample beats taking down
     /// the leader.
     pub fn observePhase(self: *Metrics, phase: String, start_ms: i64) void {
-        const elapsed_ms: u64 = @intCast(fiber.coarseMs() - start_ms);
+        const elapsed_ms: u64 = @intCast(utils.coarseMs() - start_ms);
         self.propose_phase_ms.observe(.{ .phase = phase }, elapsed_ms) catch {};
     }
 

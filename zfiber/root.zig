@@ -28,11 +28,6 @@ const _rt = @import("runtime.zig");
 
 pub const Worker = _rt.Worker;
 pub const Runtime = _rt.Runtime;
-pub const CoarseClock = _rt.CoarseClock;
-pub const coarseMs = _rt.coarseMs;
-pub const timestampNow = @import("coarse_clock.zig").timestampNow;
-pub const ClockKind = @import("coarse_clock.zig").ClockKind;
-pub const TimeUnit = @import("coarse_clock.zig").TimeUnit;
 pub const Deadlines = _rt.Deadlines;
 pub const Timeout = _rt.Timeout;
 pub const Stats = _rt.Stats;
@@ -75,6 +70,10 @@ pub const RWMutex = _sync.RWMutex;
 pub const Notify = _sync.Notify;
 pub const Event = _sync.Event;
 
+// Mutex-protected containers for state shared between fibers.
+pub const SafeHashMap = @import("safe_hash_map.zig").SafeHashMap;
+pub const SafeArray = @import("safe_array.zig").SafeArray;
+
 // Lock-holder tracking for the tracked Mutex/RWMutex modes — `dumpLocks`
 // answers "which locks are held, by what code?" on a wedged server.
 const _lock_registry = @import("lock_registry.zig");
@@ -95,10 +94,8 @@ pub const Watermark = _watermark.Watermark;
 // with optional SIGINT/SIGTERM wiring via the self-pipe trick.
 pub const Shutdown = @import("shutdown.zig").Shutdown;
 
-// Process-wide context (gpa/arena/io/args). Lives here — the universal base
-// module — so any layer can reach it without a cycle (utils re-exports it as
-// `utils.context` for existing callers). `coarse_clock` reads `context.g().io`.
-pub const context = @import("context.zig");
+// The `BENCH:` test harness: keeps its handle on the current fiber.
+pub const bench = @import("bench.zig");
 
 pub const SemaphoreMap = @import("semaphore_map.zig").SemaphoreMap;
 

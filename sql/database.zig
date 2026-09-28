@@ -60,7 +60,7 @@ pub const Database = struct {
     /// Table locks, one RWMutex per table id, created on first use
     /// by `tableLock` and never freed (table ids are
     /// never reused; a dropped table's entry is a few bytes).
-    table_locks: utils.SafeHashMap(u32, *RWMutex),
+    table_locks: fiber.SafeHashMap(u32, *RWMutex),
     oracle: Oracle,
     /// Per-table cache: compiled schema + egid counter, keyed by table_id
     /// (the namespace is this database's). Guards the map; each table's
@@ -80,7 +80,7 @@ pub const Database = struct {
             .ns = ns,
             .allocator = allocator,
             .row_locks = try fiber.SemaphoreMap.init(allocator),
-            .table_locks = utils.SafeHashMap(u32, *RWMutex).init(allocator),
+            .table_locks = fiber.SafeHashMap(u32, *RWMutex).init(allocator),
             .oracle = Oracle.init(allocator),
             .tables = std.AutoHashMap(u32, *_table.Table).init(allocator),
         };

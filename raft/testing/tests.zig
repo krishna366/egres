@@ -20,7 +20,7 @@ const NodeId = raft.NodeId;
 // chain appears to wedge) while transport connection churn continues
 // (finished≈276). Needs a focused debugging session (per-fiber stacks /
 // instrumentation). `cluster.zig` itself is now fixed for Zig 0.16
-// (nanoTimestamp→fiber.coarseMs, std.fs→vfs). Diskwal tests run separately.
+// (nanoTimestamp→utils.coarseMs, std.fs→vfs). Diskwal tests run separately.
 test "all" {
     return error.SkipZigTest;
 }

@@ -3088,7 +3088,7 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     // Four SST-named files the manifest never heard of. Three are backdated
     // two hours, one a minute — the young one stands in for a file written
     // after the cutoff: some writer may still be working on it.
-    const now = fiber.timestampNow(.realtime, .secs);
+    const now = utils.timestampNow(.realtime, .secs);
     const old_junk = [_]u64{ 0xdead, 0xbeef, 0xcafe };
     const young_junk: u64 = 0xf00d;
     for (old_junk ++ [_]u64{young_junk}, 0..) |id, i| {

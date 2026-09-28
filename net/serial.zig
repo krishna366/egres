@@ -51,7 +51,7 @@ pub const Serial = struct {
             .read_buf = read_buf,
             .buf_reader = tcp_stream.reader(read_buf),
             .outbound = try fiber.Channel(OutboundMsg).initAlloc(allocator, 256),
-            .last_recv_ms = std.atomic.Value(i64).init(fiber.coarseMs()),
+            .last_recv_ms = std.atomic.Value(i64).init(utils.coarseMs()),
             .closed = false,
             .drop_messages = std.atomic.Value(bool).init(false),
         };
@@ -170,7 +170,7 @@ pub const Serial = struct {
             defer if (msg.payload.len > 0) self.allocator.free(msg.payload);
 
             // Update the liveness of this connection.
-            self.last_recv_ms.store(fiber.coarseMs(), .release);
+            self.last_recv_ms.store(utils.coarseMs(), .release);
             if (msg.message_type == msg_type_pong) continue; // liveness ack, nothing to do
             if (msg.message_type == msg_type_ping) {
                 self.send(msg_type_pong, &.{}) catch |err| {

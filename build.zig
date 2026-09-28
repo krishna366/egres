@@ -215,7 +215,7 @@ fn makeModules(
     fiber.addImport("zio", zio);
     fiber.addImport("xev", xev);
 
-    utils.addImport("zfiber", fiber);
+    fiber.addImport("utils", utils);
     flags.addImport("zfiber", fiber);
     vfs.addImport("zfiber", fiber);
 
@@ -739,6 +739,14 @@ fn addZioBench(
     const fiber = makeModule(b, target, opt, "zfiber/root.zig");
     fiber.addImport("zio", zio);
     fiber.addImport("xev", xev);
+    // zfiber reads the process context and drives the coarse clock in
+    // utils; a ReleaseFast utils to match (its C includes are unused
+    // here, but the module declares them).
+    const utils = makeModule(b, target, opt, "u/utils.zig");
+    utils.addIncludePath(b.path("."));
+    utils.addIncludePath(b.path("third_party/lz4/lib"));
+    utils.addIncludePath(b.path("third_party/zstd/lib"));
+    fiber.addImport("utils", utils);
 
     const exe = b.addExecutable(.{
         .name = "bench-zio",
@@ -746,6 +754,7 @@ fn addZioBench(
     });
     exe.root_module.addImport("zio", zio);
     exe.root_module.addImport("zfiber", fiber);
+    exe.root_module.addImport("utils", utils);
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("bench-zio", "Build the thread/zio/fiber benchmark (always ReleaseFast)");

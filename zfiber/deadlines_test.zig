@@ -1,10 +1,11 @@
 const std = @import("std");
 const fiber = @import("zfiber");
+const utils = @import("utils");
 
 /// Fresh monotonic ms — same source `Deadlines.register` / `onTimer`
 /// use. Direct vDSO read; no cache lag under load.
 fn nowMs() i64 {
-    return fiber.timestampNow(.monotonic, .millis);
+    return utils.timestampNow(.monotonic, .millis);
 }
 
 /// Minimal `on_fire` context: stamps WHEN the timeout fired. `Timeout` is a
@@ -158,10 +159,10 @@ test "sleepMs: 100 fibers sleeping 10ms in parallel finish under 50ms" {
     defer g.deinit();
     try g.ensureTotalCapacity(100);
 
-    const start = fiber.coarseMs();
+    const start = utils.coarseMs();
     for (0..100) |_| try g.spawn(.{}, Body.run, .{&counter});
     g.wait();
-    const elapsed = fiber.coarseMs() - start;
+    const elapsed = utils.coarseMs() - start;
 
     try std.testing.expectEqual(@as(u32, 100), counter.load(.acquire));
     // Concurrency check: 100 × sleep(10) serially would be ~1000 ms;
@@ -183,10 +184,10 @@ test "sleepMs: single fiber sleeps for the requested duration" {
         }
     };
 
-    const start = fiber.coarseMs();
+    const start = utils.coarseMs();
     var h = try fiber.spawn(.{}, Body.run, .{});
     h.join();
-    const elapsed = fiber.coarseMs() - start;
+    const elapsed = utils.coarseMs() - start;
 
     if (elapsed < 19 or elapsed >= 200) {
         std.log.err("elapsed = {d} ms (expected 19 <= elapsed < 200)", .{elapsed});

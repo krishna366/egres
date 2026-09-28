@@ -165,7 +165,7 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
     // the dip.
     for (0..2 * probe_repeats) |sweep| {
         fiber.sleepMs(300);
-        const start_ms = fiber.coarseMs();
+        const start_ms = utils.coarseMs();
         const before = probes.items.len;
         for (heavy.items) |sz| {
             const s = store.probeRead(randomOffset(rand, sz), sz) catch |err| {
@@ -176,7 +176,7 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
         }
         log.info("lookahead sweep {d}/{d}: {d} probes across {d} sizes in {d} ms ({d} total)", .{
             sweep + 1,       2 * probe_repeats,           probes.items.len - before,
-            heavy.items.len, fiber.coarseMs() - start_ms, probes.items.len,
+            heavy.items.len, utils.coarseMs() - start_ms, probes.items.len,
         });
     }
 

@@ -8,11 +8,12 @@
 
 const std = @import("std");
 const utils = @import("utils");
+const fiber = @import("zfiber");
 const String = utils.String;
 const raft = @import("raft");
 const vfs = @import("vfs");
 const zen = raft.buffers;
-const bench = utils.bench;
+const bench = fiber.bench;
 const Bench = bench.Bench;
 
 const dir_root = "/data";

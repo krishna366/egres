@@ -24,7 +24,7 @@ const xev = @import("xev");
 const _fb = @import("fiber.zig");
 const _rt = @import("runtime.zig");
 const _fsops = @import("fsops.zig");
-const _context = @import("context.zig");
+const _context = @import("utils").context;
 
 const net_log = std.log.scoped(.net);
 

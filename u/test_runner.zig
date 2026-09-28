@@ -44,11 +44,11 @@ const Tty = struct {
         return .{};
     }
 };
-// Reach into utils module rather than @import("bench.zig") so the runner
-// and any test importing utils.bench end up sharing the same module tree
-// (avoids "file exists in two modules" errors).
+// Reach into the zfiber module rather than @import("bench.zig") so the
+// runner and any test importing fiber.bench end up sharing the same
+// module tree (avoids "file exists in two modules" errors).
 const utils = @import("utils");
-const bench = utils.bench;
+const bench = fiber.bench;
 const String = utils.String;
 
 // ════════════════════════════════════════════════════════════════════════

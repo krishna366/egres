@@ -7,7 +7,8 @@
 const std = @import("std");
 const proto = @import("engine").admin;
 const utils = @import("utils");
-const bench = utils.bench;
+const fiber = @import("zfiber");
+const bench = fiber.bench;
 const Bench = bench.Bench;
 
 /// Build a set-batch body in memory: `count` records of (key + ' ' + value

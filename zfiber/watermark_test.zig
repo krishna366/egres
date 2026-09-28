@@ -1,10 +1,11 @@
 const std = @import("std");
 const fiber = @import("zfiber");
+const utils = @import("utils");
 
 /// Direct vDSO monotonic ms — accurate elapsed measurement without the
 /// coarse clock's loop-tick lag.
 fn nowMs() i64 {
-    return fiber.timestampNow(.monotonic, .millis);
+    return utils.timestampNow(.monotonic, .millis);
 }
 
 test "Watermark: waitForUntimed returns when value crosses target" {

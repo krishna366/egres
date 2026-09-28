@@ -1,14 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fiber = @import("zfiber");
+const utils = @import("utils");
 
 /// CPU to be sampled: a loop the optimizer cannot remove. `noinline`
 /// so it has a frame of its own to find in the profile.
 noinline fn burn(ms: u64) u64 {
-    const end = fiber.timestampNow(.monotonic, .millis) +
+    const end = utils.timestampNow(.monotonic, .millis) +
         @as(i64, @intCast(ms));
     var x: u64 = 0x9e3779b97f4a7c15;
-    while (fiber.timestampNow(.monotonic, .millis) < end) {
+    while (utils.timestampNow(.monotonic, .millis) < end) {
         var i: u32 = 0;
         while (i < 200_000) : (i += 1) {
             x ^= x << 13;

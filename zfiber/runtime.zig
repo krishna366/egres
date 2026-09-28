@@ -23,12 +23,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const xev = @import("xev");
 const _fb = @import("fiber.zig");
-const _coarse = @import("coarse_clock.zig");
+const _coarse = @import("utils").coarse_clock;
 const _deadlines = @import("deadlines.zig");
 const _spinlock = @import("spinlock.zig");
 const _queue = @import("queue.zig");
 const _fsops = @import("fsops.zig");
-const _context = @import("context.zig");
+const _context = @import("utils").context;
 
 /// Flush a busy worker's io_uring SQ once this many SQEs have queued, so reads
 /// issued by running fibers dispatch promptly instead of waiting for the ~1 ms
@@ -64,7 +64,6 @@ const YieldIntent = _fb.YieldIntent;
 const LockedLocalQueue = _queue.LocalQueue(.withlock);
 const IdleWorkers = _queue.IdleWorkers;
 
-pub const CoarseClock = _coarse.CoarseClock;
 pub const Deadlines = _deadlines.Deadlines;
 pub const Timeout = _deadlines.Timeout;
 pub const Spinlock = _spinlock.Spinlock;
@@ -90,13 +89,6 @@ var g_rt: ?*Runtime = null;
 /// through this.
 pub fn runtime() *Runtime {
     return g_rt orelse @panic("fiber runtime not initialized");
-}
-
-/// Coarse monotonic milliseconds from the singleton runtime's clock.
-/// Convenience for code that isn't holding a `*Runtime`. Panics if no
-/// runtime is initialized.
-pub inline fn coarseMs() i64 {
-    return runtime().ms();
 }
 
 /// Contiguous worker-id range owned by a lane. `len == 0` means the
@@ -644,8 +636,7 @@ pub const Worker = struct {
         // in full-system idle, which is benign (no fiber is running to read
         // it). Seed it once here so ms() is fresh before this worker
         // dispatches its first fiber.
-        const clock = &runtime().clock;
-        clock.update();
+        _coarse.update();
 
         // Arm the cross-thread wake handle. The callback re-arms
         // automatically; its only job is to unstick `loop.run(.once)`
@@ -684,7 +675,7 @@ pub const Worker = struct {
                 // accounting below, so the per-iteration cost is a subtract +
                 // compare; the write-guard in `update` keeps it to ~1 store/ms
                 // across all workers.
-                clock.update();
+                _coarse.update();
                 self.last_coarse_clock_ticks = enter;
             }
 
@@ -918,7 +909,6 @@ fn raftWorkerCount(num_workers: usize, requested: ?usize) usize {
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     workers: []Worker,
-    clock: CoarseClock,
     /// Registry of every fiber the runtime owns. Multi-worker means
     /// multiple threads can `spawn` concurrently → spinlock guards
     /// the ArrayList mutation. Reads (`stats`, `dumpFibers`) take
@@ -1014,7 +1004,9 @@ pub const Runtime = struct {
             initialized += 1;
         }
 
-        self.clock = CoarseClock.init();
+        // Seed the process-wide coarse clock so `coarseMs` is valid the
+        // instant init returns, before any worker ticks it.
+        _coarse.update();
 
         // Blocking-I/O offload pool (fsync + fs metadata). Started before we
         // publish the singleton; no jobs arrive until fibers run.
@@ -1034,7 +1026,6 @@ pub const Runtime = struct {
             f.deinit(self.allocator);
         }
         self.fibers.deinit(self.allocator);
-        self.clock.deinit();
         for (self.workers) |*w| w.deinit();
         self.allocator.free(self.workers);
         g_rt = null;
@@ -1188,10 +1179,6 @@ pub const Runtime = struct {
 
     /// Coarse monotonic ms. One atomic load — safe from any worker
     /// thread, cheap on every call.
-    pub inline fn ms(self: *const Runtime) i64 {
-        return self.clock.ms();
-    }
-
     pub fn stats(self: *Runtime) Stats {
         self.fibers_sl.lock();
         defer self.fibers_sl.unlock();
@@ -1375,7 +1362,7 @@ pub fn park() void {
     // a concurrent `wake` can't make us runnable on another worker before
     // our context is saved (which would let two workers step one coro).
     std.debug.assert(old.tag == .ready);
-    f.parked_since_ms = runtime().clock.ms();
+    f.parked_since_ms = _coarse.ms();
 
     f.intent = .park;
     f.coro.yield();
@@ -1542,7 +1529,7 @@ pub fn dumpWorkerCpu(writer: *std.Io.Writer) !void {
 pub fn dumpFibers(rt: *Runtime, writer: *std.Io.Writer) !void {
     rt.fibers_sl.lock();
     defer rt.fibers_sl.unlock();
-    const now_ms = rt.clock.ms();
+    const now_ms = _coarse.ms();
 
     // Only `.waiting` fibers have a stable stack to walk and a `parked_for` to
     // rank by; collect them so we can list the longest-parked first (most

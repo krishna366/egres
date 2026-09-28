@@ -137,7 +137,8 @@ pub const ProposalWaiter = struct {
     pub fn wait(self: *ProposalWaiter) CommitStatus {
         self.done.wait();
         if (self.entry.index != 0) {
-            _metrics.timeline().record(self.entry.index, .woken, fiber.timestampNow(.monotonic, .micros));
+            const woken_us = utils.timestampNow(.monotonic, .micros);
+            _metrics.timeline().record(self.entry.index, .woken, woken_us);
         }
         return self.status;
     }
@@ -271,7 +272,7 @@ pub const Node = struct {
     // nodes have acknowledged it and which have failed — so we know if we have
     // reached quorum or not. Each peer starts at .sent; its batch response
     // flips it to .ok ("I have every announced file") or .fail.
-    pending_announce: utils.SafeHashMap(u64, *Announce),
+    pending_announce: fiber.SafeHashMap(u64, *Announce),
     /// Monotonic within a boot, seeded randomly at init (see the seed
     /// derivation there) so ids never repeat across restarts.
     next_announce_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
@@ -282,7 +283,7 @@ pub const Node = struct {
         fail = 2,
     };
     const Announce = struct {
-        nodes: utils.SafeHashMap(u64, Status),
+        nodes: fiber.SafeHashMap(u64, Status),
     };
 
     /// Proposal type is the same enum used in the WAL frame's entry_type.
@@ -337,7 +338,8 @@ pub const Node = struct {
             .config = config,
             .allocator = allocator,
             .prng = prng,
-            .pending_announce = utils.SafeHashMap(u64, *Announce).init(allocator),
+            .pending_announce = fiber.SafeHashMap(u64, *Announce)
+                .init(allocator),
             .next_announce_id = std.atomic.Value(u64).init(announce_base),
             .commit_index = Watermark.init(allocator),
             .applied_ts = Watermark.init(allocator),
@@ -659,7 +661,9 @@ pub const Node = struct {
 
         const announce_id = self.next_announce_id.fetchAdd(1, .monotonic);
         const ann = try self.allocator.create(Announce);
-        ann.* = .{ .nodes = utils.SafeHashMap(u64, Status).init(self.allocator) };
+        ann.* = .{
+            .nodes = fiber.SafeHashMap(u64, Status).init(self.allocator),
+        };
         {
             var peer_it = self.peers.iterator();
             while (peer_it.next()) |kv| try ann.nodes.put(kv.key_ptr.*, .sent);
@@ -1476,12 +1480,12 @@ pub const Node = struct {
     /// commit) and are unaffected.
     pub fn proposeAndWaitForApply(self: *Node, data: String, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
-        const start_ms = fiber.coarseMs();
+        const start_ms = utils.coarseMs();
         var w: ProposalWaiter = .{ .wait_for = .apply };
         try self.propose(data, proposal_type, &w);
         const status = w.wait();
 
-        const took_ms = fiber.coarseMs() - start_ms;
+        const took_ms = utils.coarseMs() - start_ms;
         if (took_ms > 5_000) {
             // The timeline's slot, if the ring still has it, says where
             // the time went; `woken` was recorded by `wait`.
@@ -1512,9 +1516,9 @@ pub const Node = struct {
         // client doesn't sit forever if the SM is genuinely stuck.
         if (self.state_machine) |sm| {
             if (proposal_type == .data and !sm.isReady()) {
-                const deadline = fiber.coarseMs() + 1000; // 1s
+                const deadline = utils.coarseMs() + 1000; // 1s
                 while (!sm.isReady()) {
-                    if (fiber.coarseMs() >= deadline) return error.NotReady;
+                    if (utils.coarseMs() >= deadline) return error.NotReady;
                     fiber.sleepMs(10);
                 }
             }
@@ -1551,7 +1555,7 @@ pub const Node = struct {
         // Sub-phase: propose_build — walk requests, validate + serialize each
         // into a LogEntryBuffer, register the apply callback. Pure CPU work
         // (no I/O); anything > 1 ms/batch points at zbuf encoding cost.
-        const t_build = fiber.coarseMs();
+        const t_build = utils.coarseMs();
 
         var entries = std.ArrayList(zen.LogEntryBuffer).empty;
         defer {
@@ -1679,7 +1683,7 @@ pub const Node = struct {
         // Sub-phase: propose_persist — DiskWAL.append batches the framed
         // records into one pwrite. The fdatasync is no longer issued here;
         // mainLoop spawns it in a fiber so it can overlap with broadcast.
-        const t_persist = fiber.coarseMs();
+        const t_persist = utils.coarseMs();
         try self.log.append(entries.items);
         _metrics.g().observePhase("log_append", t_persist);
 
@@ -1802,7 +1806,7 @@ pub const Node = struct {
                         // (e.g. a batched forest.put). Lets us see whether
                         // the apply path is the bottleneck when commit
                         // outpaces apply.
-                        const t_apply = fiber.coarseMs();
+                        const t_apply = utils.coarseMs();
                         // Timeline: queueing behind earlier entries, and the
                         // apply call itself, split.
                         const picked_us = nowUs();
@@ -1933,14 +1937,14 @@ pub const Node = struct {
     /// The timeline's clock: monotonic microseconds, since it only
     /// takes differences.
     fn nowUs() i64 {
-        return fiber.timestampNow(.monotonic, .micros);
+        return utils.timestampNow(.monotonic, .micros);
     }
 
     /// Main processing loop. Blocks on the event notifier, drains inbound messages,
     /// processes proposals, advances state, and broadcasts to peers.
     pub fn mainLoop(self: *Node, tick_interval_ms: u32) void {
         const tick_ms: i64 = @as(i64, tick_interval_ms);
-        var last_tick: i64 = fiber.coarseMs();
+        var last_tick: i64 = utils.coarseMs();
 
         while (!self.isShuttingDown()) {
             self.event_notify.wait();
@@ -1950,7 +1954,7 @@ pub const Node = struct {
             // We observe even when the queue was empty: the histogram includes
             // a 0-bucket sample, which is information about how often the loop
             // ran without inbound work to do.
-            var t = fiber.coarseMs();
+            var t = utils.coarseMs();
             while (self.inbound_ch.tryReceive()) |msg| {
                 defer self.allocator.free(msg.payload);
                 switch (msg.message_type) {
@@ -1968,7 +1972,7 @@ pub const Node = struct {
             // Phase: propose — drain proposal queue, build entries, persist,
             // register apply callbacks. Sub-phases ("propose_build" and
             // "propose_persist") are observed inside appendProposalsToLeaderLog.
-            t = fiber.coarseMs();
+            t = utils.coarseMs();
             _ = self.processProposalRequests() catch {};
             _metrics.g().observePhase("propose", t);
             const log_grew = self.log.lastIndex() > last_before;
@@ -1979,14 +1983,14 @@ pub const Node = struct {
             // `log.syncedIndex()`. mainLoop never waits on the disk.
 
             // Phase: advance — advanceCommitIndex + applyConfChanges + notify.
-            t = fiber.coarseMs();
+            t = utils.coarseMs();
             self.advance();
             _metrics.g().observePhase("advance", t);
 
             const ci_advanced = self.commit_index.load() > ci_before;
 
             var heartbeat_due = false;
-            const now = fiber.coarseMs();
+            const now = utils.coarseMs();
             if (now - last_tick >= tick_ms) {
                 heartbeat_due = self.tick() catch false;
                 last_tick = now;
@@ -1994,7 +1998,7 @@ pub const Node = struct {
 
             // Phase: broadcast — for multi-voter clusters, the WAL fsync
             // runs concurrently with these network sends.
-            t = fiber.coarseMs();
+            t = utils.coarseMs();
             self.maybeBroadcast(heartbeat_due or ci_advanced or log_grew);
             _metrics.g().observePhase("broadcast", t);
         }

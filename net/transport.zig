@@ -456,7 +456,7 @@ pub const Transport = struct {
                 self.mu.lock(@src());
                 defer self.mu.unlock();
 
-                const now = fiber.coarseMs();
+                const now = utils.coarseMs();
                 var peer_it = self.peers.iterator();
                 while (peer_it.next()) |kv| {
                     const slot = kv.value_ptr.*;

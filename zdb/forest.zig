@@ -468,7 +468,7 @@ pub const Forest = struct {
     /// The map guards itself, and a TableTrees once inserted is never freed
     /// (a dropped table's stays, empty — see `TableTrees.hasTrees`), so
     /// `getTable` needs no lock and its result never dangles.
-    tables: utils.SafeHashMap(TableKey, *TableTrees),
+    tables: fiber.SafeHashMap(TableKey, *TableTrees),
     table_cache: TableCache,
     memtables: Memtables,
     /// The read floor: the oldest timestamp a reader may ask for. Every
@@ -557,7 +557,7 @@ pub const Forest = struct {
             .allocator = allocator,
             .live = live,
             .manifest = manifest,
-            .tables = utils.SafeHashMap(TableKey, *TableTrees).init(allocator),
+            .tables = fiber.SafeHashMap(TableKey, *TableTrees).init(allocator),
             .table_cache = TableCache.init(allocator, opts.dir),
             .memtables = Memtables.init(allocator, mt),
             .global_min_read = std.atomic.Value(u64).init(0),

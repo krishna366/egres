@@ -11,6 +11,7 @@
 const std = @import("std");
 const engine = @import("engine");
 const fiber = @import("zfiber");
+const utils = @import("utils");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 const zen = zdb.buffers;
@@ -773,7 +774,7 @@ pub const Handler = struct {
             db,
             eng.forest,
         );
-        t.start_us = fiber.timestampNow(.realtime, .micros);
+        t.start_us = utils.timestampNow(.realtime, .micros);
         return t;
     }
 

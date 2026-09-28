@@ -1,5 +1,6 @@
 const std = @import("std");
 const fiber = @import("zfiber");
+const utils = @import("utils");
 const vfs = @import("vfs");
 const raft = @import("raft");
 pub const Node = raft.Node;
@@ -28,7 +29,7 @@ pub const TestLog = struct {
 
     fn makeWalDir(allocator: std.mem.Allocator, id: NodeId) ![]u8 {
         var buf: [192]u8 = undefined;
-        const ts = fiber.coarseMs();
+        const ts = utils.coarseMs();
         const path = try std.fmt.bufPrint(&buf, "/tmp/egres-test-cluster-{d}-{d}", .{ ts, id });
         try vfs.createDirPath(path);
         return allocator.dupe(u8, path);

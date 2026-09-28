@@ -18,7 +18,7 @@
 const std = @import("std");
 const utils = @import("utils");
 const fiber = @import("zfiber");
-const bench = utils.bench;
+const bench = fiber.bench;
 
 fn benchTrackedMutex(b: *bench.Bench) !void {
     // `defer deinit()` unregisters the stack lock's node before the frame
@@ -181,7 +181,7 @@ fn benchCoarseClock(b: *bench.Bench) !void {
     b.resetTimer();
     var sink: i64 = 0;
     var i: u64 = 0;
-    while (i < b.n) : (i += 1) sink +%= fiber.coarseMs();
+    while (i < b.n) : (i += 1) sink +%= utils.coarseMs();
     std.mem.doNotOptimizeAway(sink);
 }
 
@@ -224,6 +224,6 @@ test "BENCH: wake idle-bit check" {
 test "BENCH: clock std.time.milliTimestamp" {
     try benchMilliTimestamp(bench.current());
 }
-test "BENCH: clock fiber.coarseMs" {
+test "BENCH: clock utils.coarseMs" {
     try benchCoarseClock(bench.current());
 }

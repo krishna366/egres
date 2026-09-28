@@ -81,7 +81,7 @@ pub const Spinner = struct {
         std.debug.assert(pages % factor == 0); // caller's responsibility
 
         const limiter = self.limiter;
-        const start = fiber.coarseMs();
+        const start = utils.coarseMs();
 
         while (true) {
             limiter.tryRefill();
@@ -102,7 +102,8 @@ pub const Spinner = struct {
             const want = (raw_want / factor) * factor;
 
             if (want == 0 and self.priority != .p0) {
-                if (fiber.coarseMs() - start >= @as(i64, @intCast(limiter.conf.timeout_ms))) {
+                const timeout_ms: i64 = @intCast(limiter.conf.timeout_ms);
+                if (utils.coarseMs() - start >= timeout_ms) {
                     // Timeout fallback: round min_alloc_pages up to the
                     // factor so the result is still a usable multiple.
                     const fallback = limiter.min_alloc_pages;
@@ -181,7 +182,7 @@ pub const Limiter = struct {
         const pps = config.bytes_per_sec / _vfs.page_size;
         return .{
             .pages = std.atomic.Value(u64).init(pps),
-            .last_refill = std.atomic.Value(i64).init(fiber.coarseMs()),
+            .last_refill = std.atomic.Value(i64).init(utils.coarseMs()),
             .demand_p1 = std.atomic.Value(u64).init(0),
             .pages_per_sec = pps,
             .min_alloc_pages = @max(config.min_alloc_bytes / _vfs.page_size, 1),
@@ -208,7 +209,7 @@ pub const Limiter = struct {
     /// wins per time window — losers skip and proceed to page deduction.
     fn tryRefill(self: *Limiter) void {
         const old_refill = self.last_refill.load(.monotonic);
-        const now = fiber.coarseMs();
+        const now = utils.coarseMs();
         const elapsed_ms = now - old_refill;
         if (elapsed_ms <= 0) return;
 

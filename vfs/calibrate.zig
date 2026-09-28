@@ -140,7 +140,7 @@ fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
     var stop = std.atomic.Value(bool).init(false);
     var group = fiber.Group(anyerror!u64).init(a);
     defer group.deinit();
-    const t0 = fiber.timestampNow(.monotonic, .nanos);
+    const t0 = utils.timestampNow(.monotonic, .nanos);
     for (0..depth) |i| {
         try group.spawn(.{ .worker_id = @intCast(i) }, worker, .{
             a, path, kind, &stop,
@@ -152,7 +152,8 @@ fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
     var total: u64 = 0;
     for (group.wait()) |r| total += try r;
 
-    const elapsed_ns: u64 = @intCast(@max(fiber.timestampNow(.monotonic, .nanos) - t0, 1));
+    const t1 = utils.timestampNow(.monotonic, .nanos);
+    const elapsed_ns: u64 = @intCast(@max(t1 - t0, 1));
     const moved: u128 = @as(u128, total) * std.time.ns_per_s;
     const bps: u64 = @intCast(moved / elapsed_ns);
     log.info("{s} at depth {d}: {d} MiB in {d} ms = {d} MiB/s", .{

@@ -19,7 +19,8 @@ const std = @import("std");
 const raft = @import("raft");
 const vfs = @import("vfs");
 const utils = @import("utils");
-const bench = utils.bench;
+const fiber = @import("zfiber");
+const bench = fiber.bench;
 const Bench = bench.Bench;
 
 const zen = raft.buffers;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const fiber = @import("zfiber");
+const utils = @import("utils");
 
 test "fs.File: write, sync, stat, read back at offsets" {
     const path = "/tmp/fiber_fs_test_rw";
@@ -261,9 +262,9 @@ test "fs: many fibers run full file lifecycles concurrently" {
 test "fs.Dir: list reports every entry with its kind" {
     const alloc = std.testing.allocator;
     const root = "/tmp/fiber_fs_test_list";
-    std.Io.Dir.cwd().deleteTree(fiber.context.g().io, root) catch {};
-    try std.Io.Dir.cwd().createDirPath(fiber.context.g().io, root ++ "/sub");
-    defer std.Io.Dir.cwd().deleteTree(fiber.context.g().io, root) catch {};
+    std.Io.Dir.cwd().deleteTree(utils.context.g().io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(utils.context.g().io, root ++ "/sub");
+    defer std.Io.Dir.cwd().deleteTree(utils.context.g().io, root) catch {};
 
     for ([_][]const u8{ root ++ "/a.txt", root ++ "/b.txt" }) |p| {
         const f = try fiber.Dir.cwd().createFile(p, .{});
@@ -302,7 +303,7 @@ test "fs.File: stat reports a fresh file's mtime as now" {
     }
     _ = try file.write("now", 0);
 
-    const now = fiber.timestampNow(.realtime, .secs);
+    const now = utils.timestampNow(.realtime, .secs);
     const st = try file.stat();
     const skew = @abs(now - st.mtime_s);
     try std.testing.expect(skew < 10);

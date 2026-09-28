@@ -23,7 +23,7 @@
 const std = @import("std");
 const xev = @import("xev");
 const _heap = @import("heap.zig");
-const _coarse = @import("coarse_clock.zig");
+const _coarse = @import("utils").coarse_clock;
 // `sleepMs` (bottom of file) is the one fiber-aware helper here, so we import
 // the runtime for park/wake. The `Deadlines` struct itself stays oblivious to
 // fibers — this is a mutual file import, which Zig resolves lazily (runtime.zig

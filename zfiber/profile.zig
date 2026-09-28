@@ -25,8 +25,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const _rt = @import("runtime.zig");
-const timestampNow = @import("coarse_clock.zig").timestampNow;
-const _ctx = @import("context.zig");
+const timestampNow = @import("utils").timestampNow;
+const _ctx = @import("utils").context;
 const Worker = _rt.Worker;
 const Allocator = std.mem.Allocator;
 

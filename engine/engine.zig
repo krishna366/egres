@@ -101,7 +101,7 @@ pub const StorageImpl = struct {
     /// mutex would move on rehash while parked on) and entries are never
     /// removed (a parked waiter may hold the pointer): one tiny entry
     /// per distinct file ever ensured.
-    file_locks: utils.SafeHashMap(u64, *fiber.Mutex(.untracked)),
+    file_locks: fiber.SafeHashMap(u64, *fiber.Mutex(.untracked)),
 
     pub fn asStateMachine(self: *StorageImpl) raft.Node.StateMachine {
         return .{
@@ -249,9 +249,9 @@ pub const StorageImpl = struct {
         });
         // The apply fiber applies everything in order: a slow manifest
         // apply holds every data entry behind it. Log how long each took.
-        const t0 = fiber.timestampNow(.monotonic, .micros);
+        const t0 = utils.timestampNow(.monotonic, .micros);
         defer {
-            const t1 = fiber.timestampNow(.monotonic, .micros);
+            const t1 = utils.timestampNow(.monotonic, .micros);
             log.info("applyManifestChange exit  idx={d} cmd={t} took={d}us", .{
                 index, mcs.cmd, t1 - t0,
             });
@@ -497,7 +497,8 @@ pub const Engine = struct {
                 .allocator = allocator,
                 .node = node,
                 .store = store,
-                .file_locks = utils.SafeHashMap(u64, *fiber.Mutex(.untracked)).init(allocator),
+                .file_locks = fiber.SafeHashMap(u64, *fiber.Mutex(.untracked))
+                    .init(allocator),
             },
             .sm = undefined,
             .raft_rt = raft.RaftRuntime.init(allocator, node),
@@ -738,7 +739,7 @@ pub const Engine = struct {
         const stuck_threshold_ms: i64 = 30_000;
         while (!self.node.isShuttingDown()) {
             if (self.node.shutdown.waitTimeout(poll)) return;
-            const now_ms = fiber.coarseMs();
+            const now_ms = utils.coarseMs();
             self.in_flight_mu.lock(@src());
             defer self.in_flight_mu.unlock();
 
@@ -849,7 +850,7 @@ pub const Engine = struct {
                 swept_upto = snap_index;
             }
 
-            const now_ms = fiber.coarseMs();
+            const now_ms = utils.coarseMs();
             if (now_ms - last_scan_ms >= cfg.orphan_scan_interval_seconds * 1000) {
                 last_scan_ms = now_ms;
                 self.removeOrphans();
@@ -875,7 +876,7 @@ pub const Engine = struct {
         // no snapshot yet, and then nothing counts as an orphan.
         const snapshot_s = _hlc.HLC.fromU64(self.node.log.snapshot().timestamp).seconds;
         const min_age_s: i64 = @intCast(cfg.orphan_min_age_seconds);
-        const now_s = fiber.timestampNow(.realtime, .secs);
+        const now_s = utils.timestampNow(.realtime, .secs);
         const cutoff_s = @min(snapshot_s, now_s - min_age_s);
 
         self.forest.removeOrphans(cutoff_s) catch |err| {
@@ -1095,7 +1096,7 @@ pub const Engine = struct {
             self.proposeFlush() catch |err| {
                 log.err("proposeFlush failed: {s}", .{@errorName(err)});
             };
-            last_flush_ms = fiber.coarseMs();
+            last_flush_ms = utils.coarseMs();
         }
     }
 
@@ -1107,7 +1108,7 @@ pub const Engine = struct {
 
         const last = last_flush_ms orelse return true;
         const max_age_ms: i64 = @as(i64, opts.flush_max_age_seconds) * 1000;
-        return fiber.coarseMs() - last >= max_age_ms;
+        return utils.coarseMs() - last >= max_age_ms;
     }
 
     // TODO: This work can be done by a follower instead of the leader. Leader
@@ -1152,7 +1153,11 @@ pub const Engine = struct {
     }
 
     fn proposeNewMemtable(self: *Engine) !void {
-        self.addInFlight(.{ .kind = .new_memtable, .tree_id = 0, .started_at_ms = fiber.coarseMs() });
+        self.addInFlight(.{
+            .kind = .new_memtable,
+            .tree_id = 0,
+            .started_at_ms = utils.coarseMs(),
+        });
         defer self.removeInFlight(.new_memtable, 0, 0);
         // memtable_id stays 0 in the proposal: the id is assigned at apply
         // as the entry's own log index, identically on every node.
@@ -1170,7 +1175,11 @@ pub const Engine = struct {
         // part). buildFlush iterates the oldest immutable memtable; we
         // don't know the target tree(s) until changes return, so use
         // tree_id=0 as a "global" marker.
-        self.addInFlight(.{ .kind = .flush, .tree_id = 0, .started_at_ms = fiber.coarseMs() });
+        self.addInFlight(.{
+            .kind = .flush,
+            .tree_id = 0,
+            .started_at_ms = utils.coarseMs(),
+        });
         defer self.removeInFlight(.flush, 0, 0);
 
         const result = try self.forest.buildFlush() orelse return;
@@ -1200,12 +1209,12 @@ pub const Engine = struct {
             .tree_id = target.key.tree_id,
             .src_level = @intCast(target.candidate.level),
             .cid = cid,
-            .started_at_ms = fiber.coarseMs(),
+            .started_at_ms = utils.coarseMs(),
         });
         defer self.removeInFlight(.compaction, target.key.tree_id, @intCast(target.candidate.level));
 
         const src = target.candidate.level;
-        const t0 = fiber.coarseMs();
+        const t0 = utils.coarseMs();
         log.info("compact cid={d} start tree={d} L{d}", .{ cid, target.key.tree_id, src });
 
         // Resolve the tree now, by id: the target is an identity, and the
@@ -1231,17 +1240,17 @@ pub const Engine = struct {
             log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});
             return;
         }
-        const t1 = fiber.coarseMs();
+        const t1 = utils.coarseMs();
         log.info("compact cid={d} build_done changes={d} build_ms={d}", .{ cid, changes.items.len, t1 - t0 });
 
         try self.distributeNewFiles(changes.items);
-        const t2 = fiber.coarseMs();
+        const t2 = utils.coarseMs();
         log.info("compact cid={d} distribute_done distribute_ms={d}", .{ cid, t2 - t1 });
 
         const payload = try encodeManifestChange(self.allocator, .compaction, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
-        const t3 = fiber.coarseMs();
+        const t3 = utils.coarseMs();
         log.info("compact cid={d} done propose_ms={d} total_ms={d}", .{ cid, t3 - t2, t3 - t0 });
     }
 
@@ -1253,7 +1262,7 @@ pub const Engine = struct {
         self.addInFlight(.{
             .kind = .split,
             .tree_id = key.tree_id,
-            .started_at_ms = fiber.coarseMs(),
+            .started_at_ms = utils.coarseMs(),
         });
         defer self.removeInFlight(.split, key.tree_id, 0);
         // buildSplit allocates sstable_changes / tree_changes on the arena;
@@ -1388,7 +1397,7 @@ pub const Engine = struct {
             try w.print("\n  in-flight: (none)\n", .{});
             return;
         }
-        const now = fiber.coarseMs();
+        const now = utils.coarseMs();
         try w.print("\n  in-flight:\n", .{});
         for (self.in_flight.items) |it| {
             const age_ms = now - it.started_at_ms;

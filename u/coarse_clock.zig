@@ -1,10 +1,13 @@
 //! Process-wide coarse wall-clock. A single atomic `cached_ms` that any
 //! fiber on any worker reads via `ms()` (one acquire load, syscall-free
-//! on the hot path).
+//! on the hot path). It lives in utils, below the fiber runtime, so
+//! code with no runtime dependency (rate-limited logs, clocks) can read
+//! it; the runtime is what drives it.
 //!
-//! Who advances it: EVERY worker, from the top of its run loop, gated
-//! to ~once per millisecond by a per-worker TSC check (see
-//! `Worker.run`). Two guards keep this cheap regardless of worker count:
+//! Who advances it: EVERY fiber worker, from the top of its run loop,
+//! gated to ~once per millisecond by a per-worker TSC check (see
+//! `Worker.run` in zfiber). Two guards keep this cheap regardless of
+//! worker count:
 //!   - the per-worker TSC gate turns "every loop" into "once per ms", so
 //!     the `clock_gettime` vDSO + atomic happen ~once/ms/worker, not per
 //!     dispatch;
@@ -41,7 +44,7 @@
 //! clock only stops when the whole runtime is idle.
 
 const std = @import("std");
-const _context = @import("context.zig");
+const context = @import("context.zig");
 
 pub const ClockKind = enum { monotonic, realtime };
 pub const TimeUnit = enum { secs, millis, micros, nanos };
@@ -49,7 +52,7 @@ pub const TimeUnit = enum { secs, millis, micros, nanos };
 /// The current time on `kind`'s clock, in `unit`, via `std.Io.Timestamp.now`
 /// on the process io (`context.g().io`) — the same time source the rest of
 /// the codebase uses. `context.g()` asserts the process context was
-/// initialized; every caller here (CoarseClock, Deadlines, the tests) runs
+/// initialized; every caller here (`update`, Deadlines, the tests) runs
 /// inside a started runtime, which is well after `context.initGlobal`.
 ///
 /// A full clock read, uncached — unlike `ms()`, which can be up to ~1 ms
@@ -59,7 +62,7 @@ pub const TimeUnit = enum { secs, millis, micros, nanos };
 pub fn timestampNow(comptime kind: ClockKind, comptime unit: TimeUnit) i64 {
     // std.Io.Clock spells monotonic as `.awake` (Linux CLOCK_MONOTONIC,
     // macOS CLOCK_UPTIME_RAW); `.real` is wall-clock Unix time.
-    const ts = std.Io.Timestamp.now(_context.g().io, switch (kind) {
+    const ts = std.Io.Timestamp.now(context.g().io, switch (kind) {
         .monotonic => .awake,
         .realtime => .real,
     });
@@ -71,41 +74,30 @@ pub fn timestampNow(comptime kind: ClockKind, comptime unit: TimeUnit) i64 {
     };
 }
 
-pub const CoarseClock = struct {
-    /// Process-wide coarse-clock cache. Many writers (any worker's
-    /// gated `update`, but only the ms-boundary-crosser actually
-    /// stores), many readers (any fiber on any worker via `ms()`). Own
-    /// cache line so reader fan-out doesn't invalidate neighboring
-    /// fields on a writing worker.
-    cached_ms: std.atomic.Value(i64) align(std.atomic.cache_line) = .init(0),
+/// The cache. Many writers (any worker's gated `update`, but only the
+/// ms-boundary-crosser actually stores), many readers (any fiber on any
+/// worker via `ms()`). Own cache line so reader fan-out doesn't
+/// invalidate neighboring globals on a writing worker. Zero until the
+/// runtime seeds it in `Runtime.init`, so `ms()` is valid the instant
+/// the runtime exists.
+var cached_ms: std.atomic.Value(i64) align(std.atomic.cache_line) = .init(0);
 
-    /// Seed the cache so `ms()` is valid the instant `Runtime.init`
-    /// returns — before any worker thread starts ticking it.
-    pub fn init() CoarseClock {
-        return .{ .cached_ms = .init(timestampNow(.realtime, .millis)) };
+/// Publish the current wall-clock millisecond if it's newer than the
+/// cached value. Called by every worker, gated to ~once/ms. The
+/// `last < now` check makes all but the first writer each ms a plain
+/// load (no store, no invalidation); the surviving CAS is best
+/// effort — if a peer won the boundary, ours no-ops harmlessly.
+pub fn update() void {
+    const now = timestampNow(.realtime, .millis);
+    const last = cached_ms.load(.monotonic);
+    if (last < now) {
+        _ = cached_ms.cmpxchgWeak(last, now, .acquire, .monotonic);
     }
+}
 
-    pub fn deinit(self: *CoarseClock) void {
-        _ = self;
-    }
-
-    /// Publish the current wall-clock millisecond if it's newer than the
-    /// cached value. Called by every worker, gated to ~once/ms. The
-    /// `last < now` check makes all but the first writer each ms a plain
-    /// load (no store, no invalidation); the surviving CAS is best
-    /// effort — if a peer won the boundary, ours no-ops harmlessly.
-    pub fn update(self: *CoarseClock) void {
-        const now = timestampNow(.realtime, .millis);
-        const last = self.cached_ms.load(.monotonic);
-        if (last < now) {
-            _ = self.cached_ms.cmpxchgWeak(last, now, .acquire, .monotonic);
-        }
-    }
-
-    /// Coarse wall-clock milliseconds since the Unix epoch. One atomic
-    /// load — cheap on every call, safe from any worker thread.
-    /// Stale by up to ~1 ms while the runtime is busy; never torn.
-    pub inline fn ms(self: *const CoarseClock) i64 {
-        return self.cached_ms.load(.acquire);
-    }
-};
+/// Coarse wall-clock milliseconds since the Unix epoch. One atomic
+/// load — cheap on every call, safe from any thread. Stale by up to
+/// ~1 ms while the runtime is busy; never torn.
+pub inline fn ms() i64 {
+    return cached_ms.load(.acquire);
+}

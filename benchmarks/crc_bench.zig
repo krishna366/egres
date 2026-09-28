@@ -20,8 +20,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const utils = @import("utils");
+const fiber = @import("zfiber");
 const String = utils.String;
-const bench = utils.bench;
+const bench = fiber.bench;
 const Bench = bench.Bench;
 
 // ── Hardware CRC32C (x86_64-only, kept local to the bench) ────────────────

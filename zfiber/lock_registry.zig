@@ -19,8 +19,8 @@
 //! acquire timestamp, and the intrusive registry link (+ a once-flag and the
 //! type-erasure plumbing to read the lock's live state back at dump time).
 const std = @import("std");
-const _rt = @import("runtime.zig");
-const _context = @import("context.zig");
+const _context = @import("utils").context;
+const _coarse = @import("utils").coarse_clock;
 
 const SourceLocation = std.builtin.SourceLocation;
 
@@ -82,7 +82,7 @@ pub fn recordAcquire(
 ) void {
     ensureRegistered(self, owner, snapshot);
     self.holder_src = staticSrc(src);
-    self.held_since_ms = _rt.coarseMs();
+    self.held_since_ms = _coarse.ms();
 }
 
 /// Lift a comptime `SourceLocation` to a `*rodata` pointer with static storage
@@ -146,7 +146,7 @@ pub fn registeredCount() usize {
 pub fn dumpLocks(w: *std.Io.Writer) !void {
     regLock();
     defer regUnlock();
-    const now = _rt.coarseMs();
+    const now = _coarse.ms();
     var total: usize = 0;
     var held: usize = 0;
     var node = live_head;

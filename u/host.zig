@@ -2,7 +2,7 @@
 //! by the cgroup limit when one applies (Docker, Kubernetes).
 
 const std = @import("std");
-const fiber = @import("zfiber");
+const context = @import("context.zig");
 const String = @import("utils.zig").String;
 
 /// The memory this process may use. `source` names the bound that
@@ -62,13 +62,9 @@ fn parseLimit(path: String) ?u64 {
 /// A proc or sysfs file read whole into `buf` (their stat sizes mean
 /// nothing, so read until EOF). Null on any error.
 fn readSmall(path: String, buf: []u8) ?String {
-    const f = fiber.Dir.cwd().openFile(path, .{}) catch return null;
-    defer f.close();
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = f.read(buf[off..], off) catch return null;
-        if (n == 0) break;
-        off += n;
-    }
-    return buf[0..off];
+    const io = context.g().io;
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    const n = f.readPositionalAll(io, buf, 0) catch return null;
+    return buf[0..n];
 }
