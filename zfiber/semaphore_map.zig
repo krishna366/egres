@@ -45,12 +45,19 @@ pub const SemaphoreMap = struct {
     mu: _sync.Mutex(.untracked) = .{},
     /// Held-or-contended keys only; an entry is created on first
     /// acquire and recycled by whichever release/abort leaves it with
-    /// no holders and no waiters.
-    entries: std.AutoHashMapUnmanaged(u64, *Entry) = .empty,
+    /// no holders and no waiters. An ArrayHashMap, not a HashMap: a
+    /// statement inserts its keys and removes them at commit, so the
+    /// map churns at the write rate, and HashMap's tombstone deletes
+    /// leave it with no free slot to end a miss on; a `getOrPut` then
+    /// probes the whole table, 6 us each with every other connection
+    /// spinning on `sl` meanwhile (a third of the server's CPU at
+    /// 100k rows/s). ArrayHashMap removes by shifting, no tombstones.
+    entries: std.AutoArrayHashMapUnmanaged(u64, *Entry) = .empty,
     /// The wait-for graph's edge source: which entry each BLOCKED owner
     /// is queued on (an owner waits on one key at a time), and in what
-    /// mode. Registered before the fiber ever parks.
-    waiting: std.AutoHashMapUnmanaged(u64, Waiting) = .empty,
+    /// mode. Registered before the fiber ever parks. Same churn, same
+    /// map type.
+    waiting: std.AutoArrayHashMapUnmanaged(u64, Waiting) = .empty,
     /// Drained entries kept for reuse with their list capacity intact,
     /// so steady-state acquire/release does no allocator work. Bounded:
     /// beyond `max_pooled` (or after a spike balloons an entry's lists)
@@ -153,8 +160,7 @@ pub const SemaphoreMap = struct {
     pub fn deinit(self: *SemaphoreMap) void {
         // Callers release everything they hold before tearing the map
         // down; anything left here is an unclean shutdown.
-        var it = self.entries.valueIterator();
-        while (it.next()) |e| self.destroyEntry(e.*);
+        for (self.entries.values()) |e| self.destroyEntry(e);
         self.entries.deinit(self.allocator);
         for (self.pool.items) |e| self.destroyEntry(e);
         self.pool.deinit(self.allocator);
@@ -347,7 +353,7 @@ pub const SemaphoreMap = struct {
             // defensive re-lookup (that guards the error paths, which
             // don't keep a `key_ptr`). The still-locked rw needs no
             // unlock before recycling — `recycle` resets it.
-            self.entries.removeByPtr(kv.key_ptr);
+            _ = self.entries.swapRemove(key);
             self.recycle(e);
             return true;
         }
@@ -373,7 +379,7 @@ pub const SemaphoreMap = struct {
             return e;
         }
         const e = self.allocator.create(Entry) catch |err| {
-            self.entries.removeByPtr(gop.key_ptr);
+            _ = self.entries.swapRemove(key);
             return err;
         };
         e.* = .{};
@@ -392,7 +398,7 @@ pub const SemaphoreMap = struct {
         if (e.holders.items.len > 0 or e.waiters.items.len > 0) return;
 
         // No one else is holding this key-entry. Remove.
-        self.entries.removeByPtr(kv.key_ptr);
+        _ = self.entries.swapRemove(key);
         self.recycle(e);
     }
 
@@ -420,7 +426,7 @@ pub const SemaphoreMap = struct {
     /// `mu`.
     fn deregisterWaiter(self: *SemaphoreMap, e: *Entry, owner_id: u64) void {
         _ = removeOwner(&e.waiters, owner_id);
-        _ = self.waiting.remove(owner_id);
+        _ = self.waiting.swapRemove(owner_id);
     }
 
     fn removeOwner(list: *std.ArrayList(OwnerMode), owner_id: u64) ?Mode {
