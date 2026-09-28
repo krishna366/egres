@@ -28,6 +28,7 @@ run="load-readers". Reads during writes are part of the measurement:
 work a server defers to a later pass is paid here.
 """
 
+import fcntl
 import os
 import re
 import subprocess
@@ -76,6 +77,13 @@ def run_chunk(run, workload: str, a: int, b: int, log: Path) -> bool:
     with open(log, "ab") as lf:
         g = subprocess.Popen([sys.executable, str(WORKLOADS_PY), workload,
                               str(a), str(b)], stdout=subprocess.PIPE)
+        # A 64 KiB pipe is smaller than one 200-row statement, so the
+        # generator and psql would take turns; 1 MiB lets the generator
+        # run a few statements ahead while the server works.
+        try:
+            fcntl.fcntl(g.stdout.fileno(), fcntl.F_SETPIPE_SZ, 1 << 20)
+        except (OSError, AttributeError):
+            pass
         rc = subprocess.run(
             [str(run.psql), run.conn, "-X", "-q", "-v", "ON_ERROR_STOP=1"],
             stdin=g.stdout, stdout=lf, stderr=subprocess.STDOUT,

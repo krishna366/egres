@@ -6,7 +6,7 @@ pgbench scripts, in one place.
 
 Every row is derived from its id alone, so a row is reproducible and
 parallel load streams need no coordination. The payloads are random
-letters and digits, hard to compress on purpose: the disk numbers
+bytes as base64 text, hard to compress on purpose: the disk numbers
 should be about the rows, not about lz4.
 
 A workload's pgbench scripts are strings here; `script_path` writes
@@ -19,13 +19,18 @@ pgbench.py.
 """
 
 import argparse
+import base64
 import random
-import string
 import sys
 from pathlib import Path
 
 GIB = 2**30
-ALPHABET = (string.ascii_letters + string.digits).encode()
+# Payload text: random bytes from the row's own generator, base64'd.
+# Six bits of entropy per character, the same on either server, so
+# on-disk sizes compare; and 8 us a row against 75 for choosing each
+# character, which is what kept 16 load streams to 100k rows/s.
+def text(r: random.Random, chars: int) -> str:
+    return base64.b64encode(r.randbytes(chars * 3 // 4)).decode()
 ROWS_PER_STMT = 200
 
 
@@ -42,7 +47,7 @@ BIG_INSERT = "INSERT INTO big (id, n, payload) VALUES"
 
 def big_row(rid: int) -> str:
     r = random.Random(rid)
-    payload = bytes(r.choices(ALPHABET, k=1000)).decode()
+    payload = text(r, 1000)
     return f"({rid}, 0, '{payload}')"
 
 
@@ -108,7 +113,7 @@ def orders_row(rid: int) -> str:
     sku = r.randrange(1, ORDERS_SKUS + 1)
     day = r.randrange(1, ORDERS_DAYS + 1)
     amount = r.randrange(100, 100_000)
-    note = bytes(r.choices(ALPHABET, k=600)).decode()
+    note = text(r, 600)
     return f"({rid}, {customer}, {sku}, {day}, {amount}, '{note}')"
 
 
