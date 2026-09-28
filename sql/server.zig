@@ -130,12 +130,14 @@ pub const Server = struct {
     /// shutdown; `waitTimeout` doubles as the sleep.
     pub fn runOracleRotation(self: *Server) void {
         const period_ms: u64 = 10 * 60 * 1000;
+
         while (!self.engine.node.isShuttingDown()) {
             if (self.engine.node.shutdown.waitTimeout(period_ms)) return;
             self.databases_mu.lock(@src());
             defer self.databases_mu.unlock();
+
             var it = self.databases.valueIterator();
-            while (it.next()) |d| d.*.oracle.rotate();
+            while (it.next()) |d| d.*.oracle.rotate(period_ms - 1000);
         }
     }
 

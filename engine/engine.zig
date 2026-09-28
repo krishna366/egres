@@ -1349,13 +1349,15 @@ pub const Engine = struct {
         try self.node.announceAndWaitForFileQuorum(file_ids.items);
     }
 
-    /// L0 backpressure: sleep proportional to how many L0 tables the
-    /// trees these writes land in currently have, the worst of them.
-    /// Bounds writes from out-running flush + compaction so L0 doesn't
-    /// grow into a 10s-of-GiB monolithic compaction target. Per tree,
-    /// so a backlog behind one table's tail does not stall writes to
-    /// anything else on the node. See `Options.l0_backpressure_start_count`
-    /// etc. for the curve. `kvs` are the batch's marshaled keys.
+    /// Write backpressure: sleep proportional to how many L0 tables the
+    /// trees these writes land in currently have, the worst of them, or
+    /// to how many frozen memtables wait for a flush, whichever is
+    /// further past its start count. Bounds writes from out-running
+    /// flush + compaction so L0 doesn't grow into a 10s-of-GiB
+    /// monolithic compaction target. The L0 count is per tree, so a
+    /// backlog behind one table's tail does not stall writes to
+    /// anything else on the node. See `Options.backpressure_step_ms`
+    /// for the curve. `kvs` are the batch's marshaled keys.
     pub fn applyWriteBackpressure(self: *Engine, kvs: []const zdb_bufs.KeyValueStruct) void {
         const opts = self.forest.live.cur();
         var keys_buf: [64]String = undefined;
@@ -1365,18 +1367,23 @@ pub const Engine = struct {
         for (kvs[0..n], keys_buf[0..n]) |kv, *k| k.* = kv.key;
 
         const l0 = self.forest.maxL0TableCountForKeys(keys_buf[0..n]);
-        if (l0 <= opts.l0_backpressure_start_count) return;
-
-        const excess: u64 = l0 - opts.l0_backpressure_start_count;
-        const delay_us: u64 = @min(
-            excess * opts.l0_backpressure_step_us,
-            @as(u64, opts.l0_backpressure_max_us),
+        // Memtables waiting for a flush brake every write the same way;
+        // one curve, so the larger excess over its start count decides.
+        const frozen = self.forest.memtables.immutableCount();
+        const excess = @max(
+            l0 -| opts.l0_backpressure_start_count,
+            frozen -| opts.memtable_backpressure_start_count,
         );
-        if (delay_us == 0) return;
+        if (excess == 0) return;
+
+        const delay_ms = @min(
+            @as(u64, excess) * opts.backpressure_step_ms,
+            @as(u64, opts.backpressure_max_ms),
+        );
         // The sleep itself is the cost; record it so a slow write path
         // can be told apart from a braked one.
-        metrics.g().write_backpressure_ms.observe(delay_us / 1000);
-        fiber.sleepMs(delay_us / 1000);
+        metrics.g().write_backpressure_ms.observe(delay_ms);
+        fiber.sleepMs(delay_ms);
     }
 
     /// Append a section listing in-flight flush/compaction/split builds —

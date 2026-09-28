@@ -54,33 +54,44 @@ pub const Config = struct {
     // the tree splits at its median key into two trees.
     lmax_target_bytes: i64 = 10 * 1024 * 1024 * 1024, // 10 GiB
 
-    // L0 backpressure (RocksDB-style write slowdown). When a tree's L0
-    // table count exceeds `l0_backpressure_start_count`, mutations sleep
-    // `(excess) * l0_backpressure_step_us` microseconds before proposing,
-    // capped at `l0_backpressure_max_us`. The intent is to give flush +
-    // compaction a chance to drain L0 instead of letting it grow into
-    // 10s-of-GiB monolithic compaction targets. This is a *trigger*, not
-    // a cap — L0 may still grow past it; writes just slow down. With
-    // defaults, a tree at the trigger imposes 0 ms; +10 tables ~10 ms;
-    // +100 tables hits the cap of 100 ms. There is no off switch: a
-    // start count of 0 is invalid, since the L0 score divides by it.
-    // The start count sits well above what L0 holds by design: a few
-    // finished tables plus up to three per size tier, some 20 at worst
-    // for a tree fed by very small flushes.
-    l0_backpressure_start_count: u32 = 32,
-    l0_backpressure_step_us: u32 = 1000,
-    l0_backpressure_max_us: u32 = 100_000,
+    // Write backpressure (RocksDB-style write slowdown), one curve for
+    // two brakes. A mutation sleeps `excess * backpressure_step_ms`
+    // milliseconds before proposing, capped at `backpressure_max_ms`,
+    // where excess is how far a count is above its start count; the
+    // larger of the two sleeps applies. This is a *trigger*, not a
+    // cap: the count may still grow past it, writes just slow down.
+    // With defaults, at the trigger 0 ms; +5 over it 100 ms; +25 hits
+    // the cap of 500 ms. The values come from the memtable brake, set
+    // against an observed runaway (below); the L0 brake ran 1 ms per
+    // table before the merge, too gentle to matter.
+    backpressure_step_ms: u32 = 20,
+    backpressure_max_ms: u32 = 500,
 
-    // Per-job byte budget for the L0→L1 push: the picker walks L0
-    // oldest-first and stops once the total input bytes (selected L0
-    // file sizes plus their cumulative L1 overlap) would exceed this.
-    // Always picks at least one L0 table so a single oversized input
-    // still makes progress. A push starts once L0 reaches L1's target,
-    // well under this, so it binds only when compaction has fallen
-    // behind and L0 has backlogged: then it keeps one job from taking
-    // GiBs of L0 and blocking the loop for minutes. L0→L0 merges are
-    // bounded by their own rule and ignore it.
-    l0_compaction_max_bytes: u64 = 1 << 30, // 1 GiB
+    // L0 brake: a tree's L0 table count. Gives flush + compaction a
+    // chance to drain L0 instead of letting it grow into 10s-of-GiB
+    // monolithic compaction targets. There is no off switch: a start
+    // count of 0 is invalid, since the L0 score divides by it. The
+    // start count sits well above what L0 holds by design: a few
+    // finished tables plus up to three per size tier, some 20 at
+    // worst for a tree fed by very small flushes.
+    l0_backpressure_start_count: u32 = 32,
+
+    // Memtable brake: the frozen memtables waiting for a flush. Left
+    // unbounded they reached 389 (30 GiB) in six minutes of a 160k
+    // rows/s load, and every unique-key probe reads each of them,
+    // which starved the flush of CPU in turn.
+    memtable_backpressure_start_count: u32 = 8,
+
+    // Input bytes one background job takes, whether a flush of frozen
+    // memtables (their in-memory size, oldest first) or an L0→L1 push
+    // (L0 file sizes plus their cumulative L1 overlap, oldest first).
+    // At least one memtable or table is always taken, so an oversized
+    // input still makes progress. A push starts once L0 reaches L1's
+    // target, well under this, so the bound binds only when the job
+    // has fallen behind: then it keeps one job from taking GiBs and
+    // blocking its loop for minutes. L0→L0 merges have their own rule
+    // and ignore it.
+    job_max_bytes: u64 = 1 << 30, // 1 GiB
 
     // L0 is drained in two steps (RocksDB's intra-L0 compaction, made the
     // preferred job). Small L0 tables are first merged among themselves:
@@ -168,14 +179,16 @@ pub const Config = struct {
             " levels above are a fifth of the one below. A tree splits" ++
             " at its median key into two once it holds five fourths of" ++
             " this in total.",
+        .backpressure_step_ms = "Milliseconds a write sleeps per L0" ++
+            " table or frozen memtable above its start count.",
+        .backpressure_max_ms = "Longest backpressure sleep for one" ++
+            " write, in milliseconds.",
         .l0_backpressure_start_count = "L0 table count above which writes" ++
             " to the tree are slowed. Must be above 0.",
-        .l0_backpressure_step_us = "Microseconds a write sleeps per L0" ++
-            " table above the start count.",
-        .l0_backpressure_max_us = "Longest backpressure sleep for one" ++
-            " write.",
-        .l0_compaction_max_bytes = "Input byte budget for one L0 to L1" ++
-            " compaction; at least one L0 table is always taken.",
+        .memtable_backpressure_start_count = "Frozen memtable count above" ++
+            " which writes are slowed.",
+        .job_max_bytes = "Input bytes one flush or L0 to L1 compaction" ++
+            " takes, oldest first; at least one input is always taken.",
         .l0_merge_min_tables = "An L0 to L0 compaction merges the tables" ++
             " after the newest one that reached the memtable size, up to" ++
             " twice that size, into one table, once there are this many" ++

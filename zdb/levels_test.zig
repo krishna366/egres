@@ -1203,7 +1203,6 @@ test "compaction: a push that overlaps nothing below moves its oldest table" {
         defer alloc.free(l1);
         try std.testing.expectEqualSlices(u64, &.{2}, l1);
     }
-
     try compact(fx.tree, 11, 0);
     try compact(fx.tree, 12, 0);
 
@@ -1247,13 +1246,20 @@ test "compaction: overlapping L0 tables are merged, not moved" {
     defer alloc.free(dir_path);
 
     // The oldest meets nothing in an empty L1 and moves; the next one
-    // then meets it there and is merged into it. The bottom holds more
-    // than L1 will, so L1's dampened score does not outrank L0's push.
+    // then meets it there and is merged into it. L1's target holds one
+    // table, so L1 never outscores L0: the first push is L0's by its
+    // count, the second the idle pick once nothing scores.
+    var cfg = config.Config{
+        .max_levels = 3,
+        .lmax_target_bytes = 5 * 4096, // L1 target: one 4 KiB table
+        .l0_backpressure_start_count = 2,
+        .l0_merge_min_tables = 0,
+    };
+    cfg.dir = dir_path;
     var fx: TombstoneFixture = undefined;
-    try setupPlacedTree(alloc, &fx, dir_path, 3, .rows, &.{
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
         .{ .id = 2, .level = 0, .egids = &.{ 1, 3 } },
         .{ .id = 3, .level = 0, .egids = &.{ 2, 4 } },
-        .{ .id = 4, .level = 2, .egids = &egidRun(100, 50) },
     });
     defer fx.deinit();
 
@@ -1361,6 +1367,8 @@ test "compaction: an L0 push that meets nothing in L1 is not held back by a full
     });
     defer fx.deinit();
 
+    // L0's push is a move: it meets nothing in L1, so L1 being twenty
+    // times its target is no reason to wait.
     try fx.tree.updateCompactCandidate();
     const cand = fx.tree.compact_candidate orelse return error.TestExpectedCandidate;
     try std.testing.expectEqual(@as(u8, 0), cand.level);

@@ -36,7 +36,7 @@ pub const BytesWrittenLabels = struct {
 };
 
 // Millisecond buckets for the L0 write brake: the curve runs from one
-// step (a few ms) to `l0_backpressure_max_us`, and the tail says how
+// step (a few ms) to `backpressure_max_ms`, and the tail says how
 // often writes hit the cap.
 const backpressure_buckets: []const u64 = &.{
     1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,

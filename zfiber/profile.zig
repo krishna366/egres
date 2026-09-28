@@ -160,7 +160,10 @@ fn onProf(
 
 /// Whether `pc` is the instruction after a syscall instruction: the
 /// two bytes before it are `syscall` (0f 05) on x86_64, the four bytes
-/// `svc #0` on aarch64. `pc` was just executed, so its code is mapped.
+/// `svc #0` on aarch64. Reads the code, so the caller has established
+/// that `pc` is in this binary: a frame walk that ran off a frame
+/// without a frame pointer can yield any value, and one such sample
+/// took the server down with a general protection fault here.
 fn afterSyscall(pc: usize) bool {
     switch (builtin.cpu.arch) {
         .x86_64 => {
@@ -591,7 +594,7 @@ const Names = struct {
         // syscall: the kernel time of that syscall lands there. Name it
         // for what it is rather than for the errno check that follows.
         const sym = try self.lookup(address);
-        if (afterSyscall(address)) {
+        if (sym.known and afterSyscall(address)) {
             return std.fmt.allocPrint(self.a, "syscall ({s})", .{sym.file});
         }
         if (self.lines and sym.line != 0) {
@@ -602,7 +605,14 @@ const Names = struct {
         return std.fmt.allocPrint(self.a, "{s} ({s})", .{ sym.name, sym.file });
     }
 
-    const Sym = struct { name: []const u8, file: []const u8, line: u64 };
+    const Sym = struct {
+        name: []const u8,
+        file: []const u8,
+        line: u64,
+        /// The debug info places the address in this binary. False for
+        /// the hex fallbacks, whose address may be anything.
+        known: bool = false,
+    };
 
     /// The function and file at `address`; the address in hex as the
     /// name when the debug info has none.
@@ -635,6 +645,7 @@ const Names = struct {
             .name = sym.name orelse hex,
             .file = file,
             .line = if (sym.source_location) |loc| loc.line else 0,
+            .known = true,
         };
     }
 };

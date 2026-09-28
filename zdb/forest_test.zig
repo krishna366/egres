@@ -3456,3 +3456,57 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
         f.manifest.ssts.get(merged_id).?.raft_index,
     );
 }
+
+test "buildFlush takes the oldest memtables up to job_max_bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // A budget one memtable's writes exceed: each flush takes exactly
+    // the oldest frozen memtable, and the rest wait.
+    const f_live = try flags.Live(Config).create(alloc, .{
+        .dir = dir_path,
+        .job_max_bytes = 1,
+    });
+    defer f_live.destroy();
+    const f = try Forest.open(alloc, f_live);
+    defer f.close();
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
+
+    // Three frozen memtables, ids 1, 2, 3, one row each.
+    var id: u64 = 1;
+    while (id <= 3) : (id += 1) {
+        try f.newMemtable(id);
+        var primary: [1]u8 = .{@intCast('a' + id)};
+        var items = [_]zdb.kv.Item{.{
+            .key = .{ .namespace = 1, .table_id = 0, .primary = &primary },
+            .versions = .{ .one = .{ .ts = id, .meta = .{}, .value = "v" } },
+        }};
+        try f.put(&items);
+    }
+    try f.newMemtable(4);
+    try std.testing.expectEqual(3, f.memtables.immutableCount());
+
+    // Oldest first, one per flush; the apply releases what was flushed.
+    var want_id: u64 = 1;
+    while (want_id <= 3) : (want_id += 1) {
+        var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+        defer flush.changes.deinit(alloc);
+        try std.testing.expectEqual(want_id, flush.memtable_id);
+        try std.testing.expectEqual(1, flush.changes.items.len);
+        try f.applyFlush(10 + want_id, flush.changes.items, flush.memtable_id);
+        try std.testing.expectEqual(3 - want_id, f.memtables.immutableCount());
+    }
+    // Every row is readable from the L0 tables.
+    var p: u64 = 1;
+    while (p <= 3) : (p += 1) {
+        const primary: [1]u8 = .{@intCast('a' + p)};
+        const got = try f.getRaw(alloc, .{
+            .key = .{ .namespace = 1, .table_id = 0, .primary = &primary },
+        }) orelse return error.TestExpectedItem;
+        defer got.free(alloc);
+        try std.testing.expectEqualStrings("v", got.newest().value);
+    }
+}

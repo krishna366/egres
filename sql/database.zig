@@ -81,7 +81,7 @@ pub const Database = struct {
             .allocator = allocator,
             .row_locks = try fiber.SemaphoreMap.init(allocator),
             .table_locks = fiber.SafeHashMap(u32, *RWMutex).init(allocator),
-            .oracle = Oracle.init(allocator),
+            .oracle = try Oracle.init(allocator, Oracle.default_max_keys),
             .tables = std.AutoHashMap(u32, *_table.Table).init(allocator),
         };
     }

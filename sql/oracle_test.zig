@@ -26,7 +26,7 @@ fn h(primary: String) u64 {
 }
 
 test "oracle: unknown keys answer the horizon; updates answer exactly" {
-    var o = Oracle.init(testing.allocator);
+    var o = try Oracle.init(testing.allocator, 1024);
     defer o.deinit();
 
     // Empty oracle: nothing ever committed — horizon 0 for any key.
@@ -43,15 +43,29 @@ test "oracle: unknown keys answer the horizon; updates answer exactly" {
     try testing.expectEqual(150, o.commitTs(h("a")));
 }
 
+test "oracle: a tick within the period is skipped" {
+    var o = try Oracle.init(testing.allocator, 1024);
+    defer o.deinit();
+
+    // init stamps the clock, so a period-long tick is too soon and
+    // the entry stays in `current`; a forced rotation moves it.
+    try commit(&o, "a", 100);
+    o.rotate(std.math.maxInt(u64));
+    try testing.expectEqual(1, o.current.map.count());
+    o.rotate(0);
+    try testing.expectEqual(0, o.current.map.count());
+    try testing.expectEqual(1, o.previous.map.count());
+}
+
 test "oracle: entries survive one rotation and die at the second" {
-    var o = Oracle.init(testing.allocator);
+    var o = try Oracle.init(testing.allocator, 1024);
     defer o.deinit();
 
     try commit(&o, "a", 100);
-    o.rotate(); // h("a") now in `previous`
+    o.rotate(0); // h("a") now in `previous`
     try testing.expectEqual(100, o.commitTs(h("a")));
 
-    o.rotate(); // dropped; the horizon absorbs its max
+    o.rotate(0); // dropped; the horizon absorbs its max
     try testing.expectEqual(100, o.horizon_ts);
     // Absent keys — h("a") included — answer the horizon now:
     // conservative, but the old commit can never hide.
@@ -59,24 +73,52 @@ test "oracle: entries survive one rotation and die at the second" {
     try testing.expectEqual(100, o.commitTs(h("b")));
 }
 
+test "oracle: a full generation rotates by itself, maps keep capacity" {
+    // Three keys per generation. The fourth commit ends the first
+    // generation, the seventh the second; nothing is ever freed.
+    var o = try Oracle.init(testing.allocator, 3);
+    defer o.deinit();
+    const cap = o.current.map.capacity();
+    try testing.expect(cap >= 3);
+
+    try commit(&o, "a", 10);
+    try commit(&o, "b", 11);
+    try commit(&o, "c", 12);
+    try commit(&o, "d", 13); // rotation: a, b, c in previous
+    try testing.expectEqual(1, o.current.map.count());
+    try testing.expectEqual(3, o.previous.map.count());
+    try testing.expectEqual(10, o.commitTs(h("a")));
+    try testing.expectEqual(0, o.horizon_ts);
+
+    try commit(&o, "e", 14);
+    try commit(&o, "f", 15);
+    try commit(&o, "g", 16); // rotation: a, b, c retired into the horizon
+    try testing.expectEqual(12, o.horizon_ts);
+    try testing.expectEqual(12, o.commitTs(h("a")));
+    try testing.expectEqual(13, o.commitTs(h("d")));
+    try testing.expectEqual(16, o.commitTs(h("g")));
+    try testing.expectEqual(cap, o.current.map.capacity());
+    try testing.expectEqual(cap, o.previous.map.capacity());
+}
+
 test "oracle: a re-committed key reads from current, not previous" {
-    var o = Oracle.init(testing.allocator);
+    var o = try Oracle.init(testing.allocator, 1024);
     defer o.deinit();
 
     try commit(&o, "a", 100);
-    o.rotate();
+    o.rotate(0);
     try commit(&o, "a", 150); // lives in both generations now
     try testing.expectEqual(150, o.commitTs(h("a")));
 
-    o.rotate(); // drops the generation holding the 100 copy
+    o.rotate(0); // drops the generation holding the 100 copy
     try testing.expectEqual(100, o.horizon_ts);
     try testing.expectEqual(150, o.commitTs(h("a")));
-    o.rotate(); // drops the 150 copy too
+    o.rotate(0); // drops the 150 copy too
     try testing.expectEqual(150, o.horizon_ts);
 }
 
 test "oracle: maxCommitTs over a read set" {
-    var o = Oracle.init(testing.allocator);
+    var o = try Oracle.init(testing.allocator, 1024);
     defer o.deinit();
 
     // One batched apply records the whole write set under a single hold.
@@ -99,8 +141,8 @@ test "oracle: maxCommitTs over a read set" {
     try testing.expectEqual(100, o.maxCommitTs(&.{ h("k1"), h("k99") }));
 
     // Once every key has aged out, the horizon speaks for them all.
-    o.rotate();
-    o.rotate();
+    o.rotate(0);
+    o.rotate(0);
     try testing.expectEqual(300, o.horizon_ts);
     try testing.expectEqual(300, o.maxCommitTs(&.{ h("k1"), h("k99") }));
 }

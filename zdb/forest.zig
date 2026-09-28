@@ -256,11 +256,17 @@ pub const Memtables = struct {
         /// it; a flush must leave it out, so a flush's inputs are the
         /// frozen memtables alone.
         current: bool = true,
+        /// Frozen memtables to include: the oldest until their writes
+        /// exceed this, and at least one. A read takes them all; a
+        /// flush sets its byte budget, and always covers an oldest-first
+        /// prefix, since its apply releases the newest flushed memtable
+        /// and every older one.
+        max_bytes: u64 = std.math.maxInt(u64),
     };
 
     /// Iterators for a merge: `pending` when given, then the active
-    /// memtable when `current`, then the immutables newest-first (their
-    /// storage order). Each `skl.Iterator.init` acquires the
+    /// memtable when `current`, then the selected immutables newest-first
+    /// (their storage order). Each `skl.Iterator.init` acquires the
     /// underlying skiplist — release happens via `deinit` on the returned
     /// iterator (transitively from `MergeIterator.deinit`). Doing the
     /// acquires under our shared lock guarantees that even if a
@@ -276,7 +282,25 @@ pub const Memtables = struct {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
 
-        const imms = self.immutables.items;
+        // A budget leaves out the newest frozen memtables, so a read that
+        // includes `current` would skip writes between them: only a
+        // flush budgets, and a flush leaves `current` out.
+        std.debug.assert(!select.current or
+            select.max_bytes == std.math.maxInt(u64));
+
+        // `immutables` is newest first, so the oldest are at the end:
+        // count how many fit the budget from the end, then take that
+        // tail as is.
+        const all = self.immutables.items;
+        var n: usize = 0;
+        var bytes: u64 = 0;
+        while (n < all.len) {
+            bytes += all[all.len - 1 - n].memoryUsage();
+            if (n > 0 and bytes > select.max_bytes) break;
+            n += 1;
+        }
+        const imms = all[all.len - n ..];
+
         var out: std.ArrayList(_mitr.Iterator) = .empty;
         errdefer {
             for (out.items) |*it| it.deinit();
@@ -624,10 +648,11 @@ pub const Forest = struct {
         try self.memtables.swapCurrentOut(log_index);
     }
 
-    /// buildFlush is Phase A of the memtable flush: merges every frozen
-    /// memtable waiting now, routes each key to its tree, builds one L0
-    /// SST per tree, and returns the manifest changes. The caller
-    /// proposes these through Raft. Null when nothing is waiting.
+    /// buildFlush is Phase A of the memtable flush: merges the oldest
+    /// frozen memtables up to `job_max_bytes`, routes each key to its
+    /// tree, builds one L0 SST per tree, and returns the manifest
+    /// changes. The caller proposes these through Raft. Null when
+    /// nothing is waiting.
     ///
     /// `memtable_id` names the NEWEST memtable the flush covers. The apply
     /// (`applyFlush` → `popOldestIfMatches`) releases that one and every
@@ -644,13 +669,13 @@ pub const Forest = struct {
 
     pub fn buildFlush(self: *Forest) !?FlushResult {
         const opts = self.live.cur();
-        // One merge over every frozen memtable, newest first: an item is
-        // one key with every version of it across all of them, newest
-        // first. Each iterator holds its own ref on its skiplist; the
-        // merge takes them over.
+        // One merge over the oldest frozen memtables up to the flush's
+        // byte budget, newest first: an item is one key with every
+        // version of it across all of them, newest first. Each iterator
+        // holds its own ref on its skiplist; the merge takes them over.
         const srcs = try self.memtables.getIterators(
             self.allocator,
-            .{ .current = false },
+            .{ .current = false, .max_bytes = opts.job_max_bytes },
             .{},
         );
         defer self.allocator.free(srcs);
@@ -756,7 +781,11 @@ pub const Forest = struct {
 
         // Best-effort directory sync.
         if (self.live.cur().dir.len > 0) {
-            var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.live.cur().dir});
+            var dir_sync = try fiber.spawn(
+                .{},
+                vfs.syncDir,
+                .{self.live.cur().dir},
+            );
             defer dir_sync.join();
         }
 
