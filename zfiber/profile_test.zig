@@ -38,11 +38,26 @@ fn inBurn(frame: []const u8) bool {
 // library's scan of this binary's DWARF, minutes for a Debug test
 // binary. The server's admin command symbolizes.
 
+/// There is one profiler per process and the tests run in parallel:
+/// wait for the other test's run to finish rather than fail on it.
+fn startWhenFree(alloc: std.mem.Allocator, opts: fiber.profile.Options) !void {
+    while (true) {
+        fiber.profile.start(alloc, opts) catch |e| switch (e) {
+            error.AlreadyRunning => {
+                fiber.sleepMs(10);
+                continue;
+            },
+            else => return e,
+        };
+        return;
+    }
+}
+
 test "profile: samples a CPU-bound fiber, leaf frames inside it" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos)
         return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    try fiber.profile.start(alloc, .{ .hz = 500, .secs = 2 });
+    try startWhenFree(alloc, .{ .hz = 500, .secs = 2 });
     try std.testing.expect(fiber.profile.running());
 
     var sink: u64 = 0;
@@ -88,7 +103,7 @@ test "profile: samples a CPU-bound fiber, leaf frames inside it" {
 
     // A second start after a stop works: the handler and timers were
     // put back.
-    try fiber.profile.start(alloc, .{ .hz = 100, .secs = 1 });
+    try startWhenFree(alloc, .{ .hz = 100, .secs = 1 });
     var scratch: std.Io.Writer.Allocating = .init(alloc);
     defer scratch.deinit();
     _ = try fiber.profile.stop(&scratch.writer, .{
@@ -100,7 +115,7 @@ test "profile: a second start while running is refused" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos)
         return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    try fiber.profile.start(alloc, .{ .hz = 100, .secs = 1 });
+    try startWhenFree(alloc, .{ .hz = 100, .secs = 1 });
     try std.testing.expectError(
         error.AlreadyRunning,
         fiber.profile.start(alloc, .{ .hz = 100, .secs = 1 }),

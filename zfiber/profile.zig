@@ -27,6 +27,7 @@ const builtin = @import("builtin");
 const _rt = @import("runtime.zig");
 const timestampNow = @import("utils").timestampNow;
 const _ctx = @import("utils").context;
+const Spinlock = @import("spinlock.zig").Spinlock;
 const Worker = _rt.Worker;
 const Allocator = std.mem.Allocator;
 
@@ -81,6 +82,11 @@ const State = struct {
 };
 
 var state: ?*State = null;
+/// Serializes `start` against `start` and `stop`: two starts that both
+/// saw `state == null` would each build a State and the second publish
+/// would orphan the first. The handler reads `state` without the lock;
+/// `armed` and the inflight count are what keep it safe.
+var state_lock: Spinlock = .{};
 
 // ---------------------------------------------------------------------------
 // The handler
@@ -289,6 +295,10 @@ pub const StartError = error{ AlreadyRunning, TimerCreate, TimerSet } ||
 /// samples at `hz` on every worker with an average stack; a fuller
 /// stack or a longer run drops the excess, counted in the report.
 pub fn start(allocator: Allocator, opts: Options) StartError!void {
+    // Held through the timer setup too: a few syscalls, and a rare
+    // admin operation, so the simplicity is worth more than the wait.
+    state_lock.lock();
+    defer state_lock.unlock();
     if (state != null) return error.AlreadyRunning;
 
     const workers = _rt.runtime().workers;
@@ -345,7 +355,11 @@ pub fn running() bool {
 /// Disarm, restore the handler, symbolize, and write the profile to
 /// `out` in the chosen form. Frees everything `start` allocated.
 pub fn stop(out: *std.Io.Writer, output: Output) !Report {
-    const st = state orelse return error.NotRunning;
+    state_lock.lock();
+    const st = state orelse {
+        state_lock.unlock();
+        return error.NotRunning;
+    };
     st.armed.store(false, .release);
     for (st.timers) |*t| t.disarm();
 
@@ -362,6 +376,10 @@ pub fn stop(out: *std.Io.Writer, output: Output) !Report {
     // writing; it finishes within microseconds.
     while (st.inflight.load(.acquire) != 0) std.Thread.yield() catch {};
     state = null;
+    // The rest reads only `st`, which is ours now; symbolizing can
+    // take a while and must not hold up the next start.
+    state_lock.unlock();
+
     defer {
         st.allocator.free(st.ring);
         st.allocator.free(st.timers);
