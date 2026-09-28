@@ -12,9 +12,10 @@ fn acquire(
     owner_id: u64,
     mode: SemaphoreMap.Mode,
 ) !bool {
-    var newly: std.ArrayList(u64) = .empty;
-    defer newly.deinit(gpa);
-    try newly.ensureUnusedCapacity(gpa, 1);
+    // A fixed one-slot list: no allocation per call, which the big
+    // test makes millions of times through the testing allocator.
+    var slot: [1]u64 = undefined;
+    var newly: std.ArrayList(u64) = .initBuffer(&slot);
     try sm.acquireMany(&.{key}, owner_id, mode, &newly);
     return newly.items.len == 1;
 }
