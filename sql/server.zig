@@ -428,7 +428,7 @@ pub const Handler = struct {
         const arloc = entry.arena.allocator();
         entry.stmt = _parse.statement(arloc, sql) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            error.SyntaxError, error.JsonError => return null,
+            error.SyntaxError => return null,
         };
         try self.parsed.put(gpa, try arloc.dupe(u8, sql), entry);
         return entry.stmt;

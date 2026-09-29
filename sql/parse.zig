@@ -9,10 +9,10 @@
 //! a 42601.
 //!
 //! `statement` takes an arena and returns a `Stmt` whose every string
-//! and slice BORROWS from it — parse allocates the libpg_query tree into
-//! the arena and the statement points straight into it; nothing is duped
-//! or individually freed. The statement is valid only while the arena
-//! lives, and the caller drops the arena when the statement is done.
+//! and slice lives in it: the walk copies names and literals out of the
+//! parse tree, which is freed before it returns, and nothing is freed
+//! individually. The statement is valid only while the arena lives, and
+//! the caller drops the arena when the statement is done.
 
 const std = @import("std");
 const pgwire = @import("pgwire");
@@ -232,353 +232,146 @@ pub const Stmt = union(enum) {
     }
 };
 
+
+const c = parser.c;
+
 pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
-    // `alloc` must be an arena: parse allocates the whole libpg_query JSON
-    // tree into it, and the returned Stmt borrows strings straight out
-    // of that tree. Nothing is freed here — the caller drops the arena.
+    // `alloc` is an arena: the Stmt's strings and slices land in it and
+    // are never freed one by one. The tree itself lives in libpg_query's
+    // per-thread context and goes at the end of this call, so the walk
+    // below never parks (see pgwire.parser).
     const tree = try parser.parse(alloc, sql, null);
+    defer tree.deinit();
+    const node = tree.statement(0) orelse return .unsupported;
 
-    const stmts = tree.statements() orelse return .unsupported;
-    if (stmts.len == 0) return .unsupported;
-    const wrapper = asObject(stmts[0]).?.get("stmt") orelse return .unsupported;
-    const wrapper_obj = asObject(wrapper) orelse return .unsupported;
-
-    // The statement node is a single-entry map keyed by its kind. CREATE and
-    // DROP DATABASE are their own kinds (CreatedbStmt / DropdbStmt), both
-    // carrying the name in `dbname`.
-    var it = wrapper_obj.iterator();
-    const entry = it.next() orelse return .unsupported;
-    const kind = entry.key_ptr.*;
-    const body = asObject(entry.value_ptr.*) orelse return .unsupported;
-
-    if (std.mem.eql(u8, kind, "CreatedbStmt") or std.mem.eql(u8, kind, "DropdbStmt")) {
-        const name = asString(body.get("dbname") orelse return .unsupported) orelse return .unsupported;
-        return if (kind[0] == 'C')
-            .{ .create_database = name }
-        else
-            .{ .drop_database = name };
-    }
-    if (std.mem.eql(u8, kind, "CreateStmt")) return parseCreateTable(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "DropStmt")) return parseDropTable(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "IndexStmt")) return parseCreateIndex(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "InsertStmt")) return parseInsert(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "SelectStmt")) return parseSelect(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "DeleteStmt")) return parseDelete(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "UpdateStmt")) return parseUpdate(alloc, entry.value_ptr.*);
-    if (std.mem.eql(u8, kind, "TransactionStmt")) return parseTransaction(alloc, entry.value_ptr.*);
+    // CREATE and DROP DATABASE are their own kinds, both carrying the
+    // name in `dbname`.
+    if (parser.cast(c.CreatedbStmt, node)) |s|
+        return .{ .create_database = try dup(alloc, s.dbname) };
+    if (parser.cast(c.DropdbStmt, node)) |s|
+        return .{ .drop_database = try dup(alloc, s.dbname) };
+    if (parser.cast(c.CreateStmt, node)) |s| return parseCreateTable(alloc, s);
+    if (parser.cast(c.DropStmt, node)) |s| return parseDropTable(alloc, s);
+    if (parser.cast(c.IndexStmt, node)) |s| return parseCreateIndex(alloc, s);
+    if (parser.cast(c.InsertStmt, node)) |s| return parseInsert(alloc, s);
+    if (parser.cast(c.SelectStmt, node)) |s| return parseSelect(alloc, s);
+    if (parser.cast(c.DeleteStmt, node)) |s| return parseDelete(alloc, s);
+    if (parser.cast(c.UpdateStmt, node)) |s| return parseUpdate(alloc, s);
+    if (parser.cast(c.TransactionStmt, node)) |s| return parseTransaction(s);
     return .unsupported;
 }
 
 // ---------------------------------------------------------------------------
-// Typed mirrors of the libpg_query JSON we consume, decoded with
-// std.json.parseFromValue. libpg_query encodes every AST node as a
-// single-key object keyed by its kind — {"ColumnDef": {...}} — which is
-// exactly std.json's tagged-union convention, and omits zero-valued/false
-// fields, which land on the struct defaults (absent if_not_exists ⇒ false).
-// ignore_unknown_fields skips the location/typemod/oncommit noise. The
-// declarations double as the shape documentation.
+// Reading nodes. The tree is Postgres's own: a name is a List of String
+// nodes (`public.t`), a constant an A_Const whose `val` is tagged
+// Integer / Float / String / Boolean, an enum a C enum. Every string a
+// Stmt keeps is copied into the arena.
 // ---------------------------------------------------------------------------
 
-/// One part of a (possibly qualified) name: `public.t` arrives as
-/// [{"String": {"sval": "public"}}, {"String": {"sval": "t"}}] — the LAST
-/// part is the object itself.
-const NameNode = struct { String: struct { sval: String = "" } = .{} };
+fn dup(alloc: std.mem.Allocator, s: [*c]const u8) parser.ParseError!String {
+    return alloc.dupe(u8, parser.str(s));
+}
 
-/// CREATE TABLE t (id int PRIMARY KEY, name text)
-const CreateStmtJson = struct {
-    relation: struct { relname: String = "" } = .{},
-    if_not_exists: bool = false,
-    tableElts: []const TableElt = &.{},
+/// The last part of a qualified name (`public.t` → `t`), copied; null
+/// when the list is empty or its last item is not a String.
+fn lastName(
+    alloc: std.mem.Allocator,
+    names: [*c]c.List,
+) parser.ParseError!?String {
+    const n = parser.items(names).len;
+    if (n == 0) return null;
+    const s = parser.cast(c.String, parser.nodeAt(names, n - 1)) orelse
+        return null;
+    return try dup(alloc, s.sval);
+}
 
-    const TableElt = union(enum) {
-        ColumnDef: ColumnDefJson,
-        /// Table-level constraint (PRIMARY KEY (a, b), CHECK, …) — rejected.
-        Constraint: std.json.Value,
-    };
-    const ColumnDefJson = struct {
-        colname: String = "",
-        /// `int` arrives pg_catalog-qualified: names = [pg_catalog, int4].
-        /// `char(84)` is names = [pg_catalog, bpchar] with typmods =
-        /// [{A_Const: {ival: {ival: 84}}}]; `varchar(20)` the same shape
-        /// under varchar. A bare `char` arrives as `bpchar` with typmods
-        /// [1] (the grammar fills it), a bare `varchar` with none.
-        typeName: struct {
-            names: []const NameNode = &.{},
-            typmods: []const TypmodNode = &.{},
-        } = .{},
-        constraints: []const ConstraintNode = &.{},
-    };
-    const TypmodNode = struct { A_Const: ?InsertStmtJson.AConst = null };
-    const ConstraintNode = struct {
-        Constraint: struct { contype: String = "" } = .{},
-    };
-};
+fn relname(
+    alloc: std.mem.Allocator,
+    rv: [*c]c.RangeVar,
+) parser.ParseError!String {
+    if (rv == null) return "";
+    return dup(alloc, rv.*.relname);
+}
 
-/// DROP TABLE IF EXISTS public.t / DROP INDEX IF EXISTS i
-const DropStmtJson = struct {
-    removeType: String = "", // OBJECT_TABLE / OBJECT_INDEX (vs VIEW, …)
-    missing_ok: bool = false, // IF EXISTS
-    concurrent: bool = false, // DROP INDEX CONCURRENTLY — rejected
-    objects: []const Obj = &.{}, // one per dropped object
-
-    const Obj = struct { List: struct { items: []const NameNode = &.{} } = .{} };
-};
-
-/// CREATE INDEX i ON t (col)
-const IndexStmtJson = struct {
-    idxname: String = "", // empty = unnamed (executor derives one)
-    relation: struct { relname: String = "" } = .{},
-    accessMethod: String = "", // the parser fills "btree" by default
-    tableSpace: String = "",
-    indexParams: []const IndexElemNode = &.{},
-    indexIncludingParams: []const std.json.Value = &.{},
-    whereClause: ?std.json.Value = null, // presence ⇒ partial index
-    unique: bool = false,
-    concurrent: bool = false,
-    if_not_exists: bool = false,
-
-    const IndexElemNode = struct {
-        IndexElem: struct {
-            name: String = "", // empty ⇒ expression element
-            ordering: String = "", // SORTBY_* ; "" = default (ASC)
-            nulls_ordering: String = "", // SORTBY_NULLS_* ; "" = LAST
-        } = .{},
-    };
-};
-
-/// INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')
-const InsertStmtJson = struct {
-    relation: struct { relname: String = "" } = .{},
-    cols: []const ResTargetNode = &.{}, // empty = positional
-    selectStmt: ?SelectWrap = null,
-    onConflictClause: ?std.json.Value = null, // presence ⇒ ON CONFLICT
-    returningList: []const std.json.Value = &.{}, // non-empty ⇒ RETURNING
-
-    const ResTargetNode = struct { ResTarget: struct { name: String = "" } = .{} };
-    // INSERT ... VALUES nests rows under a SelectStmt with `valuesLists`;
-    // INSERT ... SELECT has a SelectStmt WITHOUT valuesLists (→ rejected).
-    const SelectWrap = struct { SelectStmt: SelectValues = .{} };
-    const SelectValues = struct { valuesLists: []const ListNode = &.{} };
-    const ListNode = struct {
-        List: struct { items: []const ValueNode = &.{} } = .{},
-    };
-    // One VALUES item: a constant, a SQL value function
-    // (CURRENT_TIMESTAMP and kin), or a `$n` placeholder. Anything
-    // else leaves all three null → `.unsupported`.
-    const ValueNode = struct {
-        A_Const: ?AConst = null,
-        SQLValueFunction: ?struct { op: String = "" } = null,
-        ParamRef: ?ParamRef = null,
-    };
-    // A_Const encodes its value under a type-named key; the key's presence is
-    // the discriminant (libpg_query omits zero inner values, so `ival: {}`
-    // still means integer 0).
-    pub const AConst = struct {
-        ival: ?struct { ival: i64 = 0 } = null,
-        fval: ?struct { fval: String = "" } = null,
-        sval: ?struct { sval: String = "" } = null,
-        boolval: ?struct { boolval: bool = false } = null,
-        isnull: bool = false,
-    };
-    /// `$n`. libpg_query omits a zero, so `$0` arrives with no number.
-    pub const ParamRef = struct { number: i64 = 0 };
-};
-
-/// SELECT [cols|*] FROM t [WHERE ...]
-const SelectStmtJson = struct {
-    targetList: []const ResTargetNode = &.{},
-    fromClause: []const FromNode = &.{},
-    whereClause: ?WhereNode = null,
-    lockingClause: []const LockingNode = &.{},
-    // LIMIT n: a literal (A_Const null ⇒ a parameter or expression);
-    // LIMIT ALL arrives as a NULL constant. limitOption tells COUNT
-    // from FETCH ... WITH TIES.
-    limitCount: ?LimitNode = null,
-    limitOption: String = "",
-    // Clauses this slice doesn't support — presence ⇒ rejection.
-    sortClause: []const std.json.Value = &.{},
-    groupClause: []const std.json.Value = &.{},
-    distinctClause: []const std.json.Value = &.{},
-    havingClause: ?std.json.Value = null,
-    limitOffset: ?std.json.Value = null,
-
-    const LimitNode = struct { A_Const: ?InsertStmtJson.AConst = null };
-
-    // FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED. Unlike zero-valued
-    // ints (omitted), enum strings are always emitted: plain FOR UPDATE
-    // arrives as strength="LCS_FORUPDATE", waitPolicy="LockWaitBlock".
-    const LockingNode = struct {
-        LockingClause: ?struct {
-            strength: String = "",
-            waitPolicy: String = "",
-            lockedRels: []const std.json.Value = &.{},
-        } = null,
-    };
-
-    const ResTargetNode = struct {
-        ResTarget: struct { val: TargetVal = .{} } = .{},
-    };
-    // A projection item: a column reference, or a function call — of
-    // which only `count(*)` is accepted. Anything else (arithmetic, a
-    // cast) leaves both null → rejected.
-    const TargetVal = struct {
-        ColumnRef: ?ColumnRef = null,
-        FuncCall: ?FuncCallNode = null,
-    };
-    // count(*) is a FuncCall with agg_star and no args; the other
-    // fields are decoded only to reject what they mark.
-    const FuncCallNode = struct {
-        funcname: []const NameNode = &.{},
-        agg_star: bool = false,
-        args: []const std.json.Value = &.{},
-        agg_distinct: bool = false,
-        agg_filter: ?std.json.Value = null, // FILTER (WHERE ...)
-        over: ?std.json.Value = null, // a window function
-    };
-    // A WHERE operand must be a column reference; anything else
-    // (function, arithmetic) leaves ColumnRef null → rejected.
-    const ColumnRefWrap = struct { ColumnRef: ?ColumnRef = null };
-    const ColumnRef = struct { fields: []const FieldNode = &.{} };
-    const FieldNode = struct {
-        String: ?struct { sval: String = "" } = null,
-        A_Star: ?struct {} = null,
-    };
-    const FromNode = struct { RangeVar: ?struct { relname: String = "" } = null };
-    // One WHERE node: exactly one of the three is present. The mirror
-    // is recursive through `args` (a slice, so the type has a size).
-    const WhereNode = struct {
-        A_Expr: ?AExpr = null,
-        BoolExpr: ?BoolExprNode = null,
-        NullTest: ?NullTestNode = null,
-        // The right side is a constant or a `$n`; anything else
-        // leaves both null → rejected.
-        const AExpr = struct {
-            kind: String = "",
-            name: []const NameNode = &.{},
-            lexpr: ColumnRefWrap = .{},
-            rexpr: struct {
-                A_Const: ?InsertStmtJson.AConst = null,
-                ParamRef: ?InsertStmtJson.ParamRef = null,
-            } = .{},
-        };
-        // AND_EXPR / OR_EXPR / NOT_EXPR. libpg_query flattens `a AND b
-        // AND c` into ONE node with three args (parse_test asserts it);
-        // NOT always carries exactly one.
-        const BoolExprNode = struct {
-            boolop: String = "",
-            args: []const WhereNode = &.{},
-        };
-        // `x IS NULL` / `x IS NOT NULL`: nulltesttype = IS_NULL | IS_NOT_NULL.
-        const NullTestNode = struct {
-            arg: ColumnRefWrap = .{},
-            nulltesttype: String = "",
-        };
-    };
-};
-
-/// DELETE FROM t [WHERE ...]. `relation` is inline (a RangeVar body,
-/// like INSERT); the last three clauses are decoded only to reject them.
-const DeleteStmtJson = struct {
-    relation: struct { relname: String = "" } = .{},
-    whereClause: ?SelectStmtJson.WhereNode = null,
-    usingClause: []const std.json.Value = &.{}, // DELETE ... USING
-    returningList: []const std.json.Value = &.{}, // RETURNING
-    withClause: ?std.json.Value = null, // WITH ... DELETE
-};
-
-/// One value-expression node: exactly one of the four is present.
-/// Any other node kind (FuncCall, TypeCast, SubLink, SetToDefault,
-/// MultiAssignRef) leaves all four null → rejected. Recursive through
-/// pointers: std.json allocates a `*T` field.
-const ExprNode = struct {
-    A_Const: ?InsertStmtJson.AConst = null,
-    ColumnRef: ?SelectStmtJson.ColumnRef = null,
-    A_Expr: ?AExpr = null,
-    ParamRef: ?InsertStmtJson.ParamRef = null,
-
-    const AExpr = struct {
-        kind: String = "",
-        name: []const NameNode = &.{},
-        lexpr: ?*const ExprNode = null, // absent: unary `-x` / `+x`
-        rexpr: ?*const ExprNode = null,
-    };
-};
-
-/// UPDATE t SET col = expr [, ...] [WHERE ...]. Each targetList entry
-/// is one SET assignment. The last three clauses are decoded only to
-/// reject them.
-const UpdateStmtJson = struct {
-    relation: struct { relname: String = "" } = .{},
-    targetList: []const ResTargetNode = &.{},
-    whereClause: ?SelectStmtJson.WhereNode = null,
-    fromClause: []const std.json.Value = &.{}, // UPDATE ... FROM
-    returningList: []const std.json.Value = &.{}, // RETURNING
-    withClause: ?std.json.Value = null, // WITH ... UPDATE
-
-    const ResTargetNode = struct { ResTarget: ResTarget = .{} };
-    const ResTarget = struct {
-        name: String = "",
-        val: ExprNode = .{},
-    };
-};
-
-/// Decode one statement body into its typed mirror. A shape we don't
-/// recognize (unknown node kind, wrong field type) is null → .unsupported;
-/// only OOM propagates.
-fn fromValue(comptime T: type, alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!?T {
-    return std.json.parseFromValueLeaky(T, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => null,
+/// A constant as a Literal, its text copied. Integers past int32 arrive
+/// as Float, the digits as text, which is what `.float` carries.
+fn literalFrom(
+    alloc: std.mem.Allocator,
+    ac: *const c.A_Const,
+) parser.ParseError!Literal {
+    if (ac.isnull) return .null_value;
+    return switch (ac.val.node.type) {
+        c.T_Integer => .{ .int = ac.val.ival.ival },
+        c.T_Float => .{ .float = try dup(alloc, ac.val.fval.fval) },
+        c.T_String => .{ .str = try dup(alloc, ac.val.sval.sval) },
+        c.T_Boolean => .{ .bool_ = ac.val.boolval.boolval },
+        else => .unsupported,
     };
 }
 
 /// CREATE TABLE. Only bare `name type` columns with an optional
 /// single-column PRIMARY KEY or UNIQUE parse; any other constraint (NOT
 /// NULL, FK, DEFAULT, table-level) is a clean `.invalid`.
-fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
-    const cs = try fromValue(CreateStmtJson, alloc, body) orelse return .unsupported;
-
+fn parseCreateTable(
+    alloc: std.mem.Allocator,
+    cs: *const c.CreateStmt,
+) parser.ParseError!Stmt {
     var columns: std.ArrayList(ColumnDef) = .empty;
     var pkey_seen = false;
-    for (cs.tableElts) |elt| {
-        const cd = switch (elt) {
-            .ColumnDef => |col| col,
-            .Constraint => return invalid("table-level constraints are not supported"),
+    for (parser.items(cs.tableElts)) |cell| {
+        const cd = parser.cast(c.ColumnDef, cell.ptr_value) orelse {
+            if (parser.cast(c.Constraint, cell.ptr_value) != null)
+                return invalid("table-level constraints are not supported");
+            return .unsupported;
         };
-        if (std.ascii.eqlIgnoreCase(cd.colname, "egid"))
+        const colname = try dup(alloc, cd.colname);
+        if (std.ascii.eqlIgnoreCase(colname, "egid"))
             return invalid("column name \"egid\" is reserved");
-        for (columns.items) |c| {
-            if (std.mem.eql(u8, c.name, cd.colname))
-                return invalidFmt(alloc, "duplicate column \"{s}\"", .{cd.colname});
+        for (columns.items) |col| {
+            if (std.mem.eql(u8, col.name, colname))
+                return invalidFmt(
+                    alloc,
+                    "duplicate column \"{s}\"",
+                    .{colname},
+                );
         }
 
-        const names = cd.typeName.names;
-        if (names.len == 0) return .unsupported;
-        const tyname = names[names.len - 1].String.sval;
+        // `int` arrives pg_catalog-qualified: names = [pg_catalog, int4];
+        // `char(84)` is [pg_catalog, bpchar] with typmods = [84]. A bare
+        // `char` arrives as `bpchar` with typmods [1] (the grammar fills
+        // it), a bare `varchar` with none.
+        if (cd.typeName == null) return .unsupported;
+        const tn = cd.typeName.*;
+        const tyname = try lastName(alloc, tn.names) orelse return .unsupported;
         var ty = _value.Type.fromName(tyname) orelse
             return invalidFmt(alloc, "unsupported type \"{s}\"", .{tyname});
 
         // A length modifier: only `char(n)` / `varchar(n)` take one, a
         // single integer in 1..max_type_mod. A lengthless `char` is
         // `char(1)`; a lengthless `varchar` stays `.text`.
-        const typmods = cd.typeName.typmods;
+        const typmods = parser.items(tn.typmods);
         var type_mod: ?u32 = null;
         if (typmods.len > 0) {
             const is_varchar = std.mem.eql(u8, tyname, "varchar");
             if (ty != .bpchar and !is_varchar)
                 return invalidFmt(alloc, "type modifier is not allowed for type \"{s}\"", .{tyname});
-            if (typmods.len != 1)
-                return invalidFmt(alloc, "invalid type modifier for type \"{s}\"", .{tyname});
-            const ac = typmods[0].A_Const orelse
-                return invalidFmt(alloc, "invalid type modifier for type \"{s}\"", .{tyname});
-            const iv = ac.ival orelse
-                return invalidFmt(alloc, "invalid type modifier for type \"{s}\"", .{tyname});
-            if (iv.ival < 1)
+            const ac = if (typmods.len == 1)
+                parser.cast(c.A_Const, typmods[0].ptr_value)
+            else
+                null;
+            if (ac == null or ac.?.val.node.type != c.T_Integer)
+                return invalidFmt(
+                    alloc,
+                    "invalid type modifier for type \"{s}\"",
+                    .{tyname},
+                );
+            const n = ac.?.val.ival.ival;
+            if (n < 1)
                 return invalidFmt(alloc, "length for type {s} must be at least 1", .{tyname});
-            if (iv.ival > _value.Type.max_type_mod)
+            if (n > _value.Type.max_type_mod)
                 return invalidFmt(alloc, "length for type {s} cannot exceed {d}", //
                     .{ tyname, _value.Type.max_type_mod });
-            type_mod = @intCast(iv.ival);
+            type_mod = @intCast(n);
             if (is_varchar) ty = .varchar;
         } else if (ty == .bpchar) {
             type_mod = 1;
@@ -586,16 +379,15 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
 
         var pkey = false;
         var unique = false;
-        for (cd.constraints) |con| {
-            const contype = con.Constraint.contype;
-            if (std.mem.eql(u8, contype, "CONSTR_PRIMARY")) {
-                pkey = true;
-            } else if (std.mem.eql(u8, contype, "CONSTR_UNIQUE")) {
-                unique = true;
-            } else {
-                return invalid(
+        for (parser.items(cd.constraints)) |ccell| {
+            const con = parser.cast(c.Constraint, ccell.ptr_value) orelse
+                return .unsupported;
+            switch (con.contype) {
+                c.CONSTR_PRIMARY => pkey = true,
+                c.CONSTR_UNIQUE => unique = true,
+                else => return invalid(
                     "only PRIMARY KEY and UNIQUE column constraints are supported",
-                );
+                ),
             }
         }
         if (pkey) {
@@ -606,7 +398,7 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
         }
 
         try columns.append(alloc, .{
-            .name = cd.colname,
+            .name = colname,
             .ty = ty,
             .type_mod = type_mod,
             .pkey = pkey,
@@ -615,22 +407,23 @@ fn parseCreateTable(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
     }
 
     return .{ .create_table = .{
-        .name = cs.relation.relname,
+        .name = try relname(alloc, cs.relation),
         .if_not_exists = cs.if_not_exists,
         .columns = try columns.toOwnedSlice(alloc),
     } };
 }
 
-/// DROP TABLE / DROP INDEX (libpg_query reuses DropStmt for both,
-/// discriminated by removeType). Other object kinds (VIEW, …) are
-/// `.unsupported`; multi-object DROPs are rejected.
-fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
-    const ds = try fromValue(DropStmtJson, alloc, body) orelse return .unsupported;
-
-    const is_index = std.mem.eql(u8, ds.removeType, "OBJECT_INDEX");
-    if (!is_index and !std.mem.eql(u8, ds.removeType, "OBJECT_TABLE"))
-        return .unsupported;
-    if (ds.objects.len != 1) {
+/// DROP TABLE / DROP INDEX (one DropStmt serves both, discriminated by
+/// removeType). Other object kinds (VIEW, …) are `.unsupported`;
+/// multi-object DROPs are rejected.
+fn parseDropTable(
+    alloc: std.mem.Allocator,
+    ds: *const c.DropStmt,
+) parser.ParseError!Stmt {
+    const is_index = ds.removeType == c.OBJECT_INDEX;
+    if (!is_index and ds.removeType != c.OBJECT_TABLE) return .unsupported;
+    const objects = parser.items(ds.objects);
+    if (objects.len != 1) {
         return if (is_index)
             invalid("DROP INDEX with multiple indexes is not supported")
         else
@@ -638,9 +431,10 @@ fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseEr
     }
     if (is_index and ds.concurrent)
         return invalid("DROP INDEX CONCURRENTLY is not supported");
-    const items = ds.objects[0].List.items;
-    if (items.len == 0) return .unsupported;
-    const name = items[items.len - 1].String.sval;
+    // Each object is itself a qualified name: a List of String.
+    const parts = parser.cast(c.List, objects[0].ptr_value) orelse
+        return .unsupported;
+    const name = try lastName(alloc, parts) orelse return .unsupported;
 
     if (is_index) {
         return .{ .drop_index = .{
@@ -660,36 +454,40 @@ fn parseDropTable(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseEr
 /// methods, DESC / NULLS FIRST ordering) is a clean `.invalid`.
 /// ASC / NULLS LAST are accepted: they are this index's semantics
 /// already (the NULL tag byte sorts last).
-fn parseCreateIndex(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
-    const is = try fromValue(IndexStmtJson, alloc, body) orelse return .unsupported;
-
+fn parseCreateIndex(
+    alloc: std.mem.Allocator,
+    is: *const c.IndexStmt,
+) parser.ParseError!Stmt {
     if (is.concurrent)
         return invalid("CREATE INDEX CONCURRENTLY is not supported");
     if (is.whereClause != null)
         return invalid("partial indexes are not supported");
-    if (is.indexIncludingParams.len > 0)
+    if (parser.items(is.indexIncludingParams).len > 0)
         return invalid("INCLUDE columns are not supported");
-    if (is.tableSpace.len > 0) return invalid("TABLESPACE is not supported");
-    if (is.accessMethod.len > 0 and !std.mem.eql(u8, is.accessMethod, "btree"))
+    if (is.tableSpace != null) return invalid("TABLESPACE is not supported");
+    const method = parser.str(is.accessMethod);
+    if (method.len > 0 and !std.mem.eql(u8, method, "btree"))
         return invalidFmt(
             alloc,
             "access method \"{s}\" is not supported",
-            .{is.accessMethod},
+            .{method},
         );
-    if (is.indexParams.len != 1)
+    const params = parser.items(is.indexParams);
+    if (params.len != 1)
         return invalid("only single-column indexes are supported");
-    const elem = is.indexParams[0].IndexElem;
-    if (elem.name.len == 0)
+    const elem = parser.cast(c.IndexElem, params[0].ptr_value) orelse
+        return .unsupported;
+    if (elem.name == null)
         return invalid("expression indexes are not supported");
-    if (std.mem.eql(u8, elem.ordering, "SORTBY_DESC"))
+    if (elem.ordering == c.SORTBY_DESC)
         return invalid("DESC index ordering is not supported");
-    if (std.mem.eql(u8, elem.nulls_ordering, "SORTBY_NULLS_FIRST"))
+    if (elem.nulls_ordering == c.SORTBY_NULLS_FIRST)
         return invalid("NULLS FIRST index ordering is not supported");
 
     return .{ .create_index = .{
-        .name = if (is.idxname.len > 0) is.idxname else null,
-        .table = is.relation.relname,
-        .column = elem.name,
+        .name = if (is.idxname != null) try dup(alloc, is.idxname) else null,
+        .table = try relname(alloc, is.relation),
+        .column = try dup(alloc, elem.name),
         .unique = is.unique,
         .if_not_exists = is.if_not_exists,
     } };
@@ -697,75 +495,81 @@ fn parseCreateIndex(alloc: std.mem.Allocator, body: std.json.Value) parser.Parse
 
 /// INSERT ... VALUES. ON CONFLICT / RETURNING / INSERT…SELECT are rejected
 /// (before any allocation, so no cleanup); arity, unknown columns, and literal
-/// coercion are the executor's job. The `errdefer`s only cover OOM.
-fn parseInsert(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
-    const is = try fromValue(InsertStmtJson, alloc, body) orelse return .unsupported;
-
+/// coercion are the executor's job.
+fn parseInsert(
+    alloc: std.mem.Allocator,
+    is: *const c.InsertStmt,
+) parser.ParseError!Stmt {
     if (is.onConflictClause != null) return invalid("ON CONFLICT is not supported");
-    if (is.returningList.len > 0) return invalid("RETURNING is not supported");
-    const sel = is.selectStmt orelse return invalid("INSERT requires VALUES");
-    if (sel.SelectStmt.valuesLists.len == 0)
+    if (parser.items(is.returningList).len > 0)
+        return invalid("RETURNING is not supported");
+    // VALUES rows nest under a SelectStmt with `valuesLists`; an
+    // INSERT ... SELECT has one without.
+    const sel = parser.cast(c.SelectStmt, is.selectStmt) orelse
+        return invalid("INSERT requires VALUES");
+    const value_lists = parser.items(sel.valuesLists);
+    if (value_lists.len == 0)
         return invalid("only INSERT ... VALUES is supported");
 
     var columns: ?[]String = null;
-    if (is.cols.len > 0) {
-        const cols = try alloc.alloc(String, is.cols.len);
-        for (is.cols, cols) |ct, *dst| dst.* = ct.ResTarget.name;
+    const col_cells = parser.items(is.cols);
+    if (col_cells.len > 0) {
+        const cols = try alloc.alloc(String, col_cells.len);
+        for (col_cells, cols) |cell, *dst| {
+            const rt = parser.cast(c.ResTarget, cell.ptr_value) orelse
+                return .unsupported;
+            dst.* = try dup(alloc, rt.name);
+        }
         columns = cols;
     }
 
     var params = ParamTally{};
-    var rows: std.ArrayList([]Literal) = .empty;
-    for (sel.SelectStmt.valuesLists) |ln| {
-        const lits = try alloc.alloc(Literal, ln.List.items.len);
-        for (ln.List.items, lits) |item, *lit| {
-            if (item.ParamRef) |pr| {
+    const rows = try alloc.alloc([]Literal, value_lists.len);
+    for (value_lists, rows) |lcell, *row| {
+        const list = parser.cast(c.List, lcell.ptr_value) orelse
+            return .unsupported;
+        const cells = parser.items(list);
+        const lits = try alloc.alloc(Literal, cells.len);
+        for (cells, lits) |cell, *lit| {
+            if (parser.cast(c.ParamRef, cell.ptr_value)) |pr| {
                 lit.* = params.note(pr.number) orelse
                     return .{ .invalid = try badParamMsg(alloc, pr.number) };
                 continue;
             }
-            lit.* = literalFromValue(item);
+            lit.* = try valueLiteral(alloc, cell.ptr_value);
         }
-        try rows.append(alloc, lits);
+        row.* = lits;
     }
 
     return .{ .insert = .{
-        .table = is.relation.relname,
+        .table = try relname(alloc, is.relation),
         .columns = columns,
-        .rows = try rows.toOwnedSlice(alloc),
+        .rows = rows,
         .param_count = params.count,
     } };
 }
 
-/// A VALUES item as a Literal: the constant, or the value function
-/// (a `$n` is the caller's: it needs the statement's tally).
-fn literalFromValue(node: InsertStmtJson.ValueNode) Literal {
-    if (node.A_Const) |ac| return literalFrom(ac);
-    const svf = node.SQLValueFunction orelse return .unsupported;
+/// A VALUES item as a Literal: a constant, or a value function (a
+/// `$n` is the caller's: it needs the statement's tally). Anything
+/// else (DEFAULT, an expression) is `.unsupported`.
+fn valueLiteral(
+    alloc: std.mem.Allocator,
+    p: ?*anyopaque,
+) parser.ParseError!Literal {
+    if (parser.cast(c.A_Const, p)) |ac| return literalFrom(alloc, ac);
+    const svf = parser.cast(c.SQLValueFunction, p) orelse return .unsupported;
     // The precision forms (CURRENT_TIMESTAMP(3)) keep the full µs;
     // LOCALTIMESTAMP is the same instant on a UTC-only server.
-    const ops = [_]String{
-        "SVFOP_CURRENT_TIMESTAMP", "SVFOP_CURRENT_TIMESTAMP_N",
-        "SVFOP_LOCALTIMESTAMP",    "SVFOP_LOCALTIMESTAMP_N",
+    return switch (svf.op) {
+        c.SVFOP_CURRENT_TIMESTAMP,
+        c.SVFOP_CURRENT_TIMESTAMP_N,
+        c.SVFOP_LOCALTIMESTAMP,
+        c.SVFOP_LOCALTIMESTAMP_N,
+        => .current_timestamp,
+        else => .unsupported,
     };
-    for (ops) |op| if (std.mem.eql(u8, svf.op, op)) return .current_timestamp;
-    return .unsupported;
 }
 
-fn literalFrom(ac: InsertStmtJson.AConst) Literal {
-    if (ac.isnull) return .null_value;
-    if (ac.ival) |iv| return .{ .int = iv.ival };
-    if (ac.fval) |fv| return .{ .float = fv.fval };
-    if (ac.sval) |sv| return .{ .str = sv.sval };
-    if (ac.boolval) |bv| return .{ .bool_ = bv.boolval };
-    return .unsupported;
-}
-
-/// The values a Bind message supplied for the statement being run:
-/// `values[n - 1]` is `$n`'s bytes (null = SQL NULL) and `formats[n -
-/// 1]` says how to read them, 0 text or 1 binary. Both borrow the
-/// portal, which outlives the Execute. Empty on the simple-query path,
-/// where no statement carries a placeholder.
 pub const Params = struct {
     values: []const ?String = &.{},
     formats: []const i16 = &.{},
@@ -856,12 +660,21 @@ const ParsedWhere = union(enum) {
 };
 
 /// The column a WHERE operand names — the last field of a qualified
-/// reference — or null when the operand is not a plain column.
-fn columnOf(ref: SelectStmtJson.ColumnRefWrap) ?String {
-    const cr = ref.ColumnRef orelse return null;
-    if (cr.fields.len == 0) return null;
-    const last = cr.fields[cr.fields.len - 1].String orelse return null;
-    return last.sval;
+/// reference, copied — or null when the operand is not a plain column.
+fn columnOf(alloc: std.mem.Allocator, p: anytype) parser.ParseError!?String {
+    const cr = parser.cast(c.ColumnRef, p) orelse return null;
+    return lastName(alloc, cr.fields);
+}
+
+/// The operator an A_Expr applies: the last part of its name, when it
+/// is a plain `AEXPR_OP` with one.
+fn operatorOf(ae: *const c.A_Expr) ?String {
+    if (ae.kind != c.AEXPR_OP) return null;
+    const n = parser.items(ae.name).len;
+    if (n == 0) return null;
+    const s = parser.cast(c.String, parser.nodeAt(ae.name, n - 1)) orelse
+        return null;
+    return parser.str(s.sval);
 }
 
 /// Parse a WHERE tree, shared by SELECT, DELETE, and UPDATE: `column =
@@ -869,29 +682,33 @@ fn columnOf(ref: SelectStmtJson.ColumnRefWrap) ?String {
 /// them. Anything else (another operator, a subquery, column-vs-column,
 /// a bare boolean column) yields a clean `.invalid` reason; only OOM
 /// propagates. AND/OR children land in one arena slice, NOT's in one
-/// arena cell.
+/// arena cell. Postgres flattens `a AND b AND c` into one node with
+/// three args; NOT always carries exactly one.
 fn parseWhere(
     alloc: std.mem.Allocator,
     params: *ParamTally,
-    where: SelectStmtJson.WhereNode,
+    p: ?*c.Node,
 ) parser.ParseError!ParsedWhere {
-    if (where.BoolExpr) |be| {
-        if (std.mem.eql(u8, be.boolop, "NOT_EXPR")) {
-            if (be.args.len != 1)
+    if (parser.cast(c.BoolExpr, p)) |be| {
+        const args = parser.items(be.args);
+        if (be.boolop == c.NOT_EXPR) {
+            if (args.len != 1)
                 return ParsedWhere.reject("NOT takes exactly one operand");
             const child = try alloc.create(Where);
-            child.* = switch (try parseWhere(alloc, params, be.args[0])) {
+            const arg = parser.asNode(args[0].ptr_value);
+            child.* = switch (try parseWhere(alloc, params, arg)) {
                 .where => |x| x,
                 .invalid => |msg| return .{ .invalid = msg },
             };
             return .{ .where = .{ .not = child } };
         }
-        const is_and = std.mem.eql(u8, be.boolop, "AND_EXPR");
-        if (!is_and and !std.mem.eql(u8, be.boolop, "OR_EXPR"))
+        const is_and = be.boolop == c.AND_EXPR;
+        if (!is_and and be.boolop != c.OR_EXPR)
             return ParsedWhere.reject("unsupported WHERE clause");
-        const kids = try alloc.alloc(Where, be.args.len);
-        for (be.args, kids) |arg, *kid| {
-            kid.* = switch (try parseWhere(alloc, params, arg)) {
+        const kids = try alloc.alloc(Where, args.len);
+        for (args, kids) |arg, *kid| {
+            const node = parser.asNode(arg.ptr_value);
+            kid.* = switch (try parseWhere(alloc, params, node)) {
                 .where => |x| x,
                 .invalid => |msg| return .{ .invalid = msg },
             };
@@ -899,36 +716,35 @@ fn parseWhere(
         return .{ .where = if (is_and) .{ .and_ = kids } else .{ .or_ = kids } };
     }
 
-    if (where.NullTest) |nt| {
-        const column = columnOf(nt.arg) orelse
+    if (parser.cast(c.NullTest, p)) |nt| {
+        const column = try columnOf(alloc, nt.arg) orelse
             return ParsedWhere.reject("IS NULL operand must be a column");
-        const negate = if (std.mem.eql(u8, nt.nulltesttype, "IS_NULL"))
-            false
-        else if (std.mem.eql(u8, nt.nulltesttype, "IS_NOT_NULL"))
-            true
-        else
-            return ParsedWhere.reject("unsupported WHERE clause");
+        const negate = switch (nt.nulltesttype) {
+            c.IS_NULL => false,
+            c.IS_NOT_NULL => true,
+            else => return ParsedWhere.reject("unsupported WHERE clause"),
+        };
         return .{ .where = .{ .is_null = .{ .column = column, .negate = negate } } };
     }
 
-    const ae = where.A_Expr orelse
+    const ae = parser.cast(c.A_Expr, p) orelse
         return ParsedWhere.reject("unsupported WHERE clause");
-    if (!std.mem.eql(u8, ae.kind, "AEXPR_OP") or ae.name.len == 0 or
-        !std.mem.eql(u8, ae.name[ae.name.len - 1].String.sval, "="))
+    const op = operatorOf(ae) orelse "";
+    if (!std.mem.eql(u8, op, "="))
         return ParsedWhere.reject(
             "only `column = value` comparisons are supported in WHERE",
         );
 
-    const column = columnOf(ae.lexpr) orelse
+    const column = try columnOf(alloc, ae.lexpr) orelse
         return ParsedWhere.reject("WHERE left side must be a column");
-    if (ae.rexpr.ParamRef) |pr| {
+    if (parser.cast(c.ParamRef, ae.rexpr)) |pr| {
         const lit = params.note(pr.number) orelse
             return .{ .invalid = try badParamMsg(alloc, pr.number) };
         return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
     }
-    const ac = ae.rexpr.A_Const orelse
+    const ac = parser.cast(c.A_Const, ae.rexpr) orelse
         return ParsedWhere.reject("WHERE right side must be a literal");
-    const lit = literalFrom(ac);
+    const lit = try literalFrom(alloc, ac);
     if (lit == .unsupported)
         return ParsedWhere.reject("WHERE right side must be a literal");
     return .{ .where = .{ .eq = .{ .column = column, .literal = lit } } };
@@ -965,43 +781,41 @@ fn opFrom(name: String) ?Expr.Op {
 fn parseExpr(
     arloc: std.mem.Allocator,
     params: *ParamTally,
-    node: ExprNode,
+    p: ?*c.Node,
 ) parser.ParseError!ParsedExpr {
-    if (node.A_Const) |ac| {
-        const lit = literalFrom(ac);
+    if (parser.cast(c.A_Const, p)) |ac| {
+        const lit = try literalFrom(arloc, ac);
         if (lit == .unsupported)
             return ParsedExpr.reject("unsupported literal in SET");
         return .{ .expr = .{ .literal = lit } };
     }
-    if (node.ParamRef) |pr| {
+    if (parser.cast(c.ParamRef, p)) |pr| {
         const lit = params.note(pr.number) orelse
             return .{ .invalid = try badParamMsg(arloc, pr.number) };
         return .{ .expr = .{ .literal = lit } };
     }
-    if (node.ColumnRef != null) {
-        const column = columnOf(.{ .ColumnRef = node.ColumnRef }) orelse
+    if (parser.cast(c.ColumnRef, p) != null) {
+        const column = try columnOf(arloc, p) orelse
             return ParsedExpr.reject("unsupported column reference in SET");
         return .{ .expr = .{ .column = column } };
     }
-    const ae = node.A_Expr orelse return ParsedExpr.reject(
+    const ae = parser.cast(c.A_Expr, p) orelse return ParsedExpr.reject(
         "SET value must be a literal, a column, or an operator " ++
             "expression over them",
     );
     const bad_op = "only + - * / % || are supported in SET";
-    if (!std.mem.eql(u8, ae.kind, "AEXPR_OP") or ae.name.len == 0)
-        return ParsedExpr.reject(bad_op);
-    const op = opFrom(ae.name[ae.name.len - 1].String.sval) orelse
+    const op = opFrom(operatorOf(ae) orelse "") orelse
         return ParsedExpr.reject(bad_op);
 
-    const rhs_node = ae.rexpr orelse return ParsedExpr.reject(bad_op);
+    if (ae.rexpr == null) return ParsedExpr.reject(bad_op);
     const rhs = try arloc.create(Expr);
-    rhs.* = switch (try parseExpr(arloc, params, rhs_node.*)) {
+    rhs.* = switch (try parseExpr(arloc, params, parser.asNode(ae.rexpr))) {
         .expr => |e| e,
         .invalid => |msg| return .{ .invalid = msg },
     };
     const lhs = try arloc.create(Expr);
-    if (ae.lexpr) |lhs_node| {
-        lhs.* = switch (try parseExpr(arloc, params, lhs_node.*)) {
+    if (ae.lexpr != null) {
+        lhs.* = switch (try parseExpr(arloc, params, parser.asNode(ae.lexpr))) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };
@@ -1018,11 +832,13 @@ fn parseExpr(
 /// SELECT [cols|*|count(*)] FROM one_table [WHERE ...] [FOR UPDATE]
 /// [LIMIT n]. Joins, subqueries, ORDER BY / GROUP BY / OFFSET /
 /// DISTINCT and expression targets are rejected.
-fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError!Stmt {
-    const ss = try fromValue(SelectStmtJson, alloc, body) orelse return .unsupported;
-
-    if (ss.sortClause.len > 0 or ss.groupClause.len > 0 or ss.distinctClause.len > 0 or
-        ss.havingClause != null or ss.limitOffset != null)
+fn parseSelect(
+    alloc: std.mem.Allocator,
+    ss: *const c.SelectStmt,
+) parser.ParseError!Stmt {
+    if (ss.sortClause != null or ss.groupClause != null or
+        ss.distinctClause != null or ss.havingClause != null or
+        ss.limitOffset != null)
         return invalid(
             "ORDER BY / GROUP BY / OFFSET / DISTINCT are not supported",
         );
@@ -1032,74 +848,86 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
     // grammar rejects WITH TIES itself today; the check is for one that
     // does not, so it can never pass as a plain LIMIT).
     var limit: ?usize = null;
-    if (ss.limitCount) |lc| {
-        if (std.mem.eql(u8, ss.limitOption, "LIMIT_OPTION_WITH_TIES"))
+    if (ss.limitCount != null) {
+        if (ss.limitOption == c.LIMIT_OPTION_WITH_TIES)
             return invalid("FETCH ... WITH TIES is not supported");
-        const ac = lc.A_Const orelse
+        const ac = parser.cast(c.A_Const, ss.limitCount) orelse
             return invalid("only an integer literal LIMIT is supported");
         if (!ac.isnull) {
-            const iv = ac.ival orelse
+            if (ac.val.node.type != c.T_Integer)
                 return invalid("only an integer literal LIMIT is supported");
-            if (iv.ival < 0) return invalid("LIMIT must not be negative");
-            limit = @intCast(iv.ival);
+            const n = ac.val.ival.ival;
+            if (n < 0) return invalid("LIMIT must not be negative");
+            limit = @intCast(n);
         }
     }
 
-    if (ss.fromClause.len != 1)
+    const from = parser.items(ss.fromClause);
+    if (from.len != 1)
         return invalid("SELECT must read exactly one table");
-    const rv = ss.fromClause[0].RangeVar orelse
+    const rv = parser.cast(c.RangeVar, from[0].ptr_value) orelse
         return invalid("only table sources are supported");
 
     // Every target must be a column reference, except the one aggregate,
     // a lone `count(*)`; a `*` anywhere makes it a star projection.
+    const targets = parser.items(ss.targetList);
     var star = false;
     var count_star = false;
-    for (ss.targetList) |tn| {
-        if (tn.ResTarget.val.FuncCall) |fc| {
+    for (targets) |cell| {
+        const rt = parser.cast(c.ResTarget, cell.ptr_value) orelse
+            return .unsupported;
+        if (parser.cast(c.FuncCall, rt.val)) |fc| {
             if (!isCountStar(fc))
                 return invalid("only count(*) is supported in SELECT");
             count_star = true;
             continue;
         }
-        const cr = tn.ResTarget.val.ColumnRef orelse
+        const cr = parser.cast(c.ColumnRef, rt.val) orelse
             return invalid("only column references are supported in SELECT");
-        for (cr.fields) |f| {
-            if (f.A_Star != null) star = true;
+        for (parser.items(cr.fields)) |f| {
+            if (parser.cast(c.A_Star, f.ptr_value) != null) star = true;
         }
     }
-    if (count_star and ss.targetList.len != 1)
+    if (count_star and targets.len != 1)
         return invalid("count(*) cannot be combined with other targets");
-    if (count_star and ss.lockingClause.len > 0)
+    const locking = parser.items(ss.lockingClause);
+    if (count_star and locking.len > 0)
         return invalid("FOR UPDATE is not allowed with count(*)");
 
     var cols: std.ArrayList(String) = .empty;
     if (!star and !count_star) {
-        for (ss.targetList) |tn| {
-            const fields = tn.ResTarget.val.ColumnRef.?.fields;
-            if (fields.len == 0 or fields[fields.len - 1].String == null)
+        for (targets) |cell| {
+            const rt = parser.cast(c.ResTarget, cell.ptr_value).?;
+            const column = try columnOf(alloc, rt.val) orelse
                 return invalid("unsupported column reference");
-            try cols.append(alloc, fields[fields.len - 1].String.?.sval);
+            try cols.append(alloc, column);
         }
     }
 
     var params = ParamTally{};
     var where: ?Where = null;
-    if (ss.whereClause) |node| switch (try parseWhere(alloc, &params, node)) {
+    if (ss.whereClause != null) switch (try parseWhere(
+        alloc,
+        &params,
+        parser.asNode(ss.whereClause),
+    )) {
         .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
 
+    // FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED: plain FOR UPDATE
+    // is strength LCS_FORUPDATE with waitPolicy LockWaitBlock.
     var for_update = false;
-    if (ss.lockingClause.len > 0) {
-        if (ss.lockingClause.len > 1)
+    if (locking.len > 0) {
+        if (locking.len > 1)
             return invalid("only a single FOR UPDATE clause is supported");
-        const lc = ss.lockingClause[0].LockingClause orelse
+        const lc = parser.cast(c.LockingClause, locking[0].ptr_value) orelse
             return invalid("unsupported locking clause");
-        if (!std.mem.eql(u8, lc.strength, "LCS_FORUPDATE"))
+        if (lc.strength != c.LCS_FORUPDATE)
             return invalid("only FOR UPDATE is supported");
-        if (!std.mem.eql(u8, lc.waitPolicy, "LockWaitBlock"))
+        if (lc.waitPolicy != c.LockWaitBlock)
             return invalid("NOWAIT / SKIP LOCKED are not supported");
-        if (lc.lockedRels.len > 0)
+        if (parser.items(lc.lockedRels).len > 0)
             return invalid("FOR UPDATE OF is not supported");
         for_update = true;
     }
@@ -1111,7 +939,7 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
     else
         .{ .columns = try cols.toOwnedSlice(alloc) };
     return .{ .select = .{
-        .table = rv.relname,
+        .table = try dup(alloc, rv.relname),
         .projection = projection,
         .where = where,
         .for_update = for_update,
@@ -1122,11 +950,13 @@ fn parseSelect(alloc: std.mem.Allocator, body: std.json.Value) parser.ParseError
 
 /// Whether a target's function call is exactly `count(*)`: no
 /// arguments, no DISTINCT, no FILTER, no OVER.
-fn isCountStar(fc: SelectStmtJson.FuncCallNode) bool {
-    if (fc.funcname.len == 0) return false;
-    const name = fc.funcname[fc.funcname.len - 1].String.sval;
-    return std.mem.eql(u8, name, "count") and fc.agg_star and
-        fc.args.len == 0 and !fc.agg_distinct and
+fn isCountStar(fc: *const c.FuncCall) bool {
+    const n = parser.items(fc.funcname).len;
+    if (n == 0) return false;
+    const s = parser.cast(c.String, parser.nodeAt(fc.funcname, n - 1)) orelse
+        return false;
+    return std.mem.eql(u8, parser.str(s.sval), "count") and fc.agg_star and
+        fc.args == null and !fc.agg_distinct and
         fc.agg_filter == null and fc.over == null;
 }
 
@@ -1145,27 +975,16 @@ fn invalidFmt(
     return .{ .invalid = try std.fmt.allocPrint(alloc, fmt, args) };
 }
 
-/// BEGIN / START TRANSACTION / COMMIT / ROLLBACK. GOTCHA: TRANS_STMT_BEGIN
-/// is protobuf tag 0, so libpg_query OMITS `kind` for a plain BEGIN — the
-/// default must be begin. Transaction modes (ISOLATION LEVEL …) are
-/// ignored; savepoints and two-phase commit are rejected with a reason.
-const TransactionStmtJson = struct {
-    kind: String = "TRANS_STMT_BEGIN",
-};
-
-fn parseTransaction(
-    alloc: std.mem.Allocator,
-    body: std.json.Value,
-) parser.ParseError!Stmt {
-    const ts = try fromValue(TransactionStmtJson, alloc, body) orelse
-        return .unsupported;
-    const k = ts.kind;
-    if (std.mem.eql(u8, k, "TRANS_STMT_BEGIN") or
-        std.mem.eql(u8, k, "TRANS_STMT_START"))
-        return .begin_txn;
-    if (std.mem.eql(u8, k, "TRANS_STMT_COMMIT")) return .commit_txn;
-    if (std.mem.eql(u8, k, "TRANS_STMT_ROLLBACK")) return .rollback_txn;
-    return invalid("unsupported transaction statement");
+/// BEGIN / START TRANSACTION / COMMIT / ROLLBACK. Transaction modes
+/// (ISOLATION LEVEL …) are ignored; savepoints and two-phase commit
+/// are rejected with a reason.
+fn parseTransaction(ts: *const c.TransactionStmt) Stmt {
+    return switch (ts.kind) {
+        c.TRANS_STMT_BEGIN, c.TRANS_STMT_START => .begin_txn,
+        c.TRANS_STMT_COMMIT => .commit_txn,
+        c.TRANS_STMT_ROLLBACK => .rollback_txn,
+        else => invalid("unsupported transaction statement"),
+    };
 }
 
 /// DELETE FROM one_table [WHERE ...]. USING, RETURNING, WITH, and any
@@ -1173,27 +992,28 @@ fn parseTransaction(
 /// as an ordinary column comparison — egid resolution stays server-side.
 fn parseDelete(
     alloc: std.mem.Allocator,
-    body: std.json.Value,
+    ds: *const c.DeleteStmt,
 ) parser.ParseError!Stmt {
-    const ds = try fromValue(DeleteStmtJson, alloc, body) orelse
-        return .unsupported;
-
-    if (ds.usingClause.len > 0)
+    if (ds.usingClause != null)
         return invalid("DELETE ... USING is not supported");
-    if (ds.returningList.len > 0)
+    if (ds.returningList != null)
         return invalid("RETURNING is not supported");
     if (ds.withClause != null)
         return invalid("WITH is not supported");
 
     var params = ParamTally{};
     var where: ?Where = null;
-    if (ds.whereClause) |node| switch (try parseWhere(alloc, &params, node)) {
+    if (ds.whereClause != null) switch (try parseWhere(
+        alloc,
+        &params,
+        parser.asNode(ds.whereClause),
+    )) {
         .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
 
     return .{ .delete = .{
-        .table = ds.relation.relname,
+        .table = try relname(alloc, ds.relation),
         .where = where,
         .param_count = params.count,
     } };
@@ -1204,59 +1024,50 @@ fn parseDelete(
 /// SET columns are rejected with a reason.
 fn parseUpdate(
     alloc: std.mem.Allocator,
-    body: std.json.Value,
+    us: *const c.UpdateStmt,
 ) parser.ParseError!Stmt {
-    const us = try fromValue(UpdateStmtJson, alloc, body) orelse
-        return .unsupported;
-
-    if (us.fromClause.len > 0)
+    if (us.fromClause != null)
         return invalid("UPDATE ... FROM is not supported");
-    if (us.returningList.len > 0)
+    if (us.returningList != null)
         return invalid("RETURNING is not supported");
     if (us.withClause != null)
         return invalid("WITH is not supported");
-    if (us.targetList.len == 0) return .unsupported;
+    const targets = parser.items(us.targetList);
+    if (targets.len == 0) return .unsupported;
 
     var params = ParamTally{};
     var where: ?Where = null;
-    if (us.whereClause) |node| switch (try parseWhere(alloc, &params, node)) {
+    if (us.whereClause != null) switch (try parseWhere(
+        alloc,
+        &params,
+        parser.asNode(us.whereClause),
+    )) {
         .where => |x| where = x,
         .invalid => |msg| return .{ .invalid = msg },
     };
 
     var sets: std.ArrayList(SetClause) = .empty;
-    for (us.targetList) |tn| {
-        const rt = tn.ResTarget;
-        if (rt.name.len == 0) return .unsupported;
+    for (targets) |cell| {
+        const rt = parser.cast(c.ResTarget, cell.ptr_value) orelse
+            return .unsupported;
+        if (rt.name == null) return .unsupported;
+        const column = try dup(alloc, rt.name);
         for (sets.items) |s| {
-            if (std.mem.eql(u8, s.column, rt.name))
+            if (std.mem.eql(u8, s.column, column))
                 return invalid("duplicate column in SET");
         }
-        const value = switch (try parseExpr(alloc, &params, rt.val)) {
+        const val = parser.asNode(rt.val);
+        const value = switch (try parseExpr(alloc, &params, val)) {
             .expr => |e| e,
             .invalid => |msg| return .{ .invalid = msg },
         };
-        try sets.append(alloc, .{ .column = rt.name, .value = value });
+        try sets.append(alloc, .{ .column = column, .value = value });
     }
 
     return .{ .update = .{
-        .table = us.relation.relname,
+        .table = try relname(alloc, us.relation),
         .sets = try sets.toOwnedSlice(alloc),
         .where = where,
         .param_count = params.count,
     } };
-}
-
-fn asObject(v: std.json.Value) ?std.json.ObjectMap {
-    return switch (v) {
-        .object => |o| o,
-        else => null,
-    };
-}
-
-fn asString(v: std.json.Value) ?String {
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
 }

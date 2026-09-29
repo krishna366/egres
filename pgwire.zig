@@ -29,12 +29,11 @@ pub const ExecuteCtx = conn_state.ExecuteCtx;
 pub const DescribeCtx = conn_state.DescribeCtx;
 pub const DescribeKind = conn_state.DescribeKind;
 
-// Parser — libpg_query JSON wrapper.
+// Parser — libpg_query, the parse tree read in place.
 pub const parse = parser.parse;
-pub const ParseTree = parser.ParseTree;
+pub const ParseTree = parser.Tree;
 pub const ParseError = parser.ParseError;
 pub const ErrorInfo = parser.ErrorInfo;
-pub const parserShutdown = parser.shutdown;
 
 // Shared protocol types.
 pub const FieldDescription = types.FieldDescription;

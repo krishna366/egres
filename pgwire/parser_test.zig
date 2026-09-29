@@ -9,71 +9,49 @@ const utils = @import("utils");
 const String = utils.String;
 
 const parser = pgwire.parser;
+const c = parser.c;
 
-/// Walk into the first statement's "stmt" wrapper and return its key
-/// (the statement-kind name libpg_query emits, e.g. "SelectStmt").
-fn firstStmtKind(tree: *const parser.ParseTree) ?String {
-    const stmts = tree.statements() orelse return null;
-    if (stmts.len == 0) return null;
-    const first = stmts[0];
-    const obj = switch (first) {
-        .object => |o| o,
-        else => return null,
-    };
-    const wrapper = obj.get("stmt") orelse return null;
-    const wrapper_obj = switch (wrapper) {
-        .object => |o| o,
-        else => return null,
-    };
-    var it = wrapper_obj.iterator();
-    if (it.next()) |entry| return entry.key_ptr.*;
-    return null;
+/// The first statement's node tag.
+fn firstStmtTag(tree: parser.Tree) ?c.NodeTag {
+    const node = tree.statement(0) orelse return null;
+    return node.type;
 }
 
 test "parse: SELECT 1 → SelectStmt" {
     const a = std.testing.allocator;
-    var tree = try parser.parse(a, "SELECT 1", null);
-    defer tree.deinit(a);
-    try testing.expectEqualStrings("SelectStmt", firstStmtKind(&tree).?);
+    const tree = try parser.parse(a, "SELECT 1", null);
+    defer tree.deinit();
+    const want: c.NodeTag = c.T_SelectStmt;
+    try testing.expectEqual(want, firstStmtTag(tree).?);
 }
 
 test "parse: SELECT a, b FROM t WHERE c = 1 → 2 target entries" {
     const a = std.testing.allocator;
-    var tree = try parser.parse(
-        a,
-        "SELECT a, b FROM t WHERE c = 1",
-        null,
-    );
-    defer tree.deinit(a);
+    const tree = try parser.parse(a, "SELECT a, b FROM t WHERE c = 1", null);
+    defer tree.deinit();
 
-    const stmts = tree.statements().?;
-    const first = stmts[0].object;
-    const wrapper = first.get("stmt").?.object;
-    const select = wrapper.get("SelectStmt").?.object;
-    const targets = select.get("targetList").?.array;
-    try testing.expectEqual(@as(usize, 2), targets.items.len);
+    const sel = parser.cast(c.SelectStmt, tree.statement(0)).?;
+    try testing.expectEqual(@as(usize, 2), parser.items(sel.targetList).len);
 }
 
 test "parse: CREATE TABLE → CreateStmt" {
     const a = std.testing.allocator;
-    var tree = try parser.parse(
+    const tree = try parser.parse(
         a,
         "CREATE TABLE t (id int primary key, name text)",
         null,
     );
-    defer tree.deinit(a);
-    try testing.expectEqualStrings("CreateStmt", firstStmtKind(&tree).?);
+    defer tree.deinit();
+    const want: c.NodeTag = c.T_CreateStmt;
+    try testing.expectEqual(want, firstStmtTag(tree).?);
 }
 
 test "parse: INSERT INTO t VALUES (1) → InsertStmt" {
     const a = std.testing.allocator;
-    var tree = try parser.parse(
-        a,
-        "INSERT INTO t VALUES (1)",
-        null,
-    );
-    defer tree.deinit(a);
-    try testing.expectEqualStrings("InsertStmt", firstStmtKind(&tree).?);
+    const tree = try parser.parse(a, "INSERT INTO t VALUES (1)", null);
+    defer tree.deinit();
+    const want: c.NodeTag = c.T_InsertStmt;
+    try testing.expectEqual(want, firstStmtTag(tree).?);
 }
 
 test "parse: syntax error returns SyntaxError + cursor info" {
@@ -82,9 +60,8 @@ test "parse: syntax error returns SyntaxError + cursor info" {
     // Unmatched paren — guaranteed syntax error in any Postgres
     // grammar. `FROMM x` would just be parsed as a column reference.
     const result = parser.parse(a, "SELECT 1 FROM (", &info);
-    if (result) |*tree| {
-        var t = tree.*;
-        t.deinit(a);
+    if (result) |tree| {
+        tree.deinit();
         try testing.expect(false); // unreachable: must error
     } else |err| {
         try testing.expectEqual(error.SyntaxError, err);
@@ -127,26 +104,27 @@ test "parse: 1000 concurrent fibers parse distinct queries (no leaks, no races)"
             };
             defer alloc.free(sql);
 
-            var tree = parser.parse(alloc, sql, null) catch {
+            const tree = parser.parse(alloc, sql, null) catch {
                 _ = fail_count.fetchAdd(1, .seq_cst);
                 return;
             };
-            defer tree.deinit(alloc);
+            defer tree.deinit();
 
-            if (!verifyParse(&tree, n)) {
+            if (!verifyParse(tree, n)) {
                 _ = fail_count.fetchAdd(1, .seq_cst);
             }
         }
 
-        fn verifyParse(tree: *const parser.ParseTree, n: u32) bool {
-            const stmts = tree.statements() orelse return false;
-            if (stmts.len != 1) return false;
-            const select = stmts[0].object.get("stmt").?.object.get("SelectStmt").?.object;
+        fn verifyParse(tree: parser.Tree, n: u32) bool {
+            if (tree.count() != 1) return false;
+            const sel = parser.cast(c.SelectStmt, tree.statement(0)) orelse
+                return false;
 
             // FROM: relname must be `t_<n>` for THIS fiber's n.
-            const from = select.get("fromClause").?.array;
-            if (from.items.len != 1) return false;
-            const relname = from.items[0].object.get("RangeVar").?.object.get("relname").?.string;
+            if (parser.items(sel.fromClause).len != 1) return false;
+            const from = parser.nodeAt(sel.fromClause, 0);
+            const rv = parser.cast(c.RangeVar, from) orelse return false;
+            const relname = parser.str(rv.relname);
             if (!std.mem.startsWith(u8, relname, "t_")) return false;
             const got_n = std.fmt.parseInt(u32, relname[2..], 10) catch return false;
             if (got_n != n) return false;
@@ -154,15 +132,11 @@ test "parse: 1000 concurrent fibers parse distinct queries (no leaks, no races)"
             // WHERE: integer constant must equal n. Independent witness
             // from the relname — both being right rules out a cross-fiber
             // bleed that happens to align on one of them.
-            //
-            // libpg_query's JSON serializer treats 0 as a default and emits
-            // "ival":{} (no inner key) instead of "ival":{"ival":0}. So a
-            // missing inner key means the value was 0.
-            const where = select.get("whereClause").?.object.get("A_Expr").?.object;
-            const aconst = where.get("rexpr").?.object.get("A_Const").?.object;
-            const outer_ival = aconst.get("ival").?.object;
-            const value: i64 = if (outer_ival.get("ival")) |v| v.integer else 0;
-            return value == @as(i64, @intCast(n));
+            const ae = parser.cast(c.A_Expr, sel.whereClause) orelse
+                return false;
+            const ac = parser.cast(c.A_Const, ae.rexpr) orelse return false;
+            if (ac.val.node.type != c.T_Integer) return false;
+            return ac.val.ival.ival == @as(c_int, @intCast(n));
         }
     };
 

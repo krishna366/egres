@@ -823,3 +823,51 @@ test "sql.parse: Params bind $n text and binary values to a column" {
     try expectEqual(Value{ .int4 = 7 }, try bindParam(mixed, 1, .int4, null));
     try expectEqual(Value{ .int4 = 8 }, try bindParam(mixed, 2, .int4, null));
 }
+
+// ---------------------------------------------------------------------------
+// Parse cost. The load's statement is a 200-row INSERT with 1 KB text
+// payloads; the point read is the other shape the server sees most.
+// ---------------------------------------------------------------------------
+
+const fiber = @import("zfiber");
+
+fn bigInsertSql(alloc: std.mem.Allocator) !String {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(alloc, "INSERT INTO big (id, n, payload) VALUES\n");
+    var payload: [1000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = 'A' + @as(u8, @intCast(i % 26));
+    for (0..200) |i| {
+        if (i > 0) try out.appendSlice(alloc, ",\n");
+        try out.print(alloc, "({d}, 0, '{s}')", .{ i + 1, payload });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn benchParse(b: *fiber.bench.Bench, sql_text: String) !void {
+    var arena = std.heap.ArenaAllocator.init(b.alloc);
+    defer arena.deinit();
+    b.resetTimer();
+    var i: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        _ = arena.reset(.retain_capacity);
+        const stmt = try parse.statement(arena.allocator(), sql_text);
+        std.mem.doNotOptimizeAway(stmt);
+    }
+}
+
+test "BENCH: parse 200-row insert, 1 KB payloads" {
+    const b = fiber.bench.current();
+    const sql_text = try bigInsertSql(b.alloc);
+    defer b.alloc.free(sql_text);
+    try benchParse(b, sql_text);
+}
+
+test "BENCH: parse point select" {
+    const b = fiber.bench.current();
+    try benchParse(b, "SELECT id, n, payload FROM big WHERE id = 12345");
+}
+
+test "BENCH: parse update" {
+    const b = fiber.bench.current();
+    try benchParse(b, "UPDATE big SET n = n + 1 WHERE id = 12345");
+}

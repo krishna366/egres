@@ -267,10 +267,17 @@ fn makeModules(
     const pgwire = makeModule(b, target, optimize, "pgwire.zig");
     pgwire.addImport("zfiber", fiber);
     pgwire.addImport("utils", utils);
-    // pgwire.parser does @cImport("pg_query.h"). Header path lives on the
-    // module; the C archive itself is linked per-executable via
-    // addLibpgQuerySources.
+    // pgwire.parser @cImports pg_query.h, libpg_query's internal header
+    // (the raw parse entry) and Postgres's node headers, so it reads
+    // the parse tree in place. The paths live on the module; the C
+    // archive itself is linked per-executable via addLibpgQuerySources.
     pgwire.addIncludePath(b.path("third_party/libpg_query"));
+    pgwire.addIncludePath(b.path("third_party/libpg_query/src"));
+    pgwire.addIncludePath(b.path("third_party/libpg_query/vendor"));
+    pgwire.addIncludePath(b.path("third_party/libpg_query/src/include"));
+    pgwire.addIncludePath(
+        b.path("third_party/libpg_query/src/postgres/include"),
+    );
 
     // The engine: zdb (storage) + raft (consensus) fused behind one API.
     // Front-ends (egres exe, the sql store) sit on top; it never imports sql.
