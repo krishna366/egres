@@ -5,6 +5,7 @@
 //! Free functions over `*Handler` — see the note in ddl.zig.
 
 const std = @import("std");
+const fiber = @import("zfiber");
 const pgwire = @import("pgwire");
 const zdb = @import("zdb");
 const zen = zdb.buffers;
@@ -589,6 +590,10 @@ const IndexBuild = struct {
             rows: *RowIndexKeys,
 
             fn emit(ctx: *@This(), item: zdb.kv.Item) anyerror!bool {
+                // The backfill is the longest statement there is: a
+                // yield point per row, one atomic load each.
+                try fiber.ctx().maybeYield();
+
                 const egid = _key.decodeEgid(item.key.primary) orelse
                     return true; // not row-shaped: nothing to index
                 const keys = try ctx.build.rowKeys(ctx.at, item);
@@ -633,6 +638,7 @@ const IndexBuild = struct {
             changed: usize = 0,
 
             fn emit(ctx: *@This(), item: zdb.kv.Item) anyerror!bool {
+                try fiber.ctx().maybeYield();
                 const egid = _key.decodeEgid(item.key.primary) orelse
                     return true;
                 ctx.changed += 1;

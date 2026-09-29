@@ -20,9 +20,16 @@
 //! the name, the formatted labels and the record list. Keeping a trace
 //! moves the arena into the ring, so nothing is copied at the end of a
 //! statement, and evicting a trace frees it whole.
+//!
+//! A context is also where a statement is interruptible: its loops call
+//! `maybeYield` once per batch, and every policy that stops or paces a
+//! statement (the shutdown's stop stage today; cancel and a per-tenant
+//! budget later) delivers through that one call, so the loops never
+//! learn about any of them.
 
 const std = @import("std");
 const _rt = @import("runtime.zig");
+const _shutdown = @import("shutdown.zig");
 const _clock = @import("utils").coarse_clock;
 const _date = @import("utils").date;
 const Spinlock = @import("spinlock.zig").Spinlock;
@@ -54,6 +61,11 @@ pub const Ctx = struct {
     start_unix_us: i64,
     start_mono_us: i64,
     records: std.ArrayList(Record) = .empty,
+    /// Set by `attach` when the installed Shutdown (`shutdown.zig`)
+    /// counted this context in, so `detach` counts it out on the same
+    /// instance and a context attached before `install` is never
+    /// counted out.
+    counted: bool = false,
     /// Joined helper fibers record into the same list from other
     /// workers; the arena is not thread safe either, so formatting a
     /// label happens under this lock too. A few dozen records per
@@ -74,11 +86,21 @@ pub const Ctx = struct {
         };
     }
 
-    /// Makes this the current fiber's context. Call once the Ctx has
-    /// its final address; the fiber keeps a pointer to it.
-    pub fn attach(self: *Ctx) void {
+    /// Makes this the current fiber's context and counts the statement
+    /// as in flight on the installed Shutdown (`Shutdown.enterCtx`).
+    /// Call once the Ctx has its final address; the fiber keeps a
+    /// pointer to it. Refused once the process is draining, and the
+    /// context is freed then, since no `detach` follows.
+    pub fn attach(self: *Ctx) YieldError!void {
         const f = _rt.currentFiber();
         std.debug.assert(f.ctx == null);
+        if (_shutdown.installed()) |sd| {
+            if (!sd.enterCtx()) {
+                self.arena.deinit();
+                return error.Shutdown;
+            }
+            self.counted = true;
+        }
         f.ctx = self;
     }
 
@@ -89,6 +111,7 @@ pub const Ctx = struct {
         const f = _rt.currentFiber();
         std.debug.assert(f.ctx == self);
         f.ctx = null;
+        if (self.counted) _shutdown.installed().?.leaveCtx();
         if (!offer(self, self.elapsedUs())) self.arena.deinit();
     }
 
@@ -118,6 +141,25 @@ pub const Ctx = struct {
     pub fn elapsedUs(self: *const Ctx) u64 {
         const now = _clock.timestampNow(.monotonic, .micros);
         return @intCast(@max(0, now - self.start_mono_us));
+    }
+
+    pub const YieldError = error{Shutdown};
+
+    /// The statement's yield point: a loop calls this once per batch or
+    /// block of work, and the runtime may pause the statement here or
+    /// decline to resume it, which comes back as the error. Today it
+    /// only asks whether the process is stopping (`Shutdown.startShutdown`)
+    /// and never parks; the pause is what a cancel or a CPU budget will
+    /// add. The drain stage before the stop is not an interrupt: a
+    /// running statement gets the grace period to finish on its own,
+    /// only `attach` refuses new ones. Callers must treat this as a
+    /// blocking call: no spinlock held across it. A no-op on the
+    /// background context, so library code never branches on which
+    /// context it runs under.
+    pub fn maybeYield(self: *Ctx) YieldError!void {
+        if (self == &background) return;
+        const sd = _shutdown.installed() orelse return;
+        if (sd.isStopping()) return error.Shutdown;
     }
 };
 

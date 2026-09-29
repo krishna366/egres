@@ -100,6 +100,9 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     const row_bytes = try arloc.alloc(String, num_rows);
     var keys: std.ArrayList(IndexKey) = .empty;
     for (ins.rows, row_bytes, 0..) |row_lits, *bytes, ri| {
+        // A yield point per batch of rows, the executor's stride.
+        if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+
         if (row_lits.len != target_cols.len)
             return replyErrorCode(state, pgwire.sqlstate.syntax_error, "INSERT has the wrong number of values");
 
@@ -314,6 +317,8 @@ pub fn delete(self: *Handler, state: *pgwire.ConnState, del: _parse.Delete) !voi
     var keys: std.ArrayList(IndexKey) = .empty;
     const egids = try arloc.alloc(u64, rows.len);
     for (rows, egids, 0..) |item, *egid, ri| {
+        if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+
         egid.* = _key.decodeEgid(item.key.primary).?;
         for (tbl.indexes) |*idx| {
             if (idx.isBuilding()) continue; // see insert
@@ -423,6 +428,7 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     const mat = &plan.root.materialize;
     const rows = mat.gatherAndLockRows(&ctx, batch) catch |err|
         return replyRunErr(state, "update", up.table, err);
+
     // Past gatherAndLockRows' locks no candidate committed above read_ts —
     // the gathered pre-images are the newest versions, frozen by our
     // locks. Per row, before any key lock: evaluate every SET against
@@ -439,6 +445,8 @@ pub fn update(self: *Handler, state: *pgwire.ConnState, up: _parse.Update) !void
     var row: _value.Row = .{};
     var rbuf: std.ArrayList(u8) = .empty; // reused: marshalRow resets it
     for (rows, egids, rewritten, 0..) |item, *egid, *bytes, ri| {
+        if (ri % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+
         egid.* = _key.decodeEgid(item.key.primary).?;
         for (sets) |*set| {
             set.val = set.node.eval(arloc, tbl, item, set.target) catch |err|
@@ -1003,6 +1011,9 @@ fn probeUnique(
     defer names.deinit(tx.allocator);
     var i: usize = 0;
     while (i < probes.len) {
+        // One index read per group: a yield point each.
+        try fiber.ctx().maybeYield();
+
         const index_table_id = probes[i].idx.index_table_id;
         utils.clearRetainCap(&names);
 
@@ -1070,6 +1081,9 @@ fn replyRunErr(
         error.Deadlock,
         error.Upgrade,
         => replyLockErr(state, err),
+        // A yield point stopped the scan: the serve loop ends the
+        // session with the FATAL, so no reply here.
+        error.Shutdown => err,
         else => {
             log.err(
                 verb ++ " '{s}': scan: {s}",

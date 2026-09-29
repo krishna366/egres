@@ -22,7 +22,7 @@ test "ctx: no statement means the background context, record is a no-op" {
 
 test "ctx: records carry labels and offsets, a slow statement is kept" {
     var qctx = fiber.Ctx.init("select 1");
-    qctx.attach();
+    try qctx.attach();
     try std.testing.expectEqual(&qctx, fiber.ctx());
 
     fiber.ctx().record("first", .{});
@@ -62,7 +62,7 @@ fn noteCtx(out: *std.atomic.Value(usize)) void {
 test "ctx: a joined helper records into the statement, detached does not" {
     const bg = fiber.ctx();
     var qctx = fiber.Ctx.init("select 2");
-    qctx.attach();
+    try qctx.attach();
     defer qctx.detach();
 
     var h = try fiber.spawn(.{}, recordHelper, .{});
@@ -94,7 +94,7 @@ test "ctx: a bucket keeps the newest traces and drops the oldest" {
         name.* = .{ 'r', 'i', 'n', 'g', '0' + @as(u8, @intCast(i)) };
         var qctx = fiber.Ctx.init(name);
         qctx.start_mono_us -= 200_000;
-        qctx.attach();
+        try qctx.attach();
         qctx.detach();
     }
     var body: std.Io.Writer.Allocating = .init(std.testing.allocator);

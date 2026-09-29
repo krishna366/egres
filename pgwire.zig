@@ -42,6 +42,7 @@ pub const Oid = types.Oid;
 pub const oid = types.oid;
 pub const TxStatus = types.TxStatus;
 pub const sqlstate = types.sqlstate;
+pub const severity_fatal = types.severity_fatal;
 
 // Re-export proto.* for callers that want to talk frames directly
 // (test fixtures, alternative drivers).

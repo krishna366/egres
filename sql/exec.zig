@@ -6,6 +6,7 @@
 //! again. plan.zig builds the trees; dml.zig drives them.
 
 const std = @import("std");
+const fiber = @import("zfiber");
 const utils = @import("utils");
 const zdb = @import("zdb");
 
@@ -251,6 +252,10 @@ pub const BitmapNode = union(enum) {
     /// AND folds in place and stops at the first empty result; OR
     /// evaluates every child and unions them in one pass.
     pub fn eval(self: *const BitmapNode, ctx: *ExecCtx) !zroar.Bitmap {
+        // One yield point per node: a node's own work is bounded by one
+        // index key, but an OR over a long IN list is many nodes.
+        try fiber.ctx().maybeYield();
+
         const alloc = ctx.tx.allocator;
         switch (self.*) {
             .egids => |*bm| return bm.clone(),
@@ -399,6 +404,8 @@ pub const SeqScan = struct {
         if (self.cursor) |*c| try c.releasePins();
         b.reset();
         if (self.done) return false;
+        // One yield point per batch: a scan is as long as the table.
+        try fiber.ctx().maybeYield();
 
         if (self.cursor == null) {
             ctx.tx.recordScan();
@@ -496,6 +503,7 @@ pub const Fetch = struct {
     pub fn next(self: *Fetch, ctx: *ExecCtx, batch: *Batch) !bool {
         batch.reset();
         if (self.done) return false;
+        try fiber.ctx().maybeYield();
 
         if (self.bm == null) {
             self.bm = try self.bnode.eval(ctx);

@@ -95,8 +95,8 @@ pub const Group = _group.Group;
 const _watermark = @import("watermark.zig");
 pub const Watermark = _watermark.Watermark;
 
-// One-shot shutdown signal: pollable (`hasStarted`), blockable (`wait`),
-// with optional SIGINT/SIGTERM wiring via the self-pipe trick.
+// Two-stage shutdown signal (drain, then stop): pollable (`isStopping`),
+// blockable (`waitForStart`), with optional SIGINT/SIGTERM wiring.
 pub const Shutdown = @import("shutdown.zig").Shutdown;
 
 // The `BENCH:` test harness: keeps its handle on the current fiber.

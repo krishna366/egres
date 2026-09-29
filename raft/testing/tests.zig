@@ -292,7 +292,7 @@ pub fn testTransportStartsAndStopsCleanly() !void {
     try group.spawn(.{}, runRaftRuntime, .{&rt});
 
     fiber.sleepMs(50);
-    node.shutdown.start();
+    node.shutdown.startShutdown();
 }
 
 pub fn testTransportProcessesProposal() !void {
@@ -327,7 +327,7 @@ pub fn testTransportProcessesProposal() !void {
     var w: raft.ProposalWaiter = .{};
     try node.propose("transport-cb", .data, &w);
     try std.testing.expectEqual(raft.CommitStatus.committed, w.wait());
-    node.shutdown.start();
+    node.shutdown.startShutdown();
 }
 
 pub fn testTransportStopIsClean() !void {
@@ -358,7 +358,7 @@ pub fn testTransportStopIsClean() !void {
     try group.spawn(.{}, runRaftRuntime, .{&rt});
 
     fiber.sleepMs(50);
-    node.shutdown.start();
+    node.shutdown.startShutdown();
 }
 
 pub fn testProposeAfterShutdownReturnsQueueClosed() !void {
@@ -376,7 +376,7 @@ pub fn testProposeAfterShutdownReturnsQueueClosed() !void {
     );
     defer node.deinit();
 
-    node.shutdown.start();
+    node.shutdown.startShutdown();
     var w: raft.ProposalWaiter = .{};
     try std.testing.expectError(
         raft.RaftError.QueueClosed,

@@ -132,7 +132,9 @@ pub const Server = struct {
         const period_ms: u64 = 10 * 60 * 1000;
 
         while (!self.engine.node.isShuttingDown()) {
-            if (self.engine.node.shutdown.waitTimeout(period_ms)) return;
+            const shutdown = &self.engine.node.shutdown;
+            if (shutdown.waitForStart(.shutdown, period_ms)) return;
+
             self.databases_mu.lock(@src());
             defer self.databases_mu.unlock();
 
@@ -250,17 +252,23 @@ pub const Server = struct {
             return;
         };
         defer listener.close();
-        // Break the blocking `accept()` at shutdown (see AdminServer): a watcher
-        // fiber self-connects to our address when the shutdown channel closes.
-        fiber.spawnDetached(.{}, engine.Engine.stopListenerOnShutdown, .{ self.engine, self.listen_addr }) catch {};
+        // Break the blocking `accept()` at the drain (see AdminServer): a
+        // watcher fiber self-connects to our address when the drain
+        // starts. No connection is taken from then on.
+        fiber.spawnDetached(
+            .{},
+            engine.Engine.stopListenerOnStart,
+            .{ self.engine, self.listen_addr, .drain },
+        ) catch {};
+
         log.info("sql listener started on port {d} (pgwire)", .{listener.port()});
-        while (!self.engine.node.isShuttingDown()) {
+        while (!self.engine.node.shutdown.isDraining()) {
             const stream = listener.accept(.{}) catch |err| {
                 log.err("accept failed: {s}", .{@errorName(err)});
                 return;
             };
             // Shutdown watcher's self-connection: drop it and exit.
-            if (self.engine.node.isShuttingDown()) {
+            if (self.engine.node.shutdown.isDraining()) {
                 stream.close();
                 return;
             }
@@ -295,6 +303,27 @@ fn handleConn(self: *Server, stream: fiber.net.Stream) void {
     handler.serve(&s) catch |err| {
         log.warn("conn serve error: {s}", .{@errorName(err)});
     };
+}
+
+/// Statements are counted in flight from `Ctx.attach` to `detach`; the
+/// drain in egres main waits for the count to reach zero. An idle
+/// connection, parked reading the socket, is not in flight: it holds
+/// nothing the teardown frees and exits with the process. It is told
+/// nothing either, since the fiber runtime has no read timeout to wake
+/// it, so its client learns of the shutdown from the closed socket.
+const admin_shutdown_msg =
+    "terminating connection: server is shutting down";
+
+/// The session's last message: a FATAL ErrorResponse the way Postgres
+/// ends a session on shutdown, after which `serve` returns and the
+/// socket closes. The loop sends it where a statement would have gone
+/// next, so a client waiting on a reply gets this instead of EOF.
+fn replyShutdown(state: *pgwire.ConnState) !void {
+    try state.sendError(.{
+        .severity = pgwire.severity_fatal,
+        .code = pgwire.sqlstate.admin_shutdown,
+        .message = admin_shutdown_msg,
+    });
 }
 
 /// A parsed statement kept for the session (Handler.parsed): the
@@ -418,18 +447,61 @@ pub const Handler = struct {
         defer session.close();
         while (!session.closed()) {
             const state = &session.state;
+            // A draining server takes no further message: the session
+            // ends here with the FATAL, at a message boundary, so the
+            // reply to the last statement went out whole. Ctx.attach
+            // refuses a statement that slipped past this check, and
+            // once the drain's grace is over maybeYield stops one still
+            // running; both come back as error.Shutdown and end the
+            // session the same way.
+            if (self.srv.engine.node.shutdown.isDraining())
+                return replyShutdown(state);
+
             const ev = try session.nextEvent();
-            switch (ev) {
-                .startup_complete => |params| try self.onStartup(state, params),
-                .query => |sql| {
-                    try self.onQuery(state, sql);
-                    try state.endCommand();
-                },
-                .execute => |ctx| try self.onExecute(state, ctx),
-                .describe => |ctx| try self.onDescribe(state, ctx),
-                .sync, .flush, .terminate => {},
-            }
+            self.dispatch(state, ev) catch |err| switch (err) {
+                error.Shutdown => return replyShutdown(state),
+                else => return err,
+            };
             if (pgwire.Session.flushAfter(ev)) try session.flush();
+        }
+    }
+
+    fn dispatch(
+        self: *Handler,
+        state: *pgwire.ConnState,
+        ev: pgwire.Event,
+    ) !void {
+        // The three events that are statements run under a context:
+        // everything below records into it through fiber.ctx(), detach
+        // keeps the trace if it was slow, and attach counts it in
+        // flight for the drain. Describe is one because the first
+        // Describe of a statement is where it gets parsed. The other
+        // events are bookkeeping between statements.
+        switch (ev) {
+            .startup_complete => |params| try self.onStartup(state, params),
+            .query => |sql| {
+                var qctx = fiber.Ctx.init(sql);
+                try qctx.attach();
+                defer qctx.detach();
+
+                try self.onQuery(state, sql);
+                try state.endCommand();
+            },
+            .execute => |ctx| {
+                var qctx = fiber.Ctx.init(ctx.sql);
+                try qctx.attach();
+                defer qctx.detach();
+
+                try self.onExecute(state, ctx);
+            },
+            .describe => |ctx| {
+                var qctx = fiber.Ctx.init(ctx.sql);
+                try qctx.attach();
+                defer qctx.detach();
+
+                try self.onDescribe(state, ctx);
+            },
+            .sync, .flush, .terminate => {},
         }
     }
 
@@ -521,11 +593,6 @@ pub const Handler = struct {
         defer self.failBlockOnError(state);
 
         if (isEmptyQuery(sql_text)) return state.sendEmptyQueryResponse();
-        // The statement's context: everything below records into it
-        // through fiber.ctx(), and detach keeps the trace if it was slow.
-        var qctx = fiber.Ctx.init(sql_text);
-        qctx.attach();
-        defer qctx.detach();
 
         // Parse into an arena: the Stmt borrows its strings from the
         // libpg_query tree, and the arena reclaims all of it — tree and
@@ -534,7 +601,7 @@ pub const Handler = struct {
         defer arena.deinit();
         const stmt = _parse.statement(arena.allocator(), sql_text) catch
             return replySyntaxError(state);
-        qctx.record("parsed", .{});
+        fiber.ctx().record("parsed", .{});
         try self.runStatement(state, stmt);
     }
 
@@ -575,13 +642,10 @@ pub const Handler = struct {
             );
         };
         if (isEmptyQuery(ctx.sql)) return state.sendEmptyQueryResponse();
-        var qctx = fiber.Ctx.init(ctx.sql);
-        qctx.attach();
-        defer qctx.detach();
 
         const stmt = (try self.cachedStatement(ctx.sql)) orelse
             return replySyntaxError(state);
-        qctx.record("bound {d} params", .{ctx.params.len});
+        fiber.ctx().record("bound {d} params", .{ctx.params.len});
         const needed = stmt.paramCount();
         if (needed != ctx.params.len) {
             var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);

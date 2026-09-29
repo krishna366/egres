@@ -254,10 +254,12 @@ pub const Node = struct {
 
     event_notify: fiber.Notify = .{},
     inbound_ch: fiber.Channel(InboundMsg) = undefined,
-    /// One-shot shutdown signal: fire via `shutdown.start()` (POSIX signal,
-    /// fatal path, or the binary). Loops poll it via `isShuttingDown()`;
+    /// Two-stage shutdown signal: fire via `shutdown.startShutdown()`
+    /// (POSIX signal, fatal path, or the binary). Loops poll it via
+    /// `isShuttingDown()`;
     /// fibers that must block until shutdown (the engine's listener
-    /// watchers) park on `shutdown.wait()`; `shutdownWatchLoop` reacts by
+    /// watchers) park on `shutdown.waitForStart(.shutdown, null)`;
+    /// `shutdownWatchLoop` reacts by
     /// tearing down everything a raft fiber can park on.
     shutdown: fiber.Shutdown = undefined,
 
@@ -427,19 +429,30 @@ pub const Node = struct {
         return node;
     }
 
-    pub fn deinit(self: *Node) void {
+    /// Reject every proposal still queued and fail every waiter parked
+    /// on a commit or apply with `.shutdown`. For after the raft loops
+    /// have exited: nothing resolves them any more, and the fibers that
+    /// own them (SQL statements mid-commit) must run their error paths
+    /// while the state they touch is still alive. Idempotent; `deinit`
+    /// calls it too.
+    pub fn abortPending(self: *Node) void {
         self.proposal_ch.close(.graceful);
         while (self.proposal_ch.tryReceive()) |req| {
             self.allocator.free(req.data);
             self.reject(req, .shutdown);
         } else |_| {}
-        self.proposal_ch.deinit();
         self.failAllPendingCallbacks(.shutdown);
+    }
+
+    pub fn deinit(self: *Node) void {
+        self.abortPending();
+        self.proposal_ch.deinit();
         self.commit_waiters.deinit(self.allocator);
         self.apply_waiters.close(.immediate);
         self.apply_waiters.deinit();
-        // Fires start() (idempotent) then joins the signal-watcher fiber (if
-        // install() was used) before freeing — nothing stays parked.
+        // Fires startShutdown() (idempotent) then joins the signal-watcher
+        // fiber (if install() was used) before freeing — nothing stays
+        // parked.
         self.shutdown.deinit();
 
         self.inbound_ch.close(.graceful);
@@ -893,15 +906,16 @@ pub const Node = struct {
         return .{ .peers = cs_peers };
     }
 
-    /// Parks until the shutdown signal fires — `shutdown.start()` from any
-    /// source (a POSIX signal via `shutdown.install()`, an internal fatal
-    /// path, or the binary) — then closes everything a raft loop can park on
+    /// Parks until the shutdown signal fires — `shutdown.startShutdown()`
+    /// from any source (a POSIX signal via `shutdown.install()`, an
+    /// internal fatal path, or the binary) — then closes everything a
+    /// raft loop can park on
     /// so all of them unwind. Runs as one of the loop-group fibers
     /// (`blockingRunAllLoops`, test cluster harness), so the teardown is
     /// joined with the loops it wakes. `wait()` returns immediately if
     /// shutdown already started, so spawn order doesn't matter.
     pub fn shutdownWatchLoop(self: *Node) void {
-        self.shutdown.wait();
+        _ = self.shutdown.waitForStart(.shutdown, null);
         self.proposal_ch.close(.graceful);
         // Wake mainLoop's blocked wait() so it observes shutdown and returns
         // (Notify has no close — a notify is the shutdown poke).
@@ -917,7 +931,7 @@ pub const Node = struct {
     }
 
     pub fn isShuttingDown(self: *const Node) bool {
-        return self.shutdown.hasStarted();
+        return self.shutdown.isStopping();
     }
 
     /// Returns true if a heartbeat is due (leader only).
@@ -2064,7 +2078,7 @@ pub const Node = struct {
         const interval: u64 = 1000;
         const min_advance: u64 = 100;
         while (!self.isShuttingDown()) {
-            if (self.shutdown.waitTimeout(interval)) break;
+            if (self.shutdown.waitForStart(.shutdown, interval)) break;
 
             const ci = self.commit_index.load();
             const persisted = self.log.hardState().commit_index;
@@ -2287,7 +2301,7 @@ pub const Node = struct {
                 .remove_node => {
                     // We've been removed from the cluster. Shut down.
                     dbg("node {d} removed from cluster, shutting down", .{self.id});
-                    self.shutdown.start();
+                    self.shutdown.startShutdown();
                 },
                 .update_addr => {}, // Our own address — nothing to do locally.
                 .unknown, _ => {},

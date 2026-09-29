@@ -591,18 +591,24 @@ pub const Engine = struct {
     }
 
     /// Watcher fiber — one per front-end listener, spawned detached by each
-    /// `runListener`. Blocks until the node's shutdown signal fires, then
+    /// `runListener`. Blocks until the node's shutdown reaches `at` (the
+    /// SQL listener stops taking connections at the drain, the admin one
+    /// stays up to answer `traces` and `locks` until the stop), then
     /// wakes the listener's parked `accept()` by opening a throwaway connection
     /// to its own address. `accept` has no per-op cancellation in the fiber
     /// runtime, so a sibling fiber has to break it from the outside — and a
     /// real self-connection makes `accept()` return a live stream *cleanly*,
-    /// after which the loop sees `isShuttingDown()` and exits. We connect
+    /// after which the loop sees the stage and exits. We connect
     /// rather than `shutdown()` the listen socket because `shutdown()` wakes
     /// accept but completes it with EINVAL (Linux returns EINVAL for accept on
     /// a shut-down listener) — a noisy `unexpectedErrno` dump in debug builds
     /// plus a spurious "accept failed" on every shutdown.
-    pub fn stopListenerOnShutdown(self: *Engine, listen_addr: fiber.net.IpAddress) void {
-        self.node.shutdown.wait();
+    pub fn stopListenerOnStart(
+        self: *Engine,
+        listen_addr: fiber.net.IpAddress,
+        at: fiber.Shutdown.Start,
+    ) void {
+        _ = self.node.shutdown.waitForStart(at, null);
         var stream = listen_addr.connect(.{}) catch |err| {
             log.warn("shutdown self-connect failed: {s}", .{@errorName(err)});
             return;
@@ -738,7 +744,7 @@ pub const Engine = struct {
         const poll: u64 = 15000;
         const stuck_threshold_ms: i64 = 30_000;
         while (!self.node.isShuttingDown()) {
-            if (self.node.shutdown.waitTimeout(poll)) return;
+            if (self.node.shutdown.waitForStart(.shutdown, poll)) return;
             const now_ms = utils.coarseMs();
             self.in_flight_mu.lock(@src());
             defer self.in_flight_mu.unlock();
@@ -835,7 +841,8 @@ pub const Engine = struct {
 
         while (!self.node.isShuttingDown()) {
             const cfg = self.snapshot_cfg.cur();
-            if (self.node.shutdown.waitTimeout(cfg.poll_interval_seconds * 1000)) return;
+            const poll_ms = cfg.poll_interval_seconds * 1000;
+            if (self.node.shutdown.waitForStart(.shutdown, poll_ms)) return;
             if (!self.node.isLeader()) continue;
 
             // TODO: Only leader is allowed to delete files because
@@ -1064,12 +1071,14 @@ pub const Engine = struct {
             const needs = self.node.isLeader() and
                 (self.forest.memtables.currentId() == 0 or self.forest.shouldFreeze());
             if (!needs) {
-                if (self.node.shutdown.waitTimeout(interval)) return;
+                if (self.node.shutdown.waitForStart(.shutdown, interval))
+                    return;
                 continue;
             }
             self.proposeNewMemtable() catch |err| {
                 log.err("proposeNewMemtable failed: {s}", .{@errorName(err)});
-                if (self.node.shutdown.waitTimeout(interval)) return;
+                if (self.node.shutdown.waitForStart(.shutdown, interval))
+                    return;
             };
         }
     }
@@ -1085,7 +1094,8 @@ pub const Engine = struct {
         var last_flush_ms: ?i64 = null;
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader() or !self.flushDue(last_flush_ms)) {
-                if (self.node.shutdown.waitTimeout(interval)) return;
+                if (self.node.shutdown.waitForStart(.shutdown, interval))
+                    return;
                 continue;
             }
             self.proposeFlush() catch |err| {
@@ -1121,11 +1131,13 @@ pub const Engine = struct {
         const interval: u64 = 500;
         while (!self.node.isShuttingDown()) {
             if (!self.node.isLeader()) {
-                if (self.node.shutdown.waitTimeout(interval)) return;
+                if (self.node.shutdown.waitForStart(.shutdown, interval))
+                    return;
                 continue;
             }
             const target = self.pickAndReserveCompactionTarget() orelse {
-                if (self.node.shutdown.waitTimeout(interval)) return;
+                if (self.node.shutdown.waitForStart(.shutdown, interval))
+                    return;
                 continue;
             };
             defer self.releaseCompactingTree(target.key);

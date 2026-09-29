@@ -126,6 +126,12 @@ pub fn build(b: *std.Build) void {
     galloc.addObjectFile(b.path(allocator_dep.library));
 
     addZbufCli(b, target, optimize, mods);
+    // `zig build check`: type-check the server binary and every test file with
+    // no codegen and no linking. ZLS runs it on save for diagnostics; the
+    // per-file test roots registered in addAllTests are what let ZLS resolve
+    // @import("zdb") and friends inside *_test.zig files.
+    const check_step = b.step("check", "Type-check the egres binary and all tests (no codegen; ZLS build-on-save)");
+
     addEgres(
         b,
         target,
@@ -134,6 +140,7 @@ pub fn build(b: *std.Build) void {
         regen_buffers_step,
         galloc,
         allocator_dep,
+        check_step,
     );
     addZdbBench(b, target, optimize, mods);
     addZioBench(b, target, optimize, mods);
@@ -153,6 +160,7 @@ pub fn build(b: *std.Build) void {
         regen_buffers_step,
         galloc,
         allocator_dep,
+        check_step,
     );
     // TODO: rewrite multiproc harness to use egres
     // Deferred for Zig 0.16 migration: builds an executable that pulls in
@@ -500,6 +508,7 @@ fn addAllTests(
     regen_buffers_step: *std.Build.Step,
     galloc: *std.Build.Module,
     allocator_dep: AllocatorDep,
+    check_step: *std.Build.Step,
 ) *std.Build.Step {
     const test_files = collectTestFiles(b);
 
@@ -556,6 +565,39 @@ fn addAllTests(
     // picked; its archive arrives via the galloc module.
     root_mod.addImport("galloc", galloc);
     root_mod.link_libc = true;
+
+    // `zig build check`: one no-emit compile of the whole test root. Same
+    // imports as the real test binary, no C sources, nothing installed or
+    // run — semantic analysis only, which is all build-on-save needs.
+    const check_mod = makeModule(b, target, optimize, root_path);
+    addImports(check_mod, mods, test_imports);
+    check_mod.addImport("galloc", galloc);
+    check_mod.link_libc = true;
+    const check_tests = b.addTest(.{
+        .name = "check-tests",
+        .root_module = check_mod,
+        .test_runner = .{ .path = b.path("u/test_runner.zig"), .mode = .simple },
+    });
+    addCheckIncludePaths(b, check_tests);
+    check_step.dependOn(&check_tests.step);
+
+    // ZLS discovery only — nothing here is meant to be built. ZLS's build
+    // runner lists the root module of every Compile step in the graph,
+    // whichever steps actually run, and a file is only analyzable when it is
+    // some module's root or a named import of one. .test_root.zig reaches
+    // the test files by *relative* @import, which that listing does not
+    // follow — so without these roots, go-to-definition is dead inside every
+    // *_test.zig. They hang off their own step so `check` stays one compile.
+    const roots_step = b.step("zls-roots", "Register each test file as a module root for ZLS (discovery only; do not run)");
+    for (test_files) |path| {
+        const m = makeModule(b, target, optimize, path);
+        addImports(m, mods, test_imports);
+        m.addImport("galloc", galloc);
+        m.link_libc = true;
+        const t = b.addTest(.{ .name = stepSafeName(b, "zls-root-", path), .root_module = m });
+        addCheckIncludePaths(b, t);
+        roots_step.dependOn(&t.step);
+    }
 
     // Name the binary by optimize mode so the Debug and ReleaseFast test
     // binaries install SIDE BY SIDE (zig-out/bin/test-Debug vs
@@ -672,6 +714,7 @@ fn addEgres(
     regen_buffers_step: *std.Build.Step,
     galloc: *std.Build.Module,
     allocator_dep: AllocatorDep,
+    check_step: *std.Build.Step,
 ) void {
     const exe = b.addExecutable(.{
         .name = "egres",
@@ -693,6 +736,20 @@ fn addEgres(
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("egres", "Build the egres SQL server binary");
     step.dependOn(&install.step);
+
+    // Type-check twin for `zig build check`: same modules and include paths,
+    // no C sources, never installed or run, so nothing is emitted or linked.
+    const check_exe = b.addExecutable(.{
+        .name = "check-egres",
+        .root_module = makeModule(b, target, optimize, "egres/main.zig"),
+    });
+    addCheckIncludePaths(b, check_exe);
+    addImports(check_exe.root_module, mods, .{
+        "raft",   "zdb",    "zfiber", "metrics", "flags", "utils",
+        "pgwire", "engine", "sql",
+    });
+    check_exe.root_module.addImport("galloc", galloc);
+    check_step.dependOn(&check_exe.step);
 }
 
 fn addZdbBench(
@@ -850,6 +907,29 @@ fn addRaftMultiprocHarness(
 /// only the JSON output path: protobuf encode/decode, the deparser,
 /// and the standalone `pg_query_scan` are dropped — see
 /// pgwire/README.md for what was excised and why.
+/// The include paths addLibpgQuerySources and addVendoredCompressionSources put
+/// on a compile, minus the C sources: enough for every @cImport to resolve in a
+/// type-check-only build (`zig build check`) without compiling a line of C.
+fn addCheckIncludePaths(b: *std.Build, compile: *std.Build.Step.Compile) void {
+    const m = compile.root_module;
+    m.link_libc = true;
+    m.addIncludePath(b.path("."));
+    m.addIncludePath(b.path("third_party/lz4/lib"));
+    m.addIncludePath(b.path("third_party/zstd/lib"));
+    m.addIncludePath(b.path("third_party/libpg_query"));
+    m.addIncludePath(b.path("third_party/libpg_query/vendor"));
+    m.addIncludePath(b.path("third_party/libpg_query/src/include"));
+    m.addIncludePath(b.path("third_party/libpg_query/src/postgres/include"));
+}
+
+/// "prefix" ++ path with '/' and '.' turned into '-', for a Compile step name.
+fn stepSafeName(b: *std.Build, prefix: []const u8, path: []const u8) []const u8 {
+    const out = b.allocator.alloc(u8, prefix.len + path.len) catch @panic("OOM");
+    @memcpy(out[0..prefix.len], prefix);
+    for (path, prefix.len..) |c, i| out[i] = if (c == '/' or c == '.') '-' else c;
+    return out;
+}
+
 fn addLibpgQuerySources(b: *std.Build, compile: *std.Build.Step.Compile) void {
     compile.root_module.link_libc = true;
     compile.root_module.addIncludePath(b.path("third_party/libpg_query"));

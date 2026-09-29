@@ -119,7 +119,7 @@ pub const TestCluster = struct {
             entry.group.spawn(.{ .lane = .raft }, Node.applyLoop, .{entry.node}) catch {};
             entry.group.spawn(.{ .lane = .raft }, Node.callbackLoop, .{entry.node}) catch {};
             // Performs the shutdown teardown (channel/watermark closes) when
-            // `shutdown.start()` fires — the loops above park on those.
+            // `shutdown.startShutdown()` fires — the loops above park on those.
             entry.group.spawn(.{ .lane = .raft }, Node.shutdownWatchLoop, .{entry.node}) catch {};
         }
         std.debug.print("TestCluster.init: done\n", .{});
@@ -131,7 +131,7 @@ pub const TestCluster = struct {
         // mainLoop/tickLoop/applyLoop/callbackLoop exit.
         var shutdown_it = self.nodes.valueIterator();
         while (shutdown_it.next()) |entry_ptr| {
-            entry_ptr.*.node.shutdown.start();
+            entry_ptr.*.node.shutdown.startShutdown();
         }
         // Wait for ALL coroutines to finish before any cleanup.
         var wait_it = self.nodes.valueIterator();

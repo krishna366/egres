@@ -88,10 +88,13 @@ pub const sqlstate = struct {
     pub const deadlock_detected: [5]u8 = .{ '4', '0', 'P', '0', '1' };
     pub const active_sql_transaction: [5]u8 = .{ '2', '5', '0', '0', '1' };
     pub const in_failed_sql_transaction: [5]u8 = .{ '2', '5', 'P', '0', '2' };
+    pub const admin_shutdown: [5]u8 = .{ '5', '7', 'P', '0', '1' };
 };
 
-/// Severity strings used in ErrorResponse 'S' / 'V' fields.
+/// Severity strings used in ErrorResponse 'S' / 'V' fields. FATAL is
+/// an error after which the server closes the connection.
 pub const severity_error = "ERROR";
+pub const severity_fatal = "FATAL";
 
 /// Postgres protocol version 3.0, big-endian on the wire.
 pub const protocol_version_3: u32 = (3 << 16) | 0;

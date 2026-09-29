@@ -43,6 +43,20 @@ const ListenCfg = struct {
     };
 };
 
+/// `--shutdown` — the drain between the first signal and the stop (see
+/// fiber.Shutdown and appMain).
+const ShutdownCfg = struct {
+    grace_ms: u32 = 10_000,
+
+    pub const docs = .{
+        .self = "How a SIGINT/SIGTERM ends the process: a drain, then" ++
+            " the stop. A second signal stops at once.",
+        .grace_ms = "Milliseconds the drain waits for the statements in" ++
+            " flight to finish before the loops stop and the rest are" ++
+            " failed.",
+    };
+};
+
 /// `--raft` — Raft node identity and cluster wiring. `id` is required (must
 /// be > 0). `seeds` is comma-separated; if empty, the node bootstraps as a
 /// single-node cluster.
@@ -209,6 +223,7 @@ fn deinitWithLog(comptime msg: String, ptr: anytype) void {
 const Args = struct {
     listen: ListenCfg,
     raft: RaftCfg,
+    shutdown: ShutdownCfg,
     data: zdb.config.Config,
     raft_addr: String,
     client_addr: String,
@@ -322,6 +337,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     defer flags.deinitGlobal();
     const live_listen = try flags.g().register("listen", ListenCfg);
     const live_raft = try flags.g().register("raft", RaftCfg);
+    const live_shutdown = try flags.g().register("shutdown", ShutdownCfg);
     const live_zdb = try flags.g().register("zdb", zdb.config.Config);
     const live_store = try flags.g().register("store", StoreCfg);
     const live_cache = try flags.g().register("cache", CacheCfg);
@@ -358,6 +374,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
 
     const listen = live_listen.cur();
     const raft_cfg = live_raft.cur();
+    const shutdown_cfg = live_shutdown.cur();
     const zdb_cfg = live_zdb.cur();
     const store_cfg = live_store.cur();
     const cache_cfg = live_cache.cur();
@@ -416,6 +433,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const args: Args = .{
         .listen = listen,
         .raft = raft_cfg,
+        .shutdown = shutdown_cfg,
         .data = zdb_cfg,
         .raft_addr = raft_addr,
         .client_addr = client_addr,
@@ -630,13 +648,41 @@ fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *sql.Se
         return;
     };
     log.info("appMain: waiting for SIGINT/SIGTERM to shutdown", .{});
-    // Blocks until SIGINT/SIGTERM fires the shutdown signal or an internal
-    // fatal path fires it. The node reacts on its own (`shutdownWatchLoop`
-    // closes everything raft fibers park on), so there is nothing to invoke
-    // here — just wait for the fibers to drain.
-    node.shutdown.wait();
-    log.info("received shutdown signal, shutting down...", .{});
+    // Blocks until SIGINT/SIGTERM starts the drain, or an internal fatal
+    // path starts the stop outright. In the drain the SQL listener has
+    // stopped accepting and no statement starts (Ctx.attach refuses),
+    // while the loops keep running so the statements in flight commit.
+    _ = node.shutdown.waitForStart(.drain, null);
+    log.info(
+        "received shutdown signal: draining {d} statements in flight",
+        .{node.shutdown.activeCtxs()},
+    );
+    if (!node.shutdown.waitForActiveCtxs(args.shutdown.grace_ms)) {
+        if (node.isShuttingDown())
+            log.info("second signal: stopping now", .{})
+        else
+            log.warn("grace over: {d} statements still in flight", .{
+                node.shutdown.activeCtxs(),
+            });
+    }
+
+    // The stop: the node reacts on its own (`shutdownWatchLoop` closes
+    // everything raft fibers park on) and the statements the grace cut
+    // off fail at their next yield point (Ctx.maybeYield), so there is
+    // nothing to invoke here beyond starting it — then wait for the
+    // fibers to drain.
+    node.shutdown.startShutdown();
+    log.info("shutting down...", .{});
     eng.wait();
+    // The loops are gone, so nothing will resolve a proposal still in
+    // flight: fail them now, then let every statement the grace cut off
+    // run its error path and exit while the databases it holds pointers
+    // into exist. The deinits in main run after this returns.
+    node.abortPending();
+    if (!node.shutdown.waitForActiveCtxs(args.shutdown.grace_ms))
+        log.warn("{d} statements still in flight at exit", .{
+            node.shutdown.activeCtxs(),
+        });
 }
 
 fn runJoin(args: *const Args, allocator: std.mem.Allocator) void {
