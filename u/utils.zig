@@ -26,6 +26,97 @@ pub fn clearRetainCap(list: anytype) void {
     list.items.len = 0;
 }
 
+/// An append-only byte buffer that grows by adding fixed-size chunks
+/// instead of reallocating. Nothing already written ever moves, so a
+/// large output (an SST) is copied once, in `copyTo`, rather than once
+/// per doubling of an ArrayList, and needs no size guess up front.
+/// The bytes are never contiguous: a reader copies them out.
+///
+/// Chunks are page aligned so that one day they can go to a direct-IO
+/// write as they are, without the gather.
+pub const ChunkBuffer = struct {
+    pub const alignment = std.mem.Alignment.fromByteUnits(4096);
+    const Chunk = []align(alignment.toByteUnits()) u8;
+
+    allocator: std.mem.Allocator,
+    chunk_bytes: usize,
+    chunks: std.ArrayList(Chunk),
+    /// Bytes written. Chunk i holds [i * chunk_bytes, (i + 1) *
+    /// chunk_bytes) of them; the last chunk may be partly filled.
+    len: usize,
+
+    pub fn init(allocator: std.mem.Allocator, chunk_bytes: usize) ChunkBuffer {
+        std.debug.assert(chunk_bytes > 0);
+        return .{
+            .allocator = allocator,
+            .chunk_bytes = chunk_bytes,
+            .chunks = .empty,
+            .len = 0,
+        };
+    }
+
+    pub fn deinit(self: *ChunkBuffer) void {
+        for (self.chunks.items) |chunk| self.allocator.free(chunk);
+        self.chunks.deinit(self.allocator);
+    }
+
+    /// Empty the buffer, keeping its chunks for the next fill.
+    pub fn reset(self: *ChunkBuffer) void {
+        self.len = 0;
+    }
+
+    /// The unwritten tail of the chunk `len` falls in, never empty:
+    /// a fresh chunk is added once the last one is full.
+    fn tail(self: *ChunkBuffer) ![]u8 {
+        const used = self.len % self.chunk_bytes;
+        const idx = self.len / self.chunk_bytes;
+        if (idx == self.chunks.items.len) {
+            const chunk = try self.allocator.alignedAlloc(
+                u8,
+                alignment,
+                self.chunk_bytes,
+            );
+            errdefer self.allocator.free(chunk);
+            try self.chunks.append(self.allocator, chunk);
+        }
+        return self.chunks.items[idx][used..];
+    }
+
+    pub fn appendSlice(self: *ChunkBuffer, bytes: String) !void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const dst = try self.tail();
+            const n = @min(dst.len, rest.len);
+            @memcpy(dst[0..n], rest[0..n]);
+            rest = rest[n..];
+            self.len += n;
+        }
+    }
+
+    pub fn appendNTimes(self: *ChunkBuffer, byte: u8, count: usize) !void {
+        var rest = count;
+        while (rest > 0) {
+            const dst = try self.tail();
+            const n = @min(dst.len, rest);
+            @memset(dst[0..n], byte);
+            rest -= n;
+            self.len += n;
+        }
+    }
+
+    /// Copy every written byte, in order, into `dst`, sized exactly.
+    pub fn copyTo(self: *const ChunkBuffer, dst: []u8) void {
+        std.debug.assert(dst.len == self.len);
+        var off: usize = 0;
+        for (self.chunks.items) |chunk| {
+            if (off == self.len) break;
+            const n = @min(chunk.len, self.len - off);
+            @memcpy(dst[off .. off + n], chunk[0..n]);
+            off += n;
+        }
+    }
+};
+
 pub fn testPrint(comptime fmt: String, args: anytype) void {
     if (!builtin.is_test) return;
     // std.debug.print(fmt, args);

@@ -64,7 +64,7 @@ const log = std.log.scoped(.table_builder);
 // are the layout's source of truth: `addItem` writes an entry with
 // `BlockEntryWriter`, `finishBlock` the payload's table and envelope by
 // hand because both stream (the ends are known before the entries are
-// laid down, the compressed payload goes straight into table_buf).
+// laid down, the envelope before the payload it covers).
 //
 // Notes:
 // - Everything needed to locate anything sits at the FRONT, in a header of
@@ -273,7 +273,13 @@ pub const Builder = struct {
     cfg: Config,
     compression: Compression,
 
-    table_buf: std.ArrayList(u8),
+    /// The table so far: every finished block, then at `finish` the
+    /// index and trailer. Chunked so that growing never copies what
+    /// is already written (an ArrayList spent two thirds of a flush's
+    /// `addItem` time copying itself at doublings) and needs no guess
+    /// of the table's size: the one copy is into the page-aligned
+    /// result.
+    table_buf: utils.ChunkBuffer,
     /// Where finishBlock assembles a block's payload: its end table,
     /// then the entries from entries_buf. Kept separate because the
     /// table's size isn't known until the block is complete.
@@ -306,13 +312,19 @@ pub const Builder = struct {
     /// on-disk footprint — fine as a signal.
     stale_data_size: u32,
 
+    /// table_buf grows by this much at a time: a few blocks' worth of
+    /// wasted tail per table, and a small table stays one allocation.
+    const table_chunk_bytes: usize = 8 << 20;
+
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Builder {
-        // TODO: Choose sane defaults for table_buf and entries_buf.
         return .{
             .allocator = allocator,
             .cfg = cfg,
             .compression = Compression.init(allocator, cfg.codec),
-            .table_buf = .empty,
+            .table_buf = utils.ChunkBuffer.init(
+                allocator,
+                table_chunk_bytes,
+            ),
             .block_buf = .empty,
             .entries_buf = .empty,
             .entry_ends = .empty,
@@ -341,7 +353,7 @@ pub const Builder = struct {
         self.entry_ends.deinit(self.allocator);
         self.entries_buf.deinit(self.allocator);
         self.block_buf.deinit(self.allocator);
-        self.table_buf.deinit(self.allocator);
+        self.table_buf.deinit();
         self.compression.deinit();
     }
 
@@ -363,7 +375,7 @@ pub const Builder = struct {
         utils.clearRetainCap(&self.entry_ends);
         utils.clearRetainCap(&self.entries_buf);
         utils.clearRetainCap(&self.block_buf);
-        utils.clearRetainCap(&self.table_buf);
+        self.table_buf.reset();
         self.compression.reset();
         self.key_count = 0;
         self.max_version = 0;
@@ -624,6 +636,19 @@ pub const Builder = struct {
 
         const index_len: u32 = @intCast(index_bytes.items.len);
         const index_checksum = zbuf.hash(index_bytes.items);
+        // The trailer goes after the index in the same buffer, so the
+        // tail reaches table_buf in one append.
+        try zbuf.appendInt(u32, &index_bytes, self.allocator, index_len);
+        try zbuf.appendInt(
+            u64,
+            &index_bytes,
+            self.allocator,
+            index_checksum,
+        );
+        // The reader seeks by idx.trailer_len, so what we wrote has to be
+        // exactly that wide — the padding below is sized on it too.
+        std.debug.assert(index_bytes.items.len - index_len ==
+            _idx.trailer_len);
 
         // Pad with zeros between the data blocks and the index so the final
         // file size is a multiple of `vfs.page_size`. The reader locates the
@@ -632,35 +657,21 @@ pub const Builder = struct {
         // Page-aligned files dodge any O_DIRECT / iomap edge case where an
         // unaligned-tail write could be silently dropped on some kernels;
         // the cost is at most page_size-1 zero bytes per SST.
-        const tail_size = index_bytes.items.len + _idx.trailer_len;
-        const total_unpadded = self.table_buf.items.len + tail_size;
+        const total_unpadded = self.table_buf.len + index_bytes.items.len;
         const remainder = total_unpadded % vfs.page_size;
-        const pad_bytes = if (remainder == 0) 0 else vfs.page_size - remainder;
-        if (pad_bytes > 0) try self.table_buf.appendNTimes(self.allocator, 0, pad_bytes);
+        const pad_bytes =
+            if (remainder == 0) 0 else vfs.page_size - remainder;
+        try self.table_buf.appendNTimes(0, pad_bytes);
+        try self.table_buf.appendSlice(index_bytes.items);
+        std.debug.assert(self.table_buf.len % vfs.page_size == 0);
 
-        try self.table_buf.appendSlice(self.allocator, index_bytes.items);
-        const trailer_at = self.table_buf.items.len;
-        try zbuf.appendInt(u32, &self.table_buf, self.allocator, index_len);
-        try zbuf.appendInt(
-            u64,
-            &self.table_buf,
-            self.allocator,
-            index_checksum,
-        );
-        // The reader seeks by idx.trailer_len, so what we wrote has to be
-        // exactly that wide — the padding above was sized on it too.
-        std.debug.assert(self.table_buf.items.len - trailer_at ==
-            _idx.trailer_len);
-
-        std.debug.assert(self.table_buf.items.len % vfs.page_size == 0);
-
-        // Copy into a page-aligned buffer (an ArrayList's backing has only
-        // byte alignment) so the result satisfies O_DIRECT's address-alignment
-        // requirement. Retain the table_buf capacity for the next SST.
-        const len = self.table_buf.items.len;
+        // Gather the chunks into one page-aligned buffer, the address
+        // alignment O_DIRECT asks for. table_buf keeps its chunks for
+        // the next SST.
+        const len = self.table_buf.len;
         const bytes = try self.allocator.alignedAlloc(u8, vfs.page_alignment, len);
-        @memcpy(bytes, self.table_buf.items);
-        utils.clearRetainCap(&self.table_buf);
+        self.table_buf.copyTo(bytes);
+        self.table_buf.reset();
         return .{ .allocator = self.allocator, .bytes = bytes };
     }
 
@@ -702,6 +713,9 @@ pub const Builder = struct {
             start = end;
         }
         payload.finish();
+        // The entries are in the payload now; entries_buf is scratch
+        // for the envelope below.
+        utils.clearRetainCap(&self.entries_buf);
 
         const raw_len: u32 = @intCast(out.items.len);
         std.debug.assert(self.uncompressed_size <= std.math.maxInt(u32) - raw_len);
@@ -717,17 +731,21 @@ pub const Builder = struct {
             self.compressed_size += clen;
         }
 
-        const block_off: u32 = @intCast(self.table_buf.items.len);
-        var block = _buffers.BlockWriter.initWithBuf(
-            self.allocator,
-            &self.table_buf,
-        );
+        // The envelope is laid down in scratch and the payload appended
+        // after it (a `.rest` field the writer may leave empty), so the
+        // stored bytes are copied once, into table_buf.
+        const env = &self.entries_buf;
+        var block = _buffers.BlockWriter.initWithBuf(self.allocator, env);
         const codec_byte = [_]u8{@intFromEnum(stored.codec)};
         try block.setCrc(zbuf.hashParts(&.{ &codec_byte, stored.bytes }));
         try block.setCodec(codec_byte[0]);
-        try block.addPayload(stored.bytes);
         block.finish();
-        const block_len: u32 = @intCast(self.table_buf.items.len - block_off);
+        std.debug.assert(env.items.len == _buffers.BlockReader.payload_off);
+
+        const block_off: u32 = @intCast(self.table_buf.len);
+        try self.table_buf.appendSlice(env.items);
+        try self.table_buf.appendSlice(stored.bytes);
+        const block_len: u32 = @intCast(self.table_buf.len - block_off);
 
         try self.block_infos.append(self.allocator, .{
             .base_key = base_key,
