@@ -28,7 +28,7 @@ const TableCache = _tree.TableCache;
 const Table = _table.Table;
 const Item = _table.table.Item;
 const SkipList = _skl.SkipList;
-const Builder = _table.builder.Builder;
+const Emitter = _tree.Tree.Emitter;
 const _mitr = _table.merge_iterator;
 
 /// Build the SST path for `file_id`. Filename layout is `<id:016x>.sst` —
@@ -666,7 +666,7 @@ pub const Forest = struct {
     /// them lands in that table once, with all its versions.
     pub const FlushResult = struct {
         changes: std.ArrayList(_manifest.SSTableChange),
-        memtable_id: u64,
+        newest_memtable_id: u64,
     };
 
     pub fn buildFlush(self: *Forest) !?FlushResult {
@@ -688,98 +688,66 @@ pub const Forest = struct {
         defer iter.deinit();
         try iter.seekRange(Key.inf, Key.inf);
 
-        // Per-tree builders, keyed by the tree's global identity. Keys within
-        // each tree are already in sorted order because the skiplist is
-        // globally sorted and each tree covers a contiguous key range within
-        // its (namespace, table_id) table. An item is one key with every
-        // version of it, newest first, which is the order the builder wants.
-        var builders = std.AutoHashMap(TreeKey, *Builder).init(self.allocator);
+        // One Emitter per tree, in the order the trees are met. The
+        // merge is globally sorted and a tree covers a contiguous key
+        // range of one table, so a tree's keys arrive as one run: the
+        // current emitter serves until a key falls outside its tree,
+        // and a tree is never met twice. Once a run ends its table
+        // goes out on a fiber of its own, overlapping the walk of the
+        // trees after it. Each emitter holds its tree's ref for as
+        // long as it lives. An item is one key with every version of
+        // it, newest first, which is the order the emitter wants. At
+        // L0 an emitter writes one table, whatever it weighs, and
+        // folds only the roaring delta chains the flushed memtables
+        // hold whole.
+        var emitters: std.ArrayList(*Emitter) = .empty;
         defer {
-            var bit = builders.valueIterator();
-            while (bit.next()) |bld| {
-                bld.*.deinit();
-                self.allocator.destroy(bld.*);
+            for (emitters.items) |em| {
+                em.deinit();
+                em.tree.release();
+                self.allocator.destroy(em);
             }
-            builders.deinit();
+            emitters.deinit(self.allocator);
+        }
+        const min_read = self.globalMinRead();
+        var flush_err: utils.SafeError = .{};
+        var flushes = fiber.Group(void).init(self.allocator);
+        defer {
+            _ = flushes.wait();
+            flushes.deinit();
         }
 
-        const bcfg = _table.builder.Config{
-            .target_block_size = opts.block_bytes,
-            .codec = opts.codecFor(0),
-            .priority = .p0,
-        };
-
-        // Route each key to a tree and add to the appropriate builder.
+        var cur: ?*Emitter = null;
         while (iter.itemRef()) |item| {
-            const tk, const kind = blk: {
-                const trees = self.getTable(item.key.tableKey()) orelse {
-                    try iter.next();
-                    continue;
-                };
-                const tree = trees.getTreeByKey(item.key) orelse {
-                    try iter.next();
-                    continue;
-                };
-                defer tree.release();
-                break :blk .{ TreeKey{
-                    .namespace = item.key.namespace,
-                    .tree_id = tree.tree_id,
-                }, tree.kind };
-            };
+            if (cur == null or !cur.?.tree.covers(item.key)) {
+                // We're on a new tree. Flush the previous one; a table
+                // that failed fails the flush, so no point walking on.
+                if (cur) |em| {
+                    try flushes.spawn(.{}, flushTable, .{ em, &flush_err });
+                }
+                if (flush_err.get()) |err| return err;
 
-            const bld = if (builders.get(tk)) |b| b else blk: {
-                const b = try self.allocator.create(Builder);
-                var tree_cfg = bcfg;
-                tree_cfg.kind = kind;
-                b.* = Builder.init(self.allocator, tree_cfg);
-                try builders.put(tk, b);
-                break :blk b;
-            };
-            try bld.addItem(item);
+                cur = try self.openFlushEmitter(&emitters, item.key, min_read);
+            }
+            // No tree for the key (its namespace is gone): dropped.
+            if (cur) |em| try em.push(item);
             try iter.next();
         }
+        if (cur) |em| try flushes.spawn(.{}, flushTable, .{ em, &flush_err });
 
-        // Flush all builders to SST files. writeAndSyncTable handles the full
-        // write path (finish → create file → write → sync → close) and returns
-        // the manifest SSTableChange directly.
-        var flush_err: utils.SafeError = .{};
-        var g = fiber.Group(?_manifest.SSTableChange).init(self.allocator);
-        defer {
-            _ = g.wait();
-            g.deinit();
-        }
-
-        var bit = builders.iterator();
-        while (bit.next()) |kv| {
-            const tk = kv.key_ptr.*;
-            const bld = kv.value_ptr.*;
-
-            var tb = try bld.finish();
-            if (tb.bytes.len == 0) {
-                tb.deinit();
-                continue;
-            }
-
-            const file_id = self.manifest.newFileId();
-            const path = try sstPath(
-                self.allocator,
-                self.live.cur().dir,
-                file_id,
-            );
-
-            try g.spawn(.{}, writeAndSyncTable, .{
-                self.allocator, tb, path, file_id, tk, 0, &flush_err,
-            });
-        }
-
-        // Join fibers and collect manifest changes.
-        const tcs = g.wait();
-        var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
-        for (tcs) |tc_opt| {
-            const tc = tc_opt orelse continue;
-            try changes.append(self.allocator, tc);
-        }
+        // Every table written, then each emitter's syncs joined for
+        // its CREATEs.
+        _ = flushes.wait();
         if (flush_err.get()) |err| return err;
+
+        var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
+        errdefer changes.deinit(self.allocator);
+
+        for (emitters.items) |em| {
+            var r = try em.finish();
+            defer r.changes.deinit(self.allocator);
+            try changes.appendSlice(self.allocator, r.changes.items);
+        }
 
         // Best-effort directory sync.
         if (self.live.cur().dir.len > 0) {
@@ -795,39 +763,41 @@ pub const Forest = struct {
             "buildFlush: {d} memtables up to id={d} into {d} table(s)",
             .{ srcs.len, newest_id, changes.items.len },
         );
-        return .{ .changes = changes, .memtable_id = newest_id };
+        return .{ .changes = changes, .newest_memtable_id = newest_id };
     }
 
-    /// Writes table bytes to a new SST file, syncs, and closes.
-    /// Returns a manifest.SSTableChange (CREATE at `level`) on success.
-    fn writeAndSyncTable(
-        allocator: std.mem.Allocator,
-        tb: _table.builder.TableBuffer,
-        path: String,
-        file_id: u64,
-        tk: TreeKey,
-        lvl: u32,
-        err_out: *utils.SafeError,
-    ) ?_manifest.SSTableChange {
-        defer allocator.free(path);
-        var mtb = tb;
-        defer mtb.deinit();
-
-        vfs.writeAndSync(
-            path,
-            mtb.bytes,
-            .{ .mode = .direct },
-            .p0,
-        ) catch |err| {
+    /// A flush emitter's table out, on its own fiber: the emitter is
+    /// done being pushed to, and nothing touches it until the fiber
+    /// is joined. A failure is logged here and set in `err_out`.
+    fn flushTable(em: *Emitter, err_out: *utils.SafeError) void {
+        em.flush() catch |err| {
+            log.err("flush tree={d} table failed: {s}", .{
+                em.tree.tree_id, @errorName(err),
+            });
             err_out.set(err);
-            return null;
         };
-        return _manifest.createSSTableChange(
-            file_id,
-            tk.namespace,
-            tk.tree_id,
-            lvl,
-        );
+    }
+
+    /// An L0 emitter for the tree owning `key`, added to `emitters`,
+    /// or null when no tree does. The emitter takes over the tree ref.
+    fn openFlushEmitter(
+        self: *Forest,
+        emitters: *std.ArrayList(*Emitter),
+        key: Key,
+        min_read: u64,
+    ) !?*Emitter {
+        const trees = self.getTable(key.tableKey()) orelse return null;
+        const tree = trees.getTreeByKey(key) orelse return null;
+        errdefer tree.release();
+
+        const em = try self.allocator.create(Emitter);
+        errdefer self.allocator.destroy(em);
+
+        em.* = Emitter.init(tree, 0, .p0, min_read);
+        errdefer em.deinit();
+
+        try emitters.append(self.allocator, em);
+        return em;
     }
 
     /// Build BOTTOM-level SSTs for (`ns`, `table_id`) from
@@ -864,81 +834,26 @@ pub const Forest = struct {
         errdefer changes.deinit(allocator);
         if (items.len == 0) return changes;
 
-        const bottom: u32 = @intCast(self.live.cur().max_levels - 1);
-        const tk, const max_bytes, const kind = blk: {
-            const tree = try self.singleTree(table_key);
-            defer tree.release();
-            var targets = try tree.levelTargets();
-            defer targets.deinit();
-            break :blk .{
-                TreeKey{
-                    .namespace = table_key.namespace,
-                    .tree_id = tree.tree_id,
-                },
-                @as(usize, @intCast(targets.file_sz[bottom])),
-                tree.kind,
-            };
-        };
+        // One emitter at the bottom level: tables cut at `table_bytes`,
+        // and every item kept, a single state above the horizon.
+        const bottom: usize = self.live.cur().max_levels - 1;
+        const tree = try self.singleTree(table_key);
+        defer tree.release();
 
-        var build_err: utils.SafeError = .{};
-        var g = fiber.Group(?_manifest.SSTableChange).init(self.allocator);
-        defer {
-            _ = g.wait();
-            g.deinit();
-        }
+        var em = Emitter.init(tree, bottom, .p2, self.globalMinRead());
+        defer em.deinit();
 
-        const opts = self.live.cur();
-        var bld = Builder.init(self.allocator, .{
-            .target_block_size = opts.block_bytes,
-            .codec = opts.codecFor(bottom),
-            .priority = .p2,
-            .kind = kind,
-        });
-        defer bld.deinit();
-        for (items) |item| {
-            if (bld.table_buf.items.len >= max_bytes) {
-                try self.spawnTableWrite(&g, &bld, tk, bottom, &build_err);
-                bld.reset();
-            }
-            try bld.addItem(item);
-        }
-        try self.spawnTableWrite(&g, &bld, tk, bottom, &build_err);
+        for (items) |item| try em.push(item);
 
-        const tcs = g.wait();
-        for (tcs) |tc_opt| {
-            const tc = tc_opt orelse continue;
-            try changes.append(allocator, tc);
-        }
-        if (build_err.get()) |err| return err;
+        var r = try em.finish();
+        defer r.changes.deinit(self.allocator);
+        try changes.appendSlice(allocator, r.changes.items);
 
         if (self.live.cur().dir.len > 0) {
             var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.live.cur().dir});
             defer dir_sync.join();
         }
         return changes;
-    }
-
-    /// One buildBottomTable output file: finish the builder and hand
-    /// the write+sync to the fiber group. Empty builders spawn
-    /// nothing.
-    fn spawnTableWrite(
-        self: *Forest,
-        g: *fiber.Group(?_manifest.SSTableChange),
-        bld: *Builder,
-        tk: TreeKey,
-        lvl: u32,
-        err_out: *utils.SafeError,
-    ) !void {
-        var tb = try bld.finish();
-        if (tb.bytes.len == 0) {
-            tb.deinit();
-            return;
-        }
-        const file_id = self.manifest.newFileId();
-        const path = try sstPath(self.allocator, self.live.cur().dir, file_id);
-        try g.spawn(.{}, writeAndSyncTable, .{
-            self.allocator, tb, path, file_id, tk, lvl, err_out,
-        });
     }
 
     /// Whether every CREATE in `changes` is now a table of `table_key`'s
@@ -1158,7 +1073,7 @@ pub const Forest = struct {
     }
 
     pub fn shouldFreeze(self: *Forest) bool {
-        return self.memtables.memoryUsage() >= self.live.cur().memtable_bytes;
+        return self.memtables.memoryUsage() >= self.live.cur().table_bytes;
     }
 
     /// Check if there are frozen memtables waiting to be flushed.

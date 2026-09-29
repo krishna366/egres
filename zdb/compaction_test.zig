@@ -60,7 +60,7 @@ test "pickL0Job merge: an unfinished earlier output is merged again with the flu
 
 test "pickL0Job merge: the run starts after the newest finished table" {
     const opts: Config = .{ .l0_merge_min_tables = 4 };
-    try std.testing.expectEqual(@as(usize, 64 * mib), opts.memtable_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * mib), opts.table_bytes);
 
     // A finished table between small ones: only the newer ones are
     // taken, whatever sits before it.

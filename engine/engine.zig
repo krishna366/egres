@@ -1062,7 +1062,7 @@ pub const Engine = struct {
 
     /// Single-purpose loop: when leader, propose a `newMemtable` whenever
     /// either (a) the placeholder is still current (id == 0) or (b) the
-    /// active memtable has hit `memtable_bytes`. Bootstrap and steady-state
+    /// active memtable has hit `table_bytes`. Bootstrap and steady-state
     /// freeze fall out of the same condition, so there's no separate
     /// startup phase.
     fn runMemtableLoop(self: *Engine) void {
@@ -1190,13 +1190,20 @@ pub const Engine = struct {
         defer self.removeInFlight(.flush, 0, 0);
 
         const result = try self.forest.buildFlush() orelse return;
+
         var changes = result.changes;
         defer changes.deinit(self.allocator);
         if (changes.items.len == 0) return;
 
         try self.distributeNewFiles(changes.items);
 
-        const payload = try encodeManifestChange(self.allocator, .flush, changes.items, &.{}, result.memtable_id);
+        const payload = try encodeManifestChange(
+            self.allocator,
+            .flush,
+            changes.items,
+            &.{},
+            result.newest_memtable_id,
+        );
         defer self.allocator.free(payload);
         try self.node.proposeAndWaitForApply(payload, .manifest);
     }

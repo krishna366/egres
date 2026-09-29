@@ -123,7 +123,7 @@ const Fixture = struct {
         try self.f.applyFlush(
             self.nextIndex(),
             fl.changes.items,
-            fl.memtable_id,
+            fl.newest_memtable_id,
         );
     }
 
@@ -366,7 +366,7 @@ fn writeOneKeyTable(
 ) !void {
     const path = try zdb.sstPath(alloc, dir, file_id);
     defer alloc.free(path);
-    var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var bld = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer bld.deinit();
     try bld.add(k, ts, value);
     var tb = try bld.finish();

@@ -4,7 +4,8 @@ const String = utils.String;
 
 pub const Error = error{
     InvalidNumCompactors,
-    InvalidMemtableSize,
+    InvalidPushFibers,
+    InvalidTableSize,
     InvalidBlockSize,
     InvalidMaxLevels,
     InvalidDirForInMemory,
@@ -17,7 +18,13 @@ pub const Config = struct {
     in_memory: bool = false,
     read_only: bool = false,
 
-    memtable_bytes: usize = 64 * 1024 * 1024,
+    /// The size a table is aimed at, in memory and on disk: a memtable
+    /// freezes once it holds this many bytes of writes, and every SST
+    /// at every level is cut at it. One size, so a job at any level
+    /// rewrites a file's share of the level below plus one file of
+    /// edge, and an L0 push has as many L1 boundaries to partition on
+    /// as L1 has files.
+    table_bytes: usize = 64 * 1024 * 1024,
 
     // When the leader flushes. A flush merges every immutable memtable
     // waiting at that moment into one L0 table per tree (RocksDB's
@@ -32,6 +39,12 @@ pub const Config = struct {
 
     block_bytes: usize = 64 * 1024,
     num_compactors: u8 = 2,
+    /// Fibers one L0→L1 push splits into, along L1 table boundaries
+    /// (compaction.partitions), each merging and writing its own key
+    /// range. A push was one fiber, up to 36 s of merge and codec
+    /// work while L0 grew past the write brake's trigger. Bounded by
+    /// `compaction.max_push_fibers`.
+    l0_push_fibers: u8 = 3,
 
     // Level sizes. `lmax_target_bytes` is the bottom level's target; upper
     // levels cascade by dividing by `level_size_multiplier`. There is no
@@ -40,13 +53,6 @@ pub const Config = struct {
     // levels add about a quarter, so that is a tree whose Lmax is full.
     level_size_multiplier: i64 = 5,
     max_levels: u8 = 4,
-
-    // Per-level SST file size. L0 inherits the memtable size. L1 uses
-    // `l1_table_bytes`; each level below ramps by `table_size_multiplier`
-    // up to `max_table_bytes`.
-    l1_table_bytes: i64 = 32 * 1024 * 1024,
-    table_size_multiplier: i64 = 2,
-    max_table_bytes: i64 = 128 * 1024 * 1024,
 
     // The bottom level's (Lmax's) byte target, and so the per-tree size:
     // Lmax holds about 80% of a tree's data. After each compaction the
@@ -156,9 +162,9 @@ pub const Config = struct {
         .in_memory = "Keep the forest in memory only; `dir` must be empty." ++
             " For tests.",
         .read_only = "Open the forest without writing to it.",
-        .memtable_bytes = "Bytes of writes a memtable holds before it is" ++
-            " frozen and flushed. Small values force frequent flushes," ++
-            " useful for tests.",
+        .table_bytes = "Bytes a memtable holds before it is frozen and" ++
+            " flushed, and the size every SST is cut at. Small values" ++
+            " force frequent flushes, useful for tests.",
         .flush_min_memtables = "Flush once this many frozen memtables are" ++
             " waiting; one flush merges all of them into one L0 table per" ++
             " tree. 1 flushes each memtable as soon as it is frozen.",
@@ -167,14 +173,11 @@ pub const Config = struct {
         .block_bytes = "Target size of one SST data block, the unit of" ++
             " reads and of the block cache.",
         .num_compactors = "Compaction worker fibers. Must not be 1.",
+        .l0_push_fibers = "Fibers an L0 to L1 compaction splits into" ++
+            " along L1 table boundaries, 1 to 16.",
         .level_size_multiplier = "Each level's byte target is the next" ++
             " deeper level's divided by this.",
         .max_levels = "Levels per tree, L0 included.",
-        .l1_table_bytes = "SST file size at L1. L0 tables are memtable" ++
-            " sized.",
-        .table_size_multiplier = "Each level below L1 multiplies the SST" ++
-            " file size by this.",
-        .max_table_bytes = "Cap on the SST file size at any level.",
         .lmax_target_bytes = "Byte target of a tree's bottom level. The" ++
             " levels above are a fifth of the one below. A tree splits" ++
             " at its median key into two once it holds five fourths of" ++
@@ -190,7 +193,7 @@ pub const Config = struct {
         .job_max_bytes = "Input bytes one flush or L0 to L1 compaction" ++
             " takes, oldest first; at least one input is always taken.",
         .l0_merge_min_tables = "An L0 to L0 compaction merges the tables" ++
-            " after the newest one that reached the memtable size, up to" ++
+            " after the newest one that reached the table size, up to" ++
             " twice that size, into one table, once there are this many" ++
             " of them. L0 is compacted into L1 once it holds as many bytes" ++
             " as L1's target. 0 turns L0 to L0 compaction off.",
@@ -237,7 +240,9 @@ pub const Config = struct {
         // Badger semantics: exactly one compactor causes pathological level
         // behavior.
         if (self.num_compactors == 1) return error.InvalidNumCompactors;
-        if (self.memtable_bytes == 0) return error.InvalidMemtableSize;
+        if (self.l0_push_fibers == 0 or self.l0_push_fibers > 16)
+            return error.InvalidPushFibers;
+        if (self.table_bytes == 0) return error.InvalidTableSize;
         if (self.block_bytes == 0) return error.InvalidBlockSize;
         if (self.max_levels == 0) return error.InvalidMaxLevels;
         if (self.in_memory and

@@ -47,7 +47,7 @@ fn buildRangeTable(
     end: usize,
     block_size: u32,
 ) !zdb.table.builder.TableBuffer {
-    var b = Builder.init(allocator, .{ .target_block_size = block_size });
+    var b = Builder.init(allocator, .{ .block_bytes = block_size });
     defer b.deinit();
 
     var i: usize = start;
@@ -70,7 +70,7 @@ fn buildTestTable(
     n: usize,
     block_size: u32,
 ) !zdb.table.builder.TableBuffer {
-    var b = Builder.init(allocator, .{ .target_block_size = block_size });
+    var b = Builder.init(allocator, .{ .block_bytes = block_size });
     defer b.deinit();
 
     var i: usize = 0;
@@ -96,7 +96,7 @@ test "builder.finish output is page-aligned for any payload size" {
     const allocator = std.testing.allocator;
     const sizes = [_]usize{ 1, 32, 100, 1000, 4095, 4096, 4097, 9000 };
     for (sizes) |n| {
-        var b = Builder.init(allocator, .{ .target_block_size = 4 * 1024 });
+        var b = Builder.init(allocator, .{ .block_bytes = 4 * 1024 });
         defer b.deinit();
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -117,7 +117,7 @@ test "builder.finish output is page-aligned for any payload size" {
 }
 
 test "table builder/reader roundtrip and seek" {
-    var b = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
+    var b = Builder.init(std.testing.allocator, .{ .block_bytes = 256 });
     defer b.deinit();
 
     try b.addItem(.{ .key = .{ .primary = "a" }, .versions = .{ .many = &.{
@@ -213,7 +213,7 @@ test "table election over many blocks, blocks stored per their own codec" {
         var prng = std.Random.DefaultPrng.init(11);
         var b = Builder.init(alloc, .{
             .codec = .lz4,
-            .target_block_size = block,
+            .block_bytes = block,
         });
         defer b.deinit();
         var val: [val_len]u8 = undefined;
@@ -298,7 +298,7 @@ fn fillValue(
 test "seekGe: prefix-length and version ordering" {
     const alloc = std.testing.allocator;
 
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer b.deinit();
     try b.add(.{ .primary = "a" }, 5, "a5");
     try b.addItem(.{ .key = .{ .primary = "ab" }, .versions = .{ .many = &.{
@@ -360,7 +360,7 @@ test "table stores primaries only and the iterator stamps the tree's ids" {
     const alloc = std.testing.allocator;
 
     // Keys written with one namespace and table_id...
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer b.deinit();
     for (0..300) |i| {
         var key_buf: [16]u8 = undefined;
@@ -417,7 +417,7 @@ test "table stores primaries only and the iterator stamps the tree's ids" {
 test "table iterator reads the table's infinity as no bound" {
     const alloc = std.testing.allocator;
 
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer b.deinit();
     for (0..50) |i| {
         var key_buf: [16]u8 = undefined;
@@ -486,7 +486,7 @@ test "table iterator reads the table's infinity as no bound" {
 test "table binary fuse contains keys" {
     const alloc = std.testing.allocator;
 
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer b.deinit();
 
     const n: usize = 1024;
@@ -516,7 +516,7 @@ test "table binary fuse contains keys" {
 test "table egid filter is exact and replaces the fuse filter" {
     const alloc = std.testing.allocator;
 
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024, .kind = .rows });
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024, .kind = .rows });
     defer b.deinit();
 
     // Every third egid from 3 to 3000, ascending as a base table's rows
@@ -558,7 +558,7 @@ test "table egid filter of dense ids is far smaller than a fuse filter" {
     // 70,000 contiguous egids, a flush table's worth of rows: two 64k
     // chunks, each one 8 KiB bitmap container. A fuse filter is about
     // two bytes per key, 140 KiB here.
-    var b = Builder.init(alloc, .{ .target_block_size = 64 * 1024, .kind = .rows });
+    var b = Builder.init(alloc, .{ .block_bytes = 64 * 1024, .kind = .rows });
     defer b.deinit();
     var key_buf: [8]u8 = undefined;
     var egid: u64 = 1;
@@ -593,7 +593,7 @@ test "table binary fuse large keyset contains sampled keys" {
     const n: usize = 1_000_000;
     const sample: usize = 10_000;
 
-    var b = Builder.init(alloc, .{ .target_block_size = 32 * 1024 });
+    var b = Builder.init(alloc, .{ .block_bytes = 32 * 1024 });
     defer b.deinit();
 
     var i: usize = 0;
@@ -636,7 +636,7 @@ test "table binary fuse large keyset contains sampled keys" {
 }
 
 test "table checksum mismatch is detected" {
-    var b = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
+    var b = Builder.init(std.testing.allocator, .{ .block_bytes = 256 });
     defer b.deinit();
 
     try b.add(.{ .primary = "k1" }, 1, "v1");
@@ -657,14 +657,14 @@ test "table checksum mismatch is detected" {
 }
 
 test "merge iterator merges sorted streams" {
-    var b1 = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
+    var b1 = Builder.init(std.testing.allocator, .{ .block_bytes = 256 });
     defer b1.deinit();
     try b1.add(.{ .primary = "a" }, 5, "a5");
     try b1.add(.{ .primary = "c" }, 1, "c1");
     var t1 = try b1.finish();
     defer t1.deinit();
 
-    var b2 = Builder.init(std.testing.allocator, .{ .target_block_size = 256 });
+    var b2 = Builder.init(std.testing.allocator, .{ .block_bytes = 256 });
     defer b2.deinit();
     try b2.add(.{ .primary = "b" }, 4, "b4");
     try b2.add(.{ .primary = "d" }, 1, "d1");
@@ -710,7 +710,7 @@ test "merge iterator gathers one primary from every source" {
     const alloc = std.testing.allocator;
     // Three tables holding versions of "k" with interleaved timestamps;
     // t1 and t2 both hold a version at 10.
-    var b1 = Builder.init(alloc, .{ .target_block_size = 256 });
+    var b1 = Builder.init(alloc, .{ .block_bytes = 256 });
     defer b1.deinit();
     try b1.addItem(.{ .key = .{ .primary = "k" }, .versions = .{ .many = &.{
         .{ .ts = 30, .meta = .{}, .value = "k30" },
@@ -720,7 +720,7 @@ test "merge iterator gathers one primary from every source" {
     var t1 = try b1.finish();
     defer t1.deinit();
 
-    var b2 = Builder.init(alloc, .{ .target_block_size = 256 });
+    var b2 = Builder.init(alloc, .{ .block_bytes = 256 });
     defer b2.deinit();
     try b2.addItem(.{ .key = .{ .primary = "k" }, .versions = .{ .many = &.{
         .{ .ts = 20, .meta = .{}, .value = "k20" },
@@ -729,7 +729,7 @@ test "merge iterator gathers one primary from every source" {
     var t2 = try b2.finish();
     defer t2.deinit();
 
-    var b3 = Builder.init(alloc, .{ .target_block_size = 256 });
+    var b3 = Builder.init(alloc, .{ .block_bytes = 256 });
     defer b3.deinit();
     try b3.add(.{ .primary = "a" }, 1, "a1");
     try b3.add(.{ .primary = "k" }, 25, "k25");
@@ -791,7 +791,7 @@ test "merge iterator gathers one primary from every source" {
 
 /// A table with every item of `items`, in one 4 KiB-block builder.
 fn buildItems(alloc: std.mem.Allocator, items: []const Item) !*Table {
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer b.deinit();
     for (items) |item| try b.addItem(item);
     var tb = try b.finish();
@@ -859,7 +859,7 @@ test "packed: a chain past the block target is still one entry" {
     for (&vers, 0..) |*ver, i| {
         ver.* = .{ .ts = 100 - i, .meta = .{}, .value = wide };
     }
-    var b = Builder.init(alloc, .{ .target_block_size = 1024 });
+    var b = Builder.init(alloc, .{ .block_bytes = 1024 });
     defer b.deinit();
     try b.add(.{ .primary = "a" }, 1, "a");
     try b.addItem(.{
@@ -1095,7 +1095,7 @@ test "table: seek and iterate to end" {
 
 test "table: max_version" {
     const alloc = std.testing.allocator;
-    var b = Builder.init(alloc, .{ .target_block_size = 4096 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4096 });
     defer b.deinit();
 
     const n = 1000;
@@ -1138,7 +1138,7 @@ test "table: big values" {
     const n = 20;
     const value_size = 64 * 1024; // 64 KB
 
-    var b = Builder.init(alloc, .{ .target_block_size = 4096 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4096 });
     defer b.deinit();
 
     const big_val = try alloc.alloc(u8, value_size);
@@ -1416,7 +1416,7 @@ test "table: meta round-trips through builder and iterator" {
     const alloc = std.testing.allocator;
     // Small blocks so the table spans many blocks: meta has to survive each
     // block re-anchoring on a new base key.
-    var b = Builder.init(alloc, .{ .target_block_size = 4096 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4096 });
     defer b.deinit();
 
     const n = 500;
@@ -1469,7 +1469,7 @@ test "table: meta round-trips through builder and iterator" {
 
 test "table: meta survives random access via seekGe" {
     const alloc = std.testing.allocator;
-    var b = Builder.init(alloc, .{ .target_block_size = 4096 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4096 });
     defer b.deinit();
 
     const n = 500;

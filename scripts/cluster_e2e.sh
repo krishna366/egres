@@ -51,7 +51,7 @@ start_node() {
     ./zig-out/bin/egres \
         --raft="id=$id$([ "$id" != 1 ] && echo ";seeds=127.0.0.1:4210")" \
         --listen="offset=$offset" \
-        --zdb="dir=$ROOT/n$id;memtable_bytes=262144" \
+        --zdb="dir=$ROOT/n$id;table_bytes=262144" \
         "$@" >"$LOGS/n$id.log" 2>&1 &
     PIDS+=($!)
 }

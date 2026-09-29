@@ -123,7 +123,7 @@ const Fixture = struct {
                 return error.TestExpectedFlush;
             var changes = fl.changes;
             defer changes.deinit(testing.allocator);
-            try f.applyFlush(3, changes.items, fl.memtable_id);
+            try f.applyFlush(3, changes.items, fl.newest_memtable_id);
         }
 
         return .{

@@ -119,7 +119,9 @@ pub const Error = error{
     _binaryfuse.Error;
 
 pub const Config = struct {
-    target_block_size: usize = 32 * 1024,
+    /// A block is cut once it reaches this. The forest passes its own
+    /// `block_bytes`; the default matches it for a builder on its own.
+    block_bytes: usize = 64 * 1024,
     /// The codec the table is asked for. Each block carries its own
     /// codec byte, and whether a block is stored compressed, and
     /// whether later blocks are tried at all, is the `Election`'s.
@@ -673,7 +675,7 @@ pub const Builder = struct {
         const header_est = envelope + 4 + (n + 1) * 4;
         const estimated = self.entries_buf.items.len +
             new_entry_est + header_est;
-        return estimated > self.cfg.target_block_size;
+        return estimated > self.cfg.block_bytes;
     }
 
     fn finishBlock(self: *Builder) Error!void {

@@ -83,7 +83,7 @@ fn buildTableMeta(
     alloc: std.mem.Allocator,
     entries: []const MetaEntry,
 ) !_table.builder.TableBuffer {
-    var b = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var b = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer b.deinit();
     var vers: std.ArrayList(zdb.kv.Version) = .empty;
     defer vers.deinit(alloc);
@@ -798,6 +798,79 @@ test "levels: compact L0 L1 with dest overlap" {
     }
 }
 
+test "levels: an L0 push splits into a fiber per L1 range" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // L0 holds aa, cc, ee, gg in two tables; L1 holds bb, dd, ff, one
+    // table each. Three fibers get [-inf, dd), [dd, ff) and [ff, inf):
+    // one output each, every key present afterwards.
+    const test_tree_id: u64 = 1;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+    const l0 = [_][]const MetaEntry{
+        &.{ .{ .key = "aa", .ts = 1, .val = "vaa" }, .{ .key = "ee", .ts = 1, .val = "vee" } },
+        &.{ .{ .key = "cc", .ts = 1, .val = "vcc" }, .{ .key = "gg", .ts = 1, .val = "vgg" } },
+    };
+    const l1 = [_][]const MetaEntry{
+        &.{.{ .key = "bb", .ts = 1, .val = "vbb" }},
+        &.{.{ .key = "dd", .ts = 1, .val = "vdd" }},
+        &.{.{ .key = "ff", .ts = 1, .val = "vff" }},
+    };
+    var id: u64 = 1;
+    var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
+    defer changes.deinit(alloc);
+    for ([_]struct { tables: []const []const MetaEntry, level: u8 }{
+        .{ .tables = &l0, .level = 0 },
+        .{ .tables = &l1, .level = 1 },
+    }) |lvl| {
+        for (lvl.tables) |entries| {
+            var tb = try buildTableMeta(alloc, entries);
+            defer tb.deinit();
+            const p = try zdb.sstPath(alloc, dir_path, id);
+            defer alloc.free(p);
+            try vfs.writeFile(p, tb.bytes);
+            try changes.append(alloc, createSSTableChange(id, 0, test_tree_id, lvl.level));
+            id += 1;
+        }
+    }
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
+    });
+    try manifest.commit(2, changes.items, &.{});
+
+    const opts = config.Config{
+        .dir = dir_path,
+        .max_levels = 2,
+        .lmax_target_bytes = push_lmax,
+        .l0_push_fibers = 3,
+    };
+    var cache = TableCache.init(alloc, opts.dir);
+    defer cache.deinit();
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
+    const tree = try Tree.open(alloc, &live, 0, test_tree_id, &manifest, &cache);
+    defer tree.release();
+
+    try std.testing.expectEqual(@as(usize, 2), tree.numTablesAt(0));
+    try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(1));
+
+    try compact(tree, 1, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(0));
+    try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(1));
+    for ([_][]const u8{ "aa", "bb", "cc", "dd", "ee", "ff", "gg" }) |k| {
+        const item = try tree.get(.{ .key = .{ .primary = k } });
+        try std.testing.expect(item != null);
+        defer item.?.free(alloc);
+        try std.testing.expectEqualStrings(k, item.?.newest().value[1..]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 12. do compact L1→L2
 // ---------------------------------------------------------------------------
@@ -1127,7 +1200,7 @@ fn setupPlacedTreeCfg(
     try fx.manifest.commit(1, &.{}, &.{tc});
     for (tables) |pt| {
         var b = Builder.init(alloc, .{
-            .target_block_size = 4 * 1024,
+            .block_bytes = 4 * 1024,
             .kind = kind,
         });
         defer b.deinit();

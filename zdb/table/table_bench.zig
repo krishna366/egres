@@ -71,7 +71,7 @@ fn buildStriped(
     block_size: u32,
     val_len: usize,
 ) !zdb.table.builder.TableBuffer {
-    var b = Builder.init(alloc, .{ .target_block_size = block_size });
+    var b = Builder.init(alloc, .{ .block_bytes = block_size });
     defer b.deinit();
 
     const val = try alloc.alloc(u8, val_len);
@@ -162,7 +162,7 @@ fn buildShared(
     block_size: u32,
     val_len: usize,
 ) !zdb.table.builder.TableBuffer {
-    var b = Builder.init(alloc, .{ .target_block_size = block_size });
+    var b = Builder.init(alloc, .{ .block_bytes = block_size });
     defer b.deinit();
 
     const val = try alloc.alloc(u8, val_len);
@@ -392,7 +392,7 @@ fn buildZipfVersions(
     block_size: u32,
     val_len: usize,
 ) !zdb.table.builder.TableBuffer {
-    var b = Builder.init(alloc, .{ .target_block_size = block_size });
+    var b = Builder.init(alloc, .{ .block_bytes = block_size });
     defer b.deinit();
 
     const val = try alloc.alloc(u8, val_len);

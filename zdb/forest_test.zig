@@ -206,7 +206,7 @@ test "forest: create tree and get" {
 
 // Helper: build a minimal SST table containing one key and write it to disk.
 fn buildAndWriteTable(alloc: std.mem.Allocator, path: String, primary: String) !void {
-    var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var bld = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer bld.deinit();
     try bld.add(.{ .primary = primary }, 1, "v");
     var tb = try bld.finish();
@@ -294,7 +294,7 @@ fn buildAndWriteTableKV(
     ts: u64,
     value: String,
 ) !void {
-    var bld = Builder.init(alloc, .{ .target_block_size = 4 * 1024 });
+    var bld = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer bld.deinit();
     try bld.add(key, ts, value);
     var tb = try bld.finish();
@@ -1301,7 +1301,7 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     try f.newMemtable(2);
     var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
     defer flush.changes.deinit(alloc);
-    try f.applyFlush(3, flush.changes.items, flush.memtable_id);
+    try f.applyFlush(3, flush.changes.items, flush.newest_memtable_id);
 
     for (cases) |c| {
         const got = try f.getRaw(alloc, .{
@@ -1476,7 +1476,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
         var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
         defer flush.changes.deinit(alloc);
         index += 1;
-        try f.applyFlush(index, flush.changes.items, flush.memtable_id);
+        try f.applyFlush(index, flush.changes.items, flush.newest_memtable_id);
     }
 
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
@@ -1507,7 +1507,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
         var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
         defer flush.changes.deinit(alloc);
         index += 1;
-        try f.applyFlush(index, flush.changes.items, flush.memtable_id);
+        try f.applyFlush(index, flush.changes.items, flush.newest_memtable_id);
         var comp = try tree.buildCompaction(f.globalMinRead());
         defer comp.deinit(alloc);
         index += 1;
@@ -2603,7 +2603,7 @@ const roar = struct {
         try f.newMemtable(next_id);
         var fl = (try f.buildFlush()) orelse return error.TestExpectedFlush;
         defer fl.changes.deinit(alloc);
-        try f.applyFlush(next_id, fl.changes.items, fl.memtable_id);
+        try f.applyFlush(next_id, fl.changes.items, fl.newest_memtable_id);
     }
 };
 
@@ -2924,13 +2924,13 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     try f.newMemtable(2);
     var flush_a = (try f.buildFlush()) orelse return error.TestExpectedFlush;
     defer flush_a.changes.deinit(alloc);
-    try f.applyFlush(3, flush_a.changes.items, flush_a.memtable_id);
+    try f.applyFlush(3, flush_a.changes.items, flush_a.newest_memtable_id);
 
     try putRow(f, "b", 2, "two");
     try f.newMemtable(4);
     var flush_b = (try f.buildFlush()) orelse return error.TestExpectedFlush;
     defer flush_b.changes.deinit(alloc);
-    try f.applyFlush(5, flush_b.changes.items, flush_b.memtable_id);
+    try f.applyFlush(5, flush_b.changes.items, flush_b.newest_memtable_id);
 
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
     defer tree.release();
@@ -3035,7 +3035,7 @@ test "table cache: a table loaded for an install survives an evict before it is 
     try f.newMemtable(2);
     var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
     defer flush.changes.deinit(alloc);
-    try f.applyFlush(3, flush.changes.items, flush.memtable_id);
+    try f.applyFlush(3, flush.changes.items, flush.newest_memtable_id);
     const listed = flush.changes.items[0].sst_id;
 
     // A real SST under an id the manifest has not heard of yet, pre-opened
@@ -3093,7 +3093,7 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     try f.newMemtable(2);
     var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
     defer flush.changes.deinit(alloc);
-    try f.applyFlush(3, flush.changes.items, flush.memtable_id);
+    try f.applyFlush(3, flush.changes.items, flush.newest_memtable_id);
     const listed = flush.changes.items[0].sst_id;
 
     // Four SST-named files the manifest never heard of. Three are backdated
@@ -3202,12 +3202,12 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     try f.newMemtable(2);
     var flush_a = (try f.buildFlush()) orelse return error.TestExpectedFlush;
     defer flush_a.changes.deinit(alloc);
-    try f.applyFlush(3, flush_a.changes.items, flush_a.memtable_id);
+    try f.applyFlush(3, flush_a.changes.items, flush_a.newest_memtable_id);
     try putRow(f, "b", 2, "two");
     try f.newMemtable(4);
     var flush_b = (try f.buildFlush()) orelse return error.TestExpectedFlush;
     defer flush_b.changes.deinit(alloc);
-    try f.applyFlush(5, flush_b.changes.items, flush_b.memtable_id);
+    try f.applyFlush(5, flush_b.changes.items, flush_b.newest_memtable_id);
 
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
     defer tree.release();
@@ -3320,9 +3320,9 @@ test "forest: one flush covers every waiting memtable" {
     defer flush.changes.deinit(alloc);
     // One table for the one tree, named after the newest memtable covered.
     try std.testing.expectEqual(@as(usize, 1), flush.changes.items.len);
-    try std.testing.expectEqual(@as(u64, 3), flush.memtable_id);
+    try std.testing.expectEqual(@as(u64, 3), flush.newest_memtable_id);
 
-    try f.applyFlush(5, flush.changes.items, flush.memtable_id);
+    try f.applyFlush(5, flush.changes.items, flush.newest_memtable_id);
     // The apply released all three, so nothing is left to flush.
     try std.testing.expectEqual(@as(usize, 0), f.memtables.immutableCount());
     try std.testing.expect((try f.buildFlush()) == null);
@@ -3374,7 +3374,7 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
         var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
         defer flush.changes.deinit(alloc);
         index += 1;
-        try f.applyFlush(index, flush.changes.items, flush.memtable_id);
+        try f.applyFlush(index, flush.changes.items, flush.newest_memtable_id);
         if (i == 2) {
             // Three small tables: below l0_merge_min_tables, and L0 is
             // within its bounds, so the tree asks for nothing.
@@ -3428,7 +3428,7 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
     var late = (try f.buildFlush()) orelse return error.TestExpectedFlush;
     defer late.changes.deinit(alloc);
     index += 1;
-    try f.applyFlush(index, late.changes.items, late.memtable_id);
+    try f.applyFlush(index, late.changes.items, late.newest_memtable_id);
 
     index += 1;
     try tree.applyCompaction(index, merge.items);
@@ -3505,9 +3505,9 @@ test "buildFlush takes the oldest memtables up to job_max_bytes" {
     while (want_id <= 3) : (want_id += 1) {
         var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
         defer flush.changes.deinit(alloc);
-        try std.testing.expectEqual(want_id, flush.memtable_id);
+        try std.testing.expectEqual(want_id, flush.newest_memtable_id);
         try std.testing.expectEqual(1, flush.changes.items.len);
-        try f.applyFlush(10 + want_id, flush.changes.items, flush.memtable_id);
+        try f.applyFlush(10 + want_id, flush.changes.items, flush.newest_memtable_id);
         try std.testing.expectEqual(3 - want_id, f.memtables.immutableCount());
     }
     // Every row is readable from the L0 tables.

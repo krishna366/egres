@@ -343,7 +343,14 @@ pub const Tree = struct {
     pub const Emitter = _compaction.Emitter;
     pub const buildCompaction = _compaction.buildCompaction;
     pub const mergeAndWrite = _compaction.mergeAndWrite;
-    pub const flushBuilderOutput = _compaction.flushBuilderOutput;
+
+    /// Whether `key` is this tree's to hold: of its table, and inside
+    /// its range (a single tree's range is unbounded).
+    pub fn covers(self: *const Tree, key: Key) bool {
+        return key.namespace == self.namespace and
+            key.table_id == self.tableId() and
+            self.key_range.contains(key);
+    }
 
     /// The SQL table this tree is part of, from the tree id.
     pub fn tableId(self: *const Tree) u32 {
