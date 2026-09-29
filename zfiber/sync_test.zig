@@ -45,13 +45,15 @@ test "Mutex: 10 fibers each incrementing 1000 times under lock" {
     try std.testing.expectEqual(@as(u32, 10_000), counter);
 }
 
-test "Mutex: hand-off preserves FIFO order under contention" {
+test "Mutex: waiters are woken in FIFO order under contention" {
     var mu: fiber.Mutex(.untracked) = .{};
 
     // attempt[i] = id of the fiber that was the i-th to call mu.lock().
     // actual[i] = id of the fiber that was the i-th to be granted the
-    // lock. FIFO hand-off means these two slices match, regardless of
-    // whatever order the scheduler happened to run the fibers in.
+    // lock. Waiters are woken in queue order, and each holder yields
+    // while holding, so nothing else is runnable when a woken waiter
+    // retries: the two slices match, whatever order the scheduler
+    // happened to run the fibers in.
     var attempt: [4]u8 = .{ 0, 0, 0, 0 };
     var actual: [4]u8 = .{ 0, 0, 0, 0 };
     var attempt_idx: std.atomic.Value(usize) = .init(0);
@@ -118,7 +120,7 @@ test "Mutex: hand-off preserves FIFO order under contention" {
 
     g.wait();
 
-    // FIFO hand-off invariant: grant order equals attempt order.
+    // Grant order equals attempt order.
     try std.testing.expectEqualSlices(u8, &attempt, &actual);
 }
 

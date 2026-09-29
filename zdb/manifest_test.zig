@@ -372,8 +372,9 @@ test "manifest clone is independent of source" {
     });
     try src.commit(2, &.{createSSTableChange(10, 5, 1, 0)}, &.{});
 
-    var copy = try src.clone(alloc);
+    var copy = _manifest.Manifest.init(alloc);
     defer copy.deinit();
+    try src.cloneInto(&copy);
 
     // Mutating src must not affect copy.
     try src.commit(3, &.{createSSTableChange(11, 5, 1, 0)}, &.{});

@@ -38,7 +38,7 @@ pub const TableEntry = struct {
 /// exclusive to change it. Every `Level` method takes a token minted by
 /// it (`Lock.Shared` / `Lock.Exclusive`), so a level cannot be touched
 /// without the tree's lock in hand, and the parameter says which mode.
-pub const Lock = fiber.RWMutex(.untracked);
+pub const Lock = fiber.RWMutex(.tracked);
 
 /// One level of a tree's LSM. No lock of its own: `tables` and
 /// `total_size` are guarded by the owning tree's `Lock`, and every

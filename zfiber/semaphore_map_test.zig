@@ -26,7 +26,7 @@ fn release(sm: *SemaphoreMap, key: u64, owner_id: u64) void {
 }
 
 fn waiterCount(sm: *SemaphoreMap, key: u64) usize {
-    sm.mu.lock(@src());
+    sm.mu.lock();
     defer sm.mu.unlock();
     const e = sm.entries.get(key) orelse return 0;
     return e.waiters.items.len;

@@ -10,13 +10,15 @@
 //! park" and the actual `coro.yield` lands as `awaken=true` on
 //! the fiber's `state`, and `park`'s CAS aborts before yielding.
 //!
-//! Mutex policy: **hand-off**. When `unlock` finds a waiter it
-//! transfers ownership directly rather than releasing the lock
-//! byte to 0. The woken waiter holds the lock the moment its
-//! `park` returns — and VERIFIES it: `unlock` records the grant in
-//! `granted_to` before the wake, and the waiter panics if it
-//! resumes without its own grant (park-once discipline; a wake
-//! must have a reason). FIFO fairness comes free.
+//! Mutex policy: **no hand-off**. `unlock` frees the lock and wakes
+//! the first waiter, which then competes for it like a newcomer and
+//! re-parks if it loses. A hand-off (the previous policy) made the
+//! woken waiter the owner while it still sat on a worker's ring
+//! behind other work, and every other contender queued behind that:
+//! measured at 4 ms per statement on SemaphoreMap under a 16-stream
+//! load. Waiters are woken in FIFO order; ownership is not FIFO.
+//! RWMutex keeps its hand-off discipline (writer preference), which
+//! SemaphoreMap's deadlock detection relies on.
 
 const std = @import("std");
 const _fb = @import("fiber.zig");
@@ -76,6 +78,10 @@ pub const WaitQueue = struct {
 /// shows up in a wedged-server dump. `.untracked` comptime-elides the record +
 /// registry calls and makes the tracking field zero-width `void`, so the lock
 /// is byte-identical to the pre-tracking primitive (use it on hot locks).
+/// A tracked lock is linked into the registry by address on its first
+/// acquire, so the struct holding it must not move after that: build it
+/// at its final address (heap, or a field of one), never return it by
+/// value once locked.
 pub const Track = enum { tracked, untracked };
 
 /// Cooperative mutex. Uncontended lock/unlock is one atomic CAS;
@@ -96,23 +102,12 @@ pub fn Mutex(comptime track: Track) type {
         /// callers bypass it entirely.
         sl: Spinlock = .{},
         waiters: WaitQueue = .{},
-        /// Hand-off tripwire, guarded by `sl` like the rest of the
-        /// composite. `unlock` stores the waiter it pops (same critical
-        /// section, before the wake); that waiter clears it under `sl`
-        /// when its `park` returns. A resume that doesn't find its own
-        /// grant is a spurious wake — panic at the source rather than
-        /// silently run the critical section unowned. At most one grant
-        /// is outstanding: the grantee holds the lock, so the next
-        /// `unlock` (which writes the next grant) can only run after the
-        /// grantee cleared this one.
-        granted_to: ?*Fiber = null,
         /// Contention gauges for the `locks` dump: `contended` counts
-        /// acquires that missed the fast CAS, `handoffs` the unlocks that
-        /// passed the lock to a parked waiter (each one is a cross-worker
-        /// wake, and the lock stays held until that waiter runs). Slow
-        /// paths only, so the uncontended cost is nil.
+        /// acquires that missed the fast CAS, `wakes` the unlocks that
+        /// woke a parked waiter (each one a possibly cross-worker wake).
+        /// Slow paths only, so the uncontended cost is nil.
         contended: std.atomic.Value(u64) = .init(0),
-        handoffs: std.atomic.Value(u64) = .init(0),
+        wakes: std.atomic.Value(u64) = .init(0),
         /// Holder breadcrumb (acquire `@src` + timestamp + registry link), only
         /// when `.tracked`; `void` otherwise. Holder/waiter counts are derived
         /// from `state`/`waiters` at dump time, never stored here.
@@ -127,7 +122,7 @@ pub fn Mutex(comptime track: Track) type {
                 .held = self.state.load(.monotonic),
                 .has_waiters = self.waiters.head != null,
                 .contended = self.contended.load(.monotonic),
-                .handoffs = self.handoffs.load(.monotonic),
+                .wakes = self.wakes.load(.monotonic),
             };
         }
         inline fn record(self: *Self, comptime src: std.builtin.SourceLocation) void {
@@ -154,60 +149,49 @@ pub fn Mutex(comptime track: Track) type {
             }
 
             // TODO: spin on `tryAcquire` for a bounded number of
-            // iterations before the slow path. `unlock` hands the lock
-            // straight to a parked waiter, so a spinner can only win
-            // while the queue is empty and never starves one; for a
-            // holder that is about to finish (SemaphoreMap's walks,
-            // microseconds) that turns a park and a cross-worker wake
-            // into a short wait. Needs a benchmark to size the bound.
+            // iterations before parking. A holder that is about to
+            // finish (a hash-map walk, microseconds) then costs a short
+            // wait instead of a park and a cross-worker wake. Needs a
+            // benchmark to size the bound.
             //
-            // Slow path: serialize with a concurrent `unlock` via the
-            // spinlock. The re-check under sl closes the lost-wakeup
-            // race — if `unlock` ran between our fast-CAS-fail and
-            // sl.lock, we'll see state==0 here and grab it directly.
+            // Slow path, no hand-off: the woken fiber competes for the
+            // lock like a newcomer and re-parks if it loses, so nobody
+            // owns the lock while queued on a ring behind other work.
+            // The enqueue and the re-check run under `sl`, as does
+            // `unlock`'s store-then-pop, so either the re-check sees the
+            // lock free or the unlock pops this waiter: no lost wake.
             _ = self.contended.fetchAdd(1, .monotonic);
-            self.sl.lock();
-            if (self.tryAcquire()) {
-                self.sl.unlock();
-                self.record(src);
-                return;
-            }
             const f = _rt.currentFiber();
-            self.waiters.pushTail(f);
-            self.sl.unlock();
-            _rt.park();
-            // Resumed by `unlock`'s hand-off: we now hold the lock,
-            // `state` is still 1, and the critical section is ours.
-            // Verify the grant — a resume without it is a spurious wake.
-            self.sl.lock();
-            const granted = self.granted_to == f;
-            self.granted_to = null;
-            self.sl.unlock();
-            if (!granted) {
-                @panic("Mutex.lock: woken without lock hand-off — spurious wake");
+            while (true) {
+                self.sl.lock();
+                if (self.tryAcquire()) {
+                    self.sl.unlock();
+                    self.record(src);
+                    return;
+                }
+                self.waiters.pushTail(f);
+                self.sl.unlock();
+                _rt.park();
             }
-            self.record(src);
         }
 
         pub fn unlock(self: *Self) void {
+            // Free the lock and pop a waiter in one `sl` section, so a
+            // waiter that enqueued before this sees the lock free on
+            // its re-check or is the one popped here.
             self.sl.lock();
+            self.state.store(0, .release);
             const waiter = self.waiters.popHead();
-            if (waiter == null) {
-                self.state.store(0, .release);
-            } else {
-                // Hand-off: record the grant in the same critical section
-                // that popped the waiter, BEFORE the wake — the waiter's
-                // resume-side check can never miss it.
-                self.granted_to = waiter;
-                _ = self.handoffs.fetchAdd(1, .monotonic);
-            }
             self.sl.unlock();
 
             // Wake outside the spinlock: cross-thread wake may push into
             // a target worker's ready ring and issue an eventfd
             // notify (kernel syscall). Holding sl during that would
             // pin a peer thread to a cache line for an entire syscall.
-            if (waiter) |w| _rt.wake(w);
+            if (waiter) |w| {
+                _ = self.wakes.fetchAdd(1, .monotonic);
+                _rt.wake(w);
+            }
         }
 
         /// Unlink from the tracking registry before destruction (tracked only;

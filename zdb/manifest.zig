@@ -12,7 +12,7 @@ const String = utils.String;
 
 /// The manifest lock. Shared for the name lookups on the query path and
 /// the copy-out readers, exclusive for the apply path's commits.
-pub const Lock = fiber.RWMutex(.untracked);
+pub const Lock = fiber.RWMutex(.tracked);
 
 // -------------------------------------------------------------------------
 // Error set
@@ -556,6 +556,7 @@ pub const Manifest = struct {
         var nit = self.namespaces.valueIterator();
         while (nit.next()) |n| n.deinit(self.allocator);
         self.namespaces.deinit();
+        self.mu.deinit();
     }
 
     /// Applies a single table CREATE or DELETE to the tree's levels, and
@@ -1030,21 +1031,16 @@ pub const Manifest = struct {
         }
     }
 
-    /// Deep-copy this Manifest into a fresh standalone copy. Used when
-    /// building a snapshot draft so the live state is never mutated by the
-    /// snapshot pipeline. The copy's `to_delete` map starts empty — retires
-    /// belong to the live manifest that applied them, and the draft is
-    /// never the thing that sweeps.
-    pub fn clone(
-        self: *Manifest,
-        allocator: std.mem.Allocator,
-    ) !Manifest {
-        const bytes = try self.serialize(allocator);
-        defer allocator.free(bytes);
-        var out = Manifest.init(allocator);
-        errdefer out.deinit();
+    /// Deep-copy this manifest into `out`, a fresh `init`, so a snapshot
+    /// draft never mutates the live state. The copy's `to_delete` map
+    /// starts empty: retires belong to the live manifest that applied
+    /// them, and the draft is never the thing that sweeps. `out` must be
+    /// at its final address: the restore takes `out.mu`, and a tracked
+    /// lock is registered by address on first acquire (see `Track`).
+    pub fn cloneInto(self: *Manifest, out: *Manifest) !void {
+        const bytes = try self.serialize(out.allocator);
+        defer out.allocator.free(bytes);
         try out.restoreFrom(bytes);
-        return out;
     }
 };
 

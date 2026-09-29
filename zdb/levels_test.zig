@@ -182,6 +182,7 @@ test "levels: handler L0 sort" {
     defer destroyTable(t2);
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
 
     var level = Level.init(alloc, 0, &lock);
 
@@ -218,6 +219,7 @@ test "levels: handler L0 sorts by raft_index, not by id" {
     defer destroyTable(tc);
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
     var level = Level.init(alloc, 0, &lock);
     const held = lock.hold(.exclusive, @src());
     defer held.release();
@@ -257,6 +259,7 @@ test "levels: handler L1 sort" {
     defer destroyTable(tb);
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
 
     var level = Level.init(alloc, 1, &lock);
 
@@ -310,6 +313,7 @@ test "levels: overlapping tables L1" {
     };
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
 
     var level = Level.init(alloc, 1, &lock);
 
@@ -358,6 +362,7 @@ test "levels: overlapping tables L0" {
     defer destroyTable(t3);
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
 
     var level = Level.init(alloc, 0, &lock);
 
@@ -402,6 +407,7 @@ test "levels: get L0 newest wins" {
     defer destroyTable(t2);
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
 
     var level = Level.init(alloc, 0, &lock);
 
@@ -441,6 +447,7 @@ test "levels: get L1 hit" {
     defer destroyTable(tc);
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
 
     var level = Level.init(alloc, 1, &lock);
 
@@ -471,6 +478,7 @@ test "levels: get miss" {
     defer destroyTable(ta);
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
 
     var level = Level.init(alloc, 1, &lock);
 
@@ -989,6 +997,7 @@ test "levels: overlappingTables finds a dest table sharing the boundary primary"
     defer destroyTable(t);
 
     var lock: zdb.level.Lock = .{};
+    defer lock.deinit();
 
     var level = Level.init(alloc, 1, &lock);
 

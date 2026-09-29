@@ -57,7 +57,7 @@ pub fn sstPath(allocator: std.mem.Allocator, dir: String, file_id: u64) ![]u8 {
 /// grows past `Config.splitBytes`, then splits at the primary-key median into
 /// more trees; entries are kept sorted by range.left so we can binary-search.
 pub const TableTrees = struct {
-    pub const Lock = fiber.RWMutex(.untracked);
+    pub const Lock = fiber.RWMutex(.tracked);
 
     allocator: std.mem.Allocator,
     /// Guards `entries`: shared to find a tree or walk the list, exclusive
@@ -84,6 +84,7 @@ pub const TableTrees = struct {
 
     pub fn deinit(self: *TableTrees) void {
         self.entries.deinit(self.allocator);
+        self.mu.deinit();
     }
 
     fn lessByLeft(_: void, a: *Tree, b: *Tree) bool {
@@ -213,7 +214,7 @@ pub const TableTrees = struct {
 
 pub const Memtables = struct {
     allocator: std.mem.Allocator,
-    mu: fiber.RWMutex(.untracked),
+    mu: fiber.RWMutex(.tracked),
     current: *SkipList,
     /// Newest at index 0, oldest last — the order every reader wants
     /// (getIterators hands sources out newest-first as-is), and the
@@ -233,6 +234,7 @@ pub const Memtables = struct {
         self.current.release();
         for (self.immutables.items) |imm| imm.release();
         self.immutables.deinit(self.allocator);
+        self.mu.deinit();
     }
 
     pub fn putItem(self: *Memtables, item: Item) !void {

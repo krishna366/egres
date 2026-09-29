@@ -32,7 +32,7 @@ pub const Snap = struct {
     /// Lifetime contention gauges (see sync.Mutex); 0 for lock types
     /// that don't keep them.
     contended: u64 = 0,
-    handoffs: u64 = 0,
+    wakes: u64 = 0,
 };
 
 /// Embedded in a *tracked* lock (`void`, zero-width, when untracked). Carries
@@ -80,6 +80,15 @@ pub fn recordAcquire(
     snapshot: *const fn (*anyopaque) Snap,
     comptime src: SourceLocation,
 ) void {
+    // A registered node whose owner is not the lock acquiring through it
+    // was copied after its first acquire: the registry still links the
+    // old address, and the next dump or unregister walks freed memory.
+    // Catch it here, at the copy's first use, where `src` names it.
+    if (self.registered.load(.acquire) == 2 and self.owner != owner)
+        std.debug.panic(
+            "tracked lock moved after its first acquire: {s}:{d}",
+            .{ src.file, src.line },
+        );
     ensureRegistered(self, owner, snapshot);
     self.holder_src = staticSrc(src);
     self.held_since_ms = _coarse.ms();
@@ -130,11 +139,34 @@ pub fn unregister(self: *Tracking) void {
     _ = registered_count.fetchSub(1, .monotonic);
 }
 
+/// Walk the live list and panic if it is inconsistent: a node whose
+/// `registered` flag is not set (its lock was freed without `deinit`;
+/// the testing allocator poisons freed memory), or more nodes than the
+/// count (a lock copied after its first acquire, whose copy `deinit`'d
+/// and decremented the count while the original stays linked). For the
+/// test runner, after each test, so the culprit is named while its
+/// frame is fresh; the same defect would otherwise surface as a
+/// segfault in an unrelated test's teardown.
+pub fn checkLockRegistryForTests() void {
+    regLock();
+    defer regUnlock();
+
+    var walked: usize = 0;
+    var node = live_head;
+    while (node) |n| : (node = n.next) {
+        walked += 1;
+        if (n.registered.load(.acquire) != 2 or
+            walked > registered_count.load(.monotonic))
+            @panic("lock registry: a lock was freed without deinit " ++
+                "or copied after its first acquire");
+    }
+}
+
 /// Number of tracked locks currently registered (acquired at least once and
 /// not yet `deinit`'d). A teardown check expecting 0 — e.g. at the end of the
 /// test suite, where every tracked lock is transient — catches a `.tracked`
 /// lock that was never `deinit`'d, which would otherwise dangle the registry.
-pub fn registeredCount() usize {
+pub fn trackedLockCount() usize {
     return registered_count.load(.monotonic);
 }
 
@@ -162,8 +194,8 @@ pub fn dumpLocks(w: *std.Io.Writer) !void {
             } else {
                 try w.writeAll("lock -");
             }
-            try w.print(" contended={d} handoffs={d}\n", .{
-                snap.contended, snap.handoffs,
+            try w.print(" contended={d} wakes={d}\n", .{
+                snap.contended, snap.wakes,
             });
         }
         if (snap.held == 0) continue;

@@ -82,7 +82,8 @@ pub const SafeArray = @import("safe_array.zig").SafeArray;
 // answers "which locks are held, by what code?" on a wedged server.
 const _lock_registry = @import("lock_registry.zig");
 pub const dumpLocks = _lock_registry.dumpLocks;
-pub const trackedLockCount = _lock_registry.registeredCount;
+pub const trackedLockCount = _lock_registry.trackedLockCount;
+pub const checkLockRegistryForTests = _lock_registry.checkLockRegistryForTests;
 
 const _channel = @import("channel.zig");
 pub const Channel = _channel.Channel;

@@ -945,18 +945,23 @@ test "forest: snapshot manifest round-trip" {
 // An id is the log index of its `new_memtable` entry, so the ids passed
 // here are increasing, as they are in a real log.
 
-fn buildMemtables(alloc: std.mem.Allocator, ids: []const u64) !_forest.Memtables {
-    const initial = try zdb.skl.SkipList.init(alloc);
-    var mts = _forest.Memtables.init(alloc, initial);
-    errdefer mts.deinit();
+/// Fill `mts` in place: its lock is tracked, and a tracked lock is
+/// registered by address on first acquire, so the struct must not
+/// move after `swapCurrentOut` has taken it.
+fn buildMemtables(mts: *_forest.Memtables, ids: []const u64) !void {
     for (ids) |id| try mts.swapCurrentOut(id);
-    return mts;
+}
+
+fn newMemtables(alloc: std.mem.Allocator) !_forest.Memtables {
+    const initial = try zdb.skl.SkipList.init(alloc);
+    return _forest.Memtables.init(alloc, initial);
 }
 
 test "forest: popOldestIfMatches empty" {
     const alloc = std.testing.allocator;
-    var mts = try buildMemtables(alloc, &.{}); // current=placeholder, immutables=[]
+    var mts = try newMemtables(alloc); // current=placeholder, immutables=[]
     defer mts.deinit();
+    try buildMemtables(&mts, &.{});
     mts.popOldestIfMatches(7); // no-op
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
 }
@@ -964,8 +969,9 @@ test "forest: popOldestIfMatches empty" {
 test "forest: popOldestIfMatches exact" {
     const alloc = std.testing.allocator;
     // immutables=[5], current=8.
-    var mts = try buildMemtables(alloc, &.{ 5, 8 });
+    var mts = try newMemtables(alloc);
     defer mts.deinit();
+    try buildMemtables(&mts, &.{ 5, 8 });
     mts.popOldestIfMatches(5);
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
     try std.testing.expectEqual(@as(u64, 8), mts.current.raft_index);
@@ -974,8 +980,9 @@ test "forest: popOldestIfMatches exact" {
 test "forest: popOldestIfMatches greater" {
     const alloc = std.testing.allocator;
     // immutables=[7], current=10. Flush proposal expects 5 — older than oldest.
-    var mts = try buildMemtables(alloc, &.{ 7, 10 });
+    var mts = try newMemtables(alloc);
     defer mts.deinit();
+    try buildMemtables(&mts, &.{ 7, 10 });
     mts.popOldestIfMatches(5); // skip — oldest > expected
     try std.testing.expectEqual(@as(usize, 1), mts.immutables.items.len);
     try std.testing.expectEqual(
@@ -987,8 +994,9 @@ test "forest: popOldestIfMatches greater" {
 test "forest: popOldestIfMatches phantom" {
     const alloc = std.testing.allocator;
     // immutables=[3], current=10. Flush proposal expects 7. M_3 is a phantom.
-    var mts = try buildMemtables(alloc, &.{ 3, 10 });
+    var mts = try newMemtables(alloc);
     defer mts.deinit();
+    try buildMemtables(&mts, &.{ 3, 10 });
     mts.popOldestIfMatches(7); // drops phantom M_3, no match for 7 → done
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
 }
@@ -997,8 +1005,9 @@ test "forest: popOldestIfMatches multi phantom then match" {
     const alloc = std.testing.allocator;
     // immutables=[7, 4, 2] (newest first), current=10. Flush proposal
     // expects 7. Loop drops M_2 and M_4 as phantoms, then pops M_7.
-    var mts = try buildMemtables(alloc, &.{ 2, 4, 7, 10 });
+    var mts = try newMemtables(alloc);
     defer mts.deinit();
+    try buildMemtables(&mts, &.{ 2, 4, 7, 10 });
     mts.popOldestIfMatches(7);
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
     try std.testing.expectEqual(@as(u64, 10), mts.current.raft_index);
@@ -1009,8 +1018,9 @@ test "forest: popOldestIfMatches multi phantom no match" {
     // immutables=[4, 2] (newest first), current=10. Flush proposal
     // expects 7. Both phantoms; no match — immutables drained, current
     // untouched.
-    var mts = try buildMemtables(alloc, &.{ 2, 4, 10 });
+    var mts = try newMemtables(alloc);
     defer mts.deinit();
+    try buildMemtables(&mts, &.{ 2, 4, 10 });
     mts.popOldestIfMatches(7);
     try std.testing.expectEqual(@as(usize, 0), mts.immutables.items.len);
     try std.testing.expectEqual(@as(u64, 10), mts.current.raft_index);
@@ -1027,8 +1037,9 @@ test "forest: getIterators outlives a concurrent flush+pop" {
 
     // Build immutables=[5], current=10, then put a key into M_5 so we
     // can read it after the pop.
-    var mts = try buildMemtables(alloc, &.{ 5, 10 });
+    var mts = try newMemtables(alloc);
     defer mts.deinit();
+    try buildMemtables(&mts, &.{ 5, 10 });
     try std.testing.expectEqual(@as(usize, 1), mts.immutables.items.len);
     const m5 = mts.immutables.items[0];
     try m5.put(.{ .namespace = 1, .primary = "alpha" }, 100, "v1");

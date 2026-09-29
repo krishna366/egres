@@ -30,7 +30,7 @@ const log = std.log.scoped(.sql);
 /// row r. A parks here, B parks in the SemaphoreMap, the DDL parks on
 /// B. Known and open; the fix is a timed exclusive take for DDL,
 /// which holds nothing else and can safely withdraw.
-pub const RWMutex = fiber.RWMutex(.untracked);
+pub const RWMutex = fiber.RWMutex(.tracked);
 
 /// One database's transaction machinery: the lock table and the commit
 /// oracle. A SQL txn is connection-bound to one database, so wait-for
@@ -72,7 +72,7 @@ pub const Database = struct {
     /// DDL swap take it exclusively, only around the egid seed and the
     /// publish (see updateEgidAndPut) — the schema load itself runs
     /// with no lock held.
-    tables_mu: fiber.RWMutex(.untracked) = .{},
+    tables_mu: fiber.RWMutex(.tracked) = .{},
     tables: std.AutoHashMap(u32, *_table.Table),
 
     pub fn init(allocator: std.mem.Allocator, ns: u64) !Database {

@@ -957,6 +957,9 @@ fn runFiberOne(t: std.builtin.TestFn, fctx: *FiberCtx) void {
         break :blk e;
     };
     const elapsed_ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
+    // A tracked lock this test freed or copied would crash a later
+    // test's teardown; panic here instead, with this test on the stack.
+    fiber.checkLockRegistryForTests();
 
     const target_counters = if (fctx.is_retry) fctx.retry_counters else fctx.counters;
     const seq = fctx.seq.fetchAdd(1, .seq_cst) + 1;

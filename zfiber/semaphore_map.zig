@@ -29,20 +29,22 @@
 
 const std = @import("std");
 const _sync = @import("sync.zig");
+const Spinlock = @import("spinlock.zig").Spinlock;
 
 pub const SemaphoreMap = struct {
     allocator: std.mem.Allocator,
     /// A parking mutex over the entry table and the wait-for graph.
-    /// Every critical section is a hash probe, a list edit or the
-    /// deadlock DFS, but `acquireMany` and `releaseMany` hold it for a
-    /// whole statement's keys at once, microseconds, long enough that
-    /// spinning contenders would burn their workers. (The per-key
-    /// version before batching was a spinlock for the opposite reason:
-    /// as a mutex it ran at 330k hand-offs/s under pgbench, each one a
-    /// park and a cross-worker wake; batching cut the holds to two per
-    /// statement.) A short spin before the park is the open question,
-    /// see the TODO in `Mutex.lock`.
-    mu: _sync.Mutex(.untracked) = .{},
+    /// A spinlock, not a fiber mutex: every hold is a hash probe, a
+    /// list edit, the deadlock DFS or a walk over one statement's keys,
+    /// microseconds, and no hold parks (`waitForLock` lets go before
+    /// it parks on the key). A mutex here convoyed: its unlock handed
+    /// the lock to a parked waiter queued on the unlocker's worker, so
+    /// the waiter owned the lock while waiting behind that worker's
+    /// statement, and a 16-stream load spent 4 ms per statement in
+    /// this walk (1.14M hand-offs in 191k statements). A spinner
+    /// burns a few microseconds of its core instead and never owns
+    /// the lock while queued.
+    mu: Spinlock = .{},
     /// Held-or-contended keys only; an entry is created on first
     /// acquire and recycled by whichever release/abort leaves it with
     /// no holders and no waiters. An ArrayHashMap, not a HashMap: a
@@ -222,7 +224,7 @@ pub const SemaphoreMap = struct {
         // in `waiters`, which is what keeps the entry alive across the
         // wake (release only frees an entry with no holders AND no
         // waiters).
-        self.mu.lock(@src());
+        self.mu.lock();
         self.deregisterWaiter(e, owner_id);
         e.holders.append(self.allocator, owner_mode) catch {
             self.rollbackHold(key, e, mode);
@@ -277,7 +279,7 @@ pub const SemaphoreMap = struct {
         // One hold of `mu` for the whole walk; only a park on a
         // contended key lets go of it, and waitForLock re-takes it
         // before returning, so the walk never re-locks itself.
-        self.mu.lock(@src());
+        self.mu.lock();
         for (keys) |key| {
             const e = self.entryFor(key) catch {
                 self.mu.unlock();
@@ -330,7 +332,7 @@ pub const SemaphoreMap = struct {
         keys: []const u64,
         owner_id: u64,
     ) void {
-        self.mu.lock(@src());
+        self.mu.lock();
         defer self.mu.unlock();
         for (keys) |key| {
             if (!self.releaseLocked(key, owner_id))

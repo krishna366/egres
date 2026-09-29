@@ -260,7 +260,10 @@ pub const Txn = struct {
             .exclusive,
             &self.held_rows,
         );
-        return self.bumpTo(self.db.oracle.maxCommitTs(hashes));
+        fiber.ctx().record("{d} row locks taken", .{hashes.len});
+        const newest = self.db.oracle.maxCommitTs(hashes);
+        fiber.ctx().record("oracle newest ts: {d}", .{newest});
+        return self.bumpTo(newest);
     }
 
     /// Advance read_ts to `ts` so the statement can see state applied
