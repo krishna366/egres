@@ -4,6 +4,14 @@ This module implements a small, FlatBuffers-style wire format and a Zig
 build-time generator that emits zero-copy readers and forward-writing
 writers from Zig schema definitions.
 
+A schema is plain data: `schema.Table`, `schema.Packed` and
+`schema.EnumDef` build `schema.Type` values, a field names its type, and
+the generator is an ordinary program that walks those values and writes
+text. A schema mistake is reported on stderr with its message, and the
+run fails. The `records` list names the records to generate, tables
+with a message id each and packed records without; enums are found by
+their `pub const` declarations.
+
 ## Generator
 
 - Generator entrypoint: `zbuf/gen.zig`
@@ -71,7 +79,7 @@ Field IDs" below).
 
 ### Table and Field IDs
 
-Each table has a **table id** (set in the schema’s `tables` list). It is used
+Each table has a **table id** (set in the schema’s `records` list). It is used
 in the message tail to identify the root table type, but is not stored inside
 the table itself.
 
@@ -126,21 +134,21 @@ Using the test schema in `zbuf/buffers.zig` (reproduced here — `Bool` fields
 have no slot of their own, they address a bit inside their `field_id`'s slot):
 
 ```zig
-pub const Cell = schema.Table(.{
+pub const Cell = schema.Table(&.{
     .{ .id = 1, .name = "tag", .ty = schema.U32 },
     .{ .id = 2, .name = "data", .ty = schema.Bytes },
     .{ .id = 3, .name = "cell_flags", .ty = schema.U8 },
     .{ .name = "cell_hot", .ty = schema.Bool(.{ .field_id = 3, .bit = 0 }) },
 });
 
-pub const Lifecycle = schema.EnumDef(.{
+pub const Lifecycle = schema.EnumDef(&.{
     .{ .name = "active", .tag = 0 },
     .{ .name = "draining", .tag = 1 },
     .{ .name = "bootstrapping", .tag = 2 },
     .{ .name = "retiring", .tag = 3 },
 });
 
-pub const Row = schema.Table(.{
+pub const Row = schema.Table(&.{
     .{ .id = 1, .name = "name", .ty = schema.Bytes },
     .{ .id = 2, .name = "value", .ty = schema.U64 },
     .{ .id = 3, .name = "cells", .ty = schema.Array(Cell) },
@@ -148,12 +156,12 @@ pub const Row = schema.Table(.{
     .{ .id = 5, .name = "flags", .ty = schema.U64 },
     .{ .name = "is_pinned", .ty = schema.Bool(.{ .field_id = 5, .bit = 0 }) },
     .{ .name = "is_deleted", .ty = schema.Bool(.{ .field_id = 5, .bit = 1 }) },
-    .{ .id = 6, .name = "lifecycle", .ty = schema.Enum(Lifecycle) },
+    .{ .id = 6, .name = "lifecycle", .ty = Lifecycle },
     .{ .id = 7, .name = "u32_values", .ty = schema.Array(schema.U32) },
     .{ .id = 8, .name = "u64_values", .ty = schema.Array(schema.U64) },
 });
 
-pub const Table = schema.Table(.{
+pub const Table = schema.Table(&.{
     .{ .id = 1, .name = "rows", .ty = schema.Array(Row) },
     .{ .id = 2, .name = "payload", .ty = schema.Bytes },
     .{ .id = 3, .name = "count", .ty = schema.U32 },
@@ -228,3 +236,56 @@ tail (optional, 4 bytes) @0x0078
 ```
 
 There is no root offset in the tail: the root is always at payload offset 0.
+
+## Packed Records
+
+`schema.Packed` is a second record kind for formats where every byte
+counts and random access is by computed offset, such as an SST block.
+It takes the same field types as `Table`, encoded inline with no
+header and no padding, in ascending field-id order:
+
+- Scalars and enums exactly as wide as their value.
+- `Bytes` as `[len][bytes]` and `Array` as `[count][elements]`. The
+  prefix is as wide as the field's `.len` says: `.u8`, `.u16` or `.u32`
+  (the default). A `Bytes` with `.len = .rest` has no prefix and runs to
+  the end of the record; it must be the last field.
+- A nested `Packed` inline, which must be fixed size. `Array` elements
+  are fixed-size (scalars, enums, a fixed `Packed`) back to back, or
+  variable-size `Packed` records behind a table of u32 end offsets, one
+  per record: record `i` lies between ends `i - 1` and `i`, and the last
+  end is the region's length, so the table checks itself.
+- No bools and no `Table` fields; a `Packed` cannot be a `Table` field.
+
+A packed record has no `size_bytes`, so nothing marks a field absent:
+its layout changes only behind a version gate the container provides.
+Packed types sit in `records` beside the tables, without a message id:
+they have no tail and no place in `parseMessageWithTail`.
+
+```zig
+pub const VersionHdr = schema.Packed(&.{
+    .{ .id = 1, .name = "ts", .ty = schema.U64 },
+    .{ .id = 2, .name = "meta", .ty = schema.U8 },
+    .{ .id = 3, .name = "off", .ty = schema.U32 },
+});                                                   // SIZE = 13
+
+pub const Entry = schema.Packed(&.{
+    .{ .id = 1, .name = "key_overlap", .ty = schema.U16 },
+    .{ .id = 2, .name = "key_diff", .ty = schema.Bytes, .len = .u16 },
+    .{ .id = 3, .name = "versions", .ty = schema.Array(VersionHdr) },
+    .{ .id = 4, .name = "values", .ty = schema.Bytes, .len = .rest },
+});
+```
+
+Generated code: `{Name}Reader.init(buf)` takes the record's own slice
+and nothing more. A packed record is trusted: its container checks it
+whole (an SST block is checksummed before it is decoded), so a field is
+read where the layout puts it when it is asked for, at a constant
+offset while every field before it is fixed-size and through a small
+offset function after the first variable one. Getters cannot fail
+(`keyDiff()`, `versionsLen()`, `values()`, `size()`); an element index
+is checked (`versionsAt(i)`); a fixed record exports `SIZE`.
+`{Name}Writer.initWithBuf(alloc, &list)` appends the record from
+`set(struct)`, which must name every field since the layout is
+positional, and `finish()` returns the record's start offset.
+`{Name}Struct` is the owned form, with `toStructValue`, `deinit` and
+`marshalTo`.

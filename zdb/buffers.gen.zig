@@ -135,49 +135,29 @@ pub const BlockIndexStruct = struct {
 
 pub const BlockIndexReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46593;
     pub const SIZE_BYTES: u16 = 18;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn key(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 10;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+        return self.t.bytes(2);
     }
 
     pub fn offset(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 14;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch 0;
+        return self.t.scalar(u32, 10);
     }
 
     pub fn len(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 18;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch 0;
+        return self.t.scalar(u32, 14);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -190,16 +170,8 @@ pub const BlockIndexReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_2 = @as(u32, self.base) + 10;
-        if (slot_end_2 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 2));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
-        }
+        try self.t.verifyHeader();
+        try self.t.verifyBytes(2);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!BlockIndexStruct {
         var s = BlockIndexStruct{
@@ -218,83 +190,35 @@ pub const BlockIndexReader = struct {
     }
 };
 
-pub const BlockIndexBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != BlockIndexReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!BlockIndexReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return BlockIndexReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const BlockIndexBuffer = zbuf.Buffer(BlockIndexReader);
 
 pub const BlockIndexWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46593;
     pub const SIZE_BYTES: u16 = 18;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setKey(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 2, 0);
-            try zbuf.patchU32(out.items, self.base + 6, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 2, off);
-        try zbuf.patchU32(out.items, self.base + 6, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(2, data);
     }
 
     pub fn setOffset(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 10, v);
+        return self.w.setScalar(u32, 10, v);
     }
 
     pub fn setLen(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 14, v);
+        return self.w.setScalar(u32, 14, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -308,36 +232,17 @@ pub const BlockIndexWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!BlockIndexBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(BlockIndexBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!BlockIndexBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(BlockIndexBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -434,128 +339,66 @@ pub const TableIndexStruct = struct {
 
 pub const TableIndexReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46594;
     pub const SIZE_BYTES: u16 = 59;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn formatVersion(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 6;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
+        return self.t.scalar(u32, 2);
     }
 
     pub fn maxVersion(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 14;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 6)) catch 0;
+        return self.t.scalar(u64, 6);
     }
 
     pub fn keyCount(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 18;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch 0;
+        return self.t.scalar(u32, 14);
     }
 
     pub fn uncompressedSize(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 22;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 18)) catch 0;
+        return self.t.scalar(u32, 18);
     }
 
     pub fn compressedSize(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 26;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 22)) catch 0;
+        return self.t.scalar(u32, 22);
     }
 
     pub fn staleDataSize(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 30;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 26)) catch 0;
+        return self.t.scalar(u32, 26);
     }
 
     pub fn compression(self: Self) CompressionEnum {
-        const slot_end = @as(u32, self.base) + 31;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return @enumFromInt(0);
-        const v = zbuf.readU8(self.buf, @as(usize, self.base + 30)) catch 0;
-        return @enumFromInt(v);
+        return @enumFromInt(self.t.scalar(u8, 30));
     }
 
     pub fn lastKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 39;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 35)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
-    }
-
-    fn blocksSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 47;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 39)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 43)) catch return &.{};
-        if (elem_count == 0) return &.{};
-        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return &.{};
-        return self.buf[index_off..end];
+        return self.t.bytes(31);
     }
 
     pub fn blocksLen(self: Self) u32 {
-        return @intCast(self.blocksSlice().len / 4);
+        return self.t.arrayLen(39, 4);
     }
 
     pub fn blocksAt(self: Self, i: u32) Error!BlockIndexReader {
-        const s = self.blocksSlice();
-        const off = @as(usize, i) * 4;
-        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
-        const child_off = zbuf.readU32(s, off) catch unreachable;
-        return BlockIndexReader.init(self.buf, child_off);
+        return BlockIndexReader.init(self.t.buf, try self.t.arrayChild(39, i));
     }
 
     pub fn binaryFuse(self: Self) ?BinaryFuseFilterReader {
-        const slot_end = @as(u32, self.base) + 51;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return null;
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 47)) catch 0;
-        if (off == zbuf.NullOffset) return null;
-        return BinaryFuseFilterReader.init(self.buf, off) catch null;
+        const off = self.t.child(47) orelse return null;
+        return BinaryFuseFilterReader.init(self.t.buf, off) catch null;
     }
 
     pub fn egidBitmap(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 59;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 51)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 55)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+        return self.t.bytes(51);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -589,42 +432,14 @@ pub const TableIndexReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_31 = @as(u32, self.base) + 39;
-        if (slot_end_31 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 31));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 35));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
+        try self.t.verifyHeader();
+        try self.t.verifyBytes(31);
+        try self.t.verifyArray(39, 4);
+        for (0..self.blocksLen()) |i| {
+            try (try self.blocksAt(@intCast(i))).verify();
         }
-        const slot_end_arr_39 = @as(u32, self.base) + 47;
-        if (slot_end_arr_39 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 39));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 43));
-            if (elem_count > 0) {
-                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-            }
-        }
-        const count_blocks: u32 = self.blocksLen();
-        var i_blocks: u32 = 0;
-        while (i_blocks < count_blocks) : (i_blocks += 1) {
-            const child_view = try self.blocksAt(i_blocks);
-            try child_view.verify();
-        }
-        if (self.binaryFuse()) |child_view| {
-            try child_view.verify();
-        }
-        const slot_end_51 = @as(u32, self.base) + 59;
-        if (slot_end_51 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 51));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 55));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
-        }
+        if (self.binaryFuse()) |child_view| try child_view.verify();
+        try self.t.verifyBytes(51);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableIndexStruct {
         var s = TableIndexStruct{
@@ -661,141 +476,67 @@ pub const TableIndexReader = struct {
     }
 };
 
-pub const TableIndexBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != TableIndexReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!TableIndexReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return TableIndexReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const TableIndexBuffer = zbuf.Buffer(TableIndexReader);
 
 pub const TableIndexWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46594;
     pub const SIZE_BYTES: u16 = 59;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{47};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        try zbuf.patchU32(buf.items, base + 47, zbuf.NullOffset);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        try zbuf.patchU32(owned.items, base + 47, zbuf.NullOffset);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setFormatVersion(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 2, v);
+        return self.w.setScalar(u32, 2, v);
     }
 
     pub fn setMaxVersion(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 6, v);
+        return self.w.setScalar(u64, 6, v);
     }
 
     pub fn setKeyCount(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 14, v);
+        return self.w.setScalar(u32, 14, v);
     }
 
     pub fn setUncompressedSize(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 18, v);
+        return self.w.setScalar(u32, 18, v);
     }
 
     pub fn setCompressedSize(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 22, v);
+        return self.w.setScalar(u32, 22, v);
     }
 
     pub fn setStaleDataSize(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 26, v);
+        return self.w.setScalar(u32, 26, v);
     }
 
     pub fn setCompression(self: *Self, v: CompressionEnum) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU8(out.items, self.base + 30, @intFromEnum(v));
+        return self.w.setScalar(u8, 30, @intFromEnum(v));
     }
 
     pub fn setLastKey(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 31, 0);
-            try zbuf.patchU32(out.items, self.base + 35, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 31, off);
-        try zbuf.patchU32(out.items, self.base + 35, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(31, data);
     }
 
     pub fn setBlocks(self: *Self, values: []const u32) Error!void {
-        const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 39, 0);
-            try zbuf.patchU32(out.items, self.base + 43, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 39, index_off);
-        try zbuf.patchU32(out.items, self.base + 43, @as(u32, @intCast(values.len)));
+        return self.w.setArray(u32, 39, values);
     }
 
     pub fn setBinaryFuse(self: *Self, child_off: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 47, child_off);
+        return self.w.setChild(47, child_off);
     }
 
     pub fn setEgidBitmap(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 51, 0);
-            try zbuf.patchU32(out.items, self.base + 55, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 51, off);
-        try zbuf.patchU32(out.items, self.base + 55, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(51, data);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -817,36 +558,17 @@ pub const TableIndexWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!TableIndexBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(TableIndexBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!TableIndexBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(TableIndexBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -903,94 +625,49 @@ pub const BinaryFuseFilterStruct = struct {
 
 pub const BinaryFuseFilterReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46595;
     pub const SIZE_BYTES: u16 = 34;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn seed(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 10;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
+        return self.t.scalar(u64, 2);
     }
 
     pub fn segmentLength(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 14;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch 0;
+        return self.t.scalar(u32, 10);
     }
 
     pub fn segmentLengthMask(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 18;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch 0;
+        return self.t.scalar(u32, 14);
     }
 
     pub fn segmentCount(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 22;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 18)) catch 0;
+        return self.t.scalar(u32, 18);
     }
 
     pub fn segmentCountLength(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 26;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 22)) catch 0;
-    }
-
-    fn fingerprintsSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 34;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 26)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 30)) catch return &.{};
-        if (elem_count == 0) return &.{};
-        const end = @as(usize, index_off) + @as(usize, elem_count) * 2;
-        if (end > self.buf.len) return &.{};
-        return self.buf[index_off..end];
+        return self.t.scalar(u32, 22);
     }
 
     pub fn fingerprintsLen(self: Self) u32 {
-        return @intCast(self.fingerprintsSlice().len / 2);
+        return self.t.arrayLen(26, 2);
     }
 
     pub fn fingerprintsAt(self: Self, i: u32) Error!u16 {
-        const s = self.fingerprintsSlice();
-        const off = @as(usize, i) * 2;
-        if (off + 2 > s.len) return zbuf.Error.OutOfBounds;
-        return zbuf.readU16(s, off) catch unreachable;
+        return self.t.arrayScalar(u16, 26, i);
     }
 
     pub fn fingerprintsToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u16 {
-        const raw = self.fingerprintsSlice();
-        const count = raw.len / 2;
-        const out = try alloc.alloc(u16, count);
-        errdefer alloc.free(out);
-        for (out, 0..) |*v, i| {
-            v.* = zbuf.readU16(raw, i * 2) catch unreachable;
-        }
-        return out;
+        return self.t.arrayToSliceAlloc(u16, 26, alloc);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -1008,17 +685,8 @@ pub const BinaryFuseFilterReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_arr_26 = @as(u32, self.base) + 34;
-        if (slot_end_arr_26 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 26));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 30));
-            if (elem_count > 0) {
-                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 2;
-                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-            }
-        }
+        try self.t.verifyHeader();
+        try self.t.verifyArray(26, 2);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!BinaryFuseFilterStruct {
         var s = BinaryFuseFilterStruct{
@@ -1040,98 +708,47 @@ pub const BinaryFuseFilterReader = struct {
     }
 };
 
-pub const BinaryFuseFilterBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != BinaryFuseFilterReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!BinaryFuseFilterReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return BinaryFuseFilterReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const BinaryFuseFilterBuffer = zbuf.Buffer(BinaryFuseFilterReader);
 
 pub const BinaryFuseFilterWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46595;
     pub const SIZE_BYTES: u16 = 34;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setSeed(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 2, v);
+        return self.w.setScalar(u64, 2, v);
     }
 
     pub fn setSegmentLength(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 10, v);
+        return self.w.setScalar(u32, 10, v);
     }
 
     pub fn setSegmentLengthMask(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 14, v);
+        return self.w.setScalar(u32, 14, v);
     }
 
     pub fn setSegmentCount(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 18, v);
+        return self.w.setScalar(u32, 18, v);
     }
 
     pub fn setSegmentCountLength(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 22, v);
+        return self.w.setScalar(u32, 22, v);
     }
 
     pub fn setFingerprints(self: *Self, values: []const u16) Error!void {
-        const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 26, 0);
-            try zbuf.patchU32(out.items, self.base + 30, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU16Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 26, index_off);
-        try zbuf.patchU32(out.items, self.base + 30, @as(u32, @intCast(values.len)));
+        return self.w.setArray(u16, 26, values);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -1148,36 +765,17 @@ pub const BinaryFuseFilterWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!BinaryFuseFilterBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(BinaryFuseFilterBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!BinaryFuseFilterBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(BinaryFuseFilterBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -1241,85 +839,45 @@ pub const TreeChangeStruct = struct {
 
 pub const TreeChangeReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46596;
     pub const SIZE_BYTES: u16 = 44;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn op(self: Self) OpEnum {
-        const slot_end = @as(u32, self.base) + 3;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return @enumFromInt(0);
-        const v = zbuf.readU8(self.buf, @as(usize, self.base + 2)) catch 0;
-        return @enumFromInt(v);
+        return @enumFromInt(self.t.scalar(u8, 2));
     }
 
     pub fn namespaceId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 11;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 3)) catch 0;
+        return self.t.scalar(u64, 3);
     }
 
     pub fn treeId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 19;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 11)) catch 0;
+        return self.t.scalar(u64, 11);
     }
 
     pub fn leftKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 27;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 19)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 23)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+        return self.t.bytes(19);
     }
 
     pub fn rightKey(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 35;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 27)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+        return self.t.bytes(27);
     }
 
     pub fn name(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 43;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 35)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 39)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+        return self.t.bytes(35);
     }
 
     pub fn kind(self: Self) TreeKindEnum {
-        const slot_end = @as(u32, self.base) + 44;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return @enumFromInt(0);
-        const v = zbuf.readU8(self.buf, @as(usize, self.base + 43)) catch 0;
-        return @enumFromInt(v);
+        return @enumFromInt(self.t.scalar(u8, 43));
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -1336,32 +894,10 @@ pub const TreeChangeReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_19 = @as(u32, self.base) + 27;
-        if (slot_end_19 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 19));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 23));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
-        }
-        const slot_end_27 = @as(u32, self.base) + 35;
-        if (slot_end_27 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 27));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 31));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
-        }
-        const slot_end_35 = @as(u32, self.base) + 43;
-        if (slot_end_35 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 35));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 39));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
-        }
+        try self.t.verifyHeader();
+        try self.t.verifyBytes(19);
+        try self.t.verifyBytes(27);
+        try self.t.verifyBytes(35);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TreeChangeStruct {
         var s = TreeChangeStruct{
@@ -1384,119 +920,51 @@ pub const TreeChangeReader = struct {
     }
 };
 
-pub const TreeChangeBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != TreeChangeReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!TreeChangeReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return TreeChangeReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const TreeChangeBuffer = zbuf.Buffer(TreeChangeReader);
 
 pub const TreeChangeWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46596;
     pub const SIZE_BYTES: u16 = 44;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setOp(self: *Self, v: OpEnum) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU8(out.items, self.base + 2, @intFromEnum(v));
+        return self.w.setScalar(u8, 2, @intFromEnum(v));
     }
 
     pub fn setNamespaceId(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 3, v);
+        return self.w.setScalar(u64, 3, v);
     }
 
     pub fn setTreeId(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 11, v);
+        return self.w.setScalar(u64, 11, v);
     }
 
     pub fn setLeftKey(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 19, 0);
-            try zbuf.patchU32(out.items, self.base + 23, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 19, off);
-        try zbuf.patchU32(out.items, self.base + 23, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(19, data);
     }
 
     pub fn setRightKey(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 27, 0);
-            try zbuf.patchU32(out.items, self.base + 31, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 27, off);
-        try zbuf.patchU32(out.items, self.base + 31, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(27, data);
     }
 
     pub fn setName(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 35, 0);
-            try zbuf.patchU32(out.items, self.base + 39, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 35, off);
-        try zbuf.patchU32(out.items, self.base + 39, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(35, data);
     }
 
     pub fn setKind(self: *Self, v: TreeKindEnum) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU8(out.items, self.base + 43, @intFromEnum(v));
+        return self.w.setScalar(u8, 43, @intFromEnum(v));
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -1514,36 +982,17 @@ pub const TreeChangeWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!TreeChangeBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(TreeChangeBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!TreeChangeBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(TreeChangeBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -1606,82 +1055,49 @@ pub const SSTableChangeStruct = struct {
 
 pub const SSTableChangeReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46597;
     pub const SIZE_BYTES: u16 = 51;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn op(self: Self) OpEnum {
-        const slot_end = @as(u32, self.base) + 3;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return @enumFromInt(0);
-        const v = zbuf.readU8(self.buf, @as(usize, self.base + 2)) catch 0;
-        return @enumFromInt(v);
+        return @enumFromInt(self.t.scalar(u8, 2));
     }
 
     pub fn level(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 7;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 3)) catch 0;
+        return self.t.scalar(u32, 3);
     }
 
     pub fn sstId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 15;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 7)) catch 0;
+        return self.t.scalar(u64, 7);
     }
 
     pub fn treeId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 23;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 15)) catch 0;
+        return self.t.scalar(u64, 15);
     }
 
     pub fn namespaceId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 31;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 23)) catch 0;
+        return self.t.scalar(u64, 23);
     }
 
     pub fn checksum(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 35;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch 0;
+        return self.t.scalar(u32, 31);
     }
 
     pub fn size(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 43;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 35)) catch 0;
+        return self.t.scalar(u64, 35);
     }
 
     pub fn raftIndex(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 51;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 43)) catch 0;
+        return self.t.scalar(u64, 43);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -1699,7 +1115,7 @@ pub const SSTableChangeReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
+        try self.t.verifyHeader();
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!SSTableChangeStruct {
         var s = SSTableChangeStruct{
@@ -1723,100 +1139,55 @@ pub const SSTableChangeReader = struct {
     }
 };
 
-pub const SSTableChangeBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != SSTableChangeReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!SSTableChangeReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return SSTableChangeReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const SSTableChangeBuffer = zbuf.Buffer(SSTableChangeReader);
 
 pub const SSTableChangeWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46597;
     pub const SIZE_BYTES: u16 = 51;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setOp(self: *Self, v: OpEnum) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU8(out.items, self.base + 2, @intFromEnum(v));
+        return self.w.setScalar(u8, 2, @intFromEnum(v));
     }
 
     pub fn setLevel(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 3, v);
+        return self.w.setScalar(u32, 3, v);
     }
 
     pub fn setSstId(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 7, v);
+        return self.w.setScalar(u64, 7, v);
     }
 
     pub fn setTreeId(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 15, v);
+        return self.w.setScalar(u64, 15, v);
     }
 
     pub fn setNamespaceId(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 23, v);
+        return self.w.setScalar(u64, 23, v);
     }
 
     pub fn setChecksum(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 31, v);
+        return self.w.setScalar(u32, 31, v);
     }
 
     pub fn setSize(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 35, v);
+        return self.w.setScalar(u64, 35, v);
     }
 
     pub fn setRaftIndex(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 43, v);
+        return self.w.setScalar(u64, 43, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -1835,36 +1206,17 @@ pub const SSTableChangeWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!SSTableChangeBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(SSTableChangeBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!SSTableChangeBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(SSTableChangeBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -1967,119 +1319,53 @@ pub const ManifestChangeStruct = struct {
 
 pub const ManifestChangeReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46598;
     pub const SIZE_BYTES: u16 = 43;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
-    }
-
-    fn treeChangesSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 10;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch return &.{};
-        if (elem_count == 0) return &.{};
-        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return &.{};
-        return self.buf[index_off..end];
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn treeChangesLen(self: Self) u32 {
-        return @intCast(self.treeChangesSlice().len / 4);
+        return self.t.arrayLen(2, 4);
     }
 
     pub fn treeChangesAt(self: Self, i: u32) Error!TreeChangeReader {
-        const s = self.treeChangesSlice();
-        const off = @as(usize, i) * 4;
-        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
-        const child_off = zbuf.readU32(s, off) catch unreachable;
-        return TreeChangeReader.init(self.buf, child_off);
-    }
-
-    fn sstableChangesSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 18;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch return &.{};
-        if (elem_count == 0) return &.{};
-        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return &.{};
-        return self.buf[index_off..end];
+        return TreeChangeReader.init(self.t.buf, try self.t.arrayChild(2, i));
     }
 
     pub fn sstableChangesLen(self: Self) u32 {
-        return @intCast(self.sstableChangesSlice().len / 4);
+        return self.t.arrayLen(10, 4);
     }
 
     pub fn sstableChangesAt(self: Self, i: u32) Error!SSTableChangeReader {
-        const s = self.sstableChangesSlice();
-        const off = @as(usize, i) * 4;
-        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
-        const child_off = zbuf.readU32(s, off) catch unreachable;
-        return SSTableChangeReader.init(self.buf, child_off);
+        return SSTableChangeReader.init(self.t.buf, try self.t.arrayChild(10, i));
     }
 
     pub fn cmd(self: Self) CommandEnum {
-        const slot_end = @as(u32, self.base) + 19;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return @enumFromInt(0);
-        const v = zbuf.readU8(self.buf, @as(usize, self.base + 18)) catch 0;
-        return @enumFromInt(v);
+        return @enumFromInt(self.t.scalar(u8, 18));
     }
 
     pub fn memtableId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 27;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 19)) catch 0;
-    }
-
-    fn namespacesSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 35;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 27)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 31)) catch return &.{};
-        if (elem_count == 0) return &.{};
-        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return &.{};
-        return self.buf[index_off..end];
+        return self.t.scalar(u64, 19);
     }
 
     pub fn namespacesLen(self: Self) u32 {
-        return @intCast(self.namespacesSlice().len / 4);
+        return self.t.arrayLen(27, 4);
     }
 
     pub fn namespacesAt(self: Self, i: u32) Error!NamespaceReader {
-        const s = self.namespacesSlice();
-        const off = @as(usize, i) * 4;
-        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
-        const child_off = zbuf.readU32(s, off) catch unreachable;
-        return NamespaceReader.init(self.buf, child_off);
+        return NamespaceReader.init(self.t.buf, try self.t.arrayChild(27, i));
     }
 
     pub fn nextNsId(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 43;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 35)) catch 0;
+        return self.t.scalar(u64, 35);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -2125,52 +1411,18 @@ pub const ManifestChangeReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_arr_2 = @as(u32, self.base) + 10;
-        if (slot_end_arr_2 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 2));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
-            if (elem_count > 0) {
-                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-            }
+        try self.t.verifyHeader();
+        try self.t.verifyArray(2, 4);
+        for (0..self.treeChangesLen()) |i| {
+            try (try self.treeChangesAt(@intCast(i))).verify();
         }
-        const count_treeChanges: u32 = self.treeChangesLen();
-        var i_treeChanges: u32 = 0;
-        while (i_treeChanges < count_treeChanges) : (i_treeChanges += 1) {
-            const child_view = try self.treeChangesAt(i_treeChanges);
-            try child_view.verify();
+        try self.t.verifyArray(10, 4);
+        for (0..self.sstableChangesLen()) |i| {
+            try (try self.sstableChangesAt(@intCast(i))).verify();
         }
-        const slot_end_arr_10 = @as(u32, self.base) + 18;
-        if (slot_end_arr_10 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
-            if (elem_count > 0) {
-                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-            }
-        }
-        const count_sstableChanges: u32 = self.sstableChangesLen();
-        var i_sstableChanges: u32 = 0;
-        while (i_sstableChanges < count_sstableChanges) : (i_sstableChanges += 1) {
-            const child_view = try self.sstableChangesAt(i_sstableChanges);
-            try child_view.verify();
-        }
-        const slot_end_arr_27 = @as(u32, self.base) + 35;
-        if (slot_end_arr_27 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 27));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 31));
-            if (elem_count > 0) {
-                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-            }
-        }
-        const count_namespaces: u32 = self.namespacesLen();
-        var i_namespaces: u32 = 0;
-        while (i_namespaces < count_namespaces) : (i_namespaces += 1) {
-            const child_view = try self.namespacesAt(i_namespaces);
-            try child_view.verify();
+        try self.t.verifyArray(27, 4);
+        for (0..self.namespacesLen()) |i| {
+            try (try self.namespacesAt(@intCast(i))).verify();
         }
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!ManifestChangeStruct {
@@ -2217,114 +1469,47 @@ pub const ManifestChangeReader = struct {
     }
 };
 
-pub const ManifestChangeBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != ManifestChangeReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!ManifestChangeReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return ManifestChangeReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const ManifestChangeBuffer = zbuf.Buffer(ManifestChangeReader);
 
 pub const ManifestChangeWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46598;
     pub const SIZE_BYTES: u16 = 43;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setTreeChanges(self: *Self, values: []const u32) Error!void {
-        const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 2, 0);
-            try zbuf.patchU32(out.items, self.base + 6, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 2, index_off);
-        try zbuf.patchU32(out.items, self.base + 6, @as(u32, @intCast(values.len)));
+        return self.w.setArray(u32, 2, values);
     }
 
     pub fn setSstableChanges(self: *Self, values: []const u32) Error!void {
-        const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 10, 0);
-            try zbuf.patchU32(out.items, self.base + 14, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 10, index_off);
-        try zbuf.patchU32(out.items, self.base + 14, @as(u32, @intCast(values.len)));
+        return self.w.setArray(u32, 10, values);
     }
 
     pub fn setCmd(self: *Self, v: CommandEnum) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU8(out.items, self.base + 18, @intFromEnum(v));
+        return self.w.setScalar(u8, 18, @intFromEnum(v));
     }
 
     pub fn setMemtableId(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 19, v);
+        return self.w.setScalar(u64, 19, v);
     }
 
     pub fn setNamespaces(self: *Self, values: []const u32) Error!void {
-        const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 27, 0);
-            try zbuf.patchU32(out.items, self.base + 31, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 27, index_off);
-        try zbuf.patchU32(out.items, self.base + 31, @as(u32, @intCast(values.len)));
+        return self.w.setArray(u32, 27, values);
     }
 
     pub fn setNextNsId(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 35, v);
+        return self.w.setScalar(u64, 35, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -2341,36 +1526,17 @@ pub const ManifestChangeWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!ManifestChangeBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(ManifestChangeBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!ManifestChangeBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(ManifestChangeBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -2420,52 +1586,29 @@ pub const KeyValueStruct = struct {
 
 pub const KeyValueReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46599;
     pub const SIZE_BYTES: u16 = 19;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn key(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 10;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+        return self.t.bytes(2);
     }
 
     pub fn value(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 18;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+        return self.t.bytes(10);
     }
 
     pub fn meta(self: Self) u8 {
-        const slot_end = @as(u32, self.base) + 19;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU8(self.buf, @as(usize, self.base + 18)) catch 0;
+        return self.t.scalar(u8, 18);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -2478,24 +1621,9 @@ pub const KeyValueReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_2 = @as(u32, self.base) + 10;
-        if (slot_end_2 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 2));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
-        }
-        const slot_end_10 = @as(u32, self.base) + 18;
-        if (slot_end_10 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
-        }
+        try self.t.verifyHeader();
+        try self.t.verifyBytes(2);
+        try self.t.verifyBytes(10);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!KeyValueStruct {
         var s = KeyValueStruct{
@@ -2514,91 +1642,35 @@ pub const KeyValueReader = struct {
     }
 };
 
-pub const KeyValueBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != KeyValueReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!KeyValueReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return KeyValueReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const KeyValueBuffer = zbuf.Buffer(KeyValueReader);
 
 pub const KeyValueWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46599;
     pub const SIZE_BYTES: u16 = 19;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setKey(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 2, 0);
-            try zbuf.patchU32(out.items, self.base + 6, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 2, off);
-        try zbuf.patchU32(out.items, self.base + 6, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(2, data);
     }
 
     pub fn setValue(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 10, 0);
-            try zbuf.patchU32(out.items, self.base + 14, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 10, off);
-        try zbuf.patchU32(out.items, self.base + 14, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(10, data);
     }
 
     pub fn setMeta(self: *Self, v: u8) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU8(out.items, self.base + 18, v);
+        return self.w.setScalar(u8, 18, v);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -2612,36 +1684,17 @@ pub const KeyValueWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!KeyValueBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(KeyValueBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!KeyValueBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(KeyValueBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -2700,56 +1753,29 @@ pub const MutationsStruct = struct {
 
 pub const MutationsReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46600;
     pub const SIZE_BYTES: u16 = 18;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn namespace(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 10;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
-    }
-
-    fn kvsSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 18;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch return &.{};
-        if (elem_count == 0) return &.{};
-        const end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-        if (end > self.buf.len) return &.{};
-        return self.buf[index_off..end];
+        return self.t.scalar(u64, 2);
     }
 
     pub fn kvsLen(self: Self) u32 {
-        return @intCast(self.kvsSlice().len / 4);
+        return self.t.arrayLen(10, 4);
     }
 
     pub fn kvsAt(self: Self, i: u32) Error!KeyValueReader {
-        const s = self.kvsSlice();
-        const off = @as(usize, i) * 4;
-        if (off + 4 > s.len) return zbuf.Error.OutOfBounds;
-        const child_off = zbuf.readU32(s, off) catch unreachable;
-        return KeyValueReader.init(self.buf, child_off);
+        return KeyValueReader.init(self.t.buf, try self.t.arrayChild(10, i));
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -2771,22 +1797,10 @@ pub const MutationsReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_arr_10 = @as(u32, self.base) + 18;
-        if (slot_end_arr_10 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
-            if (elem_count > 0) {
-                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 4;
-                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-            }
-        }
-        const count_kvs: u32 = self.kvsLen();
-        var i_kvs: u32 = 0;
-        while (i_kvs < count_kvs) : (i_kvs += 1) {
-            const child_view = try self.kvsAt(i_kvs);
-            try child_view.verify();
+        try self.t.verifyHeader();
+        try self.t.verifyArray(10, 4);
+        for (0..self.kvsLen()) |i| {
+            try (try self.kvsAt(@intCast(i))).verify();
         }
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!MutationsStruct {
@@ -2813,78 +1827,31 @@ pub const MutationsReader = struct {
     }
 };
 
-pub const MutationsBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != MutationsReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!MutationsReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return MutationsReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const MutationsBuffer = zbuf.Buffer(MutationsReader);
 
 pub const MutationsWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46600;
     pub const SIZE_BYTES: u16 = 18;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setNamespace(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 2, v);
+        return self.w.setScalar(u64, 2, v);
     }
 
     pub fn setKvs(self: *Self, values: []const u32) Error!void {
-        const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 10, 0);
-            try zbuf.patchU32(out.items, self.base + 14, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU32Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 10, index_off);
-        try zbuf.patchU32(out.items, self.base + 14, @as(u32, @intCast(values.len)));
+        return self.w.setArray(u32, 10, values);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -2897,36 +1864,17 @@ pub const MutationsWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!MutationsBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(MutationsBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!MutationsBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(MutationsBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -2974,49 +1922,29 @@ pub const NamespaceStruct = struct {
 
 pub const NamespaceReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46601;
     pub const SIZE_BYTES: u16 = 22;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn id(self: Self) u64 {
-        const slot_end = @as(u32, self.base) + 10;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU64(self.buf, @as(usize, self.base + 2)) catch 0;
+        return self.t.scalar(u64, 2);
     }
 
     pub fn nextTableId(self: Self) u32 {
-        const slot_end = @as(u32, self.base) + 14;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return 0;
-        return zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch 0;
+        return self.t.scalar(u32, 10);
     }
 
     pub fn name(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 22;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &[_]u8{};
-        const off = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch 0;
-        const data_len = zbuf.readU32(self.buf, @as(usize, self.base + 18)) catch 0;
-        if (data_len == 0) return &[_]u8{};
-        return zbuf.sliceAt(self.buf, off, data_len) catch &[_]u8{};
+        return self.t.bytes(14);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -3029,16 +1957,8 @@ pub const NamespaceReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_14 = @as(u32, self.base) + 22;
-        if (slot_end_14 <= header_end) {
-            const off = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
-            const data_len = try zbuf.readU32(self.buf, @as(usize, self.base + 18));
-            if (data_len > 0) {
-                _ = try zbuf.sliceAt(self.buf, off, data_len);
-            }
-        }
+        try self.t.verifyHeader();
+        try self.t.verifyBytes(14);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!NamespaceStruct {
         var s = NamespaceStruct{
@@ -3057,83 +1977,35 @@ pub const NamespaceReader = struct {
     }
 };
 
-pub const NamespaceBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != NamespaceReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!NamespaceReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return NamespaceReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const NamespaceBuffer = zbuf.Buffer(NamespaceReader);
 
 pub const NamespaceWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46601;
     pub const SIZE_BYTES: u16 = 22;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setId(self: *Self, v: u64) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU64(out.items, self.base + 2, v);
+        return self.w.setScalar(u64, 2, v);
     }
 
     pub fn setNextTableId(self: *Self, v: u32) Error!void {
-        const out = self.bufMut();
-        try zbuf.patchU32(out.items, self.base + 10, v);
+        return self.w.setScalar(u32, 10, v);
     }
 
     pub fn setName(self: *Self, data: []const u8) Error!void {
-        const out = self.bufMut();
-        if (data.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 14, 0);
-            try zbuf.patchU32(out.items, self.base + 18, 0);
-            return;
-        }
-        const abs_off = try zbuf.appendBytes(out, self.alloc, data);
-        const off = abs_off;
-        try zbuf.patchU32(out.items, self.base + 14, off);
-        try zbuf.patchU32(out.items, self.base + 18, @as(u32, @intCast(data.len)));
+        return self.w.setBytes(14, data);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -3147,36 +2019,17 @@ pub const NamespaceWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!NamespaceBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(NamespaceBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!NamespaceBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(NamespaceBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };
 
@@ -3222,93 +2075,41 @@ pub const RoaringDeltaStruct = struct {
 
 pub const RoaringDeltaReader = struct {
     const Self = @This();
-    buf: []const u8,
-    base: u32,
-    size_bytes: u16,
+    t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46602;
     pub const SIZE_BYTES: u16 = 18;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
-        const tail = try zbuf.readMessageTail(buf);
-        if (tail.table_id != TABLE_ID) return zbuf.Error.Invalid;
-        const payload_buf = buf[0 .. buf.len - zbuf.message_tail_size];
-        return init(payload_buf, 0);
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
     }
 
     pub fn init(buf: []const u8, base: u32) Error!Self {
-        if (@as(usize, base) + 2 > buf.len) return zbuf.Error.OutOfBounds;
-        const size_bytes = try zbuf.readU16(buf, @as(usize, base));
-        if (@as(usize, base) + @as(usize, size_bytes) > buf.len) return zbuf.Error.OutOfBounds;
-        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
-    }
-
-    fn addsSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 10;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 2)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 6)) catch return &.{};
-        if (elem_count == 0) return &.{};
-        const end = @as(usize, index_off) + @as(usize, elem_count) * 8;
-        if (end > self.buf.len) return &.{};
-        return self.buf[index_off..end];
+        return .{ .t = try zbuf.Table.init(buf, base) };
     }
 
     pub fn addsLen(self: Self) u32 {
-        return @intCast(self.addsSlice().len / 8);
+        return self.t.arrayLen(2, 8);
     }
 
     pub fn addsAt(self: Self, i: u32) Error!u64 {
-        const s = self.addsSlice();
-        const off = @as(usize, i) * 8;
-        if (off + 8 > s.len) return zbuf.Error.OutOfBounds;
-        return zbuf.readU64(s, off) catch unreachable;
+        return self.t.arrayScalar(u64, 2, i);
     }
 
     pub fn addsToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u64 {
-        const raw = self.addsSlice();
-        const count = raw.len / 8;
-        const out = try alloc.alloc(u64, count);
-        errdefer alloc.free(out);
-        for (out, 0..) |*v, i| {
-            v.* = zbuf.readU64(raw, i * 8) catch unreachable;
-        }
-        return out;
-    }
-
-    fn removesSlice(self: Self) []const u8 {
-        const slot_end = @as(u32, self.base) + 18;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        if (slot_end > header_end) return &.{};
-        const index_off = zbuf.readU32(self.buf, @as(usize, self.base + 10)) catch return &.{};
-        const elem_count = zbuf.readU32(self.buf, @as(usize, self.base + 14)) catch return &.{};
-        if (elem_count == 0) return &.{};
-        const end = @as(usize, index_off) + @as(usize, elem_count) * 8;
-        if (end > self.buf.len) return &.{};
-        return self.buf[index_off..end];
+        return self.t.arrayToSliceAlloc(u64, 2, alloc);
     }
 
     pub fn removesLen(self: Self) u32 {
-        return @intCast(self.removesSlice().len / 8);
+        return self.t.arrayLen(10, 8);
     }
 
     pub fn removesAt(self: Self, i: u32) Error!u64 {
-        const s = self.removesSlice();
-        const off = @as(usize, i) * 8;
-        if (off + 8 > s.len) return zbuf.Error.OutOfBounds;
-        return zbuf.readU64(s, off) catch unreachable;
+        return self.t.arrayScalar(u64, 10, i);
     }
 
     pub fn removesToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u64 {
-        const raw = self.removesSlice();
-        const count = raw.len / 8;
-        const out = try alloc.alloc(u64, count);
-        errdefer alloc.free(out);
-        for (out, 0..) |*v, i| {
-            v.* = zbuf.readU64(raw, i * 8) catch unreachable;
-        }
-        return out;
+        return self.t.arrayToSliceAlloc(u64, 10, alloc);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -3324,26 +2125,9 @@ pub const RoaringDeltaReader = struct {
     }
 
     pub fn verify(self: Self) Error!void {
-        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return zbuf.Error.OutOfBounds;
-        const header_end = @as(u32, self.base) + self.size_bytes;
-        const slot_end_arr_2 = @as(u32, self.base) + 10;
-        if (slot_end_arr_2 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 2));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 6));
-            if (elem_count > 0) {
-                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 8;
-                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-            }
-        }
-        const slot_end_arr_10 = @as(u32, self.base) + 18;
-        if (slot_end_arr_10 <= header_end) {
-            const index_off = try zbuf.readU32(self.buf, @as(usize, self.base + 10));
-            const elem_count = try zbuf.readU32(self.buf, @as(usize, self.base + 14));
-            if (elem_count > 0) {
-                const index_end = @as(usize, index_off) + @as(usize, elem_count) * 8;
-                if (index_end > self.buf.len) return zbuf.Error.OutOfBounds;
-            }
-        }
+        try self.t.verifyHeader();
+        try self.t.verifyArray(2, 8);
+        try self.t.verifyArray(10, 8);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!RoaringDeltaStruct {
         var s = RoaringDeltaStruct{};
@@ -3360,86 +2144,31 @@ pub const RoaringDeltaReader = struct {
     }
 };
 
-pub const RoaringDeltaBuffer = struct {
-    alloc: std.mem.Allocator,
-    offset: u32,
-    bytes: ?[]u8,
-    ownership: Ownership,
-    has_tail: bool,
-    pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) Error!@This() {
-        const tail = try zbuf.readMessageTail(bytes);
-        if (tail.table_id != RoaringDeltaReader.TABLE_ID) return zbuf.Error.Invalid;
-        return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
-    }
-    pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) Error!@This() {
-        return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
-    }
-    pub fn initReader(self: @This()) Error!RoaringDeltaReader {
-        const payload = self.bytes orelse return zbuf.Error.Invalid;
-        return RoaringDeltaReader.init(payload, self.offset);
-    }
-    pub fn deinit(self: *@This()) void {
-        if (self.bytes) |bytes| {
-            if (self.ownership == .owned) self.alloc.free(bytes);
-            self.bytes = null;
-            self.ownership = .borrowed;
-        }
-    }
-};
+pub const RoaringDeltaBuffer = zbuf.Buffer(RoaringDeltaReader);
 
 pub const RoaringDeltaWriter = struct {
     const Self = @This();
-    buf: ?*std.ArrayList(u8),
-    owns_buf: bool,
-    alloc: std.mem.Allocator,
-    base: u32,
+    w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46602;
     pub const SIZE_BYTES: u16 = 18;
-
-    fn bufMut(self: *Self) *std.ArrayList(u8) {
-        return self.buf orelse @panic("zbuf writer missing buffer");
-    }
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
-        const base = try zbuf.reserveHeader(buf, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(buf.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
     }
 
     pub fn init(alloc: std.mem.Allocator) Error!Self {
-        const owned = try alloc.create(std.ArrayList(u8));
-        owned.* = .empty;
-        errdefer alloc.destroy(owned);
-        const base = try zbuf.reserveHeader(owned, alloc, SIZE_BYTES);
-        try zbuf.writeU16At(owned.items, @as(usize, base), SIZE_BYTES);
-        return .{ .buf = owned, .owns_buf = true, .alloc = alloc, .base = base };
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
     }
 
     pub fn setAdds(self: *Self, values: []const u64) Error!void {
-        const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 2, 0);
-            try zbuf.patchU32(out.items, self.base + 6, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU64Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 2, index_off);
-        try zbuf.patchU32(out.items, self.base + 6, @as(u32, @intCast(values.len)));
+        return self.w.setArray(u64, 2, values);
     }
 
     pub fn setRemoves(self: *Self, values: []const u64) Error!void {
-        const out = self.bufMut();
-        if (values.len == 0) {
-            try zbuf.patchU32(out.items, self.base + 10, 0);
-            try zbuf.patchU32(out.items, self.base + 14, 0);
-            return;
-        }
-        const abs_index_off = try zbuf.appendU64Slice(out, self.alloc, values);
-        const index_off = abs_index_off;
-        try zbuf.patchU32(out.items, self.base + 10, index_off);
-        try zbuf.patchU32(out.items, self.base + 14, @as(u32, @intCast(values.len)));
+        return self.w.setArray(u64, 10, values);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -3452,35 +2181,16 @@ pub const RoaringDeltaWriter = struct {
     }
 
     pub fn finish(self: *Self) Error!RoaringDeltaBuffer {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return zbuf.Error.Invalid;
-            const bytes = try owned.toOwnedSlice(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
-        }
-        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+        return self.w.finish(RoaringDeltaBuffer);
     }
 
-    /// Root must be at payload offset 0. Initialize the root writer first
-    /// on an empty buffer; children built later land at higher offsets.
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!RoaringDeltaBuffer {
-        if (self.base != 0) return zbuf.Error.Invalid;
-        const out = self.bufMut();
-        try zbuf.appendMessageTail(out, self.alloc, TABLE_ID, self.base);
-        var result = try self.finish();
-        result.has_tail = true;
-        return result;
+        return self.w.finishWithTail(RoaringDeltaBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_buf) {
-            const owned = self.buf orelse return;
-            owned.deinit(self.alloc);
-            self.alloc.destroy(owned);
-            self.buf = null;
-            self.base = 0;
-            self.owns_buf = false;
-        }
+        self.w.deinit();
     }
 };

@@ -302,3 +302,518 @@ fn writeIntLittle(comptime T: type, buf: []u8, off: usize, v: T) void {
     const ptr = @as(*[size]u8, @ptrCast(slice.ptr));
     std.mem.writeInt(T, ptr, v, .little);
 }
+
+// =========================================================================
+// The runtime the generated code is written against. A generated reader
+// or writer holds one of the views below and reads or patches each of
+// its fields through it in one line; the layout rules (absent slots,
+// alignment, null children, length prefixes) live here, once. See the
+// README for the wire format.
+// =========================================================================
+
+/// An integer read little-endian, bounds-checked.
+pub fn readInt(comptime T: type, buf: []const u8, off: usize) Error!T {
+    if (off + @sizeOf(T) > buf.len) return Error.OutOfBounds;
+    return readIntLittle(T, buf, off);
+}
+
+/// An integer patched little-endian into a header slot.
+pub fn patchInt(comptime T: type, buf: []u8, off: usize, v: T) Error!void {
+    if (off + @sizeOf(T) > buf.len) return Error.OutOfBounds;
+    writeIntLittle(T, buf, off, v);
+}
+
+/// A run of integers appended little-endian, 4-byte aligned like every
+/// payload region; returns where it starts.
+pub fn appendIntSlice(comptime T: type, list: *std.ArrayList(u8), alloc: std.mem.Allocator, values: []const T) !u32 {
+    const aligned = alignForward(list.items.len, payload_alignment);
+    if (aligned > list.items.len) {
+        try appendZeros(list, alloc, aligned - list.items.len);
+    }
+    const off: u32 = @intCast(list.items.len);
+    try list.ensureUnusedCapacity(alloc, values.len * @sizeOf(T));
+    for (values) |v| {
+        const start = list.items.len;
+        list.items.len += @sizeOf(T);
+        writeIntLittle(T, list.items, start, v);
+    }
+    return off;
+}
+
+/// A table as a reader sees it: the payload, where the table's header
+/// starts, and the header size the record was written with. A slot
+/// past that header is absent, and reads as its zero: 0, false, empty,
+/// null. Every accessor is bounds-checked and never fails; `verify`
+/// is the one that reports a corrupt payload.
+pub const Table = struct {
+    buf: []const u8,
+    base: u32,
+    size_bytes: u16,
+
+    pub fn init(buf: []const u8, base: u32) Error!Table {
+        if (@as(usize, base) + 2 > buf.len) return Error.OutOfBounds;
+        const size_bytes = try readU16(buf, base);
+        if (@as(usize, base) + size_bytes > buf.len) return Error.OutOfBounds;
+        return .{ .buf = buf, .base = base, .size_bytes = size_bytes };
+    }
+
+    /// The root table of a message whose tail names `table_id`: the
+    /// root is always at payload offset 0.
+    pub fn parseRoot(buf: []const u8, table_id: u16) Error!Table {
+        const tail = try readMessageTail(buf);
+        if (tail.table_id != table_id) return Error.Invalid;
+        return init(buf[0 .. buf.len - message_tail_size], 0);
+    }
+
+    /// Whether a slot of `size` bytes at `offset` lies inside the header.
+    fn present(self: Table, offset: u16, size: u16) bool {
+        return @as(u32, offset) + size <= self.size_bytes;
+    }
+
+    fn at(self: Table, offset: u16) usize {
+        return @as(usize, self.base) + offset;
+    }
+
+    pub fn scalar(self: Table, comptime T: type, offset: u16) T {
+        if (!self.present(offset, @sizeOf(T))) return 0;
+        return readInt(T, self.buf, self.at(offset)) catch 0;
+    }
+
+    /// Bit `bit_index` of the scalar at `offset`; false past its width.
+    pub fn hasBit(self: Table, comptime T: type, offset: u16, bit_index: u32) bool {
+        if (bit_index >= @bitSizeOf(T)) return false;
+        const word = self.scalar(T, offset);
+        return ((word >> @intCast(bit_index)) & 1) == 1;
+    }
+
+    /// A bytes field: `{off, len}` in the slot, the data elsewhere.
+    pub fn bytes(self: Table, offset: u16) []const u8 {
+        if (!self.present(offset, 8)) return &.{};
+        const off = readU32(self.buf, self.at(offset)) catch 0;
+        const len = readU32(self.buf, self.at(offset + 4)) catch 0;
+        if (len == 0) return &.{};
+        return sliceAt(self.buf, off, len) catch &.{};
+    }
+
+    /// An array's elements as bytes: `{index_off, count}` in the slot,
+    /// `count` elements of `elem_size` at `index_off`.
+    pub fn array(self: Table, offset: u16, elem_size: u16) []const u8 {
+        if (!self.present(offset, 8)) return &.{};
+        const index_off = readU32(self.buf, self.at(offset)) catch return &.{};
+        const count = readU32(self.buf, self.at(offset + 4)) catch return &.{};
+        if (count == 0) return &.{};
+        const end = @as(usize, index_off) + @as(usize, count) * elem_size;
+        if (end > self.buf.len) return &.{};
+        return self.buf[index_off..end];
+    }
+
+    pub fn arrayLen(self: Table, offset: u16, elem_size: u16) u32 {
+        return @intCast(self.array(offset, elem_size).len / elem_size);
+    }
+
+    /// Element `i` of a scalar array.
+    pub fn arrayScalar(self: Table, comptime T: type, offset: u16, i: u32) Error!T {
+        const s = self.array(offset, @sizeOf(T));
+        const off = @as(usize, i) * @sizeOf(T);
+        if (off + @sizeOf(T) > s.len) return Error.OutOfBounds;
+        return readInt(T, s, off) catch unreachable;
+    }
+
+    /// Element `i` of a table array: the child's offset in the payload.
+    pub fn arrayChild(self: Table, offset: u16, i: u32) Error!u32 {
+        return self.arrayScalar(u32, offset, i);
+    }
+
+    pub fn arrayToSliceAlloc(self: Table, comptime T: type, offset: u16, alloc: std.mem.Allocator) ![]T {
+        const raw = self.array(offset, @sizeOf(T));
+        const out = try alloc.alloc(T, raw.len / @sizeOf(T));
+        errdefer alloc.free(out);
+        for (out, 0..) |*v, i| {
+            v.* = readInt(T, raw, i * @sizeOf(T)) catch unreachable;
+        }
+        return out;
+    }
+
+    /// A nested table's offset, or null when absent or unset.
+    pub fn child(self: Table, offset: u16) ?u32 {
+        if (!self.present(offset, 4)) return null;
+        const off = readU32(self.buf, self.at(offset)) catch 0;
+        if (off == NullOffset) return null;
+        return off;
+    }
+
+    pub fn verifyHeader(self: Table) Error!void {
+        if (@as(usize, self.base) + @as(usize, self.size_bytes) > self.buf.len) return Error.OutOfBounds;
+    }
+
+    /// The bytes field at `offset` lies within the payload.
+    pub fn verifyBytes(self: Table, offset: u16) Error!void {
+        if (!self.present(offset, 8)) return;
+        const off = try readU32(self.buf, self.at(offset));
+        const len = try readU32(self.buf, self.at(offset + 4));
+        if (len > 0) _ = try sliceAt(self.buf, off, len);
+    }
+
+    /// The array at `offset` lies within the payload.
+    pub fn verifyArray(self: Table, offset: u16, elem_size: u16) Error!void {
+        if (!self.present(offset, 8)) return;
+        const index_off = try readU32(self.buf, self.at(offset));
+        const count = try readU32(self.buf, self.at(offset + 4));
+        if (count == 0) return;
+        const end = @as(usize, index_off) + @as(usize, count) * elem_size;
+        if (end > self.buf.len) return Error.OutOfBounds;
+    }
+};
+
+/// What a finished table writer hands back: the bytes, owned or
+/// borrowed, and where the root sits in them. `Reader` is the table's
+/// generated reader, whose TABLE_ID a tail is checked against.
+pub fn Buffer(comptime Reader: type) type {
+    return struct {
+        alloc: std.mem.Allocator,
+        offset: u32,
+        bytes: ?[]u8,
+        ownership: Ownership,
+        has_tail: bool,
+
+        /// A message with a tail: the root is at payload offset 0.
+        pub fn initWithTail(alloc: std.mem.Allocator, bytes: []u8, ownership: Ownership) !@This() {
+            const tail = try readMessageTail(bytes);
+            if (tail.table_id != Reader.TABLE_ID) return Error.Invalid;
+            return .{ .alloc = alloc, .offset = 0, .bytes = bytes, .ownership = ownership, .has_tail = true };
+        }
+
+        pub fn initWithOffset(alloc: std.mem.Allocator, bytes: []u8, offset: u32, ownership: Ownership) !@This() {
+            return .{ .alloc = alloc, .offset = offset, .bytes = bytes, .ownership = ownership, .has_tail = false };
+        }
+
+        pub fn initReader(self: @This()) !Reader {
+            const payload = self.bytes orelse return Error.Invalid;
+            return Reader.init(payload, self.offset);
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.bytes) |bytes| {
+                if (self.ownership == .owned) self.alloc.free(bytes);
+                self.bytes = null;
+                self.ownership = .borrowed;
+            }
+        }
+    };
+}
+
+/// A table being written: the header is reserved up front, with every
+/// nested table slot null, and each setter patches its slot, appending
+/// bytes and arrays after the header. Either into a caller's list or
+/// into one of its own that `finish` hands over.
+pub const TableWriter = struct {
+    buf: ?*std.ArrayList(u8),
+    owns_buf: bool,
+    alloc: std.mem.Allocator,
+    base: u32,
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), size_bytes: u16, child_slots: []const u16) !TableWriter {
+        const base = try reserveHeader(buf, alloc, size_bytes);
+        try writeU16At(buf.items, base, size_bytes);
+        for (child_slots) |slot| try patchU32(buf.items, base + slot, NullOffset);
+        return .{ .buf = buf, .owns_buf = false, .alloc = alloc, .base = base };
+    }
+
+    pub fn init(alloc: std.mem.Allocator, size_bytes: u16, child_slots: []const u16) !TableWriter {
+        const owned = try alloc.create(std.ArrayList(u8));
+        owned.* = .empty;
+        errdefer alloc.destroy(owned);
+        var w = try initWithBuf(alloc, owned, size_bytes, child_slots);
+        w.owns_buf = true;
+        return w;
+    }
+
+    fn out(self: *TableWriter) *std.ArrayList(u8) {
+        return self.buf orelse @panic("zbuf writer missing buffer");
+    }
+
+    fn at(self: *TableWriter, offset: u16) u32 {
+        return self.base + offset;
+    }
+
+    pub fn setScalar(self: *TableWriter, comptime T: type, offset: u16, v: T) Error!void {
+        try patchInt(T, self.out().items, self.at(offset), v);
+    }
+
+    /// Sets or clears one bit of the scalar at `offset`.
+    pub fn setBit(self: *TableWriter, comptime T: type, offset: u16, bit: u16, v: bool) Error!void {
+        const items = self.out().items;
+        var word = try readInt(T, items, self.at(offset));
+        const mask = @as(T, 1) << @intCast(bit);
+        if (v) word |= mask else word &= ~mask;
+        try patchInt(T, items, self.at(offset), word);
+    }
+
+    /// The runtime-indexed bit helpers a flags field exports: a bit
+    /// past the scalar's width is OutOfBounds.
+    pub fn bitSet(self: *TableWriter, comptime T: type, offset: u16, bit_index: u32) Error!void {
+        if (bit_index >= @bitSizeOf(T)) return Error.OutOfBounds;
+        try self.setBit(T, offset, @intCast(bit_index), true);
+    }
+
+    pub fn bitClear(self: *TableWriter, comptime T: type, offset: u16, bit_index: u32) Error!void {
+        if (bit_index >= @bitSizeOf(T)) return Error.OutOfBounds;
+        try self.setBit(T, offset, @intCast(bit_index), false);
+    }
+
+    pub fn bitHas(self: *TableWriter, comptime T: type, offset: u16, bit_index: u32) Error!bool {
+        if (bit_index >= @bitSizeOf(T)) return Error.OutOfBounds;
+        const word = try readInt(T, self.out().items, self.at(offset));
+        return ((word >> @intCast(bit_index)) & 1) == 1;
+    }
+
+    /// Appends the data and points the slot at it; empty data leaves
+    /// the slot zero.
+    pub fn setBytes(self: *TableWriter, offset: u16, data: []const u8) !void {
+        const list = self.out();
+        if (data.len == 0) {
+            try patchU32(list.items, self.at(offset), 0);
+            try patchU32(list.items, self.at(offset + 4), 0);
+            return;
+        }
+        const off = try appendBytes(list, self.alloc, data);
+        try patchU32(list.items, self.at(offset), off);
+        try patchU32(list.items, self.at(offset + 4), @intCast(data.len));
+    }
+
+    /// Appends the elements and points the slot at them; a table array
+    /// is its children's u32 offsets.
+    pub fn setArray(self: *TableWriter, comptime T: type, offset: u16, values: []const T) !void {
+        const list = self.out();
+        if (values.len == 0) {
+            try patchU32(list.items, self.at(offset), 0);
+            try patchU32(list.items, self.at(offset + 4), 0);
+            return;
+        }
+        const off = try appendIntSlice(T, list, self.alloc, values);
+        try patchU32(list.items, self.at(offset), off);
+        try patchU32(list.items, self.at(offset + 4), @intCast(values.len));
+    }
+
+    pub fn setChild(self: *TableWriter, offset: u16, child_off: u32) Error!void {
+        try patchU32(self.out().items, self.at(offset), child_off);
+    }
+
+    pub fn finish(self: *TableWriter, comptime B: type) !B {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return Error.Invalid;
+            const bytes = try owned.toOwnedSlice(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            return .{ .alloc = self.alloc, .offset = self.base, .bytes = bytes, .ownership = .owned, .has_tail = false };
+        }
+        return .{ .alloc = self.alloc, .offset = self.base, .bytes = null, .ownership = .borrowed, .has_tail = false };
+    }
+
+    /// Root must be at payload offset 0. Initialize the root writer first
+    /// on an empty buffer; children built later land at higher offsets.
+    pub fn finishWithTail(self: *TableWriter, comptime B: type, table_id: u16) !B {
+        if (self.base != 0) return Error.Invalid;
+        try appendMessageTail(self.out(), self.alloc, table_id, self.base);
+        var result = try self.finish(B);
+        result.has_tail = true;
+        return result;
+    }
+
+    pub fn deinit(self: *TableWriter) void {
+        if (self.owns_buf) {
+            const owned = self.buf orelse return;
+            owned.deinit(self.alloc);
+            self.alloc.destroy(owned);
+            self.buf = null;
+            self.base = 0;
+            self.owns_buf = false;
+        }
+    }
+};
+
+/// Width of a packed length or count prefix.
+pub const LenWidth = enum(u8) {
+    u8 = 1,
+    u16 = 2,
+    u32 = 4,
+
+    /// The prefix at `off`, trusted (see `load`).
+    pub fn load(self: LenWidth, buf: []const u8, off: u32) u32 {
+        return switch (self) {
+            .u8 => zbuf_load(u8, buf, off),
+            .u16 => zbuf_load(u16, buf, off),
+            .u32 => zbuf_load(u32, buf, off),
+        };
+    }
+
+    pub fn max(self: LenWidth) u64 {
+        return switch (self) {
+            .u8 => std.math.maxInt(u8),
+            .u16 => std.math.maxInt(u16),
+            .u32 => std.math.maxInt(u32),
+        };
+    }
+
+    pub fn append(self: LenWidth, list: *std.ArrayList(u8), alloc: std.mem.Allocator, n: u64) !void {
+        if (n > self.max()) return Error.Invalid;
+        switch (self) {
+            .u8 => try appendInt(u8, list, alloc, @intCast(n)),
+            .u16 => try appendInt(u16, list, alloc, @intCast(n)),
+            .u32 => try appendInt(u32, list, alloc, @intCast(n)),
+        }
+    }
+};
+
+/// A packed record is TRUSTED: its container vouches for it (a block
+/// is checksummed before it is decoded), so its fields are read where
+/// the layout says with no walk and no per-field bounds test. A record
+/// that lies about a length is a bug upstream, caught by the slice
+/// bounds check in a safe build.
+pub fn load(comptime T: type, buf: []const u8, off: u32) T {
+    return readIntLittle(T, buf, off);
+}
+
+const zbuf_load = load;
+
+/// A `[len][bytes]` field at `off`.
+pub fn packedBytes(buf: []const u8, off: u32, width: LenWidth) []const u8 {
+    const len = width.load(buf, off);
+    const start = off + @intFromEnum(width);
+    return buf[start .. start + len];
+}
+
+/// The count of a `[count][elements]` field at `off`.
+pub fn packedArrayLen(buf: []const u8, off: u32, width: LenWidth) u32 {
+    return width.load(buf, off);
+}
+
+/// The elements of a `[count][elements]` field at `off`, count × elem
+/// bytes.
+pub fn packedArray(buf: []const u8, off: u32, width: LenWidth, elem: u32) []const u8 {
+    const count = packedArrayLen(buf, off, width);
+    const start = off + @intFromEnum(width);
+    return buf[start .. start + count * elem];
+}
+
+/// Element `i` of a `[count][elements]` field: its bytes. The index is
+/// the caller's, so it is checked.
+pub fn packedElem(buf: []const u8, off: u32, width: LenWidth, elem: u32, i: u32) Error![]const u8 {
+    if (i >= packedArrayLen(buf, off, width)) return Error.OutOfBounds;
+    const start = off + @intFromEnum(width) + i * elem;
+    return buf[start .. start + elem];
+}
+
+/// A `[count][count × u32 end][records]` field at `off`: records of
+/// varying size, indexed by where each ENDS within the region, so
+/// record `i` is `[end(i-1), end(i))` with `end(-1) = 0`. Ends rather
+/// than starts, so the table is its own check: the last end is the
+/// region's length, and every record's bounds come from two table
+/// entries. Empty when the count is 0.
+pub fn packedRecordsLen(buf: []const u8, off: u32, width: LenWidth) u32 {
+    return width.load(buf, off);
+}
+
+/// The byte after the records region: the field's end.
+pub fn packedRecordsEnd(buf: []const u8, off: u32, width: LenWidth) u32 {
+    const count = packedRecordsLen(buf, off, width);
+    const table = off + @intFromEnum(width);
+    const region = table + count * 4;
+    if (count == 0) return region;
+    return region + load(u32, buf, table + (count - 1) * 4);
+}
+
+/// Record `i`'s bytes. The index is the caller's and is checked; a
+/// table whose ends run backwards or past the region is Invalid.
+pub fn packedRecord(buf: []const u8, off: u32, width: LenWidth, i: u32) Error![]const u8 {
+    const count = packedRecordsLen(buf, off, width);
+    if (i >= count) return Error.OutOfBounds;
+    const table = off + @intFromEnum(width);
+    const region = table + count * 4;
+    const start: u32 = if (i == 0) 0 else load(u32, buf, table + (i - 1) * 4);
+    const end = load(u32, buf, table + i * 4);
+    const last = load(u32, buf, table + (count - 1) * 4);
+    if (end < start or end > last) return Error.Invalid;
+    return buf[region + start .. region + end];
+}
+
+pub fn packedToSliceAlloc(comptime T: type, buf: []const u8, off: u32, width: LenWidth, alloc: std.mem.Allocator) ![]T {
+    const raw = packedArray(buf, off, width, @sizeOf(T));
+    const out = try alloc.alloc(T, raw.len / @sizeOf(T));
+    for (out, 0..) |*v, i| {
+        v.* = readIntLittle(T, raw, i * @sizeOf(T));
+    }
+    return out;
+}
+
+/// An integer appended little-endian.
+pub fn appendInt(comptime T: type, list: *std.ArrayList(u8), alloc: std.mem.Allocator, v: T) !void {
+    var tmp: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &tmp, v, .little);
+    try list.appendSlice(alloc, &tmp);
+}
+
+/// A packed record being written: fields appended in order from where
+/// the list ended.
+pub const PackedWriter = struct {
+    buf: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    base: u32,
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) PackedWriter {
+        return .{ .buf = buf, .alloc = alloc, .base = @intCast(buf.items.len) };
+    }
+
+    pub fn int(self: *PackedWriter, comptime T: type, v: T) !void {
+        try appendInt(T, self.buf, self.alloc, v);
+    }
+
+    /// `[len][bytes]`; data longer than the prefix can say is Invalid.
+    pub fn bytes(self: *PackedWriter, width: LenWidth, data: []const u8) !void {
+        try width.append(self.buf, self.alloc, data.len);
+        try self.buf.appendSlice(self.alloc, data);
+    }
+
+    pub fn rest(self: *PackedWriter, data: []const u8) !void {
+        try self.buf.appendSlice(self.alloc, data);
+    }
+
+    /// `[count][count × element]` of scalars.
+    pub fn ints(self: *PackedWriter, comptime T: type, width: LenWidth, values: []const T) !void {
+        try width.append(self.buf, self.alloc, values.len);
+        for (values) |v| try appendInt(T, self.buf, self.alloc, v);
+    }
+
+    /// The count prefix of an array whose elements the caller appends.
+    pub fn count(self: *PackedWriter, width: LenWidth, n: usize) !void {
+        try width.append(self.buf, self.alloc, n);
+    }
+
+    /// Begins a records field of `n` variable-size records: the count,
+    /// then a table of `n` end offsets left for `RecordTable.endRecord`
+    /// to fill as each record is appended.
+    pub fn records(self: *PackedWriter, width: LenWidth, n: usize) !RecordTable {
+        try width.append(self.buf, self.alloc, n);
+        const table: u32 = @intCast(self.buf.items.len);
+        try appendZeros(self.buf, self.alloc, n * 4);
+        return .{ .table = table, .region = @intCast(self.buf.items.len), .next = 0 };
+    }
+
+    pub fn finish(self: *PackedWriter) u32 {
+        return self.base;
+    }
+};
+
+/// The offset table of a records field being written: after each
+/// record is appended, `endRecord` notes where it ended.
+pub const RecordTable = struct {
+    table: u32,
+    region: u32,
+    next: u32,
+
+    pub fn endRecord(self: *RecordTable, w: *PackedWriter) void {
+        const end: u32 = @intCast(w.buf.items.len - self.region);
+        patchU32(w.buf.items, self.table + self.next * 4, end) catch unreachable;
+        self.next += 1;
+    }
+};

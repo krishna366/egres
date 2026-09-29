@@ -4,13 +4,13 @@ const schema = @import("schema");
 // - table BlockOffset { key:[ubyte]; offset:uint; len:uint; }
 // - table TableIndex { offsets:[BlockOffset]; bloom_filter:[ubyte];
 //   max_version:uint64; ... }
-pub const BlockIndex = schema.Table(.{
+pub const BlockIndex = schema.Table(&.{
     .{ .id = 1, .name = "key", .ty = schema.Bytes },
     .{ .id = 2, .name = "offset", .ty = schema.U32 },
     .{ .id = 3, .name = "len", .ty = schema.U32 },
 });
 
-pub const BinaryFuseFilter = schema.Table(.{
+pub const BinaryFuseFilter = schema.Table(&.{
     .{ .id = 1, .name = "seed", .ty = schema.U64 },
     .{ .id = 2, .name = "segment_length", .ty = schema.U32 },
     .{ .id = 3, .name = "segment_length_mask", .ty = schema.U32 },
@@ -21,13 +21,13 @@ pub const BinaryFuseFilter = schema.Table(.{
 
 // Tags chosen to match `u/compress.zig::Codec` so
 // @enumFromInt(@intFromEnum(...)) is identity at the wire boundary.
-pub const Compression = schema.EnumDef(.{
+pub const Compression = schema.EnumDef(&.{
     .{ .name = "none", .tag = 0 },
     .{ .name = "zstd", .tag = 1 },
     .{ .name = "lz4", .tag = 2 },
 });
 
-pub const TableIndex = schema.Table(.{
+pub const TableIndex = schema.Table(&.{
     // Bumped whenever the per-entry block encoding changes (table/builder.zig
     // is the source of truth for that layout).
     .{ .id = 1, .name = "format_version", .ty = schema.U32 },
@@ -36,7 +36,7 @@ pub const TableIndex = schema.Table(.{
     .{ .id = 4, .name = "uncompressed_size", .ty = schema.U32 },
     .{ .id = 5, .name = "compressed_size", .ty = schema.U32 },
     .{ .id = 6, .name = "stale_data_size", .ty = schema.U32 },
-    .{ .id = 7, .name = "compression", .ty = schema.Enum(Compression) },
+    .{ .id = 7, .name = "compression", .ty = Compression },
     .{ .id = 8, .name = "last_key", .ty = schema.Bytes },
     .{ .id = 9, .name = "blocks", .ty = schema.Array(BlockIndex) },
     .{ .id = 10, .name = "binary_fuse", .ty = BinaryFuseFilter },
@@ -47,7 +47,7 @@ pub const TableIndex = schema.Table(.{
     .{ .id = 11, .name = "egid_bitmap", .ty = schema.Bytes },
 });
 
-pub const Op = schema.EnumDef(.{
+pub const Op = schema.EnumDef(&.{
     .{ .name = "create", .tag = 0 },
     .{ .name = "delete", .tag = 1 },
     .{ .name = "update", .tag = 2 },
@@ -72,23 +72,23 @@ pub const Op = schema.EnumDef(.{
 // Only a posting index holds roaring states and deltas. Tag 0 is the
 // unset value of a change that never named a kind: `unknown`, which
 // the manifest refuses at create.
-pub const TreeKind = schema.EnumDef(.{
+pub const TreeKind = schema.EnumDef(&.{
     .{ .name = "unknown", .tag = 0 },
     .{ .name = "rows", .tag = 1 },
     .{ .name = "unique_index", .tag = 2 },
     .{ .name = "posting_index", .tag = 3 },
 });
 
-pub const TreeChange = schema.Table(.{
+pub const TreeChange = schema.Table(&.{
     // 0=CREATE, 1=DELETE, 2=UPDATE
-    .{ .id = 1, .name = "op", .ty = schema.Enum(Op) },
+    .{ .id = 1, .name = "op", .ty = Op },
     .{ .id = 2, .name = "namespace_id", .ty = schema.U64 },
     .{ .id = 3, .name = "tree_id", .ty = schema.U64 },
     .{ .id = 4, .name = "left_key", .ty = schema.Bytes },
     .{ .id = 5, .name = "right_key", .ty = schema.Bytes },
     .{ .id = 6, .name = "name", .ty = schema.Bytes },
     // create only: fixed for the tree's life, inherited by a split.
-    .{ .id = 7, .name = "kind", .ty = schema.Enum(TreeKind) },
+    .{ .id = 7, .name = "kind", .ty = TreeKind },
 });
 
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a
@@ -98,8 +98,8 @@ pub const TreeChange = schema.Table(.{
 // freed when its refcount hits 0). `namespace_id` + `tree_id` locate the owning
 // tree — a single flush spans many namespaces, so the namespace can't be
 // implied by the batch.
-pub const SSTableChange = schema.Table(.{
-    .{ .id = 1, .name = "op", .ty = schema.Enum(Op) }, // 0=CREATE, 1=DELETE
+pub const SSTableChange = schema.Table(&.{
+    .{ .id = 1, .name = "op", .ty = Op }, // 0=CREATE, 1=DELETE
     .{ .id = 2, .name = "level", .ty = schema.U32 }, // 0 for DELETE
     .{ .id = 3, .name = "sst_id", .ty = schema.U64 }, // on-disk SST id
     .{ .id = 4, .name = "tree_id", .ty = schema.U64 },
@@ -119,7 +119,7 @@ pub const SSTableChange = schema.Table(.{
 // re-elected leader never re-issues an id even after a DROP) and the
 // database name (SQL CREATE DATABASE; empty for unnamed legacy namespaces).
 // Live (non-snapshot) ManifestChanges leave `namespaces` empty.
-pub const Namespace = schema.Table(.{
+pub const Namespace = schema.Table(&.{
     .{ .id = 1, .name = "id", .ty = schema.U64 },
     .{ .id = 2, .name = "next_table_id", .ty = schema.U32 },
     .{ .id = 3, .name = "name", .ty = schema.Bytes },
@@ -129,7 +129,7 @@ pub const Namespace = schema.Table(.{
 // left by the snapshot path (Manifest.serialize sets only the state fields);
 // it is never dispatched. DDL commands are verb-first and grouped as
 // consecutive create/drop pairs by object.
-pub const Command = schema.EnumDef(.{
+pub const Command = schema.EnumDef(&.{
     .{ .name = "none", .tag = 0 },
     .{ .name = "new_memtable", .tag = 1 },
     .{ .name = "flush", .tag = 2 },
@@ -144,10 +144,10 @@ pub const Command = schema.EnumDef(.{
     .{ .name = "index_backfill", .tag = 9 },
 });
 
-pub const ManifestChange = schema.Table(.{
+pub const ManifestChange = schema.Table(&.{
     .{ .id = 1, .name = "tree_changes", .ty = schema.Array(TreeChange) },
     .{ .id = 2, .name = "sstable_changes", .ty = schema.Array(SSTableChange) },
-    .{ .id = 3, .name = "cmd", .ty = schema.Enum(Command) },
+    .{ .id = 3, .name = "cmd", .ty = Command },
     // for flush: which memtable was flushed
     .{ .id = 4, .name = "memtable_id", .ty = schema.U64 },
     // snapshot only
@@ -163,7 +163,7 @@ pub const ManifestChange = schema.Table(.{
 /// commit HLC shared by the whole batch. `meta` is zdb.Meta packed into
 /// a byte (see zdb/kv.zig); 0 is Meta.raw, so a writer that never sets
 /// it produces a plain put.
-pub const KeyValue = schema.Table(.{
+pub const KeyValue = schema.Table(&.{
     .{ .id = 1, .name = "key", .ty = schema.Bytes },
     .{ .id = 2, .name = "value", .ty = schema.Bytes },
     .{ .id = 3, .name = "meta", .ty = schema.U8 },
@@ -173,7 +173,7 @@ pub const KeyValue = schema.Table(.{
 /// egids to add to / remove from the posting bitmap, layered on the
 /// versions below it (zdb/compaction.zig's VersionTracker owns the fold,
 /// zdb/validate.zig the write-side gate).
-pub const RoaringDelta = schema.Table(.{
+pub const RoaringDelta = schema.Table(&.{
     .{ .id = 1, .name = "adds", .ty = schema.Array(schema.U64) },
     .{ .id = 2, .name = "removes", .ty = schema.Array(schema.U64) },
 });
@@ -183,7 +183,7 @@ pub const RoaringDelta = schema.Table(.{
 /// An entry never spans namespaces (a session is bound to one database),
 /// so `namespace` sits at the top level as the authority; apply validates
 /// each key's own namespace bytes against it.
-pub const Mutations = schema.Table(.{
+pub const Mutations = schema.Table(&.{
     .{ .id = 1, .name = "namespace", .ty = schema.U64 },
     .{ .id = 2, .name = "kvs", .ty = schema.Array(KeyValue) },
 });
@@ -196,7 +196,7 @@ fn tableId(comptime local_id: u16) u16 {
     return ZDB_TABLE_NS | local_id;
 }
 
-pub const tables = .{
+pub const records: []const schema.Named = &.{
     .{ .name = "BlockIndex", .ty = BlockIndex, .id = tableId(1) },
     .{ .name = "TableIndex", .ty = TableIndex, .id = tableId(2) },
     .{ .name = "BinaryFuseFilter", .ty = BinaryFuseFilter, .id = tableId(3) },
