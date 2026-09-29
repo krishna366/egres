@@ -12,7 +12,10 @@ const String = utils.String;
 /// readers return 0 for slots past size_bytes), and that's exactly the case we
 /// need to reject.
 ///
-/// 1: [u64 crc][u32 entry_count][u32 entry_off × n][entries region]
+/// 1: [u64 crc][u8 codec][payload], the crc over the codec byte and the
+///    stored payload; the payload, decoded per the codec byte, is
+///    [u32 entry_count][u32 entry_end × n][entries region]
+///    (buffers.zig's Block, BlockPayload and BlockEntry)
 ///    entries region contains one entry per key in this format:
 ///    [u16 key_overlap][u16 key_diff_len][key diff][packed versions]
 ///    packed versions, newest first:

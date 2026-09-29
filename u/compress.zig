@@ -7,8 +7,8 @@ const String = @import("utils.zig").String;
 // - .lz4: [u32 raw_len][lz4 block]
 pub const Codec = enum(u8) {
     none = 0,
-    zstd = 1,
-    lz4 = 2,
+    lz4 = 1,
+    zstd = 2,
 };
 
 pub const Error = std.mem.Allocator.Error || error{

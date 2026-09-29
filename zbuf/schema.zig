@@ -252,6 +252,22 @@ pub fn camelName(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
     return out;
 }
 
+/// The singular of a plural field name, for one element of an array:
+/// `entries` to `entry`, `versions` to `version`. A name that is not
+/// plural is returned as is.
+pub fn singularName(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, name, "ies")) {
+        const out = try alloc.alloc(u8, name.len - 2);
+        @memcpy(out[0 .. name.len - 3], name[0 .. name.len - 3]);
+        out[name.len - 3] = 'y';
+        return out;
+    }
+    if (std.mem.endsWith(u8, name, "s") and !std.mem.endsWith(u8, name, "ss")) {
+        return try alloc.dupe(u8, name[0 .. name.len - 1]);
+    }
+    return try alloc.dupe(u8, name);
+}
+
 pub fn camelNameCapitalized(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
     const base = try camelName(alloc, name);
     defer alloc.free(base);

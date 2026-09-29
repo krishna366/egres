@@ -1,5 +1,6 @@
 const std = @import("std");
 const utils = @import("utils");
+const compress = utils.compression;
 const String = utils.String;
 const zdb = @import("zdb");
 const zbuf = @import("zbuf").zbuf;
@@ -143,6 +144,150 @@ test "table builder/reader roundtrip and seek" {
 
     try it.seekRange(.{ .primary = "b" }, Key.inf);
     try std.testing.expectEqualStrings("vb3", it.itemRef().?.newest().value);
+}
+
+test "table elects no codec when its sample does not compress" {
+    // A value of random bytes: lz4 finds nothing to shrink, so the
+    // table must come out uncompressed and still read back; a value of
+    // one repeated byte shrinks, so the codec stays. One key per table:
+    // a second copy of the same value would compress as a repeat. One
+    // block, under the sample, so its codec byte alone says.
+    var prng = std.Random.DefaultPrng.init(7);
+    var random: [4096]u8 = undefined;
+    prng.random().bytes(&random);
+    const same = [_]u8{'x'} ** 4096;
+
+    for ([_]struct { val: []const u8, want: compress.Codec }{
+        .{ .val = &random, .want = .none },
+        .{ .val = &same, .want = .lz4 },
+    }) |case| {
+        var b = Builder.init(std.testing.allocator, .{ .codec = .lz4 });
+        defer b.deinit();
+        try b.add(.{ .primary = "b" }, 1, case.val);
+        var tb = try b.finish();
+        defer tb.deinit();
+
+        const r = try Table.openHandle(
+            std.testing.allocator,
+            try fromBuf(std.testing.allocator, tb.bytes),
+            .p0,
+        );
+        defer destroyTable(r);
+        try std.testing.expectEqual(case.want, blockCodec(tb.bytes, r, 0));
+
+        var it = TableIterator.init(
+            std.testing.allocator,
+            r,
+            .p0,
+            zero_table_key,
+        );
+        defer it.deinit();
+        try it.seekRange(.{ .primary = "b" }, Key.inf);
+        const got = it.itemRef().?.newest().value;
+        try std.testing.expectEqualSlices(u8, case.val, got);
+    }
+}
+
+test "table election over many blocks, blocks stored per their own codec" {
+    // Enough distinct random values to fill the sample and go past it,
+    // in small blocks, one value each: the election drops the codec
+    // mid-table, and every block reads back whatever it was stored
+    // as. A table smaller than the sample never elects. The
+    // compressible twin keeps its codec, and a mixed table keeps it
+    // too, with its random blocks stored raw and its repeated ones
+    // compressed: each block's codec byte says which it was.
+    const alloc = std.testing.allocator;
+    const val_len = 4096;
+    const block = 8 * 1024;
+    const elect_bytes = zdb.table.builder.Compression.elect_bytes;
+    const past_sample = elect_bytes / val_len + 64;
+    const under_sample = 16;
+
+    const Fill = enum { random, same, mixed };
+    for ([_]struct { n: usize, fill: Fill, want: ?compress.Codec }{
+        .{ .n = past_sample, .fill = .random, .want = .none },
+        .{ .n = under_sample, .fill = .random, .want = null },
+        .{ .n = past_sample, .fill = .same, .want = .lz4 },
+        .{ .n = past_sample, .fill = .mixed, .want = .lz4 },
+    }) |case| {
+        var prng = std.Random.DefaultPrng.init(11);
+        var b = Builder.init(alloc, .{
+            .codec = .lz4,
+            .target_block_size = block,
+        });
+        defer b.deinit();
+        var val: [val_len]u8 = undefined;
+        var i: usize = 0;
+        while (i < case.n) : (i += 1) {
+            fillValue(&prng, case.fill, i, &val);
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try b.add(.{ .primary = &key }, 1, &val);
+        }
+        var tb = try b.finish();
+        defer tb.deinit();
+
+        const r = try Table.openHandle(
+            alloc,
+            try fromBuf(alloc, tb.bytes),
+            .p0,
+        );
+        defer destroyTable(r);
+        // `want` is what the election chose, null when the table was
+        // too small to hold one; a random block is stored raw either way.
+        try std.testing.expectEqual(case.want, b.compression.elected);
+        try std.testing.expectEqual(case.n, r.blockCount());
+        for (0..r.blockCount()) |bi| {
+            const key = r.index.blocks[bi].key;
+            const ki = std.mem.readInt(u64, key[0..8], .big);
+            const is_random = case.fill == .random or
+                (case.fill == .mixed and ki % 2 == 0);
+            const want_block: compress.Codec = if (is_random) .none else .lz4;
+            const got_block = blockCodec(tb.bytes, r, bi);
+            try std.testing.expectEqual(want_block, got_block);
+        }
+
+        // Replay the values and check every key, first to last.
+        prng = std.Random.DefaultPrng.init(11);
+        var it = TableIterator.init(alloc, r, .p0, zero_table_key);
+        defer it.deinit();
+        try it.seekRange(Key.inf, Key.inf);
+        i = 0;
+        while (i < case.n) : (i += 1) {
+            fillValue(&prng, case.fill, i, &val);
+            const item = it.itemRef() orelse return error.TestUnexpectedResult;
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try std.testing.expectEqualSlices(u8, &key, item.key.primary);
+            try std.testing.expectEqualSlices(u8, &val, item.newest().value);
+            try it.next();
+        }
+        try std.testing.expect(it.itemRef() == null);
+    }
+}
+
+/// Block `i`'s codec byte, read from its envelope in the table bytes.
+fn blockCodec(bytes: []const u8, r: *Table, i: usize) compress.Codec {
+    const off: usize = r.index.blocks[i].offset;
+    return @enumFromInt(bytes[off + 8]);
+}
+
+/// The i-th value of an election test table: random bytes, one
+/// repeated byte, or the two alternating by key.
+fn fillValue(
+    prng: *std.Random.DefaultPrng,
+    fill: anytype,
+    i: usize,
+    val: []u8,
+) void {
+    switch (fill) {
+        .random => prng.random().bytes(val),
+        .same => @memset(val, @as(u8, @truncate(i))),
+        .mixed => if (i % 2 == 0)
+            prng.random().bytes(val)
+        else
+            @memset(val, @as(u8, @truncate(i))),
+    }
 }
 
 // seekGe compares stored keys in place, against the base key plus a diff,
@@ -790,8 +935,8 @@ test "packed: n versions cost at most 4 + 13n bytes over one" {
     const tn = try buildItems(alloc, &all);
     defer destroyTable(tn);
     const grew = tn.index.uncompressed_size - t1.index.uncompressed_size;
-    try std.testing.expect(grew <= Builder.ver_hdr_len * (n - 1));
-    try std.testing.expect(grew >= Builder.ver_hdr_len * (n - 1));
+    const ver_hdr = zdb.buffers.BlockVersionReader.SIZE;
+    try std.testing.expectEqual(ver_hdr * (n - 1), grew);
 }
 
 // ---------------------------------------------------------------------------

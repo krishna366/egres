@@ -638,7 +638,7 @@ test "packed: an entry round-trips and is laid out byte for byte" {
         .versions = &vers,
         .values = "xyz",
     });
-    try std.testing.expectEqual(@as(u32, 0), w.finish());
+    w.finish();
 
     // [u16 5][u16 2]"ab"[u32 2][ts 9,meta 0x80,off 0][ts 3,meta 0,off 2]"xyz"
     const want = [_]u8{
@@ -650,15 +650,30 @@ test "packed: an entry round-trips and is laid out byte for byte" {
     try std.testing.expectEqualSlices(u8, &want, buf.items);
     try std.testing.expectEqual(@as(u32, 13), gen.VersionHdrReader.SIZE);
 
+    // The same record a field at a time, the values in two pieces:
+    // byte for byte what `set` wrote.
+    var piecewise: std.ArrayList(u8) = .empty;
+    defer piecewise.deinit(alloc);
+    var pw = gen.EntryWriter.initWithBuf(alloc, &piecewise);
+    try pw.setKeyOverlap(5);
+    try pw.setKeyDiff("ab");
+    try pw.versionCount(vers.len);
+    for (vers) |v| try pw.addVersion(v);
+    try pw.addValues("xy");
+    try pw.addValues("z");
+    pw.finish();
+    try std.testing.expectEqualSlices(u8, buf.items, piecewise.items);
+
     const r = gen.EntryReader.init(buf.items);
     try std.testing.expectEqual(buf.items.len, @as(usize, r.size()));
     try std.testing.expectEqual(@as(u16, 5), r.keyOverlap());
     try std.testing.expectEqualStrings("ab", r.keyDiff());
-    try std.testing.expectEqual(@as(u32, 2), r.versionsLen());
-    const v1 = try r.versionsAt(1);
+    const vers_view = r.versions();
+    try std.testing.expectEqual(@as(u32, 2), vers_view.len());
+    const v1 = try vers_view.at(1);
     try std.testing.expectEqual(@as(u64, 3), v1.ts());
     try std.testing.expectEqual(@as(u32, 2), v1.off());
-    try std.testing.expectError(zbuf.Error.OutOfBounds, r.versionsAt(2));
+    try std.testing.expectError(zbuf.Error.OutOfBounds, vers_view.at(2));
     try std.testing.expectEqualStrings("xyz", r.values());
 
     var st = try r.toStructValue(alloc);
@@ -690,7 +705,30 @@ test "packed: records of varying size are indexed by their ends" {
     defer block.deinit(alloc);
     var bw = gen.BlockWriter.initWithBuf(alloc, &block);
     try bw.set(.{ .entries = &entries, .crc = 0xC0FFEE });
-    _ = bw.finish();
+    bw.finish();
+
+    // The same block from entries encoded beforehand: byte for byte.
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(alloc);
+    var ends: [3]usize = undefined;
+    for (entries, 0..) |e, i| {
+        var ew = gen.EntryWriter.initWithBuf(alloc, &encoded);
+        try ew.set(e);
+        ew.finish();
+        ends[i] = encoded.items.len;
+    }
+    var from_bytes: std.ArrayList(u8) = .empty;
+    defer from_bytes.deinit(alloc);
+    var bw2 = gen.BlockWriter.initWithBuf(alloc, &from_bytes);
+    try bw2.entryCount(entries.len);
+    var start: usize = 0;
+    for (ends) |end| {
+        try bw2.addEntryBytes(encoded.items[start..end]);
+        start = end;
+    }
+    try bw2.setCrc(0xC0FFEE);
+    bw2.finish();
+    try std.testing.expectEqualSlices(u8, block.items, from_bytes.items);
 
     // [u32 3][u32 end × 3][records][u64 crc]: each entry is 2 + 2 + key
     // + 4 + 13 + values bytes, and the ends accumulate.
@@ -700,17 +738,19 @@ test "packed: records of varying size are indexed by their ends" {
     try std.testing.expectEqual(lens[0] + lens[1] + lens[2], zbuf.readU32(block.items, 12) catch unreachable);
 
     const br = gen.BlockReader.init(block.items);
-    try std.testing.expectEqual(@as(u32, 3), br.entriesLen());
+    const es = br.entries();
+    try std.testing.expectEqual(@as(u32, 3), es.len());
     try std.testing.expectEqual(@as(u64, 0xC0FFEE), br.crc());
     try std.testing.expectEqual(@as(u32, @intCast(block.items.len)), br.size());
     for (keys, 0..) |k, i| {
-        const er = try br.entriesAt(@intCast(i));
+        const er = try es.at(@intCast(i));
         try std.testing.expectEqualStrings(k, er.keyDiff());
         try std.testing.expectEqualStrings(k, er.values());
-        try std.testing.expectEqual(@as(u64, i), (try er.versionsAt(0)).ts());
+        const v0 = try er.versions().at(0);
+        try std.testing.expectEqual(@as(u64, i), v0.ts());
         try std.testing.expectEqual(lens[i], er.size());
     }
-    try std.testing.expectError(zbuf.Error.OutOfBounds, br.entriesAt(3));
+    try std.testing.expectError(zbuf.Error.OutOfBounds, es.at(3));
 
     // The struct form round-trips through the table too.
     var st = try br.toStructValue(alloc);
@@ -724,7 +764,7 @@ test "packed: records of varying size are indexed by their ends" {
 
     // An end that runs backwards is refused.
     block.items[8] = 1; // end(1) < end(0)
-    try std.testing.expectError(zbuf.Error.Invalid, br.entriesAt(1));
+    try std.testing.expectError(zbuf.Error.Invalid, br.entries().at(1));
 }
 
 test "packed: nested record, enum, and every prefix width" {
@@ -743,7 +783,7 @@ test "packed: nested record, enum, and every prefix width" {
         .weights = &weights,
         .note = "n",
     });
-    _ = w.finish();
+    w.finish();
     // 1 + 8 + (1 + 2) + (1 + 2 * 8) + (4 + 3 * 2) + (4 + 1)
     try std.testing.expectEqual(@as(usize, 44), buf.items.len);
 
@@ -751,8 +791,8 @@ test "packed: nested record, enum, and every prefix width" {
     try std.testing.expectEqual(gen.LifecycleEnum.draining, r.lifecycle());
     try std.testing.expectEqual(@as(u32, 20), r.origin().y());
     try std.testing.expectEqualStrings("sq", r.name());
-    try std.testing.expectEqual(@as(u32, 2), r.cornersLen());
-    try std.testing.expectEqual(@as(u32, 3), (try r.cornersAt(1)).x());
+    try std.testing.expectEqual(@as(u32, 2), r.corners().len());
+    try std.testing.expectEqual(@as(u32, 3), (try r.corners().at(1)).x());
     try std.testing.expectEqual(@as(u16, 9), try r.weightsAt(2));
     try std.testing.expectEqualStrings("n", r.note());
 

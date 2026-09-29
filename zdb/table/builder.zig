@@ -7,7 +7,7 @@ const _idx = @import("index.zig");
 const _buffers = @import("../buffers.gen.zig");
 const utils = @import("utils");
 const String = utils.String;
-const compress = utils.compression;
+const _compress = utils.compression;
 const _binaryfuse = @import("../binaryfusefilter.zig");
 const zroar = @import("zroar");
 const vfs = @import("vfs");
@@ -26,41 +26,54 @@ const log = std.log.scoped(.table_builder);
 // [u32 index_len]
 // [u64 index_hash]
 //
-// Block layout is set as:
+// A block on disk is an envelope around its payload, `buffers.Block`:
 // | ------------------------------------------------------------------------|
-// | -- block crc u64 -- | -- entry count u32 -- |
-// | --- offsets to entries, each offset is u32, entry_count of them --- |
+// | -- block crc u64 -- | -- codec u8 -- | -- payload -- |
+// | ------------------------------------------------------------------------|
+// The crc (xxhash3, zbuf.hash) covers the codec byte and the payload as
+// stored, so a reader verifies a block before decoding it and a scrub
+// verifies a table without decoding anything. The codec byte says how
+// THIS block's payload is stored; blocks of one table may differ (see
+// Config.codec). The payload, decoded, is a `buffers.BlockPayload`, one
+// packed array of variable-size entries:
+// | ------------------------------------------------------------------------|
+// | -- entry count u32 -- |
+// | --- end offset of each entry, u32 each, entry_count of them --- |
 // | --- entries region --- |
 // | ------------------------------------------------------------------------|
 //
-// Note that we only store the start offset of each entry i, not the end, because
-// the end offset of entry i = the start offset of entry i+1.
+// The table holds where each entry ENDS within the entries region, so
+// entry i is [end(i-1), end(i)) with end(-1) = 0, and the last end is
+// the region's length: a reader bounds every entry from the table alone.
 //
-// Each entry is one key with every version of it, stored as such:
+// Each entry is one key with every version of it, a `buffers.BlockEntry`:
 // | ----------------------------------------------------------------------|
 // | -- u16 key overlap with base -- | -- u16 key diff length from base -- |
 // | -- key diff bytes -- | -- packed versions ------------------------- |
 // | ----------------------------------------------------------------------|
 //
-// The packed versions are, newest first:
+// The packed versions are, newest first, a count of `buffers.BlockVersion`
+// headers and then the bytes of every version:
 // | -- u32 count -- | count x { u64 ts, u8 meta, u32 off } -- | -- bytes -- |
 // where version i's value is bytes[off_i .. off_(i+1)), the last one's
 // runs to the end, and off_0 is 0. A tombstone is a version with no bytes.
 // The headers are fixed width, so the version at or below a read
 // timestamp is a binary search, and a value is a slice into the block.
-// The header is decoded field by field (readInt at 4 + 13 i): a Zig packed
-// struct rounds to its backing integer and an extern struct pads to its
-// alignment, so neither gives the 13-byte stride.
+//
+// The packed records' generated readers and writers (zdb/buffers.gen.zig)
+// are the layout's source of truth: `addItem` writes an entry with
+// `BlockEntryWriter`, `finishBlock` the payload's table and envelope by
+// hand because both stream (the ends are known before the entries are
+// laid down, the compressed payload goes straight into table_buf).
 //
 // Notes:
 // - Everything needed to locate anything sits at the FRONT, in a header of
-//   known shape: the crc, the entry count, then the offsets. The reader
-//   walks it forward at fixed strides instead of unwinding a chain of
-//   subtractions from the block's end. The crc covers every byte after it,
-//   so it is written last, backpatched into the 8 bytes reserved for it at
-//   offset 0.
+//   known shape: the entry count, then the ends. The reader walks it
+//   forward at fixed strides instead of unwinding a chain of subtractions
+//   from the block's end. The envelope's crc covers every byte after it,
+//   so it is written last, backpatched into the 8 bytes reserved for it.
 //
-// - Entry offsets are relative to the entries region, so they need no
+// - Entry ends are relative to the entries region, so they need no
 //   rewriting once the header's size (which follows from the entry count)
 //   is known.
 //
@@ -73,23 +86,21 @@ const log = std.log.scoped(.table_builder);
 //   whatever the layout. Separation only pays where it lets you avoid
 //   LOADING bytes, which within one block it never does.
 //
-// - An entry's stored key is the marshaled key ([ns u64 BE][tid u32 BE]
-//   [primary], see kv.zig); a version's timestamp lives in its packed
-//   header. Entries ascend by key, which is bytewise order.
+// - An entry's stored key is the primary alone (the namespace and
+//   table_id are the tree's, see addItem); a version's timestamp lives
+//   in its packed header. Entries ascend by key, which is bytewise order.
 //
 // - Keys are prefix-compressed against the block base key (first key in block),
 //   not against the previous key. This is useful because it allows us random
 //   access to any idx on the block entry, and derive its key.
 //
-// - An entry's value length is implicit — it runs to the next entry's
-//   offset — so the packed versions carry their own count and offsets up
-//   front, where the reader's bounds checks cover them before any value
-//   math.
+// - An entry's value length is implicit — it runs to the entry's end —
+//   so the packed versions carry their own count and offsets up front,
+//   where the reader's bounds checks cover them before any value math.
 //
-// - entry_off_* values point to entry starts within the entries region.
-// - Checksums are xxhash3 u64 (zbuf.hash) over the uncompressed block bytes
-//   prior to the checksum field. Blocks are then optionally compressed; the
-//   stored checksum remains over the uncompressed data.
+// - Checksums are xxhash3 u64 (zbuf.hash) over the block's stored bytes
+//   after the checksum field: the codec byte and the payload, compressed
+//   or not. A corrupt block is rejected before any decoding.
 // - TableIndex (zbuf) contains block offsets, max_version, key_count, sizes,
 //   format_version, and a binary fuse filter over the keys' primaries.
 // - All integer fields are little-endian. (Keys marshal big-endian — see
@@ -104,11 +115,15 @@ pub const Error = error{
     /// A key of a rows tree that is not an 8-byte egid.
     KeyNotEgid,
     UnknownTreeKind,
-} || _buffers.Error || compress.Error || std.mem.Allocator.Error || _binaryfuse.Error;
+} || _buffers.Error || _compress.Error || std.mem.Allocator.Error ||
+    _binaryfuse.Error;
 
 pub const Config = struct {
     target_block_size: usize = 32 * 1024,
-    codec: compress.Codec = .none,
+    /// The codec the table is asked for. Each block carries its own
+    /// codec byte, and whether a block is stored compressed, and
+    /// whether later blocks are tried at all, is the `Election`'s.
+    codec: _compress.Codec = .none,
     priority: vfs.Priority = .p2,
     /// The tree the table is built for (`buffers.TreeKind`), which
     /// picks its filter. A rows table keeps its keys, 8-byte big-endian
@@ -122,11 +137,118 @@ pub const Config = struct {
     kind: _buffers.TreeKindEnum = .posting_index,
 };
 
+/// A table's block compression: the scratch it runs in, and whether
+/// it is worth it, decided per block and once for the table. A block
+/// that saves less than `min_saving` of its bytes is stored raw, so a
+/// mixed table keeps compression on the blocks that earn it. The table
+/// also elects whether to keep trying: a payload that does not
+/// compress (random bytes, base64 of them) still costs the codec's
+/// full pass, and on such data lz4 was three quarters of a flush's
+/// CPU and zstd two thirds of a compaction's for nothing, so once the
+/// first `elect_bytes` of blocks have saved less than `min_saving` in
+/// total, no later block is compressed. A reader takes each block's
+/// codec byte; nothing records the table's.
+pub const Compression = struct {
+    alloc: std.mem.Allocator,
+    /// Where a block is compressed; `compress` returns a slice of it.
+    buf: std.ArrayList(u8) = .empty,
+    /// The codec the table was configured with, and asks for until the
+    /// election.
+    configured: _compress.Codec,
+    /// The election's choice, once held: `configured` or `.none`.
+    elected: ?_compress.Codec = null,
+    /// The sample: raw and compressed totals of every block compressed
+    /// so far, whatever each block was then stored as.
+    sample_in: u64 = 0,
+    sample_out: u64 = 0,
+
+    /// The least a block, and the sample, must shrink for the codec to
+    /// be worth it: one byte in eight. Base64 of random bytes sits
+    /// right at this line under zstd (six bits of entropy per byte, so
+    /// about a quarter saved) and well under it with lz4 (no repeats
+    /// to find).
+    pub const min_saving: f64 = 1.0 / 8.0;
+
+    /// Raw bytes of blocks the election looks at before deciding: 16
+    /// blocks at the default block size, 3% of a 32 MiB L1 table and
+    /// under 1% of a flush's. A table with less than this never holds
+    /// one: every block of it is tried.
+    pub const elect_bytes: usize = 1 << 20;
+
+    /// A block's payload as it is stored: the codec it is stored with
+    /// and its bytes, which are the payload itself under `.none`.
+    pub const Payload = struct {
+        codec: _compress.Codec,
+        bytes: String,
+    };
+
+    pub fn init(alloc: std.mem.Allocator, codec: _compress.Codec) Compression {
+        return .{ .alloc = alloc, .configured = codec };
+    }
+
+    pub fn deinit(self: *Compression) void {
+        self.buf.deinit(self.alloc);
+    }
+
+    /// The next table holds its own election; the scratch keeps its
+    /// capacity.
+    pub fn reset(self: *Compression) void {
+        utils.clearRetainCap(&self.buf);
+        self.elected = null;
+        self.sample_in = 0;
+        self.sample_out = 0;
+    }
+
+    /// A block's `payload` as the block stores it: compressed with the
+    /// codec the table asks for when that shrinks it enough, else raw.
+    /// The block also joins the sample until the election, which is
+    /// held as soon as the sample is large enough. The bytes are valid
+    /// until the next call.
+    pub fn compress(self: *Compression, payload: String) Error!Payload {
+        const codec = self.elected orelse self.configured;
+        if (codec == .none) return .{ .codec = .none, .bytes = payload };
+
+        utils.clearRetainCap(&self.buf);
+        const clen = try _compress.compress(
+            self.alloc,
+            codec,
+            payload,
+            &self.buf,
+        );
+
+        // The election, over the sample's totals so one odd block does
+        // not decide alone: a codec that has not earned its pass is
+        // not tried on any later block. The blocks already written
+        // keep whatever each was stored as.
+        if (self.elected == null) {
+            self.sample_in += payload.len;
+            self.sample_out += clen;
+            if (self.sample_in >= elect_bytes) {
+                const earned = worthKeeping(self.sample_in, self.sample_out);
+                self.elected = if (earned) codec else .none;
+            }
+        }
+        // Per block, whatever the table decides.
+        if (!worthKeeping(payload.len, clen))
+            return .{ .codec = .none, .bytes = payload };
+        return .{ .codec = codec, .bytes = self.buf.items };
+    }
+
+    /// Whether bytes that compressed from `raw` to `compressed` saved
+    /// at least `min_saving` of themselves.
+    fn worthKeeping(raw: u64, compressed: u64) bool {
+        const saved = if (compressed < raw) raw - compressed else 0;
+        const saved_f: f64 = @floatFromInt(saved);
+        const raw_f: f64 = @floatFromInt(raw);
+        return saved_f >= raw_f * min_saving;
+    }
+};
+
 const BlockInfo = struct {
     // base_key is the first key of the block. It is used to prefix-decode
     // all keys in that block.
     base_key: []u8,
-    // offset/len point to the finalized block bytes inside table_bytes.
+    // offset/len point to the finalized block bytes inside table_buf.
     offset: u32,
     len: u32,
 };
@@ -147,13 +269,19 @@ pub const TableBuffer = struct {
 pub const Builder = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
-    table_bytes: std.ArrayList(u8),
-    /// Where finishBlock assembles a block: header, then the entries the
-    /// two cur_* buffers below accumulated. Kept separate from them
-    /// because the header's size isn't known until the block is complete.
+    compression: Compression,
+
+    table_buf: std.ArrayList(u8),
+    /// Where finishBlock assembles a block's payload: its end table,
+    /// then the entries from entries_buf. Kept separate because the
+    /// table's size isn't known until the block is complete.
     block_buf: std.ArrayList(u8),
-    cur_entries: std.ArrayList(u8),
-    cur_offsets: std.ArrayList(u32),
+    /// The open block's entries, encoded as they are added.
+    entries_buf: std.ArrayList(u8),
+
+    /// Where each entry of the open block ends in entries_buf: the
+    /// payload's end table, filled as entries are added.
+    entry_ends: std.ArrayList(u32),
     cur_base_key: std.ArrayList(u8),
     block_infos: std.ArrayList(BlockInfo),
     last_key: std.ArrayList(u8),
@@ -177,14 +305,15 @@ pub const Builder = struct {
     stale_data_size: u32,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Builder {
-        // TODO: Choose sane defaults for table_bytes and cur_entries.
+        // TODO: Choose sane defaults for table_buf and entries_buf.
         return .{
             .allocator = allocator,
             .cfg = cfg,
-            .table_bytes = .empty,
+            .compression = Compression.init(allocator, cfg.codec),
+            .table_buf = .empty,
             .block_buf = .empty,
-            .cur_entries = .empty,
-            .cur_offsets = .empty,
+            .entries_buf = .empty,
+            .entry_ends = .empty,
             .cur_base_key = .empty,
             .block_infos = .empty,
             .last_key = .empty,
@@ -207,14 +336,15 @@ pub const Builder = struct {
         self.bf_hashes.deinit(self.allocator);
         if (self.egid_bm) |*bm| bm.deinit();
         self.cur_base_key.deinit(self.allocator);
-        self.cur_offsets.deinit(self.allocator);
-        self.cur_entries.deinit(self.allocator);
+        self.entry_ends.deinit(self.allocator);
+        self.entries_buf.deinit(self.allocator);
         self.block_buf.deinit(self.allocator);
-        self.table_bytes.deinit(self.allocator);
+        self.table_buf.deinit(self.allocator);
+        self.compression.deinit();
     }
 
     /// reset clears all state so the builder can produce a new table without
-    /// reallocating its backing buffers (especially table_bytes).
+    /// reallocating its backing buffers (especially table_buf).
     pub fn reset(self: *Builder) void {
         for (self.block_infos.items) |info| {
             self.allocator.free(info.base_key);
@@ -228,10 +358,11 @@ pub const Builder = struct {
         if (self.egid_bm) |*bm| bm.deinit();
         self.egid_bm = null;
         utils.clearRetainCap(&self.cur_base_key);
-        utils.clearRetainCap(&self.cur_offsets);
-        utils.clearRetainCap(&self.cur_entries);
+        utils.clearRetainCap(&self.entry_ends);
+        utils.clearRetainCap(&self.entries_buf);
         utils.clearRetainCap(&self.block_buf);
-        utils.clearRetainCap(&self.table_bytes);
+        utils.clearRetainCap(&self.table_buf);
+        self.compression.reset();
         self.key_count = 0;
         self.max_version = 0;
         self.uncompressed_size = 0;
@@ -264,10 +395,6 @@ pub const Builder = struct {
         });
     }
 
-    /// Bytes of packed-version header per version: u64 ts, u8 meta,
-    /// u32 off.
-    pub const ver_hdr_len: usize = 13;
-
     /// Write `item` as one entry: its key, then its versions packed
     /// newest first. Keys must arrive strictly ascending, one item per
     /// key; an item's versions must descend strictly in timestamp.
@@ -282,7 +409,8 @@ pub const Builder = struct {
         if (key.primary.len > std.math.maxInt(u16)) return error.KeyTooLarge;
 
         var prev_ts: ?u64 = null;
-        var packed_len = 4 + ver_hdr_len * vers.len;
+        const ver_hdr = _buffers.BlockVersionReader.SIZE;
+        var packed_len = 4 + ver_hdr * vers.len;
         for (vers) |ver| {
             if (prev_ts) |pt| {
                 if (ver.ts >= pt) return error.KeyOrderViolation;
@@ -357,23 +485,30 @@ pub const Builder = struct {
         const diff = entry_key[overlap..];
         if (diff.len > std.math.maxInt(u16)) return error.KeyTooLarge;
 
-        // cur_offsets stores the start offset of each entry in cur_entries,
-        // recorded before the append so it names where this entry begins.
-        try self.cur_offsets.append(
-            self.allocator,
-            @intCast(self.cur_entries.items.len),
-        );
-
-        // Per-entry encoding:
-        //   [u16 overlap][u16 diff_len][diff bytes][packed versions]
-        // The entry's end is the next entry's offset (or the end of the
-        // entries region). See the layout notes at the top.
-        const out = &self.cur_entries;
+        // The entry, a BlockEntry (see the layout notes at the top):
+        // the key, the versions' headers newest first with each `off`
+        // where its bytes start among the values, then the values.
+        const out = &self.entries_buf;
         try out.ensureUnusedCapacity(self.allocator, 4 + diff.len + packed_len);
-        try appendU16(out, self.allocator, @intCast(overlap));
-        try appendU16(out, self.allocator, @intCast(diff.len));
-        try out.appendSlice(self.allocator, diff);
-        try self.appendVersions(vers);
+
+        var entry = _buffers.BlockEntryWriter.initWithBuf(self.allocator, out);
+        try entry.setKeyOverlap(@intCast(overlap));
+        try entry.setKeyDiff(diff);
+        try entry.versionCount(vers.len);
+        var off: u32 = 0;
+        for (vers) |ver| {
+            try entry.addVersion(.{
+                .ts = ver.ts,
+                .meta = ver.meta.toByte(),
+                .off = off,
+            });
+            off += @intCast(ver.value.len);
+        }
+        for (vers) |ver| try entry.addValues(ver.value);
+        entry.finish();
+
+        // The payload's table holds where each entry ENDS.
+        try self.entry_ends.append(self.allocator, @intCast(out.items.len));
 
         // Newest first, so the item's max is its first version.
         self.max_version = @max(self.max_version, item.newest().ts);
@@ -382,24 +517,6 @@ pub const Builder = struct {
             return error.IntegerOverflow;
         }
         self.key_count += n;
-    }
-
-    /// Append `versions` packed, per the layout at the top: the count,
-    /// one fixed header per version with its offset into the bytes that
-    /// follow, then the bytes.
-    fn appendVersions(self: *Builder, versions: []const Version) Error!void {
-        const out = &self.cur_entries;
-        try appendU32(out, self.allocator, @intCast(versions.len));
-        var off: u32 = 0;
-        for (versions) |ver| {
-            try appendU64(out, self.allocator, ver.ts);
-            try out.append(self.allocator, ver.meta.toByte());
-            try appendU32(out, self.allocator, off);
-            off += @intCast(ver.value.len);
-        }
-        for (versions) |ver| {
-            try out.appendSlice(self.allocator, ver.value);
-        }
     }
 
     /// How many entries of `bf_hashes` repeat another one. Only for the
@@ -491,7 +608,6 @@ pub const Builder = struct {
             .stale_data_size = self.stale_data_size,
             .format_version = _idx.format_version,
         });
-        try index_writer.setCompression(@enumFromInt(@intFromEnum(self.cfg.codec)));
         if (binary_fuse_off) |off| {
             try index_writer.setBinaryFuse(off);
         }
@@ -515,95 +631,101 @@ pub const Builder = struct {
         // unaligned-tail write could be silently dropped on some kernels;
         // the cost is at most page_size-1 zero bytes per SST.
         const tail_size = index_bytes.items.len + _idx.trailer_len;
-        const total_unpadded = self.table_bytes.items.len + tail_size;
+        const total_unpadded = self.table_buf.items.len + tail_size;
         const remainder = total_unpadded % vfs.page_size;
         const pad_bytes = if (remainder == 0) 0 else vfs.page_size - remainder;
-        if (pad_bytes > 0) try self.table_bytes.appendNTimes(self.allocator, 0, pad_bytes);
+        if (pad_bytes > 0) try self.table_buf.appendNTimes(self.allocator, 0, pad_bytes);
 
-        try self.table_bytes.appendSlice(self.allocator, index_bytes.items);
-        const trailer_at = self.table_bytes.items.len;
-        try appendU32(&self.table_bytes, self.allocator, index_len);
-        try appendU64(&self.table_bytes, self.allocator, index_checksum);
+        try self.table_buf.appendSlice(self.allocator, index_bytes.items);
+        const trailer_at = self.table_buf.items.len;
+        try zbuf.appendInt(u32, &self.table_buf, self.allocator, index_len);
+        try zbuf.appendInt(
+            u64,
+            &self.table_buf,
+            self.allocator,
+            index_checksum,
+        );
         // The reader seeks by idx.trailer_len, so what we wrote has to be
         // exactly that wide — the padding above was sized on it too.
-        std.debug.assert(self.table_bytes.items.len - trailer_at ==
+        std.debug.assert(self.table_buf.items.len - trailer_at ==
             _idx.trailer_len);
 
-        std.debug.assert(self.table_bytes.items.len % vfs.page_size == 0);
+        std.debug.assert(self.table_buf.items.len % vfs.page_size == 0);
 
         // Copy into a page-aligned buffer (an ArrayList's backing has only
         // byte alignment) so the result satisfies O_DIRECT's address-alignment
-        // requirement. Retain the table_bytes capacity for the next SST.
-        const len = self.table_bytes.items.len;
+        // requirement. Retain the table_buf capacity for the next SST.
+        const len = self.table_buf.items.len;
         const bytes = try self.allocator.alignedAlloc(u8, vfs.page_alignment, len);
-        @memcpy(bytes, self.table_bytes.items);
-        utils.clearRetainCap(&self.table_bytes);
+        @memcpy(bytes, self.table_buf.items);
+        utils.clearRetainCap(&self.table_buf);
         return .{ .allocator = self.allocator, .bytes = bytes };
     }
 
     fn shouldFinishBlock(self: *Builder, new_entry_est: usize) bool {
-        if (self.cur_offsets.items.len == 0) return false;
+        if (self.entry_ends.items.len == 0) return false;
 
-        // Block header layout, counting the entry we're about to add:
-        // 8 bytes checksum (xxhash3, see zbuf.hash)
-        // + 4 bytes entry_count
-        // + (entry_count + 1) offsets * 4 bytes each
-        const n = self.cur_offsets.items.len;
-        const header_est = 8 + 4 + (n + 1) * 4;
-        const estimated = self.cur_entries.items.len +
+        // Block layout, counting the entry we're about to add: the
+        // envelope (crc and codec, up to the payload) + 4 bytes
+        // entry_count + (entry_count + 1) ends * 4 bytes each
+        const n = self.entry_ends.items.len;
+        const envelope = _buffers.BlockReader.payload_off;
+        const header_est = envelope + 4 + (n + 1) * 4;
+        const estimated = self.entries_buf.items.len +
             new_entry_est + header_est;
         return estimated > self.cfg.target_block_size;
     }
 
     fn finishBlock(self: *Builder) Error!void {
-        if (self.cur_offsets.items.len == 0) return;
+        if (self.entry_ends.items.len == 0) return;
         if (self.block_infos.items.len >= std.math.maxInt(u32)) return error.TooManyBlocks;
 
         // Capture block base key before scratch buffers are reset.
         const base_key = try self.allocator.dupe(u8, self.cur_base_key.items);
         errdefer self.allocator.free(base_key);
 
-        // Header first: [u64 crc][u32 entry_count][u32 entry_off × n].
-        // Its size follows from the entry count, so the region-relative
-        // offsets recorded while adding entries stay valid — the crc is
-        // the only field needing a second pass, and we reserve it here.
-        const n = self.cur_offsets.items.len;
-        const header_len = 8 + 4 + n * 4;
-
+        // The payload, a BlockPayload: [u32 entry_count][u32 end × n]
+        // [entries], the entries already encoded in entries_buf and
+        // bounded by entry_ends.
         const out = &self.block_buf;
         utils.clearRetainCap(out);
-
-        try appendU64(out, self.allocator, 0); // crc, backpatched below
-        try appendU32(out, self.allocator, @intCast(n));
-        for (self.cur_offsets.items) |off| {
-            try appendU32(out, self.allocator, off);
+        var payload = _buffers.BlockPayloadWriter.initWithBuf(
+            self.allocator,
+            out,
+        );
+        try payload.entryCount(self.entry_ends.items.len);
+        var start: usize = 0;
+        for (self.entry_ends.items) |end| {
+            try payload.addEntryBytes(self.entries_buf.items[start..end]);
+            start = end;
         }
-        std.debug.assert(out.items.len == header_len);
+        payload.finish();
 
-        try out.appendSlice(self.allocator, self.cur_entries.items);
-
-        const checksum = zbuf.hash(out.items[8..]);
-        std.mem.writeInt(u64, out.items[0..8], checksum, .little);
-
-        // Track pre-compression size; CRC was computed over the uncompressed bytes.
         const raw_len: u32 = @intCast(out.items.len);
         std.debug.assert(self.uncompressed_size <= std.math.maxInt(u32) - raw_len);
         self.uncompressed_size += raw_len;
 
-        const block_off: u32 = @intCast(self.table_bytes.items.len);
-        if (self.cfg.codec == .none) {
-            try self.table_bytes.appendSlice(self.allocator, out.items);
-        } else {
-            const clen: u32 = @intCast(try compress.compress(
-                self.allocator,
-                self.cfg.codec,
-                out.items,
-                &self.table_bytes,
-            ));
+        // The block, a Block: its envelope then the payload as stored,
+        // the crc over the codec byte and those bytes as the reader
+        // hashes them.
+        const stored = try self.compression.compress(out.items);
+        if (stored.codec != .none) {
+            const clen: u32 = @intCast(stored.bytes.len);
             std.debug.assert(self.compressed_size <= std.math.maxInt(u32) - clen);
             self.compressed_size += clen;
         }
-        const block_len: u32 = @intCast(self.table_bytes.items.len - block_off);
+
+        const block_off: u32 = @intCast(self.table_buf.items.len);
+        var block = _buffers.BlockWriter.initWithBuf(
+            self.allocator,
+            &self.table_buf,
+        );
+        const codec_byte = [_]u8{@intFromEnum(stored.codec)};
+        try block.setCrc(zbuf.hashParts(&.{ &codec_byte, stored.bytes }));
+        try block.setCodec(codec_byte[0]);
+        try block.addPayload(stored.bytes);
+        block.finish();
+        const block_len: u32 = @intCast(self.table_buf.items.len - block_off);
 
         try self.block_infos.append(self.allocator, .{
             .base_key = base_key,
@@ -612,26 +734,8 @@ pub const Builder = struct {
         });
 
         // Reuse capacity for the next block to avoid re-allocating every time.
-        utils.clearRetainCap(&self.cur_entries);
-        utils.clearRetainCap(&self.cur_offsets);
+        utils.clearRetainCap(&self.entries_buf);
+        utils.clearRetainCap(&self.entry_ends);
         utils.clearRetainCap(&self.cur_base_key);
     }
 };
-
-fn appendU16(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u16) !void {
-    var tmp: [2]u8 = undefined;
-    std.mem.writeInt(u16, &tmp, v, .little);
-    try out.appendSlice(alloc, tmp[0..]);
-}
-
-fn appendU32(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32) !void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(u32, &tmp, v, .little);
-    try out.appendSlice(alloc, tmp[0..]);
-}
-
-fn appendU64(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u64) !void {
-    var tmp: [8]u8 = undefined;
-    std.mem.writeInt(u64, &tmp, v, .little);
-    try out.appendSlice(alloc, tmp[0..]);
-}

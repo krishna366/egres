@@ -853,7 +853,7 @@ pub const Emitter = struct {
         }
         if (t.kept.items.len == 0) return;
 
-        if (e.bld.table_bytes.items.len >= e.file_sz) {
+        if (e.bld.table_buf.items.len >= e.file_sz) {
             // An item is a whole primary, so splitting the output here
             // never separates a primary's versions across tables. That
             // matters: a table holding a newer version of a key could

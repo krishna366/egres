@@ -7,13 +7,6 @@ pub const NullOffset: u32 = zbuf.NullOffset;
 
 pub const Ownership = zbuf.Ownership;
 
-pub const CompressionEnum = enum(u8) {
-    none = 0,
-    zstd = 1,
-    lz4 = 2,
-    _,
-};
-
 pub const OpEnum = enum(u8) {
     create = 0,
     delete = 1,
@@ -254,7 +247,6 @@ pub const TableIndexStruct = struct {
     uncompressed_size: u32 = 0,
     compressed_size: u32 = 0,
     stale_data_size: u32 = 0,
-    compression: CompressionEnum = @enumFromInt(0),
     last_key: []const u8 = &.{},
     blocks: []BlockIndexStruct = &.{},
     binary_fuse: ?BinaryFuseFilterStruct = null,
@@ -284,7 +276,6 @@ pub const TableIndexStruct = struct {
             .uncompressed_size = self.uncompressed_size,
             .compressed_size = self.compressed_size,
             .stale_data_size = self.stale_data_size,
-            .compression = self.compression,
         };
         errdefer s.deinit(alloc);
         s.last_key = try alloc.dupe(u8, self.last_key);
@@ -317,7 +308,6 @@ pub const TableIndexStruct = struct {
         try writer.setUncompressedSize(self.uncompressed_size);
         try writer.setCompressedSize(self.compressed_size);
         try writer.setStaleDataSize(self.stale_data_size);
-        try writer.setCompression(self.compression);
         try writer.setLastKey(self.last_key);
         if (self.blocks.len > 0) {
             const offsets = try alloc.alloc(u32, self.blocks.len);
@@ -342,7 +332,7 @@ pub const TableIndexReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46594;
-    pub const SIZE_BYTES: u16 = 59;
+    pub const SIZE_BYTES: u16 = 58;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -376,29 +366,25 @@ pub const TableIndexReader = struct {
         return self.t.scalar(u32, 26);
     }
 
-    pub fn compression(self: Self) CompressionEnum {
-        return @enumFromInt(self.t.scalar(u8, 30));
-    }
-
     pub fn lastKey(self: Self) []const u8 {
-        return self.t.bytes(31);
+        return self.t.bytes(30);
     }
 
     pub fn blocksLen(self: Self) u32 {
-        return self.t.arrayLen(39, 4);
+        return self.t.arrayLen(38, 4);
     }
 
     pub fn blocksAt(self: Self, i: u32) Error!BlockIndexReader {
-        return BlockIndexReader.init(self.t.buf, try self.t.arrayChild(39, i));
+        return BlockIndexReader.init(self.t.buf, try self.t.arrayChild(38, i));
     }
 
     pub fn binaryFuse(self: Self) ?BinaryFuseFilterReader {
-        const off = self.t.child(47) orelse return null;
+        const off = self.t.child(46) orelse return null;
         return BinaryFuseFilterReader.init(self.t.buf, off) catch null;
     }
 
     pub fn egidBitmap(self: Self) []const u8 {
-        return self.t.bytes(51);
+        return self.t.bytes(50);
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
@@ -409,7 +395,6 @@ pub const TableIndexReader = struct {
         try writer.setUncompressedSize(self.uncompressedSize());
         try writer.setCompressedSize(self.compressedSize());
         try writer.setStaleDataSize(self.staleDataSize());
-        try writer.setCompression(self.compression());
         try writer.setLastKey(self.lastKey());
         const count_blocks: u32 = self.blocksLen();
         if (count_blocks != 0) {
@@ -433,13 +418,13 @@ pub const TableIndexReader = struct {
 
     pub fn verify(self: Self) Error!void {
         try self.t.verifyHeader();
-        try self.t.verifyBytes(31);
-        try self.t.verifyArray(39, 4);
+        try self.t.verifyBytes(30);
+        try self.t.verifyArray(38, 4);
         for (0..self.blocksLen()) |i| {
             try (try self.blocksAt(@intCast(i))).verify();
         }
         if (self.binaryFuse()) |child_view| try child_view.verify();
-        try self.t.verifyBytes(51);
+        try self.t.verifyBytes(50);
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!TableIndexStruct {
         var s = TableIndexStruct{
@@ -449,7 +434,6 @@ pub const TableIndexReader = struct {
             .uncompressed_size = self.uncompressedSize(),
             .compressed_size = self.compressedSize(),
             .stale_data_size = self.staleDataSize(),
-            .compression = self.compression(),
         };
         errdefer s.deinit(alloc);
         s.last_key = try alloc.dupe(u8, self.lastKey());
@@ -483,9 +467,9 @@ pub const TableIndexWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46594;
-    pub const SIZE_BYTES: u16 = 59;
+    pub const SIZE_BYTES: u16 = 58;
     /// Slots of nested tables, null until set.
-    const child_slots = [_]u16{47};
+    const child_slots = [_]u16{46};
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
         return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
@@ -519,24 +503,20 @@ pub const TableIndexWriter = struct {
         return self.w.setScalar(u32, 26, v);
     }
 
-    pub fn setCompression(self: *Self, v: CompressionEnum) Error!void {
-        return self.w.setScalar(u8, 30, @intFromEnum(v));
-    }
-
     pub fn setLastKey(self: *Self, data: []const u8) Error!void {
-        return self.w.setBytes(31, data);
+        return self.w.setBytes(30, data);
     }
 
     pub fn setBlocks(self: *Self, values: []const u32) Error!void {
-        return self.w.setArray(u32, 39, values);
+        return self.w.setArray(u32, 38, values);
     }
 
     pub fn setBinaryFuse(self: *Self, child_off: u32) Error!void {
-        return self.w.setChild(47, child_off);
+        return self.w.setChild(46, child_off);
     }
 
     pub fn setEgidBitmap(self: *Self, data: []const u8) Error!void {
-        return self.w.setBytes(51, data);
+        return self.w.setBytes(50, data);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -550,7 +530,6 @@ pub const TableIndexWriter = struct {
         if (@hasField(Values, "uncompressed_size")) try self.setUncompressedSize(@field(values, "uncompressed_size"));
         if (@hasField(Values, "compressed_size")) try self.setCompressedSize(@field(values, "compressed_size"));
         if (@hasField(Values, "stale_data_size")) try self.setStaleDataSize(@field(values, "stale_data_size"));
-        if (@hasField(Values, "compression")) try self.setCompression(@field(values, "compression"));
         if (@hasField(Values, "last_key")) try self.setLastKey(@field(values, "last_key"));
         if (@hasField(Values, "blocks")) try self.setBlocks(@field(values, "blocks"));
         if (@hasField(Values, "binary_fuse")) try self.setBinaryFuse(@field(values, "binary_fuse"));
@@ -2192,5 +2171,598 @@ pub const RoaringDeltaWriter = struct {
 
     pub fn deinit(self: *Self) void {
         self.w.deinit();
+    }
+};
+
+pub const BlockVersionStruct = struct {
+    ts: u64 = 0,
+    meta: u8 = 0,
+    off: u32 = 0,
+    pub fn deinit(self: *BlockVersionStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+
+    pub fn destroy(self: *BlockVersionStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: BlockVersionStruct, alloc: std.mem.Allocator) Error!BlockVersionStruct {
+        var s = BlockVersionStruct{
+            .ts = self.ts,
+            .meta = self.meta,
+            .off = self.off,
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn clone(self: BlockVersionStruct, alloc: std.mem.Allocator) Error!*BlockVersionStruct {
+        const ptr = try alloc.create(BlockVersionStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: BlockVersionStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
+        var writer = BlockVersionWriter.initWithBuf(alloc, out);
+        try writer.set(self);
+        writer.finish();
+        return off;
+    }
+};
+
+pub const BlockVersionReader = struct {
+    const Self = @This();
+    /// The record's bytes, from its first field. A packed record is
+    /// trusted (zbuf.load): its container checks it whole, so the
+    /// fields are read where the layout puts them, when asked for.
+    buf: []const u8,
+
+    pub const SIZE: u32 = 13;
+
+    pub fn init(buf: []const u8) Self {
+        return .{ .buf = buf };
+    }
+
+    pub const ts_off: u32 = 0;
+    pub const meta_off: u32 = 8;
+    pub const off_off: u32 = 9;
+
+    /// Bytes the record spans.
+    pub fn size(_: Self) u32 {
+        return SIZE;
+    }
+
+    pub fn ts(self: Self) u64 {
+        return zbuf.load(u64, self.buf, ts_off);
+    }
+
+    pub fn meta(self: Self) u8 {
+        return zbuf.load(u8, self.buf, meta_off);
+    }
+
+    pub fn off(self: Self) u32 {
+        return zbuf.load(u32, self.buf, off_off);
+    }
+
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!BlockVersionStruct {
+        var s = BlockVersionStruct{
+            .ts = self.ts(),
+            .meta = self.meta(),
+            .off = self.off(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*BlockVersionStruct {
+        const ptr = try alloc.create(BlockVersionStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const BlockVersionWriter = struct {
+    const Self = @This();
+    w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
+
+    pub const SIZE: u32 = 13;
+
+    /// The record is appended to `buf` from its current end.
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
+        return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    pub fn setTs(self: *Self, v: u64) Error!void {
+        self.cursor.field(0);
+        try self.w.int(u64, v);
+    }
+
+    pub fn setMeta(self: *Self, v: u8) Error!void {
+        self.cursor.field(1);
+        try self.w.int(u8, v);
+    }
+
+    pub fn setOff(self: *Self, v: u32) Error!void {
+        self.cursor.field(2);
+        try self.w.int(u32, v);
+    }
+
+    /// Every field, in order, from a struct literal or a *Struct: a
+    /// packed record is positional, so none may be left out. Call once.
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") @compileError("set() expects a struct like .{ .field = value }");
+        if (!@hasField(Values, "ts")) @compileError("packed set() needs every field; missing: ts");
+        if (!@hasField(Values, "meta")) @compileError("packed set() needs every field; missing: meta");
+        if (!@hasField(Values, "off")) @compileError("packed set() needs every field; missing: off");
+        try self.setTs(values.ts);
+        try self.setMeta(values.meta);
+        try self.setOff(values.off);
+    }
+
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(3);
+    }
+};
+
+pub const BlockEntryStruct = struct {
+    key_overlap: u16 = 0,
+    key_diff: []const u8 = &.{},
+    versions: []BlockVersionStruct = &.{},
+    values: []const u8 = &.{},
+    pub fn deinit(self: *BlockEntryStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.key_diff);
+        self.key_diff = &.{};
+        for (self.versions) |*_b| _b.deinit(alloc);
+        alloc.free(self.versions);
+        self.versions = &.{};
+        alloc.free(self.values);
+        self.values = &.{};
+    }
+
+    pub fn destroy(self: *BlockEntryStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: BlockEntryStruct, alloc: std.mem.Allocator) Error!BlockEntryStruct {
+        var s = BlockEntryStruct{
+            .key_overlap = self.key_overlap,
+        };
+        errdefer s.deinit(alloc);
+        s.key_diff = try alloc.dupe(u8, self.key_diff);
+        s.values = try alloc.dupe(u8, self.values);
+        {
+            s.versions = try alloc.alloc(BlockVersionStruct, self.versions.len);
+            @memset(s.versions, .{});
+            for (self.versions, 0..) |_child, _i| {
+                s.versions[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        return s;
+    }
+
+    pub fn clone(self: BlockEntryStruct, alloc: std.mem.Allocator) Error!*BlockEntryStruct {
+        const ptr = try alloc.create(BlockEntryStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: BlockEntryStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
+        var writer = BlockEntryWriter.initWithBuf(alloc, out);
+        try writer.set(self);
+        writer.finish();
+        return off;
+    }
+};
+
+pub const BlockEntryReader = struct {
+    const Self = @This();
+    /// The record's bytes, from its first field. A packed record is
+    /// trusted (zbuf.load): its container checks it whole, so the
+    /// fields are read where the layout puts them, when asked for.
+    buf: []const u8,
+
+    pub fn init(buf: []const u8) Self {
+        return .{ .buf = buf };
+    }
+
+    pub const key_overlap_off: u32 = 0;
+    pub const key_diff_off: u32 = 2;
+    fn versionsOff(self: Self) u32 {
+        const at = key_diff_off;
+        return at + 2 + zbuf.packedArrayLen(self.buf, at, .u16);
+    }
+    fn valuesOff(self: Self) u32 {
+        const at = self.versionsOff();
+        return at + 4 + 13 * zbuf.packedArrayLen(self.buf, at, .u32);
+    }
+
+    /// Bytes the record spans: to the end of its buffer.
+    pub fn size(self: Self) u32 {
+        return @intCast(self.buf.len);
+    }
+
+    pub fn keyOverlap(self: Self) u16 {
+        return zbuf.load(u16, self.buf, key_overlap_off);
+    }
+
+    pub fn keyDiff(self: Self) []const u8 {
+        return zbuf.packedBytes(self.buf, key_diff_off, .u16);
+    }
+
+    pub fn versions(self: Self) zbuf.ArrayFixed(BlockVersionReader) {
+        return zbuf.packedArrayFixed(BlockVersionReader, self.buf, self.versionsOff(), .u32);
+    }
+
+    pub fn values(self: Self) []const u8 {
+        return self.buf[self.valuesOff()..];
+    }
+
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!BlockEntryStruct {
+        var s = BlockEntryStruct{
+            .key_overlap = self.keyOverlap(),
+        };
+        errdefer s.deinit(alloc);
+        s.key_diff = try alloc.dupe(u8, self.keyDiff());
+        s.values = try alloc.dupe(u8, self.values());
+        {
+            const _view = self.versions();
+            s.versions = try alloc.alloc(BlockVersionStruct, @intCast(_view.len()));
+            @memset(s.versions, .{});
+            for (0.._view.len()) |_i| {
+                const _child = try _view.at(@intCast(_i));
+                s.versions[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*BlockEntryStruct {
+        const ptr = try alloc.create(BlockEntryStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const BlockEntryWriter = struct {
+    const Self = @This();
+    w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
+
+    /// The record is appended to `buf` from its current end.
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
+        return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    pub fn setKeyOverlap(self: *Self, v: u16) Error!void {
+        self.cursor.field(0);
+        try self.w.int(u16, v);
+    }
+
+    pub fn setKeyDiff(self: *Self, v: []const u8) Error!void {
+        self.cursor.field(1);
+        try self.w.bytes(.u16, v);
+    }
+
+    /// The count of `versions`, then `addVersion` that many times.
+    pub fn versionCount(self: *Self, n: usize) Error!void {
+        self.cursor.array(2, n);
+        try self.w.count(.u32, n);
+    }
+
+    pub fn addVersion(self: *Self, values: anytype) Error!void {
+        self.cursor.elem(2);
+        var child = BlockVersionWriter.initWithBuf(self.w.alloc, self.w.buf);
+        try child.set(values);
+        child.finish();
+    }
+
+    /// The record's tail: pieces appended in any number of calls.
+    pub fn addValues(self: *Self, v: []const u8) Error!void {
+        self.cursor.rest(3);
+        try self.w.rest(v);
+    }
+
+    /// Every field, in order, from a struct literal or a *Struct: a
+    /// packed record is positional, so none may be left out. Call once.
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") @compileError("set() expects a struct like .{ .field = value }");
+        if (!@hasField(Values, "key_overlap")) @compileError("packed set() needs every field; missing: key_overlap");
+        if (!@hasField(Values, "key_diff")) @compileError("packed set() needs every field; missing: key_diff");
+        if (!@hasField(Values, "versions")) @compileError("packed set() needs every field; missing: versions");
+        if (!@hasField(Values, "values")) @compileError("packed set() needs every field; missing: values");
+        try self.setKeyOverlap(values.key_overlap);
+        try self.setKeyDiff(values.key_diff);
+        try self.versionCount(values.versions.len);
+        for (values.versions) |elem| try self.addVersion(elem);
+        try self.addValues(values.values);
+    }
+
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(3);
+    }
+};
+
+pub const BlockPayloadStruct = struct {
+    entries: []BlockEntryStruct = &.{},
+    pub fn deinit(self: *BlockPayloadStruct, alloc: std.mem.Allocator) void {
+        for (self.entries) |*_b| _b.deinit(alloc);
+        alloc.free(self.entries);
+        self.entries = &.{};
+    }
+
+    pub fn destroy(self: *BlockPayloadStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: BlockPayloadStruct, alloc: std.mem.Allocator) Error!BlockPayloadStruct {
+        var s = BlockPayloadStruct{};
+        errdefer s.deinit(alloc);
+        {
+            s.entries = try alloc.alloc(BlockEntryStruct, self.entries.len);
+            @memset(s.entries, .{});
+            for (self.entries, 0..) |_child, _i| {
+                s.entries[_i] = try _child.cloneValue(alloc);
+            }
+        }
+        return s;
+    }
+
+    pub fn clone(self: BlockPayloadStruct, alloc: std.mem.Allocator) Error!*BlockPayloadStruct {
+        const ptr = try alloc.create(BlockPayloadStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: BlockPayloadStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
+        var writer = BlockPayloadWriter.initWithBuf(alloc, out);
+        try writer.set(self);
+        writer.finish();
+        return off;
+    }
+};
+
+pub const BlockPayloadReader = struct {
+    const Self = @This();
+    /// The record's bytes, from its first field. A packed record is
+    /// trusted (zbuf.load): its container checks it whole, so the
+    /// fields are read where the layout puts them, when asked for.
+    buf: []const u8,
+
+    pub fn init(buf: []const u8) Self {
+        return .{ .buf = buf };
+    }
+
+    pub const entries_off: u32 = 0;
+
+    /// Bytes the record spans, from its start to after its last field.
+    pub fn size(self: Self) u32 {
+        const at = entries_off;
+        return zbuf.packedRecordsEnd(self.buf, at, .u32);
+    }
+
+    pub fn entries(self: Self) zbuf.ArrayVar(BlockEntryReader) {
+        return zbuf.packedArrayVar(BlockEntryReader, self.buf, entries_off, .u32);
+    }
+
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!BlockPayloadStruct {
+        var s = BlockPayloadStruct{};
+        errdefer s.deinit(alloc);
+        {
+            const _view = self.entries();
+            s.entries = try alloc.alloc(BlockEntryStruct, @intCast(_view.len()));
+            @memset(s.entries, .{});
+            for (0.._view.len()) |_i| {
+                const _child = try _view.at(@intCast(_i));
+                s.entries[_i] = try _child.toStructValue(alloc);
+            }
+        }
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*BlockPayloadStruct {
+        const ptr = try alloc.create(BlockPayloadStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const BlockPayloadWriter = struct {
+    const Self = @This();
+    w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
+    entries_tbl: zbuf.RecordTable = undefined,
+
+    /// The record is appended to `buf` from its current end.
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
+        return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    /// The count of `entries`, then `addEntry` that many times.
+    pub fn entryCount(self: *Self, n: usize) Error!void {
+        self.cursor.array(0, n);
+        self.entries_tbl = try self.w.records(.u32, n);
+    }
+
+    pub fn addEntry(self: *Self, values: anytype) Error!void {
+        self.cursor.elem(0);
+        var child = BlockEntryWriter.initWithBuf(self.w.alloc, self.w.buf);
+        try child.set(values);
+        child.finish();
+        self.entries_tbl.endRecord(&self.w);
+    }
+
+    /// One element already encoded as a BlockEntry.
+    pub fn addEntryBytes(self: *Self, bytes: []const u8) Error!void {
+        self.cursor.elem(0);
+        try self.w.rest(bytes);
+        self.entries_tbl.endRecord(&self.w);
+    }
+
+    /// Every field, in order, from a struct literal or a *Struct: a
+    /// packed record is positional, so none may be left out. Call once.
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") @compileError("set() expects a struct like .{ .field = value }");
+        if (!@hasField(Values, "entries")) @compileError("packed set() needs every field; missing: entries");
+        try self.entryCount(values.entries.len);
+        for (values.entries) |elem| try self.addEntry(elem);
+    }
+
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(1);
+    }
+};
+
+pub const BlockStruct = struct {
+    crc: u64 = 0,
+    codec: u8 = 0,
+    payload: []const u8 = &.{},
+    pub fn deinit(self: *BlockStruct, alloc: std.mem.Allocator) void {
+        alloc.free(self.payload);
+        self.payload = &.{};
+    }
+
+    pub fn destroy(self: *BlockStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: BlockStruct, alloc: std.mem.Allocator) Error!BlockStruct {
+        var s = BlockStruct{
+            .crc = self.crc,
+            .codec = self.codec,
+        };
+        errdefer s.deinit(alloc);
+        s.payload = try alloc.dupe(u8, self.payload);
+        return s;
+    }
+
+    pub fn clone(self: BlockStruct, alloc: std.mem.Allocator) Error!*BlockStruct {
+        const ptr = try alloc.create(BlockStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: BlockStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
+        var writer = BlockWriter.initWithBuf(alloc, out);
+        try writer.set(self);
+        writer.finish();
+        return off;
+    }
+};
+
+pub const BlockReader = struct {
+    const Self = @This();
+    /// The record's bytes, from its first field. A packed record is
+    /// trusted (zbuf.load): its container checks it whole, so the
+    /// fields are read where the layout puts them, when asked for.
+    buf: []const u8,
+
+    pub fn init(buf: []const u8) Self {
+        return .{ .buf = buf };
+    }
+
+    pub const crc_off: u32 = 0;
+    pub const codec_off: u32 = 8;
+    pub const payload_off: u32 = 9;
+
+    /// Bytes the record spans: to the end of its buffer.
+    pub fn size(self: Self) u32 {
+        return @intCast(self.buf.len);
+    }
+
+    pub fn crc(self: Self) u64 {
+        return zbuf.load(u64, self.buf, crc_off);
+    }
+
+    pub fn codec(self: Self) u8 {
+        return zbuf.load(u8, self.buf, codec_off);
+    }
+
+    pub fn payload(self: Self) []const u8 {
+        return self.buf[payload_off..];
+    }
+
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!BlockStruct {
+        var s = BlockStruct{
+            .crc = self.crc(),
+            .codec = self.codec(),
+        };
+        errdefer s.deinit(alloc);
+        s.payload = try alloc.dupe(u8, self.payload());
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*BlockStruct {
+        const ptr = try alloc.create(BlockStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const BlockWriter = struct {
+    const Self = @This();
+    w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
+
+    /// The record is appended to `buf` from its current end.
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
+        return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    pub fn setCrc(self: *Self, v: u64) Error!void {
+        self.cursor.field(0);
+        try self.w.int(u64, v);
+    }
+
+    pub fn setCodec(self: *Self, v: u8) Error!void {
+        self.cursor.field(1);
+        try self.w.int(u8, v);
+    }
+
+    /// The record's tail: pieces appended in any number of calls.
+    pub fn addPayload(self: *Self, v: []const u8) Error!void {
+        self.cursor.rest(2);
+        try self.w.rest(v);
+    }
+
+    /// Every field, in order, from a struct literal or a *Struct: a
+    /// packed record is positional, so none may be left out. Call once.
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") @compileError("set() expects a struct like .{ .field = value }");
+        if (!@hasField(Values, "crc")) @compileError("packed set() needs every field; missing: crc");
+        if (!@hasField(Values, "codec")) @compileError("packed set() needs every field; missing: codec");
+        if (!@hasField(Values, "payload")) @compileError("packed set() needs every field; missing: payload");
+        try self.setCrc(values.crc);
+        try self.setCodec(values.codec);
+        try self.addPayload(values.payload);
+    }
+
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(2);
     }
 };

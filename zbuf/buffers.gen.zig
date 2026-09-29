@@ -1390,9 +1390,11 @@ pub const VersionHdrStruct = struct {
     }
 
     pub fn marshalTo(self: VersionHdrStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
         var writer = VersionHdrWriter.initWithBuf(alloc, out);
         try writer.set(self);
-        return writer.finish();
+        writer.finish();
+        return off;
     }
 };
 
@@ -1409,9 +1411,9 @@ pub const VersionHdrReader = struct {
         return .{ .buf = buf };
     }
 
-    const ts_off: u32 = 0;
-    const meta_off: u32 = 8;
-    const off_off: u32 = 9;
+    pub const ts_off: u32 = 0;
+    pub const meta_off: u32 = 8;
+    pub const off_off: u32 = 9;
 
     /// Bytes the record spans.
     pub fn size(_: Self) u32 {
@@ -1450,12 +1452,28 @@ pub const VersionHdrReader = struct {
 pub const VersionHdrWriter = struct {
     const Self = @This();
     w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
 
     pub const SIZE: u32 = 13;
 
     /// The record is appended to `buf` from its current end.
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
         return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    pub fn setTs(self: *Self, v: u64) Error!void {
+        self.cursor.field(0);
+        try self.w.int(u64, v);
+    }
+
+    pub fn setMeta(self: *Self, v: u8) Error!void {
+        self.cursor.field(1);
+        try self.w.int(u8, v);
+    }
+
+    pub fn setOff(self: *Self, v: u32) Error!void {
+        self.cursor.field(2);
+        try self.w.int(u32, v);
     }
 
     /// Every field, in order, from a struct literal or a *Struct: a
@@ -1466,14 +1484,15 @@ pub const VersionHdrWriter = struct {
         if (!@hasField(Values, "ts")) @compileError("packed set() needs every field; missing: ts");
         if (!@hasField(Values, "meta")) @compileError("packed set() needs every field; missing: meta");
         if (!@hasField(Values, "off")) @compileError("packed set() needs every field; missing: off");
-        try self.w.int(u64, values.ts);
-        try self.w.int(u8, values.meta);
-        try self.w.int(u32, values.off);
+        try self.setTs(values.ts);
+        try self.setMeta(values.meta);
+        try self.setOff(values.off);
     }
 
-    /// The record's start offset in the buffer.
-    pub fn finish(self: *Self) u32 {
-        return self.w.finish();
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(3);
     }
 };
 
@@ -1522,9 +1541,11 @@ pub const EntryStruct = struct {
     }
 
     pub fn marshalTo(self: EntryStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
         var writer = EntryWriter.initWithBuf(alloc, out);
         try writer.set(self);
-        return writer.finish();
+        writer.finish();
+        return off;
     }
 };
 
@@ -1539,8 +1560,8 @@ pub const EntryReader = struct {
         return .{ .buf = buf };
     }
 
-    const key_overlap_off: u32 = 0;
-    const key_diff_off: u32 = 2;
+    pub const key_overlap_off: u32 = 0;
+    pub const key_diff_off: u32 = 2;
     fn versionsOff(self: Self) u32 {
         const at = key_diff_off;
         return at + 2 + zbuf.packedArrayLen(self.buf, at, .u16);
@@ -1563,12 +1584,8 @@ pub const EntryReader = struct {
         return zbuf.packedBytes(self.buf, key_diff_off, .u16);
     }
 
-    pub fn versionsLen(self: Self) u32 {
-        return zbuf.packedArrayLen(self.buf, self.versionsOff(), .u32);
-    }
-
-    pub fn versionsAt(self: Self, i: u32) Error!VersionHdrReader {
-        return VersionHdrReader.init(try zbuf.packedElem(self.buf, self.versionsOff(), .u32, 13, i));
+    pub fn versions(self: Self) zbuf.ArrayFixed(VersionHdrReader) {
+        return zbuf.packedArrayFixed(VersionHdrReader, self.buf, self.versionsOff(), .u32);
     }
 
     pub fn values(self: Self) []const u8 {
@@ -1583,11 +1600,11 @@ pub const EntryReader = struct {
         s.key_diff = try alloc.dupe(u8, self.keyDiff());
         s.values = try alloc.dupe(u8, self.values());
         {
-            const _cnt = self.versionsLen();
-            s.versions = try alloc.alloc(VersionHdrStruct, @intCast(_cnt));
+            const _view = self.versions();
+            s.versions = try alloc.alloc(VersionHdrStruct, @intCast(_view.len()));
             @memset(s.versions, .{});
-            for (0.._cnt) |_i| {
-                const _child = try self.versionsAt(@intCast(_i));
+            for (0.._view.len()) |_i| {
+                const _child = try _view.at(@intCast(_i));
                 s.versions[_i] = try _child.toStructValue(alloc);
             }
         }
@@ -1604,10 +1621,40 @@ pub const EntryReader = struct {
 pub const EntryWriter = struct {
     const Self = @This();
     w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
 
     /// The record is appended to `buf` from its current end.
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
         return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    pub fn setKeyOverlap(self: *Self, v: u16) Error!void {
+        self.cursor.field(0);
+        try self.w.int(u16, v);
+    }
+
+    pub fn setKeyDiff(self: *Self, v: []const u8) Error!void {
+        self.cursor.field(1);
+        try self.w.bytes(.u16, v);
+    }
+
+    /// The count of `versions`, then `addVersion` that many times.
+    pub fn versionCount(self: *Self, n: usize) Error!void {
+        self.cursor.array(2, n);
+        try self.w.count(.u32, n);
+    }
+
+    pub fn addVersion(self: *Self, values: anytype) Error!void {
+        self.cursor.elem(2);
+        var child = VersionHdrWriter.initWithBuf(self.w.alloc, self.w.buf);
+        try child.set(values);
+        child.finish();
+    }
+
+    /// The record's tail: pieces appended in any number of calls.
+    pub fn addValues(self: *Self, v: []const u8) Error!void {
+        self.cursor.rest(3);
+        try self.w.rest(v);
     }
 
     /// Every field, in order, from a struct literal or a *Struct: a
@@ -1619,20 +1666,17 @@ pub const EntryWriter = struct {
         if (!@hasField(Values, "key_diff")) @compileError("packed set() needs every field; missing: key_diff");
         if (!@hasField(Values, "versions")) @compileError("packed set() needs every field; missing: versions");
         if (!@hasField(Values, "values")) @compileError("packed set() needs every field; missing: values");
-        try self.w.int(u16, values.key_overlap);
-        try self.w.bytes(.u16, values.key_diff);
-        try self.w.count(.u32, values.versions.len);
-        for (values.versions) |elem| {
-            var child = VersionHdrWriter.initWithBuf(self.w.alloc, self.w.buf);
-            try child.set(elem);
-            _ = child.finish();
-        }
-        try self.w.rest(values.values);
+        try self.setKeyOverlap(values.key_overlap);
+        try self.setKeyDiff(values.key_diff);
+        try self.versionCount(values.versions.len);
+        for (values.versions) |elem| try self.addVersion(elem);
+        try self.addValues(values.values);
     }
 
-    /// The record's start offset in the buffer.
-    pub fn finish(self: *Self) u32 {
-        return self.w.finish();
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(3);
     }
 };
 
@@ -1673,9 +1717,11 @@ pub const BlockStruct = struct {
     }
 
     pub fn marshalTo(self: BlockStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
         var writer = BlockWriter.initWithBuf(alloc, out);
         try writer.set(self);
-        return writer.finish();
+        writer.finish();
+        return off;
     }
 };
 
@@ -1690,7 +1736,7 @@ pub const BlockReader = struct {
         return .{ .buf = buf };
     }
 
-    const entries_off: u32 = 0;
+    pub const entries_off: u32 = 0;
     fn crcOff(self: Self) u32 {
         const at = entries_off;
         return zbuf.packedRecordsEnd(self.buf, at, .u32);
@@ -1702,12 +1748,8 @@ pub const BlockReader = struct {
         return at + 8;
     }
 
-    pub fn entriesLen(self: Self) u32 {
-        return zbuf.packedArrayLen(self.buf, entries_off, .u32);
-    }
-
-    pub fn entriesAt(self: Self, i: u32) Error!EntryReader {
-        return EntryReader.init(try zbuf.packedRecord(self.buf, entries_off, .u32, i));
+    pub fn entries(self: Self) zbuf.ArrayVar(EntryReader) {
+        return zbuf.packedArrayVar(EntryReader, self.buf, entries_off, .u32);
     }
 
     pub fn crc(self: Self) u64 {
@@ -1720,11 +1762,11 @@ pub const BlockReader = struct {
         };
         errdefer s.deinit(alloc);
         {
-            const _cnt = self.entriesLen();
-            s.entries = try alloc.alloc(EntryStruct, @intCast(_cnt));
+            const _view = self.entries();
+            s.entries = try alloc.alloc(EntryStruct, @intCast(_view.len()));
             @memset(s.entries, .{});
-            for (0.._cnt) |_i| {
-                const _child = try self.entriesAt(@intCast(_i));
+            for (0.._view.len()) |_i| {
+                const _child = try _view.at(@intCast(_i));
                 s.entries[_i] = try _child.toStructValue(alloc);
             }
         }
@@ -1741,10 +1783,38 @@ pub const BlockReader = struct {
 pub const BlockWriter = struct {
     const Self = @This();
     w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
+    entries_tbl: zbuf.RecordTable = undefined,
 
     /// The record is appended to `buf` from its current end.
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
         return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    /// The count of `entries`, then `addEntry` that many times.
+    pub fn entryCount(self: *Self, n: usize) Error!void {
+        self.cursor.array(0, n);
+        self.entries_tbl = try self.w.records(.u32, n);
+    }
+
+    pub fn addEntry(self: *Self, values: anytype) Error!void {
+        self.cursor.elem(0);
+        var child = EntryWriter.initWithBuf(self.w.alloc, self.w.buf);
+        try child.set(values);
+        child.finish();
+        self.entries_tbl.endRecord(&self.w);
+    }
+
+    /// One element already encoded as a Entry.
+    pub fn addEntryBytes(self: *Self, bytes: []const u8) Error!void {
+        self.cursor.elem(0);
+        try self.w.rest(bytes);
+        self.entries_tbl.endRecord(&self.w);
+    }
+
+    pub fn setCrc(self: *Self, v: u64) Error!void {
+        self.cursor.field(1);
+        try self.w.int(u64, v);
     }
 
     /// Every field, in order, from a struct literal or a *Struct: a
@@ -1754,19 +1824,15 @@ pub const BlockWriter = struct {
         if (@typeInfo(Values) != .@"struct") @compileError("set() expects a struct like .{ .field = value }");
         if (!@hasField(Values, "entries")) @compileError("packed set() needs every field; missing: entries");
         if (!@hasField(Values, "crc")) @compileError("packed set() needs every field; missing: crc");
-        var entries_tbl = try self.w.records(.u32, values.entries.len);
-        for (values.entries) |elem| {
-            var child = EntryWriter.initWithBuf(self.w.alloc, self.w.buf);
-            try child.set(elem);
-            _ = child.finish();
-            entries_tbl.endRecord(&self.w);
-        }
-        try self.w.int(u64, values.crc);
+        try self.entryCount(values.entries.len);
+        for (values.entries) |elem| try self.addEntry(elem);
+        try self.setCrc(values.crc);
     }
 
-    /// The record's start offset in the buffer.
-    pub fn finish(self: *Self) u32 {
-        return self.w.finish();
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(2);
     }
 };
 
@@ -1800,9 +1866,11 @@ pub const PointStruct = struct {
     }
 
     pub fn marshalTo(self: PointStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
         var writer = PointWriter.initWithBuf(alloc, out);
         try writer.set(self);
-        return writer.finish();
+        writer.finish();
+        return off;
     }
 };
 
@@ -1819,8 +1887,8 @@ pub const PointReader = struct {
         return .{ .buf = buf };
     }
 
-    const x_off: u32 = 0;
-    const y_off: u32 = 4;
+    pub const x_off: u32 = 0;
+    pub const y_off: u32 = 4;
 
     /// Bytes the record spans.
     pub fn size(_: Self) u32 {
@@ -1854,12 +1922,23 @@ pub const PointReader = struct {
 pub const PointWriter = struct {
     const Self = @This();
     w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
 
     pub const SIZE: u32 = 8;
 
     /// The record is appended to `buf` from its current end.
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
         return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    pub fn setX(self: *Self, v: u32) Error!void {
+        self.cursor.field(0);
+        try self.w.int(u32, v);
+    }
+
+    pub fn setY(self: *Self, v: u32) Error!void {
+        self.cursor.field(1);
+        try self.w.int(u32, v);
     }
 
     /// Every field, in order, from a struct literal or a *Struct: a
@@ -1869,13 +1948,14 @@ pub const PointWriter = struct {
         if (@typeInfo(Values) != .@"struct") @compileError("set() expects a struct like .{ .field = value }");
         if (!@hasField(Values, "x")) @compileError("packed set() needs every field; missing: x");
         if (!@hasField(Values, "y")) @compileError("packed set() needs every field; missing: y");
-        try self.w.int(u32, values.x);
-        try self.w.int(u32, values.y);
+        try self.setX(values.x);
+        try self.setY(values.y);
     }
 
-    /// The record's start offset in the buffer.
-    pub fn finish(self: *Self) u32 {
-        return self.w.finish();
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(2);
     }
 };
 
@@ -1931,9 +2011,11 @@ pub const ShapeStruct = struct {
     }
 
     pub fn marshalTo(self: ShapeStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        const off: u32 = @intCast(out.items.len);
         var writer = ShapeWriter.initWithBuf(alloc, out);
         try writer.set(self);
-        return writer.finish();
+        writer.finish();
+        return off;
     }
 };
 
@@ -1948,9 +2030,9 @@ pub const ShapeReader = struct {
         return .{ .buf = buf };
     }
 
-    const lifecycle_off: u32 = 0;
-    const origin_off: u32 = 1;
-    const name_off: u32 = 9;
+    pub const lifecycle_off: u32 = 0;
+    pub const origin_off: u32 = 1;
+    pub const name_off: u32 = 9;
     fn cornersOff(self: Self) u32 {
         const at = name_off;
         return at + 1 + zbuf.packedArrayLen(self.buf, at, .u8);
@@ -1982,12 +2064,8 @@ pub const ShapeReader = struct {
         return zbuf.packedBytes(self.buf, name_off, .u8);
     }
 
-    pub fn cornersLen(self: Self) u32 {
-        return zbuf.packedArrayLen(self.buf, self.cornersOff(), .u8);
-    }
-
-    pub fn cornersAt(self: Self, i: u32) Error!PointReader {
-        return PointReader.init(try zbuf.packedElem(self.buf, self.cornersOff(), .u8, 8, i));
+    pub fn corners(self: Self) zbuf.ArrayFixed(PointReader) {
+        return zbuf.packedArrayFixed(PointReader, self.buf, self.cornersOff(), .u8);
     }
 
     pub fn weightsLen(self: Self) u32 {
@@ -2015,11 +2093,11 @@ pub const ShapeReader = struct {
         s.note = try alloc.dupe(u8, self.note());
         s.weights = try self.weightsToSliceAlloc(alloc);
         {
-            const _cnt = self.cornersLen();
-            s.corners = try alloc.alloc(PointStruct, @intCast(_cnt));
+            const _view = self.corners();
+            s.corners = try alloc.alloc(PointStruct, @intCast(_view.len()));
             @memset(s.corners, .{});
-            for (0.._cnt) |_i| {
-                const _child = try self.cornersAt(@intCast(_i));
+            for (0.._view.len()) |_i| {
+                const _child = try _view.at(@intCast(_i));
                 s.corners[_i] = try _child.toStructValue(alloc);
             }
         }
@@ -2037,10 +2115,57 @@ pub const ShapeReader = struct {
 pub const ShapeWriter = struct {
     const Self = @This();
     w: zbuf.PackedWriter,
+    cursor: zbuf.FieldCursor = .{},
 
     /// The record is appended to `buf` from its current end.
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Self {
         return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
+    }
+
+    pub fn setLifecycle(self: *Self, v: LifecycleEnum) Error!void {
+        self.cursor.field(0);
+        try self.w.int(u8, @intFromEnum(v));
+    }
+
+    pub fn setOrigin(self: *Self, values: anytype) Error!void {
+        self.cursor.field(1);
+        var child = PointWriter.initWithBuf(self.w.alloc, self.w.buf);
+        try child.set(values);
+        child.finish();
+    }
+
+    pub fn setName(self: *Self, v: []const u8) Error!void {
+        self.cursor.field(2);
+        try self.w.bytes(.u8, v);
+    }
+
+    /// The count of `corners`, then `addCorner` that many times.
+    pub fn cornerCount(self: *Self, n: usize) Error!void {
+        self.cursor.array(3, n);
+        try self.w.count(.u8, n);
+    }
+
+    pub fn addCorner(self: *Self, values: anytype) Error!void {
+        self.cursor.elem(3);
+        var child = PointWriter.initWithBuf(self.w.alloc, self.w.buf);
+        try child.set(values);
+        child.finish();
+    }
+
+    /// The count of `weights`, then `addWeight` that many times.
+    pub fn weightCount(self: *Self, n: usize) Error!void {
+        self.cursor.array(4, n);
+        try self.w.count(.u32, n);
+    }
+
+    pub fn addWeight(self: *Self, v: u16) Error!void {
+        self.cursor.elem(4);
+        try self.w.int(u16, v);
+    }
+
+    pub fn setNote(self: *Self, v: []const u8) Error!void {
+        self.cursor.field(5);
+        try self.w.bytes(.u32, v);
     }
 
     /// Every field, in order, from a struct literal or a *Struct: a
@@ -2054,26 +2179,19 @@ pub const ShapeWriter = struct {
         if (!@hasField(Values, "corners")) @compileError("packed set() needs every field; missing: corners");
         if (!@hasField(Values, "weights")) @compileError("packed set() needs every field; missing: weights");
         if (!@hasField(Values, "note")) @compileError("packed set() needs every field; missing: note");
-        const lifecycle_v: LifecycleEnum = values.lifecycle;
-        try self.w.int(u8, @intFromEnum(lifecycle_v));
-        {
-            var child = PointWriter.initWithBuf(self.w.alloc, self.w.buf);
-            try child.set(values.origin);
-            _ = child.finish();
-        }
-        try self.w.bytes(.u8, values.name);
-        try self.w.count(.u8, values.corners.len);
-        for (values.corners) |elem| {
-            var child = PointWriter.initWithBuf(self.w.alloc, self.w.buf);
-            try child.set(elem);
-            _ = child.finish();
-        }
-        try self.w.ints(u16, .u32, values.weights);
-        try self.w.bytes(.u32, values.note);
+        try self.setLifecycle(values.lifecycle);
+        try self.setOrigin(values.origin);
+        try self.setName(values.name);
+        try self.cornerCount(values.corners.len);
+        for (values.corners) |elem| try self.addCorner(elem);
+        try self.weightCount(values.weights.len);
+        for (values.weights) |elem| try self.addWeight(elem);
+        try self.setNote(values.note);
     }
 
-    /// The record's start offset in the buffer.
-    pub fn finish(self: *Self) u32 {
-        return self.w.finish();
+    /// The record is complete: in safe builds, that every field
+    /// was written.
+    pub fn finish(self: *Self) void {
+        self.cursor.done(6);
     }
 };

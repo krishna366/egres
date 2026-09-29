@@ -280,12 +280,23 @@ Generated code: `{Name}Reader.init(buf)` takes the record's own slice
 and nothing more. A packed record is trusted: its container checks it
 whole (an SST block is checksummed before it is decoded), so a field is
 read where the layout puts it when it is asked for, at a constant
-offset while every field before it is fixed-size and through a small
-offset function after the first variable one. Getters cannot fail
-(`keyDiff()`, `versionsLen()`, `values()`, `size()`); an element index
-is checked (`versionsAt(i)`); a fixed record exports `SIZE`.
-`{Name}Writer.initWithBuf(alloc, &list)` appends the record from
-`set(struct)`, which must name every field since the layout is
-positional, and `finish()` returns the record's start offset.
+offset (`{field}_off`, public) while every field before it is
+fixed-size and through a small offset function after the first
+variable one. Getters cannot fail
+(`keyDiff()`, `values()`, `size()`); a fixed record exports `SIZE`. An
+array of records comes as a view located once, `versions()` (a
+`zbuf.ArrayFixed`) or `entries()` (a `zbuf.ArrayVar`, records of
+varying size), with `len()` and a checked `at(i)`, a bounds test and
+a slice. An array of scalars has `weightsLen()` and `weightsAt(i)`.
+`{Name}Writer.initWithBuf(alloc, &list)` appends the record a field at
+a time, in schema order since the layout is positional: `setKeyDiff(b)`
+for a field written whole, `versionCount(n)` then `addVersion(v)` per
+element for an array (`addEntryBytes(b)` takes an already-encoded
+variable-size record), `addValues(b)` any number of times for the
+trailing rest bytes. `set(struct)` writes every field from one value
+through the same methods, and `finish()` marks the record complete. In
+safe builds a `zbuf.FieldCursor` asserts the order, that an array got
+the elements its count promised, and at `finish` that no field was
+skipped.
 `{Name}Struct` is the owned form, with `toStructValue`, `deinit` and
 `marshalTo`.

@@ -19,14 +19,6 @@ pub const BinaryFuseFilter = schema.Table(&.{
     .{ .id = 6, .name = "fingerprints", .ty = schema.Array(schema.U16) },
 });
 
-// Tags chosen to match `u/compress.zig::Codec` so
-// @enumFromInt(@intFromEnum(...)) is identity at the wire boundary.
-pub const Compression = schema.EnumDef(&.{
-    .{ .name = "none", .tag = 0 },
-    .{ .name = "zstd", .tag = 1 },
-    .{ .name = "lz4", .tag = 2 },
-});
-
 pub const TableIndex = schema.Table(&.{
     // Bumped whenever the per-entry block encoding changes (table/builder.zig
     // is the source of truth for that layout).
@@ -36,15 +28,14 @@ pub const TableIndex = schema.Table(&.{
     .{ .id = 4, .name = "uncompressed_size", .ty = schema.U32 },
     .{ .id = 5, .name = "compressed_size", .ty = schema.U32 },
     .{ .id = 6, .name = "stale_data_size", .ty = schema.U32 },
-    .{ .id = 7, .name = "compression", .ty = Compression },
-    .{ .id = 8, .name = "last_key", .ty = schema.Bytes },
-    .{ .id = 9, .name = "blocks", .ty = schema.Array(BlockIndex) },
-    .{ .id = 10, .name = "binary_fuse", .ty = BinaryFuseFilter },
+    .{ .id = 7, .name = "last_key", .ty = schema.Bytes },
+    .{ .id = 8, .name = "blocks", .ty = schema.Array(BlockIndex) },
+    .{ .id = 9, .name = "binary_fuse", .ty = BinaryFuseFilter },
     // The filter of an `egid` tree's table: a roaring bitmap
     // (zroar buffer) of every key in the table. Exact, so a miss is
     // certain and a hit is certain. Absent on a `bytes` tree's table,
     // which carries `binary_fuse` instead.
-    .{ .id = 11, .name = "egid_bitmap", .ty = schema.Bytes },
+    .{ .id = 10, .name = "egid_bitmap", .ty = schema.Bytes },
 });
 
 pub const Op = schema.EnumDef(&.{
@@ -188,6 +179,39 @@ pub const Mutations = schema.Table(&.{
     .{ .id = 2, .name = "kvs", .ty = schema.Array(KeyValue) },
 });
 
+// An SST block, as packed records; table/builder.zig writes them and
+// table/table.zig's BlockIterator reads them. On disk a block is its
+// envelope, `Block`: the crc (zbuf.hash) over the codec byte and the
+// payload as stored, so a reader verifies a block before decoding it,
+// then the codec (a `u/compress.zig` Codec tag) the payload is stored
+// with. The payload, decoded, is a `BlockPayload`: the entries behind
+// their table of end offsets, the last end the region's length. An
+// entry: its key as an overlap with the block's base key plus the
+// differing tail, its versions' fixed headers, newest first, then the
+// versions' bytes, each header's `off` its start among them.
+pub const BlockVersion = schema.Packed(&.{
+    .{ .id = 1, .name = "ts", .ty = schema.U64 },
+    .{ .id = 2, .name = "meta", .ty = schema.U8 },
+    .{ .id = 3, .name = "off", .ty = schema.U32 },
+});
+
+pub const BlockEntry = schema.Packed(&.{
+    .{ .id = 1, .name = "key_overlap", .ty = schema.U16 },
+    .{ .id = 2, .name = "key_diff", .ty = schema.Bytes, .len = .u16 },
+    .{ .id = 3, .name = "versions", .ty = schema.Array(BlockVersion) },
+    .{ .id = 4, .name = "values", .ty = schema.Bytes, .len = .rest },
+});
+
+pub const BlockPayload = schema.Packed(&.{
+    .{ .id = 1, .name = "entries", .ty = schema.Array(BlockEntry) },
+});
+
+pub const Block = schema.Packed(&.{
+    .{ .id = 1, .name = "crc", .ty = schema.U64 },
+    .{ .id = 2, .name = "codec", .ty = schema.U8 },
+    .{ .id = 3, .name = "payload", .ty = schema.Bytes, .len = .rest },
+});
+
 // zbuf tail stores table_id as u16, so use a module namespace in high bits and
 // OR local ids into low bits.
 const ZDB_TABLE_NS: u16 = 0xB600;
@@ -208,4 +232,10 @@ pub const records: []const schema.Named = &.{
     .{ .name = "Mutations", .ty = Mutations, .id = tableId(8) },
     .{ .name = "Namespace", .ty = Namespace, .id = tableId(9) },
     .{ .name = "RoaringDelta", .ty = RoaringDelta, .id = tableId(10) },
+
+    // Packed records: no message id.
+    .{ .name = "BlockVersion", .ty = BlockVersion },
+    .{ .name = "BlockEntry", .ty = BlockEntry },
+    .{ .name = "BlockPayload", .ty = BlockPayload },
+    .{ .name = "Block", .ty = Block },
 };

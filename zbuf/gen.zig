@@ -885,9 +885,11 @@ fn emitStructType(alloc: std.mem.Allocator, table_name: []const u8, table_id: ?u
     , .{ .name = table_name });
     if (table_id == null) {
         try emit(w,
+            \\        const off: u32 = @intCast(out.items.len);
             \\        var writer = ${name}Writer.initWithBuf(alloc, out);
             \\        try writer.set(self);
-            \\        return writer.finish();
+            \\        writer.finish();
+            \\        return off;
             \\    }
             \\};
             \\
@@ -1028,7 +1030,18 @@ fn emitCopy(alloc: std.mem.Allocator, table_name: []const u8, infos: []const Fie
         defer alloc.free(getter);
         const args = .{ .field = info.name, .getter = getter, .child = try recordName(info.ty.elem()) };
         switch (mode) {
-            .decode => try emit(w,
+            .decode => if (info.ty.elem().kind == .packed_) try emit(w,
+                \\        {
+                \\            const _view = self.$getter();
+                \\            s.$field = try alloc.alloc(${child}Struct, @intCast(_view.len()));
+                \\            @memset(s.$field, .{});
+                \\            for (0.._view.len()) |_i| {
+                \\                const _child = try _view.at(@intCast(_i));
+                \\                s.$field[_i] = try _child.toStructValue(alloc);
+                \\            }
+                \\        }
+                \\
+            , args) else try emit(w,
                 \\        {
                 \\            const _cnt = self.${getter}Len();
                 \\            s.$field = try alloc.alloc(${child}Struct, @intCast(_cnt));
@@ -1101,7 +1114,7 @@ fn emitPacked(alloc: std.mem.Allocator, name: []const u8, ty: schema.Type, w: an
 
     try emitStructType(alloc, name, null, infos, w);
     try emitPackedReader(alloc, name, ty, infos, w);
-    try emitPackedWriter(name, ty, infos, w);
+    try emitPackedWriter(alloc, name, ty, infos, w);
 }
 
 fn lenWidthName(width: schema.LenWidth) []const u8 {
@@ -1160,7 +1173,7 @@ fn emitPackedReader(alloc: std.mem.Allocator, name: []const u8, ty: schema.Type,
         defer alloc.free(getter);
         if (static) |off| {
             pos[i].expr = try std.fmt.allocPrint(alloc, "{s}_off", .{info.name});
-            try emit(w, "    const ${field}_off: u32 = $off;\n", .{ .field = info.name, .off = off });
+            try emit(w, "    pub const ${field}_off: u32 = $off;\n", .{ .field = info.name, .off = off });
         } else {
             // The previous field's start, bound once, then its end.
             pos[i].expr = try std.fmt.allocPrint(alloc, "self.{s}Off()", .{getter});
@@ -1270,46 +1283,36 @@ fn emitPackedReader(alloc: std.mem.Allocator, name: []const u8, ty: schema.Type,
             , .{ .getter = getter, .child = try packedName(info.ty), .off = off }),
             .array => {
                 const child = info.ty.elem();
+                // Records come as a view that locates the array once
+                // (zbuf.ArrayFixed, zbuf.ArrayVar): a loop holds it and
+                // pays the field's offset math a single time.
+                if (child.kind == .packed_) {
+                    const kind = if (schema.packedFixedSize(child) == null) "Var" else "Fixed";
+                    try emit(w,
+                        \\    pub fn $getter(self: Self) zbuf.Array$kind(${child}Reader) {
+                        \\        return zbuf.packedArray$kind(${child}Reader, self.buf, $off, $width);
+                        \\    }
+                        \\
+                        \\
+                    , .{ .getter = getter, .kind = kind, .child = try packedName(child), .off = off, .width = lenWidthName(info.len) });
+                    continue;
+                }
+                const ty_name = scalar(child.kind).ty;
                 try emit(w,
                     \\    pub fn ${getter}Len(self: Self) u32 {
                     \\        return zbuf.packedArrayLen(self.buf, $off, $width);
                     \\    }
                     \\
+                    \\    pub fn ${getter}At(self: Self, i: u32) Error!$ty {
+                    \\        return zbuf.load($ty, try zbuf.packedElem(self.buf, $off, $width, $elem, i), 0);
+                    \\    }
                     \\
-                , .{ .getter = getter, .off = off, .width = lenWidthName(info.len) });
-                const elem = schema.packedFixedSize(child) orelse {
-                    // Variable-size records behind their end-offset table.
-                    try emit(w,
-                        \\    pub fn ${getter}At(self: Self, i: u32) Error!${child}Reader {
-                        \\        return ${child}Reader.init(try zbuf.packedRecord(self.buf, $off, $width, i));
-                        \\    }
-                        \\
-                        \\
-                    , .{ .getter = getter, .child = try packedName(child), .off = off, .width = lenWidthName(info.len) });
-                    continue;
-                };
-                if (child.kind == .packed_) {
-                    try emit(w,
-                        \\    pub fn ${getter}At(self: Self, i: u32) Error!${child}Reader {
-                        \\        return ${child}Reader.init(try zbuf.packedElem(self.buf, $off, $width, $elem, i));
-                        \\    }
-                        \\
-                        \\
-                    , .{ .getter = getter, .child = try packedName(child), .off = off, .width = lenWidthName(info.len), .elem = elem });
-                } else {
-                    const ty_name = scalar(child.kind).ty;
-                    try emit(w,
-                        \\    pub fn ${getter}At(self: Self, i: u32) Error!$ty {
-                        \\        return zbuf.load($ty, try zbuf.packedElem(self.buf, $off, $width, $elem, i), 0);
-                        \\    }
-                        \\
-                        \\    pub fn ${getter}ToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]$ty {
-                        \\        return zbuf.packedToSliceAlloc($ty, self.buf, $off, $width, alloc);
-                        \\    }
-                        \\
-                        \\
-                    , .{ .getter = getter, .ty = ty_name, .off = off, .width = lenWidthName(info.len), .elem = elem });
-                }
+                    \\    pub fn ${getter}ToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]$ty {
+                    \\        return zbuf.packedToSliceAlloc($ty, self.buf, $off, $width, alloc);
+                    \\    }
+                    \\
+                    \\
+                , .{ .getter = getter, .ty = ty_name, .off = off, .width = lenWidthName(info.len), .elem = scalar(child.kind).bytes });
             },
             .table, .bool => unreachable,
         }
@@ -1319,14 +1322,29 @@ fn emitPackedReader(alloc: std.mem.Allocator, name: []const u8, ty: schema.Type,
     try w.writeAll("};\n\n");
 }
 
-fn emitPackedWriter(name: []const u8, ty: schema.Type, infos: []const FieldInfo, w: anytype) !void {
+/// The writer of a packed record takes its fields one at a time, in
+/// schema order, since the record is positional: `set<Field>` for a
+/// field written whole, `<elem>Count(n)` then `add<Elem>` per element
+/// for an array (`add<Elem>Bytes` takes one already encoded), and
+/// `add<Field>` any number of times for the trailing rest bytes. `set(values)` writes them all from one struct through
+/// the same methods. A `zbuf.FieldCursor` checks the order in safe
+/// builds.
+fn emitPackedWriter(alloc: std.mem.Allocator, name: []const u8, ty: schema.Type, infos: []const FieldInfo, w: anytype) !void {
     try emit(w,
         \\pub const ${name}Writer = struct {
         \\    const Self = @This();
         \\    w: zbuf.PackedWriter,
-        \\
+        \\    cursor: zbuf.FieldCursor = .{},
         \\
     , .{ .name = name });
+    // A records array patches its end table as records are added.
+    for (infos) |info| {
+        if (info.ty.kind != .array) continue;
+        const child = info.ty.elem();
+        if (child.kind != .packed_ or schema.packedFixedSize(child) != null) continue;
+        try emit(w, "    ${field}_tbl: zbuf.RecordTable = undefined,\n", .{ .field = info.name });
+    }
+    try w.writeAll("\n");
     if (schema.packedFixedSize(ty)) |sz| {
         try emit(w, "    pub const SIZE: u32 = $size;\n\n", .{ .size = sz });
     }
@@ -1336,6 +1354,132 @@ fn emitPackedWriter(name: []const u8, ty: schema.Type, infos: []const FieldInfo,
         \\        return .{ .w = zbuf.PackedWriter.initWithBuf(alloc, buf) };
         \\    }
         \\
+        \\
+    );
+    for (infos, 0..) |info, idx| {
+        const setter = try schema.camelNameCapitalized(alloc, info.name);
+        defer alloc.free(setter);
+        switch (info.ty.kind) {
+            .u8, .u16, .u32, .u64 => try emit(w,
+                \\    pub fn set$setter(self: *Self, v: $ty) Error!void {
+                \\        self.cursor.field($idx);
+                \\        try self.w.int($ty, v);
+                \\    }
+                \\
+                \\
+            , .{ .setter = setter, .ty = scalar(info.ty.kind).ty, .idx = idx }),
+            .enum_ => try emit(w,
+                \\    pub fn set$setter(self: *Self, v: ${enum}Enum) Error!void {
+                \\        self.cursor.field($idx);
+                \\        try self.w.int(u8, @intFromEnum(v));
+                \\    }
+                \\
+                \\
+            , .{ .setter = setter, .@"enum" = try enumName(info.ty), .idx = idx }),
+            .bytes => if (info.len == .rest) {
+                try emit(w,
+                    \\    /// The record's tail: pieces appended in any number of calls.
+                    \\    pub fn add$setter(self: *Self, v: []const u8) Error!void {
+                    \\        self.cursor.rest($idx);
+                    \\        try self.w.rest(v);
+                    \\    }
+                    \\
+                    \\
+                , .{ .setter = setter, .idx = idx });
+            } else {
+                try emit(w,
+                    \\    pub fn set$setter(self: *Self, v: []const u8) Error!void {
+                    \\        self.cursor.field($idx);
+                    \\        try self.w.bytes($width, v);
+                    \\    }
+                    \\
+                    \\
+                , .{ .setter = setter, .idx = idx, .width = lenWidthName(info.len) });
+            },
+            // A nested value is written as given: a literal must name
+            // every field of the child, like `set` itself.
+            .packed_ => try emit(w,
+                \\    pub fn set$setter(self: *Self, values: anytype) Error!void {
+                \\        self.cursor.field($idx);
+                \\        var child = ${child}Writer.initWithBuf(self.w.alloc, self.w.buf);
+                \\        try child.set(values);
+                \\        child.finish();
+                \\    }
+                \\
+                \\
+            , .{ .setter = setter, .idx = idx, .child = try packedName(info.ty) }),
+            .array => {
+                const single = try schema.singularName(alloc, info.name);
+                defer alloc.free(single);
+                const count_fn = try schema.camelName(alloc, single);
+                defer alloc.free(count_fn);
+                const adder = try schema.camelNameCapitalized(alloc, single);
+                defer alloc.free(adder);
+                const child = info.ty.elem();
+                if (child.kind == .packed_ and schema.packedFixedSize(child) == null) {
+                    try emit(w,
+                        \\    /// The count of `$field`, then `add$adder` that many times.
+                        \\    pub fn ${count}Count(self: *Self, n: usize) Error!void {
+                        \\        self.cursor.array($idx, n);
+                        \\        self.${field}_tbl = try self.w.records($width, n);
+                        \\    }
+                        \\
+                        \\    pub fn add$adder(self: *Self, values: anytype) Error!void {
+                        \\        self.cursor.elem($idx);
+                        \\        var child = ${child}Writer.initWithBuf(self.w.alloc, self.w.buf);
+                        \\        try child.set(values);
+                        \\        child.finish();
+                        \\        self.${field}_tbl.endRecord(&self.w);
+                        \\    }
+                        \\
+                        \\    /// One element already encoded as a ${child}.
+                        \\    pub fn add${adder}Bytes(self: *Self, bytes: []const u8) Error!void {
+                        \\        self.cursor.elem($idx);
+                        \\        try self.w.rest(bytes);
+                        \\        self.${field}_tbl.endRecord(&self.w);
+                        \\    }
+                        \\
+                        \\
+                    , .{ .count = count_fn, .adder = adder, .field = info.name, .idx = idx, .width = lenWidthName(info.len), .child = try packedName(child) });
+                } else if (child.kind == .packed_) {
+                    try emit(w,
+                        \\    /// The count of `$field`, then `add$adder` that many times.
+                        \\    pub fn ${count}Count(self: *Self, n: usize) Error!void {
+                        \\        self.cursor.array($idx, n);
+                        \\        try self.w.count($width, n);
+                        \\    }
+                        \\
+                        \\    pub fn add$adder(self: *Self, values: anytype) Error!void {
+                        \\        self.cursor.elem($idx);
+                        \\        var child = ${child}Writer.initWithBuf(self.w.alloc, self.w.buf);
+                        \\        try child.set(values);
+                        \\        child.finish();
+                        \\    }
+                        \\
+                        \\
+                    , .{ .count = count_fn, .adder = adder, .field = info.name, .idx = idx, .width = lenWidthName(info.len), .child = try packedName(child) });
+                } else {
+                    try emit(w,
+                        \\    /// The count of `$field`, then `add$adder` that many times.
+                        \\    pub fn ${count}Count(self: *Self, n: usize) Error!void {
+                        \\        self.cursor.array($idx, n);
+                        \\        try self.w.count($width, n);
+                        \\    }
+                        \\
+                        \\    pub fn add$adder(self: *Self, v: $ty) Error!void {
+                        \\        self.cursor.elem($idx);
+                        \\        try self.w.int($ty, v);
+                        \\    }
+                        \\
+                        \\
+                    , .{ .count = count_fn, .adder = adder, .field = info.name, .idx = idx, .width = lenWidthName(info.len), .ty = scalar(child.kind).ty });
+                }
+            },
+            .table, .bool => unreachable,
+        }
+    }
+
+    try w.writeAll(
         \\    /// Every field, in order, from a struct literal or a *Struct: a
         \\    /// packed record is positional, so none may be left out. Call once.
         \\    pub fn set(self: *Self, values: anytype) Error!void {
@@ -1350,73 +1494,43 @@ fn emitPackedWriter(name: []const u8, ty: schema.Type, infos: []const FieldInfo,
         , .{ .field = info.name });
     }
     for (infos) |info| {
+        const setter = try schema.camelNameCapitalized(alloc, info.name);
+        defer alloc.free(setter);
         switch (info.ty.kind) {
-            .u8, .u16, .u32, .u64 => try emit(w,
-                \\        try self.w.int($ty, values.$field);
-                \\
-            , .{ .ty = scalar(info.ty.kind).ty, .field = info.name }),
-            .enum_ => try emit(w,
-                \\        const ${field}_v: ${enum}Enum = values.$field;
-                \\        try self.w.int(u8, @intFromEnum(${field}_v));
-                \\
-            , .{ .field = info.name, .@"enum" = try enumName(info.ty) }),
-            .bytes => if (info.len == .rest) {
-                try emit(w, "        try self.w.rest(values.$field);\n", .{ .field = info.name });
-            } else {
-                try emit(w, "        try self.w.bytes($width, values.$field);\n", .{ .width = lenWidthName(info.len), .field = info.name });
-            },
-            // A nested value is written as given: a literal must name
-            // every field of the child, like `set` itself.
-            .packed_ => try emit(w,
-                \\        {
-                \\            var child = ${child}Writer.initWithBuf(self.w.alloc, self.w.buf);
-                \\            try child.set(values.$field);
-                \\            _ = child.finish();
-                \\        }
-                \\
-            , .{ .child = try packedName(info.ty), .field = info.name }),
             .array => {
-                const child = info.ty.elem();
-                if (child.kind == .packed_ and schema.packedFixedSize(child) == null) {
-                    try emit(w,
-                        \\        var ${field}_tbl = try self.w.records($width, values.$field.len);
-                        \\        for (values.$field) |elem| {
-                        \\            var child = ${child}Writer.initWithBuf(self.w.alloc, self.w.buf);
-                        \\            try child.set(elem);
-                        \\            _ = child.finish();
-                        \\            ${field}_tbl.endRecord(&self.w);
-                        \\        }
-                        \\
-                    , .{ .width = lenWidthName(info.len), .field = info.name, .child = try packedName(child) });
-                } else if (child.kind == .packed_) {
-                    try emit(w,
-                        \\        try self.w.count($width, values.$field.len);
-                        \\        for (values.$field) |elem| {
-                        \\            var child = ${child}Writer.initWithBuf(self.w.alloc, self.w.buf);
-                        \\            try child.set(elem);
-                        \\            _ = child.finish();
-                        \\        }
-                        \\
-                    , .{ .width = lenWidthName(info.len), .field = info.name, .child = try packedName(child) });
-                } else {
-                    try emit(w,
-                        \\        try self.w.ints($ty, $width, values.$field);
-                        \\
-                    , .{ .ty = scalar(child.kind).ty, .width = lenWidthName(info.len), .field = info.name });
-                }
+                const single = try schema.singularName(alloc, info.name);
+                defer alloc.free(single);
+                const count_fn = try schema.camelName(alloc, single);
+                defer alloc.free(count_fn);
+                const adder = try schema.camelNameCapitalized(alloc, single);
+                defer alloc.free(adder);
+                try emit(w,
+                    \\        try self.${count}Count(values.$field.len);
+                    \\        for (values.$field) |elem| try self.add$adder(elem);
+                    \\
+                , .{ .count = count_fn, .adder = adder, .field = info.name });
             },
-            .table, .bool => unreachable,
+            .bytes => if (info.len == .rest) {
+                try emit(w, "        try self.add$setter(values.$field);\n", .{ .setter = setter, .field = info.name });
+            } else {
+                try emit(w, "        try self.set$setter(values.$field);\n", .{ .setter = setter, .field = info.name });
+            },
+            else => try emit(w, "        try self.set$setter(values.$field);\n", .{ .setter = setter, .field = info.name }),
         }
     }
-    try w.writeAll(
+    // A record ending in the rest may leave it empty.
+    const last = infos[infos.len - 1];
+    const min_fields = if (last.ty.kind == .bytes and last.len == .rest) infos.len - 1 else infos.len;
+    try emit(w,
         \\    }
         \\
-        \\    /// The record's start offset in the buffer.
-        \\    pub fn finish(self: *Self) u32 {
-        \\        return self.w.finish();
+        \\    /// The record is complete: in safe builds, that every field
+        \\    /// was written.
+        \\    pub fn finish(self: *Self) void {
+        \\        self.cursor.done($min);
         \\    }
         \\};
         \\
         \\
-    );
+    , .{ .min = min_fields });
 }

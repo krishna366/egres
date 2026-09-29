@@ -261,20 +261,19 @@ fn benchBlockSeekGe(b: *Bench) !void {
     var bi = try BlockIterator.init(a, block.data, base_raw, zero_table_key);
     defer bi.deinit();
 
-    // Spread targets over the block: entry 0's key is the base key, and
-    // keys here are dense, so index = first + offset.
-    const base_key = Key.init(base_raw);
-    const first = try std.fmt.parseInt(usize, base_key.primary[1..], 10);
+    // Spread targets over the block: entry 0's key is the base key (a
+    // primary, "k" then digits), and keys here are dense, so index =
+    // first + offset.
+    const first = try std.fmt.parseInt(usize, base_raw[1..], 10);
     const num_targets: usize = 64;
-    const step = @max(1, bi.layout.entry_count / num_targets);
+    const step = @max(1, bi.entryCount() / num_targets);
 
-    // seekGe compares against marshaled bytes, so pre-build them —
-    // production marshals once per seek, not once per probe.
+    // seekGe takes a primary; pre-build the targets so the loop
+    // measures the search alone.
     var targets: [num_targets]String = undefined;
     for (&targets, 0..) |*raw, k| {
         var kb: [16]u8 = undefined;
-        const p = try keyAt(&kb, first + k * step);
-        raw.* = try (Key{ .primary = p }).marshal(a);
+        raw.* = try a.dupe(u8, try keyAt(&kb, first + k * step));
     }
     defer for (targets) |raw| a.free(raw);
 
@@ -307,7 +306,7 @@ fn benchBlockKeyWalk(b: *Bench, val_len: usize) !void {
 
     var bi = try BlockIterator.init(a, block.data, base_raw, zero_table_key);
     defer bi.deinit();
-    const n = bi.layout.entry_count;
+    const n = bi.entryCount();
 
     b.resetTimer();
     var i: u64 = 0;
@@ -323,6 +322,138 @@ fn benchBlockKeyWalk(b: *Bench, val_len: usize) !void {
     }
     // Per-key cost is what matters here; report keys walked, not bytes.
     std.mem.doNotOptimizeAway(bytes);
+}
+
+/// Walk every entry of ONE resident block, materializing each key and
+/// its versions, the way a block-level decode does.
+fn benchBlockEntryWalk(b: *Bench, val_len: usize) !void {
+    const a = gpa;
+    const t = try openStriped(a, 0, 1, single_keys, 64 * 1024, val_len);
+    defer destroyTable(t);
+
+    const bpos = t.blockCount() / 2;
+    const block = try t.readBlock(bpos, .p0);
+    defer block.decrRef();
+    const base_raw = try t.blockBaseKey(bpos);
+
+    var bi = try BlockIterator.init(a, block.data, base_raw, zero_table_key);
+    defer bi.deinit();
+    const n = bi.entryCount();
+
+    b.resetTimer();
+    var i: u64 = 0;
+    var bytes: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        try bi.seekToFirst();
+        var count: usize = 0;
+        while (bi.itemRef()) |item| : (count += 1) {
+            bytes += item.key.primary.len + item.newest().value.len;
+            try bi.next();
+        }
+        if (count != n) return error.ShortScan;
+    }
+    std.mem.doNotOptimizeAway(bytes);
+}
+
+
+/// Versions per key drawn from a Zipf law: P(k) proportional to 1/k^s
+/// over 1..max, so most keys hold one version and a few hold many, the
+/// shape of a table with hot rows or posting keys before compaction
+/// folds them. At s = 2 about 61% of keys hold one version, 15% two,
+/// and the mean is just under three.
+const zipf_max_versions: usize = 64;
+const zipf_s: f64 = 2.0;
+
+/// The cumulative weights of the law, for inverse sampling.
+fn zipfCdf(alloc: std.mem.Allocator) ![]f64 {
+    const cdf = try alloc.alloc(f64, zipf_max_versions);
+    var total: f64 = 0;
+    for (cdf, 1..) |*c, k| {
+        total += 1.0 / std.math.pow(f64, @floatFromInt(k), zipf_s);
+        c.* = total;
+    }
+    for (cdf) |*c| c.* /= total;
+    return cdf;
+}
+
+fn zipfDraw(cdf: []const f64, prng: *std.Random.DefaultPrng) usize {
+    const u = prng.random().float(f64);
+    for (cdf, 1..) |c, k| {
+        if (u < c) return k;
+    }
+    return cdf.len;
+}
+
+/// A table of `n` keys whose version counts follow the Zipf law, every
+/// version `val_len` bytes, timestamps descending from the count.
+fn buildZipfVersions(
+    alloc: std.mem.Allocator,
+    n: usize,
+    block_size: u32,
+    val_len: usize,
+) !zdb.table.builder.TableBuffer {
+    var b = Builder.init(alloc, .{ .target_block_size = block_size });
+    defer b.deinit();
+
+    const val = try alloc.alloc(u8, val_len);
+    defer alloc.free(val);
+    @memset(val, 'v');
+    const cdf = try zipfCdf(alloc);
+    defer alloc.free(cdf);
+    var prng = std.Random.DefaultPrng.init(5);
+    var vers: [zipf_max_versions]zdb.kv.Version = undefined;
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kb: [16]u8 = undefined;
+        const p = try keyAt(&kb, i);
+        const count = zipfDraw(cdf, &prng);
+        for (vers[0..count], 0..) |*v, j| {
+            v.* = .{ .ts = count - j, .meta = .{}, .value = val };
+        }
+        try b.addItem(.{
+            .key = .{ .primary = p },
+            .versions = .{ .many = vers[0..count] },
+        });
+    }
+    return b.finish();
+}
+
+/// `benchBlockEntryWalk` over a block whose keys hold Zipf-distributed
+/// version counts: every version of every entry is decoded, so this is
+/// the multi-version decode cost the version layout decides.
+fn benchBlockEntryWalkZipf(b: *Bench, val_len: usize) !void {
+    const a = gpa;
+    var tb = try buildZipfVersions(a, single_keys, 64 * 1024, val_len);
+    defer tb.deinit();
+    const t = try Table.openHandle(a, try fromBuf(a, tb.bytes), .p0);
+    defer destroyTable(t);
+
+    const bpos = t.blockCount() / 2;
+    const block = try t.readBlock(bpos, .p0);
+    defer block.decrRef();
+    const base_raw = try t.blockBaseKey(bpos);
+
+    var bi = try BlockIterator.init(a, block.data, base_raw, zero_table_key);
+    defer bi.deinit();
+
+    b.resetTimer();
+    var i: u64 = 0;
+    var bytes: u64 = 0;
+    var versions: u64 = 0;
+    while (i < b.n) : (i += 1) {
+        try bi.seekToFirst();
+        var count: usize = 0;
+        while (bi.itemRef()) |item| : (count += 1) {
+            const vs = item.versions.slice();
+            versions += vs.len;
+            bytes += item.key.primary.len + vs[vs.len - 1].value.len;
+            try bi.next();
+        }
+        if (count == 0) return error.ShortScan;
+    }
+    std.mem.doNotOptimizeAway(bytes);
+    std.mem.doNotOptimizeAway(versions);
 }
 
 /// Full-table key-only scan. Dominated by per-block load cost, so it
@@ -394,6 +525,18 @@ test "BENCH: key-only scan 256B values" {
 test "BENCH: in-block key walk 16B values" {
     try benchBlockKeyWalk(bench.current(), 16);
 }
+test "BENCH: in-block entry walk 16B values" {
+    try benchBlockEntryWalk(bench.current(), 16);
+}
+test "BENCH: in-block entry walk 256B values" {
+    try benchBlockEntryWalk(bench.current(), 256);
+}
 test "BENCH: in-block key walk 256B values" {
     try benchBlockKeyWalk(bench.current(), 256);
+}
+test "BENCH: in-block entry walk, zipf versions, 16B values" {
+    try benchBlockEntryWalkZipf(bench.current(), 16);
+}
+test "BENCH: in-block entry walk, zipf versions, 256B values" {
+    try benchBlockEntryWalkZipf(bench.current(), 256);
 }

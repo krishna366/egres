@@ -896,7 +896,7 @@ pub const Forest = struct {
         });
         defer bld.deinit();
         for (items) |item| {
-            if (bld.table_bytes.items.len >= max_bytes) {
+            if (bld.table_buf.items.len >= max_bytes) {
                 try self.spawnTableWrite(&g, &bld, tk, bottom, &build_err);
                 bld.reset();
             }

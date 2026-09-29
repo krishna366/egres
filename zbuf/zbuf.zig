@@ -62,6 +62,15 @@ pub fn hash(payload: []const u8) u64 {
     return std.hash.XxHash3.hash(0, payload);
 }
 
+/// `hash` of `parts` laid end to end, without laying them out: what a
+/// writer with the pieces in hand computes, and a reader with the
+/// whole checks with `hash`.
+pub fn hashParts(parts: []const []const u8) u64 {
+    var h = std.hash.XxHash3.init(0);
+    for (parts) |part| h.update(part);
+    return h.final();
+}
+
 /// 12-byte self-describing prefix for an arbitrary serialized payload:
 /// `[u64 hash][u32 length][payload bytes]`. Lets the reader bound the
 /// payload inside a larger fixed-size region (e.g. a zero-padded WAL
@@ -723,18 +732,68 @@ pub fn packedRecordsEnd(buf: []const u8, off: u32, width: LenWidth) u32 {
     return region + load(u32, buf, table + (count - 1) * 4);
 }
 
-/// Record `i`'s bytes. The index is the caller's and is checked; a
-/// table whose ends run backwards or past the region is Invalid.
-pub fn packedRecord(buf: []const u8, off: u32, width: LenWidth, i: u32) Error![]const u8 {
-    const count = packedRecordsLen(buf, off, width);
-    if (i >= count) return Error.OutOfBounds;
+/// A `[count][elements]` field of fixed-size records, located once:
+/// `at(i)` is then a bounds check and a slice, with nothing reloaded.
+/// What a loop over the array holds, instead of asking the record for
+/// each element and having it find the field again every time.
+pub fn ArrayFixed(comptime Reader: type) type {
+    return struct {
+        const Self = @This();
+        /// The elements region: count × Reader.SIZE bytes.
+        buf: []const u8,
+        count: u32,
+
+        pub fn len(self: Self) u32 {
+            return self.count;
+        }
+
+        pub fn at(self: Self, i: u32) Error!Reader {
+            if (i >= self.count) return Error.OutOfBounds;
+            const start = i * Reader.SIZE;
+            return Reader.init(self.buf[start .. start + Reader.SIZE]);
+        }
+    };
+}
+
+pub fn packedArrayFixed(comptime Reader: type, buf: []const u8, off: u32, width: LenWidth) ArrayFixed(Reader) {
+    return .{
+        .buf = packedArray(buf, off, width, Reader.SIZE),
+        .count = packedArrayLen(buf, off, width),
+    };
+}
+
+/// A `[count][count × u32 end][records]` field located once: `at(i)`
+/// is then two loads from the end table and a slice. The index is the
+/// caller's and is checked; a table whose ends run backwards or past
+/// the buffer is Invalid. The buffer bounds a record rather than the
+/// last end, which a probe would otherwise load on every call: a
+/// container checks once, at init, that the last end is where its
+/// buffer ends.
+pub fn ArrayVar(comptime Reader: type) type {
+    return struct {
+        const Self = @This();
+        /// From the end table on: the table, then the records region.
+        buf: []const u8,
+        count: u32,
+
+        pub fn len(self: Self) u32 {
+            return self.count;
+        }
+
+        pub fn at(self: Self, i: u32) Error!Reader {
+            if (i >= self.count) return Error.OutOfBounds;
+            const region = self.count * 4;
+            const start: u32 = if (i == 0) 0 else load(u32, self.buf, (i - 1) * 4);
+            const end = load(u32, self.buf, i * 4);
+            if (end < start or region + end > self.buf.len) return Error.Invalid;
+            return Reader.init(self.buf[region + start .. region + end]);
+        }
+    };
+}
+
+pub fn packedArrayVar(comptime Reader: type, buf: []const u8, off: u32, width: LenWidth) ArrayVar(Reader) {
     const table = off + @intFromEnum(width);
-    const region = table + count * 4;
-    const start: u32 = if (i == 0) 0 else load(u32, buf, table + (i - 1) * 4);
-    const end = load(u32, buf, table + i * 4);
-    const last = load(u32, buf, table + (count - 1) * 4);
-    if (end < start or end > last) return Error.Invalid;
-    return buf[region + start .. region + end];
+    return .{ .buf = buf[table..], .count = packedRecordsLen(buf, off, width) };
 }
 
 pub fn packedToSliceAlloc(comptime T: type, buf: []const u8, off: u32, width: LenWidth, alloc: std.mem.Allocator) ![]T {
@@ -758,10 +817,9 @@ pub fn appendInt(comptime T: type, list: *std.ArrayList(u8), alloc: std.mem.Allo
 pub const PackedWriter = struct {
     buf: *std.ArrayList(u8),
     alloc: std.mem.Allocator,
-    base: u32,
 
     pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) PackedWriter {
-        return .{ .buf = buf, .alloc = alloc, .base = @intCast(buf.items.len) };
+        return .{ .buf = buf, .alloc = alloc };
     }
 
     pub fn int(self: *PackedWriter, comptime T: type, v: T) !void {
@@ -798,10 +856,6 @@ pub const PackedWriter = struct {
         try appendZeros(self.buf, self.alloc, n * 4);
         return .{ .table = table, .region = @intCast(self.buf.items.len), .next = 0 };
     }
-
-    pub fn finish(self: *PackedWriter) u32 {
-        return self.base;
-    }
 };
 
 /// The offset table of a records field being written: after each
@@ -815,5 +869,53 @@ pub const RecordTable = struct {
         const end: u32 = @intCast(w.buf.items.len - self.region);
         patchU32(w.buf.items, self.table + self.next * 4, end) catch unreachable;
         self.next += 1;
+    }
+};
+
+/// A packed writer's bookkeeping in safe builds: fields go in schema
+/// order, an array gets exactly the elements its count promised, and
+/// `finish` finds every field written. Compiled out otherwise, so a
+/// generated writer costs nothing over the bytes it appends.
+pub const FieldCursor = struct {
+    const checked = std.debug.runtime_safety;
+    /// The field expected next.
+    next: u32 = 0,
+    /// Elements the open array still owes.
+    owed: usize = 0,
+
+    /// Field `idx`, written whole.
+    pub fn field(self: *FieldCursor, idx: u32) void {
+        if (!checked) return;
+        std.debug.assert(self.owed == 0);
+        std.debug.assert(self.next == idx);
+        self.next = idx + 1;
+    }
+
+    /// Array field `idx`, begun with a count of `n`.
+    pub fn array(self: *FieldCursor, idx: u32, n: usize) void {
+        self.field(idx);
+        if (checked) self.owed = n;
+    }
+
+    /// One element of array field `idx`.
+    pub fn elem(self: *FieldCursor, idx: u32) void {
+        if (!checked) return;
+        std.debug.assert(self.next == idx + 1 and self.owed > 0);
+        self.owed -= 1;
+    }
+
+    /// A piece of the trailing rest field `idx`: any number of them.
+    pub fn rest(self: *FieldCursor, idx: u32) void {
+        if (!checked) return;
+        std.debug.assert(self.owed == 0);
+        std.debug.assert(self.next == idx or self.next == idx + 1);
+        self.next = idx + 1;
+    }
+
+    /// Every field written: `min` is the field count, or one less when
+    /// the record ends in a rest field, which may stay empty.
+    pub fn done(self: FieldCursor, min: u32) void {
+        if (!checked) return;
+        std.debug.assert(self.owed == 0 and self.next >= min);
     }
 };

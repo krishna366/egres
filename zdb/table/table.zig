@@ -15,7 +15,6 @@ const _binaryfuse = @import("../binaryfusefilter.zig");
 const zroar = @import("zroar");
 const vfs = @import("vfs");
 const _cache = @import("../cache.zig");
-const Builder = @import("builder.zig").Builder;
 
 /// Module-level block cache singleton. Set before opening tables to enable
 /// caching. When null (default), readBlock always reads from disk.
@@ -49,25 +48,10 @@ inline fn baseKeyOf(b: _buffers.BlockIndexStruct) Key {
 /// The smallest stored key: one primary byte.
 const min_key_len: usize = 1;
 
-/// An entry's fixed header: [u16 overlap][u16 diff_len].
-const entry_hdr_len: usize = 4;
-
-// TODO: Consider using zbuf to store this.
-/// Where each part of a block starts, all absolute from block[0]. See the
-/// layout diagram at the top of builder.zig.
-pub const BlockLayout = struct {
-    /// Entry offsets array (u32 × entry_count).
-    offsets_off: usize,
-    /// Entries region — also where the header ends.
-    entries_off: usize,
-    entry_count: usize,
-};
-
 pub const Table = struct {
     allocator: std.mem.Allocator,
     handle: vfs.FileHandle,
     index: *_buffers.TableIndexStruct,
-    codec: compress.Codec,
     /// The table's filter, one of the two (see `builder.Config.kind`),
     /// or neither for a table written without one.
     binary_fuse: ?_binaryfuse.BinaryFuse(u16),
@@ -182,8 +166,6 @@ pub const Table = struct {
             return error.UnsupportedTableFormat;
         }
 
-        const codec: compress.Codec = @enumFromInt(@intFromEnum(table_index.compression));
-
         // Steal the fingerprints slice from the decoded index struct into a
         // BinaryFuse(u16) that we keep for the lifetime of this Table.  After
         // the transfer table_index.binary_fuse holds no heap memory (fingerprints is
@@ -219,7 +201,6 @@ pub const Table = struct {
             .allocator = allocator,
             .handle = handle,
             .index = table_index,
-            .codec = codec,
             .binary_fuse = binary_fuse,
             .egid_bm = egid_bm,
             .smallest = if (smallest_raw.len >= min_key_len)
@@ -384,25 +365,30 @@ pub const Table = struct {
         return removed;
     }
 
-    /// Decompress and checksum one block's raw bytes into a ref-counted
-    /// Value; the one ref is the caller's.
+    /// Checksum and decode one block's stored bytes into a ref-counted
+    /// Value holding its payload; the one ref is the caller's. The
+    /// block is a `buffers.Block`: its crc, checked over the bytes as
+    /// stored before any decoding, then its own codec byte saying how.
     fn decodeBlock(self: *const Table, raw: String) Error!*_cache.Value {
+        // The envelope must be there before the reader is trusted.
+        if (raw.len < _buffers.BlockReader.payload_off)
+            return error.CorruptTable;
+
+        const block = _buffers.BlockReader.init(raw);
+        // Everything after the crc: the codec byte and the payload.
+        const hashed = raw[_buffers.BlockReader.codec_off..];
+        if (block.crc() != zbuf.hash(hashed)) return error.ChecksumMismatch;
+        const codec = std.enums.fromInt(compress.Codec, block.codec()) orelse
+            return error.CorruptTable;
+
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.allocator);
-        const sz = try compress.decompress(
+        _ = try compress.decompress(
             self.allocator,
-            self.codec,
-            raw,
+            codec,
+            block.payload(),
             &out,
         );
-        // Block must contain at least the leading u64 hash (see zbuf.hash).
-        if (sz < 8) return error.CorruptTable;
-        std.debug.assert(out.items.len == sz);
-
-        const stored_checksum = try _idx.readU64LE(out.items, 0);
-        const got_checksum = zbuf.hash(out.items[8..]);
-        if (stored_checksum != got_checksum) return error.ChecksumMismatch;
-
         const owned_data = try out.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(owned_data);
         return _cache.Value.init(self.allocator, owned_data) catch
@@ -517,17 +503,22 @@ pub const Table = struct {
 /// BlockIterator decodes entries from a single block lazily, one at a
 /// time: one entry is one key with every version of it. Block data is
 /// caller-owned; key_buf and vers are self-owned.
+///
+/// The block is a decoded `buffers.BlockPayload` (builder.zig has the
+/// layout), read through the generated packed readers. Those trust
+/// their bytes: decodeBlock verified the block's crc, so the only
+/// checks left here are the ones a well-formed block can still fail
+/// by meaning, an overlap past the base key, an empty key, version
+/// offsets that do not tile the values, and an end table that runs
+/// backwards, which zbuf reports as Invalid.
 pub const BlockIterator = struct {
     alloc: std.mem.Allocator,
     /// The current entry's stored key: the primary.
     key_buf: std.ArrayList(u8),
     /// Stamped onto every emitted key: the tree this block is read for.
     table_key: TableKey,
-    block: String,
-    /// The entries region, sliced once at init. Entry offsets stored in
-    /// the block are relative to this, not to the block.
-    entries_region: String,
-    layout: BlockLayout,
+    /// The payload's entries, located once (a `buffers.BlockPayload`).
+    entries: zbuf.ArrayVar(_buffers.BlockEntryReader),
     base_key: String,
     entry_idx: usize,
     /// The current entry's versions, newest first, decoded by setIdx
@@ -540,60 +531,30 @@ pub const BlockIterator = struct {
         self.key_buf.deinit(self.alloc);
     }
 
-    fn parseBlockLayout(block: String) Error!BlockLayout {
-        // Header is [u64 block_hash][u32 entry_count] then the entry
-        // offsets (see builder.zig finishBlock). parseBlockLayout never
-        // validates the hash itself — that's already done in readBlock's
-        // decompress step.
-        if (block.len < 12) return error.CorruptTable;
-
-        const entry_count: usize = @intCast(try _idx.readU32LE(block, 8));
-        if (entry_count == 0) return error.CorruptTable;
-
-        const offsets_off: usize = 12;
-        const entries_off = offsets_off + entry_count * 4;
-        if (entries_off > block.len) return error.CorruptTable;
-
-        return .{
-            .offsets_off = offsets_off,
-            .entries_off = entries_off,
-            .entry_count = entry_count,
-        };
-    }
-
     pub fn init(
         alloc: std.mem.Allocator,
         block: String,
         base_key: String,
         table_key: TableKey,
     ) !BlockIterator {
-        // See Table Layout diagram in builder.zig.
-        // This should be a copy of that. If not, use builder.zig as the source of truth.
-        //
-        // Block layout is set as:
-        // | ------------------------------------------------------------------------||
-        // | -- block crc u64 -- | -- entry count u32 -- |
-        // | --- offsets to entries, u32 each, entry_count of them --- |
-        // | --- entries region --- |
-        // | ------------------------------------------------------------------------||
-        //
-        // Note that we only store the start offset of each entry i, not the end, because
-        // the end offset of entry i = the start offset of entry i+1.
-        //
-        // Each entry is stored as such:
-        // | ----------------------------------------------------------------------||
-        // | -- u16 key overlap with base -- | -- u16 key diff length from base -- |
-        // | -- u8 meta -- | -- key diff bytes -- | -- value bytes ----------- |
-        // | ----------------------------------------------------------------------||
-        const layout = try parseBlockLayout(block);
+        // The payload's one field is the entries array: [u32 count]
+        // [u32 end × count][entries]. The count is read before anything
+        // is trusted through it: the table must fit, and the last end
+        // must be the region's length, so no entry can reach past the
+        // block. See the layout diagram at the top of builder.zig.
+        if (block.len < 4) return error.CorruptTable;
+        const payload = _buffers.BlockPayloadReader.init(block);
+        const entry_count = payload.entries().len();
+        if (entry_count == 0) return error.CorruptTable;
+        const table_len = 4 + @as(u64, entry_count) * 4;
+        if (table_len > block.len) return error.CorruptTable;
+        if (payload.size() != block.len) return error.CorruptTable;
 
         return .{
             .alloc = alloc,
             .key_buf = .empty,
             .table_key = table_key,
-            .block = block,
-            .layout = layout,
-            .entries_region = block[layout.entries_off..],
+            .entries = payload.entries(),
             .base_key = base_key,
             .entry_idx = 0,
             .vers = .empty,
@@ -605,12 +566,13 @@ pub const BlockIterator = struct {
         try self.setIdx(0);
     }
 
+    /// Entries in the block; at least one (init refuses an empty one).
+    pub fn entryCount(self: *const BlockIterator) usize {
+        return self.entries.len();
+    }
+
     pub fn seekToLast(self: *BlockIterator) Error!void {
-        if (self.layout.entry_count == 0) {
-            self.is_valid = false;
-            return;
-        }
-        try self.setIdx(self.layout.entry_count - 1);
+        try self.setIdx(self.entryCount() - 1);
     }
 
     pub fn next(self: *BlockIterator) Error!void {
@@ -636,23 +598,12 @@ pub const BlockIterator = struct {
 
     /// Read entry i's key without copying it.
     fn storedKeyAt(self: *BlockIterator, i: usize) Error!StoredKey {
-        const er = self.entries_region;
-        const off = try self.getOffset(i);
-        if (off + entry_hdr_len > er.len) return error.CorruptTable;
-
-        const overlap: usize = @intCast(try _idx.readU16LE(er, off));
-        const dlen: usize = @intCast(try _idx.readU16LE(er, off + 2));
+        const entry = try self.entries.at(@intCast(i));
+        const overlap: usize = entry.keyOverlap();
+        const diff = entry.keyDiff();
         if (overlap > self.base_key.len) return error.CorruptTable;
-        if (overlap + dlen < min_key_len) return error.CorruptTable;
-
-        const start = off + entry_hdr_len;
-        const end = start + dlen;
-        if (end > er.len) return error.CorruptTable;
-
-        return .{
-            .base = self.base_key[0..overlap],
-            .diff = er[start..end],
-        };
+        if (overlap + diff.len < min_key_len) return error.CorruptTable;
+        return .{ .base = self.base_key[0..overlap], .diff = diff };
     }
 
     /// Order entry i against a target primary, bytewise: `Key.orderPrimary`
@@ -714,7 +665,7 @@ pub const BlockIterator = struct {
             @min(target_key.len, self.base_key.len);
 
         var lo: usize = from;
-        var hi: usize = self.layout.entry_count;
+        var hi: usize = self.entryCount();
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             const ord = try self.cmpStoredKey(mid, target_key, shared);
@@ -724,7 +675,7 @@ pub const BlockIterator = struct {
                 hi = mid;
             }
         }
-        if (lo < self.layout.entry_count) {
+        if (lo < self.entryCount()) {
             try self.setIdx(lo);
         } else {
             self.is_valid = false;
@@ -747,95 +698,72 @@ pub const BlockIterator = struct {
         };
     }
 
-    /// Start of entry i within entries_region.
-    inline fn getOffset(self: *BlockIterator, i: usize) Error!usize {
-        const at = self.layout.offsets_off + (i * 4);
-        return @intCast(try _idx.readU32LE(self.block, at));
-    }
-
     fn setIdx(self: *BlockIterator, i: usize) Error!void {
-        if (i >= self.layout.entry_count) {
+        if (i >= self.entryCount()) {
             self.is_valid = false;
             return;
         }
 
-        const er = self.entries_region;
-        const off = try self.getOffset(i);
-        // Fixed header: [u16 overlap][u16 diff_len].
-        if (off + entry_hdr_len > er.len) return error.CorruptTable;
-
-        const key_overlap: usize = @intCast(try _idx.readU16LE(er, off));
-        const key_diff_len: usize = @intCast(try _idx.readU16LE(er, off + 2));
+        const entry = try self.entries.at(@intCast(i));
+        const key_overlap: usize = entry.keyOverlap();
+        const diff = entry.keyDiff();
         if (key_overlap > self.base_key.len) return error.CorruptTable;
-        if (key_overlap + key_diff_len < min_key_len) return error.CorruptTable;
-
-        const diff_start = off + entry_hdr_len;
-        const diff_end = diff_start + key_diff_len;
-        if (diff_end > er.len) return error.CorruptTable;
-        const diff = er[diff_start..diff_end];
+        if (key_overlap + diff.len < min_key_len) return error.CorruptTable;
 
         // Reconstruct full key into reusable buffer: base[0..overlap] ++ diff.
         utils.clearRetainCap(&self.key_buf);
         try self.key_buf.appendSlice(self.alloc, self.base_key[0..key_overlap]);
         try self.key_buf.appendSlice(self.alloc, diff);
 
-        // Value boundary: next entry's offset, or end of the entries
-        // region for the last entry.
-        const value_start = diff_end;
-        const value_end = if (i + 1 < self.layout.entry_count)
-            try self.getOffset(i + 1)
-        else
-            er.len;
-        if (value_end < value_start or value_end > er.len) {
-            return error.CorruptTable;
-        }
-        try self.unpackVersions(er[value_start..value_end]);
+        try self.unpackVersions(entry);
         self.entry_idx = i;
         self.is_valid = true;
     }
 
-    /// Decode an entry's packed versions (see builder.zig) into `vers`.
-    /// `count` is untrusted: the header size is computed in u64 and
-    /// every offset is checked against the bytes region, and a
+    /// Decode an entry's versions (see builder.zig) into `vers`: each
+    /// header's `off` is checked to start where the previous version's
+    /// bytes ended, so the versions tile the entry's values, and a
     /// tombstone's offset equals the next one (no bytes).
-    fn unpackVersions(self: *BlockIterator, value: String) Error!void {
-        const count: usize = @intCast(try _idx.readU32LE(value, 0));
+    fn unpackVersions(
+        self: *BlockIterator,
+        entry: _buffers.BlockEntryReader,
+    ) Error!void {
+        const vers = entry.versions();
+        const count: usize = vers.len();
         if (count == 0) return error.CorruptTable;
-
-        const hdr_len = 4 + @as(u64, count) * Builder.ver_hdr_len;
-        if (hdr_len > value.len) return error.CorruptTable;
-
-        const hdrs = value[4..@intCast(hdr_len)];
-        const bytes = value[@intCast(hdr_len)..];
+        const bytes = entry.values();
 
         utils.clearRetainCap(&self.vers);
         try self.vers.ensureTotalCapacity(self.alloc, count);
+
         if (count == 1) {
             // Nearly every entry after compaction: the value is the
             // whole bytes region.
-            if (try _idx.readU32LE(hdrs, 9) != 0) return error.CorruptTable;
+            const hdr = vers.at(0) catch unreachable;
+            if (hdr.off() != 0) return error.CorruptTable;
             self.vers.appendAssumeCapacity(.{
-                .ts = try _idx.readU64LE(hdrs, 0),
-                .meta = Meta.fromByte(hdrs[8]),
+                .ts = hdr.ts(),
+                .meta = Meta.fromByte(hdr.meta()),
                 .value = bytes,
             });
             return;
         }
+
         var off: usize = 0;
         for (0..count) |v| {
-            const at = v * Builder.ver_hdr_len;
-            const start: usize = @intCast(try _idx.readU32LE(hdrs, at + 9));
+            const hdr = vers.at(@intCast(v)) catch unreachable;
+            const start: usize = hdr.off();
             if (start != off) return error.CorruptTable;
 
             const end: usize = if (v + 1 < count)
-                @intCast(try _idx.readU32LE(hdrs, at + Builder.ver_hdr_len + 9))
+                (vers.at(@intCast(v + 1)) catch unreachable).off()
             else
                 bytes.len;
             if (end < start or end > bytes.len) return error.CorruptTable;
 
             self.vers.appendAssumeCapacity(.{
-                .ts = try _idx.readU64LE(hdrs, at),
-                .meta = Meta.fromByte(hdrs[at + 8]),
+                .ts = hdr.ts(),
+                .meta = Meta.fromByte(hdr.meta()),
                 .value = bytes[start..end],
             });
             off = end;
