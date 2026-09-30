@@ -235,7 +235,6 @@ pub const Stmt = union(enum) {
     }
 };
 
-
 const c = parser.c;
 
 pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {

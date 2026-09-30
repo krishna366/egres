@@ -122,14 +122,32 @@ const small: usize = 64;
 const medium: usize = 4 * 1024;
 const large: usize = 64 * 1024;
 
-test "BENCH: 64B crc32c-sw" { try benchSw(bench.current(), small); }
-test "BENCH: 64B crc32c-hw" { try benchHw(bench.current(), small); }
-test "BENCH: 64B xxhash3" { try benchXxHash3(bench.current(), small); }
+test "BENCH: 64B crc32c-sw" {
+    try benchSw(bench.current(), small);
+}
+test "BENCH: 64B crc32c-hw" {
+    try benchHw(bench.current(), small);
+}
+test "BENCH: 64B xxhash3" {
+    try benchXxHash3(bench.current(), small);
+}
 
-test "BENCH: 4KiB crc32c-sw" { try benchSw(bench.current(), medium); }
-test "BENCH: 4KiB crc32c-hw" { try benchHw(bench.current(), medium); }
-test "BENCH: 4KiB xxhash3" { try benchXxHash3(bench.current(), medium); }
+test "BENCH: 4KiB crc32c-sw" {
+    try benchSw(bench.current(), medium);
+}
+test "BENCH: 4KiB crc32c-hw" {
+    try benchHw(bench.current(), medium);
+}
+test "BENCH: 4KiB xxhash3" {
+    try benchXxHash3(bench.current(), medium);
+}
 
-test "BENCH: 64KiB crc32c-sw" { try benchSw(bench.current(), large); }
-test "BENCH: 64KiB crc32c-hw" { try benchHw(bench.current(), large); }
-test "BENCH: 64KiB xxhash3" { try benchXxHash3(bench.current(), large); }
+test "BENCH: 64KiB crc32c-sw" {
+    try benchSw(bench.current(), large);
+}
+test "BENCH: 64KiB crc32c-hw" {
+    try benchHw(bench.current(), large);
+}
+test "BENCH: 64KiB xxhash3" {
+    try benchXxHash3(bench.current(), large);
+}

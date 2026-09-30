@@ -358,7 +358,6 @@ fn benchBlockEntryWalk(b: *Bench, val_len: usize) !void {
     std.mem.doNotOptimizeAway(bytes);
 }
 
-
 /// Versions per key drawn from a Zipf law: P(k) proportional to 1/k^s
 /// over 1..max, so most keys hold one version and a few hold many, the
 /// shape of a table with hot rows or posting keys before compaction

@@ -69,7 +69,6 @@ fn waitForMux(server: *Transport, peer_id: u64, priority: Transport.Priority) !*
     return error.PeerNotConnected;
 }
 
-
 test "single server echo via raw client" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();

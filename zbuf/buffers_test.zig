@@ -645,10 +645,10 @@ test "packed: an entry round-trips and is laid out byte for byte" {
 
     // [u16 5][u16 2]"ab"[u32 2][ts 9,meta 0x80,off 0][ts 3,meta 0,off 2]"xyz"
     const want = [_]u8{
-        5, 0, 2, 0, 'a', 'b', 2, 0, 0, 0,
-        9, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0,
-        3, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0,
-        'x', 'y', 'z',
+        5, 0, 2, 0, 'a', 'b', 2, 0, 0, 0, // overlap 5, diff "ab", 2 versions
+        9, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, // ts 9, meta 0x80, off 0
+        3, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, // ts 3, meta 0, off 2
+        'x', 'y', 'z', // values
     };
     try std.testing.expectEqualSlices(u8, &want, buf.items);
     try std.testing.expectEqual(@as(u32, 13), gen.VersionHdrReader.SIZE);
