@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Ideal-readahead calibration: how large a read is still (half) "free"
 //! on a store endpoint? Timed ranged GETs at doubling sizes feed a fit of
 //! `latency(s) = ttfb + s/bandwidth`; the answer is `ttfb × bandwidth` —

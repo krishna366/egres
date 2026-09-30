@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The statement executor: a pull pipeline of RowNodes exchanging ONE
 //! Batch — rows the source copied once, plus a bit set saying which of
 //! them survive — and BitmapNodes that turn index reads into egid sets.

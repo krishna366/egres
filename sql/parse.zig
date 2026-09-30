@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Statement parsing: SQL text → a small typed `Stmt`, via libpg_query
 //! (reused from pgwire). Only the statements the server executes are
 //! recognized — CREATE/DROP DATABASE, TABLE, INDEX; INSERT, SELECT,

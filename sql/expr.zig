@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! SET value expressions over stored rows. `SetNode` is the resolved
 //! form of one `column = expr` assignment — parse.Expr with its
 //! columns bound to the table, its literals typed, and its operators

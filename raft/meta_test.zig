@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 // Tests for raft/meta.zig::MetaStore.
 //
 // Each test creates a fresh /tmp/egres-meta-<ts> directory, exercises a

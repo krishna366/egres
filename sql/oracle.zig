@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Oracle: which keys committed recently, and at what timestamp.
 //!
 //! One map per namespace, keyed by row/table identity hash

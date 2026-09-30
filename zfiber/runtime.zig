@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Multi-threaded fiber scheduler. The `Runtime` owns N `Worker`s,
 //! each driving its own `xev.Loop` on its own OS thread (worker 0 on
 //! the calling thread, workers 1..N-1 on `std.Thread.spawn`).

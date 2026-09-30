@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! In-process CPU sampling profiler, started and stopped from the admin
 //! protocol (`profile cpu <seconds> [hz]`). Replaces running the server
 //! under gdb: no ptrace, no process-wide stop, a few percent of one

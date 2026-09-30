@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! File I/O for fibers, split by how each op is serviced:
 //!
 //!   - **Data plane** (`read`/`write`/`preadBatch`): positional `pread`/

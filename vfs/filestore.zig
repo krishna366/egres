@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! FileStore — the S3-equivalent object store that distributes immutable
 //! files (SSTs) across nodes. The creator uploads an object BEFORE
 //! proposing the manifest change that references it, so store durability

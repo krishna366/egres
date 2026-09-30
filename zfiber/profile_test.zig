@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const builtin = @import("builtin");
 const fiber = @import("zfiber");

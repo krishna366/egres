@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! engine — the glue binding `zdb` (storage) and `raft` (consensus) into one
 //! replicated storage unit, behind a single API.
 //!

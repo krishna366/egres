@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end driver tests. The driver is the only net-touching layer,
 //! so we drive it through a real TCP loopback pair on the fiber runtime
 //! — server and client each run as a fiber in a Group. The server

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Write-side validation of roaring posting values.
 //!
 //! A posting is the set of u64 row ids (egids) stored under one index

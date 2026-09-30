@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Dates and timestamps: proleptic-Gregorian calendar arithmetic (any
 //! year, no tables) and the ISO-8601 text codecs built on it, `YYYY-MM-DD`
 //! and `YYYY-MM-DD[T| ]HH:MM:SS[.ffffff][Z|±HH[:MM]]`. SQL date and

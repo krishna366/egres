@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! GuardAllocator — a diagnostic allocator that page-isolates every allocation
 //! so a use-after-free or buffer overflow faults (SIGSEGV) AT the offending
 //! instruction, making the backtrace name the WRITER rather than a later

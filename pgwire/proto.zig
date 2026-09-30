@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Postgres v3 wire-protocol message codec — pure byte buffers, no I/O.
 //!
 //! Two message shapes coexist on the wire:

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Helpers for tests that drive a Forest directly, without an Engine
 //! or Raft. Not a `_test.zig` file, so it holds no tests of its own;
 //! test files import it by path.

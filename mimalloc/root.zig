@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Zig allocator adapter and production policy for the pinned mimalloc.
 //!
 //! The policy is: stock defaults, no configuration. The zmem study probed

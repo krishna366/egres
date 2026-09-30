@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! TCP networking that cooperatively parks the calling fiber on libxev
 //! completions. The public surface mirrors `zio.net` so the rest of the
 //! codebase migrates by swapping `zio.net` → `fiber.net`:

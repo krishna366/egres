@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 """Load-test driver for a local zdb Raft cluster.
 
 Spawns N `egres` processes, bootstraps namespaces, drives the `zdb-bench`

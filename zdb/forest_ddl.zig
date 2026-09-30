@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Forest's DDL methods for the namespace, table and split commands: the
 //! leader-side `build*` functions, which read the manifest and the live
 //! levels and return a ManifestChange for the caller to propose, and the

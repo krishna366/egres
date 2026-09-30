@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The zbuf generator: reads a schema (`buffers.zig`, see schema.zig)
 //! as plain values and writes the readers, writers and structs for
 //! its records. The generated code is written from templates that

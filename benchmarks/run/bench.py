@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 """Benchmark runs: one server (Egres or PostgreSQL) through one workload,
 a load with readers alongside, then pgbench runs back to back, with
 Prometheus and Grafana drawing the whole run. The same commands rerun

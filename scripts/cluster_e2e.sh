@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 # End-to-end multi-process cluster test: 3 egres nodes distributing SST
 # files through the shared object store (the `dir` depot backend), plus an
 # optional SeaweedFS leg (SEAWEED=1) that runs the same matrix against a

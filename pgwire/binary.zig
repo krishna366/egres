@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binary encoders/decoders for the primitive Postgres types most
 //! clients will negotiate by default. Pure-logic — operates on byte
 //! buffers, no I/O. The 6 primitives covered here unblock pgx's and

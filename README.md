@@ -164,3 +164,8 @@ exec 3>&-
 A successful load reports `0 err` per worker plus a Load Phase summary
 (`records`, `throughput`, `errors: 0`). On disk you should see SST files
 appear and the WAL stay bounded as snapshots truncate it.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE). Every source file carries
+an SPDX header; `third_party/` keeps its own licenses.

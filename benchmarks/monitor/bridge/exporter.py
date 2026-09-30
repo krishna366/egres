@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 """Prometheus bridge for a running Egres.
 
 Egres answers the admin command `zdb` with its storage counters in

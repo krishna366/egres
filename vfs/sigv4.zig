@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! AWS Signature Version 4 (SigV4) request signing — the auth scheme every
 //! S3-compatible store speaks (AWS, GCS interop, SeaweedFS, proxies). Pure
 //! stdlib crypto (Sha256 + HmacSha256); no I/O. The S3 client signs exactly

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! S3-compatible object store client — the `s3` FileStore backend. A
 //! minimal HTTP/1.1 client over fiber.net with SigV4-signed
 //! PUT/GET/HEAD/DELETE, path-style URLs (`/bucket/prefix/key`), TLS, and

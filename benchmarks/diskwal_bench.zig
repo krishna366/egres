@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 // DiskWAL micro-benchmarks: append + (optionally) fsync records through the
 // raw `raft.diskwal` layer, bypassing Raft itself. Isolates the WAL from
 // the propose queue / quorum / apply loop so we can tell whether the

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded MPMC channel of `T`. Built directly on `Spinlock` +
 //! `WaitQueue` + the runtime's `park`/`wake` — no Mutex/Condition
 //! layering. One short spinlock-protected critical section per op,

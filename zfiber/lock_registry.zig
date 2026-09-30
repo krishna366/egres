@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Holder tracking for the *tracked* `Mutex`/`RWMutex` modes in sync.zig.
 //! A triage tool for a wedged server: `dumpLocks` answers "which locks are
 //! held, by what code, and for how long?" without a debugger.

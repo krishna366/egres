@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logical → physical schema compilation for the row codec.
 //!
 //! The catalog knows a table as a LogicalSchema: a set of columns, each

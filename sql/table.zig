@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reconstructing a user table's schema from its catalog rows.
 //!
 //! CREATE TABLE writes one catalog row per column (server.writeCatalogRows);

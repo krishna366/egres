@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! SemaphoreMap: keyed reader/writer locks with owner tokens and
 //! block-time deadlock detection.
 //!

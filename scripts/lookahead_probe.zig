@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! lookahead-probe — run the FileStore lookahead calibration against any
 //! store backend — an S3-compatible endpoint or a local filesystem
 //! depot — and print the latency profile. The same probing egres runs at

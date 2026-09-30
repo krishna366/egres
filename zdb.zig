@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 pub const config = @import("zdb/config.zig");
 pub const kv = @import("zdb/kv.zig");
 pub const skl = @import("zdb/skl/skiplist.zig");

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Process-wide coarse wall-clock. A single atomic `cached_ms` that any
 //! fiber on any worker reads via `ms()` (one acquire load, syscall-free
 //! on the hot path). It lives in utils, below the fiber runtime, so

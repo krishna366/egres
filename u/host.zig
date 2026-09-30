@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! What the host lets this process have: memory from sysinfo, capped
 //! by the cgroup limit when one applies (Docker, Kubernetes).
 

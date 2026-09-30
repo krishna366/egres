@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Forest's read paths: point lookups (`get`, `getRaw`, `getBitmap`),
 //! the batch they are one-key calls of (`MultiGet`, `multiGet`), and
 //! the range scan with its `Cursor` and `maxKey`. Every function here

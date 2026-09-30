@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 // Single-threaded, uncontended micro-benchmarks of the per-worker ready queue
 // `fiber.LocalQueue(.none)` vs `fiber.LocalQueue(.withlock)`.
 //

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Synchronization primitives. All built on the runtime's `park`/
 //! `wake` mechanism; no kernel locking, no `std.Thread.Mutex`.
 //!

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 if (( $# != 2 )); then

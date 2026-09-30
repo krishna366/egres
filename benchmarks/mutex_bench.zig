@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 // Single-fiber, uncontended micro-benchmarks comparing the TRACKED vs
 // UNTRACKED fiber Mutex / RWMutex modes — `fiber.Mutex(.tracked)` vs
 // `fiber.Mutex(.untracked)`.

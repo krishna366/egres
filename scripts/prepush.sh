@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 # Pre-push gate: build the exe and run the full (big) test suite before a
 # push is allowed. `zig build test` alone skips the exe (it rots silently),
 # so build it too. Wired to the `jj push` alias in this repo's jj config;

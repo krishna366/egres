@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! libpg_query wrapper: the raw parse tree, read in place.
 //!
 //! `pg_query_raw_parse` builds Postgres's own node tree in a memory

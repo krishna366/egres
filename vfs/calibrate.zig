@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Disk calibration at startup: the data directory's read and write
 //! bandwidth, measured with several requests in flight, which
 //! `bwConfigFrom` turns into the bandwidth limiter's settings. Works

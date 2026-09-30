@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 # End-to-end smoke test for SQL DDL (CREATE/DROP DATABASE + TABLE + INDEX)
 # pgwire endpoint. Builds, starts a fresh single-node egres, drives psql
 # through the DDL matrix (including a restart-persistence leg), and greps

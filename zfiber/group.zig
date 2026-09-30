@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Collective fan-out + wait over fibers returning the same type `T`.
 //! Wraps the "vector-of-handles + for-spawn / for-join" pattern so the
 //! call site stays compact.

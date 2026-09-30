@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The four DML statement bodies — INSERT, SELECT, DELETE, UPDATE.
 //! Each resolves its table and WHERE, plans the read (plan.zig) and
 //! runs it (exec.zig) for the rows it acts on, maintains every index

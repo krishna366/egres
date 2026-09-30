@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Module root. Re-exports every public symbol from sibling files so
 //! consumers see one flat namespace (`fiber.Fiber`, `fiber.Runtime`,
 //! `fiber.spawn`, …) regardless of which file the symbol lives in.

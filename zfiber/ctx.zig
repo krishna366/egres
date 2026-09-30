@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-statement context: the record of a statement's path through the
 //! system, and the latency-bucketed traces kept for the admin port.
 //!

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Planner tests: the tree a WHERE turns into, on a hand-built table
 //! — `a int4` the PK behind a unique index, `b int4` behind a
 //! non-unique one, `c text` unindexed. Each case is the SQL text of

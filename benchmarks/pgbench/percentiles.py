@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 """Print p50/p99/p99.9 transaction latency from pgbench -l logs.
 
 Usage: percentiles.py <log-prefix>

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Runtime SQL types and values for the physical row codec.
 //!
 //! A table's columns are known only at runtime, so — unlike zbuf's

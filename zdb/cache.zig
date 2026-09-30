@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! S3-FIFO block cache for ZDB.
 //!
 //! Three FIFO queues: S (small, 10%), M (main, 90%), G (ghost, fixed count).

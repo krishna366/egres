@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! SQL key encodings. zdb sees only opaque key bytes; this is where
 //! the SQL layer gives them meaning.
 //!

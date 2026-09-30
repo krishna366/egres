@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 """Emit the pgbench schema and data as SQL that Egres can execute.
 
 `pgbench -i` cannot be used against Egres: it needs COPY, NOT NULL,

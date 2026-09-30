@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Intrusive min-heap of pointers, with O(log N) middle removal via
 //! a back-pointer index stored on each entry. Generic over the entry
 //! type, the field name to compare on, and the field name used as

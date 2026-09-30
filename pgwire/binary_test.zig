@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Binary encoder/decoder tests for the primitive Postgres types.
 //! Pure-logic — every byte goes through a stack buffer.
 

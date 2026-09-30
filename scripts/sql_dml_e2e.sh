@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 # End-to-end smoke test for SQL INSERT/SELECT/UPDATE/DELETE over the pgwire
 # endpoint. Builds, starts a fresh single-node egres, drives psql through
 # insert/select/filter, egid visibility, update (point + multi-SET + scan +

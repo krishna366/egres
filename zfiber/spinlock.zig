@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Atomic test-and-test-and-set spinlock. ~15 LOC. Use for short
 //! critical sections (≤ 10s of cycles) where setting up a futex
 //! would dominate the cost. Wraps composite ops on data structures

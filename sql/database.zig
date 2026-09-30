@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! One SQL database's per-namespace state: the row lock table, the
 //! table locks, the commit oracle, and the compiled-schema
 //! cache. A Txn holds a pointer to its Database and takes what it

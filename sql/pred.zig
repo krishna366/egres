@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Boolean WHERE predicates over stored rows. `Pred` is the resolved
 //! tree — parse.Where with its columns bound to the table and its
 //! literals coerced to the columns' types — and `eval` is its SQL

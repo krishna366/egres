@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stackful fiber primitive. A `Fiber` wraps a coroutine (its own
 //! mmap-backed stack + saved register context) and the metadata the
 //! scheduler needs: priority, home worker, intrusive list pointers,

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Monotonically-advancing u64 with targeted wait/wake.
 //!
 //! Built directly on `Spinlock` + a centralized `ArrayList(Entry)`

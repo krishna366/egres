@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stress harness for the fiber timeout / watermark / sleep machinery.
 //!
 //! Pounds `sleepMs`, timed/untimed `Watermark.waitFor`, CPU-bound compute,

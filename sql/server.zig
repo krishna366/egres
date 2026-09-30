@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The SQL front-end: a pgwire listener over the engine. Owns the
 //! accept loop, the per-database txn machinery (lock table + commit
 //! oracle + table cache), and the per-connection Handler — session

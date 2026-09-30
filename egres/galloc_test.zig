@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Generic allocator-contract tests for the build-selected backend.
 //!
 //! `galloc` is whichever adapter `-Dallocator` picked (see build.zig),

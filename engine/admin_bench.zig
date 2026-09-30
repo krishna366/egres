@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Protocol parser benchmarks. Measures `proto.readToken` in isolation —
 //! no sockets, no allocator contention beyond what the real handler does,
 //! no Raft. Goal is to verify the parser can move bytes far faster than

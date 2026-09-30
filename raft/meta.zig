@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 // MetaStore — durable HardState + Snapshot for the Raft log.
 //
 //   state.bin     — 8 KiB, two-slot double-buffered HardState. Opened with

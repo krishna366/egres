@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! DiskWAL on the real disk: what one durable batch costs, what the
 //! append alone costs, and how the latency spreads across a run long
 //! enough to cross a log file rotation.

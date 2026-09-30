@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 # Sampling profiler for a running egres command, for boxes where perf is
 # not available (perf_event_paranoid > 2 and no root). The server is
 # started as gdb's child, so ptrace is allowed; a SIGPROF is sent to it

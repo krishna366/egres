@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The compaction output stage: what of a primary's versions is
 //! written (`VersionTracker`), and how the tables come out
 //! (`Emitter`). One Emitter writes one level of one tree; the memtable

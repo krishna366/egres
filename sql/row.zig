@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Marshal/unmarshal a SQL row to/from its physical byte layout.
 //!
 //! Layout (all little-endian; offsets precomputed in schema.PhysicalSchema):

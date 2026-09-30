@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Go-style benchmark harness for `BENCH: …` -prefixed tests.
 //!
 //! Usage in a test file:

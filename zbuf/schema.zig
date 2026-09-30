@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The schema DSL: a `buffers.zig` describes its records with the
 //! constructors here, and the generator (gen.zig) reads the result as
 //! plain values. A record type is a `Type` holding its fields; a field

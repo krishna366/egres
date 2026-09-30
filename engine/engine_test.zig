@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Wire-format tests for the .data Mutations payload: a flat kv list
 //! with full self-describing keys, one namespace per entry.
 

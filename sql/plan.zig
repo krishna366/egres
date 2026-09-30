@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The planner: the one place that chooses index vs. scan. A bound
 //! Pred (pred.zig) in, a tree of exec nodes out — `materialize →
 //! (seq_scan | fetch(bitmap))` — with the WHOLE predicate re-checked

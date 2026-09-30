@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Thread-pool offload for blocking operations the libxev loop can't do
 //! asynchronously — primarily file `fsync` (libxev has no fsync op) and the
 //! blocking filesystem metadata syscalls (open/stat/rename/…).

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Layer 2: fiber-backed I/O for the pgwire state machine.
 //!
 //! This is the *only* file in pgwire that is allowed to know about

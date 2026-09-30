@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Smoke test for the test_runner's process-level watchdog.
 //!
 //! Default run skips this file's tests (HANG:-prefixed, opted out by

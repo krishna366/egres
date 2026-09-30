@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Transaction context for DML. Every statement runs inside a Txn —
 //! implicit (one statement, auto-commit) today; interactive
 //! (BEGIN..COMMIT) changes only its lifetime. Pending writes live in a

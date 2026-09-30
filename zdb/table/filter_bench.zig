@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Size of the two SST filters over egid key sets: the binary fuse
 //! filter (hashes of the keys) against a roaring bitmap of the keys
 //! themselves. Run with `zig build bench` and read the table it prints.

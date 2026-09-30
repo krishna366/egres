@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 # Concurrency e2e for interactive transactions over pgwire. Two long-lived
 # psql sessions (FIFO-fed) drive: BEGIN/COMMIT/ROLLBACK visibility across
 # sessions, read-your-own-writes (point + scan), row-lock blocking with

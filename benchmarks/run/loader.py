@@ -1,3 +1,6 @@
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 """The load: a workload's table filled through parallel psql streams,
 with readers alongside, progress published as Prometheus metrics.
 

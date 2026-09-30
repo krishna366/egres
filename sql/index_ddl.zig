@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! CREATE INDEX and DROP INDEX — the online backfill protocol, for
 //! both kinds of index (postings and unique entries), and the
 //! removal both statements share. Tables and databases are ddl.zig.

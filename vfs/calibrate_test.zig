@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 const std = @import("std");
 const testing = std.testing;
 const vfs = @import("vfs");

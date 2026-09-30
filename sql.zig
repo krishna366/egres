@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! sql — the relational layer's physical row codec.
 //!
 //! value:  Type / Value / Row — runtime SQL types and typed cells.

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared pgwire types and constants. No I/O.
 //!
 //! The Postgres wire protocol is document-of-record; OIDs come from

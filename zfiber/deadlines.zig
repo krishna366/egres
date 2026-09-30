@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-worker timeout machinery: a flat array of pending deadlines plus a
 //! growable pool of `xev.Timer` completions, one always armed for the earliest
 //! deadline.

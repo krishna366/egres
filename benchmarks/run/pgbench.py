@@ -1,3 +1,6 @@
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 """Run pgbench and publish its progress.
 
 `start` launches pgbench in its own session, appending to a log, and

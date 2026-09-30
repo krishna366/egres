@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Micro-benchmarks for the SST read path.
 //!
 //! Four angles, each isolating one cost so an optimization's effect is

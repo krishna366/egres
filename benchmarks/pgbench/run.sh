@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 # One runner for both Egres and Postgres pgbench numbers.  Every
 # measured run is preceded by a warmup of the same shape, so cache
 # fill and connection setup stay out of the measurement, and one TSV

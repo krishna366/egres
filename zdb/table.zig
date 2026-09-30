@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 pub const index = @import("table/index.zig");
 pub const builder = @import("table/builder.zig");
 pub const table = @import("table/table.zig");

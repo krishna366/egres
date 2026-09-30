@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 const schema = @import("schema");
 
 // tag 0 reserved for undefined — a freshly-zeroed byte never decodes as a real change.

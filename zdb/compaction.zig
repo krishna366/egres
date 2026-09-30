@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Compaction for a zdb Tree: the per-level size targets, the scoring
 //! that picks which level to compact next, and Phase A of the pipeline,
 //! which merges a level into the one below it and writes the output SST

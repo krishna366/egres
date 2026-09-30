@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! DDL execution: CREATE/DROP DATABASE and TABLE. Each is a
 //! choreography over the forest's manifest (name reservation, tree
 //! creation, catalog rows) replicated through raft — the data plane

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The system catalog: table 1 in every namespace.
 //!
 //! Each namespace (database) carries its own catalog, so a namespace is

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shutdown — a two-stage "shutdown has begun" signal that is pollable,
 //! blockable, and timed-blockable, with optional SIGINT/SIGTERM wiring.
 //!

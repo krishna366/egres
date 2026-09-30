@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! The human-readable stats dump of a Forest: a top-level summary, one
 //! tree, or one namespace. Every function here takes a `*Forest` and
 //! leaves it unchanged; `Forest` aliases each declaration back in, so

@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 // Hash throughput benchmarks. Three implementations are compared:
 //
 //   1. `std.hash.crc.Crc32Iscsi.hash` — table-based software CRC.

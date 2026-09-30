@@ -1,3 +1,6 @@
+// Copyright 2026 Manish R Jain
+// SPDX-License-Identifier: Apache-2.0
+
 //! libpg_query wrapper tests. The parser layer is technically Layer 1
 //! (no I/O), but it pulls in the C library so we test it separately.
 

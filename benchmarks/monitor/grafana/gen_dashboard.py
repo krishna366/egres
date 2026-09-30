@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Manish R Jain
+# SPDX-License-Identifier: Apache-2.0
+
 """Writes grafana/dashboards/egres.json: one dashboard for a long run.
 
 Hand-editing Grafana JSON is error-prone, so the panels are declared
