@@ -1012,13 +1012,22 @@ pub const Engine = struct {
             return;
         }
 
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.allocator);
         for (result.entries) |stored| {
             const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch |err| {
                 log.warn("maybeProposeSnapshot: parseRoot at index={d}: {s}", .{ stored.index, @errorName(err) });
                 continue;
             };
-            const payload = reader.data();
+            // An entry's data may be stored compressed.
+            const payload = try utils.compression.maybeUnpack(
+                self.allocator,
+                reader.codec(),
+                reader.data(),
+                &scratch,
+            );
             if (payload.len == 0) continue;
+
             const parsed = zdb_bufs.parseMessageWithTail(payload) catch |err| {
                 log.warn("maybeProposeSnapshot: parseMessageWithTail at index={d}: {s}", .{ stored.index, @errorName(err) });
                 continue;

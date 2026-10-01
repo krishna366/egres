@@ -86,3 +86,124 @@ test "zstd rejects garbage bytes" {
         compress.decompress(std.testing.allocator, .zstd, &garbage, &dec_buf),
     );
 }
+
+/// `maybePack` then `maybeUnpack` with the codec it chose gives the
+/// input back. Returns that codec.
+fn packRoundTrip(input: String, rule: compress.PackRule) !compress.Codec {
+    const alloc = std.testing.allocator;
+    var pack_scratch: std.ArrayList(u8) = .empty;
+    defer pack_scratch.deinit(alloc);
+    const stored = try compress.maybePack(alloc, input, rule, &pack_scratch);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(alloc);
+    const got = try compress.maybeUnpack(
+        alloc,
+        @intFromEnum(stored.codec),
+        stored.data,
+        &scratch,
+    );
+    try std.testing.expectEqualSlices(u8, input, got);
+    if (stored.codec == .none) {
+        // Not compressed: the input itself, both ways, with no copy.
+        try std.testing.expectEqual(input.ptr, stored.data.ptr);
+        try std.testing.expectEqual(input.len, stored.data.len);
+        try std.testing.expectEqual(input.ptr, got.ptr);
+    } else {
+        // Compressed: in the caller's scratch.
+        try std.testing.expectEqual(pack_scratch.items.ptr, stored.data.ptr);
+        // Kept compressed means smaller by the saving asked for.
+        const saved: f64 = @floatFromInt(input.len - stored.data.len);
+        const raw: f64 = @floatFromInt(input.len);
+        try std.testing.expect(saved >= raw * rule.min_saving);
+    }
+    return stored.codec;
+}
+
+const pack_rule: compress.PackRule = .{
+    .codec = .lz4,
+    .min_bytes = 512,
+    .min_saving = 1.0 / 8.0,
+};
+
+test "maybePack: a large input that compresses is kept compressed" {
+    const input = "the quick brown fox jumps over the lazy dog. " ** 200;
+    try std.testing.expectEqual(
+        compress.Codec.lz4,
+        try packRoundTrip(input, pack_rule),
+    );
+}
+
+test "maybePack: an input below min_bytes is not tried" {
+    // It would compress, and is returned as it came.
+    const small = "a" ** (pack_rule.min_bytes - 1);
+    try std.testing.expectEqual(
+        compress.Codec.none,
+        try packRoundTrip(small, pack_rule),
+    );
+    try std.testing.expectEqual(
+        compress.Codec.none,
+        try packRoundTrip("", pack_rule),
+    );
+    // At min_bytes it is tried.
+    const at = "a" ** pack_rule.min_bytes;
+    try std.testing.expectEqual(
+        compress.Codec.lz4,
+        try packRoundTrip(at, pack_rule),
+    );
+}
+
+test "maybePack: a saving below min_saving is not kept" {
+    var input: [16384]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+    // Random bytes: nothing saved.
+    prng.random().bytes(&input);
+    try std.testing.expectEqual(
+        compress.Codec.none,
+        try packRoundTrip(&input, pack_rule),
+    );
+    // Half zeros: about half saved, kept.
+    @memset(input[input.len / 2 ..], 0);
+    try std.testing.expectEqual(
+        compress.Codec.lz4,
+        try packRoundTrip(&input, pack_rule),
+    );
+    // One sixteenth zeros: under an eighth saved, not kept.
+    prng.random().bytes(&input);
+    @memset(input[input.len - input.len / 16 ..], 0);
+    try std.testing.expectEqual(
+        compress.Codec.none,
+        try packRoundTrip(&input, pack_rule),
+    );
+}
+
+test "maybePack: codec none returns the input, and scratch is reused" {
+    const alloc = std.testing.allocator;
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(alloc);
+    const input = "a" ** 4096;
+    var no_codec = pack_rule;
+    no_codec.codec = .none;
+    const plain = try compress.maybePack(alloc, input, no_codec, &scratch);
+    try std.testing.expectEqual(compress.Codec.none, plain.codec);
+    try std.testing.expectEqual(@as([*]const u8, input), plain.data.ptr);
+    try std.testing.expectEqual(@as(usize, 0), scratch.capacity);
+
+    // Two packs through one scratch: the second reuses the first's
+    // buffer, with nothing allocated.
+    const first = try compress.maybePack(alloc, input, pack_rule, &scratch);
+    try std.testing.expectEqual(compress.Codec.lz4, first.codec);
+    const buf = scratch.items.ptr;
+    const cap = scratch.capacity;
+    const second = try compress.maybePack(alloc, input, pack_rule, &scratch);
+    try std.testing.expectEqual(buf, second.data.ptr);
+    try std.testing.expectEqual(cap, scratch.capacity);
+}
+
+test "maybeUnpack: a codec byte it does not know is an error" {
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.UnknownCodec,
+        compress.maybeUnpack(std.testing.allocator, 200, "abc", &scratch),
+    );
+}

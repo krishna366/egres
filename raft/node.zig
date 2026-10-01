@@ -6,6 +6,7 @@ const fiber = @import("zfiber");
 const _diskwal = @import("diskwal.zig");
 const zen = @import("buffers_gen");
 const utils = @import("utils");
+const compression = utils.compression;
 const String = utils.String;
 const _transport = @import("transport");
 const Transport = _transport.Transport;
@@ -158,6 +159,9 @@ pub const ProposalWaiter = struct {
     }
 };
 
+/// A worker's id is a u8.
+const max_workers = std.math.maxInt(u8) + 1;
+
 pub const Node = struct {
     const TimeoutResetReason = enum {
         init,
@@ -253,6 +257,16 @@ pub const Node = struct {
     elapsed_ticks: u32,
     election_timeout: u32,
     tick_count: u64,
+    /// Where the apply loop decodes a compressed entry's data
+    /// (`compression.maybeUnpack`): one buffer, reused entry after
+    /// entry.
+    apply_scratch: std.ArrayList(u8) = .empty,
+    /// Where `propose` compresses: one buffer for each fiber worker,
+    /// by its id, so that proposers on different threads compress at
+    /// the same time with no lock, and none allocates once its buffer
+    /// has grown to the largest payload it has seen.
+    pack_scratch: [max_workers]std.ArrayList(u8) =
+        [_]std.ArrayList(u8){.empty} ** max_workers,
     config: Config,
 
     allocator: std.mem.Allocator,
@@ -313,7 +327,10 @@ pub const Node = struct {
     pub const ProposalType = zen.EntryTypeEnum;
     const proposal_queue_capacity: usize = 4096;
     const ProposalRequest = struct {
+        /// The payload as the entry will store it, and the codec it
+        /// is in (`compression.maybePack` in `propose`).
         data: []u8,
+        codec: compression.Codec = .none,
         proposal_type: ProposalType = .data,
         /// Null: nobody waits (the bootstrap self-add); the entry goes
         /// into the log and that is all.
@@ -464,6 +481,9 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        self.apply_scratch.deinit(self.allocator);
+        for (&self.pack_scratch) |*scratch| scratch.deinit(self.allocator);
+
         self.abortPending();
         self.proposal_ch.deinit();
         self.commit_waiters.deinit(self.allocator);
@@ -1544,8 +1564,10 @@ pub const Node = struct {
     pub fn proposeAndWaitForApply(self: *Node, data: String, proposal_type: ProposalType) RaftError!void {
         std.debug.assert(proposal_type != .any);
         const start_ms = utils.coarseMs();
+
         var w: ProposalWaiter = .{ .wait_for = .apply };
         try self.propose(data, proposal_type, &w);
+
         fiber.ctx().record("proposed", .{});
         const status = w.wait();
         fiber.ctx().record("committed and applied", .{});
@@ -1570,6 +1592,22 @@ pub const Node = struct {
         std.debug.assert(self.applied_ts.load() >= w.entry.timestamp);
     }
 
+    /// How a proposal's data is stored in its log entry. Every byte of
+    /// a proposal is written to the WAL, on each node, and shipped to
+    /// each follower, so a payload that shrinks is cheaper everywhere
+    /// at once. The entry's `codec` byte says which form it is in, and
+    /// an entry decodes on its own, with no other entry's bytes.
+    ///
+    /// lz4, not zstd: entries are applied by one fiber, and lz4 decodes
+    /// several times faster for somewhat less saved. Below 512 bytes a
+    /// proposal is not tried: the durable write of a small entry costs
+    /// the same whatever its size. Above, it is kept compressed only
+    /// when that saves an eighth.
+    const data_pack_rule: compression.PackRule = .{
+        .codec = .lz4,
+        .min_bytes = 1024,
+        .min_saving = 1.0 / 8.0,
+    };
     /// Queue a proposal for the main loop; `w` gets the outcome (see
     /// `ProposalWaiter`), or null when nobody wants it.
     pub fn propose(self: *Node, data: String, proposal_type: ProposalType, w: ?*ProposalWaiter) RaftError!void {
@@ -1589,10 +1627,25 @@ pub const Node = struct {
             }
         }
 
-        const owned = try self.allocator.dupe(u8, data);
+        // Compressed here, in the proposer's fiber, where every kind of
+        // proposal passes: the log, the WAL and the followers only ever
+        // see the stored form (see `data_pack_rule`).
+        // The worker is read here and used at once: nothing from this
+        // line to the copy below yields, so the fiber stays on it.
+        const scratch = &self.pack_scratch[fiber.currentWorker().id];
+        const stored = try compression.maybePack(
+            self.allocator,
+            data,
+            data_pack_rule,
+            scratch,
+        );
+        // The one allocation a proposal costs: its stored bytes, exact
+        // size, owned by the request from here on.
+        const owned = try self.allocator.dupe(u8, stored.data);
         errdefer self.allocator.free(owned);
         self.proposal_ch.trySend(.{
             .data = owned,
+            .codec = stored.codec,
             .proposal_type = proposal_type,
             .waiter = w,
             .proposed_us = nowUs(),
@@ -1636,6 +1689,13 @@ pub const Node = struct {
             if (is_conf) {
                 if (self.pending_conf_change or has_conf) {
                     self.reject(req, .pending_conf_change);
+                    continue;
+                }
+                // Its bytes are parsed below as they are. A conf change
+                // is a few dozen bytes, far under what `propose`
+                // compresses; one that arrives compressed is not one.
+                if (req.codec != .none) {
+                    self.reject(req, .invalid_req);
                     continue;
                 }
 
@@ -1715,6 +1775,7 @@ pub const Node = struct {
                 .data = if (is_conf) &[_]u8{} else req.data,
                 .entry_type = req.proposal_type,
                 .conf_change = cc_offset,
+                .codec = @intFromEnum(req.codec),
             });
             _ = try writer.finishWithTail();
 
@@ -1864,7 +1925,26 @@ pub const Node = struct {
                 const reader = zen.LogEntryReader.parseRoot(entry.bytes) catch continue;
 
                 const ety = reader.entryType();
-                if ((ety == .data or ety == .manifest) and reader.data().len > 0) {
+                // The data as proposed: decoded here, once, for whichever
+                // branch below takes it. Failing is retried like a failed
+                // apply, so the fiber stays responsive to shutdown.
+                const data = while (true) {
+                    break compression.maybeUnpack(
+                        self.allocator,
+                        reader.codec(),
+                        reader.data(),
+                        &self.apply_scratch,
+                    ) catch |err| {
+                        raft_log.err(
+                            "entry idx={d}: decode data: {s}, retrying in 1ms",
+                            .{ entry.index, @errorName(err) },
+                        );
+                        if (self.isShuttingDown()) return;
+                        fiber.sleepMs(1);
+                        continue;
+                    };
+                };
+                if ((ety == .data or ety == .manifest) and data.len > 0) {
                     if (self.state_machine) |s| {
                         // One observation per state-machine apply call —
                         // each carries one Raft entry's worth of work
@@ -1892,7 +1972,7 @@ pub const Node = struct {
                         // ~1000 lines/sec during normal startup, so it goes
                         // through `utils.logEvery` (5 s).
                         while (true) {
-                            s.apply(sm_entry, reader.data()) catch |err| {
+                            s.apply(sm_entry, data) catch |err| {
                                 if (err == error.RecoveryInProgress) {
                                     utils.logEvery(5, "apply idx={d}: recovery in progress, retrying", .{entry.index});
                                 } else {
@@ -1910,8 +1990,8 @@ pub const Node = struct {
                             nowUs() - picked_us,
                         );
                     }
-                } else if (ety == .snapshot and reader.data().len > 0) {
-                    self.applySnapshotEntry(reader.data()) catch |err| {
+                } else if (ety == .snapshot and data.len > 0) {
+                    self.applySnapshotEntry(data) catch |err| {
                         raft_log.err("applySnapshotEntry at index={d}: {s}", .{ entry.index, @errorName(err) });
                     };
                 }

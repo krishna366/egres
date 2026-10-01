@@ -135,6 +135,10 @@ pub const LogEntry = schema.Table(&.{
     .{ .id = 4, .name = "data", .ty = schema.Bytes },
     .{ .id = 5, .name = "entry_type", .ty = EntryType },
     .{ .id = 6, .name = "conf_change", .ty = ConfChange },
+    // How `data` is stored: a `compress.Codec` tag, 0 for as proposed.
+    // `Node.propose` compresses; readers go through
+    // `compression.maybeUnpack`.
+    .{ .id = 7, .name = "codec", .ty = schema.U8 },
 });
 
 pub const RequestVote = schema.Table(&.{

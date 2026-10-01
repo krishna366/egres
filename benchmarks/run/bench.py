@@ -21,8 +21,10 @@ the same benchmark on any machine.
 An env is a row of ENVS below: a workload, a server, a memory cap. The
 machine's paths come from local.toml next to this file (copy
 local.example.toml). `--set key.path=value` overrides any resolved
-setting for one invocation (`--set load.last=120000 --set runs=1`) and
-`--name` suffixes the env name, so a small trial keeps its own dirs.
+setting for one invocation (`--set load.last=120000 --set runs=1`),
+`--local key=value` one of local.toml's (`--local wal_root=/data`),
+and `--name` suffixes the env name, so a small trial keeps its own
+dirs.
 
 A run's output dir is <out_root>/<name>-<start time>; `begin` creates
 it and points <out_root>/<name>.latest at it, and every later command
@@ -410,6 +412,8 @@ def detach(run: Run, sub: str, extra: list[str], out_name: str):
         cmd.append("--no-monitor")
     for s in run.sets:
         cmd += ["--set", s]
+    for s in run.locals:
+        cmd += ["--local", s]
     with open(run.out / out_name, "w") as out:
         subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT,
                          stdin=subprocess.DEVNULL, start_new_session=True)
@@ -543,6 +547,8 @@ def main():
     ap.add_argument("arg", nargs="*")
     ap.add_argument("--set", action="append", default=[],
                     help="override a resolved setting: load.last=1000")
+    ap.add_argument("--local", action="append", default=[],
+                    help="override a local.toml setting: wal_root=/data")
     ap.add_argument("--name", help="suffix for the run name (a trial)")
     ap.add_argument("--no-monitor", action="store_true")
     ap.add_argument("--foreground", action="store_true")
@@ -550,9 +556,16 @@ def main():
     ap.add_argument("--runs-done", type=int, default=0)
     a = ap.parse_args()
     env = resolve_env(a.env, a.set)
-    run = Run(a.env, a.name or "", env, load_local())
+    local = load_local()
+    for item in a.local:
+        key, _, val = item.partition("=")
+        if key not in local:
+            sys.exit(f"--local: no {key!r} in local.toml")
+        local[key] = val
+    run = Run(a.env, a.name or "", env, local)
     run.no_monitor = a.no_monitor
     run.sets = a.set
+    run.locals = a.local
     match a.command:
         case "begin":
             cmd_begin(run)

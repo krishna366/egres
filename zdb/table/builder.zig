@@ -155,15 +155,16 @@ pub const Config = struct {
 /// codec byte; nothing records the table's.
 pub const Compression = struct {
     alloc: std.mem.Allocator,
-    /// Where a block is compressed; `compress` returns a slice of it.
+    /// Where a block is compressed; `compress` returns it when the
+    /// block is stored compressed.
     buf: std.ArrayList(u8) = .empty,
     /// The codec the table was configured with, and asks for until the
     /// election.
     configured: _compress.Codec,
     /// The election's choice, once held: `configured` or `.none`.
     elected: ?_compress.Codec = null,
-    /// The sample: raw and compressed totals of every block compressed
-    /// so far, whatever each block was then stored as.
+    /// The sample: raw and stored totals of every block so far. A
+    /// block stored raw counts as no saving.
     sample_in: u64 = 0,
     sample_out: u64 = 0,
 
@@ -179,13 +180,6 @@ pub const Compression = struct {
     /// under 1% of a flush's. A table with less than this never holds
     /// one: every block of it is tried.
     pub const elect_bytes: usize = 1 << 20;
-
-    /// A block's payload as it is stored: the codec it is stored with
-    /// and its bytes, which are the payload itself under `.none`.
-    pub const Payload = struct {
-        codec: _compress.Codec,
-        bytes: String,
-    };
 
     pub fn init(alloc: std.mem.Allocator, codec: _compress.Codec) Compression {
         return .{ .alloc = alloc, .configured = codec };
@@ -205,47 +199,39 @@ pub const Compression = struct {
     }
 
     /// A block's `payload` as the block stores it: compressed with the
-    /// codec the table asks for when that shrinks it enough, else raw.
-    /// The block also joins the sample until the election, which is
-    /// held as soon as the sample is large enough. The bytes are valid
-    /// until the next call.
-    pub fn compress(self: *Compression, payload: String) Error!Payload {
+    /// codec the table asks for when that shrinks it enough, else the
+    /// payload itself under `.none` (`compress.maybePack`). The block
+    /// also joins the sample until the election, which is held as soon
+    /// as the sample is large enough. The bytes are valid until the
+    /// next call.
+    pub fn compress(
+        self: *Compression,
+        payload: String,
+    ) Error!_compress.Packed {
         const codec = self.elected orelse self.configured;
-        if (codec == .none) return .{ .codec = .none, .bytes = payload };
-
-        utils.clearRetainCap(&self.buf);
-        const clen = try _compress.compress(
-            self.alloc,
-            codec,
-            payload,
-            &self.buf,
-        );
+        // Per block, whatever the table decides: any size is tried.
+        const stored = try _compress.maybePack(self.alloc, payload, .{
+            .codec = codec,
+            .min_bytes = 0,
+            .min_saving = min_saving,
+        }, &self.buf);
 
         // The election, over the sample's totals so one odd block does
         // not decide alone: a codec that has not earned its pass is
-        // not tried on any later block. The blocks already written
-        // keep whatever each was stored as.
-        if (self.elected == null) {
+        // not tried on any later block.
+        if (self.elected == null and codec != .none) {
             self.sample_in += payload.len;
-            self.sample_out += clen;
+            self.sample_out += stored.data.len;
             if (self.sample_in >= elect_bytes) {
-                const earned = worthKeeping(self.sample_in, self.sample_out);
+                const earned = _compress.worthKeeping(
+                    self.sample_in,
+                    self.sample_out,
+                    min_saving,
+                );
                 self.elected = if (earned) codec else .none;
             }
         }
-        // Per block, whatever the table decides.
-        if (!worthKeeping(payload.len, clen))
-            return .{ .codec = .none, .bytes = payload };
-        return .{ .codec = codec, .bytes = self.buf.items };
-    }
-
-    /// Whether bytes that compressed from `raw` to `compressed` saved
-    /// at least `min_saving` of themselves.
-    fn worthKeeping(raw: u64, compressed: u64) bool {
-        const saved = if (compressed < raw) raw - compressed else 0;
-        const saved_f: f64 = @floatFromInt(saved);
-        const raw_f: f64 = @floatFromInt(raw);
-        return saved_f >= raw_f * min_saving;
+        return stored;
     }
 };
 
@@ -729,7 +715,7 @@ pub const Builder = struct {
         // hashes them.
         const stored = try self.compression.compress(out.items);
         if (stored.codec != .none) {
-            const clen: u32 = @intCast(stored.bytes.len);
+            const clen: u32 = @intCast(stored.data.len);
             std.debug.assert(self.compressed_size <= std.math.maxInt(u32) - clen);
             self.compressed_size += clen;
         }
@@ -740,14 +726,14 @@ pub const Builder = struct {
         const env = &self.entries_buf;
         var block = _buffers.BlockWriter.initWithBuf(self.allocator, env);
         const codec_byte = [_]u8{@intFromEnum(stored.codec)};
-        try block.setCrc(zbuf.hashParts(&.{ &codec_byte, stored.bytes }));
+        try block.setCrc(zbuf.hashParts(&.{ &codec_byte, stored.data }));
         try block.setCodec(codec_byte[0]);
         block.finish();
         std.debug.assert(env.items.len == _buffers.BlockReader.payload_off);
 
         const block_off: u32 = @intCast(self.table_buf.len);
         try self.table_buf.appendSlice(env.items);
-        try self.table_buf.appendSlice(stored.bytes);
+        try self.table_buf.appendSlice(stored.data);
         const block_len: u32 = @intCast(self.table_buf.len - block_off);
 
         try self.block_infos.append(self.allocator, .{

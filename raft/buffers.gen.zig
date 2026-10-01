@@ -266,6 +266,7 @@ pub const LogEntryStruct = struct {
     data: []const u8 = &.{},
     entry_type: EntryTypeEnum = @enumFromInt(0),
     conf_change: ?ConfChangeStruct = null,
+    codec: u8 = 0,
     pub fn deinit(self: *LogEntryStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.data = &.{};
@@ -284,6 +285,7 @@ pub const LogEntryStruct = struct {
             .term = self.term,
             .timestamp = self.timestamp,
             .entry_type = self.entry_type,
+            .codec = self.codec,
         };
         errdefer s.deinit(alloc);
         s.data = try alloc.dupe(u8, self.data);
@@ -311,6 +313,7 @@ pub const LogEntryStruct = struct {
             const child_off = try child.marshalTo(alloc, out);
             try writer.setConfChange(child_off);
         }
+        try writer.setCodec(self.codec);
         const result = try writer.finish();
         return result.offset;
     }
@@ -321,7 +324,7 @@ pub const LogEntryReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 42242;
-    pub const SIZE_BYTES: u16 = 39;
+    pub const SIZE_BYTES: u16 = 40;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -356,6 +359,10 @@ pub const LogEntryReader = struct {
         return ConfChangeReader.init(self.t.buf, off) catch null;
     }
 
+    pub fn codec(self: Self) u8 {
+        return self.t.scalar(u8, 39);
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try LogEntryWriter.initWithBuf(alloc, out);
         try writer.setIndex(self.index());
@@ -367,6 +374,7 @@ pub const LogEntryReader = struct {
             const child_off = try child.cloneInto(alloc, out);
             try writer.setConfChange(child_off);
         }
+        try writer.setCodec(self.codec());
         const result = try writer.finish();
         return result.offset;
     }
@@ -382,6 +390,7 @@ pub const LogEntryReader = struct {
             .term = self.term(),
             .timestamp = self.timestamp(),
             .entry_type = self.entryType(),
+            .codec = self.codec(),
         };
         errdefer s.deinit(alloc);
         s.data = try alloc.dupe(u8, self.data());
@@ -405,7 +414,7 @@ pub const LogEntryWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 42242;
-    pub const SIZE_BYTES: u16 = 39;
+    pub const SIZE_BYTES: u16 = 40;
     /// Slots of nested tables, null until set.
     const child_slots = [_]u16{35};
 
@@ -441,6 +450,10 @@ pub const LogEntryWriter = struct {
         return self.w.setChild(35, child_off);
     }
 
+    pub fn setCodec(self: *Self, v: u8) Error!void {
+        return self.w.setScalar(u8, 39, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -452,6 +465,7 @@ pub const LogEntryWriter = struct {
         if (@hasField(Values, "data")) try self.setData(@field(values, "data"));
         if (@hasField(Values, "entry_type")) try self.setEntryType(@field(values, "entry_type"));
         if (@hasField(Values, "conf_change")) try self.setConfChange(@field(values, "conf_change"));
+        if (@hasField(Values, "codec")) try self.setCodec(@field(values, "codec"));
     }
 
     pub fn finish(self: *Self) Error!LogEntryBuffer {

@@ -31,6 +31,88 @@ const shim = @cImport({
     @cInclude("u/compress_shim.h");
 });
 
+/// How `maybePack` compresses: under `codec`, an input of at least
+/// `min_bytes`, and only if that saves at least `min_saving` of the
+/// input's bytes, a fraction: 1.0 / 8.0 keeps a result an eighth
+/// smaller or better.
+pub const PackRule = struct {
+    codec: Codec,
+    min_bytes: usize,
+    min_saving: f64,
+};
+
+/// What `maybePack` returns: the bytes to store, and the codec they
+/// are in. Borrowed, not owned: `data` is the caller's `scratch` when
+/// compressed and the caller's input when not.
+pub const Packed = struct {
+    data: String,
+    codec: Codec,
+};
+
+/// Whether bytes that compressed from `raw` to `compressed` saved at
+/// least `min_saving` of themselves, a fraction.
+pub fn worthKeeping(raw: u64, compressed: u64, min_saving: f64) bool {
+    const saved: f64 = @floatFromInt(raw -| compressed);
+    const raw_f: f64 = @floatFromInt(raw);
+    return saved >= raw_f * min_saving;
+}
+
+/// `input` compressed as `rule` says, when it says that is worth it,
+/// else `input` itself under `.none`. Compressed, the result is in
+/// `scratch` (emptied first) and valid until `scratch` is next used;
+/// nothing is allocated beyond what `scratch` has to grow by, so a
+/// caller that keeps its `scratch` allocates nothing. `maybeUnpack`
+/// with the returned codec gives `input` back.
+///
+/// Conditional twice. A small input is not tried: there is little to
+/// save. A larger one is kept compressed only when that saved enough,
+/// so data that does not compress costs one attempt and is stored as
+/// it came. A compressor failure is not an error either: the input is
+/// returned.
+pub fn maybePack(
+    alloc: std.mem.Allocator,
+    input: String,
+    rule: PackRule,
+    scratch: *std.ArrayList(u8),
+) std.mem.Allocator.Error!Packed {
+    if (rule.codec == .none or input.len < rule.min_bytes) return .{
+        .data = input,
+        .codec = .none,
+    };
+
+    scratch.items.len = 0;
+    if (compress(alloc, rule.codec, input, scratch)) |packed_len| {
+        if (worthKeeping(input.len, packed_len, rule.min_saving))
+            return .{ .data = scratch.items, .codec = rule.codec };
+        //
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Nothing usable was written.
+        else => scratch.items.len = 0,
+    }
+    return .{ .data = input, .codec = .none };
+}
+
+/// The bytes `maybePack` was given, from what it returned. `codec_tag`
+/// is the codec as a stored byte (`@intFromEnum`), which is how a
+/// record on disk carries it. Stored under `.none`, the result is
+/// `data` itself, with no copy; compressed, it is decoded into
+/// `scratch` (emptied first) and valid until `scratch` is next used.
+pub fn maybeUnpack(
+    alloc: std.mem.Allocator,
+    codec_tag: u8,
+    data: String,
+    scratch: *std.ArrayList(u8),
+) (Error || error{UnknownCodec})!String {
+    const codec = std.enums.fromInt(Codec, codec_tag) orelse
+        return error.UnknownCodec;
+    if (codec == .none) return data;
+
+    scratch.items.len = 0;
+    _ = try decompress(alloc, codec, data, scratch);
+    return scratch.items;
+}
+
 /// Compresses input into out, appending the result. Returns the number of
 /// bytes appended. Access the data via out.items[out.items.len - sz ..].
 pub fn compress(

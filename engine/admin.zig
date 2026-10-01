@@ -1404,10 +1404,24 @@ fn formatEntry(alloc: std.mem.Allocator, w: *std.Io.Writer, stored: raft.StoredE
     };
     const ety = reader.entryType();
     const hlc = utils.hlc.HLC.fromU64(reader.timestamp());
-    const data = reader.data();
-    try w.print("idx={d} term={d} ts={d}.{d} type={s} data_bytes={d}", .{
-        stored.index, stored.term, hlc.seconds, hlc.logical, @tagName(ety), data.len,
-    });
+    // The data as proposed; `stored_bytes` is what the entry holds,
+    // smaller when it was compressed.
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(alloc);
+    const data = try utils.compression.maybeUnpack(
+        alloc,
+        reader.codec(),
+        reader.data(),
+        &scratch,
+    );
+    try w.print(
+        "idx={d} term={d} ts={d}.{d} type={s} data_bytes={d} " ++
+            "stored_bytes={d}",
+        .{
+            stored.index,  stored.term, hlc.seconds,       hlc.logical,
+            @tagName(ety), data.len,    reader.data().len,
+        },
+    );
     if (data.len == 0) {
         try w.print(" detail=tick\n", .{});
         return;

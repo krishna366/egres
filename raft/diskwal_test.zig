@@ -1052,6 +1052,72 @@ fn makeLogEntryWithTimestamp(
     return writer.finishWithTail();
 }
 
+// A log entry's data, stored as `Node.propose` stores it and read back
+// as its readers do: compressed when `maybePack` chose to, and equal to
+// what was proposed either way. An entry with no codec byte, from a
+// writer that never sets it, reads as it is.
+test "log entry: data round-trips through its codec byte" {
+    const alloc = std.testing.allocator;
+    const compression = utils.compression;
+    const rule: compression.PackRule = .{
+        .codec = .lz4,
+        .min_bytes = 512,
+        .min_saving = 1.0 / 8.0,
+    };
+    const cases = [_]struct { data: String, codec: compression.Codec }{
+        .{ .data = "the quick brown fox. " ** 200, .codec = .lz4 },
+        .{ .data = "small", .codec = .none },
+        .{ .data = "", .codec = .none },
+    };
+    var pack_scratch: std.ArrayList(u8) = .empty;
+    defer pack_scratch.deinit(alloc);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(alloc);
+    for (cases) |case| {
+        const stored = try compression.maybePack(
+            alloc,
+            case.data,
+            rule,
+            &pack_scratch,
+        );
+        try std.testing.expectEqual(case.codec, stored.codec);
+
+        var writer = try zen.LogEntryWriter.init(alloc);
+        defer writer.deinit();
+        try writer.set(.{
+            .index = 1,
+            .term = 1,
+            .timestamp = 1,
+            .data = stored.data,
+            .entry_type = zen.EntryTypeEnum.data,
+            .conf_change = zen.NullOffset,
+            .codec = @intFromEnum(stored.codec),
+        });
+        var entry = try writer.finishWithTail();
+        defer entry.deinit();
+        const reader = try entry.initReader();
+        const got = try compression.maybeUnpack(
+            alloc,
+            reader.codec(),
+            reader.data(),
+            &scratch,
+        );
+        try std.testing.expectEqualStrings(case.data, got);
+    }
+
+    var plain = try makeLogEntry(alloc, 1, 1, "plain");
+    defer plain.deinit();
+    const reader = try plain.initReader();
+    try std.testing.expectEqual(@as(u8, 0), reader.codec());
+    const got = try compression.maybeUnpack(
+        alloc,
+        reader.codec(),
+        reader.data(),
+        &scratch,
+    );
+    try std.testing.expectEqualStrings("plain", got);
+}
+
 // A snapshot takes its term and timestamp from the slot of the entry
 // at its index, which is nearly always a data entry: the lookup must
 // answer for any type and say so when the index is not in the log.
