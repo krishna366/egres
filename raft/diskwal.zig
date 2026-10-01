@@ -286,23 +286,38 @@ pub const wal = struct {
         var found_fids = std.ArrayList(u64).empty;
         defer found_fids.deinit(alloc);
 
+        var spare_fids = std.ArrayList(u64).empty;
+        defer spare_fids.deinit(alloc);
+
         var it = dir.iterate();
-        var stale_tmp = std.ArrayList(u64).empty;
-        defer stale_tmp.deinit(alloc);
         while (try it.next(io)) |entry_dir| {
             if (entry_dir.kind != .file) continue;
+
             const name = entry_dir.name;
             if (std.mem.endsWith(u8, name, tmp_suffix)) {
-                // Prepared for a rotation that never came; nothing was
-                // appended to it.
-                const fid = parseWalFid(name[0 .. name.len - tmp_suffix.len]) orelse continue;
-                try stale_tmp.append(alloc, fid);
+                // A spare the last run left: the file it had prepared,
+                // or one it kept for reuse.
+                const base = name[0 .. name.len - tmp_suffix.len];
+                const fid = parseWalFid(base) orelse continue;
+                try spare_fids.append(alloc, fid);
                 continue;
             }
+
             const fid = parseWalFid(name) orelse continue;
             try found_fids.append(alloc, fid);
         }
-        for (stale_tmp.items) |fid| _lf.deleteTmpByFid(alloc, path, fid);
+        // Its fids start below, once the highest log file is known
+        // (`bumpFid`).
+        var next_log = NextLog{
+            .allocator = alloc,
+            .vfs_inst = vfs_inst,
+            .dir_path = dir_copy,
+            .opts = opts,
+            .next_fid = 0,
+        };
+        errdefer next_log.deinit();
+
+        try next_log.adoptByIds(spare_fids.items);
         std.mem.sort(u64, found_fids.items, {}, comptime std.sort.asc(u64));
 
         // No files: create the first one.
@@ -312,15 +327,19 @@ pub const wal = struct {
                 for (files.items) |*lf| lf.deinit();
                 files.deinit(alloc);
             }
+
+            next_log.bumpFid(0);
             try files.append(alloc, try LogFile.createCurrent(
                 vfs_inst,
                 alloc,
                 path,
-                1,
+                next_log.takeFid(),
                 opts,
             ));
+
             var entry_cache = try EntryCache.init(alloc, cache_capacity);
             errdefer entry_cache.deinit();
+
             return .{
                 .allocator = alloc,
                 .vfs_inst = vfs_inst,
@@ -329,13 +348,7 @@ pub const wal = struct {
                 .current = &files.items[files.items.len - 1],
                 .cache = entry_cache,
                 .opts = opts,
-                .next = .{
-                    .allocator = alloc,
-                    .vfs_inst = vfs_inst,
-                    .dir_path = dir_copy,
-                    .opts = opts,
-                    .next_fid = 2,
-                },
+                .next = next_log,
                 .buf = LogBuf.init(alloc),
             };
         }
@@ -357,13 +370,30 @@ pub const wal = struct {
             // A missing or torn header is rebuilt from the records
             // inside openRotated; only a file whose records are
             // corrupt drops the tail.
-            const lf = LogFile.openRotated(vfs_inst, alloc, path, fid) catch |err| switch (err) {
+            var lf = LogFile.openRotated(
+                vfs_inst,
+                alloc,
+                path,
+                fid,
+            ) catch |err| switch (err) {
                 error.CorruptLogFile => {
                     first_bad = idx;
                     break;
                 },
                 else => return err,
             };
+            // No record on disk even after a scan. The wal had moved
+            // on to the next file while this one's records were still
+            // buffered in memory, and the process stopped before the
+            // writer wrote them. It leaves the log, as a spare or
+            // deleted: `slotGe` needs every file but the last to hold
+            // a record. Any gap this leaves in the log is handled by
+            // `verifyChain`.
+            if (lf.slots.items.len == 0) {
+                next_log.adoptLogFile(&lf);
+                lf.deinit();
+                continue;
+            }
             try opened.append(alloc, lf);
         }
 
@@ -382,15 +412,17 @@ pub const wal = struct {
         }
 
         const cur_lf = if (first_bad != null) blk: {
-            const new_fid: u64 = if (opened.items.len > 0)
-                opened.items[opened.items.len - 1].fid + 1
+            const last_fid: u64 = if (opened.items.len > 0)
+                opened.items[opened.items.len - 1].fid
             else
-                1;
+                0;
+            next_log.bumpFid(last_fid);
+
             break :blk try LogFile.createCurrent(
                 vfs_inst,
                 alloc,
                 path,
-                new_fid,
+                next_log.takeFid(),
                 opts,
             );
         } else try LogFile.openCurrent(
@@ -406,6 +438,7 @@ pub const wal = struct {
         var entry_cache = try EntryCache.init(alloc, cache_capacity);
         errdefer entry_cache.deinit();
 
+        next_log.bumpFid(cur_lf.fid);
         return .{
             .allocator = alloc,
             .vfs_inst = vfs_inst,
@@ -414,13 +447,7 @@ pub const wal = struct {
             .current = &opened.items[opened.items.len - 1],
             .cache = entry_cache,
             .opts = opts,
-            .next = .{
-                .allocator = alloc,
-                .vfs_inst = vfs_inst,
-                .dir_path = dir_copy,
-                .opts = opts,
-                .next_fid = cur_lf.fid + 1,
-            },
+            .next = next_log,
             .buf = LogBuf.init(alloc),
         };
     }
@@ -434,7 +461,7 @@ pub const wal = struct {
         self.syncLocked() catch |err| {
             std.log.err("raft/diskwal: flush at close: {s}", .{@errorName(err)});
         };
-        self.next.discard();
+        self.next.deinit();
         self.cache.deinit();
         for (self.files.items) |*lf| lf.deinit();
         self.files.deinit(self.allocator);
@@ -733,13 +760,19 @@ pub const wal = struct {
         };
         self.pins.waitFor(0, raft_index);
 
+        // At every trim, also one that drops nothing: this is what
+        // empties the pool of a wal that stopped rotating.
+        self.next.startTrim();
+
         const pos = self.slotGe(raft_index);
         // null = raft_index falls before everything we have on disk —
         // nothing to drop.
         if (pos.slot_idx == null) return;
 
+        // A dropped file is kept for reuse while the pool takes it,
+        // and unlinked otherwise.
         for (self.files.items[0..pos.file_idx]) |*lf| {
-            self.deleteFileByFid(lf.fid);
+            self.next.adoptLogFile(lf);
             lf.deinit();
         }
         self.files.replaceRangeAssumeCapacity(0, pos.file_idx, &.{});
@@ -750,6 +783,7 @@ pub const wal = struct {
     pub fn reset(self: *wal) void {
         self.buf.reset();
         self.next.discard();
+        self.next.dropSpares();
         while (self.files.items.len > 0) {
             var ef = self.files.pop().?;
             self.deleteFileByFid(ef.fid);

@@ -286,8 +286,8 @@ def id_vars(cfg: dict, rows: int, per: int) -> dict:
     id up, so the ids present are the first `per` of each slice (the
     shortest slice's count, so every script's draw exists) and `rows`
     of them in all. A script draws a slice and an offset:
-    `:first + :s * :slice + :k - 1` for s in [0, streams) and k in
-    [1, per]."""
+    `:first + :s * :slice + :k` for s in [0, streams) and k in
+    [0, per)."""
     total = cfg["last"] - cfg["first"] + 1
     streams = min(cfg["streams"], total)
     return {"rows": rows, "first": cfg["first"], "streams": streams,

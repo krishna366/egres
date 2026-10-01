@@ -48,46 +48,39 @@ test "Mutex: 10 fibers each incrementing 1000 times under lock" {
     try std.testing.expectEqual(@as(u32, 10_000), counter);
 }
 
-test "Mutex: waiters are woken in FIFO order under contention" {
+test "Mutex: every waiter gets the lock, in whatever order" {
     var mu: fiber.Mutex(.untracked) = .{};
 
-    // attempt[i] = id of the fiber that was the i-th to call mu.lock().
-    // actual[i] = id of the fiber that was the i-th to be granted the
-    // lock. Waiters are woken in queue order, and each holder yields
-    // while holding, so nothing else is runnable when a woken waiter
-    // retries: the two slices match, whatever order the scheduler
-    // happened to run the fibers in.
-    var attempt: [4]u8 = .{ 0, 0, 0, 0 };
-    var actual: [4]u8 = .{ 0, 0, 0, 0 };
-    var attempt_idx: std.atomic.Value(usize) = .init(0);
-    var acquired_idx: std.atomic.Value(usize) = .init(0);
+    // The mutex promises no order among waiters (see sync.zig: no
+    // hand-off), only that each gets the lock and that one fiber
+    // holds it at a time. granted[i] is how often fiber i held it;
+    // holders is how many hold it at once.
+    const contenders = 4;
+    var granted: [contenders]u8 = @splat(0);
+    var holders: std.atomic.Value(u32) = .init(0);
+    var overlapped: std.atomic.Value(bool) = .init(false);
 
     const Ctx = struct {
         mu: *fiber.Mutex(.untracked),
-        attempt: *[4]u8,
-        actual: *[4]u8,
-        attempt_idx: *std.atomic.Value(usize),
-        acquired_idx: *std.atomic.Value(usize),
-        id: u8,
+        granted: *[contenders]u8,
+        holders: *std.atomic.Value(u32),
+        overlapped: *std.atomic.Value(bool),
+        id: usize,
     };
-    var ctxs: [4]Ctx = undefined;
+    var ctxs: [contenders]Ctx = undefined;
 
     const Body = struct {
         fn run(c: *Ctx) void {
-            // Stamp our place in the attempt order just before the
-            // call that may park us. Single-worker means fetchAdd
-            // happens-before the matching mu.lock() the same fiber
-            // makes, and only one fiber runs at a time — so the
-            // attempt index matches the order we enter mu's queue.
-            const my_attempt = c.attempt_idx.fetchAdd(1, .acq_rel);
-            c.attempt[my_attempt] = c.id;
             c.mu.lock(@src());
-            // Stamp our place in the grant order just after wake-up.
-            const my_acquired = c.acquired_idx.fetchAdd(1, .acq_rel);
-            c.actual[my_acquired] = c.id;
-            // Yield while holding the lock so the others actually
-            // get to enqueue behind us before we unlock.
+            if (c.holders.fetchAdd(1, .acq_rel) != 0) {
+                c.overlapped.store(true, .release);
+            }
+            // Its own slot, written with the lock held.
+            c.granted[c.id] += 1;
+            // Yield while holding the lock so the others queue up
+            // behind it before the unlock.
             fiber.yield();
+            _ = c.holders.fetchSub(1, .acq_rel);
             c.mu.unlock();
         }
     };
@@ -97,18 +90,15 @@ test "Mutex: waiters are woken in FIFO order under contention" {
 
     var g: fiber.Group(void) = .init(std.testing.allocator);
     defer g.deinit();
-    try g.ensureTotalCapacity(5);
+    try g.ensureTotalCapacity(contenders + 1);
 
-    // Pin every contender to worker 0 so FIFO order in the wait
-    // queue is the FIFO order of fetchAdd above.
     for (&ctxs, 0..) |*c, i| {
         c.* = .{
             .mu = &mu,
-            .attempt = &attempt,
-            .actual = &actual,
-            .attempt_idx = &attempt_idx,
-            .acquired_idx = &acquired_idx,
-            .id = @intCast(i + 1),
+            .granted = &granted,
+            .holders = &holders,
+            .overlapped = &overlapped,
+            .id = i,
         };
         try g.spawn(.{}, Body.run, .{c});
     }
@@ -123,8 +113,8 @@ test "Mutex: waiters are woken in FIFO order under contention" {
 
     g.wait();
 
-    // Grant order equals attempt order.
-    try std.testing.expectEqualSlices(u8, &attempt, &actual);
+    for (granted) |n| try std.testing.expectEqual(@as(u8, 1), n);
+    try std.testing.expect(!overlapped.load(.acquire));
 }
 
 test "Mutex: cross-worker contention preserves the increment count" {

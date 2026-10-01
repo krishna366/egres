@@ -606,6 +606,144 @@ test "diskwal rotated file with a torn header is rebuilt from its records" {
     }
 }
 
+test "diskwal rotated file left with its empty header is rebuilt too" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    // As above: 40 entries of 1 MiB in three 32 MiB files.
+    const opts: raft.diskwal.OpenOptions = .{ .log_file_size = 32 << 20 };
+    const payload = try alloc.alloc(u8, 1 << 20);
+    defer alloc.free(payload);
+    const total: u64 = 40;
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        var idx: u64 = 1;
+        while (idx <= total) : (idx += 1) {
+            fillLargePayload(payload, idx);
+            try appendEntry(alloc, &ds, idx, 1, payload);
+        }
+        try ds.sync();
+    }
+
+    // What that crash really leaves at the head of the outgoing file:
+    // not zeros, but the header it was created with, a valid frame
+    // that lists no record. Put that back over the first file's.
+    const first_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/00001.wal",
+        .{wal_dir},
+    );
+    defer alloc.free(first_path);
+    const io = utils.context.g().io;
+    {
+        const created = raft.diskwal.LogFile{
+            .fid = 1,
+            .handle = undefined,
+            .allocator = alloc,
+            .slots = .empty,
+            .write_offset = raft.diskwal.log_file_offset,
+            .is_current = true,
+        };
+        const frame = try created.encodeHeader();
+        defer alloc.free(frame);
+        var page = [_]u8{0} ** 4096;
+        @memcpy(page[0..frame.len], frame);
+
+        var file = try std.Io.Dir.cwd().openFile(io, first_path, .{
+            .mode = .read_write,
+        });
+        defer file.close(io);
+        try file.writePositionalAll(io, &page, 0);
+    }
+
+    // Reopen: every entry is there, the first file's from a scan.
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+    defer ds.deinit();
+    try std.testing.expectEqual(total, ds.lastIndex());
+    var all = try ds.entriesRange(.{ .lo = 1, .hi = total + 1 });
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, total), all.entries.len);
+    for (all.entries, 1..) |stored, i| {
+        try std.testing.expectEqual(i, stored.index);
+        const reader = try zen.LogEntryReader.parseRoot(stored.bytes);
+        fillLargePayload(payload, i);
+        try std.testing.expectEqualSlices(u8, payload, reader.data());
+    }
+}
+
+test "diskwal rotated file with no record at all is dropped at open" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    // 40 entries of 1 MiB in three 32 MiB files: 15 fit in a file
+    // (1 to 15, 16 to 30, 31 to 40).
+    const opts: raft.diskwal.OpenOptions = .{ .log_file_size = 32 << 20 };
+    const payload = try alloc.alloc(u8, 1 << 20);
+    defer alloc.free(payload);
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+        defer ds.deinit();
+        var idx: u64 = 1;
+        while (idx <= 40) : (idx += 1) {
+            fillLargePayload(payload, idx);
+            try appendEntry(alloc, &ds, idx, 1, payload);
+        }
+        try ds.sync();
+    }
+
+    // The second file as a crash can leave one whose records never
+    // reached the disk: the empty header, and no record after it.
+    const second_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/00002.wal",
+        .{wal_dir},
+    );
+    defer alloc.free(second_path);
+    const io = utils.context.g().io;
+    {
+        const created = raft.diskwal.LogFile{
+            .fid = 2,
+            .handle = undefined,
+            .allocator = alloc,
+            .slots = .empty,
+            .write_offset = raft.diskwal.log_file_offset,
+            .is_current = true,
+        };
+        const frame = try created.encodeHeader();
+        defer alloc.free(frame);
+        var page = [_]u8{0} ** 4096;
+        @memcpy(page[0..frame.len], frame);
+        const zeros = [_]u8{0} ** 4096;
+
+        var file = try std.Io.Dir.cwd().openFile(io, second_path, .{
+            .mode = .read_write,
+        });
+        defer file.close(io);
+        try file.writePositionalAll(io, &page, 0);
+        try file.writePositionalAll(
+            io,
+            &zeros,
+            raft.diskwal.log_file_offset,
+        );
+    }
+
+    // Reopen: the empty file is gone, and the log ends where the gap
+    // it left begins, after the first file's 15 entries.
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+    defer ds.deinit();
+    try std.testing.expect(!try dirHas(wal_dir, "00002.wal"));
+    try std.testing.expectEqual(@as(u64, 15), ds.lastIndex());
+    try std.testing.expectEqual(@as(?u64, 1), try ds.term(15));
+    try std.testing.expectEqual(@as(?u64, null), try ds.term(16));
+}
+
 test "BIG: diskwal large payload rotation" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
@@ -1358,7 +1496,7 @@ fn dirHas(path: String, name: String) !bool {
     return false;
 }
 
-test "diskwal prepared log file: renamed in at rotation, a stray one removed at open" {
+test "diskwal prepared log file: renamed in at rotation, a spare at open" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);
     defer {
@@ -1393,16 +1531,25 @@ test "diskwal prepared log file: renamed in at rotation, a stray one removed at 
         try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
         try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
     }
-    // A prepared log file left behind by a crash is removed at open, and
-    // the log files around it are untouched.
+    // A prepared log file left behind by a crash is a spare at the
+    // next open; one whose fill was cut short is removed. The log
+    // files around them are untouched.
     {
         var stray = try raft.diskwal.LogFile.createNamed(vfs.g(), alloc, wal_dir, "00003.wal.tmp", 3, opts);
         stray.deinit();
+        const short = try std.fmt.allocPrint(
+            alloc,
+            "{s}/00007.wal.tmp",
+            .{wal_dir},
+        );
+        defer alloc.free(short);
+        try vfs.writeFile(short, "a fill cut short");
     }
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
         defer ds.deinit();
-        try std.testing.expect(!try dirHas(wal_dir, "00003.wal.tmp"));
+        try std.testing.expect(try dirHas(wal_dir, "00003.wal.tmp"));
+        try std.testing.expect(!try dirHas(wal_dir, "00007.wal.tmp"));
         try std.testing.expectEqual(@as(u64, 4), ds.lastIndex());
         for (1..5) |i| try std.testing.expectEqual(@as(?u64, 1), try ds.term(@intCast(i)));
         fillLargePayload(payload, 5);
@@ -1503,4 +1650,254 @@ test "diskwal: an unfilled log file rotates once the prepared one is ready" {
     try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
     try std.testing.expect(ds.wal_store.current.filled);
     try checkRange(&ds, 1, 5);
+}
+
+// One 300 KiB record, appended with the next log file already
+// prepared: a rotation then always finds it, and no file is handed
+// out unfilled.
+fn appendPrepared(
+    alloc: std.mem.Allocator,
+    ds: *raft.DiskWAL,
+    payload: []u8,
+    index: u64,
+) !void {
+    ds.wal_store.next.prepare();
+    while (!ds.wal_store.next.isReady()) fiber.yield();
+    fillLargePayload(payload, index);
+    try appendEntry(alloc, ds, index, 1, payload);
+}
+
+// 17 MiB log files, zero-filled: three 300 KiB records each.
+const reuse_opts: raft.diskwal.OpenOptions = .{
+    .log_file_size = 17 << 20,
+    .prezero = .true,
+};
+
+test "diskwal: a trimmed log file is reused, its old records unread" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const payload = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(payload);
+
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
+        defer ds.deinit();
+        const spares = &ds.wal_store.next.spares;
+        // Files 1 to 4. File 5 is prepared after record 12, new.
+        for (1..13) |i| {
+            try appendPrepared(alloc, &ds, payload, @intCast(i));
+        }
+        try ds.sync();
+        try std.testing.expectEqual(@as(usize, 4), try countWalFiles(wal_dir));
+
+        // A snapshot at 8 drops files 1 and 2. Three rotations since
+        // the start, so the pool keeps both, as spares.
+        try ds.setSnapshot(.{ .index = 8, .term = 1, .data = "snap" });
+        try ds.compactUntil(8);
+        try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
+        try std.testing.expectEqual(@as(usize, 2), spares.items.len);
+        try std.testing.expect(try dirHas(wal_dir, "00001.wal.tmp"));
+        try std.testing.expect(try dirHas(wal_dir, "00002.wal.tmp"));
+
+        // 13 rotates into file 5. The prepare after it takes the old
+        // file 2, which becomes file 6 when 16 rotates in.
+        for (13..17) |i| {
+            try appendPrepared(alloc, &ds, payload, @intCast(i));
+        }
+        try ds.sync();
+        // The prepare after 16 takes the other pooled file.
+        while (!ds.wal_store.next.isReady()) fiber.yield();
+        try std.testing.expect(try dirHas(wal_dir, "00006.wal"));
+        try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
+        try std.testing.expectEqual(@as(usize, 0), spares.items.len);
+        try std.testing.expectEqual(@as(u64, 16), ds.lastIndex());
+
+        // Right after 16 in file 6 sits the old file's second record,
+        // 5: an intact frame, which only its index gives away.
+        const slot = (try ds.slotAt(16)).?;
+        const frame_len: u64 = zbuf.Frame.hdr_size + slot.data_len;
+        const stale_at: u64 = slot.data_offset + frame_len;
+        const path = try std.fmt.allocPrint(alloc, "{s}/00006.wal", .{wal_dir});
+        defer alloc.free(path);
+        const io = utils.context.g().io;
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const frame = try alloc.alloc(u8, @intCast(frame_len));
+        defer alloc.free(frame);
+        _ = try file.readPositionalAll(io, frame, stale_at);
+        const stale = try zen.LogEntryReader.parseRoot(
+            try zbuf.Frame.read(frame),
+        );
+        try std.testing.expectEqual(@as(u64, 5), stale.index());
+    }
+
+    // Reopened, file 6 is indexed from its records and ends at 16.
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
+        defer ds.deinit();
+        try std.testing.expectEqual(@as(u64, 16), ds.lastIndex());
+        try std.testing.expectEqual(@as(?u64, 1), try ds.term(16));
+        try std.testing.expectEqual(@as(?u64, null), try ds.term(17));
+        try appendPrepared(alloc, &ds, payload, 17);
+        try ds.sync();
+        try std.testing.expectEqual(@as(u64, 17), ds.lastIndex());
+    }
+}
+
+test "diskwal: a pooled log file nobody took goes at the next trim" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const payload = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(payload);
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
+    defer ds.deinit();
+    const spares = &ds.wal_store.next.spares;
+    for (1..13) |i| {
+        try appendPrepared(alloc, &ds, payload, @intCast(i));
+    }
+    try ds.sync();
+    try ds.setSnapshot(.{ .index = 8, .term = 1, .data = "snap" });
+    try ds.compactUntil(8);
+    try std.testing.expectEqual(@as(usize, 2), spares.items.len);
+
+    // No rotation since that trim: the next one keeps none.
+    try ds.compactUntil(8);
+    try std.testing.expectEqual(@as(usize, 0), spares.items.len);
+    try std.testing.expect(!try dirHas(wal_dir, "00001.wal.tmp"));
+    try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
+    try std.testing.expectEqual(@as(usize, 2), try countWalFiles(wal_dir));
+}
+
+test "diskwal: the pool keeps at most max_spare_log_files" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const payload = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(payload);
+
+    var opts = reuse_opts;
+    opts.max_spare_log_files = 1;
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
+    defer ds.deinit();
+    for (1..13) |i| {
+        try appendPrepared(alloc, &ds, payload, @intCast(i));
+    }
+    try ds.sync();
+    // Files 1 and 2 are dropped after three rotations: one is kept.
+    try ds.setSnapshot(.{ .index = 8, .term = 1, .data = "snap" });
+    try ds.compactUntil(8);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        ds.wal_store.next.spares.items.len,
+    );
+    try std.testing.expect(try dirHas(wal_dir, "00001.wal.tmp"));
+    try std.testing.expect(!try dirHas(wal_dir, "00002.wal.tmp"));
+    try std.testing.expect(!try dirHas(wal_dir, "00002.wal"));
+}
+
+test "diskwal: spare log files are taken up again after a restart" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const payload = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(payload);
+
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
+        defer ds.deinit();
+        for (1..13) |i| {
+            try appendPrepared(alloc, &ds, payload, @intCast(i));
+        }
+        try ds.sync();
+        try ds.setSnapshot(.{ .index = 8, .term = 1, .data = "snap" });
+        try ds.compactUntil(8);
+    }
+    // Left on disk: the two pooled files and the one that was prepared.
+    try std.testing.expect(try dirHas(wal_dir, "00001.wal.tmp"));
+    try std.testing.expect(try dirHas(wal_dir, "00002.wal.tmp"));
+    try std.testing.expect(try dirHas(wal_dir, "00005.wal.tmp"));
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
+    defer ds.deinit();
+    const next = &ds.wal_store.next;
+    try std.testing.expectEqual(@as(usize, 3), next.spares.items.len);
+    // No new file takes a fid a spare holds.
+    try std.testing.expectEqual(@as(u64, 6), next.next_fid);
+
+    // 13 rotates into one of the spares; the prepare after it takes
+    // another.
+    try appendPrepared(alloc, &ds, payload, 13);
+    try ds.sync();
+    while (!next.isReady()) fiber.yield();
+    try std.testing.expectEqual(@as(usize, 3), try countWalFiles(wal_dir));
+    try std.testing.expectEqual(@as(usize, 1), next.spares.items.len);
+    try std.testing.expectEqual(@as(u64, 13), ds.lastIndex());
+}
+
+test "diskwal: a reused log file opens empty" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+    const payload = try alloc.alloc(u8, 300 * 1024);
+    defer alloc.free(payload);
+
+    // File 1 with three records, then made a spare by hand.
+    {
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, reuse_opts);
+        defer ds.deinit();
+        for (1..4) |i| {
+            try appendPrepared(alloc, &ds, payload, @intCast(i));
+        }
+        try ds.sync();
+    }
+    const live = try std.fmt.allocPrint(alloc, "{s}/00001.wal", .{wal_dir});
+    defer alloc.free(live);
+    const tmp = try std.fmt.allocPrint(alloc, "{s}/00001.wal.tmp", .{wal_dir});
+    defer alloc.free(tmp);
+    try vfs.renameFile(live, tmp);
+
+    const LogFile = raft.diskwal.LogFile;
+    {
+        var next = raft.diskwal.NextLog{
+            .allocator = alloc,
+            .vfs_inst = vfs.g(),
+            .dir_path = wal_dir,
+            .opts = reuse_opts,
+            .next_fid = 9,
+        };
+        var lf = try next.reuse(1);
+        lf.deinit();
+    }
+    // Rotation would rename it in; here by hand, as file 9.
+    const cur = try std.fmt.allocPrint(alloc, "{s}/00009.wal", .{wal_dir});
+    defer alloc.free(cur);
+    try vfs.renameFile(tmp, cur);
+
+    // Scanned as a current file: no record, though the old second and
+    // third are still in it.
+    var lf = try LogFile.openCurrent(vfs.g(), alloc, wal_dir, 9, reuse_opts);
+    defer lf.deinit();
+    try std.testing.expectEqual(@as(usize, 0), lf.slots.items.len);
+    try std.testing.expectEqual(
+        @as(u64, raft.diskwal.log_file_offset),
+        lf.write_offset,
+    );
 }

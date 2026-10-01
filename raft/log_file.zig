@@ -49,8 +49,15 @@ const DiskWAL = @import("diskwal.zig").DiskWAL;
 // On open, the highest id is indexed from its records: every intact
 // frame up to the first zero or torn one, which the next append
 // overwrites. Every lower id is indexed from its header alone, one read
-// per file. A stray .wal.tmp, a next file whose rotation never came,
-// is deleted.
+// per file.
+//
+// A <fid>.wal.tmp is a spare: not part of the log, and the next file
+// when one is needed. It is the file prepared ahead of rotation, or a
+// file a trim dropped and kept (`NextLog.adoptLogFile`, `reuse`): its
+// blocks are written already, so it needs no fill. A kept file's old
+// records stay in it; their indexes are below every new one, which is
+// how a scan tells them apart. On open the spares are taken up again;
+// one cut short, a fill a crash interrupted, is deleted.
 
 // 16 MiB header / 41 bytes-per-slot (37-byte WalSlot + 4-byte offset
 // entry in the WalHeader's slots array) ≈ 409,000 max slots; round down
@@ -118,10 +125,15 @@ pub const OpenOptions = struct {
     /// allocates anew and zeros are elided, and on tmpfs, where growing
     /// a file is free; `.auto` tells them apart by statfs.
     prezero: Prezero = .auto,
+    /// The most log files kept for reuse after a trim drops them (see
+    /// `NextLog.adoptLogFile`). The pool holds fewer when fewer were needed,
+    /// and 0 turns reuse off.
+    max_spare_log_files: usize = 64,
 };
 
 pub const log_suffix = ".wal";
-/// Suffix of a log file prepared ahead of rotation; see `wal.rotate`.
+/// Suffix of a spare log file: one prepared ahead of rotation, or one
+/// a trim dropped and kept for reuse. See `NextLog`.
 pub const tmp_suffix = ".tmp";
 
 pub const Error = error{
@@ -224,7 +236,11 @@ pub const LogFile = struct {
         return slots_list;
     }
 
-    /// Open a rotated <fid>.wal file. Reads header to populate in-memory slots.
+    /// Open a rotated <fid>.wal file: its slots come from its header.
+    /// A header that is torn, or that lists no record, is the crash
+    /// between a rotation and the outgoing file's header write: the
+    /// file still has the empty header it was created with. Its
+    /// records are then found by a scan (`openScanned`).
     pub fn openRotated(
         vfs_inst: *const _vfs.VFS,
         alloc: std.mem.Allocator,
@@ -242,15 +258,20 @@ pub const LogFile = struct {
             .mode = .default,
             .flags = .{ .writable = true, .dsync = true },
         });
-        errdefer handle.close();
 
-        var slots_list = readHeader(alloc, handle) catch |err| switch (err) {
-            error.InvalidLogHeader => {
-                handle.close();
-                return openScanned(vfs_inst, alloc, dir_path, fid);
-            },
-            else => return err,
+        // The handle is closed on every path that leaves before the
+        // errdefer below: `openScanned` opens the file itself.
+        var slots_list = readHeader(alloc, handle) catch |err| {
+            handle.close();
+            if (err != error.InvalidLogHeader) return err;
+            return openScanned(vfs_inst, alloc, dir_path, fid);
         };
+        if (slots_list.items.len == 0) {
+            slots_list.deinit(alloc);
+            handle.close();
+            return openScanned(vfs_inst, alloc, dir_path, fid);
+        }
+        errdefer handle.close();
         errdefer slots_list.deinit(alloc);
 
         var wo: u64 = log_file_offset;
@@ -316,6 +337,12 @@ pub const LogFile = struct {
             if (payload.len == 0) break;
 
             const reader = zen.LogEntryReader.parseRoot(payload) catch break;
+            // A reused file's old records are intact frames past the
+            // new ones. Their indexes are below the snapshot that
+            // freed the file, so one never follows the record before.
+            if (slots_list.getLastOrNull()) |prev| {
+                if (reader.index() != prev.index + 1) break;
+            }
             try slots_list.append(alloc, .{
                 .term = reader.term(),
                 .index = reader.index(),
@@ -442,12 +469,12 @@ pub const LogFile = struct {
         return lf;
     }
 
-    /// Write zeros from `from` to `size`, in pieces, at the lowest I/O
+    /// Write zeros over [from, end), in pieces, at the lowest I/O
     /// priority.
-    fn zeroFill(self: *LogFile, from: u64, size: u64) !void {
+    fn zeroFill(self: *LogFile, from: u64, end: u64) !void {
         var at: u64 = from;
-        while (at < size) {
-            const n: usize = @intCast(@min(zero_piece, size - at));
+        while (at < end) {
+            const n: usize = @intCast(@min(zero_piece, end - at));
             try self.handle.write(zero_block[0..n], at, .p2);
             at += n;
         }
@@ -637,10 +664,10 @@ pub const LogFile = struct {
 
 /// The log file after `current`. Once `current` is half full, `prepare`
 /// spawns a fiber that creates and zero-fills it under a temporary name
-/// (<fid>.wal.tmp, which `openPath` ignores and removes, so a restart
-/// never takes it for the current log file while the real one, whose
-/// header is written only when it rotates, sits below it with an empty
-/// header). `swapIn` renames the prepared file into place at rotation,
+/// (<fid>.wal.tmp, which `openPath` never reads as a log file, so a
+/// restart never takes it for the current log file while the real one,
+/// whose header is written only when it rotates, sits below it with an
+/// empty header). `swapIn` renames the prepared file into place at rotation,
 /// under a fid taken then, so file order is time order whichever file
 /// it hands back; a prepare still running does not delay the rotation
 /// (see swapIn). Every method runs with the wal lock held; the fiber
@@ -655,21 +682,49 @@ pub const NextLog = struct {
     /// The create fiber, from `prepare` until `swapIn` or `discard`
     /// joins it. A spawned fiber is freed by its join, so exactly once.
     creating: ?fiber.JoinHandle(anyerror!LogFile) = null,
+    /// Spare log files, by fid, each on disk as <fid>.wal.tmp for
+    /// `prepare` to reuse: files a trim dropped, and the ones the last
+    /// run left. Touched only under the wal lock.
+    spares: std.ArrayList(u64) = .empty,
+    /// How many files `spares` may hold: `max_spare_log_files` from
+    /// open (`adoptByIds`), then as many as were rotated in between
+    /// the last two trims (`startTrim`), never above that maximum.
+    spare_cap: usize = 0,
+    /// Rotations since the last trim.
+    rotations: usize = 0,
 
-    /// Start creating the next log file, unless one is being created or
-    /// is ready. With prezero off there is nothing to do ahead: the
+    /// Which of a fid's two names: the log file, or the spare.
+    const Kind = enum { log, tmp };
+
+    /// <dir>/<fid>.wal, or <dir>/<fid>.wal.tmp. Caller frees.
+    fn fullPath(self: *const NextLog, fid: u64, kind: Kind) ![]u8 {
+        var buf: LogFile.NameBuf = undefined;
+        return LogFile.fullPath(self.allocator, self.dir_path, switch (kind) {
+            .log => try LogFile.fname(fid, &buf),
+            .tmp => try LogFile.tmpName(fid, &buf),
+        });
+    }
+
+    /// Start preparing the next log file, unless one is being prepared
+    /// or is ready. With prezero off there is nothing to do ahead: the
     /// file is then a header write and one dsync, the same cost inline
     /// at rotation. A spawn failure is logged and skipped: `swapIn`
     /// then creates inline, unfilled.
     pub fn prepare(self: *NextLog) void {
         if (self.opts.prezero == .false) return;
         if (self.creating != null) return;
-        const fid = self.takeFid();
+
+        // A spare is prepared under the name it has; a new file takes
+        // the next fid. Popped here, under the wal lock.
+        const spare = self.spares.pop();
+        const fid = spare orelse self.takeFid();
         self.creating = fiber.spawn(
             .{ .lane = .raft },
             createAndFill,
-            .{ self, fid },
+            .{ self, fid, spare != null },
         ) catch |err| {
+            // The pop left the capacity in place.
+            if (spare) |s| self.spares.appendAssumeCapacity(s);
             std.log.warn("raft/diskwal: no fiber to prepare log file {d}: {s}", .{
                 fid, @errorName(err),
             });
@@ -677,8 +732,26 @@ pub const NextLog = struct {
         };
     }
 
-    fn createAndFill(self: *NextLog, fid: u64) anyerror!LogFile {
+    /// The next log file as <fid>.wal.tmp: that spare when `is_spare`,
+    /// else a new file, zero-filled. A reuse that fails falls back to
+    /// a new file under the same name.
+    fn createAndFill(
+        self: *NextLog,
+        fid: u64,
+        is_spare: bool,
+    ) anyerror!LogFile {
         std.debug.assert(self.opts.prezero == .true);
+        if (is_spare) {
+            if (self.reuse(fid)) |lf| {
+                return lf;
+            } else |err| {
+                std.log.warn(
+                    "raft/diskwal: reuse of log file {d}: {s}; " ++
+                        "creating a new one",
+                    .{ fid, @errorName(err) },
+                );
+            }
+        }
         var name_buf: LogFile.NameBuf = undefined;
         return LogFile.createNamed(
             self.vfs_inst,
@@ -688,6 +761,152 @@ pub const NextLog = struct {
             fid,
             self.opts,
         );
+    }
+
+    /// The spare <fid>.wal.tmp made ready as the next file, in place:
+    /// what `createNamed` returns, without the fill. Written here: an
+    /// empty header, zeros over the first record's place so the file
+    /// scans as empty, and zeros over the tail rotation cut off. The
+    /// old records in between stay (see `scanFrames`).
+    pub fn reuse(self: *NextLog, fid: u64) !LogFile {
+        std.debug.assert(self.opts.prezero == .true);
+        const alloc = self.allocator;
+        const path = try self.fullPath(fid, .tmp);
+        defer alloc.free(path);
+
+        const handle = try self.vfs_inst.openFile(alloc, path, .{
+            .mode = .default,
+            .flags = .{ .writable = true, .dsync = true },
+        });
+        var lf = LogFile{
+            .fid = fid,
+            .handle = handle,
+            .allocator = alloc,
+            .slots = std.ArrayList(entry).empty,
+            .write_offset = log_file_offset,
+            .is_current = true,
+            .filled = true,
+        };
+        errdefer lf.deinit();
+
+        const full_size = self.opts.log_file_size;
+        const size = lf.handle.file_size;
+        if (size > full_size) try lf.truncateFile(full_size);
+        try lf.writeHeader();
+
+        // One page of zeros where the first record goes.
+        const first_record: u64 = log_file_offset;
+        const first_end = first_record + _vfs.page_size;
+        try lf.zeroFill(first_record, first_end);
+
+        // And zeros from where the file ends to its full size.
+        const tail = @max(size, first_end);
+        if (tail < full_size) try lf.zeroFill(tail, full_size);
+        try lf.handle.syncData();
+        return lf;
+    }
+
+    /// The pool at open: `fids` are the <fid>.wal.tmp files the last
+    /// run left, the one it had prepared and the ones it kept. A kept
+    /// file's records are below the snapshot, as when it was dropped.
+    /// One not worth reusing, such as a fill cut short, is deleted.
+    pub fn adoptByIds(self: *NextLog, fids: []const u64) !void {
+        // Until the first trim sets it from rotations, the pool may
+        // hold as many as it is ever allowed.
+        self.spare_cap = self.opts.max_spare_log_files;
+        for (fids) |fid| {
+            const path = try self.fullPath(fid, .tmp);
+            defer self.allocator.free(path);
+            const size = if (_vfs.fileStat(path)) |st| st.size else |_| 0;
+
+            if (self.canAdopt(size)) {
+                try self.spares.append(self.allocator, fid);
+            } else {
+                _vfs.deleteFile(path) catch {};
+            }
+        }
+    }
+
+    /// A log file the trim is dropping: kept as the spare
+    /// <fid>.wal.tmp, or deleted (`canAdopt`).
+    pub fn adoptLogFile(self: *NextLog, lf: *const LogFile) void {
+        if (self.canAdopt(lf.write_offset)) {
+            if (self.renameToSpare(lf.fid)) return else |_| {}
+        }
+        const path = self.fullPath(lf.fid, .log) catch return;
+        defer self.allocator.free(path);
+        _vfs.deleteFile(path) catch {};
+    }
+
+    /// Whether a file with `bytes` of it written joins the pool. Not
+    /// when the pool is full (`spare_cap`), when log files are not
+    /// zero-filled here, or when the file is cut well short of
+    /// `log_file_size` and would need most of a fill anyway.
+    fn canAdopt(self: *const NextLog, bytes: u64) bool {
+        if (self.opts.prezero != .true) return false;
+        if (self.spares.items.len >= self.spare_cap) return false;
+        const full_size = self.opts.log_file_size;
+        return bytes + full_size / 16 >= full_size;
+    }
+
+    /// Fids continue above `last`, the highest log file on disk, and
+    /// above every spare's, so a new log file never shares a fid, and
+    /// so a name, with a spare. Never below where they already are.
+    pub fn bumpFid(self: *NextLog, last: u64) void {
+        var max = last;
+        for (self.spares.items) |fid| max = @max(max, fid);
+        self.next_fid = @max(self.next_fid, max + 1);
+    }
+
+    /// A trim begins. The pool keeps as many files as the wal rotated
+    /// in since the last trim, so a file nobody took for a whole
+    /// interval is unlinked here, and an idle wal's pool empties.
+    pub fn startTrim(self: *NextLog) void {
+        self.spare_cap = @min(
+            self.rotations,
+            self.opts.max_spare_log_files,
+        );
+        self.rotations = 0;
+        while (self.spares.items.len > self.spare_cap) {
+            const fid = self.spares.pop().?;
+            deleteTmpByFid(self.allocator, self.dir_path, fid);
+        }
+    }
+
+    /// Unlink every pooled file.
+    pub fn dropSpares(self: *NextLog) void {
+        for (self.spares.items) |fid| {
+            deleteTmpByFid(self.allocator, self.dir_path, fid);
+        }
+        self.spares.clearRetainingCapacity();
+    }
+
+    /// The prepared file and the pooled ones stay on disk: the next
+    /// open takes them up as spares.
+    pub fn deinit(self: *NextLog) void {
+        if (self.creating) |*handle| {
+            if (handle.join()) |lf| {
+                var prepared = lf;
+                prepared.deinit();
+            } else |_| {}
+            self.creating = null;
+        }
+        self.spares.deinit(self.allocator);
+    }
+
+    /// <fid>.wal becomes the spare <fid>.wal.tmp, in the pool. Not
+    /// synced: a crash that undoes the rename leaves a log file below
+    /// the snapshot, as a crash before an unlink does.
+    fn renameToSpare(self: *NextLog, fid: u64) !void {
+        try self.spares.append(self.allocator, fid);
+        errdefer _ = self.spares.pop();
+
+        const path = try self.fullPath(fid, .log);
+        defer self.allocator.free(path);
+        const tmp_path = try self.fullPath(fid, .tmp);
+        defer self.allocator.free(tmp_path);
+
+        try _vfs.renameFile(path, tmp_path);
     }
 
     /// Whether a prepared log file is waiting for rotation.
@@ -706,6 +925,7 @@ pub const NextLog = struct {
     /// again as soon as a prepared file is ready. A prepare still
     /// running is left running for that rotation.
     pub fn swapIn(self: *NextLog) !LogFile {
+        self.rotations += 1;
         var inline_opts = self.opts;
         inline_opts.prezero = .false;
         if (self.creating) |*handle| {
@@ -730,8 +950,9 @@ pub const NextLog = struct {
                 var prepared = lf;
                 const tmp_fid = prepared.fid;
                 // The tmp fid is still the next one unless a rotation
-                // went by meanwhile; then a fresh fid keeps file order
-                // equal to time order.
+                // went by meanwhile, or the file is a spare under its
+                // old fid; then a fresh fid keeps file order equal to
+                // time order.
                 const fid = if (tmp_fid + 1 == self.next_fid)
                     tmp_fid
                 else
@@ -768,26 +989,19 @@ pub const NextLog = struct {
         }
     }
 
-    fn takeFid(self: *NextLog) u64 {
+    pub fn takeFid(self: *NextLog) u64 {
         const fid = self.next_fid;
         self.next_fid += 1;
         return fid;
     }
 
     /// <tmp_fid>.wal.tmp becomes <fid>.wal, and the name is made durable
-    /// before anything is appended under it. The two differ when a
-    /// rotation went by while the file was still being prepared.
+    /// before anything is appended under it. The two differ for a
+    /// spare, and when a rotation went by during the prepare.
     fn rename(self: *NextLog, tmp_fid: u64, fid: u64) !void {
-        var tmp_buf: LogFile.NameBuf = undefined;
-        const tmp_path = try LogFile.fullPath(
-            self.allocator,
-            self.dir_path,
-            try LogFile.tmpName(tmp_fid, &tmp_buf),
-        );
+        const tmp_path = try self.fullPath(tmp_fid, .tmp);
         defer self.allocator.free(tmp_path);
-
-        var name_buf: LogFile.NameBuf = undefined;
-        const path = try LogFile.fullPath(self.allocator, self.dir_path, try LogFile.fname(fid, &name_buf));
+        const path = try self.fullPath(fid, .log);
         defer self.allocator.free(path);
 
         try _vfs.renameFile(tmp_path, path);

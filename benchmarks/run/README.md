@@ -9,8 +9,8 @@ same commands rerun the same benchmark on any machine.
 
 - `bench.py`: the command, and the tables that define the benchmarks:
   `SERVERS` (ports, database, config) and `ENVS` (a workload, a
-  server, a memory cap). Four envs exist: `egres-big`, `postgres-big`,
-  `egres-orders`, `postgres-orders`.
+  server, a memory cap). Two envs exist: `egres-orders` and
+  `postgres-orders`, neither capped.
 - `workloads.py`: each workload's schema, row generator, load size,
   and pgbench scripts, with the read-only subset the readers run and
   the full mix. `workloads.py <name> --ddl` prints a schema,

@@ -87,14 +87,10 @@ SERVERS = {
 # `secs` seconds with `clients` clients, `latency_sample` of their
 # transactions logged for percentiles. `runs` 0 ends with the load.
 ENVS = {
-    "egres-big": {"server": "egres", "workload": "big",
-                  "memory_max": None},
-    "postgres-big": {"server": "postgres", "workload": "big",
-                     "memory_max": None},
     "egres-orders": {"server": "egres", "workload": "orders",
-                     "memory_max": "64G"},
+                     "memory_max": None},
     "postgres-orders": {"server": "postgres", "workload": "orders",
-                        "memory_max": "64G"},
+                        "memory_max": None},
 }
 ENV_DEFAULTS = {"runs": 2, "secs": 7200, "clients": 64,
                 "latency_sample": 0.1}

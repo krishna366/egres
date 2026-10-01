@@ -305,6 +305,7 @@ const WalCfg = struct {
     dir: String = "",
     log_file_mib: u64 = 256,
     prezero: raft.diskwal.Prezero = .auto,
+    max_spare_log_files: usize = 64,
 
     pub const docs = .{
         .self = "Raft WAL location and log files (see raft/diskwal.zig" ++
@@ -315,6 +316,10 @@ const WalCfg = struct {
         .prezero = "Zero-fill a log file when it is created so appends never" ++
             " grow the file: true for ext4/xfs, false for ZFS/btrfs/tmpfs," ++
             " auto decides by statfs.",
+        .max_spare_log_files = "The most log files kept for reuse after a" ++
+            " snapshot drops them. Fewer are kept when fewer were needed" ++
+            " since the last snapshot, none on an idle node. 0 = never" ++
+            " reuse. Only with prezero.",
     };
 };
 
@@ -493,6 +498,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     var wal = try raft.DiskWAL.openPath(wal_dir, allocator, .{
         .log_file_size = wal_cfg.log_file_mib << 20,
         .prezero = wal_cfg.prezero,
+        .max_spare_log_files = wal_cfg.max_spare_log_files,
     });
     defer deinitWithLog("wal", &wal);
     // Genesis before the node reads the log: a fresh WAL gets its

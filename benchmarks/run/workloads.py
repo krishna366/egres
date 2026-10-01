@@ -108,79 +108,15 @@ def blended(r: random.Random, chars: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# big: 1 KiB rows past the page cache, point updates, reads and scans.
-# The payload is blended: rows that compress 2x under zstd.
-# ---------------------------------------------------------------------------
-
-# `g` is what the scans filter on: BIG_GROUPS values, each on about one
-# row in BIG_GROUPS wherever it is in the table, and no index, so
-# `WHERE g = v` reads every row whichever value is asked for.
-BIG_GROUPS = 1000
-
-BIG_DDL = """\
-CREATE TABLE big (id BIGINT PRIMARY KEY, n BIGINT, g BIGINT, payload TEXT);
-"""
-
-BIG_INSERT = "INSERT INTO big (id, n, g, payload) VALUES"
-
-
-def big_row(rid: int) -> str:
-    r = random.Random(rid)
-    payload = blended(r, 1000)
-    g = r.randrange(1, BIG_GROUPS + 1)
-    return f"({rid}, 0, {g}, '{payload}')"
-
-
-# A point update on a zipfian id: a few rows are very hot.
-BIG_UPDATE = """\
-\\set id random_zipfian(1, :rows, 1.1)
-UPDATE big SET n = n + 1 WHERE id = :id;
-"""
-
-# A point read of a row that exists: a slice of the load, then a
-# zipfian offset into what that slice has loaded, so each slice has a
-# few very hot rows and a long cold tail.
-BIG_SELECT = """\
-\\set s random(0, :streams - 1)
-\\set k random_zipfian(1, :per, 1.1)
-\\set id :first + :s * :slice + :k - 1
-SELECT n FROM big WHERE id = :id;
-"""
-
-# A scan: no index on g, so every row is read to count the one in
-# BIG_GROUPS that matches. Its latency grows with the table.
-BIG_SCAN = """\
-\\set g random(1, :groups)
-SELECT count(*) FROM big WHERE g = :g;
-"""
-
-BIG = {
-    "ddl": BIG_DDL,
-    "insert": BIG_INSERT,
-    "row": big_row,
-    # By rows, not by bytes on disk: the same rows for either server.
-    "load": {"first": 1, "last": 600_000_000, "streams": 16,
-             "chunk": 100_000, "stop_bytes": None, "stop_secs": None},
-    "vars": {"groups": BIG_GROUPS},
-    "scripts": {"update": BIG_UPDATE, "select": BIG_SELECT,
-                "scan": BIG_SCAN},
-    "reads": [
-        {"name": "point", "clients": 8, "scripts": [("select", 1)],
-         "sample": 0.01},
-        {"name": "scan", "clients": 1, "scripts": [("scan", 1)]},
-    ],
-    "mix": [("update", 3), ("select", 1)],
-}
-
-
-# ---------------------------------------------------------------------------
-# orders: a table with three secondary indexes
+# orders: a table with four secondary indexes
 # ---------------------------------------------------------------------------
 # Ours, not a standard: a plain OLTP table of the shape an application
 # has. Every indexed value is random per row while `id` is sequential,
-# so a load lands each insert at a random place in three indexes.
-# Cardinalities: 8M customers (~100 orders each), 200k SKUs (~4,000
-# each), 730 days (~1.1M each); the note is 600 random characters.
+# so a load lands each insert at a random place in four indexes.
+# Cardinalities: 8M customers (~75 orders each), 200k SKUs (~3,000
+# each), 730 days (~820k each), 99,900 amounts (~6,000 each); the
+# note is 1000 blended characters,
+# which compress 2x under zstd.
 
 ORDERS_CUSTOMERS = 8_000_000
 ORDERS_SKUS = 200_000
@@ -198,6 +134,7 @@ CREATE TABLE orders (
 CREATE INDEX orders_customer ON orders (customer_id);
 CREATE INDEX orders_sku ON orders (sku);
 CREATE INDEX orders_day ON orders (day);
+CREATE INDEX orders_amount ON orders (amount);
 """
 
 ORDERS_INSERT = ("INSERT INTO orders (id, customer_id, sku, day, amount, "
@@ -210,9 +147,30 @@ def orders_row(rid: int) -> str:
     sku = r.randrange(1, ORDERS_SKUS + 1)
     day = r.randrange(1, ORDERS_DAYS + 1)
     amount = r.randrange(100, 100_000)
-    note = text(r, 600)
+    note = blended(r, 1000)
     return f"({rid}, {customer}, {sku}, {day}, {amount}, '{note}')"
 
+
+# The id of a row that exists, scrambled zipfian as in YCSB: a zipfian
+# rank over the whole table, scattered by `permute` so the hot rows are
+# spread over every slice, old and new, and not the first ones loaded.
+# The seed is fixed, so a rank is the same row in every pgbench of a
+# run. While that row is not loaded yet, `% :per` folds the rank onto
+# a loaded row of the same slice. 1.01 is the nearest pgbench has to
+# YCSB's 0.99: about 80% of draws go to 1% of the rows.
+ORDERS_ID = """\
+\\set total :streams * :slice
+\\set r random_zipfian(1, :total, 1.01)
+\\set p permute(:r - 1, :total, 7)
+\\set s :p % :streams
+\\set k (:p / :streams) % :per
+\\set id :first + :s * :slice + :k
+"""
+
+# One order by its id: the primary key index, then the row.
+ORDERS_SELECT = ORDERS_ID + """\
+SELECT amount FROM orders WHERE id = :id;
+"""
 
 # One customer's orders. Zipfian over customers, a few hot ones.
 ORDERS_CUSTOMER = """\
@@ -220,7 +178,7 @@ ORDERS_CUSTOMER = """\
 SELECT id, sku, day, amount FROM orders WHERE customer_id = :c LIMIT 100;
 """
 
-# One SKU on one day: an index intersection, about five rows.
+# One SKU on one day: an index intersection, about four rows.
 ORDERS_SKU_DAY = """\
 \\set s random(1, :skus)
 \\set d random(1, :days)
@@ -234,7 +192,7 @@ ORDERS_CUSTOMER_DAY_COUNT = """\
 SELECT count(*) FROM orders WHERE customer_id = :c AND day = :d;
 """
 
-# A new order: four index entries. Ids continue past the loaded range,
+# A new order: five index entries. Ids continue past the loaded range,
 # a block of 100M per client and 10M of it per workload run, so no run
 # repeats an id another inserted.
 ORDERS_NEW = """\
@@ -256,14 +214,14 @@ ORDERS_RESCHEDULE = """\
 UPDATE orders SET day = :d WHERE id = :id;
 """
 
-# Update an unindexed column: no index entry moves.
+# Change an order's amount: one index entry moves.
 ORDERS_AMOUNT = """\
 \\set id random(1, :rows)
 \\set a random(100, 100000)
 UPDATE orders SET amount = :a WHERE id = :id;
 """
 
-# Delete an order: four index entries removed. Repeats on an already
+# Delete an order: five index entries removed. Repeats on an already
 # deleted id are no-ops, as in any such workload.
 ORDERS_DELETE = """\
 \\set id random(1, :rows)
@@ -274,12 +232,13 @@ ORDERS = {
     "ddl": ORDERS_DDL,
     "insert": ORDERS_INSERT,
     "row": orders_row,
-    "load": {"first": 1, "last": 700_000_000, "streams": 16,
-             "chunk": 100_000, "stop_bytes": 500 * GIB,
-             "stop_secs": None},
+    # By rows, not by bytes on disk: the same rows for either server.
+    "load": {"first": 1, "last": 600_000_000, "streams": 16,
+             "chunk": 100_000, "stop_bytes": None, "stop_secs": None},
     "vars": {"customers": ORDERS_CUSTOMERS, "skus": ORDERS_SKUS,
              "days": ORDERS_DAYS},
     "scripts": {
+        "select": ORDERS_SELECT,
         "customer": ORDERS_CUSTOMER,
         "sku_day": ORDERS_SKU_DAY,
         "customer_day_count": ORDERS_CUSTOMER_DAY_COUNT,
@@ -288,8 +247,12 @@ ORDERS = {
         "amount": ORDERS_AMOUNT,
         "delete": ORDERS_DELETE,
     },
+    # Beside the load: point reads by id. The index queries are a
+    # second group, off unless asked for (`--set readers.index=8`).
     "reads": [
-        {"name": "reads", "clients": 8, "sample": 0.1,
+        {"name": "point", "clients": 8, "scripts": [("select", 1)],
+         "sample": 0.01},
+        {"name": "index", "clients": 0, "sample": 0.1,
          "scripts": [("customer", 35), ("sku_day", 20),
                      ("customer_day_count", 10)]},
     ],
@@ -297,7 +260,7 @@ ORDERS = {
             ("insert", 25), ("reschedule", 5), ("amount", 3), ("delete", 2)],
 }
 
-WORKLOADS = {"big": BIG, "orders": ORDERS}
+WORKLOADS = {"orders": ORDERS}
 
 
 def script_path(run, script: str) -> Path:
@@ -343,7 +306,7 @@ def main():
         description="Print a workload's schema, or INSERTs for a range of "
                     "ids to pipe through psql.",
         epilog="examples: workloads.py orders --ddl | psql \"$CONN\"; "
-               "workloads.py big 1 100000 | psql \"$CONN\"")
+               "workloads.py orders 1 100000 | psql \"$CONN\"")
     ap.add_argument("workload", choices=sorted(WORKLOADS),
                     help="which workload")
     ap.add_argument("--ddl", action="store_true",

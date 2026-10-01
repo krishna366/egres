@@ -148,6 +148,34 @@ class Progress:
         return min(self.done[i] - a + 1 for i, a in self.first.items())
 
 
+def server_mem(pid) -> int:
+    """Resident bytes of the server: the process and its children (a
+    Postgres postmaster's backends), private memory summed and shared
+    memory counted once. Page cache is not in it. 0 when unreadable."""
+    if not pid:
+        return 0
+    anon, shared = 0, 0
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            text = (proc / "status").read_text()
+        except OSError:
+            continue
+        f = dict(line.split(":", 1) for line in text.splitlines()
+                 if ":" in line)
+
+        def kb(key):
+            return int(f.get(key, "0").split()[0]) * 1024
+
+        if int(proc.name) != pid and \
+                int(f.get("PPid", "0").split()[0]) != pid:
+            continue
+        anon += kb("RssAnon")
+        shared = max(shared, kb("RssFile") + kb("RssShmem"))
+    return anon + shared
+
+
 def dir_bytes(root: Path) -> int:
     total = 0
     for dirpath, _dirs, files in os.walk(root):
@@ -391,9 +419,12 @@ def run_load(run, resume: bool):
     io_prev = io0
     last_log = t0
     last_rows = rows0
+    mem = mem_peak = 0
     while prog.loading():
         write_prom(prom, prog, total)
         now = time.time()
+        mem = server_mem(run.pid("server.pid"))
+        mem_peak = max(mem_peak, mem)
         if now - last_log >= 60:
             with prog.lock:
                 rows = prog.rows
@@ -415,7 +446,8 @@ def run_load(run, resume: bool):
                             f"p99={ins['p99']:.1f} max={ins['max']:.1f}"
                             if ins["n"] else "")
                          + f" disk_MiBps read={rd / mib:.0f} "
-                           f"write={wr / mib:.0f}\n")
+                           f"write={wr / mib:.0f} "
+                           f"mem={mem / GIB:.1f}GiB\n")
             last_log, last_rows = now, rows
             if cfg["stop_bytes"] and size >= cfg["stop_bytes"]:
                 prog.stop = True
@@ -443,7 +475,7 @@ def run_load(run, resume: bool):
         ef.write(f"{utc()} load done rows={prog.rows} failed={prog.failed} "
                  f"per={prog.per()} in {secs:.0f}s\n")
     summarize(run, prog, prog.rows - rows0, t0, secs,
-              iostat.delta(io0, io1))
+              iostat.delta(io0, io1), {"peak": mem_peak, "end": mem})
 
 
 def zdb_bytes(run) -> dict:
@@ -466,7 +498,7 @@ def zdb_bytes(run) -> dict:
 
 
 def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
-              io: dict):
+              io: dict, mem: dict):
     """load-summary.md and .json: what this load (or this resumed part
     of one) cost, from `t0` for `secs` seconds. The readers' last round
     runs on past the load; only what they started within it counts."""
@@ -498,6 +530,7 @@ def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
                       "written_bytes": w}
                   for d, (r, w) in sorted(io["disks"].items())},
         "server_process": io["proc"], "zdb_bytes_written": zdb,
+        "server_memory_bytes": mem,
     }
     (run.out / "load-summary.json").write_text(
         json.dumps(data, indent=2) + "\n")
@@ -513,7 +546,10 @@ def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
         f"- Data dir: {data['data_dir_bytes'] / GIB:.1f} GiB, "
         f"{data['data_dir_bytes'] / max(prog.rows, 1):.0f} bytes per row "
         f"loaded, as the load ended (compaction may still shrink it). "
-        f"WAL dir: {data['wal_dir_bytes'] / GIB:.1f} GiB.\n",
+        f"WAL dir: {data['wal_dir_bytes'] / GIB:.1f} GiB.",
+        f"- Server memory, resident (`server_mem`; page cache not "
+        f"counted): peak {mem['peak'] / GIB:.1f} GiB, "
+        f"{mem['end'] / GIB:.1f} GiB as the load ended.\n",
         "## Insert latency\n",
         "One INSERT statement's round trip as psql timed it, in ms.\n",
         "| statements | p50 | p90 | p99 | p99.9 | max |",
