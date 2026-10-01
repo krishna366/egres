@@ -74,10 +74,29 @@ PANELS = [
     ], desc="Load phase: rows the load streams committed. Workload "
             "phase: pgbench transactions per second."),
     ts("Latency", "ms", [
-        ('pgbench_latency_ms', "pgbench avg"),
-        ('pgbench_latency_stddev_ms', "pgbench stddev"),
+        ('pgbench_latency_ms', "{{run}} avg"),
+        ('pgbench_latency_stddev_ms', "{{run}} stddev"),
         ('egres_admin_seconds * 1000', "admin round trip"),
     ]),
+    ts("Insert latency, one statement", "s", [
+        ('histogram_quantile(0.5, sum(rate('
+         'egres_load_insert_seconds_bucket[1m])) by (le))', "p50"),
+        ('histogram_quantile(0.99, sum(rate('
+         'egres_load_insert_seconds_bucket[1m])) by (le))', "p99"),
+        ('rate(egres_load_insert_seconds_sum[1m]) / '
+         'rate(egres_load_insert_seconds_count[1m])', "mean"),
+    ], fill=0, desc="A multi-row INSERT's round trip as psql timed it "
+                    "during the load. Quantiles are read off histogram "
+                    "buckets; load-summary.md has the exact ones."),
+    ts("Query latency by script", "ms", [
+        ('pgbench_latency_p50_ms', "{{script}} p50"),
+        ('pgbench_latency_p99_ms', "{{script}} p99"),
+        ('pgbench_latency_max_ms', "{{script}} max"),
+    ], fill=0, desc="From pgbench's per-transaction log, over the "
+                    "transactions of the last few seconds."),
+    ts("Queries per second, by pgbench", "none", [
+        ('pgbench_tps', "{{run}}"),
+    ], fill=0),
     ts("Bytes written per second, by source", "Bps", [
         ('sum(rate(zdb_bytes_written_total[1m])) by (source)', "{{source}}"),
     ], stack=True, desc="user = accepted writes; flush and compact = "
@@ -115,13 +134,30 @@ PANELS = [
         (f'sum(rate(node_disk_written_bytes_total{{{DISK}}}[1m])) by (device)',
          "write {{device}}"),
     ]),
+    stat("Disk bytes over the shown range", "bytes", [
+        (f'sum(increase(node_disk_read_bytes_total{{{DISK}}}[$__range]))'
+         ' by (device)', "read {{device}}"),
+        (f'sum(increase(node_disk_written_bytes_total{{{DISK}}}[$__range]))'
+         ' by (device)', "written {{device}}"),
+        (f'increase(namedprocess_namegroup_read_bytes_total{{{EGRES}}}'
+         '[$__range])', "read by egres"),
+        (f'increase(namedprocess_namegroup_write_bytes_total{{{EGRES}}}'
+         '[$__range])', "written by egres"),
+    ], desc="Set the time range to the load to read its totals; "
+            "load-summary.md has them exactly."),
+    ts("Egres process I/O", "Bps", [
+        (f'rate(namedprocess_namegroup_read_bytes_total{{{EGRES}}}[1m])',
+         "read"),
+        (f'rate(namedprocess_namegroup_write_bytes_total{{{EGRES}}}[1m])',
+         "write"),
+    ]),
     ts("Disk busy", "percentunit", [
         (f'rate(node_disk_io_time_seconds_total{{{DISK}}}[1m])',
          "{{device}}"),
     ], fill=0),
     ts("Filesystem free", "bytes", [
-        ('node_filesystem_avail_bytes{mountpoint="/"}', "/ (nvme)"),
-        ('node_filesystem_avail_bytes{mountpoint="/zdata"}', "/zdata"),
+        ('node_filesystem_avail_bytes{fstype=~"ext4|xfs|zfs|btrfs"}',
+         "{{mountpoint}}"),
     ], fill=0),
     ts("Flushes and compactions per minute", "none", [
         ('sum(rate(zdb_flushes_total[5m])) * 60', "flushes"),

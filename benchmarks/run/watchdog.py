@@ -17,7 +17,7 @@ Incidents, all recorded in INCIDENTS.md with dumps in dumps/:
     the run (STOP file for the load driver, pgbench killed)
   - stall: rows (load) or pgbench progress unchanged for 15 minutes
     takes admin dumps; 30 minutes stops the phase
-  - disk: under 150 GiB free on the output root stops the load
+  - disk: under 150 GiB free where the data dir is stops the load
 
 Everything is by pid from the pid files; nothing is matched by name.
 The phase logic reads the load's own metrics file; Prometheus only
@@ -182,7 +182,8 @@ class Watch:
         return float(m.group(1)) if m else None
 
     def numbers(self) -> dict:
-        free = shutil.disk_usage(self.run.out_root).free
+        # The data dir's filesystem: the one a load can fill.
+        free = shutil.disk_usage(self.run.data).free
         return {
             "rows": self.load_rows(),
             "rate": prom("sum(rate(egres_load_rows_total[5m]))"),
@@ -335,7 +336,9 @@ class Watch:
                 self.incident("load driver exited without 'load done'",
                               f"rows from metrics: {self.rows_loaded}")
             self.progress_row(n)
-            if self.rows_loaded > 0 and self.phase == "load":
+            # An env with no workload runs ends with its load.
+            if self.rows_loaded > 0 and self.phase == "load" and \
+                    self.run.env["runs"] > 0:
                 self.phase = "workload"
                 self.start_workload()
             else:
@@ -379,7 +382,8 @@ class Watch:
             f"{f(n['trees'], 1, 0)}.\n",
             f"Server restarts: {len(self.restarts)}. Workload runs: "
             f"{self.workload_run}.\n",
-            "See progress.md, INCIDENTS.md, results/, dumps/, watch.log.\n",
+            "See load-summary.md (latency and disk bytes of the load), "
+            "progress.md, INCIDENTS.md, results/, dumps/, watch.log.\n",
         ]
         (self.out / "SUMMARY-auto.md").write_text("\n".join(text))
 

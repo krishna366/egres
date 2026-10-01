@@ -79,9 +79,11 @@ SERVERS = {
 }
 
 # An env: one benchmark. memory_max is a systemd scope's MemoryMax
-# (page cache included, swap off) or None; readers are pgbench clients
-# on the read-only scripts during the load; then `runs` workload runs
-# of `secs` seconds with `clients` clients.
+# (page cache included, swap off) or None. During the load the
+# workload's reader groups run beside it (`readers.<group>` is a
+# group's client count, 0 for none); then `runs` workload runs of
+# `secs` seconds with `clients` clients, `latency_sample` of their
+# transactions logged for percentiles. `runs` 0 ends with the load.
 ENVS = {
     "egres-big": {"server": "egres", "workload": "big",
                   "memory_max": None},
@@ -92,7 +94,8 @@ ENVS = {
     "postgres-orders": {"server": "postgres", "workload": "orders",
                         "memory_max": "64G"},
 }
-ENV_DEFAULTS = {"readers": 8, "runs": 2, "secs": 7200, "clients": 64}
+ENV_DEFAULTS = {"runs": 2, "secs": 7200, "clients": 64,
+                "latency_sample": 0.1}
 
 
 def resolve_env(name: str, sets: list[str]) -> dict:
@@ -110,7 +113,9 @@ def resolve_env(name: str, sets: list[str]) -> dict:
     # for `--set load.last=...`.
     w = workloads.WORKLOADS[env["workload"]]
     env["workload"] = {"name": env["workload"], "vars": dict(w["vars"]),
-                       "reads": list(w["reads"]), "mix": list(w["mix"])}
+                       "reads": copy.deepcopy(w["reads"]),
+                       "mix": list(w["mix"])}
+    env["readers"] = {g["name"]: g["clients"] for g in w["reads"]}
     env["load"] = dict(w["load"])
     for item in sets:
         key, _, raw = item.partition("=")
@@ -124,6 +129,11 @@ def resolve_env(name: str, sets: list[str]) -> dict:
         elif isinstance(old, bool):
             val = raw.lower() in ("1", "true", "yes")
         elif isinstance(old, int):
+            val = int(raw)
+        elif isinstance(old, float):
+            val = float(raw)
+        elif old is None and raw.isdigit():
+            # A setting that is off by default: load.stop_bytes.
             val = int(raw)
         else:
             val = raw
@@ -513,8 +523,10 @@ def cmd_status(run: Run):
             size = subprocess.run(["du", "-sh", str(d)], capture_output=True,
                                   text=True).stdout.strip()
             print(size)
-    total, used, free = shutil.disk_usage(run.out_root)
-    print(f"{run.out_root}: {free / GIB:.0f} GiB free of {total / GIB:.0f}")
+    for d in (run.data, run.wal, run.out):
+        if d.exists():
+            total, used, free = shutil.disk_usage(d)
+            print(f"{d}: {free / GIB:.0f} GiB free of {total / GIB:.0f}")
 
 
 def main():

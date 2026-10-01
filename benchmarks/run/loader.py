@@ -14,24 +14,45 @@ dir, where node exporter picks it up:
     egres_load_target_rows         rows in the whole range
     egres_load_streams_running     streams still working
     egres_load_chunks_failed_total chunks that failed all retries
+    egres_load_insert_seconds      histogram: one INSERT statement's
+                                   round trip as psql timed it
 
-The load stops early once the data dir passes the env's stop_bytes, or
-when the file `STOP` appears in the output dir; running chunks finish
-first.
+Insert latency is per statement (ROWS_PER_STMT rows), measured by the
+client: psql runs with `\timing on` and its "Time:" lines, kept in the
+stream's log, are read back after each chunk. The time starts when the
+whole statement is in psql's hands, so the generator is not in it.
+
+The load stops early once the data dir passes the env's stop_bytes or
+the load has run for its stop_secs (when it has either), or when the
+file `STOP` appears in the output dir; running chunks finish first.
+
+When the load ends, `load-summary.md` and `.json` in the output dir
+say what it cost: rows and rate, insert and reader latency
+percentiles, and the bytes each disk read and wrote meanwhile (see
+iostat.py), which is also logged per minute for the data dir's disk.
 
 `--resume` continues a load stopped that way: it reads load.log for the
 last "load start" and each stream's "done at id" line after it, and
 starts every stream after its last committed id.
 
-The readers: the env's `readers` pgbench clients on the workload's
-read-only scripts for the whole load, in rounds of ten minutes each
-started with `-D rows=<rows loaded so far>` so the ids they draw exist.
-Their progress goes to results/readers.log and readers.prom under
-run="load-readers". Reads during writes are part of the measurement:
-work a server defers to a later pass is paid here.
+The readers: the workload's reader groups, each a pgbench of its own
+on its own scripts for the whole load (a group per kind of query, so a
+scan that takes minutes does not hold the clients that should be
+doing point reads). A group runs in rounds of a minute, each started
+with the ids loaded so far (`pgbench.id_vars`) so the ids they draw
+exist. A round is left to end on its own, the last one too: pgbench
+writes its latency log through a buffer and has no flush, so a killed
+round loses its last transactions, which for a slow script is all of
+them. A group's progress goes to results/readers-<group>.log and
+readers-<group>.prom under run="load-<group>", each transaction's
+latency to results/latency/. Reads during writes are part of the
+measurement: work a server defers to a later pass is paid here.
 """
 
+import array
 import fcntl
+import glob
+import json
 import os
 import re
 import subprocess
@@ -40,15 +61,67 @@ import threading
 import time
 from pathlib import Path
 
+import iostat
 import pgbench
 
 HERE = Path(__file__).resolve().parent
 WORKLOADS_PY = HERE / "workloads.py"
-READER_ROUND_SECS = 600
+READER_ROUND_SECS = 60
+GIB = 2**30
+# psql prints one of these per statement under \timing; a time of a
+# second or more carries a clock form after it, which is not needed.
+TIME_LINE = re.compile(rb"^Time: ([\d.]+) ms", re.M)
 
 
 def utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+class Latency:
+    """Insert statement latencies, in milliseconds: all of them for the
+    final percentiles (4 bytes each, a few million), the ones since
+    the last log line, and histogram buckets for Prometheus."""
+    BUCKETS_MS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,
+                  10000, 30000)
+
+    def __init__(self):
+        self.all = array.array("f")
+        self.window: list = []
+        self.counts = [0] * len(self.BUCKETS_MS)
+        self.sum_ms = 0.0
+
+    def add(self, ms: float):
+        self.all.append(ms)
+        self.window.append(ms)
+        self.sum_ms += ms
+        for i, le in enumerate(self.BUCKETS_MS):
+            if ms <= le:
+                self.counts[i] += 1
+                break
+
+    def prom(self) -> str:
+        body = "# TYPE egres_load_insert_seconds histogram\n"
+        seen = 0
+        for le, n in zip(self.BUCKETS_MS, self.counts):
+            seen += n
+            body += (f'egres_load_insert_seconds_bucket{{le="{le / 1000}"}}'
+                     f" {seen}\n")
+        body += (f'egres_load_insert_seconds_bucket{{le="+Inf"}} '
+                 f"{len(self.all)}\n"
+                 f"egres_load_insert_seconds_sum {self.sum_ms / 1000}\n"
+                 f"egres_load_insert_seconds_count {len(self.all)}\n")
+        return body
+
+
+def spread(vals) -> dict:
+    """n, p50, p90, p99, p999 and max of a list of latencies."""
+    ordered = sorted(vals)
+    if not ordered:
+        return {"n": 0}
+    out = {"n": len(ordered), "max": ordered[-1]}
+    for key, pct in (("p50", 50), ("p90", 90), ("p99", 99), ("p999", 99.9)):
+        out[key] = pgbench.percentile(ordered, pct)
+    return out
 
 
 class Progress:
@@ -59,9 +132,20 @@ class Progress:
         self.running = 0
         self.stop = False
         self.threads: list = []
+        self.insert = Latency()
+        # Per stream: its slice's first id and the last id it has
+        # committed. `per` is what the readers may draw from.
+        self.first: dict = {}
+        self.done: dict = {}
 
     def loading(self) -> bool:
         return any(t.is_alive() for t in self.threads)
+
+    def per(self) -> int:
+        """Ids loaded in every slice: the shortest loaded prefix."""
+        if not self.first:
+            return 0
+        return min(self.done[i] - a + 1 for i, a in self.first.items())
 
 
 def dir_bytes(root: Path) -> int:
@@ -87,9 +171,14 @@ def run_chunk(run, workload: str, a: int, b: int, log: Path) -> bool:
             fcntl.fcntl(g.stdout.fileno(), fcntl.F_SETPIPE_SZ, 1 << 20)
         except (OSError, AttributeError):
             pass
+        # \timing first, then the statements from stdin: the log gets
+        # a "Time:" line per statement. A C numeric locale keeps the
+        # decimal point a point.
         rc = subprocess.run(
-            [str(run.psql), run.conn, "-X", "-q", "-v", "ON_ERROR_STOP=1"],
+            [str(run.psql), run.conn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+             "-c", "\\timing on", "-f", "-"],
             stdin=g.stdout, stdout=lf, stderr=subprocess.STDOUT,
+            env={**os.environ, "LC_NUMERIC": "C"},
         ).returncode
         g.stdout.close()
         g.wait()
@@ -132,11 +221,26 @@ def resume_points(events: Path, first: int, last: int, streams: int):
     return points, rows
 
 
+def new_times(log: Path, pos: int):
+    """The statement times psql logged past byte `pos`, and the new
+    position. A failed attempt's statements count too: they ran."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(pos)
+            chunk = f.read()
+    except OSError:
+        return [], pos
+    return ([float(m) for m in TIME_LINE.findall(chunk)],
+            pos + len(chunk))
+
+
 def stream(run, workload: str, idx: int, a: int, b: int, chunk: int,
            prog: Progress):
     log = run.results / f"load-{idx}.log"
     events = run.out / "load.log"
     rid = a
+    # Only this run's lines: a resumed load appends to the same log.
+    log_pos = log.stat().st_size if log.exists() else 0
     while rid <= b and not prog.stop:
         hi = min(rid + chunk - 1, b)
         ok = False
@@ -148,9 +252,13 @@ def stream(run, workload: str, idx: int, a: int, b: int, chunk: int,
                 ef.write(f"{utc()} stream {idx} chunk {rid}..{hi} "
                          f"failed attempt {attempt}\n")
             time.sleep(5 * attempt)
+        times, log_pos = new_times(log, log_pos)
         with prog.lock:
+            for ms in times:
+                prog.insert.add(ms)
             if ok:
                 prog.rows += hi - rid + 1
+                prog.done[idx] = hi
             else:
                 prog.failed += 1
         if not ok:
@@ -166,27 +274,45 @@ def stream(run, workload: str, idx: int, a: int, b: int, chunk: int,
         ef.write(f"{utc()} stream {idx} done at id {rid - 1}\n")
 
 
-def readers(run, prog: Progress, total: int):
-    """Rounds of pgbench over the rows loaded so far until the load is
-    over. The first round waits for a first slice of rows, so the ids
-    it draws exist."""
-    n = run.env["readers"]
-    log = run.results / "readers.log"
+def readers(run, prog: Progress, total: int, group: dict):
+    """One reader group: rounds of pgbench over the rows loaded so far
+    until the load is over. The first round waits for a first slice of
+    rows, so the ids it draws exist."""
+    name = group["name"]
+    n = run.env["readers"][name]
+    log = run.results / f"readers-{name}.log"
     events = run.out / "load.log"
     min_rows = min(1_000_000, total // 10)
+    round_no = 0
     while not prog.stop and prog.loading():
         with prog.lock:
-            rows = prog.rows
-        if rows < min_rows:
+            rows, per = prog.rows, prog.per()
+        # Every slice needs rows before a script may draw from it.
+        if rows < min_rows or per == 0:
             time.sleep(10)
             continue
-        h = pgbench.start(run, log, "readers", "load-readers", n,
-                          READER_ROUND_SECS, run.env["workload"]["reads"],
-                          {"rows": rows})
+        round_no += 1
+        h = pgbench.start(run, log, f"readers-{name}", f"load-{name}", n,
+                          READER_ROUND_SECS, group["scripts"],
+                          pgbench.id_vars(run.env["load"], rows, per),
+                          reader_prefix(run, name, round_no),
+                          group.get("sample", 1.0))
         with open(events, "a") as ef:
-            ef.write(f"{utc()} readers round rows={rows} pid={h.pid}\n")
-        # A round ends with the load, not ten minutes after it.
-        pgbench.follow(h, stop=lambda: prog.stop or not prog.loading())
+            ef.write(f"{utc()} readers {name} round rows={rows} per={per} "
+                     f"pid={h.pid}\n")
+        # Never killed: however the load ends, the round finishes what
+        # it is doing, so its log is whole.
+        pgbench.follow(h)
+
+
+def reader_prefix(run, group: str, round_no) -> str:
+    """The latency log prefix of one round of a reader group; `*`
+    globs the group's rounds. A resumed load's rounds get their own
+    names by the time."""
+    d = run.results / "latency"
+    if round_no == "*":
+        return str(d / f"readers-{group}-*")
+    return str(d / f"readers-{group}-{int(time.time())}-{round_no:03d}")
 
 
 def write_prom(path: Path, prog: Progress, target: int):
@@ -200,7 +326,7 @@ def write_prom(path: Path, prog: Progress, target: int):
             f"egres_load_streams_running {prog.running}\n"
             "# TYPE egres_load_chunks_failed_total counter\n"
             f"egres_load_chunks_failed_total {prog.failed}\n"
-        )
+        ) + prog.insert.prom()
     tmp = path.with_suffix(".tmp")
     tmp.write_text(body)
     os.replace(tmp, path)
@@ -237,36 +363,59 @@ def run_load(run, resume: bool):
         with open(events, "a") as ef:
             ef.write(f"{utc()} load start ids {cfg['first']}..{cfg['last']} "
                      f"streams={cfg['streams']} chunk={cfg['chunk']}\n")
+    firsts = {i: a for i, a, _ in slices(cfg["first"], cfg["last"],
+                                         cfg["streams"])}
     for i, a, b in points:
         prog.running += 1
+        prog.first[i] = firsts[i]
+        prog.done[i] = a - 1
         t = threading.Thread(target=stream,
                              args=(run, workload, i, a, b, cfg["chunk"],
                                    prog),
                              daemon=True)
         t.start()
         prog.threads.append(t)
-    reader = None
-    if run.env["readers"] > 0:
-        reader = threading.Thread(target=readers, args=(run, prog, total),
-                                  daemon=True)
-        reader.start()
+    reader_threads = []
+    for group in run.env["workload"]["reads"]:
+        if run.env["readers"][group["name"]] > 0:
+            t = threading.Thread(target=readers,
+                                 args=(run, prog, total, group), daemon=True)
+            t.start()
+            reader_threads.append(t)
 
     prom = run.textfile / "load.prom"
     t0 = time.time()
-    last_log = 0.0
-    last_rows = 0
+    rows0 = prog.rows
+    data_disks = iostat.device_of(run.data)
+    io0 = iostat.snapshot(run.pid("server.pid"))
+    io_prev = io0
+    last_log = t0
+    last_rows = rows0
     while prog.loading():
         write_prom(prom, prog, total)
         now = time.time()
         if now - last_log >= 60:
             with prog.lock:
                 rows = prog.rows
+                window, prog.insert.window = prog.insert.window, []
             rate = (rows - last_rows) / max(now - last_log, 1)
             size = dir_bytes(run.data)
+            ins = spread(window)
+            io_now = iostat.snapshot(run.pid("server.pid"))
+            io = iostat.delta(io_prev, io_now)
+            io_prev = io_now
+            mib = 2**20 * max(io["secs"], 1)
+            rd = sum(io["disks"].get(d, (0, 0))[0] for d in data_disks)
+            wr = sum(io["disks"].get(d, (0, 0))[1] for d in data_disks)
             with open(events, "a") as ef:
                 ef.write(f"{utc()} rows={rows} rate={rate:.0f}/s "
-                         f"data={size / 2**30:.1f}GiB "
-                         f"streams={prog.running} failed={prog.failed}\n")
+                         f"data={size / GIB:.1f}GiB "
+                         f"streams={prog.running} failed={prog.failed}"
+                         + (f" insert_ms p50={ins['p50']:.1f} "
+                            f"p99={ins['p99']:.1f} max={ins['max']:.1f}"
+                            if ins["n"] else "")
+                         + f" disk_MiBps read={rd / mib:.0f} "
+                           f"write={wr / mib:.0f}\n")
             last_log, last_rows = now, rows
             if cfg["stop_bytes"] and size >= cfg["stop_bytes"]:
                 prog.stop = True
@@ -277,10 +426,146 @@ def run_load(run, resume: bool):
             prog.stop = True
             with open(events, "a") as ef:
                 ef.write(f"{utc()} stop: STOP file\n")
+        if cfg.get("stop_secs") and now - t0 >= cfg["stop_secs"] and \
+                not prog.stop:
+            prog.stop = True
+            with open(events, "a") as ef:
+                ef.write(f"{utc()} stop: ran {cfg['stop_secs']} s\n")
         time.sleep(5)
+    # The load's own span: the snapshot before the readers wind down.
+    io1 = iostat.snapshot(run.pid("server.pid"))
+    secs = time.time() - t0
     write_prom(prom, prog, total)
-    if reader is not None:
-        reader.join()
+    for t in reader_threads:
+        t.join()
+    # `per` lets a later workload run draw only ids that exist.
     with open(events, "a") as ef:
         ef.write(f"{utc()} load done rows={prog.rows} failed={prog.failed} "
-                 f"in {time.time() - t0:.0f}s\n")
+                 f"per={prog.per()} in {secs:.0f}s\n")
+    summarize(run, prog, prog.rows - rows0, t0, secs,
+              iostat.delta(io0, io1))
+
+
+def zdb_bytes(run) -> dict:
+    """Egres's own byte counters by source (user, flush, compact), from
+    the admin `zdb` metrics; {} for Postgres or when unreachable."""
+    if run.kind != "egres":
+        return {}
+    import watchdog
+    try:
+        text = watchdog.admin("zdb", run.env["server"]["admin_port"])
+    except OSError:
+        return {}
+    # One series per source, tree and level; summed here by source.
+    out: dict = {}
+    for source, val in re.findall(
+            r'^zdb_bytes_written_total\{[^}]*source="(\w+)"[^}]*\} (\d+)',
+            text, re.M):
+        out[source] = out.get(source, 0) + int(val)
+    return out
+
+
+def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
+              io: dict):
+    """load-summary.md and .json: what this load (or this resumed part
+    of one) cost, from `t0` for `secs` seconds. The readers' last round
+    runs on past the load; only what they started within it counts."""
+    ins = spread(prog.insert.all)
+    groups = []
+    for group in run.env["workload"]["reads"]:
+        name = group["name"]
+        if run.env["readers"][name] <= 0:
+            continue
+        sample = group.get("sample", 1.0)
+        scripts = [script for script, _weight in group["scripts"]]
+        lat = pgbench.latency_summary(
+            glob.glob(reader_prefix(run, name, "*") + ".*"), scripts,
+            whole_paths=True, until=t0 + secs)
+        groups.append({"name": name, "clients": run.env["readers"][name],
+                       "sample": sample, "scripts": lat})
+    roles = {}
+    for role, path in (("data", run.data), ("wal", run.wal)):
+        for disk in iostat.device_of(path):
+            roles.setdefault(disk, []).append(role)
+    zdb = zdb_bytes(run)
+    data = {
+        "env": run.name, "rows": rows, "secs": secs,
+        "rows_per_sec": rows / max(secs, 1), "failed_chunks": prog.failed,
+        "data_dir_bytes": dir_bytes(run.data),
+        "wal_dir_bytes": dir_bytes(run.wal),
+        "insert_ms": ins, "readers": groups,
+        "disks": {d: {"roles": roles.get(d, []), "read_bytes": r,
+                      "written_bytes": w}
+                  for d, (r, w) in sorted(io["disks"].items())},
+        "server_process": io["proc"], "zdb_bytes_written": zdb,
+    }
+    (run.out / "load-summary.json").write_text(
+        json.dumps(data, indent=2) + "\n")
+
+    def ms(d, key):
+        return f"{d[key]:.2f}" if key in d else "-"
+
+    md = [
+        "# Load summary\n",
+        f"Env `{run.name}`, written {utc()}.\n",
+        f"- Rows: {rows:,} in {secs:.0f} s, {rows / max(secs, 1):,.0f} "
+        f"rows/s on average; {prog.failed} chunks failed.",
+        f"- Data dir: {data['data_dir_bytes'] / GIB:.1f} GiB, "
+        f"{data['data_dir_bytes'] / max(prog.rows, 1):.0f} bytes per row "
+        f"loaded, as the load ended (compaction may still shrink it). "
+        f"WAL dir: {data['wal_dir_bytes'] / GIB:.1f} GiB.\n",
+        "## Insert latency\n",
+        "One INSERT statement's round trip as psql timed it, in ms.\n",
+        "| statements | p50 | p90 | p99 | p99.9 | max |",
+        "|---|---|---|---|---|---|",
+        f"| {ins['n']:,} | {ms(ins, 'p50')} | {ms(ins, 'p90')} | "
+        f"{ms(ins, 'p99')} | {ms(ins, 'p999')} | {ms(ins, 'max')} |\n",
+        "## Readers during the load\n",
+        "Latency in ms per script, from pgbench's per-transaction log, "
+        "for transactions started while the load ran. `txns` is the "
+        "logged count over the sampled fraction.\n",
+        "| group | script | clients | txns | txns/s | p50 | p90 | p99 "
+        "| p99.9 | max |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for g in groups:
+        for script, d in g["scripts"].items():
+            txns = d["n"] / g["sample"]
+            md.append(
+                f"| {g['name']} | {script} | {g['clients']} | {txns:,.0f} | "
+                f"{txns / max(secs, 1):,.1f} | {ms(d, 'p50')} | "
+                f"{ms(d, 'p90')} | {ms(d, 'p99')} | {ms(d, 'p999')} | "
+                f"{ms(d, 'max')} |")
+    md += [
+        "\n## Disk bytes during the load\n",
+        "Whole disks, from /proc/diskstats: everything the device "
+        "served.\n",
+        "| disk | holds | read GiB | written GiB | read MiB/s "
+        "| write MiB/s |",
+        "|---|---|---|---|---|---|",
+    ]
+    for disk, d in data["disks"].items():
+        r, w = d["read_bytes"], d["written_bytes"]
+        md.append(
+            f"| {disk} | {', '.join(d['roles']) or '-'} | {r / GIB:.1f} | "
+            f"{w / GIB:.1f} | {r / 2**20 / max(secs, 1):.0f} | "
+            f"{w / 2**20 / max(secs, 1):.0f} |")
+    if io["proc"]:
+        r, w = io["proc"]
+        # Buffered writes count when a page is dirtied, not when it
+        # reaches a disk, so this can exceed the disks' sum.
+        md.append(f"\nThe server process's own counters (/proc/<pid>/io, "
+                  f"which count a buffered write when it is made): read "
+                  f"{r / GIB:.1f} GiB, wrote {w / GIB:.1f} GiB.")
+    if zdb.get("user"):
+        user = zdb["user"]
+        total = sum(zdb.values())
+        wrote = sum(d["written_bytes"] for d in data["disks"].values()
+                    if "data" in d["roles"])
+        md.append(
+            f"\nEgres counters since the server started: "
+            + ", ".join(f"{k} {v / GIB:.1f} GiB" for k, v in zdb.items())
+            + f". Write amplification: {total / user:.2f} by those "
+            f"counters, {wrote / user:.2f} as data disk bytes written "
+            f"per user byte.")
+    (run.out / "load-summary.md").write_text("\n".join(md) + "\n")

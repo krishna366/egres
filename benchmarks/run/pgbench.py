@@ -14,6 +14,19 @@ so Grafana shows tps and latency over time:
     pgbench_failed_total{run="..."}       failed transactions so far
     pgbench_clients{run="..."}            client count
 
+An average hides the slow transactions, so pgbench also logs each
+transaction's latency (`-l`, or a sample of them for fast scripts),
+and `follow` publishes percentiles per script over the transactions
+since its last look:
+
+    pgbench_latency_p50_ms{run="...",script="..."}
+    pgbench_latency_p99_ms{run="...",script="..."}
+    pgbench_latency_max_ms{run="...",script="..."}
+
+`latency_summary` gives the same per script over whole log files, for
+a report. Percentiles are per script because a mix's scripts differ by
+orders of magnitude: a point read and a scan share no distribution.
+
 When pgbench exits the metrics are cleared and its final report parsed
 into a dict (tps, latency, transactions, failed, per script).
 
@@ -24,6 +37,9 @@ keeps its ids apart from an earlier run's (the orders insert script);
 load reached.
 """
 
+import array
+import glob
+import math
 import os
 import re
 import subprocess
@@ -46,7 +62,7 @@ SCRIPT = re.compile(r"^SQL script \d+: (\S+)\n(?: - .*\n)*?"
 
 class Handle:
     def __init__(self, proc, log: Path, prom: Path, run_label: str,
-                 clients: int):
+                 clients: int, lat_prefix, scripts: list):
         self.proc = proc
         self.log = log
         self.prom = prom
@@ -55,6 +71,12 @@ class Handle:
         self.pos = 0
         self.failed = 0
         self.last = None
+        # The per-transaction logs: pgbench writes one file per
+        # thread, `<prefix>.<pid>[.<n>]`; how far each has been read.
+        self.lat_prefix = lat_prefix
+        self.lat_pos: dict = {}
+        self.scripts = scripts
+        self.lat_last: dict = {}
 
     @property
     def pid(self) -> int:
@@ -74,17 +96,103 @@ def script_args(run, scripts, extra_vars: dict) -> list[str]:
 
 
 def start(run, log: Path, prom_name: str, run_label: str, clients: int,
-          secs: int, scripts, extra_vars: dict) -> Handle:
+          secs: int, scripts, extra_vars: dict, lat_prefix=None,
+          sample: float = 1.0) -> Handle:
+    """`lat_prefix`: where the per-transaction latency logs go (a path
+    prefix, its dir created here), or None for none. `sample`: the
+    fraction of transactions logged; fast scripts at full rate would
+    write gigabytes onto the disk under test."""
     # Appending, never truncating: a second start with the same name
     # must not erase a finished run's numbers.
     cmd = [str(run.pgbench), run.conn, "-n", "-c", str(clients), "-j",
            str(min(clients, 16)), "-T", str(secs), "-P", "5"]
+    if lat_prefix is not None:
+        Path(lat_prefix).parent.mkdir(parents=True, exist_ok=True)
+        cmd += ["-l", f"--log-prefix={lat_prefix}"]
+        if sample < 1.0:
+            cmd.append(f"--sampling-rate={sample}")
     cmd += script_args(run, scripts, extra_vars)
     with open(log, "ab") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
                                 start_new_session=True)
     return Handle(proc, log, run.textfile / f"{prom_name}.prom",
-                  run_label, clients)
+                  run_label, clients, lat_prefix,
+                  [name for name, _weight in scripts])
+
+
+def percentile(sorted_vals, pct: float):
+    """Nearest rank: the ceil(n * pct / 100)-th smallest value."""
+    n = len(sorted_vals)
+    rank = min(max(math.ceil(n * pct / 100.0), 1), n)
+    return sorted_vals[rank - 1]
+
+
+def parse_latencies(chunk: bytes, into: dict, until=None):
+    """Add a log chunk's latencies (microseconds) to `into`, a dict of
+    script number -> array. A line is
+    `client txn_no time_us script_no epoch epoch_us [...]`, the epoch
+    being when the transaction ended; a failed transaction has a word
+    where the time is, and is skipped. `until` (epoch seconds) leaves
+    out transactions that started after it."""
+    for line in chunk.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        try:
+            us, script = int(parts[2]), int(parts[3])
+            ended = int(parts[4]) + int(parts[5]) / 1e6
+        except ValueError:
+            continue
+        if until is not None and ended - us / 1e6 > until:
+            continue
+        if script not in into:
+            into[script] = array.array("L")
+        into[script].append(us)
+
+
+def poll_latencies(h: Handle):
+    """Percentiles per script over the log lines written since the
+    last call. Only whole lines are consumed: pgbench flushes these
+    files a buffer at a time, mid-line."""
+    fresh: dict = {}
+    for path in glob.glob(f"{h.lat_prefix}.*"):
+        pos = h.lat_pos.get(path, 0)
+        with open(path, "rb") as f:
+            f.seek(pos)
+            chunk = f.read()
+        end = chunk.rfind(b"\n") + 1
+        h.lat_pos[path] = pos + end
+        parse_latencies(chunk[:end], fresh)
+    for script, vals in fresh.items():
+        ordered = sorted(vals)
+        name = h.scripts[script] if script < len(h.scripts) else str(script)
+        h.lat_last[name] = (percentile(ordered, 50) / 1000.0,
+                            percentile(ordered, 99) / 1000.0,
+                            ordered[-1] / 1000.0)
+
+
+def latency_summary(prefixes: list, scripts: list,
+                    whole_paths: bool = False, until=None) -> dict:
+    """Per script name, over every log file under the given prefixes
+    (or the files themselves with `whole_paths`): n (logged
+    transactions; a sample when the run samples) and p50, p90, p99,
+    p999, max in milliseconds. `until`: only transactions started by
+    that time (epoch seconds)."""
+    vals: dict = {}
+    for prefix in prefixes:
+        paths = [prefix] if whole_paths else sorted(glob.glob(f"{prefix}.*"))
+        for path in paths:
+            with open(path, "rb") as f:
+                parse_latencies(f.read(), vals, until)
+    out = {}
+    for script, arr in sorted(vals.items()):
+        ordered = sorted(arr)
+        name = scripts[script] if script < len(scripts) else str(script)
+        out[name] = {"n": len(ordered), "max": ordered[-1] / 1000.0}
+        for key, pct in (("p50", 50), ("p90", 90), ("p99", 99),
+                         ("p999", 99.9)):
+            out[name][key] = percentile(ordered, pct) / 1000.0
+    return out
 
 
 def write_prom(h: Handle, vals):
@@ -102,6 +210,13 @@ def write_prom(h: Handle, vals):
             f"pgbench_failed_total{lab} {failed}\n"
             f"# TYPE pgbench_clients gauge\npgbench_clients{lab} {h.clients}\n"
         )
+        for i, metric in enumerate(("p50", "p99", "max")):
+            if not h.lat_last:
+                break
+            body += f"# TYPE pgbench_latency_{metric}_ms gauge\n"
+            for script, stats in sorted(h.lat_last.items()):
+                body += (f'pgbench_latency_{metric}_ms{{run="{h.run_label}"'
+                         f',script="{script}"}} {stats[i]:.3f}\n')
     tmp = h.prom.with_suffix(".tmp")
     tmp.write_text(body)
     os.replace(tmp, h.prom)
@@ -121,6 +236,8 @@ def poll(h: Handle):
             h.failed += int(failed or 0)
             h.last = (tps, lat, "0" if sd == "NaN" else sd, h.failed)
         h.pos = f.tell()
+    if h.lat_prefix is not None:
+        poll_latencies(h)
     if h.last is not None:
         write_prom(h, h.last)
 
@@ -163,19 +280,47 @@ def rows_loaded(run) -> int:
     return int(done[-1])
 
 
+def id_vars(cfg: dict, rows: int, per: int) -> dict:
+    """The pgbench variables that say which ids exist. The load fills
+    `streams` slices of `slice` ids each, every slice from its first
+    id up, so the ids present are the first `per` of each slice (the
+    shortest slice's count, so every script's draw exists) and `rows`
+    of them in all. A script draws a slice and an offset:
+    `:first + :s * :slice + :k - 1` for s in [0, streams) and k in
+    [1, per]."""
+    total = cfg["last"] - cfg["first"] + 1
+    streams = min(cfg["streams"], total)
+    return {"rows": rows, "first": cfg["first"], "streams": streams,
+            "slice": (total + streams - 1) // streams, "per": per}
+
+
+def loaded_vars(run) -> dict:
+    """`id_vars` for a finished load, from its "load done" line."""
+    text = (run.out / "load.log").read_text(errors="replace")
+    per = re.findall(r"load done rows=\d+ .*\bper=(\d+)", text)
+    cfg = run.env["load"]
+    total = cfg["last"] - cfg["first"] + 1
+    slice_ids = (total + cfg["streams"] - 1) // cfg["streams"]
+    return id_vars(cfg, rows_loaded(run),
+                   int(per[-1]) if per else slice_ids)
+
+
 def workload(run, run_no: int, secs: int) -> dict:
     clients = run.env["clients"]
     name = f"mixed-c{clients}-run{run_no}"
     log = run.results / f"pgbench-{name}.log"
     rows = rows_loaded(run)
     run.event(f"workload {name} rows={rows} secs={secs} clients={clients}")
+    lat_prefix = run.results / "latency" / name
     h = start(run, log, "pgbench", name, clients, secs,
-              run.env["workload"]["mix"], {"rows": rows, "run": run_no,
-                                           "n": 0})
+              run.env["workload"]["mix"],
+              {**loaded_vars(run), "run": run_no, "n": 0}, lat_prefix,
+              run.env["latency_sample"])
     # The session leader's pid, for `bench.py stop`.
     (run.out / "workload.pid").write_text(f"{h.pid}\n")
     res = follow(h)
     res["rc"] = h.proc.returncode
+    res["latency"] = latency_summary([lat_prefix], h.scripts)
     run.event(f"workload {name} exit={res['rc']} tps={res['tps']} "
               f"latency_ms={res['latency_ms']} failed={res['failed']}")
     # The final report, kept apart from the log as well.

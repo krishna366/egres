@@ -15,9 +15,12 @@ same commands rerun the same benchmark on any machine.
   and pgbench scripts, with the read-only subset the readers run and
   the full mix. `workloads.py <name> --ddl` prints a schema,
   `workloads.py <name> <first> <last>` the rows.
-- `loader.py`: the load driver and the readers beside it.
-- `pgbench.py`: runs pgbench, publishes its progress lines as metrics,
-  parses its final report.
+- `loader.py`: the load driver and the reader groups beside it; times
+  every INSERT statement; writes `load-summary.md` when the load ends.
+- `pgbench.py`: runs pgbench, publishes its progress lines and
+  per-script latency percentiles as metrics, parses its final report.
+- `iostat.py`: bytes read and written per disk, and by the server
+  process, over a span of a run.
 - `watchdog.py`: the night operator. Restarts a dead server once,
   dumps on a stall, starts the workload runs when the load ends,
   records every run and incident, writes the summary.
@@ -51,8 +54,12 @@ A run's output dir is `<out_root>/<env>-<start time>`;
 `<out_root>/<env>.latest` points at it, so no date is ever typed. In
 it: `env.json` (the resolved env the run used), `events.log` (what
 happened when), `load.log`, `watch.log`, `progress.md`,
-`results/pgbench-*.log` and `.summary`, `results/readers.log`,
-`scripts/` (the pgbench scripts as run), `textfile/*.prom`, `dumps/`,
+`load-summary.md` and `.json` (the load's rate, insert and reader
+latency percentiles, bytes read and written per disk),
+`results/pgbench-*.log` and `.summary`, `results/readers-<group>.log`,
+`results/latency/` (pgbench's per-transaction logs),
+`results/load-<n>.log` (each stream's statement times), `scripts/`
+(the pgbench scripts as run), `textfile/*.prom`, `dumps/`,
 `INCIDENTS.md`, the server log, and `SUMMARY-auto.md` when the
 watchdog is done.
 
@@ -61,12 +68,22 @@ monitoring:
 
 ```
 benchmarks/run/bench.py egres-orders all --name trial --no-monitor \
-  --set load.last=120000 --set load.streams=4 --set readers=2 \
+  --set load.last=120000 --set load.streams=4 --set readers.reads=2 \
   --set secs=15 --set clients=4 --set memory_max=none \
   --set server.sql_port=3321 --set server.admin_port=5321
 ```
 
+`--set runs=0` ends a run with its load: the watchdog writes its
+summary and stops, the server stays up. `--set load.stop_secs=600`
+ends the load after ten minutes, wherever it has got to.
+
 ## What is measured, and why
+
+Three things are measured over the load, and reported in
+`load-summary.md`: how long an INSERT statement takes (every one, as
+psql times it), how long the readers' queries take (percentiles per
+script from pgbench's per-transaction log), and how many bytes each
+disk read and wrote, with the server process's own share.
 
 The load is measured with readers on it. A server that defers work to
 a later pass (Postgres: hint bits, the visibility map, freezing, set by
