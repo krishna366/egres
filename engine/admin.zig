@@ -157,7 +157,7 @@ pub const SetCmd = struct {
 /// `del <ns> <key>` — write a tombstone over `key`. A delete is a write, not
 /// an erasure: it appends a new version whose meta kind is `deleted`, which
 /// shadows every older version on read. The bytes go away later, when a bottom-
-/// level compaction finds the tombstone below `global_min_read`.
+/// level compaction finds the tombstone below `snapshot_ts`.
 pub const DelCmd = struct {
     ns: u32,
     key: String,

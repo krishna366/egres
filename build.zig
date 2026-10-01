@@ -165,10 +165,6 @@ pub fn build(b: *std.Build) void {
         allocator_dep,
         check_step,
     );
-    // TODO: rewrite multiproc harness to use egres
-    // Deferred for Zig 0.16 migration: builds an executable that pulls in
-    // std.process.Child paths in raft/testing.
-    // _ = addRaftMultiprocHarness(b, target, optimize, mods, regen_buffers_step);
 }
 
 fn makeModule(
@@ -445,9 +441,7 @@ fn testFileLessThan(_: void, a: []const u8, b: []const u8) bool {
 // Files that contain tests but don't match the `*_test.zig` / `test.zig`
 // naming convention. Added explicitly to avoid silent skips. Audit when
 // renaming or adding files in these locations.
-const extra_test_files = [_][]const u8{
-    "raft/testing/tests.zig",
-};
+const extra_test_files = [_][]const u8{};
 
 // Test files that the auto-discovery walker finds but that don't currently
 // compile against the live source. These were not in any pre-unification
@@ -883,33 +877,6 @@ fn addLookaheadProbe(
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("lookahead-probe", "Build the store lookahead probe tool");
     step.dependOn(&install.step);
-}
-
-fn addRaftMultiprocHarness(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    mods: Modules,
-    regen_buffers_step: *std.Build.Step,
-) *std.Build.Step {
-    const harness_exe = b.addExecutable(.{
-        .name = "raft-multiproc-harness",
-        .root_module = makeModule(b, target, optimize, "raft/testing/multiproc_harness.zig"),
-    });
-    addVendoredCompressionSources(b, harness_exe);
-    addImports(harness_exe.root_module, mods, .{"raft"});
-
-    const run = b.addRunArtifact(harness_exe);
-    run.step.dependOn(regen_buffers_step);
-    run.step.dependOn(b.getInstallStep());
-    run.addArg("zig-out/bin/raftd");
-
-    const step = b.step(
-        "test-raft-multiproc",
-        "Run multi-process raft integration harness",
-    );
-    step.dependOn(&run.step);
-    return step;
 }
 
 /// libpg_query is the upstream Postgres parser carved out as a static

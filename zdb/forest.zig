@@ -10,6 +10,7 @@ const _config = @import("config.zig");
 const _manifest = @import("manifest.zig");
 const _ddl = @import("forest_ddl.zig");
 const _read = @import("read.zig");
+pub const ReadMarks = @import("read_marks.zig").ReadMarks;
 const _stats = @import("stats.zig");
 const _table = @import("table.zig");
 const _cache = @import("cache.zig");
@@ -500,26 +501,16 @@ pub const Forest = struct {
     tables: fiber.SafeHashMap(TableKey, *TableTrees),
     table_cache: TableCache,
     memtables: Memtables,
-    /// The read floor: the oldest timestamp a reader may ask for. Every
-    /// version below it that a newer version shadows may already be gone,
-    /// since a bottom-level compaction discards under it (`VersionTracker`,
-    /// fed the floor by `Engine.proposeCompaction`), and the read entry
-    /// points refuse a `read_ts` below it.
-    ///
-    /// It is the timestamp of the installed raft snapshot
-    /// (`Snapshot.timestamp`), raised through `setGlobalMinRead` when the
-    /// snapshot entry applies and at recovery, so every node raises it at
-    /// the same point in the log: a compaction the leader builds after
-    /// that entry discards below it, and a follower applies that
-    /// compaction after the same entry. It never moves back. No new read
-    /// starts below it — a new read_ts is the applied timestamp, and the
-    /// snapshot entry applied earlier. A read open across the install is
-    /// refused from then on rather than answered from a table missing
-    /// its versions.
-    ///
-    /// 0 means "nothing is droppable", the safe default: no timestamp is
-    /// below it, so no read is rejected and no row is ever dropped.
-    global_min_read: std.atomic.Value(u64),
+    /// The installed raft snapshot's timestamp, the oldest a reader
+    /// may ask for: builds discard shadowed versions below it and the
+    /// read entry points refuse a `read_ts` below it. Every node
+    /// raises it at the same point in the log, and the leader picks
+    /// it at or below every open read (`minReadTs`). 0 until the
+    /// first snapshot: nothing is discarded or refused.
+    snapshot_ts: std.atomic.Value(u64),
+    /// The reads open on this node, by the minute they read at. A
+    /// reader calls `begin` and `end` on it directly.
+    read_marks: ReadMarks,
 
     // Read paths, from read.zig.
     pub const get = _read.get;
@@ -589,31 +580,38 @@ pub const Forest = struct {
             .tables = fiber.SafeHashMap(TableKey, *TableTrees).init(allocator),
             .table_cache = TableCache.init(allocator, opts.dir),
             .memtables = Memtables.init(allocator, mt),
-            .global_min_read = std.atomic.Value(u64).init(0),
+            .snapshot_ts = std.atomic.Value(u64).init(0),
+            .read_marks = .{},
         };
         return self;
     }
 
-    /// Raise the read horizon. Monotonic: a lower value is ignored rather
-    /// than rejected, so a caller racing with a newer update can't walk the
-    /// horizon backwards and un-discard data that a compaction already
-    /// dropped. Returns the value in force afterward.
-    pub fn setGlobalMinRead(self: *Forest, ts: u64) u64 {
-        var cur = self.global_min_read.load(.acquire);
-        while (ts > cur) {
-            const prev = self.global_min_read.cmpxchgWeak(
-                cur,
-                ts,
-                .acq_rel,
-                .acquire,
-            ) orelse return ts;
-            cur = prev;
-        }
-        return cur;
+    /// Never lowers it: builds have already discarded below the
+    /// current value. Returns the value in force afterward.
+    pub fn setSnapshotTs(self: *Forest, ts: u64) u64 {
+        const prev = self.snapshot_ts.fetchMax(ts, .acq_rel);
+        return @max(prev, ts);
     }
 
-    pub fn globalMinRead(self: *Forest) u64 {
-        return self.global_min_read.load(.acquire);
+    pub fn snapshotTs(self: *Forest) u64 {
+        return self.snapshot_ts.load(.acquire);
+    }
+
+    /// The lowest timestamp a read still needs as of `upper_ts`: the
+    /// oldest read open on any voter, kept between `snapshot_ts` and
+    /// `upper_ts`.
+    pub fn minReadTs(
+        self: *Forest,
+        upper_ts: u64,
+        max_age_secs: u64,
+        peers_min_ts: u64,
+    ) u64 {
+        const min_ts = self.read_marks.minReadTs(
+            upper_ts,
+            max_age_secs,
+            peers_min_ts,
+        );
+        return @min(upper_ts, @max(min_ts, self.snapshotTs()));
     }
 
     pub fn close(self: *Forest) void {
@@ -712,7 +710,7 @@ pub const Forest = struct {
             }
             emitters.deinit(self.allocator);
         }
-        const min_read = self.globalMinRead();
+        const snapshot_ts = self.snapshotTs();
         var flush_err: utils.SafeError = .{};
         var flushes = fiber.Group(void).init(self.allocator);
         defer {
@@ -730,7 +728,11 @@ pub const Forest = struct {
                 }
                 if (flush_err.get()) |err| return err;
 
-                cur = try self.openFlushEmitter(&emitters, item.key, min_read);
+                cur = try self.openFlushEmitter(
+                    &emitters,
+                    item.key,
+                    snapshot_ts,
+                );
             }
             // No tree for the key (its namespace is gone): dropped.
             if (cur) |em| try em.push(item);
@@ -787,7 +789,7 @@ pub const Forest = struct {
         self: *Forest,
         emitters: *std.ArrayList(*Emitter),
         key: Key,
-        min_read: u64,
+        snapshot_ts: u64,
     ) !?*Emitter {
         const trees = self.getTable(key.tableKey()) orelse return null;
         const tree = trees.getTreeByKey(key) orelse return null;
@@ -796,7 +798,7 @@ pub const Forest = struct {
         const em = try self.allocator.create(Emitter);
         errdefer self.allocator.destroy(em);
 
-        em.* = Emitter.init(tree, 0, .p0, min_read);
+        em.* = Emitter.init(tree, 0, .p0, snapshot_ts);
         errdefer em.deinit();
 
         try emitters.append(self.allocator, em);
@@ -843,7 +845,7 @@ pub const Forest = struct {
         const tree = try self.singleTree(table_key);
         defer tree.release();
 
-        var em = Emitter.init(tree, bottom, .p2, self.globalMinRead());
+        var em = Emitter.init(tree, bottom, .p2, self.snapshotTs());
         defer em.deinit();
 
         for (items) |item| try em.push(item);
@@ -1159,21 +1161,14 @@ pub const Forest = struct {
     }
 
     /// Unlink every SST-shaped file in the data dir that the manifest does
-    /// not know and that was last written at or before `cutoff_s`, whole
-    /// seconds on the realtime clock.
-    ///
-    /// The engine derives `cutoff_s` as the earlier of two moments
-    /// (`Engine.scanOrphans`):
-    ///   - the wall-clock time of the log entry at this node's snapshot
-    ///     index (`Snapshot.timestamp`), 0 before the first snapshot, and
-    ///     then the scan removes nothing. A file written after it may
-    ///     belong to an entry the snapshot does not cover.
-    ///   - now minus `SnapshotCfg.orphan_min_age_seconds`. A file this
-    ///     process is still writing, or one a leader is pushing to this
-    ///     follower, is in no manifest yet, so anything younger is
-    ///     assumed to be in flight. This has to exceed one compaction's
-    ///     window from its first output write to its proposal; the
-    ///     snapshot entry can be much more recent than that.
+    /// not know and that was last written at or before a cutoff, the
+    /// earlier of two moments:
+    ///   - `snapshot_ts`, 0 before the first snapshot, and then the scan
+    ///     removes nothing. A file written after it may belong to an
+    ///     entry the snapshot does not cover.
+    ///   - now minus `min_age_secs`. A file still being written is in no
+    ///     manifest yet, so this has to exceed one compaction's window
+    ///     from its first output write to its proposal.
     ///
     /// It catches three kinds of leftovers: files retired at or below the
     /// snapshot index before a crash (the `to_delete` map is not persisted, so
@@ -1186,8 +1181,15 @@ pub const Forest = struct {
     /// The directory is listed by name only, and only the files the
     /// manifest does not know are stat'ed: normally a handful out of
     /// hundreds of thousands.
-    pub fn removeOrphans(self: *Forest, cutoff_s: i64) !void {
+    pub fn removeOrphans(self: *Forest, min_age_secs: u64) !void {
         // TODO: Switch to using DirStore.
+
+        // Whole seconds on the realtime clock, like a file's mtime.
+        const snapshot_hlc = utils.hlc.HLC.fromU64(self.snapshotTs());
+        const snapshot_s: i64 = snapshot_hlc.seconds;
+        const min_age_s: i64 = @intCast(min_age_secs);
+        const now_s = utils.timestampNow(.realtime, .secs);
+        const cutoff_s = @min(snapshot_s, now_s - min_age_s);
 
         const unknowns = blk: {
             var arena = std.heap.ArenaAllocator.init(self.allocator);

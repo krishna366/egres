@@ -218,6 +218,12 @@ pub fn createIndex(
         return build.fail("forget table", err);
     build.read_ts = build.readTs() catch |err|
         return build.fail("read read_ts", err);
+    // The backfill reads at read_ts until the index is valid: counted
+    // among the open reads, it holds the read floor below itself, so
+    // no compaction meanwhile discards a version the scan must see.
+    const read_marks = &self.srv.engine.forest.read_marks;
+    read_marks.begin(build.read_ts);
+    defer read_marks.end(build.read_ts);
 
     // Drop the barrier before the backfill, so other txns can
     // proceed.

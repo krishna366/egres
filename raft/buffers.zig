@@ -78,10 +78,12 @@ pub const Snapshot = schema.Table(&.{
     // putting them into the placeholder memtable (where they'd be discarded
     // anyway). 0 means "skip nothing" — backward-compat default.
     .{ .id = 5, .name = "oldest_memtable_index", .ty = schema.U64 },
-    // HLC timestamp of the log entry at `index`: the moment, on the
-    // leader's clock, the state this snapshot captures was reached. 0 when
-    // unknown. The orphan scan reads it: a file written after this moment
-    // may belong to an entry the snapshot does not cover.
+    // The oldest timestamp a reader may ask for once this snapshot is
+    // installed: the HLC timestamp of the log entry at `index`, or older
+    // when a read still open on a voting node was older (the state
+    // machine picks it). 0 when unknown. The orphan scan reads it too: a file
+    // written after this moment may belong to an entry the snapshot does
+    // not cover, and an older moment only spares more files.
     .{ .id = 6, .name = "timestamp", .ty = schema.U64 },
 });
 
@@ -171,6 +173,11 @@ pub const AppendEntriesReply = schema.Table(&.{
     .{ .id = 4, .name = "last_index", .ty = schema.U64 },
     .{ .id = 5, .name = "conflict_term", .ty = schema.U64 },
     .{ .id = 6, .name = "conflict_index", .ty = schema.U64 },
+    // The oldest timestamp the sender still reads at, or may yet begin
+    // a read at (`StateMachine.minReadTs`): the leader keeps the next
+    // snapshot's timestamp, the read floor, at or below what every
+    // voter reports. 0: nothing to report.
+    .{ .id = 7, .name = "min_read_ts", .ty = schema.U64 },
 });
 
 pub const TransportHandshake = schema.Table(&.{

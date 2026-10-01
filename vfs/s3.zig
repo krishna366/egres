@@ -12,8 +12,7 @@
 //! (chunked → error), single PUT ≤ 5 GiB (no multipart).
 //!
 //! Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY at
-//! init. Local testing: SeaweedFS — `weed server -s3` (see
-//! scripts/cluster_e2e.sh).
+//! init. Local testing: SeaweedFS — `weed server -s3`.
 
 const std = @import("std");
 const fiber = @import("zfiber");

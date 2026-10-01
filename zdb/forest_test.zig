@@ -1400,7 +1400,7 @@ test "forest: a tombstone reads as absent" {
     try std.testing.expectEqualStrings("v", before.newest().value);
 }
 
-test "forest: globalMinRead rejects older reads and only moves forward" {
+test "forest: snapshotTs rejects older reads and only moves forward" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1417,13 +1417,13 @@ test "forest: globalMinRead rejects older reads and only moves forward" {
     try f.newMemtable(1);
 
     // Default 0 means nothing is rejected and nothing is droppable.
-    try std.testing.expectEqual(@as(u64, 0), f.globalMinRead());
+    try std.testing.expectEqual(@as(u64, 0), f.snapshotTs());
     try std.testing.expect((try f.get(alloc, .{
         .key = .{ .namespace = 1, .table_id = 0, .primary = "k" },
         .read_ts = 1,
     })) == null);
 
-    try std.testing.expectEqual(@as(u64, 100), f.setGlobalMinRead(100));
+    try std.testing.expectEqual(@as(u64, 100), f.setSnapshotTs(100));
 
     // Below the horizon: the versions may already be compacted away, so the
     // read is refused rather than answered wrongly.
@@ -1440,9 +1440,9 @@ test "forest: globalMinRead rejects older reads and only moves forward" {
 
     // Monotonic: a stale caller can't walk it back and un-discard data that
     // a compaction already dropped.
-    try std.testing.expectEqual(@as(u64, 100), f.setGlobalMinRead(50));
-    try std.testing.expectEqual(@as(u64, 100), f.globalMinRead());
-    try std.testing.expectEqual(@as(u64, 150), f.setGlobalMinRead(150));
+    try std.testing.expectEqual(@as(u64, 100), f.setSnapshotTs(50));
+    try std.testing.expectEqual(@as(u64, 100), f.snapshotTs());
+    try std.testing.expectEqual(@as(u64, 150), f.setSnapshotTs(150));
 }
 
 test "forest: a bottom-level compaction discards under the read floor" {
@@ -1488,9 +1488,9 @@ test "forest: a bottom-level compaction discards under the read floor" {
     // Floor 15, as a snapshot at that timestamp would set: v10 is the
     // version a read at 15 sees, so it is kept; nothing is shadowed by
     // a version at or below the floor.
-    _ = f.setGlobalMinRead(15);
+    _ = f.setSnapshotTs(15);
     {
-        var comp = try tree.buildCompaction(f.globalMinRead());
+        var comp = try tree.buildCompaction(f.snapshotTs());
         defer comp.deinit(alloc);
         index += 1;
         try tree.applyCompaction(index, comp.items);
@@ -1502,7 +1502,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
     // Floor 25: v20 is at or below it and shadows v10, so the next
     // bottom-level compaction discards v10. A read at 15 is refused
     // rather than answered from a table missing its version.
-    _ = f.setGlobalMinRead(25);
+    _ = f.setSnapshotTs(25);
     {
         try putRow(f, "k", 40, "v40");
         index += 1;
@@ -1511,7 +1511,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
         defer flush.changes.deinit(alloc);
         index += 1;
         try f.applyFlush(index, flush.changes.items, flush.newest_memtable_id);
-        var comp = try tree.buildCompaction(f.globalMinRead());
+        var comp = try tree.buildCompaction(f.snapshotTs());
         defer comp.deinit(alloc);
         index += 1;
         try tree.applyCompaction(index, comp.items);
@@ -1972,7 +1972,7 @@ test "scan: read_ts at the delete sees the key as gone" {
     try std.testing.expectEqualStrings("c1", col.got.items[1].newest().value);
 }
 
-test "scan: rejects a read_ts below globalMinRead" {
+test "scan: rejects a read_ts below snapshotTs" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1987,7 +1987,7 @@ test "scan: rejects a read_ts below globalMinRead" {
     defer f.close();
     try seedVersionedForest(f);
 
-    _ = f.setGlobalMinRead(100);
+    _ = f.setSnapshotTs(100);
 
     var col = ScanCollector{ .alloc = alloc };
     defer col.deinit();
@@ -2141,7 +2141,7 @@ test "cursor: max_rows 0 opens exhausted without the min-read check" {
     const f = try Forest.open(alloc, f_live);
     defer f.close();
     try seedVersionedForest(f);
-    _ = f.setGlobalMinRead(100);
+    _ = f.setSnapshotTs(100);
 
     // Below the horizon is refused at open — unless nothing will be read.
     try std.testing.expectError(error.ReadBelowMinRead, f.openCursor(
@@ -2804,7 +2804,7 @@ test "forest: getBitmap rejects non-roaring chains and old reads" {
         f.getBitmap(alloc, .{ .key = roar.key("c") }),
     );
 
-    _ = f.setGlobalMinRead(100);
+    _ = f.setSnapshotTs(100);
     try std.testing.expectError(
         error.ReadBelowMinRead,
         f.getBitmap(alloc, .{ .key = roar.key("r"), .read_ts = 99 }),
@@ -3076,6 +3076,12 @@ test "table cache: a table loaded for an install survives an evict before it is 
     try std.testing.expect(needs[0].table == null);
 }
 
+// The forest's snapshot timestamp, at `secs` on the realtime clock.
+fn snapshotAt(f: *Forest, secs: i64) void {
+    const ts = utils.hlc.HLC{ .seconds = @intCast(secs), .logical = 0 };
+    _ = f.setSnapshotTs(ts.asU64());
+}
+
 test "forest: removeOrphans unlinks only unknown files at or before the cutoff" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3136,18 +3142,20 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
         try backdate(path, now - 2 * std.time.s_per_hour);
     }
 
-    // No snapshot yet (cutoff 0), or a cutoff older than every file:
-    // nothing is an orphan.
-    for ([_]i64{ 0, now - 3 * std.time.s_per_hour }) |cutoff_s| {
-        try f.removeOrphans(cutoff_s);
+    // No snapshot yet, or a snapshot older than every file: nothing is
+    // an orphan.
+    for ([_]bool{ false, true }) |with_snapshot| {
+        if (with_snapshot) snapshotAt(f, now - 3 * std.time.s_per_hour);
+        try f.removeOrphans(0);
         for (old_junk) |id|
             try std.testing.expect(try sstExists(alloc, dir_path, id));
         try std.testing.expect(try sstExists(alloc, dir_path, prewarmed));
         try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
     }
 
-    // A cutoff between the old files and the young one.
-    try f.removeOrphans(now - std.time.s_per_hour);
+    // A snapshot between the old files and the young one.
+    snapshotAt(f, now - std.time.s_per_hour);
+    try f.removeOrphans(0);
 
     // Only the old unknown SSTs go, the pre-opened one with its cache entry.
     for (old_junk) |id|
@@ -3164,13 +3172,19 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
         defer alloc.free(path);
         try backdate(path, now - 2 * std.time.s_per_hour);
     }
-    try f.removeOrphans(now - std.time.s_per_hour);
+    try f.removeOrphans(0);
     try std.testing.expect(try sstExists(alloc, dir_path, listed));
     try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
 
-    // Once the cutoff passes the young file it goes too, and still
-    // nothing the manifest lists.
-    try f.removeOrphans(now);
+    // A snapshot past the young file does not remove it while it is
+    // younger than the minimum age.
+    snapshotAt(f, now);
+    try f.removeOrphans(std.time.s_per_hour);
+    try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
+
+    // Without that age it goes too, and still nothing the manifest
+    // lists.
+    try f.removeOrphans(0);
     try std.testing.expect(!try sstExists(alloc, dir_path, young_junk));
     try std.testing.expect(try sstExists(alloc, dir_path, listed));
     try vfs.access(other);

@@ -89,6 +89,11 @@ pub const Peer = struct {
     last_index: u64,
     role: PeerRole,
     addr: String = "",
+    /// What this peer last reported in an AppendEntries reply as the
+    /// oldest timestamp it still reads at (`StateMachine.minReadTs`),
+    /// and the tick the reply arrived on. 0: nothing reported yet.
+    min_read_ts: u64 = 0,
+    min_read_tick: u64 = 0,
 };
 
 pub const msg_type_raft = _serial.msg_type_raft;
@@ -191,6 +196,13 @@ pub const Node = struct {
         /// with the applies around it. The state machine reads what it
         /// needs off the snapshot (its `timestamp` is the read floor).
         snapshotInstallFn: ?*const fn (*anyopaque, *const zen.SnapshotStruct) void = null,
+        /// The oldest timestamp this node still reads at, or may yet
+        /// begin a read at. Raft carries it to the leader in every
+        /// AppendEntries reply, and the leader gives the minimum over
+        /// the voters (`Node.peersMinReadTs`) to the state machine to
+        /// pick a snapshot's read floor with. 0, or null here: nothing to
+        /// report. Called on the raft fiber: must not block.
+        minReadTsFn: ?*const fn (*anyopaque) u64 = null,
 
         pub fn apply(self: *StateMachine, entry: Entry, data: String) anyerror!void {
             try self.applyFn(self.ctx, entry, data);
@@ -204,6 +216,10 @@ pub const Node = struct {
         }
         pub fn snapshotInstall(self: *StateMachine, snap: *const zen.SnapshotStruct) void {
             if (self.snapshotInstallFn) |f| f(self.ctx, snap);
+        }
+        pub fn minReadTs(self: *StateMachine) u64 {
+            if (self.minReadTsFn) |f| return f(self.ctx);
+            return 0;
         }
     };
 
@@ -937,6 +953,31 @@ pub const Node = struct {
         return self.shutdown.isStopping();
     }
 
+    /// The oldest timestamp a voter other than this node still reads
+    /// at, from what each last reported in an AppendEntries reply
+    /// (`Peer.min_read_ts`); maxInt when none constrains: this node is
+    /// not the leader, has no voting peer, or has heard from none
+    /// lately. For the state machine, which asks once per snapshot it
+    /// proposes, so it is worked out here and not kept.
+    ///
+    /// A voter not heard from for an election timeout is left out: it
+    /// is down or cut off, and holding the floor for it would stop
+    /// garbage collection for the group. A read it still has open is
+    /// refused, not misread, once it catches up to a floor above it.
+    pub fn peersMinReadTs(self: *const Node) u64 {
+        var oldest: u64 = std.math.maxInt(u64);
+        if (self.state != .leader) return oldest;
+
+        const stale = self.config.election_timeout_max_ticks;
+        var it = self.peers.valueIterator();
+        while (it.next()) |peer| {
+            if (peer.role != .voter or peer.min_read_ts == 0) continue;
+            if (self.tick_count - peer.min_read_tick > stale) continue;
+            oldest = @min(oldest, peer.min_read_ts);
+        }
+        return oldest;
+    }
+
     /// Returns true if a heartbeat is due (leader only).
     pub fn tick(self: *Node) RaftError!bool {
         self.tick_count += 1;
@@ -1428,6 +1469,11 @@ pub const Node = struct {
         }
 
         const from = aer.from();
+        // The peer's oldest read rides on every reply, accepted or not.
+        if (self.peers.getPtr(from)) |state| {
+            state.min_read_ts = aer.minReadTs();
+            state.min_read_tick = self.tick_count;
+        }
         if (!aer.success()) {
             if (self.peers.getPtr(from)) |state| {
                 const conflict_index = aer.conflictIndex();
@@ -2189,6 +2235,7 @@ pub const Node = struct {
             .last_index = opts.last_index,
             .conflict_term = opts.conflict_term,
             .conflict_index = opts.conflict_index,
+            .min_read_ts = if (self.state_machine) |sm| sm.minReadTs() else 0,
         });
         const buf = try writer.finishWithTail();
         const bytes = buf.bytes orelse return zen.Error.Invalid;

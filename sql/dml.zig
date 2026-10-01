@@ -1087,6 +1087,7 @@ fn replyRunErr(
         // A yield point stopped the scan: the serve loop ends the
         // session with the FATAL, so no reply here.
         error.Shutdown => err,
+        error.ReadBelowMinRead => _server.replySnapshotTooOld(state),
         else => {
             log.err(
                 verb ++ " '{s}': scan: {s}",

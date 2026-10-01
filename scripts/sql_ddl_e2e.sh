@@ -6,8 +6,8 @@
 # pgwire endpoint. Builds, starts a fresh single-node egres, drives psql
 # through the DDL matrix (including a restart-persistence leg), and greps
 # the server log. Wipes $DATA (default /data/egres) — throw-away by
-# convention; override like cluster_e2e.sh's ROOT (must be a real fs —
-# SSTs are O_DIRECT).
+# convention; override it with DATA=<dir> (must be a real fs — SSTs are
+# O_DIRECT).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -101,11 +101,12 @@ expect "PK index name collision fails CREATE" "already exists" \
 # --- restart from a raft snapshot: names must ride in the snapshot ----------
 # Once a snapshot is taken the WAL below it is gone, so the database and
 # table names have to be in the snapshot itself (engine.replayNames).
-# A tiny memtable makes the rows below flush, which lets the snapshot
-# reach past the CREATE TABLE; the snapshot flags make the leader take
-# one within a second or two.
+# A tiny memtable, flushed as soon as it is frozen, makes the rows
+# below flush, which lets the snapshot reach past the CREATE TABLE; the
+# snapshot flags make the leader take one within a second or two.
 stop_server
-./zig-out/bin/egres --raft="id=1" --zdb="dir=$DATA;memtable-bytes=4096" \
+./zig-out/bin/egres --raft="id=1" \
+    --zdb="dir=$DATA;table-bytes=4096;flush-min-memtables=1" \
     --snapshot="min-bytes=1;min-age-seconds=1;poll-interval-seconds=1" \
     >"$LOG" 2>&1 &
 SERVER_PID=$!
@@ -132,6 +133,51 @@ for _ in $(seq 1 150); do
 done
 if [ "$covered" = 1 ]; then ok "snapshot covers the DDL"; else
     bad "no snapshot past the CREATE TABLE (create=$created snap=$snap)"; fi
+# The snapshot's timestamp is the read floor: 0 would mean compaction
+# discards no old version and no orphan file is ever removed. It is
+# the timestamp of the entry at the snapshot index, a data entry here.
+floor=0
+for _ in $(seq 1 50); do
+    floor=$(grep -oE "read floor: snapshot index=[0-9]+ timestamp=[0-9]+" \
+        "$LOG" | tail -1 | grep -oE "[0-9]+$" || true)
+    if [ -n "$floor" ] && [ "$floor" != 0 ]; then break; fi
+    sleep 0.2
+done
+if [ -n "$floor" ] && [ "$floor" != 0 ]; then
+    ok "snapshot raises the read floor"
+else bad "read floor stayed at 0 after a snapshot (floor=$floor)"; fi
+
+# --- an open transaction holds the read floor ------------------------------
+# One session reads, waits and reads again inside a transaction, while
+# another writes in three rounds. With these flags each round freezes
+# and flushes a memtable, which lets a snapshot land between rounds,
+# past the point the open transaction reads at. Each snapshot carries
+# the read floor, and the leader must keep that below the open
+# transaction: its second read is answered, and sees what its first
+# did. A floor that was the snapshot entry's own time refuses it with
+# "snapshot too old" (checked by making ReadMarks.minReadTs ignore
+# the open reads: this then fails).
+HELD=/tmp/zdb/held.out
+psql "$E" -X -qc "CREATE TABLE held_t (a int PRIMARY KEY, s text);" >/dev/null
+psql "$E" -X -q -t >"$HELD" 2>&1 <<'SQL' &
+BEGIN;
+SELECT count(*) FROM snap_t;
+\! sleep 7
+SELECT count(*) FROM snap_t;
+COMMIT;
+SQL
+held_pid=$!
+sleep 1
+for round in 0 1 2; do
+    rows=$(for i in $(seq 1 40); do
+        printf "(%d,'%s')," "$((round * 40 + i))" "$pad"; done)
+    psql "$E" -X -qc "INSERT INTO held_t VALUES ${rows%,};" >/dev/null
+    sleep 1.5
+done
+wait "$held_pid" || true
+if [ "$(grep -cE '^ *40$' "$HELD")" = 2 ] && ! grep -q ERROR "$HELD"; then
+    ok "an open transaction holds the read floor"
+else bad "held transaction: $(tr '\n' ' ' <"$HELD")"; fi
 stop_server
 start_server
 expect "rows resolve after a snapshot restart" "(40 rows)" \

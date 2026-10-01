@@ -55,7 +55,7 @@ pub const VersionTracker = struct {
 
     allocator: std.mem.Allocator,
     can_discard_versions: bool,
-    global_min_read_ts: u64,
+    snapshot_ts_ts: u64,
 
     // Retention state, reset by `startItem`: one item is one primary.
     stale_below: u64 = 0,
@@ -68,12 +68,12 @@ pub const VersionTracker = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        global_min_read_ts: u64,
+        snapshot_ts_ts: u64,
         can_discard_versions: bool,
     ) VersionTracker {
         return .{
             .allocator = allocator,
-            .global_min_read_ts = global_min_read_ts,
+            .snapshot_ts_ts = snapshot_ts_ts,
             .can_discard_versions = can_discard_versions,
         };
     }
@@ -110,7 +110,7 @@ pub const VersionTracker = struct {
             // unreachable at every level and goes now. The tombstone
             // itself waits for the bottom: dropped higher up, an older
             // version below would come back.
-            if (ver.ts <= self.global_min_read_ts) {
+            if (ver.ts <= self.snapshot_ts_ts) {
                 self.discard_below = ver.ts;
                 if (ver.meta.isDeleted() and self.can_discard_versions)
                     return .discard;
@@ -366,7 +366,7 @@ pub const Emitter = struct {
         tree: *Tree,
         dest: usize,
         prio: vfs.Priority,
-        global_min_read: u64,
+        snapshot_ts: u64,
     ) Emitter {
         const opts = tree.live.cur();
         const cfg = _table.builder.Config{
@@ -391,7 +391,7 @@ pub const Emitter = struct {
             // tombstone would otherwise resurrect.
             .tracker = VersionTracker.init(
                 tree.allocator,
-                global_min_read,
+                snapshot_ts,
                 dest == @as(usize, opts.max_levels) - 1,
             ),
         };

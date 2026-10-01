@@ -780,6 +780,10 @@ pub const Handler = struct {
                 else => unreachable,
             };
             result catch |err| {
+                if (err == error.ReadBelowMinRead) {
+                    self.endImplicit();
+                    return replySnapshotTooOld(state);
+                }
                 if (err != error.Restart) {
                     self.endImplicit();
                     return err;
@@ -1040,4 +1044,18 @@ pub fn replyError(state: *pgwire.ConnState, msg: String) !void {
 
 pub fn replyErrorCode(state: *pgwire.ConnState, code: [5]u8, msg: String) !void {
     try state.sendError(.{ .code = code, .message = msg });
+}
+
+/// A read was refused as below the read floor
+/// (`error.ReadBelowMinRead`): the txn was open longer than the forest
+/// holds the floor for, or on a node whose floor is another node's to
+/// set. The versions it would read may be gone, so it cannot go on; a
+/// new txn reads at a current timestamp.
+pub fn replySnapshotTooOld(state: *pgwire.ConnState) !void {
+    return replyErrorCode(
+        state,
+        pgwire.sqlstate.snapshot_too_old,
+        "snapshot too old: the transaction's snapshot is below the " ++
+            "read floor, retry it",
+    );
 }

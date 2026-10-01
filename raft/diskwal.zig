@@ -1040,6 +1040,22 @@ pub const DiskWAL = struct {
         };
     }
 
+    /// The slot of the entry at `idx`, whatever its type: its term,
+    /// timestamp, type and size, with no payload read. Null when the
+    /// log no longer (or does not yet) hold that index.
+    pub fn slotAt(self: *DiskWAL, idx: u64) RaftLogError!?entry {
+        self.mu.lockShared(@src());
+        defer self.mu.unlockShared();
+
+        if (idx == 0) return null;
+        return self.wal_store.seekEntry(idx) catch |err| switch (err) {
+            RaftLogError.Compacted => null,
+            RaftLogError.Unavailable => null,
+            err_not_found.NotFound => null,
+            else => return mapToRaftLogError(err),
+        };
+    }
+
     /// The lock covers the slot walk only; the disk reads run without
     /// it, so an append never waits on a reader (a snapshot's read of
     /// the manifest entries once held it for seconds).

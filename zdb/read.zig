@@ -35,7 +35,7 @@ const Pin = merge_iterator.Pin;
 /// Many keys of one table at one read_ts, resolved together (see
 /// `MultiGet`). The result owns its pins: read it through `item` /
 /// `bitmap`, then `deinit`. `keys` need not be sorted; they are
-/// borrowed until then. Rejects a read_ts below `global_min_read`,
+/// borrowed until then. Rejects a read_ts below `snapshot_ts`,
 /// whose versions may already have been compacted away.
 pub fn multiGet(
     self: *Forest,
@@ -44,7 +44,7 @@ pub fn multiGet(
     keys: []const String,
     opts: MultiGet.Options,
 ) !MultiGet {
-    if (opts.read_ts < self.globalMinRead()) {
+    if (opts.read_ts < self.snapshotTs()) {
         return error.ReadBelowMinRead;
     }
     var mg = try MultiGet.init(allocator, table_key, keys, opts);
@@ -130,9 +130,9 @@ pub const Lookup = struct {
 ///
 /// A key deleted at or below `read_ts` reads as absent: the tombstone
 /// wins the lookup and is reported as null. Rejects reads below
-/// `global_min_read`, whose versions may already have been compacted away.
+/// `snapshot_ts`, whose versions may already have been compacted away.
 pub fn get(self: *Forest, allocator: std.mem.Allocator, lookup: Lookup) !?Item {
-    if (lookup.read_ts < self.globalMinRead()) {
+    if (lookup.read_ts < self.snapshotTs()) {
         return error.ReadBelowMinRead;
     }
     return getOne(self, allocator, lookup, false);
@@ -192,7 +192,7 @@ pub fn getBitmap(
     allocator: std.mem.Allocator,
     lookup: Lookup,
 ) !zroar.Bitmap {
-    if (lookup.read_ts < self.globalMinRead()) {
+    if (lookup.read_ts < self.snapshotTs()) {
         return error.ReadBelowMinRead;
     }
     const keys = [_]String{lookup.key.primary};
@@ -243,7 +243,7 @@ pub const MultiGet = struct {
 
     pub const Options = struct {
         /// Versions above this are not visible. Must be at or above
-        /// `Forest.globalMinRead` for the entry points that check it.
+        /// `Forest.snapshotTs` for the entry points that check it.
         read_ts: u64 = std.math.maxInt(u64),
         priority: vfs.Priority = .p0,
         /// Rows only: a txn's private writes, the first source (src 0
@@ -684,7 +684,7 @@ pub const ScanOptions = struct {
     /// tombstone ABOVE read_ts hasn't happened yet from here, so it does
     /// not hide the key, and the live version under it is what surfaces.
     ///
-    /// Must be at or above `global_min_read`, like any other read.
+    /// Must be at or above `snapshot_ts`, like any other read.
     read_ts: u64 = std.math.maxInt(u64),
     /// Only what changed after this timestamp: versions at or below it
     /// are skipped, so a key is emitted only when its newest visible
@@ -754,7 +754,7 @@ pub fn scan(
 
 /// Open a `Cursor` over `scan_range` — the walk `scan` does, handed out
 /// one item per `next` so the caller sets the pace. Same arguments and
-/// guards as `scan`: a `read_ts` below `globalMinRead` is refused here,
+/// guards as `scan`: a `read_ts` below `snapshotTs` is refused here,
 /// except when `max_rows` is 0, which opens an already-exhausted cursor
 /// without looking. Nothing is read or pinned until the first `next`.
 pub fn openCursor(
@@ -764,7 +764,7 @@ pub fn openCursor(
     range: KeyRange,
     opts: ScanOptions,
 ) !Cursor {
-    if (opts.max_rows != 0 and opts.read_ts < self.globalMinRead()) {
+    if (opts.max_rows != 0 and opts.read_ts < self.snapshotTs()) {
         return error.ReadBelowMinRead;
     }
     return .{

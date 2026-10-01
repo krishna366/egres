@@ -115,6 +115,12 @@ pub const Txn = struct {
     /// can see, and visible to its own scans. The commit timestamp is
     /// raft's, not ours — apply rewrites every wire key's ts to the
     /// commit entry's HLC.
+    ///
+    /// The forest counts this txn among its open reads at `read_ts`
+    /// (`Forest.read_marks`), which holds the read floor at or below it
+    /// for as long as the txn lives: no build discards a version it can
+    /// see. The count is found again from the value, so nothing assigns
+    /// it but `init` and `bumpTo`, which move the count with it.
     read_ts: u64,
     /// Wall-clock µs since the Unix epoch when the txn began: the value
     /// of CURRENT_TIMESTAMP for every statement in it (transaction
@@ -144,6 +150,7 @@ pub const Txn = struct {
         db: *Database,
         forest: *zdb.forest.Forest,
     ) Txn {
+        forest.read_marks.begin(read_ts);
         return .{
             .allocator = allocator,
             .id = id,
@@ -156,6 +163,7 @@ pub const Txn = struct {
     }
 
     pub fn deinit(self: *Txn) void {
+        self.forest.read_marks.end(self.read_ts);
         self.releaseLocks();
         self.held_rows.deinit(self.allocator);
         self.held_tables.deinit(self.allocator);
@@ -281,6 +289,10 @@ pub const Txn = struct {
         if (ts <= self.read_ts) return;
         if (self.prev.aboveReadTs(&self.db.oracle, self.read_ts))
             return error.Conflict;
+        // Counted at the new timestamp before the old count is given
+        // up, so the floor never sees this txn as gone.
+        self.forest.read_marks.begin(ts);
+        self.forest.read_marks.end(self.read_ts);
         self.read_ts = ts;
         return error.Restart;
     }

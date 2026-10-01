@@ -37,8 +37,8 @@ const push_lmax: i64 = 1;
 /// Build the compaction the tree wants (`compact_candidate`) and apply
 /// it, listed under log index `index`: what the engine does across a
 /// proposal.
-fn compact(tree: *Tree, index: u64, min_read: u64) !void {
-    var changes = try tree.buildCompaction(min_read);
+fn compact(tree: *Tree, index: u64, snapshot_ts: u64) !void {
+    var changes = try tree.buildCompaction(snapshot_ts);
     defer changes.deinit(tree.allocator);
     try tree.applyCompaction(index, changes.items);
 }

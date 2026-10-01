@@ -237,7 +237,7 @@ not a format migration:
   hides the key from later readers, and compaction folds version
   chains (`VersionTracker`, zdb/tree.zig). What is deferred is
   discarding versions nobody can read any more: the read horizon
-  (`Forest.setGlobalMinRead`, the oldest read_ts any open
+  (`Forest.setSnapshotTs`, the oldest read_ts any open
   transaction may still use) has no production caller, so no
   version is ever dropped, and the catalog rows of dropped tables
   stay behind as unreachable garbage. Advancing it needs the

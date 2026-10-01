@@ -531,12 +531,12 @@ fn l0MergeDownOldest(
 /// where they stood in L0's order. A flush that lands while this builds
 /// is newer than every input and keeps sorting after the output.
 ///
-/// `global_min_read` is the oldest timestamp a reader may still ask for
-/// (`Forest.global_min_read`); anything strictly below it is unobservable
+/// `snapshot_ts` is the oldest timestamp a reader may still ask for
+/// (`Forest.snapshot_ts`); anything strictly below it is unobservable
 /// and eligible to be discarded. Pass 0 to discard nothing.
 pub fn buildCompaction(
     self: *Tree,
-    global_min_read: u64,
+    snapshot_ts: u64,
 ) !std.ArrayList(_manifest.SSTableChange) {
     // Pinned under the hold: a remote-built applyCompaction landing
     // mid-build (leadership flip) must not free tables we're about to
@@ -576,7 +576,7 @@ pub fn buildCompaction(
     const src: usize = cand.level;
     switch (cand.job) {
         .move_down => return moveDown(self, src, src + 1, srcs[0]),
-        .merge_down => return mergeDown(self, src, srcs, global_min_read),
+        .merge_down => return mergeDown(self, src, srcs, snapshot_ts),
         .merge_l0 => return self.mergeAndWrite(.{
             .src_level = 0,
             .dest_level = 0,
@@ -584,7 +584,7 @@ pub fn buildCompaction(
             .bot = &.{},
             .prio = .p1,
             .out_raft_index = srcs[srcs.len - 1].raft_index,
-        }, global_min_read),
+        }, snapshot_ts),
         .split => unreachable,
     }
 }
@@ -607,7 +607,7 @@ fn mergeDown(
     self: *Tree,
     src: usize,
     srcs: []const TableEntry,
-    global_min_read: u64,
+    snapshot_ts: u64,
 ) !std.ArrayList(_manifest.SSTableChange) {
     const dest = src + 1;
     const prio: vfs.Priority = if (src == 0) .p1 else .p2;
@@ -635,7 +635,7 @@ fn mergeDown(
         .src = srcs,
         .bot = bot,
         .prio = prio,
-    }, global_min_read);
+    }, snapshot_ts);
 }
 
 /// A trivial move: list `e` in `dest` and unlist it from `src`, in one
@@ -764,7 +764,7 @@ fn partitions(
 pub fn mergeAndWrite(
     self: *Tree,
     job: MergeJob,
-    global_min_read: u64,
+    snapshot_ts: u64,
 ) !std.ArrayList(_manifest.SSTableChange) {
     const src = job.src_level;
     const dest = job.dest_level;
@@ -788,7 +788,7 @@ pub fn mergeAndWrite(
     errdefer for (parts[spawned..]) |*part| part.bot.deinit();
 
     for (parts) |part| {
-        try group.spawn(.{}, runPartition, .{ self, job, part, global_min_read });
+        try group.spawn(.{}, runPartition, .{ self, job, part, snapshot_ts });
         spawned += 1;
     }
     const results = group.wait();
@@ -822,7 +822,7 @@ pub fn mergeAndWrite(
         stats.merge(r.stats);
     }
     if (failed) return error.FlushFailed;
-    try reportJob(self, job, parts.len, &stats, global_min_read);
+    try reportJob(self, job, parts.len, &stats, snapshot_ts);
 
     for (job.src) |e| try changes.append(
         self.allocator,
@@ -856,7 +856,7 @@ fn reportJob(
     job: MergeJob,
     num_fibers: usize,
     stats: *Metrics,
-    global_min_read: u64,
+    snapshot_ts: u64,
 ) !void {
     const src = job.src_level;
     const dest = job.dest_level;
@@ -879,7 +879,7 @@ fn reportJob(
             "bot_bytes_disk={d} expected_in={d} expected_bytes_disk={d} " ++
             "keys_in={d} keys_out={d} bytes_in={d} bytes_out={d} " ++
             "lost_in_iter={d} discarded={d} discarded_bytes={d} " ++
-            "stale_bytes={d} rollups={d} min_read={d}",
+            "stale_bytes={d} rollups={d} snapshot_ts={d}",
         .{
             self.tree_id,         src,               dest,
             num_fibers,           job.src.len,       stats.src_keys,
@@ -888,7 +888,7 @@ fn reportJob(
             stats.keys_in,        stats.keys_out,    stats.bytes_in,
             stats.bytes_out,      lost_in_iter,      discarded,
             stats.dropped_bytes,  stats.stale_bytes, stats.rollups,
-            global_min_read,
+            snapshot_ts,
         },
     );
     if (stats.rollups > 0) {
@@ -910,9 +910,9 @@ fn runPartition(
     self: *Tree,
     job: MergeJob,
     part: Partition,
-    global_min_read: u64,
+    snapshot_ts: u64,
 ) ?Emitter.Result {
-    return runPartition_(self, job, part, global_min_read) catch |err| {
+    return runPartition_(self, job, part, snapshot_ts) catch |err| {
         log.err("compact tree={d} L{d}->L{d} partition failed: {s}", .{
             self.tree_id, job.src_level, job.dest_level, @errorName(err),
         });
@@ -924,7 +924,7 @@ fn runPartition_(
     self: *Tree,
     job: MergeJob,
     part: Partition,
-    global_min_read: u64,
+    snapshot_ts: u64,
 ) !Emitter.Result {
     const dest = job.dest_level;
     const prio = job.prio;
@@ -964,7 +964,7 @@ fn runPartition_(
     try merge.seekRange(part.range.left, part.range.right);
 
     // --- merge loop ---
-    var emitter = Emitter.init(self, dest, prio, global_min_read);
+    var emitter = Emitter.init(self, dest, prio, snapshot_ts);
     defer emitter.deinit();
     while (merge.itemRef()) |item| {
         try emitter.push(item);

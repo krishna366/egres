@@ -1052,6 +1052,44 @@ fn makeLogEntryWithTimestamp(
     return writer.finishWithTail();
 }
 
+// A snapshot takes its term and timestamp from the slot of the entry
+// at its index, which is nearly always a data entry: the lookup must
+// answer for any type and say so when the index is not in the log.
+test "diskwal slotAt: term and timestamp of any entry" {
+    const alloc = std.testing.allocator;
+    const wal_dir = try makeTempWalDir(alloc);
+    defer {
+        vfs.deleteTree(wal_dir) catch {};
+        alloc.free(wal_dir);
+    }
+
+    var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+    defer ds.deinit();
+
+    for (1..6) |i| {
+        var entry = try makeLogEntryWithTimestamp(
+            alloc,
+            @intCast(i),
+            7,
+            1000 + i,
+            "payload",
+        );
+        defer entry.deinit();
+        try ds.addEntries(&[_]zen.LogEntryBuffer{entry});
+    }
+
+    for ([_]u64{ 1, 4, 5 }) |idx| {
+        const slot = (try ds.slotAt(idx)).?;
+        try std.testing.expectEqual(idx, slot.index);
+        try std.testing.expectEqual(@as(u64, 7), slot.term);
+        try std.testing.expectEqual(1000 + idx, slot.timestamp);
+        try std.testing.expectEqual(zen.EntryTypeEnum.data, slot.entry_type);
+    }
+    // Not in the log: index 0 is no entry, 6 is past the head.
+    try std.testing.expect((try ds.slotAt(0)) == null);
+    try std.testing.expect((try ds.slotAt(6)) == null);
+}
+
 test "diskwal findIndexOlderThan bytes-only branch" {
     const alloc = std.testing.allocator;
     const wal_dir = try makeTempWalDir(alloc);

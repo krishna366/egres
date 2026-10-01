@@ -346,13 +346,13 @@ test "multiget: read_ts hides the versions above it" {
     try expectRow(&fx, &now, latest, "c", .{ .value = "c30", .ts = 30 });
 }
 
-test "multiget: rejects a read_ts below globalMinRead" {
+test "multiget: rejects a read_ts below snapshotTs" {
     const alloc = std.testing.allocator;
     var fx: Fixture = undefined;
     try fx.setup(alloc);
     defer fx.teardown();
 
-    _ = fx.f.setGlobalMinRead(50);
+    _ = fx.f.setSnapshotTs(50);
     try std.testing.expectError(
         error.ReadBelowMinRead,
         fx.f.multiGet(alloc, table_key, &.{"a"}, .{ .read_ts = 10 }),

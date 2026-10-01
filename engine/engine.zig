@@ -8,7 +8,6 @@ const fiber = @import("zfiber");
 const m = @import("metrics");
 const flags = @import("flags");
 const utils = @import("raft").utils;
-const _hlc = utils.hlc;
 const String = utils.String;
 
 /// `--snapshot` — Raft snapshot triggers, polling cadence, and the SST
@@ -21,6 +20,7 @@ pub const SnapshotCfg = struct {
     poll_interval_seconds: u64 = 60,
     orphan_min_age_seconds: u64 = 30 * 60,
     orphan_scan_interval_seconds: u64 = 30 * 60,
+    max_txn_age_seconds: u64 = 60 * 60,
 
     pub const docs = .{
         .self = "Raft snapshot triggers. Leader proposes a snapshot when WAL" ++
@@ -38,12 +38,17 @@ pub const SnapshotCfg = struct {
             " output write to proposal.",
         .orphan_scan_interval_seconds = "How often the data directory is" ++
             " scanned for orphan SST files.",
+        .max_txn_age_seconds = "How long an open transaction on any" ++
+            " voting node holds back the read floor, and with it the" ++
+            " versions it can see. One open for longer is refused as" ++
+            " snapshot too old on its next statement. At most 12 hours.",
     };
 };
 
 const zdb_bufs = zdb.buffers;
 const _manifest = zdb.manifest;
 const Forest = zdb.forest.Forest;
+const ReadMarks = zdb.forest.ReadMarks;
 const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
 const Meta = zdb.kv.Meta;
@@ -77,6 +82,9 @@ pub const StorageImpl = struct {
     /// files the manifest references but the local disk lacks. `.none` on
     /// single node, where the local disk always has them.
     store: *zdb.vfs.FileStore,
+    /// For `max_txn_age_seconds`, read when this node reports its
+    /// oldest read to the leader (`minReadTs`).
+    snapshot_cfg: *flags.Live(SnapshotCfg),
     /// Optional commit-stream hook (see ApplyObserver). Set once at startup
     /// via Engine.setApplyObserver, before the apply loop runs; the loop stops
     /// (eng.wait) before the observer's owner is torn down, so no unregister.
@@ -113,16 +121,26 @@ pub const StorageImpl = struct {
             .ensureFilesFn = &ensureFiles,
             .isReadyFn = &isReady,
             .snapshotInstallFn = &snapshotInstall,
+            .minReadTsFn = &minReadTs,
         };
     }
 
-    /// A snapshot entry applied: its timestamp becomes the read floor,
-    /// on every node at this same point in the log (see
-    /// `Forest.global_min_read`). The leader's compactions from here on
-    /// discard below it; no read may ask below it.
+    /// Reported to the leader in each append reply: the oldest read
+    /// open here, or the applied timestamp when none is.
+    fn minReadTs(ctx: *anyopaque) u64 {
+        const self: *StorageImpl = @ptrCast(@alignCast(ctx));
+        return self.forest.minReadTs(
+            self.node.appliedTs(),
+            self.snapshot_cfg.cur().max_txn_age_seconds,
+            ReadMarks.no_peers,
+        );
+    }
+
+    /// A snapshot entry applied: its timestamp becomes
+    /// `Forest.snapshot_ts`, on every node at this point in the log.
     fn snapshotInstall(ctx: *anyopaque, snap: *const raft.buffers.SnapshotStruct) void {
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-        const floor = self.forest.setGlobalMinRead(snap.timestamp);
+        const floor = self.forest.setSnapshotTs(snap.timestamp);
         log.info("read floor: snapshot index={d} timestamp={d} floor={d}", .{ snap.index, snap.timestamp, floor });
     }
 
@@ -500,6 +518,7 @@ pub const Engine = struct {
                 .allocator = allocator,
                 .node = node,
                 .store = store,
+                .snapshot_cfg = snapshot_cfg,
                 .file_locks = fiber.SafeHashMap(u64, *fiber.Mutex(.untracked))
                     .init(allocator),
             },
@@ -785,9 +804,7 @@ pub const Engine = struct {
         log.info("recovery: restoring manifest from snapshot index={d} bytes={d}", .{ snap.index, snap.data.len });
         try self.forest.manifest.restoreFrom(snap.data);
         oldest_idx = snap.oldest_memtable_index;
-        // The read floor is the installed snapshot's timestamp
-        // (`snapshotInstalled` keeps it so from here on).
-        _ = self.forest.setGlobalMinRead(snap.timestamp);
+        _ = self.forest.setSnapshotTs(snap.timestamp);
 
         // Download every missing SST from the shared object store before
         // proceeding — opening a partial forest would start a node with
@@ -863,35 +880,16 @@ pub const Engine = struct {
             const now_ms = utils.coarseMs();
             if (now_ms - last_scan_ms >= cfg.orphan_scan_interval_seconds * 1000) {
                 last_scan_ms = now_ms;
-                self.removeOrphans();
+                const min_age_secs = cfg.orphan_min_age_seconds;
+                self.forest.removeOrphans(min_age_secs) catch |err| {
+                    log.warn("removeOrphans: {s}", .{@errorName(err)});
+                };
             }
 
             self.maybeProposeSnapshot() catch |err| {
                 log.warn("maybeProposeSnapshot: {s}", .{@errorName(err)});
             };
         }
-    }
-
-    /// Scan and remove orphan SSTables. A file the manifest does not know goes
-    /// only if it passes two gates, both on its modification time: not written
-    /// after the entry at this node's snapshot index, and at least
-    /// `orphan_min_age_seconds` old. The snapshot gate alone is not enough: the
-    /// byte trigger can pick a snapshot entry seconds behind the log head, and
-    /// a compaction's early outputs are older than that long before its
-    /// proposal applies. Failure is logged and dropped: the next scan retries
-    /// the whole directory.
-    fn removeOrphans(self: *Engine) void {
-        const cfg = self.snapshot_cfg.cur();
-        // Wall-clock seconds of the entry at the snapshot index; 0 with
-        // no snapshot yet, and then nothing counts as an orphan.
-        const snapshot_s = _hlc.HLC.fromU64(self.node.log.snapshot().timestamp).seconds;
-        const min_age_s: i64 = @intCast(cfg.orphan_min_age_seconds);
-        const now_s = utils.timestampNow(.realtime, .secs);
-        const cutoff_s = @min(snapshot_s, now_s - min_age_s);
-
-        self.forest.removeOrphans(cutoff_s) catch |err| {
-            log.warn("removeOrphans: {s}", .{@errorName(err)});
-        };
     }
 
     /// Leader-only. Pick a target snapshot index from WAL size/age (capped by
@@ -977,10 +975,19 @@ pub const Engine = struct {
         const prev_snap = wal.snapshot();
         if (target <= prev_snap.index) return;
 
-        const target_term = (try wal.term(target)) orelse {
-            log.warn("maybeProposeSnapshot: no term for index={d}", .{target});
+        // Asked of the log by index: the range read below returns
+        // manifest entries only, and the target is rarely one.
+        const target_slot = (try wal.slotAt(target)) orelse {
+            log.warn("maybeProposeSnapshot: no slot for index={d}", .{target});
             return;
         };
+        const target_term = target_slot.term;
+        // `Snapshot.timestamp`: `Forest.snapshot_ts` once this applies.
+        const target_ts = self.forest.minReadTs(
+            target_slot.timestamp,
+            cfg.max_txn_age_seconds,
+            self.node.peersMinReadTs(),
+        );
 
         // Seed draft from previous snapshot's manifest, then replay every
         // manifest-bearing log entry in (prev_snap.index, target].
@@ -1005,16 +1012,11 @@ pub const Engine = struct {
             return;
         }
 
-        // HLC timestamp of the entry at `target`, for `Snapshot.timestamp`.
-        var target_ts: u64 = 0;
         for (result.entries) |stored| {
             const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch |err| {
                 log.warn("maybeProposeSnapshot: parseRoot at index={d}: {s}", .{ stored.index, @errorName(err) });
                 continue;
             };
-            if (stored.index == target) target_ts = reader.timestamp();
-            if (reader.entryType() != .manifest) continue;
-
             const payload = reader.data();
             if (payload.len == 0) continue;
             const parsed = zdb_bufs.parseMessageWithTail(payload) catch |err| {
@@ -1245,8 +1247,8 @@ pub const Engine = struct {
         // What this build may discard below: the read floor, the
         // installed snapshot's timestamp. Every node raised it when that
         // snapshot entry applied, before this compaction's entry.
-        const min_read = self.forest.globalMinRead();
-        var changes = try tree.buildCompaction(min_read);
+        const snapshot_ts = self.forest.snapshotTs();
+        var changes = try tree.buildCompaction(snapshot_ts);
         defer changes.deinit(self.allocator);
 
         if (changes.items.len == 0) {

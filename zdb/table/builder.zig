@@ -309,7 +309,7 @@ pub const Builder = struct {
     /// Estimated bytes of shadowed (dead-or-dying) data written into this
     /// table: versions that sit below their primary's newest terminal (a newer
     /// full `state` or a `deleted`), so no read past the horizon needs them —
-    /// reclaimable once global_min_read rises past them. Fed by `addStaleBytes`
+    /// reclaimable once snapshot_ts rises past them. Fed by `addStaleBytes`
     /// from compaction, snapshotted into the table index at `finish()`.
     /// A user-data estimate (key.primary + value), so it under-approximates
     /// on-disk footprint — fine as a signal.

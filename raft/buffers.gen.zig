@@ -1124,6 +1124,7 @@ pub const AppendEntriesReplyStruct = struct {
     last_index: u64 = 0,
     conflict_term: u64 = 0,
     conflict_index: u64 = 0,
+    min_read_ts: u64 = 0,
     pub fn deinit(self: *AppendEntriesReplyStruct, alloc: std.mem.Allocator) void {
         _ = self;
         _ = alloc;
@@ -1143,6 +1144,7 @@ pub const AppendEntriesReplyStruct = struct {
             .last_index = self.last_index,
             .conflict_term = self.conflict_term,
             .conflict_index = self.conflict_index,
+            .min_read_ts = self.min_read_ts,
         };
         errdefer s.deinit(alloc);
         return s;
@@ -1163,6 +1165,7 @@ pub const AppendEntriesReplyStruct = struct {
         try writer.setLastIndex(self.last_index);
         try writer.setConflictTerm(self.conflict_term);
         try writer.setConflictIndex(self.conflict_index);
+        try writer.setMinReadTs(self.min_read_ts);
         try writer.setSuccess(self.success);
         const result = try writer.finish();
         return result.offset;
@@ -1174,7 +1177,7 @@ pub const AppendEntriesReplyReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 42246;
-    pub const SIZE_BYTES: u16 = 44;
+    pub const SIZE_BYTES: u16 = 52;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -1216,6 +1219,10 @@ pub const AppendEntriesReplyReader = struct {
         return self.t.scalar(u64, 36);
     }
 
+    pub fn minReadTs(self: Self) u64 {
+        return self.t.scalar(u64, 44);
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try AppendEntriesReplyWriter.initWithBuf(alloc, out);
         try writer.setSuccess(self.success());
@@ -1225,6 +1232,7 @@ pub const AppendEntriesReplyReader = struct {
         try writer.setLastIndex(self.lastIndex());
         try writer.setConflictTerm(self.conflictTerm());
         try writer.setConflictIndex(self.conflictIndex());
+        try writer.setMinReadTs(self.minReadTs());
         const result = try writer.finish();
         return result.offset;
     }
@@ -1241,6 +1249,7 @@ pub const AppendEntriesReplyReader = struct {
             .last_index = self.lastIndex(),
             .conflict_term = self.conflictTerm(),
             .conflict_index = self.conflictIndex(),
+            .min_read_ts = self.minReadTs(),
         };
         errdefer s.deinit(alloc);
         return s;
@@ -1260,7 +1269,7 @@ pub const AppendEntriesReplyWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 42246;
-    pub const SIZE_BYTES: u16 = 44;
+    pub const SIZE_BYTES: u16 = 52;
     /// Slots of nested tables, null until set.
     const child_slots = [_]u16{};
 
@@ -1312,6 +1321,10 @@ pub const AppendEntriesReplyWriter = struct {
         return self.w.setScalar(u64, 36, v);
     }
 
+    pub fn setMinReadTs(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 44, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -1324,6 +1337,7 @@ pub const AppendEntriesReplyWriter = struct {
         if (@hasField(Values, "last_index")) try self.setLastIndex(@field(values, "last_index"));
         if (@hasField(Values, "conflict_term")) try self.setConflictTerm(@field(values, "conflict_term"));
         if (@hasField(Values, "conflict_index")) try self.setConflictIndex(@field(values, "conflict_index"));
+        if (@hasField(Values, "min_read_ts")) try self.setMinReadTs(@field(values, "min_read_ts"));
     }
 
     pub fn finish(self: *Self) Error!AppendEntriesReplyBuffer {

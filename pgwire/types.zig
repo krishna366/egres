@@ -69,6 +69,7 @@ pub const FieldDescription = struct {
 /// per error class (constraint violation, type mismatch, etc.).
 pub const sqlstate = struct {
     pub const internal_error: [5]u8 = .{ 'X', 'X', '0', '0', '0' };
+    pub const snapshot_too_old: [5]u8 = .{ '7', '2', '0', '0', '0' };
     pub const syntax_error: [5]u8 = .{ '4', '2', '6', '0', '1' };
     pub const duplicate_table: [5]u8 = .{ '4', '2', 'P', '0', '7' };
     pub const undefined_table: [5]u8 = .{ '4', '2', 'P', '0', '1' };
