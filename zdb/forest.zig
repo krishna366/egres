@@ -1058,19 +1058,25 @@ pub const Forest = struct {
         var max_count: u32 = 0;
         // Consecutive keys of one batch mostly share a tree (rows are
         // keyed by increasing egids); skip the lookup when they do.
+        // The table is compared too: a tree's range is unbounded at a
+        // table's edge, so it would hold a later table's keys as well.
         var last: ?*Tree = null;
+        var last_table: TableKey = undefined;
         defer if (last) |t| t.release();
 
         for (keys) |raw| {
             const key = Key.init(raw);
+            const table_key = key.tableKey();
             if (last) |ltree| {
-                if (ltree.key_range.contains(key)) continue;
+                if (std.meta.eql(last_table, table_key) and
+                    ltree.key_range.contains(key)) continue;
                 ltree.release();
                 last = null;
             }
-            const trees = self.getTable(key.tableKey()) orelse continue;
+            const trees = self.getTable(table_key) orelse continue;
             const tree = trees.getTreeByKey(key) orelse continue;
             last = tree;
+            last_table = table_key;
             const n: u32 = @intCast(tree.numTablesAt(0));
             if (n > max_count) max_count = n;
         }

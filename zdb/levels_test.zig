@@ -1488,6 +1488,65 @@ test "compaction: an L0 push that overlaps L1 waits for room below" {
     try std.testing.expectEqual(@as(u8, 1), cand.level);
 }
 
+fn setJobMaxBytes(fx: *TombstoneFixture, bytes: u64) !void {
+    var buf: [64]u8 = undefined;
+    const input = try std.fmt.bufPrint(&buf, "job_max_bytes={d}", .{bytes});
+    try fx.live.update(input);
+    try fx.tree.updateCompactCandidate();
+}
+
+test "compaction: a push takes L0 tables that add no L1 overlap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Four L0 tables, each spanning the one L1 table: any push rewrites
+    // all of L1. L1 is the bottom of two levels with a 1 byte target,
+    // so L0 pushes whenever it holds a table.
+    var cfg = config.Config{
+        .max_levels = 2,
+        .lmax_target_bytes = 1,
+        .l0_merge_min_tables = 0,
+    };
+    cfg.dir = dir_path;
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{ 50, 700 } },
+        .{ .id = 3, .level = 0, .egids = &.{ 51, 701 } },
+        .{ .id = 4, .level = 0, .egids = &.{ 52, 702 } },
+        .{ .id = 5, .level = 0, .egids = &.{ 53, 703 } },
+        .{ .id = 6, .level = 1, .egids = &egidRun(100, 500) },
+    });
+    defer fx.deinit();
+
+    const l0 = fx.tree.levels[0].tables.items;
+    const two_l0 = l0[0].table.fileSize() + l0[1].table.fileSize();
+
+    // A budget of two L0 tables: L1 puts the first table over it, the
+    // second adds no L1 bytes and is taken, and L0's own bytes stop
+    // the third.
+    try setJobMaxBytes(&fx, two_l0);
+    try compact(fx.tree, 10, 0);
+    {
+        const ids = try levelIds(alloc, fx.tree, 0);
+        defer alloc.free(ids);
+        try std.testing.expectEqualSlices(u64, &.{ 4, 5 }, ids);
+    }
+
+    // A budget L1 alone reaches, with room for the rest of L0: one
+    // push takes both tables left.
+    var l1_bytes: u64 = 0;
+    for (fx.tree.levels[1].tables.items) |e| l1_bytes += e.table.fileSize();
+    try std.testing.expect(l1_bytes > two_l0);
+    try setJobMaxBytes(&fx, l1_bytes);
+    try compact(fx.tree, 11, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), fx.tree.numTablesAt(0));
+    try expectEgids(alloc, fx.tree, &.{ 50, 53, 100, 599, 700, 703 });
+}
+
 test "compaction: a posting index's push is rewritten, not moved" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

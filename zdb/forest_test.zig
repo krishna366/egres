@@ -3538,3 +3538,55 @@ test "buildFlush takes the oldest memtables up to job_max_bytes" {
         try std.testing.expectEqualStrings("v", got.newest().value);
     }
 }
+
+test "maxL0TableCountForKeys counts each key's own table" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // One memtable per flush, so three flushes leave three L0 tables.
+    const f_live = try flags.Live(Config).create(alloc, .{
+        .dir = dir_path,
+        .job_max_bytes = 1,
+    });
+    defer f_live.destroy();
+    const f = try Forest.open(alloc, f_live);
+    defer f.close();
+    const table1: TableKey = .{ .namespace = 1, .table_id = 1 };
+    _ = try createTree(f, ns1_table0, .{}, .posting_index);
+    _ = try createTree(f, table1, .{}, .posting_index);
+
+    // Keys for table 1 only: its tree gets the L0 tables, table 0's none.
+    var id: u64 = 1;
+    while (id <= 3) : (id += 1) {
+        try f.newMemtable(id);
+        var primary: [1]u8 = .{@intCast('a' + id)};
+        var items = [_]zdb.kv.Item{.{
+            .key = .{ .namespace = 1, .table_id = 1, .primary = &primary },
+            .versions = .{ .one = .{ .ts = id, .meta = .{}, .value = "v" } },
+        }};
+        try f.put(&items);
+    }
+    try f.newMemtable(4);
+    id = 1;
+    while (id <= 3) : (id += 1) {
+        var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+        defer flush.changes.deinit(alloc);
+        const newest = flush.newest_memtable_id;
+        try f.applyFlush(10 + id, flush.changes.items, newest);
+    }
+
+    const key0: zdb.kv.Key = .{ .namespace = 1, .table_id = 0, .primary = "a" };
+    const key1: zdb.kv.Key = .{ .namespace = 1, .table_id = 1, .primary = "b" };
+    const raw0 = try key0.marshal(alloc);
+    defer alloc.free(raw0);
+    const raw1 = try key1.marshal(alloc);
+    defer alloc.free(raw1);
+
+    // Table 0's tree is unbounded on both sides, and still not the
+    // tree of a table 1 key that follows one of its own.
+    try std.testing.expectEqual(0, f.maxL0TableCountForKeys(&.{raw0}));
+    try std.testing.expectEqual(3, f.maxL0TableCountForKeys(&.{ raw0, raw1 }));
+}

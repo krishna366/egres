@@ -450,7 +450,8 @@ pub fn clearCandidate(self: *Tree) void {
 /// the oldest table alone when it can (`movable`), else pushes the
 /// oldest-first prefix that brings total compaction input bytes
 /// (selected L0 + their L1 overlap) up to `job_max_bytes`.
-/// The table that crosses the budget is included; we stop afterwards.
+/// The table that crosses the budget is included; after it, only
+/// tables that add no L1 overlap (`l0MergeDownOldest`).
 /// Newer L0 tables stay put and continue to shadow the compacted
 /// versions on read.
 ///
@@ -491,7 +492,10 @@ fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?Job {
 }
 
 /// The oldest L0 tables a `merge_down` takes (`pickJob`): `entries` is
-/// L0 oldest first.
+/// L0 oldest first. Past the budget a table is still taken while it
+/// widens no L1 overlap and L0's own bytes are under the budget: the
+/// job rewrites the same L1 tables either way. Without that, an L1
+/// larger than the budget let each push drain a single table.
 fn l0MergeDownOldest(
     self: *Tree,
     held: Lock.Shared,
@@ -501,18 +505,23 @@ fn l0MergeDownOldest(
     // The union of the tables taken so far; null until the first.
     var union_kr: ?KeyRange = null;
     var l0_bytes: u64 = 0;
+    var bot_bytes: u64 = 0;
     var n: usize = 0;
-    while (n < entries.len) {
-        const tkr = tableRange(entries[n]);
-        if (union_kr) |*u| u.extend(tkr) else union_kr = tkr;
+    while (n < entries.len) : (n += 1) {
+        var kr = tableRange(entries[n]);
+        if (union_kr) |u| kr.extend(u);
+
+        var next_bot: u64 = 0;
+        for (self.levels[1].overlapping(held, kr)) |oe|
+            next_bot += oe.table.fileSize();
+
+        // The first table is always taken, so a job makes progress.
+        if (n > 0 and l0_bytes + bot_bytes >= budget and
+            (next_bot > bot_bytes or l0_bytes >= budget)) break;
+
+        union_kr = kr;
+        bot_bytes = next_bot;
         l0_bytes += entries[n].table.fileSize();
-        n += 1;
-
-        var bot_bytes: u64 = 0;
-        for (self.levels[1].overlapping(held, union_kr.?)) |oe|
-            bot_bytes += oe.table.fileSize();
-
-        if (l0_bytes + bot_bytes >= budget) break;
     }
     return entries[0..n];
 }

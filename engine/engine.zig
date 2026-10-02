@@ -1393,13 +1393,19 @@ pub const Engine = struct {
     /// for the curve. `kvs` are the batch's marshaled keys.
     pub fn applyWriteBackpressure(self: *Engine, kvs: []const zdb_bufs.KeyValueStruct) void {
         const opts = self.forest.live.cur();
+        // Every key: a batch is in key order, a table's rows before
+        // its index entries, so a prefix never reaches the index trees.
+        var l0: u32 = 0;
         var keys_buf: [64]String = undefined;
-        const n = @min(kvs.len, keys_buf.len);
-        // A batch is one commit: its keys share a few trees, so a
-        // prefix of them finds the same trees at a bounded cost.
-        for (kvs[0..n], keys_buf[0..n]) |kv, *k| k.* = kv.key;
+        var rest = kvs;
+        while (rest.len > 0) {
+            const n = @min(rest.len, keys_buf.len);
+            for (rest[0..n], keys_buf[0..n]) |kv, *k| k.* = kv.key;
+            const count = self.forest.maxL0TableCountForKeys(keys_buf[0..n]);
+            l0 = @max(l0, count);
+            rest = rest[n..];
+        }
 
-        const l0 = self.forest.maxL0TableCountForKeys(keys_buf[0..n]);
         // Memtables waiting for a flush brake every write the same way;
         // one curve, so the larger excess over its start count decides.
         const frozen = self.forest.memtables.immutableCount();
