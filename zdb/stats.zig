@@ -59,13 +59,15 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
 
     // Per-level aggregate (sum + max-with-tree).
     const max_levels = self.live.cur().max_levels;
+    // Trees are named `<ns>:<id>`, the form `zdb tree=` takes.
+    const no_tree: TreeKey = .{ .namespace = 0, .tree_id = 0 };
     const Agg = struct {
         tables_total: u64 = 0,
         tables_max: u64 = 0,
-        tables_max_tree: u64 = 0,
+        tables_max_tree: TreeKey = no_tree,
         bytes_total: u64 = 0,
         bytes_max: u64 = 0,
-        bytes_max_tree: u64 = 0,
+        bytes_max_tree: TreeKey = no_tree,
     };
     const aggs = try self.allocator.alloc(Agg, max_levels);
     defer self.allocator.free(aggs);
@@ -75,14 +77,14 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
     const Wanted = struct {
         count: u64 = 0,
         score_max: f64 = 0,
-        score_max_tree: u64 = 0,
+        score_max_tree: TreeKey = no_tree,
     };
     const wanted = try self.allocator.alloc(Wanted, max_levels);
     defer self.allocator.free(wanted);
     for (wanted) |*x| x.* = .{};
 
     // Largest tree (sum across levels).
-    var largest_tree_id: u64 = 0;
+    var largest_tree: TreeKey = no_tree;
     var largest_tree_size: i64 = 0;
     var tree_count: usize = 0;
 
@@ -98,7 +100,10 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
             defer held.release();
             for (trees.list(held)) |tree| {
                 tree_count += 1;
-                const tree_id = tree.tree_id;
+                const tree_key: TreeKey = .{
+                    .namespace = tree.namespace,
+                    .tree_id = tree.tree_id,
+                };
 
                 const th = tree.mu.hold(.shared, @src());
                 defer th.release();
@@ -112,17 +117,17 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
                     aggs[idx].tables_total += tcount;
                     if (tcount > aggs[idx].tables_max) {
                         aggs[idx].tables_max = tcount;
-                        aggs[idx].tables_max_tree = tree_id;
+                        aggs[idx].tables_max_tree = tree_key;
                     }
                     aggs[idx].bytes_total += tbytes;
                     if (tbytes > aggs[idx].bytes_max) {
                         aggs[idx].bytes_max = tbytes;
-                        aggs[idx].bytes_max_tree = tree_id;
+                        aggs[idx].bytes_max_tree = tree_key;
                     }
                 }
                 if (tree_total > largest_tree_size) {
                     largest_tree_size = tree_total;
-                    largest_tree_id = tree_id;
+                    largest_tree = tree_key;
                 }
 
                 if (tree.compact_candidate) |c| {
@@ -130,7 +135,7 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
                         wanted[c.level].count += 1;
                         if (c.score > wanted[c.level].score_max) {
                             wanted[c.level].score_max = c.score;
-                            wanted[c.level].score_max_tree = tree_id;
+                            wanted[c.level].score_max_tree = tree_key;
                         }
                     }
                 }
@@ -139,7 +144,9 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
     }
 
     try w.print("  trees: {d}\n", .{tree_count});
-    try w.print("  largest_tree: id={d} size=", .{largest_tree_id});
+    try w.print("  largest_tree: id={d}:{d} size=", .{
+        largest_tree.namespace, largest_tree.tree_id,
+    });
     try writeBytes(w, @intCast(largest_tree_size));
     try w.print("\n\n", .{});
 
@@ -147,13 +154,17 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
     for (aggs, 0..) |a, idx| {
         // Skip levels that have nothing — shows max_levels=7 dumps cleanly.
         if (a.tables_total == 0 and a.bytes_total == 0) continue;
-        try w.print("    L{d}: tables={d} (max={d} in tree {d})  bytes=", .{
-            idx, a.tables_total, a.tables_max, a.tables_max_tree,
-        });
+        const tm = a.tables_max_tree;
+        try w.print(
+            "    L{d}: tables={d} (max={d} in tree {d}:{d})  bytes=",
+            .{ idx, a.tables_total, a.tables_max, tm.namespace, tm.tree_id },
+        );
         try writeBytes(w, a.bytes_total);
         try w.print(" (max=", .{});
         try writeBytes(w, a.bytes_max);
-        try w.print(" in tree {d})\n", .{a.bytes_max_tree});
+        try w.print(" in tree {d}:{d})\n", .{
+            a.bytes_max_tree.namespace, a.bytes_max_tree.tree_id,
+        });
     }
 
     var any_wanted = false;
@@ -165,16 +176,21 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
         try w.print("\n  compactions wanted:\n", .{});
         for (wanted, 0..) |x, idx| {
             if (x.count == 0) continue;
-            try w.print("    L{d}: trees={d} score_max={d:.2} (tree {d})\n", .{
-                idx, x.count, x.score_max, x.score_max_tree,
-            });
+            const smax = x.score_max_tree;
+            try w.print(
+                "    L{d}: trees={d} score_max={d:.2} (tree {d}:{d})\n",
+                .{ idx, x.count, x.score_max, smax.namespace, smax.tree_id },
+            );
         }
     }
 }
 
 pub fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tk: TreeKey) !void {
     const tree = self.getTree(tk.namespace, tk.tree_id) orelse {
-        try w.print("tree id={d}: not found\n", .{tk.tree_id});
+        try w.print(
+            "tree id={d}:{d}: not found\n",
+            .{ tk.namespace, tk.tree_id },
+        );
         return;
     };
     defer tree.release();
@@ -198,8 +214,8 @@ pub fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tk: TreeKey) !void {
     };
 
     try w.print(
-        "tree id={d} namespace={d} size=",
-        .{ tk.tree_id, tk.namespace },
+        "tree id={d}:{d} size=",
+        .{ tk.namespace, tk.tree_id },
     );
     try writeBytes(w, @intCast(total));
     try w.print("\n", .{});

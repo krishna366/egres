@@ -130,15 +130,19 @@ pub const VersionTracker = struct {
     }
 
     /// The chain a rollup may fold: the item's versions down to and
-    /// including the first terminal, when rollup is on, the newest
-    /// version is a roaring delta, and nothing foreign sits inside the
-    /// chain — every version is a roaring delta, or the terminal is a
-    /// tombstone (its encoding is not looked at) or a roaring state.
+    /// including the first terminal, when rollup is on, the output goes
+    /// below L0, the newest version is a roaring delta, and nothing
+    /// foreign sits inside the chain — every version is a roaring
+    /// delta, or the terminal is a tombstone (its encoding is not
+    /// looked at) or a roaring state.
     /// Null otherwise: the item is emitted verbatim. A lone state is
     /// already rolled, raw rows are not ours, and everything below the
     /// terminal is shadowed history that is never folded.
     fn foldable(e: *const Tree.Emitter, item: Item) ?Item {
         if (!e.opts.rollup_enabled) return null;
+        // An L0 to L0 merge folds nothing: a state it wrote would be
+        // rewritten by the next push, and L0 would hold whole postings.
+        if (e.dest == 0) return null;
 
         const newest = item.newest();
         if (!(newest.meta.isRoaring() and newest.meta.isDelta())) return null;

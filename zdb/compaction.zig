@@ -43,20 +43,6 @@ const log = std.log.scoped(.zdb_tree);
 // Internal types
 // ---------------------------------------------------------------------------
 
-pub const Targets = struct {
-    allocator: std.mem.Allocator,
-    target_sz: []i64,
-
-    pub fn deinit(self: *Targets) void {
-        self.allocator.free(self.target_sz);
-    }
-};
-
-const LevelPriority = struct {
-    level: usize,
-    score: f64,
-};
-
 /// A tree's pending work item, picked by `Forest.bestCompactionCandidate`.
 /// What a tree wants done next, decided by `updateCompactCandidate_`
 /// from the levels as they are and kept fresh by every install. The
@@ -81,7 +67,8 @@ pub const CompactCandidate = struct {
     job: Job,
 };
 
-/// What a level wants done (`pickJob`), or a split of the whole tree.
+/// What a level wants done (`pickJob`, `pickL0Merge`),
+/// or a split of the whole tree.
 /// Picked as views into the level's own array, valid under the hold it
 /// was picked under; the candidate holds a copy.
 pub const Job = union(enum) {
@@ -108,24 +95,18 @@ pub const Job = union(enum) {
 // L0 job selection
 // -----------------------------------------------------------------------
 
-/// The job L0 needs now, null when it needs none (see `Config`), from
-/// L0 alone: `tables` is L0 in its own order, oldest first, and a
-/// sub-slice of it comes back, so the caller holds the level for as
-/// long as it uses one. A push comes back as `merge_down` of all of
-/// L0; `pickJob` narrows it against L1 to the oldest table's move or
-/// the prefix a merge takes.
-///
-///   1. L0 holds as many bytes as L1's target (`levelTarget`): push
-///      L0 into L1. A push of that size costs about two bytes written
-///      per byte drained.
-///   2. A merge run is ready: merge it into one L0 table. The run
-///      starts after the newest finished table (one that has reached
-///      the table size, `opts.table_bytes`), takes the tables that
-///      follow it in order, and stops once it holds twice that size or
-///      runs out of tables. It is ready once it has at least
-///      `opts.l0_merge_min_tables` tables. The output is finished if the
-///      run reached the size.
-///   3. Otherwise L0 is left to fill.
+// L0 has two jobs of its own: a push into L1 (`pickJob`) and a
+// merge within L0 (`pickL0Merge`). Both can be ready at once, and
+// `updateCompactCandidate_` picks between them by score.
+
+/// The run an L0 to L0 merge rewrites as one table, a sub-slice of
+/// `tables` (L0 in its own order, oldest first), null when none is
+/// ready. The run starts after the newest
+/// finished table (one that has reached the table size,
+/// `opts.table_bytes`), takes the tables that follow it in order, and
+/// stops once it holds twice that size or runs out of tables. It is
+/// ready once it has at least `opts.l0_merge_min_tables` tables. The
+/// output is finished if the run reached the size.
 ///
 /// A run is contiguous and its output is listed at the newest input's
 /// raft index, so it stands where its inputs stood: a point read walks
@@ -133,19 +114,13 @@ pub const Job = union(enum) {
 /// which is only right while newer tables hold newer versions. A
 /// finished table is never an input again, so a byte is rewritten
 /// within L0 only until it sits in a finished table.
-pub fn pickL0Job(opts: _config.Config, tables: []const TableEntry) ?Job {
-    if (tables.len == 0) return null;
-
-    // A tree with no L1 has nowhere to push.
-    if (opts.max_levels > 1) {
-        var total: u64 = 0;
-        for (tables) |t| total += t.size;
-        const push_bytes: u64 = @intCast(@max(levelTarget(opts, 1), 1));
-        if (total >= push_bytes) return .{ .merge_down = tables };
-    }
-
+pub fn l0MergeRun(
+    opts: _config.Config,
+    tables: []const TableEntry,
+) ?[]const TableEntry {
     const min_tables: usize = opts.l0_merge_min_tables;
     if (min_tables == 0) return null;
+
     const full: u64 = opts.table_bytes;
     var lo: usize = 0;
     for (tables, 0..) |t, i| {
@@ -157,7 +132,7 @@ pub fn pickL0Job(opts: _config.Config, tables: []const TableEntry) ?Job {
         total += tables[hi].size;
     }
     if (hi - lo < min_tables) return null;
-    return .{ .merge_l0 = tables[lo..hi] };
+    return tables[lo..hi];
 }
 
 /// Whether the tree's tables may ever move down without a rewrite:
@@ -207,9 +182,17 @@ fn tableRange(e: TableEntry) KeyRange {
     return .{ .left = e.table.smallest, .right = e.table.biggest };
 }
 
-/// Score of a level with a movable table: above any size score, below
-/// a split's.
+/// Score of a level with a movable table (`Job.move_down`: it meets
+/// nothing in the level below): above the scores a rewrite has, below
+/// a split's. A move costs one manifest entry, so there is nothing to
+/// wait for, and it empties the upper levels of sequential data at no
+/// write cost. Measured at 32 load streams: 165k rows/s with moves
+/// first against 153k on raw scores, whose L0 picks were 1 GiB rewrites.
 pub const move_priority_score: f64 = 50.0;
+
+/// Score of an L0 to L0 merge with tables to spare (`pickL0Merge`):
+/// above the scores a rewrite has, below a move's.
+pub const merge_priority_score: f64 = 49.0;
 
 /// Score assigned to a tree that needs a split. Comfortably above any
 /// natural compaction score so splits always rank first.
@@ -222,10 +205,10 @@ pub const split_priority_score: f64 = 100.0;
 /// The byte target of `level`, a function of the options alone. Fixed
 /// per tree: the bottom level's is `lmax_target_bytes`, and the levels
 /// above cascade up by dividing by `level_size_multiplier`, floored at
-/// 1 byte so the size/target score is well-defined. L0 has none. A tree
-/// splits once its total passes `Config.splitBytes`, five fourths of
-/// the Lmax target: what the whole tree weighs with every level at
-/// target.
+/// 1 byte so the size/target score is well-defined. L0's is L1's: it
+/// pushes once it holds what L1 may hold. A tree splits once its total
+/// passes `Config.splitBytes`, five fourths of the Lmax target: what
+/// the whole tree weighs with every level at target.
 ///
 /// Why FIXED instead of derived from current data: dynamic targets
 /// (RocksDB-style) have a chicken-and-egg problem — early in a tree's
@@ -235,7 +218,8 @@ pub const split_priority_score: f64 = 100.0;
 /// sidestep this entirely. If Lmax briefly exceeds its target before
 /// the split kicks in, that's fine — the split will eventually fire.
 pub fn levelTarget(opts: _config.Config, level: usize) i64 {
-    if (level == 0 or level >= opts.max_levels) return 0;
+    if (level >= opts.max_levels) return 0;
+    if (level == 0) return levelTarget(opts, 1);
     var target: i64 = opts.lmax_target_bytes;
     var i = opts.max_levels - 1;
     while (i > level) : (i -= 1) {
@@ -243,22 +227,6 @@ pub fn levelTarget(opts: _config.Config, level: usize) i64 {
         if (target < 1) return 1;
     }
     return target;
-}
-
-/// Targets are a function of the options alone; no lock needed.
-pub fn levelTargets(self: *Tree) !Targets {
-    const opts = self.live.cur();
-    const n = self.live.cur().max_levels;
-    const target_sz = try self.allocator.alloc(i64, n);
-    errdefer self.allocator.free(target_sz);
-    @memset(target_sz, 0);
-    for (1..n) |i| target_sz[i] = levelTarget(opts, i);
-
-    // Every level's files are cut at `opts.table_bytes`; only the byte
-    // targets differ by level. Compaction is strictly stepwise (L0→L1,
-    // L1→L2, …) so there's no separate base-level concept — L1 is
-    // always the destination of L0.
-    return .{ .allocator = self.allocator, .target_sz = target_sz };
 }
 
 // -----------------------------------------------------------------------
@@ -318,108 +286,48 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
                 split_bytes,
             },
         );
-        const level: u8 = @intCast(linfo.level);
-        try setCandidate(self, level, split_priority_score, .split);
+        try setCandidate(self, .{
+            .level = @intCast(linfo.level),
+            .score = split_priority_score,
+            .job = .split,
+        });
         return;
     }
 
-    var t = try self.levelTargets();
-    defer t.deinit();
-
-    const opts = self.live.cur();
-    const n = self.live.cur().max_levels;
-    const prios = try self.allocator.alloc(LevelPriority, n);
-    defer self.allocator.free(prios);
-
-    // What each level would do (`pickJob`), decided once here: the
-    // winner's job is stored with the verdict and the builder runs it
-    // as it is.
-    const jobs = try self.allocator.alloc(?Job, n);
-    defer self.allocator.free(jobs);
-    for (jobs, 0..) |*job, level| job.* = pickJob(self, rd, level);
-
-    // A level with a table that can move down (`Job.move_down`: it meets
-    // nothing in the level below) outranks every rewrite. A move costs
-    // one manifest entry, so there is nothing to wait for, and it
-    // empties the upper levels of sequential data at no write cost.
-    // Measured at 32 load streams: 165k rows/s with this rule against
-    // 153k on raw scores alone, whose L0 picks were 1 GiB rewrites.
-    for (jobs, 0..) |j, level| {
-        const job = j orelse continue;
-        if (job != .move_down) continue;
-        try setCandidate(self, @intCast(level), move_priority_score, job);
-        return;
-    }
-
-    // L0: count-based score, scaled so it competes on the same axis
-    // as L1+ size scores. Score reaches 1.0 at HALF the backpressure
-    // start count — early enough that compaction usually catches up
-    // before backpressure kicks in. Without this scaling (or with
-    // the old "if score >= 2.5, compact L0 immediately" shortcut),
-    // L0 starves L1→L2/L3 work and lower levels go unmaintained.
-    // Backpressure (`l0_backpressure_start_count`) is what protects
-    // writes from a temporarily-out-of-shape L0; the scoring loop
-    // is for steady-state level shape.
+    // What each level would do and its score, decided once here: the
+    // winner is stored as the verdict and the builder runs its job as
+    // it is. L0 offers a push and a merge; the bottom level nothing.
     //
-    // L0 scores only when it has a job to run (`pickL0Job`): an L0 that
-    // is within its bounds and has nothing to merge is left alone, by
-    // design, and scoring it would hand the workers a tree with nothing
-    // to build.
-    const l0_job = jobs[0];
-
-    const l0_tables = self.levels[0].numTables(rd);
-    const l0_score = if (l0_job == null)
-        0.0
-    else
-        @as(f64, @floatFromInt(l0_tables * 2)) /
-            @as(f64, @floatFromInt(opts.l0_backpressure_start_count));
-    prios[0] = .{ .level = 0, .score = l0_score };
-
-    // L≥1: size-based score.
-    for (1..n) |j| {
-        const target = t.target_sz[j];
-        const score = if (target > 0)
-            @as(f64, @floatFromInt(self.levels[j].getTotalSize(rd))) /
-                @as(f64, @floatFromInt(target))
-        else
-            0.0;
-        prios[j] = .{ .level = j, .score = score };
-    }
-    // The highest raw score above 1.0 wins, the bottom level aside:
-    // the fullest level by ratio is drained first, as RocksDB does.
+    // The highest score above 1.0 wins, the upper level on a tie. For
+    // rewrites that is the fullest level by ratio, as RocksDB does.
     // Badger's adjustment, dividing a level's score by the one below
     // it, was here once; it boosts a level over an under-full one, and
     // under a sustained load that let L1 win every pick over an L0 of
     // 65 tables, with the write brake throttling the load meanwhile.
-    var winner: ?LevelPriority = null;
-    for (prios[0 .. n - 1]) |p| {
-        if (p.score <= 1.0) continue;
-        if (winner == null or p.score > winner.?.score) winner = p;
+    var best: ?CompactCandidate = null;
+    for (0..self.live.cur().max_levels) |level| {
+        const c = pickJob(self, rd, level) orelse continue;
+        if (best == null or c.score > best.?.score) best = c;
+    }
+    const merge = pickL0Merge(self, rd);
+    if (merge) |c| {
+        if (best == null or c.score > best.?.score) best = c;
+    }
+    if (best) |c| {
+        if (c.score > 1.0) return setCandidate(self, c);
     }
 
-    if (winner) |w| {
-        // A level that scored holds tables and is not the bottom, so
-        // it has a job.
-        try setCandidate(self, @intCast(w.level), w.score, jobs[w.level].?);
-        return;
-    }
-
-    // Idle fallback: nothing scored above 1.0, but L0 has a job. Run it
-    // while the workers have nothing better: a merge of a few small
-    // tables scores far below 1.0 and would otherwise wait for L0 to
-    // fill up. Lower levels by definition need no work when nothing
-    // scored ≥ 1.0, so L0 is always the right idle pick.
-    if (l0_job) |job| {
-        try setCandidate(self, 0, prios[0].score, job);
-    } else {
-        self.clearCandidate();
-    }
+    // Idle fallback: nothing scored above 1.0, so no level needs work.
+    // A merge of exactly the fewest tables runs while the workers have
+    // nothing better.
+    if (merge) |c| return setCandidate(self, c);
+    self.clearCandidate();
 }
 
-/// The verdict, with a copy of `job`'s tables in place of the level
+/// The verdict, with a copy of the job's tables in place of the level
 /// views it was picked as.
-fn setCandidate(self: *Tree, level: u8, score: f64, job: Job) !void {
-    const owned: Job = switch (job) {
+fn setCandidate(self: *Tree, c: CompactCandidate) !void {
+    const owned: Job = switch (c.job) {
         .move_down => |e| .{ .move_down = e },
         .merge_down => |ts| .{
             .merge_down = try self.allocator.dupe(TableEntry, ts),
@@ -430,7 +338,11 @@ fn setCandidate(self: *Tree, level: u8, score: f64, job: Job) !void {
         .split => .split,
     };
     self.clearCandidate();
-    self.compact_candidate = .{ .level = level, .score = score, .job = owned };
+    self.compact_candidate = .{
+        .level = c.level,
+        .score = c.score,
+        .job = owned,
+    };
 }
 
 pub fn clearCandidate(self: *Tree) void {
@@ -442,88 +354,167 @@ pub fn clearCandidate(self: *Tree) void {
     self.compact_candidate = null;
 }
 
-/// The job level `src` wants now, null when it wants none. The one
-/// place that decides what compacts: `updateCompactCandidate_` stores
-/// the answer and `buildCompaction` runs it.
+/// `num / den` as a score.
+fn ratio(num: u64, den: u64) f64 {
+    return @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
+}
+
+/// A rewrite's score from its ratio `r`: `r` itself, kept below
+/// `merge_priority_score`, so a merge with tables to spare and a move
+/// outrank a rewrite however far over target its level is. The last
+/// unit under the bound takes every larger ratio in order, so two
+/// rewrites past it still rank by how far over they are.
+fn rewriteScore(r: f64) f64 {
+    const knee = merge_priority_score - 1.0;
+    return if (r <= knee) r else merge_priority_score - knee / r;
+}
+
+/// L0's merge, null when no run is ready (`l0MergeRun`). Its score is
+/// the run's length against the fewest tables a merge takes. Above
+/// 1.0 that becomes `merge_priority_score`, ahead of the push and of
+/// the levels below: the merge is cheap and leaves L1 alone, and every
+/// table it removes is a run each read merges and the brake counts.
+/// Scored against an L1 at six times its target, L0 waited to 99
+/// tables. At exactly 1.0 it does not win the pick and waits for the
+/// tree to be idle.
+fn pickL0Merge(self: *Tree, held: Lock.Shared) ?CompactCandidate {
+    const opts = self.live.cur();
+    const run = l0MergeRun(opts, self.levels[0].entries(held)) orelse
+        return null;
+    const score = ratio(run.len, opts.l0_merge_min_tables);
+    return .{
+        .level = 0,
+        .score = if (score > 1.0) merge_priority_score else score,
+        .job = .{ .merge_l0 = run },
+    };
+}
+
+/// The job level `src` wants now, null when it wants none. With
+/// `pickL0Merge`, what decides which tables compact:
+/// `updateCompactCandidate_` stores the winner and `buildCompaction`
+/// runs it.
 ///
-/// L0 asks `pickL0Job`: a merge run is returned as it is; a push moves
-/// the oldest table alone when it can (`movable`), else pushes the
-/// oldest-first prefix that brings total compaction input bytes
-/// (selected L0 + their L1 overlap) up to `job_max_bytes`.
-/// The table that crosses the budget is included; after it, only
-/// tables that add no L1 overlap (`l0MergeDownOldest`).
-/// Newer L0 tables stay put and continue to shadow the compacted
-/// versions on read.
-///
-/// L≥1 hands over ONE table, at random among those that can move down
-/// as they are when there are any, else among all. Random rather than
-/// the first: always taking the smallest-key table starves higher key
+/// It moves ONE table down as it is when any can, else rewrites a run
+/// of tables (`mergeDownRun`), scored by the level's bytes against its
+/// target. Below L0 the moved table is picked at random among those
+/// that can: always taking the smallest-key table starves higher key
 /// ranges and biases write amplification to the keyspace's left edge.
-fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?Job {
+///
+/// L0 differs in two ways. Only its oldest table may move. Its
+/// rewrite scores the larger of the bytes ratio (L0's target is L1's:
+/// a push of that size costs about two bytes written per byte
+/// drained) and its table count against HALF the backpressure start
+/// count: full-size tables at the target are still too few to score
+/// by count.
+fn pickJob(self: *Tree, held: Lock.Shared, src: usize) ?CompactCandidate {
     const entries = self.levels[src].entries(held);
     if (entries.len == 0) return null;
 
+    const opts = self.live.cur();
     const dest = src + 1;
-    if (src == 0) {
-        const job = pickL0Job(self.live.cur(), entries) orelse return null;
-        if (job != .merge_down) return job;
-        if (movable(self, held, dest, entries[0]))
-            return .{ .move_down = entries[0] };
-        return .{ .merge_down = l0MergeDownOldest(self, held, entries) };
-    }
+    if (dest >= opts.max_levels) return null;
 
-    if (dest >= self.live.cur().max_levels) return null;
-
+    // For move, L0 can only consider the oldest table. Otherwise, we'd
+    // have issues with newer values in lower levels.
+    const pool: []const TableEntry =
+        if (src == 0) entries[0..1] else entries;
     var movables: std.ArrayList(TableEntry) = .empty;
     defer movables.deinit(self.allocator);
-    for (entries) |e| {
+    for (pool) |e| {
         if (movable(self, held, dest, e))
             movables.append(self.allocator, e) catch unreachable;
     }
 
-    const rng_impl: std.Random.IoSource = .{ .io = utils.context.g().io };
-    const rng = rng_impl.interface();
     if (movables.items.len > 0) {
-        const i = rng.uintLessThan(usize, movables.items.len);
-        return .{ .move_down = movables.items[i] };
+        const i = randomIndex(movables.items.len);
+        return .{
+            .level = @intCast(src),
+            .score = move_priority_score,
+            .job = .{ .move_down = movables.items[i] },
+        };
     }
-    const i = rng.uintLessThan(usize, entries.len);
-    return .{ .merge_down = entries[i..][0..1] };
+
+    const size: u64 = @intCast(self.levels[src].getTotalSize(held));
+    const target: u64 = @intCast(levelTarget(opts, src));
+    var score = ratio(size, target);
+    if (src == 0) {
+        const start_count = opts.l0_backpressure_start_count;
+        score = @max(score, ratio(entries.len * 2, start_count));
+    }
+    return .{
+        .level = @intCast(src),
+        .score = rewriteScore(score),
+        .job = .{ .merge_down = mergeDownRun(self, held, src) },
+    };
 }
 
-/// The oldest L0 tables a `merge_down` takes (`pickJob`): `entries` is
-/// L0 oldest first. Past the budget a table is still taken while it
-/// widens no L1 overlap and L0's own bytes are under the budget: the
-/// job rewrites the same L1 tables either way. Without that, an L1
-/// larger than the budget let each push drain a single table.
-fn l0MergeDownOldest(
+/// A random index below `n`.
+fn randomIndex(n: usize) usize {
+    const rng_impl: std.Random.IoSource = .{ .io = utils.context.g().io };
+    return rng_impl.interface().uintLessThan(usize, n);
+}
+
+/// The tables a `merge_down` of level `src` takes: a first table and
+/// its neighbours in the level's order, as many as `job_max_bytes`
+/// allows. L0 starts at its oldest table, so the run is its oldest
+/// tables in order. A lower level starts at a random table and grows
+/// the run evenly to both sides, so neither edge of the level waits
+/// longer than the other; the run is adjacent in key order, so each
+/// table of the level below is rewritten once.
+///
+/// The budget bounds the input, the tables taken plus those they
+/// overlap below. The table that reaches it is taken; after it, only
+/// tables that widen no overlap below, while the run's own bytes are
+/// under the budget: the job rewrites the same tables below either
+/// way. Without that, an L1 larger than the budget let each push
+/// drain a single L0 table.
+fn mergeDownRun(self: *Tree, held: Lock.Shared, src: usize) []const TableEntry {
+    const entries = self.levels[src].entries(held);
+    const budget = self.live.cur().job_max_bytes;
+    const start = if (src == 0) 0 else randomIndex(entries.len);
+
+    // The run is entries[lo..hi], `kr` the union of its key ranges and
+    // `bot` the bytes that union overlaps below.
+    var lo = start;
+    var hi = start + 1;
+    var kr = tableRange(entries[start]);
+    var taken: u64 = entries[start].size;
+    var bot = overlapBytes(self, held, src + 1, kr);
+
+    while (hi < entries.len or lo > 0) {
+        // The side with fewer tables in the run, when both have one.
+        const right = if (lo == 0)
+            true
+        else if (hi == entries.len)
+            false
+        else
+            hi - start <= start - lo;
+        const next = if (right) hi else lo - 1;
+
+        var next_kr = kr;
+        next_kr.extend(tableRange(entries[next]));
+        const next_bot = overlapBytes(self, held, src + 1, next_kr);
+        if (taken + bot >= budget and
+            (next_bot > bot or taken >= budget)) break;
+
+        kr = next_kr;
+        bot = next_bot;
+        taken += entries[next].size;
+        if (right) hi += 1 else lo -= 1;
+    }
+    return entries[lo..hi];
+}
+
+/// The bytes of `level`'s tables that overlap `kr`.
+fn overlapBytes(
     self: *Tree,
     held: Lock.Shared,
-    entries: []const TableEntry,
-) []const TableEntry {
-    const budget = self.live.cur().job_max_bytes;
-    // The union of the tables taken so far; null until the first.
-    var union_kr: ?KeyRange = null;
-    var l0_bytes: u64 = 0;
-    var bot_bytes: u64 = 0;
-    var n: usize = 0;
-    while (n < entries.len) : (n += 1) {
-        var kr = tableRange(entries[n]);
-        if (union_kr) |u| kr.extend(u);
-
-        var next_bot: u64 = 0;
-        for (self.levels[1].overlapping(held, kr)) |oe|
-            next_bot += oe.table.fileSize();
-
-        // The first table is always taken, so a job makes progress.
-        if (n > 0 and l0_bytes + bot_bytes >= budget and
-            (next_bot > bot_bytes or l0_bytes >= budget)) break;
-
-        union_kr = kr;
-        bot_bytes = next_bot;
-        l0_bytes += entries[n].table.fileSize();
-    }
-    return entries[0..n];
+    level: usize,
+    kr: KeyRange,
+) u64 {
+    var bytes: u64 = 0;
+    for (self.levels[level].overlapping(held, kr)) |oe| bytes += oe.size;
+    return bytes;
 }
 
 /// buildCompaction is Phase A: the candidate's job (`CompactCandidate`),

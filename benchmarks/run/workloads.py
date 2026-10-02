@@ -234,9 +234,13 @@ ORDERS = {
     "ddl": ORDERS_DDL,
     "insert": ORDERS_INSERT,
     "row": orders_row,
+    # Whether a row is loaded: a killed load resumes from the answers.
+    "exists": "SELECT id FROM orders WHERE id = {id};",
     # By rows, not by bytes on disk: the same rows for either server.
+    # `create` false loads a further id range into the table as it is.
     "load": {"first": 1, "last": 600_000_000, "streams": 16,
-             "chunk": 100_000, "stop_bytes": None, "stop_secs": None},
+             "chunk": 100_000, "stop_bytes": None, "stop_secs": None,
+             "create": True},
     "vars": {"customers": ORDERS_CUSTOMERS, "skus": ORDERS_SKUS,
              "days": ORDERS_DAYS},
     "scripts": {

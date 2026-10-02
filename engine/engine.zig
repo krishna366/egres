@@ -425,8 +425,10 @@ pub const StorageImpl = struct {
 /// just waiting on an in-flight build to finish.
 pub const InFlight = struct {
     pub const Kind = enum { flush, compaction, split, new_memtable };
+    /// A flush or a new memtable works on no one tree.
+    pub const no_tree: TreeKey = .{ .namespace = 0, .tree_id = 0 };
     kind: Kind,
-    tree_id: u64,
+    tree: TreeKey = no_tree,
     src_level: u8 = 0,
     src_tables: u32 = 0,
     /// Compaction id (`cid`) for `kind == .compaction`; 0 otherwise. Lets
@@ -687,14 +689,21 @@ pub const Engine = struct {
         self.in_flight.append(self.allocator, entry) catch {};
     }
 
-    fn removeInFlight(self: *Engine, kind: InFlight.Kind, tree_id: u64, src_level: u8) void {
+    fn removeInFlight(
+        self: *Engine,
+        kind: InFlight.Kind,
+        tree: TreeKey,
+        src_level: u8,
+    ) void {
         self.in_flight_mu.lock(@src());
         defer self.in_flight_mu.unlock();
-        // Match on (kind, tree_id, src_level) — multiple in-flight entries
+        // Match on (kind, tree, src_level) — multiple in-flight entries
         // with the same key would mean two concurrent compactions on the
         // same level of the same tree, which we don't currently spawn.
         for (self.in_flight.items, 0..) |it, i| {
-            if (it.kind == kind and it.tree_id == tree_id and it.src_level == src_level) {
+            if (it.kind == kind and std.meta.eql(it.tree, tree) and
+                it.src_level == src_level)
+            {
                 _ = self.in_flight.orderedRemove(i);
                 return;
             }
@@ -774,8 +783,10 @@ pub const Engine = struct {
             for (self.in_flight.items) |it| {
                 const age_ms = now_ms - it.started_at_ms;
                 if (age_ms < stuck_threshold_ms) continue;
-                log.warn("in-flight stuck: kind={s} cid={d} tree={d} src_level={d} age_ms={d}", .{
-                    @tagName(it.kind), it.cid, it.tree_id, it.src_level, age_ms,
+                log.warn("in-flight stuck: kind={s} cid={d} tree={d}:{d} " ++
+                    "src_level={d} age_ms={d}", .{
+                    @tagName(it.kind), it.cid,       it.tree.namespace,
+                    it.tree.tree_id,   it.src_level, age_ms,
                 });
             }
         }
@@ -1176,10 +1187,9 @@ pub const Engine = struct {
     fn proposeNewMemtable(self: *Engine) !void {
         self.addInFlight(.{
             .kind = .new_memtable,
-            .tree_id = 0,
             .started_at_ms = utils.coarseMs(),
         });
-        defer self.removeInFlight(.new_memtable, 0, 0);
+        defer self.removeInFlight(.new_memtable, InFlight.no_tree, 0);
         // memtable_id stays 0 in the proposal: the id is assigned at apply
         // as the entry's own log index, identically on every node.
         const payload = try zdb_bufs.marshalRoot(self.allocator, _manifest.ManifestChange{ .cmd = .new_memtable, .memtable_id = 0 });
@@ -1194,14 +1204,13 @@ pub const Engine = struct {
 
         // Track the flush BUILD as in-flight (writing SSTs is the slow
         // part). buildFlush iterates the oldest immutable memtable; we
-        // don't know the target tree(s) until changes return, so use
-        // tree_id=0 as a "global" marker.
+        // don't know the target tree(s) until changes return, so the
+        // record names no tree.
         self.addInFlight(.{
             .kind = .flush,
-            .tree_id = 0,
             .started_at_ms = utils.coarseMs(),
         });
-        defer self.removeInFlight(.flush, 0, 0);
+        defer self.removeInFlight(.flush, InFlight.no_tree, 0);
 
         const result = try self.forest.buildFlush() orelse return;
 
@@ -1234,12 +1243,16 @@ pub const Engine = struct {
         // on a build/sync that hasn't proposed yet.
         self.addInFlight(.{
             .kind = .compaction,
-            .tree_id = target.key.tree_id,
+            .tree = target.key,
             .src_level = @intCast(target.candidate.level),
             .cid = cid,
             .started_at_ms = utils.coarseMs(),
         });
-        defer self.removeInFlight(.compaction, target.key.tree_id, @intCast(target.candidate.level));
+        defer self.removeInFlight(
+            .compaction,
+            target.key,
+            @intCast(target.candidate.level),
+        );
 
         const src = target.candidate.level;
         const t0 = utils.coarseMs();
@@ -1289,10 +1302,10 @@ pub const Engine = struct {
 
         self.addInFlight(.{
             .kind = .split,
-            .tree_id = key.tree_id,
+            .tree = key,
             .started_at_ms = utils.coarseMs(),
         });
-        defer self.removeInFlight(.split, key.tree_id, 0);
+        defer self.removeInFlight(.split, key, 0);
         // buildSplit allocates sstable_changes / tree_changes on the arena;
         // encodeManifestChange copies the bytes into a self-owned payload,
         // so the arena can be torn down right after encode. No new SST
@@ -1442,13 +1455,18 @@ pub const Engine = struct {
         try w.print("\n  in-flight:\n", .{});
         for (self.in_flight.items) |it| {
             const age_ms = now - it.started_at_ms;
+            const ns = it.tree.namespace;
+            const id = it.tree.tree_id;
             switch (it.kind) {
                 .compaction => try w.print(
-                    "    compaction tree={d} L{d} age_ms={d}\n",
-                    .{ it.tree_id, it.src_level, age_ms },
+                    "    compaction tree={d}:{d} L{d} age_ms={d}\n",
+                    .{ ns, id, it.src_level, age_ms },
                 ),
                 .flush => try w.print("    flush age_ms={d}\n", .{age_ms}),
-                .split => try w.print("    split tree={d} age_ms={d}\n", .{ it.tree_id, age_ms }),
+                .split => try w.print(
+                    "    split tree={d}:{d} age_ms={d}\n",
+                    .{ ns, id, age_ms },
+                ),
                 .new_memtable => try w.print("    new_memtable age_ms={d}\n", .{age_ms}),
             }
         }

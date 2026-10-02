@@ -116,10 +116,10 @@ def forest_gauges(text: str) -> dict[str, int]:
     m = re.search(r"trees: (\d+)", text)
     if m:
         g["egres_trees"] = int(m.group(1))
-    m = re.search(r"largest_tree: id=\d+ size=(\S+)", text)
+    m = re.search(r"largest_tree: id=[\d:]+ size=(\S+)", text)
     if m:
         g["egres_largest_tree_bytes"] = size_bytes(m.group(1))
-    m = re.search(r"L0: tables=(\d+) \(max=(\d+) in tree \d+\)\s+"
+    m = re.search(r"L0: tables=(\d+) \(max=(\d+) in tree [\d:]+\)\s+"
                   r"bytes=(\S+) \(max=(\S+)", text)
     if m:
         g["egres_l0_tables"] = int(m.group(1))

@@ -101,7 +101,7 @@ pub const help_text =
     \\  ns create <ns>                  create a namespace
     \\  zdb                             Prometheus-format storage metrics dump
     \\  zdb forest                      hierarchical forest summary
-    \\  zdb tree=<id>                   forest summary scoped to one tree
+    \\  zdb tree=<ns>:<id>              forest summary scoped to one tree
     \\  zdb namespace=<id>              forest summary for trees in one namespace
     \\  raft                            cluster topology + per-peer log progress
     \\  raft entry <N>                  dump WAL entry N (one human-readable line)
@@ -126,7 +126,7 @@ pub const NsCreateCmd = struct {
 
 /// `zdb`                 → Prometheus dump (existing behavior; loadtest scrapes this)
 /// `zdb forest`          → hierarchical forest summary
-/// `zdb tree=<N>`        → forest summary scoped to one tree
+/// `zdb tree=<ns>:<N>`   → forest summary scoped to one tree
 /// `zdb namespace=<N>`   → forest summary for trees in one namespace
 pub const ZdbCmd = struct {
     filter: Filter = .prom,

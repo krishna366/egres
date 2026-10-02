@@ -56,7 +56,7 @@ const Fixture = struct {
         };
         self.dir = try tmpPath(alloc, &self.tmp);
         // A bottom target of one byte makes a push L0's job at any
-        // size (`pickL0Job`), so `compactL0` below pushes into L1.
+        // size (`pickJob`), so `compactL0` below pushes into L1.
         self.live = try flags.Live(Config).create(alloc, .{
             .dir = self.dir,
             .lmax_target_bytes = 1,

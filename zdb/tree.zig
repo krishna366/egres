@@ -33,7 +33,6 @@ const log = std.log.scoped(.zdb_tree);
 
 // Compaction lives in compaction.zig; these keep `_tree.X` and this
 // file's own references to the moved declarations resolving.
-pub const Targets = _compaction.Targets;
 pub const CompactCandidate = _compaction.CompactCandidate;
 pub const split_priority_score = _compaction.split_priority_score;
 const MultiGet = @import("read.zig").MultiGet;
@@ -339,7 +338,6 @@ pub const Tree = struct {
     mu: Lock = .{},
 
     // Compaction, from compaction.zig.
-    pub const levelTargets = _compaction.levelTargets;
     pub const updateCompactCandidate = _compaction.updateCompactCandidate;
     pub const updateCompactCandidate_ = _compaction.updateCompactCandidate_;
     pub const clearCandidate = _compaction.clearCandidate;

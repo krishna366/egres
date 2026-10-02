@@ -106,8 +106,9 @@ pub const Config = struct {
     // preferred job). Small L0 tables are first merged among themselves:
     // an L0→L0 job takes the tables after the newest finished one, in
     // order, up to twice the L0 file size (the memtable size, 64 MiB),
-    // and writes ONE output table (see `pickL0Job`). It runs once that
-    // run has `l0_merge_min_tables` tables. A table that has reached the
+    // and writes ONE output table (see `l0MergeRun`). A run needs
+    // `l0_merge_min_tables` tables; with more it runs ahead of the push
+    // and the levels below. A table that has reached the
     // L0 file size is finished: it is never merged again and waits for
     // the push to L1. So a byte is rewritten within L0 only until it
     // sits in a finished table; an unfinished output is merged again
@@ -115,8 +116,9 @@ pub const Config = struct {
     // the job costs what its inputs weigh, where an L0→L1 job over the
     // same tables rewrites every L1 table they overlap. 0 disables L0→L0.
     //
-    // An L0→L1 job runs once L0 holds as many bytes as L1's target size
-    // (`levelTargets`; 410 MiB when Lmax targets 10 GiB). An L0→L1 job rewrites
+    // An L0→L1 job is due once L0 holds as many bytes as L1's target size
+    // (`levelTarget`; 410 MiB when Lmax targets 10 GiB), and then
+    // competes with the levels below on score. An L0→L1 job rewrites
     // about all of L1, since L0 tables span the tree's range, so it costs
     // (L0 + L1) / L0 bytes written per byte drained: about 2 when L0 has
     // grown to L1's size, 10 and more when a few small tables are pushed.
@@ -124,13 +126,14 @@ pub const Config = struct {
     // `l0_merge_min_tables` unfinished tables sit after the newest
     // finished one, and the finished ones number at most L1's target
     // over the L0 file size.
-    l0_merge_min_tables: u32 = 3,
+    l0_merge_min_tables: u32 = 4,
 
-    // Roaring posting rollup (zdb/compaction.zig's VersionTracker).
+    // Roaring posting rollup (zdb/emitter.zig's VersionTracker).
     // Compaction folds a
     // version run whose newest item is a roaring delta into one full
     // bitmap state, so reads stop at their first hit instead of
-    // walking a delta chain.
+    // walking a delta chain. Only a compaction into L1 or deeper: an
+    // L0 to L0 merge leaves chains as they are.
     //
     // A chain whose base state is among the compaction's own inputs
     // rolls up for free (the merge already streams every input byte
@@ -180,7 +183,7 @@ pub const Config = struct {
             " along L1 table boundaries, 1 to 16.",
         .level_size_multiplier = "Each level's byte target is the next" ++
             " deeper level's divided by this.",
-        .max_levels = "Levels per tree, L0 included.",
+        .max_levels = "Levels per tree, L0 included. At least 2.",
         .lmax_target_bytes = "Byte target of a tree's bottom level. The" ++
             " levels above are a fifth of the one below. A tree splits" ++
             " at its median key into two once it holds five fourths of" ++
@@ -247,7 +250,9 @@ pub const Config = struct {
             return error.InvalidPushFibers;
         if (self.table_bytes == 0) return error.InvalidTableSize;
         if (self.block_bytes == 0) return error.InvalidBlockSize;
-        if (self.max_levels == 0) return error.InvalidMaxLevels;
+        // L0 needs an L1 to push into, and only a level below L0 rolls
+        // postings up and discards old versions.
+        if (self.max_levels < 2) return error.InvalidMaxLevels;
         if (self.in_memory and
             self.dir.len != 0) return error.InvalidDirForInMemory;
         // A merge of one table is a copy.

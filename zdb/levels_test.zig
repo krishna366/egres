@@ -30,7 +30,7 @@ const TableCache = zdb.tree.TableCache;
 const config = zdb.config;
 
 /// A bottom target of one byte makes a push L0's job at any size
-/// (`pickL0Job`), so compacting L0 here pushes into L1 as the tests
+/// (`pickJob`), so compacting L0 here pushes into L1 as the tests
 /// expect, instead of L0 asking for nothing or merging within itself.
 const push_lmax: i64 = 1;
 
@@ -1332,12 +1332,12 @@ test "compaction: overlapping L0 tables are merged, not moved" {
 
     // The oldest meets nothing in an empty L1 and moves; the next one
     // then meets it there and is merged into it. L1's target holds one
-    // table, so L1 never outscores L0: the first push is L0's by its
-    // count, the second the idle pick once nothing scores.
+    // table, so L1 never outscores L0, whose one table left scores
+    // 2.0 by its count.
     var cfg = config.Config{
         .max_levels = 3,
         .lmax_target_bytes = 5 * 4096, // L1 target: one 4 KiB table
-        .l0_backpressure_start_count = 2,
+        .l0_backpressure_start_count = 1,
         .l0_merge_min_tables = 0,
     };
     cfg.dir = dir_path;
@@ -1466,8 +1466,9 @@ test "compaction: an L0 push that overlaps L1 waits for room below" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    // Same shape, but L1's table spans L0's keys: the push would
-    // rewrite it, so L1's fullness dampens L0 and L1 compacts first.
+    // L1's first table spans L0's keys, so the push would rewrite it.
+    // L1 holds eight tables to L0's four smaller ones: it is the more
+    // over-full by bytes as well as by count, and compacts first.
     var cfg = score_cfg;
     cfg.dir = dir_path;
     var fx: TombstoneFixture = undefined;
@@ -1477,9 +1478,16 @@ test "compaction: an L0 push that overlaps L1 waits for room below" {
         .{ .id = 4, .level = 0, .egids = &.{103} },
         .{ .id = 5, .level = 0, .egids = &.{104} },
         .{ .id = 6, .level = 1, .egids = &egidRun(100, 50) },
-        .{ .id = 7, .level = 2, .egids = &egidRun(200, 50) },
-        .{ .id = 8, .level = 2, .egids = &egidRun(300, 50) },
-        .{ .id = 9, .level = 2, .egids = &egidRun(400, 50) },
+        .{ .id = 7, .level = 1, .egids = &egidRun(1000, 50) },
+        .{ .id = 8, .level = 1, .egids = &egidRun(1100, 50) },
+        .{ .id = 9, .level = 1, .egids = &egidRun(1200, 50) },
+        .{ .id = 10, .level = 1, .egids = &egidRun(1300, 50) },
+        .{ .id = 11, .level = 1, .egids = &egidRun(1400, 50) },
+        .{ .id = 12, .level = 1, .egids = &egidRun(1500, 50) },
+        .{ .id = 13, .level = 1, .egids = &egidRun(1600, 50) },
+        .{ .id = 14, .level = 2, .egids = &egidRun(200, 50) },
+        .{ .id = 15, .level = 2, .egids = &egidRun(300, 50) },
+        .{ .id = 16, .level = 2, .egids = &egidRun(400, 50) },
     });
     defer fx.deinit();
 
@@ -1488,11 +1496,203 @@ test "compaction: an L0 push that overlaps L1 waits for room below" {
     try std.testing.expectEqual(@as(u8, 1), cand.level);
 }
 
+test "compaction: an L0 merge with tables to spare runs ahead of L1" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Four small L0 tables where a merge takes three: the merge scores
+    // above 1.0. With three it would wait for the tree to be idle.
+    var cfg = config.Config{ .max_levels = 3, .l0_merge_min_tables = 3 };
+    cfg.dir = dir_path;
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{101} },
+        .{ .id = 3, .level = 0, .egids = &.{102} },
+        .{ .id = 4, .level = 0, .egids = &.{103} },
+        .{ .id = 9, .level = 0, .egids = &.{104} },
+        .{ .id = 5, .level = 1, .egids = &egidRun(100, 450) },
+        .{ .id = 6, .level = 1, .egids = &egidRun(1000, 450) },
+        .{ .id = 7, .level = 1, .egids = &egidRun(2000, 450) },
+        .{ .id = 8, .level = 1, .egids = &egidRun(3000, 450) },
+    });
+    defer fx.deinit();
+
+    var l0_bytes: u64 = 0;
+    for (fx.tree.levels[0].tables.items) |e| l0_bytes += e.table.fileSize();
+    var l1_bytes: u64 = 0;
+    for (fx.tree.levels[1].tables.items) |e| l1_bytes += e.table.fileSize();
+
+    // An L1 target just over L0's bytes: no push is due, and L1 is
+    // over its target, so it scores above 1.0 and would win the pick.
+    const l1_target = l0_bytes + 1;
+    try std.testing.expect(l1_bytes > l1_target);
+    var buf: [64]u8 = undefined;
+    try fx.live.update(try std.fmt.bufPrint(
+        &buf,
+        "lmax_target_bytes={d}",
+        .{5 * l1_target},
+    ));
+
+    try fx.tree.updateCompactCandidate();
+    const cand = fx.tree.compact_candidate orelse
+        return error.TestExpectedCandidate;
+    try std.testing.expectEqual(@as(u8, 0), cand.level);
+    try std.testing.expect(cand.job == .merge_l0);
+}
+
+test "compaction: a push with few tables scores by L0's bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Two L0 tables against a start count of 32: 0.125 by count. They
+    // span L1's one smaller table, so the push is a rewrite.
+    var cfg = config.Config{ .max_levels = 3 };
+    cfg.dir = dir_path;
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &egidRun(100, 450) },
+        .{ .id = 3, .level = 0, .egids = &egidRun(1000, 450) },
+        .{ .id = 4, .level = 1, .egids = &egidRun(200, 50) },
+    });
+    defer fx.deinit();
+
+    // Under the default target L0 is left to fill: no push is due, two
+    // tables are too few to merge, and the tree has no candidate.
+    try fx.tree.updateCompactCandidate();
+    try std.testing.expect(fx.tree.compact_candidate == null);
+
+    var l0_bytes: u64 = 0;
+    for (fx.tree.levels[0].tables.items) |e| l0_bytes += e.table.fileSize();
+    const l1_bytes = fx.tree.levels[1].tables.items[0].table.fileSize();
+    try std.testing.expect(l0_bytes > l1_bytes);
+
+    // An L1 target just under L1's bytes: L1 scores a little over 1.0
+    // and would win over L0's count. L0 holds more bytes than L1, so
+    // by bytes it is the more over-full, and its push is picked.
+    var buf: [64]u8 = undefined;
+    try fx.live.update(try std.fmt.bufPrint(
+        &buf,
+        "lmax_target_bytes={d}",
+        .{5 * (l1_bytes - 1)},
+    ));
+
+    try fx.tree.updateCompactCandidate();
+    const cand = fx.tree.compact_candidate orelse
+        return error.TestExpectedCandidate;
+    try std.testing.expectEqual(@as(u8, 0), cand.level);
+    try std.testing.expect(cand.job == .merge_down);
+}
+
+test "compaction: L0 merges its small tables before a push that is due" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // A 1 byte target: L0 is due a push whatever it holds. L1 is the
+    // bottom, so the push is a rewrite and L1 never competes.
+    var cfg = config.Config{
+        .max_levels = 2,
+        .lmax_target_bytes = 1,
+        .l0_merge_min_tables = 3,
+    };
+    cfg.dir = dir_path;
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{101} },
+        .{ .id = 3, .level = 0, .egids = &.{102} },
+        .{ .id = 4, .level = 0, .egids = &.{103} },
+        .{ .id = 5, .level = 0, .egids = &.{104} },
+        .{ .id = 6, .level = 1, .egids = &egidRun(100, 50) },
+    });
+    defer fx.deinit();
+
+    // Both jobs are ready. Four tables where a merge takes three: the
+    // merge goes first.
+    try fx.tree.updateCompactCandidate();
+    {
+        const cand = fx.tree.compact_candidate orelse
+            return error.TestExpectedCandidate;
+        try std.testing.expectEqual(@as(u8, 0), cand.level);
+        try std.testing.expect(cand.job == .merge_l0);
+        try std.testing.expectEqual(@as(usize, 4), cand.job.merge_l0.len);
+    }
+    try compact(fx.tree, 10, 0);
+    try std.testing.expectEqual(@as(usize, 1), fx.tree.numTablesAt(0));
+
+    // One table left, nothing to merge: the push runs.
+    {
+        const cand = fx.tree.compact_candidate orelse
+            return error.TestExpectedCandidate;
+        try std.testing.expectEqual(@as(u8, 0), cand.level);
+        try std.testing.expect(cand.job == .merge_down);
+    }
+    try compact(fx.tree, 11, 0);
+    try std.testing.expectEqual(@as(usize, 0), fx.tree.numTablesAt(0));
+    try expectEgids(alloc, fx.tree, &.{ 100, 101, 104, 149 });
+}
+
 fn setJobMaxBytes(fx: *TombstoneFixture, bytes: u64) !void {
     var buf: [64]u8 = undefined;
     const input = try std.fmt.bufPrint(&buf, "job_max_bytes={d}", .{bytes});
     try fx.live.update(input);
     try fx.tree.updateCompactCandidate();
+}
+
+test "compaction: a level below L0 rewrites a run of adjacent tables" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // Six adjacent L1 tables over one L2 table that spans them all. L2
+    // is the bottom, so nothing moves: L1's job is a rewrite.
+    var cfg = config.Config{ .max_levels = 3 };
+    cfg.dir = dir_path;
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 1, .egids = &egidRun(100, 50) },
+        .{ .id = 3, .level = 1, .egids = &egidRun(200, 50) },
+        .{ .id = 4, .level = 1, .egids = &egidRun(300, 50) },
+        .{ .id = 5, .level = 1, .egids = &egidRun(400, 50) },
+        .{ .id = 6, .level = 1, .egids = &egidRun(500, 50) },
+        .{ .id = 7, .level = 1, .egids = &egidRun(600, 50) },
+        .{ .id = 8, .level = 2, .egids = &.{ 50, 700 } },
+    });
+    defer fx.deinit();
+
+    var l1_bytes: u64 = 0;
+    for (fx.tree.levels[1].tables.items) |e| l1_bytes += e.size;
+    const one = l1_bytes / 6;
+
+    // A target of one byte and a budget of three and a half tables.
+    // Every run overlaps the one L2 table, so a neighbour adds no
+    // overlap: the job stops once its own tables reach the budget, at
+    // four, whichever it starts at, and they are neighbours.
+    try fx.live.update("lmax_target_bytes=5");
+    try setJobMaxBytes(&fx, one * 7 / 2);
+    {
+        const cand = fx.tree.compact_candidate orelse
+            return error.TestExpectedCandidate;
+        try std.testing.expectEqual(@as(u8, 1), cand.level);
+        const run = cand.job.merge_down;
+        try std.testing.expectEqual(@as(usize, 4), run.len);
+        for (run[1..], run[0 .. run.len - 1]) |e, prev|
+            try std.testing.expectEqual(prev.id + 1, e.id);
+    }
+
+    // The run compacts as one job: its tables leave L1 together.
+    try compact(fx.tree, 10, 0);
+    try std.testing.expectEqual(@as(usize, 2), fx.tree.numTablesAt(1));
+    try expectEgids(alloc, fx.tree, &.{ 50, 100, 349, 649, 700 });
 }
 
 test "compaction: a push takes L0 tables that add no L1 overlap" {
@@ -1921,6 +2121,17 @@ fn setupTreeWithCfg(
     cfg: config.Config,
     entries: []const MetaEntry,
 ) !void {
+    return setupTreeWithTables(alloc, fx, dir_path, cfg, &.{entries});
+}
+
+/// setupTreeWithCfg with one L0 table per entry list, oldest first.
+fn setupTreeWithTables(
+    alloc: std.mem.Allocator,
+    fx: *TombstoneFixture,
+    dir_path: String,
+    cfg: config.Config,
+    tables: []const []const MetaEntry,
+) !void {
     const tree_id: u64 = 1;
     fx.manifest = _manifest.Manifest.init(alloc);
     errdefer fx.manifest.deinit();
@@ -1928,9 +2139,19 @@ fn setupTreeWithCfg(
         createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
     });
 
-    var tb = try buildTableMeta(alloc, entries);
-    defer tb.deinit();
-    try installTable(alloc, &fx.manifest, dir_path, &tb, 1, tree_id, 0);
+    for (tables, 1..) |entries, sst_id| {
+        var tb = try buildTableMeta(alloc, entries);
+        defer tb.deinit();
+        try installTable(
+            alloc,
+            &fx.manifest,
+            dir_path,
+            &tb,
+            sst_id,
+            tree_id,
+            0,
+        );
+    }
 
     var opts = cfg;
     opts.dir = dir_path;
@@ -2060,6 +2281,52 @@ test "compaction: rollup folds a delta chain onto its in-inputs state" {
     var at150 = try foldAt(alloc, fx.tree, "k", 150);
     defer at150.deinit();
     try std.testing.expectEqual(@as(u64, 2), at150.getCardinality());
+}
+
+test "compaction: an L0 to L0 merge does not roll up" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const d300 = try encodeDelta(alloc, &.{40}, &.{2});
+    defer alloc.free(d300);
+    const d200 = try encodeDelta(alloc, &.{ 2, 3 }, &.{});
+    defer alloc.free(d200);
+    const s100 = try encodeState(alloc, &.{ 1, 2 });
+    defer alloc.free(s100);
+
+    // Three small L0 tables, far under L1's target, where a merge
+    // takes three: the job is an L0 to L0 merge. The chain has its
+    // state among the inputs, which a push would fold.
+    var fx: TombstoneFixture = undefined;
+    try setupTreeWithTables(alloc, &fx, dir_path, .{
+        .max_levels = 4,
+        .l0_merge_min_tables = 3,
+    }, &.{
+        &.{.{ .key = "k", .ts = 100, .val = s100, .meta = roaring_state }},
+        &.{.{ .key = "k", .ts = 200, .val = d200, .meta = roaring_delta }},
+        &.{.{ .key = "k", .ts = 300, .val = d300, .meta = roaring_delta }},
+    });
+    defer fx.deinit();
+
+    try compact(fx.tree, 10, 0);
+    try std.testing.expectEqual(@as(usize, 1), fx.tree.numTablesAt(0));
+    try std.testing.expectEqual(@as(usize, 0), fx.tree.numTablesAt(1));
+
+    // The newest version is still the delta, and the chain folds to
+    // the posting it folded to before.
+    const top = try fx.tree.get(.{ .key = .{ .primary = "k" } }) orelse
+        return error.TestExpectedItem;
+    defer top.free(alloc);
+    try std.testing.expect(top.newest().meta.isDelta());
+    try std.testing.expectEqual(@as(u64, 300), top.newest().ts);
+
+    var bm = try foldAt(alloc, fx.tree, "k", std.math.maxInt(u64));
+    defer bm.deinit();
+    try std.testing.expectEqual(@as(u64, 3), bm.getCardinality());
+    for ([_]u64{ 1, 3, 40 }) |v| try std.testing.expect(bm.contains(v));
 }
 
 test "compaction: rollup leaves lone states and baseless chains alone" {

@@ -33,7 +33,12 @@ iostat.py), which is also logged per minute for the data dir's disk.
 
 `--resume` continues a load stopped that way: it reads load.log for the
 last "load start" and each stream's "done at id" line after it, and
-starts every stream after its last committed id.
+starts every stream after its last committed id. A load that was
+killed (`bench.py stop`) logged no such lines; its streams' last ids
+are then found on the server (`last_loaded`).
+
+`--set load.create=false` with a new `load.first` and `load.last`
+loads a further id range into the table an earlier load made.
 
 The readers: the workload's reader groups, each a pgbench of its own
 on its own scripts for the whole load (a group per kind of query, so a
@@ -226,9 +231,39 @@ def slices(first: int, last: int, streams: int):
     return out
 
 
-def resume_points(events: Path, first: int, last: int, streams: int):
+def last_loaded(run, workload: str, a: int, b: int) -> int:
+    """The last id of [a, b] the server holds, a - 1 when it holds
+    none. A stream loads its slice in id order, so the ids present are
+    a prefix of the slice, and a binary search of point lookups finds
+    where it ends."""
+    import workloads
+    query = workloads.WORKLOADS[workload]["exists"]
+
+    def present(rid: int) -> bool:
+        res = subprocess.run(
+            [str(run.psql), run.conn, "-X", "-q", "-t", "-A", "-c",
+             query.format(id=rid)], capture_output=True, text=True)
+        if res.returncode != 0:
+            sys.exit(f"resume: lookup of id {rid} failed: "
+                     f"{res.stderr.strip()}")
+        return bool(res.stdout.strip())
+
+    lo, hi = a - 1, b
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if present(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def resume_points(events: Path, first: int, last: int, streams: int,
+                  probe=None):
     """Per stream, the id after its last committed one, from the last
-    "load start" section of load.log; and the rows already loaded."""
+    "load start" section of load.log; and the rows already loaded. A
+    stream with no "done at id" line (the load was killed) gets its
+    last id from `probe(a, b)`, when there is one."""
     lines = events.read_text().splitlines()
     starts = [i for i, l in enumerate(lines)
               if " load start " in l or " load resume " in l]
@@ -239,11 +274,16 @@ def resume_points(events: Path, first: int, last: int, streams: int):
         m = re.search(r" stream (\d+) done at id (\d+)", line)
         if m:
             done[int(m.group(1))] = int(m.group(2))
+    # A chunk that was given up left a hole: the ids present are then
+    # not a prefix, which is what the probe searches for.
+    holes = any(" given up" in line for line in lines[starts[-1]:])
     points, rows = [], 0
     for i, a, b in slices(first, last, streams):
         if i not in done:
-            sys.exit(f"resume: stream {i} has no 'done at id' line; "
-                     "the stopped run did not stop cleanly")
+            if probe is None or holes:
+                sys.exit(f"resume: stream {i} has no 'done at id' line; "
+                         "the stopped run did not stop cleanly")
+            done[i] = probe(a, b)
         rows += done[i] - a + 1
         points.append((i, done[i] + 1, b))
     return points, rows
@@ -380,13 +420,15 @@ def run_load(run, resume: bool):
     total = cfg["last"] - cfg["first"] + 1
     prog = Progress()
     if resume:
-        points, prog.rows = resume_points(events, cfg["first"], cfg["last"],
-                                          cfg["streams"])
+        points, prog.rows = resume_points(
+            events, cfg["first"], cfg["last"], cfg["streams"],
+            lambda a, b: last_loaded(run, workload, a, b))
         with open(events, "a") as ef:
             ef.write(f"{utc()} load resume rows={prog.rows} from "
                      + " ".join(f"{i}:{a}" for i, a, _ in points) + "\n")
     else:
-        create_table(run, workload)
+        if cfg.get("create", True):
+            create_table(run, workload)
         points = slices(cfg["first"], cfg["last"], cfg["streams"])
         with open(events, "a") as ef:
             ef.write(f"{utc()} load start ids {cfg['first']}..{cfg['last']} "

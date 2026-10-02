@@ -176,6 +176,19 @@ PANELS = [
         ('egres_l0_tables_max_tree', "busiest tree"),
         ('egres_inflight_jobs', "in-flight jobs"),
     ], fill=0, desc="Backpressure starts at 32 tables in one tree."),
+    ts("Write backpressure", "none", [
+        ('rate(zdb_write_backpressure_ms_sum[1m]) / 1000',
+         "seconds slept per second, all writers"),
+        ('rate(zdb_write_backpressure_ms_count[1m])',
+         "braked batches per second"),
+        ('rate(zdb_write_backpressure_ms_sum[1m]) / '
+         'rate(zdb_write_backpressure_ms_count[1m])',
+         "mean sleep per braked batch, ms"),
+    ], fill=0, desc="A write batch sleeps before it is proposed when a "
+                    "tree it writes to has over 32 L0 tables, or over 8 "
+                    "memtables wait for a flush: 20 ms per table or "
+                    "memtable over, 500 ms at most. Batches that did "
+                    "not sleep are not counted."),
     ts("Memtables", "bytes", [
         ('egres_memtable_active_bytes', "active"),
         ('egres_memtable_immutable_bytes', "immutable, pending flush"),
@@ -224,13 +237,16 @@ PANELS = [
 
     row("Host"),
     ts("CPU", "percent", [
-        ('100 - avg(rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100',
-         "host busy %"),
-        (f'rate(namedprocess_namegroup_cpu_seconds_total{{{EGRES}}}[1m])'
-         ' * 100 / 32', "egres % of 32 threads"),
+        ('(1 - sum(rate(node_cpu_seconds_total{mode=~"idle|iowait"}[1m]))'
+         ' / count(node_cpu_seconds_total{mode="idle"})) * 100',
+         "host cpu %"),
+        (f'sum(rate(namedprocess_namegroup_cpu_seconds_total{{{EGRES}}}'
+         '[1m])) * 100 / 32', "egres % of 32 threads"),
         ('avg(rate(node_cpu_seconds_total{mode="iowait"}[1m])) * 100',
          "iowait %"),
-    ], fill=0),
+    ], fill=0, desc="host cpu is user and system time. Waiting on I/O "
+                    "is its own line: a CPU with nothing to run while "
+                    "a disk request is out, which is not work."),
     ts("Memory", "bytes", [
         ('egres_cgroup_memory_bytes', "server cgroup used"),
         ('egres_cgroup_memory_max_bytes', "server cgroup cap"),

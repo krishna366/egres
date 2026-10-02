@@ -76,7 +76,7 @@ const TableTrees = _forest.TableTrees;
 const config = zdb.config;
 
 /// A bottom target of one byte makes a push L0's job at any size
-/// (`pickL0Job`), so compacting L0 pushes into L1 as the tests
+/// (`pickJob`), so compacting L0 pushes into L1 as the tests
 /// that compact L0 expect.
 const push_lmax: i64 = 1;
 

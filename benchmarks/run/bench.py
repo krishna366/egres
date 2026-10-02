@@ -418,6 +418,8 @@ def detach(run: Run, sub: str, extra: list[str], out_name: str):
 
 def cmd_load(run: Run, foreground: bool, resume: bool):
     if not foreground:
+        # `stop` leaves a STOP file, which would end this load at once.
+        (run.out / "STOP").unlink(missing_ok=True)
         detach(run, "load", ["--resume"] if resume else [],
                "load_driver.out")
         time.sleep(2)
