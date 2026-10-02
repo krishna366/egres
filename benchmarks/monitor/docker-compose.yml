@@ -7,6 +7,8 @@
 # Paths come from `.env`, which benchmarks/run/lib.sh writes for the
 # current run (`docker compose up -d` then recreates what changed):
 #   EGRES_DATA_DIR  the data dir, mounted read-only for size/file counts
+#   WAL_ROOT        the WAL root, mounted read-only for the WAL's size
+#   WAL_NAME        the run's WAL dir under it
 #   TEXTFILE_DIR    where the load driver and pgbench parser drop *.prom
 #   CGROUP_PATH     the server's cgroup when it runs under a memory cap
 #   PG_CONN         the Postgres URL for the postgres exporter, if any
@@ -81,12 +83,16 @@ services:
     volumes:
       - ./bridge:/bridge:ro
       - ${EGRES_DATA_DIR}:/egres-data:ro
+      # The root, not the run's WAL dir: a server may remove and
+      # recreate that dir, which a mount of it would not follow.
+      - ${WAL_ROOT}:/wal-root:ro
       - /sys/fs/cgroup:/host-cgroup:ro
     command:
       - python3
       - /bridge/exporter.py
       - --admin=127.0.0.1:5210
       - --data=/egres-data
+      - --wal=/wal-root/${WAL_NAME}
       - --listen=9877
       - --cgroup=${CGROUP_PATH:-}
       - --cgroup-root=/host-cgroup

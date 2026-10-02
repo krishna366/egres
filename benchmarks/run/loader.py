@@ -81,8 +81,8 @@ class Latency:
     """Insert statement latencies, in milliseconds: all of them for the
     final percentiles (4 bytes each, a few million), the ones since
     the last log line, and histogram buckets for Prometheus."""
-    BUCKETS_MS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,
-                  10000, 30000)
+    BUCKETS_MS = (1, 2, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200,
+                  300, 500, 1000, 2000, 5000, 10000, 30000)
 
     def __init__(self):
         self.all = array.array("f")
@@ -114,12 +114,12 @@ class Latency:
 
 
 def spread(vals) -> dict:
-    """n, p50, p90, p99, p999 and max of a list of latencies."""
+    """n, p50, p95, p99, p999 and max of a list of latencies."""
     ordered = sorted(vals)
     if not ordered:
         return {"n": 0}
     out = {"n": len(ordered), "max": ordered[-1]}
-    for key, pct in (("p50", 50), ("p90", 90), ("p99", 99), ("p999", 99.9)):
+    for key, pct in (("p50", 50), ("p95", 95), ("p99", 99), ("p999", 99.9)):
         out[key] = pgbench.percentile(ordered, pct)
     return out
 
@@ -443,6 +443,7 @@ def run_load(run, resume: bool):
                          f"data={size / GIB:.1f}GiB "
                          f"streams={prog.running} failed={prog.failed}"
                          + (f" insert_ms p50={ins['p50']:.1f} "
+                            f"p95={ins['p95']:.1f} "
                             f"p99={ins['p99']:.1f} max={ins['max']:.1f}"
                             if ins["n"] else "")
                          + f" disk_MiBps read={rd / mib:.0f} "
@@ -552,15 +553,15 @@ def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
         f"{mem['end'] / GIB:.1f} GiB as the load ended.\n",
         "## Insert latency\n",
         "One INSERT statement's round trip as psql timed it, in ms.\n",
-        "| statements | p50 | p90 | p99 | p99.9 | max |",
+        "| statements | p50 | p95 | p99 | p99.9 | max |",
         "|---|---|---|---|---|---|",
-        f"| {ins['n']:,} | {ms(ins, 'p50')} | {ms(ins, 'p90')} | "
+        f"| {ins['n']:,} | {ms(ins, 'p50')} | {ms(ins, 'p95')} | "
         f"{ms(ins, 'p99')} | {ms(ins, 'p999')} | {ms(ins, 'max')} |\n",
         "## Readers during the load\n",
         "Latency in ms per script, from pgbench's per-transaction log, "
         "for transactions started while the load ran. `txns` is the "
         "logged count over the sampled fraction.\n",
-        "| group | script | clients | txns | txns/s | p50 | p90 | p99 "
+        "| group | script | clients | txns | txns/s | p50 | p95 | p99 "
         "| p99.9 | max |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
@@ -570,7 +571,7 @@ def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
             md.append(
                 f"| {g['name']} | {script} | {g['clients']} | {txns:,.0f} | "
                 f"{txns / max(secs, 1):,.1f} | {ms(d, 'p50')} | "
-                f"{ms(d, 'p90')} | {ms(d, 'p99')} | {ms(d, 'p999')} | "
+                f"{ms(d, 'p95')} | {ms(d, 'p99')} | {ms(d, 'p999')} | "
                 f"{ms(d, 'max')} |")
     md += [
         "\n## Disk bytes during the load\n",

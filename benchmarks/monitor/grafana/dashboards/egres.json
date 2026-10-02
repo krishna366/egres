@@ -82,7 +82,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Latency",
+      "title": "Admin round trip",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -120,16 +120,6 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "pgbench_latency_ms",
-          "legendFormat": "{{run}} avg"
-        },
-        {
-          "refId": "B",
-          "expr": "pgbench_latency_stddev_ms",
-          "legendFormat": "{{run}} stddev"
-        },
-        {
-          "refId": "C",
           "expr": "egres_admin_seconds * 1000",
           "legendFormat": "admin round trip"
         }
@@ -187,13 +177,13 @@
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.99, sum(rate(egres_load_insert_seconds_bucket[1m])) by (le))",
-          "legendFormat": "p99"
+          "expr": "histogram_quantile(0.95, sum(rate(egres_load_insert_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p95"
         },
         {
           "refId": "C",
-          "expr": "rate(egres_load_insert_seconds_sum[1m]) / rate(egres_load_insert_seconds_count[1m])",
-          "legendFormat": "mean"
+          "expr": "histogram_quantile(0.99, sum(rate(egres_load_insert_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p99"
         }
       ],
       "id": 4,
@@ -249,11 +239,16 @@
         },
         {
           "refId": "B",
+          "expr": "pgbench_latency_p95_ms",
+          "legendFormat": "{{script}} p95"
+        },
+        {
+          "refId": "C",
           "expr": "pgbench_latency_p99_ms",
           "legendFormat": "{{script}} p99"
         },
         {
-          "refId": "C",
+          "refId": "D",
           "expr": "pgbench_latency_max_ms",
           "legendFormat": "{{script}} max"
         }
@@ -736,6 +731,63 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "Disk operations per second",
+      "description": "Requests the device completed, after the kernel merged adjacent ones.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "iops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(node_disk_reads_completed_total{device=~\"nvme0n1|sd[a-z]\"}[1m])) by (device)",
+          "legendFormat": "read {{device}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(node_disk_writes_completed_total{device=~\"nvme0n1|sd[a-z]\"}[1m])) by (device)",
+          "legendFormat": "write {{device}}"
+        }
+      ],
+      "id": 15,
+      "gridPos": {
+        "x": 12,
+        "y": 50,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
       "type": "stat",
       "title": "Disk bytes over the shown range",
       "description": "Set the time range to the load to read its totals; load-summary.md has them exactly.",
@@ -790,10 +842,10 @@
           "legendFormat": "written by egres"
         }
       ],
-      "id": 15,
+      "id": 16,
       "gridPos": {
-        "x": 12,
-        "y": 50,
+        "x": 0,
+        "y": 58,
         "w": 12,
         "h": 8
       }
@@ -847,9 +899,9 @@
           "legendFormat": "write"
         }
       ],
-      "id": 16,
+      "id": 17,
       "gridPos": {
-        "x": 0,
+        "x": 12,
         "y": 58,
         "w": 12,
         "h": 8
@@ -899,10 +951,10 @@
           "legendFormat": "{{device}}"
         }
       ],
-      "id": 17,
+      "id": 18,
       "gridPos": {
-        "x": 12,
-        "y": 58,
+        "x": 0,
+        "y": 66,
         "w": 12,
         "h": 8
       }
@@ -951,9 +1003,9 @@
           "legendFormat": "{{mountpoint}}"
         }
       ],
-      "id": 18,
+      "id": 19,
       "gridPos": {
-        "x": 0,
+        "x": 12,
         "y": 66,
         "w": 12,
         "h": 8
@@ -1008,10 +1060,10 @@
           "legendFormat": "compactions"
         }
       ],
-      "id": 19,
+      "id": 20,
       "gridPos": {
-        "x": 12,
-        "y": 66,
+        "x": 0,
+        "y": 74,
         "w": 12,
         "h": 8
       }
@@ -1020,10 +1072,10 @@
       "type": "row",
       "title": "Egres internals",
       "collapsed": false,
-      "id": 20,
+      "id": 21,
       "gridPos": {
         "x": 0,
-        "y": 74,
+        "y": 82,
         "w": 24,
         "h": 1
       }
@@ -1082,10 +1134,10 @@
           "legendFormat": "in-flight jobs"
         }
       ],
-      "id": 21,
+      "id": 22,
       "gridPos": {
         "x": 0,
-        "y": 75,
+        "y": 83,
         "w": 12,
         "h": 8
       }
@@ -1144,10 +1196,10 @@
           "legendFormat": "L0 bytes"
         }
       ],
-      "id": 22,
+      "id": 23,
       "gridPos": {
         "x": 12,
-        "y": 75,
+        "y": 83,
         "w": 12,
         "h": 8
       }
@@ -1201,10 +1253,10 @@
           "legendFormat": "largest tree"
         }
       ],
-      "id": 23,
+      "id": 24,
       "gridPos": {
         "x": 0,
-        "y": 83,
+        "y": 91,
         "w": 12,
         "h": 8
       }
@@ -1263,10 +1315,10 @@
           "legendFormat": "immutable memtables"
         }
       ],
-      "id": 24,
+      "id": 25,
       "gridPos": {
         "x": 12,
-        "y": 83,
+        "y": 91,
         "w": 12,
         "h": 8
       }
@@ -1275,10 +1327,10 @@
       "type": "row",
       "title": "Postgres (P1 run)",
       "collapsed": false,
-      "id": 25,
+      "id": 26,
       "gridPos": {
         "x": 0,
-        "y": 91,
+        "y": 99,
         "w": 24,
         "h": 1
       }
@@ -1332,10 +1384,10 @@
           "legendFormat": "rollbacks/s"
         }
       ],
-      "id": 26,
+      "id": 27,
       "gridPos": {
         "x": 0,
-        "y": 92,
+        "y": 100,
         "w": 12,
         "h": 8
       }
@@ -1389,10 +1441,10 @@
           "legendFormat": "wal dir (bridge)"
         }
       ],
-      "id": 27,
+      "id": 28,
       "gridPos": {
         "x": 12,
-        "y": 92,
+        "y": 100,
         "w": 12,
         "h": 8
       }
@@ -1451,10 +1503,10 @@
           "legendFormat": "requested ckpt/min"
         }
       ],
-      "id": 28,
+      "id": 29,
       "gridPos": {
         "x": 0,
-        "y": 100,
+        "y": 108,
         "w": 12,
         "h": 8
       }
@@ -1513,10 +1565,10 @@
           "legendFormat": "processes"
         }
       ],
-      "id": 29,
+      "id": 30,
       "gridPos": {
         "x": 12,
-        "y": 100,
+        "y": 108,
         "w": 12,
         "h": 8
       }
@@ -1525,10 +1577,10 @@
       "type": "row",
       "title": "Host",
       "collapsed": false,
-      "id": 30,
+      "id": 31,
       "gridPos": {
         "x": 0,
-        "y": 108,
+        "y": 116,
         "w": 24,
         "h": 1
       }
@@ -1587,10 +1639,10 @@
           "legendFormat": "iowait %"
         }
       ],
-      "id": 31,
+      "id": 32,
       "gridPos": {
         "x": 0,
-        "y": 109,
+        "y": 117,
         "w": 12,
         "h": 8
       }
@@ -1664,10 +1716,10 @@
           "legendFormat": "total"
         }
       ],
-      "id": 32,
+      "id": 33,
       "gridPos": {
         "x": 12,
-        "y": 109,
+        "y": 117,
         "w": 12,
         "h": 8
       }
@@ -1721,10 +1773,10 @@
           "legendFormat": "open fds"
         }
       ],
-      "id": 33,
+      "id": 34,
       "gridPos": {
         "x": 0,
-        "y": 117,
+        "y": 125,
         "w": 12,
         "h": 8
       }
@@ -1778,10 +1830,10 @@
           "legendFormat": "egres up"
         }
       ],
-      "id": 34,
+      "id": 35,
       "gridPos": {
         "x": 12,
-        "y": 117,
+        "y": 125,
         "w": 12,
         "h": 8
       }

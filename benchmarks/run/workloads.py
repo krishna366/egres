@@ -24,8 +24,10 @@ weights. `reads` are the reader groups that run beside the load: each
 a name, a client count, its read-only scripts with weights, and
 optionally `sample`, the fraction of its transactions whose latency is
 logged (fast scripts would otherwise log gigabytes). A group is one
-pgbench, so queries that differ by orders of magnitude get a group
-each and neither starves the other of clients.
+pgbench: each client draws its next script by weight, and latency is
+reported per script. Queries in one group share its clients, so a
+slow script lowers the rate of a fast one; a second group keeps them
+apart.
 
 pgbench.py passes the variables: `:rows` is the count the load
 reached, `:run` the workload run number, `:n` a per-client counter
@@ -247,13 +249,12 @@ ORDERS = {
         "amount": ORDERS_AMOUNT,
         "delete": ORDERS_DELETE,
     },
-    # Beside the load: point reads by id. The index queries are a
-    # second group, off unless asked for (`--set readers.index=8`).
+    # Beside the load: each client rotates between a point read by id
+    # and the index queries, half its transactions each. Latency is
+    # reported per script.
     "reads": [
-        {"name": "point", "clients": 8, "scripts": [("select", 1)],
-         "sample": 0.01},
-        {"name": "index", "clients": 0, "sample": 0.1,
-         "scripts": [("customer", 35), ("sku_day", 20),
+        {"name": "reads", "clients": 8, "sample": 0.1,
+         "scripts": [("select", 65), ("customer", 35), ("sku_day", 20),
                      ("customer_day_count", 10)]},
     ],
     "mix": [("customer", 35), ("sku_day", 20), ("customer_day_count", 10),

@@ -20,6 +20,7 @@ and `follow` publishes percentiles per script over the transactions
 since its last look:
 
     pgbench_latency_p50_ms{run="...",script="..."}
+    pgbench_latency_p95_ms{run="...",script="..."}
     pgbench_latency_p99_ms{run="...",script="..."}
     pgbench_latency_max_ms{run="...",script="..."}
 
@@ -167,6 +168,7 @@ def poll_latencies(h: Handle):
         ordered = sorted(vals)
         name = h.scripts[script] if script < len(h.scripts) else str(script)
         h.lat_last[name] = (percentile(ordered, 50) / 1000.0,
+                            percentile(ordered, 95) / 1000.0,
                             percentile(ordered, 99) / 1000.0,
                             ordered[-1] / 1000.0)
 
@@ -175,7 +177,7 @@ def latency_summary(prefixes: list, scripts: list,
                     whole_paths: bool = False, until=None) -> dict:
     """Per script name, over every log file under the given prefixes
     (or the files themselves with `whole_paths`): n (logged
-    transactions; a sample when the run samples) and p50, p90, p99,
+    transactions; a sample when the run samples) and p50, p95, p99,
     p999, max in milliseconds. `until`: only transactions started by
     that time (epoch seconds)."""
     vals: dict = {}
@@ -189,7 +191,7 @@ def latency_summary(prefixes: list, scripts: list,
         ordered = sorted(arr)
         name = scripts[script] if script < len(scripts) else str(script)
         out[name] = {"n": len(ordered), "max": ordered[-1] / 1000.0}
-        for key, pct in (("p50", 50), ("p90", 90), ("p99", 99),
+        for key, pct in (("p50", 50), ("p95", 95), ("p99", 99),
                          ("p999", 99.9)):
             out[name][key] = percentile(ordered, pct) / 1000.0
     return out
@@ -210,7 +212,7 @@ def write_prom(h: Handle, vals):
             f"pgbench_failed_total{lab} {failed}\n"
             f"# TYPE pgbench_clients gauge\npgbench_clients{lab} {h.clients}\n"
         )
-        for i, metric in enumerate(("p50", "p99", "max")):
+        for i, metric in enumerate(("p50", "p95", "p99", "max")):
             if not h.lat_last:
                 break
             body += f"# TYPE pgbench_latency_{metric}_ms gauge\n"

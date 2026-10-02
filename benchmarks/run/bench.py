@@ -203,6 +203,7 @@ class Run:
             cg = cg_path.read_text().strip().removeprefix("/sys/fs/cgroup")
         (MONITOR / ".env").write_text(
             f"EGRES_DATA_DIR={self.data}\nTEXTFILE_DIR={self.textfile}\n"
+            f"WAL_ROOT={self.wal.parent}\nWAL_NAME={self.wal.name}\n"
             f"CGROUP_PATH={cg}\nPG_CONN={self.pg_url}\n")
         if self.no_monitor:
             return

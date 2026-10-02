@@ -12,6 +12,9 @@ byte totals and file count, and whether the admin port answered.
 
     exporter.py --admin 127.0.0.1:5210 --data /path/to/forest --listen 9877
 
+`--wal /path/to/wal` when the WAL has a dir of its own: its size is
+then every file under that dir.
+
 Standard library only, so it runs from a stock python image.
 """
 
@@ -68,6 +71,18 @@ def dir_stats(root: str) -> dict[str, int]:
         "egres_sst_files": sst_files,
         "egres_wal_bytes": wal_bytes,
     }
+
+
+def dir_bytes(root: str) -> int:
+    """Bytes of every file under `root`."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                continue
+    return total
 
 
 SIZE_RE = re.compile(r"([\d.]+)(B|KiB|MiB|GiB|TiB)")
@@ -136,6 +151,7 @@ def cgroup_gauges(cg: str) -> dict[str, int]:
 class Handler(BaseHTTPRequestHandler):
     admin_addr: tuple[str, int]
     data_dir: str
+    wal_dir: str = ""
     cgroup_dir: str = ""
 
     def log_message(self, *_args):  # quiet
@@ -170,7 +186,11 @@ class Handler(BaseHTTPRequestHandler):
         lines.append("# TYPE egres_admin_seconds gauge")
         lines.append(f"egres_admin_seconds {time.monotonic() - t0:.4f}")
         if os.path.isdir(self.data_dir):
-            for name, value in dir_stats(self.data_dir).items():
+            stats = dir_stats(self.data_dir)
+            # A WAL dir of its own is outside the data dir's walk.
+            if os.path.isdir(self.wal_dir):
+                stats["egres_wal_bytes"] = dir_bytes(self.wal_dir)
+            for name, value in stats.items():
                 lines.append(f"# TYPE {name} gauge")
                 lines.append(f"{name} {value}")
         if self.cgroup_dir:
@@ -190,6 +210,8 @@ def main():
     ap.add_argument("--admin", default="127.0.0.1:5210")
     ap.add_argument("--data", required=True)
     ap.add_argument("--listen", type=int, default=9877)
+    # The WAL dir when it is not inside --data; empty = it is.
+    ap.add_argument("--wal", default="")
     # A cgroup (memory-capped server scope) to report, as its relative
     # path under --cgroup-root; empty = none.
     ap.add_argument("--cgroup", default="")
@@ -202,6 +224,7 @@ def main():
     host, port = args.admin.rsplit(":", 1)
     Handler.admin_addr = (host, int(port))
     Handler.data_dir = args.data
+    Handler.wal_dir = args.wal
     srv = ThreadingHTTPServer(("0.0.0.0", args.listen), Handler)
     print(f"serving /metrics on :{args.listen}; admin {args.admin}")
     srv.serve_forever()
