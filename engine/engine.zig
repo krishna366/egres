@@ -474,13 +474,6 @@ pub const Engine = struct {
     /// never; a leadership change bumps the term and re-arms the barrier.
     catchup_term: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Set of trees currently being compacted/split by some compactor
-    /// fiber. Each fiber reserves its tree before starting work so
-    /// two fibers never pick the same tree. Allocated lazily on init;
-    /// the deinit code below frees it.
-    compacting_mu: fiber.Mutex(.tracked) = .{},
-    compacting_trees: std.AutoHashMap(TreeKey, void) = undefined,
-
     /// Serializes `proposeFlush` and `proposeSplit` end-to-end (build → propose
     /// → wait-for-apply). Without this, a flush whose `buildFlush` ran before a
     /// split's `applySplit` routes every key to the pre-split tree (`ns_routes`
@@ -489,8 +482,8 @@ pub const Engine = struct {
     /// the new tree) miss them. Holding the lock guarantees the next acquirer
     /// reads post-apply state — fresh routes for a flush after a split, fresh
     /// L0 contents for a split after a flush. Compactions don't take this lock:
-    /// they don't touch routes, and same-tree split↔compaction is already
-    /// mutex'd via `compacting_trees`.
+    /// they don't touch routes, and a split runs only when no job of its
+    /// tree does (`Tree.reserveJob`).
     flush_split_mu: fiber.Mutex(.tracked) = .{},
 
     /// Background fibers: the raft runtime + compaction + snapshot loops, plus
@@ -527,7 +520,6 @@ pub const Engine = struct {
             .sm = undefined,
             .raft_rt = raft.RaftRuntime.init(allocator, node),
             .snapshot_cfg = snapshot_cfg,
-            .compacting_trees = std.AutoHashMap(TreeKey, void).init(allocator),
             .bg = fiber.Group(void).init(allocator),
         };
         self.sm = self.storage_impl.asStateMachine();
@@ -539,9 +531,6 @@ pub const Engine = struct {
         self.in_flight_mu.lock(@src());
         self.in_flight.deinit(self.allocator);
         self.in_flight_mu.unlock();
-        self.compacting_mu.lock(@src());
-        self.compacting_trees.deinit();
-        self.compacting_mu.unlock();
         self.in_flight_mu.deinit();
         var lock_it = self.storage_impl.file_locks.valueIterator();
         while (lock_it.next()) |mu| {
@@ -549,7 +538,6 @@ pub const Engine = struct {
             self.allocator.destroy(mu.*);
         }
         self.storage_impl.file_locks.deinit();
-        self.compacting_mu.deinit();
         self.flush_split_mu.deinit();
         self.bg.deinit();
         self.raft_rt.deinit();
@@ -645,39 +633,27 @@ pub const Engine = struct {
         self.bg.wait();
     }
 
-    /// Try to claim a compaction target; returns null if every eligible
-    /// tree is already being compacted by another fiber. The reservation
-    /// stays in place until `releaseCompactingTree` runs (typically via
-    /// `defer` in the caller). Race-safe because the candidate selection
-    /// and the reservation insert happen under the same mutex.
-    fn pickAndReserveCompactionTarget(self: *Engine) ?Forest.CompactionTarget {
-        self.compacting_mu.lock(@src());
-        defer self.compacting_mu.unlock();
-        const target = self.forest.bestCompactionCandidateExcluding(&self.compacting_trees) orelse return null;
-        self.compacting_trees.put(target.key, {}) catch return null;
-        return target;
-    }
-
-    fn releaseCompactingTree(self: *Engine, key: TreeKey) void {
-        self.compacting_mu.lock(@src());
-        defer self.compacting_mu.unlock();
-        _ = self.compacting_trees.remove(key);
-    }
-
     /// Reserve a tree against compaction/split for a long-running
-    /// external build (CREATE INDEX's backfill): occupies the same
-    /// slot the compaction loop claims, so the picker skips the tree
-    /// until releaseTree. Keeps the index tree's bottom level empty
-    /// while the backfill runs — the condition its install depends on
-    /// (Tree.applyBackfill).
+    /// external build (CREATE INDEX's backfill): every level is marked
+    /// busy, so the tree offers no job until releaseTree. Keeps the
+    /// index tree's bottom level empty while the backfill runs — the
+    /// condition its install depends on (Tree.applyBackfill).
     pub fn reserveTree(self: *Engine, key: TreeKey) !void {
-        self.compacting_mu.lock(@src());
-        defer self.compacting_mu.unlock();
-        try self.compacting_trees.put(key, {});
+        const tree = self.forest.getTree(key.namespace, key.tree_id) orelse
+            return error.TreeNotFound;
+        defer tree.release();
+        try tree.reserveAll();
     }
 
     pub fn releaseTree(self: *Engine, key: TreeKey) void {
-        self.releaseCompactingTree(key);
+        const tree = self.forest.getTree(key.namespace, key.tree_id) orelse
+            return;
+        defer tree.release();
+        tree.releaseAll() catch |err| {
+            log.err("releaseTree tree={d}: {s}", .{
+                key.tree_id, @errorName(err),
+            });
+        };
     }
 
     /// Add an in-flight record. Returns the slice index for `removeInFlight`.
@@ -697,9 +673,8 @@ pub const Engine = struct {
     ) void {
         self.in_flight_mu.lock(@src());
         defer self.in_flight_mu.unlock();
-        // Match on (kind, tree, src_level) — multiple in-flight entries
-        // with the same key would mean two concurrent compactions on the
-        // same level of the same tree, which we don't currently spawn.
+        // Match on (kind, tree, src_level): a tree runs at most one job
+        // per level (`Tree.reserveJob`).
         for (self.in_flight.items, 0..) |it, i| {
             if (it.kind == kind and std.meta.eql(it.tree, tree) and
                 it.src_level == src_level)
@@ -746,12 +721,10 @@ pub const Engine = struct {
             log.err("runCompactionLoop: spawn runFlushLoop failed: {s}", .{@errorName(err)});
             return;
         };
-        // Each levels-loop fiber claims one tree at a time via
-        // `pickAndReserveCompactionTarget`; with N fibers we get N
-        // tree-parallel compactions. Single-tree workloads degenerate
-        // to one effective compactor (others spin idle), which is
-        // exactly the right behavior — multiple compactors on one
-        // tree would race on level mutexes.
+        // Each levels-loop fiber runs one job at a time, taken from the
+        // best tree (`Tree.reserveJob`); with N fibers, N jobs run at
+        // once. A tree runs several only on disjoint levels, so an L0
+        // merge proceeds while a long rewrite below holds the tree.
         for (0..n_compactors) |_| {
             g.spawn(.{}, runLevelsLoop, .{self}) catch |err| {
                 log.err("runCompactionLoop: spawn runLevelsLoop failed: {s}", .{@errorName(err)});
@@ -1149,9 +1122,9 @@ pub const Engine = struct {
     // For now, leader is the one doing the compaction.
     //
     // Multiple instances of this loop run in parallel — one per
-    // `num_compactors`. `pickAndReserveCompactionTarget` ensures no
-    // two fibers ever pick the same tree concurrently (each tree
-    // gets at most one in-flight compaction/split).
+    // `num_compactors`. `Tree.reserveJob` hands each job out once and
+    // marks its levels busy, so two fibers never run the same job or
+    // overlapping levels of one tree.
     fn runLevelsLoop(self: *Engine) void {
         const interval: u64 = 500;
         while (!self.node.isShuttingDown()) {
@@ -1160,28 +1133,61 @@ pub const Engine = struct {
                     return;
                 continue;
             }
-            const target = self.pickAndReserveCompactionTarget() orelse {
+            const job = self.takeJob() orelse {
                 if (self.node.shutdown.waitForStart(.shutdown, interval))
                     return;
                 continue;
             };
-            defer self.releaseCompactingTree(target.key);
+            defer job.tree.release();
+            defer job.tree.releaseJob(job.cand);
             // The candidate's job is a split when the tree has outgrown
             // `Config.splitBytes`, its Lmax target plus the levels above
             // it. updateCompactCandidate sets this in the apply path
             // (after every compaction/flush), so the dispatch here
             // always reflects the latest applied state — no separate
             // polling for splits is needed.
-            if (target.candidate.job == .split) {
-                self.proposeSplit(target.key) catch |err| {
-                    log.err("proposeSplit failed for tree {d}: {s}", .{ target.key.tree_id, @errorName(err) });
+            if (job.cand.job == .split) {
+                self.proposeSplit(job.key) catch |err| {
+                    log.err("proposeSplit failed for tree {d}: {s}", .{
+                        job.key.tree_id, @errorName(err),
+                    });
                 };
             } else {
-                self.proposeCompaction(target) catch |err| {
+                self.proposeCompaction(job) catch |err| {
                     log.err("proposeCompaction failed: {s}", .{@errorName(err)});
                 };
             }
         }
+    }
+
+    /// A job taken from a tree, held with a reference to the tree until
+    /// `Tree.releaseJob` and `release`.
+    const TakenJob = struct {
+        key: TreeKey,
+        tree: *zdb.tree.Tree,
+        cand: zdb.compaction.CompactCandidate,
+    };
+
+    /// The best tree's job, reserved. Null when no tree wants anything,
+    /// or the best one was retired or satisfied between the ranking and
+    /// the reservation.
+    fn takeJob(self: *Engine) ?TakenJob {
+        const key = self.forest.bestTreeToCompact() orelse return null;
+        const tree = self.forest.getTree(key.namespace, key.tree_id) orelse
+            return null;
+        errdefer tree.release();
+
+        const cand = tree.reserveJob() catch |err| {
+            log.err("reserveJob tree={d}: {s}", .{
+                key.tree_id, @errorName(err),
+            });
+            tree.release();
+            return null;
+        } orelse {
+            tree.release();
+            return null;
+        };
+        return .{ .key = key, .tree = tree, .cand = cand };
     }
 
     fn proposeNewMemtable(self: *Engine) !void {
@@ -1231,7 +1237,7 @@ pub const Engine = struct {
         try self.node.proposeAndWaitForApply(payload, .manifest);
     }
 
-    fn proposeCompaction(self: *Engine, target: Forest.CompactionTarget) !void {
+    fn proposeCompaction(self: *Engine, job: TakenJob) !void {
         // Per-call ID so we can grep all phase-lines for one compaction
         // out of a noisy multi-loop log: every line below carries
         // `cid=<id>`. The `cid_` prefix is unique enough to tail+grep.
@@ -1241,43 +1247,33 @@ pub const Engine = struct {
         // Track the compaction so `zdb forest` can show whether a
         // "compactions wanted" entry is genuinely starved or just waiting
         // on a build/sync that hasn't proposed yet.
+        const tree = job.tree;
         self.addInFlight(.{
             .kind = .compaction,
-            .tree = target.key,
-            .src_level = @intCast(target.candidate.level),
+            .tree = job.key,
+            .src_level = job.cand.level,
             .cid = cid,
             .started_at_ms = utils.coarseMs(),
         });
-        defer self.removeInFlight(
-            .compaction,
-            target.key,
-            @intCast(target.candidate.level),
-        );
+        defer self.removeInFlight(.compaction, job.key, job.cand.level);
 
-        const src = target.candidate.level;
+        const src = job.cand.level;
         const t0 = utils.coarseMs();
-        log.info("compact cid={d} start tree={d} L{d}", .{ cid, target.key.tree_id, src });
+        log.info("compact cid={d} start tree={d} L{d}", .{
+            cid, job.key.tree_id, src,
+        });
 
-        // Resolve the tree now, by id: the target is an identity, and the
-        // tree it named may have been split or dropped since the pick —
-        // then there is nothing to build, and the candidate was stale.
-        const tree = self.forest.getTree(target.key.namespace, target.key.tree_id) orelse {
-            log.info("compact cid={d} skipped: tree={d} no longer listed", .{ cid, target.key.tree_id });
-            return;
-        };
-        defer tree.release();
         // What this build may discard below: the read floor, the
         // installed snapshot's timestamp. Every node raised it when that
         // snapshot entry applied, before this compaction's entry.
         const snapshot_ts = self.forest.snapshotTs();
-        var changes = try tree.buildCompaction(snapshot_ts);
+        var changes = try tree.buildCompaction(job.cand, snapshot_ts);
         defer changes.deinit(self.allocator);
 
         if (changes.items.len == 0) {
-            // The candidate went stale between the pick and the build
-            // (a flush changed which L0 run is worth merging). Refresh
-            // it so the next pick sees what the tree needs now.
-            tree.updateCompactCandidate() catch {};
+            // The job went stale between the pick and the build (an
+            // install unlisted one of its tables). `releaseJob` refreshes
+            // the candidate, so the next pick sees what the tree needs.
             log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});
             return;
         }
@@ -1290,6 +1286,7 @@ pub const Engine = struct {
 
         const payload = try encodeManifestChange(self.allocator, .compaction, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
+
         try self.node.proposeAndWaitForApply(payload, .manifest);
         const t3 = utils.coarseMs();
         log.info("compact cid={d} done propose_ms={d} total_ms={d}", .{ cid, t3 - t2, t3 - t0 });
@@ -1319,17 +1316,11 @@ pub const Engine = struct {
             key.namespace,
             key.tree_id,
         ) orelse {
-            // No split key (Lmax has < 2 tables). The candidate that sent
-            // us here was stale — refresh it so the next levels-loop
-            // iteration picks a different (real) candidate instead of
-            // hammering this tree forever. Without this, the loop spins
-            // on the same split-wanting tree and starves every
-            // other tree's pending compactions.
-            if (self.forest.getTree(key.namespace, key.tree_id)) |t| {
-                defer t.release();
-                t.updateCompactCandidate() catch {};
-            }
-            log.warn("proposeSplit tree={d} skipped: no split key (refreshed candidate)", .{key.tree_id});
+            // No split key (Lmax has < 2 tables): the candidate that
+            // sent us here was stale. `releaseJob` recomputes it.
+            log.warn("proposeSplit tree={d} skipped: no split key", .{
+                key.tree_id,
+            });
             return;
         };
 

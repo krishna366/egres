@@ -997,28 +997,15 @@ pub const Forest = struct {
     /// compaction on it. Returns true if a compaction was executed, false if
     /// no tree needs compaction.
     /// An identity, not an object: which tree, and what its candidate said.
-    /// The proposer resolves the tree by id (`getTree`) when it builds —
-    /// by then a split or drop may have retired the object the score came
-    /// from, in which case there is nothing to build and the candidate was
-    /// stale anyway. A key can also travel to a peer; a pointer cannot.
-    pub const CompactionTarget = struct {
-        key: TreeKey,
-        candidate: _tree.CompactCandidate,
-    };
-
-    /// Find the best tree/level to compact without performing compaction.
-    pub fn bestCompactionCandidate(self: *Forest) ?CompactionTarget {
-        return self.bestCompactionCandidateExcluding(null);
-    }
-
-    /// Same as `bestCompactionCandidate` but skips any tree whose key is
-    /// in `skip` (used by parallel compactors so two fibers don't pick
-    /// the same tree). `skip == null` means "no exclusions".
-    pub fn bestCompactionCandidateExcluding(
-        self: *Forest,
-        skip: ?*const std.AutoHashMap(TreeKey, void),
-    ) ?CompactionTarget {
-        var best: ?CompactionTarget = null;
+    /// The tree whose candidate scores highest across the forest, by
+    /// key: the proposer resolves it by id (`getTree`) and takes its job
+    /// (`Tree.reserveJob`); by then a split or drop may have retired the
+    /// object the score came from, or an install changed what it wants,
+    /// and the job taken is whatever the tree wants then. A key can also
+    /// travel to a peer; a pointer cannot.
+    pub fn bestTreeToCompact(self: *Forest) ?TreeKey {
+        var best: ?TreeKey = null;
+        var best_score: f64 = 0;
         var tables_it = self.tables.iterator();
         defer tables_it.deinit();
         while (tables_it.next()) |kv| {
@@ -1026,16 +1013,16 @@ pub const Forest = struct {
             const held = trees.mu.hold(.shared, @src());
             defer held.release();
             for (trees.list(held)) |tree| {
-                const tk = TreeKey{
-                    .namespace = tree.namespace,
-                    .tree_id = tree.tree_id,
-                };
-                if (skip) |s| if (s.contains(tk)) continue;
                 const th = tree.mu.hold(.shared, @src());
                 defer th.release();
+
                 const candidate = tree.compact_candidate orelse continue;
-                if (best == null or candidate.score > best.?.candidate.score) {
-                    best = .{ .key = tk, .candidate = candidate };
+                if (best == null or candidate.score > best_score) {
+                    best = .{
+                        .namespace = tree.namespace,
+                        .tree_id = tree.tree_id,
+                    };
+                    best_score = candidate.score;
                 }
             }
         }

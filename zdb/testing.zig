@@ -8,6 +8,7 @@ const std = @import("std");
 const zdb = @import("zdb");
 
 const Forest = zdb.forest.Forest;
+const Tree = zdb.tree.Tree;
 const TableKey = zdb.kv.TableKey;
 const KeyRange = zdb.kv.KeyRange;
 const _manifest = zdb.manifest;
@@ -40,4 +41,16 @@ pub fn createTree(
     });
     try f.installTree(table_key.namespace, tree_id);
     return tree_id;
+}
+
+/// Builds the tree's next compaction as the engine does: the job is
+/// taken (`reserveJob`), built, and released. Empty when the tree
+/// wants nothing. The caller installs the changes (`applyCompaction`).
+pub fn buildCompaction(
+    tree: *Tree,
+    snapshot_ts: u64,
+) !std.ArrayList(_manifest.SSTableChange) {
+    const job = try tree.reserveJob() orelse return .empty;
+    defer tree.releaseJob(job);
+    return tree.buildCompaction(job, snapshot_ts);
 }

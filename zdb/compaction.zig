@@ -65,7 +65,39 @@ pub const CompactCandidate = struct {
     /// one up by id in its level and gives up if one is gone. Under the
     /// tree's lock, freed at the next refresh (`clearCandidate`).
     job: Job,
+
+    /// The levels the job occupies while it runs: its source and
+    /// destination; a split, every level. Two jobs of one tree run at
+    /// once when these are disjoint (`Tree.busy_levels`).
+    pub fn levelSet(self: CompactCandidate) LevelSet {
+        var set = LevelSet.initEmpty();
+        switch (self.job) {
+            .split => set = LevelSet.initFull(),
+            .merge_l0 => set.set(0),
+            .move_down, .merge_down => {
+                set.set(self.level);
+                set.set(self.level + 1);
+            },
+        }
+        return set;
+    }
+
+    /// A copy that owns its job (`Job.dupe`).
+    pub fn dupe(
+        self: CompactCandidate,
+        allocator: std.mem.Allocator,
+    ) !CompactCandidate {
+        return .{
+            .level = self.level,
+            .score = self.score,
+            .job = try self.job.dupe(allocator),
+        };
+    }
 };
+
+/// A set of a tree's levels (`Config.max_levels` is a u8).
+pub const LevelSet = std.StaticBitSet(max_levels);
+const max_levels = 1 + @as(usize, std.math.maxInt(u8));
 
 /// What a level wants done (`pickJob`, `pickL0Merge`),
 /// or a split of the whole tree.
@@ -88,6 +120,27 @@ pub const Job = union(enum) {
             .merge_down, .merge_l0 => |ts| ts,
             .split => &.{},
         };
+    }
+
+    /// A copy whose table list is the caller's, freed with `deinit`.
+    pub fn dupe(self: Job, allocator: std.mem.Allocator) !Job {
+        return switch (self) {
+            .move_down => |e| .{ .move_down = e },
+            .merge_down => |ts| .{
+                .merge_down = try allocator.dupe(TableEntry, ts),
+            },
+            .merge_l0 => |ts| .{
+                .merge_l0 = try allocator.dupe(TableEntry, ts),
+            },
+            .split => .split,
+        };
+    }
+
+    pub fn deinit(self: Job, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .merge_down, .merge_l0 => |ts| allocator.free(ts),
+            .move_down, .split => {},
+        }
     }
 };
 
@@ -271,9 +324,13 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
     // Lmax until a split becomes possible.
     const lmax_tables = self.levels[self.live.cur().max_levels - 1].numTables(rd);
     const split_bytes = self.live.cur().splitBytes();
+    const busy = self.busy_levels;
     if (total > split_bytes and
         lmax_tables >= min_lmax_tables_for_split)
     {
+        // A split remaps every table: it waits for the tree's running
+        // jobs and lets no new one start meanwhile.
+        if (busy.count() != 0) return self.clearCandidate();
         log.debug(
             "split-trigger tree={d} total={d} deepest_level={d} " ++
                 "lmax_size={d} lmax_tables={d} > threshold={d}",
@@ -304,12 +361,15 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
     // it, was here once; it boosts a level over an under-full one, and
     // under a sustained load that let L1 win every pick over an L0 of
     // 65 tables, with the write brake throttling the load meanwhile.
+    // A level with a job running on it, or on the level it writes to,
+    // offers nothing until that job is done.
     var best: ?CompactCandidate = null;
     for (0..self.live.cur().max_levels) |level| {
+        if (busy.isSet(level) or busy.isSet(level + 1)) continue;
         const c = pickJob(self, rd, level) orelse continue;
         if (best == null or c.score > best.?.score) best = c;
     }
-    const merge = pickL0Merge(self, rd);
+    const merge = if (busy.isSet(0)) null else pickL0Merge(self, rd);
     if (merge) |c| {
         if (best == null or c.score > best.?.score) best = c;
     }
@@ -327,31 +387,64 @@ pub fn updateCompactCandidate_(self: *Tree, held: Lock.Exclusive) !void {
 /// The verdict, with a copy of the job's tables in place of the level
 /// views it was picked as.
 fn setCandidate(self: *Tree, c: CompactCandidate) !void {
-    const owned: Job = switch (c.job) {
-        .move_down => |e| .{ .move_down = e },
-        .merge_down => |ts| .{
-            .merge_down = try self.allocator.dupe(TableEntry, ts),
-        },
-        .merge_l0 => |ts| .{
-            .merge_l0 = try self.allocator.dupe(TableEntry, ts),
-        },
-        .split => .split,
-    };
+    const owned = try c.dupe(self.allocator);
     self.clearCandidate();
-    self.compact_candidate = .{
-        .level = c.level,
-        .score = c.score,
-        .job = owned,
-    };
+    self.compact_candidate = owned;
 }
 
 pub fn clearCandidate(self: *Tree) void {
     const c = self.compact_candidate orelse return;
-    switch (c.job) {
-        .merge_down, .merge_l0 => |ts| self.allocator.free(ts),
-        .move_down, .split => {},
-    }
+    c.job.deinit(self.allocator);
     self.compact_candidate = null;
+}
+
+/// Takes the candidate to run it: the caller owns the returned copy
+/// until `releaseJob`. Its levels are marked busy and the candidate
+/// recomputed under the same hold, so the next pick sees the tree's
+/// next runnable job, never this one. Null when the tree wants nothing.
+pub fn reserveJob(self: *Tree) !?CompactCandidate {
+    const held = self.mu.hold(.exclusive, @src());
+    defer held.release();
+
+    const c = self.compact_candidate orelse return null;
+    const owned = try c.dupe(self.allocator);
+    errdefer owned.job.deinit(self.allocator);
+
+    self.busy_levels.setUnion(owned.levelSet());
+    try self.updateCompactCandidate_(held);
+    return owned;
+}
+
+/// Frees a job from `reserveJob`, done or abandoned, and recomputes the
+/// candidate: a job its levels blocked can be offered now.
+pub fn releaseJob(self: *Tree, c: CompactCandidate) void {
+    defer c.job.deinit(self.allocator);
+
+    const held = self.mu.hold(.exclusive, @src());
+    defer held.release();
+
+    var freed = c.levelSet();
+    freed.toggleAll();
+    self.busy_levels.setIntersection(freed);
+    // The next install refreshes the candidate if this cannot.
+    self.updateCompactCandidate_(held) catch {};
+}
+
+/// Marks every level busy, for a build outside compaction (an index
+/// backfill): the tree offers no job until `releaseAll`. The tree is
+/// new then and runs nothing, so no job's own levels are taken over.
+pub fn reserveAll(self: *Tree) !void {
+    const held = self.mu.hold(.exclusive, @src());
+    defer held.release();
+    self.busy_levels = LevelSet.initFull();
+    try self.updateCompactCandidate_(held);
+}
+
+pub fn releaseAll(self: *Tree) !void {
+    const held = self.mu.hold(.exclusive, @src());
+    defer held.release();
+    self.busy_levels = LevelSet.initEmpty();
+    try self.updateCompactCandidate_(held);
 }
 
 /// `num / den` as a score.
@@ -517,14 +610,13 @@ fn overlapBytes(
     return bytes;
 }
 
-/// buildCompaction is Phase A: the candidate's job (`CompactCandidate`),
+/// buildCompaction is Phase A: a job taken from the tree (`reserveJob`),
 /// built into new SST files, as the manifest SSTableChange list the
 /// caller proposes (through Raft) and then applies (applyCompaction).
-/// Nothing is picked here: the candidate was computed from the levels
-/// as they are, and every install recomputes it. The job's tables are
-/// looked up by id under one hold; one that is gone means an install
-/// landed between its refresh and this read, and there is nothing to
-/// build until the next refresh.
+/// Nothing is picked here: the job was computed from the levels as
+/// they were. Its tables are looked up by id under one hold; one that
+/// is gone means an install landed between the pick and this read,
+/// and there is nothing to build for it.
 ///
 /// A merge's output is listed under the newest input's `raft_index`,
 /// not the applying entry's: it holds what its inputs held, so it stands
@@ -536,20 +628,19 @@ fn overlapBytes(
 /// and eligible to be discarded. Pass 0 to discard nothing.
 pub fn buildCompaction(
     self: *Tree,
+    cand: CompactCandidate,
     snapshot_ts: u64,
 ) !std.ArrayList(_manifest.SSTableChange) {
+    if (cand.job == .split) return .empty;
     // Pinned under the hold: a remote-built applyCompaction landing
     // mid-build (leadership flip) must not free tables we're about to
     // read. decrRef at zero frees memory only — the file stays — so a
     // pinned table remains readable. The hold covers the lookup only:
     // a build takes seconds to minutes, and the tree's exclusive holders
     // (a flush's apply, on the raft apply loop) must not wait on it.
-    const cand, const srcs = blk: {
+    const srcs = blk: {
         const held = self.mu.hold(.shared, @src());
         defer held.release();
-
-        const cand = self.compact_candidate orelse return .empty;
-        if (cand.job == .split) return .empty;
 
         // The listed entries, by id: the candidate's own may name a
         // table that has since been unlisted and freed.
@@ -569,7 +660,7 @@ pub fn buildCompaction(
             };
         }
         for (srcs) |e| e.table.incrRef();
-        break :blk .{ cand, srcs };
+        break :blk srcs;
     };
     defer Level.releaseTables(self.allocator, srcs);
 

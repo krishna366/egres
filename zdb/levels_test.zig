@@ -28,6 +28,7 @@ const Tree = zdb.tree.Tree;
 const TableCache = zdb.tree.TableCache;
 
 const config = zdb.config;
+const buildCompaction = @import("testing.zig").buildCompaction;
 
 /// A bottom target of one byte makes a push L0's job at any size
 /// (`pickJob`), so compacting L0 here pushes into L1 as the tests
@@ -38,7 +39,7 @@ const push_lmax: i64 = 1;
 /// it, listed under log index `index`: what the engine does across a
 /// proposal.
 fn compact(tree: *Tree, index: u64, snapshot_ts: u64) !void {
-    var changes = try tree.buildCompaction(snapshot_ts);
+    var changes = try buildCompaction(tree, snapshot_ts);
     defer changes.deinit(tree.allocator);
     try tree.applyCompaction(index, changes.items);
 }
@@ -1541,6 +1542,74 @@ test "compaction: an L0 merge with tables to spare runs ahead of L1" {
         return error.TestExpectedCandidate;
     try std.testing.expectEqual(@as(u8, 0), cand.level);
     try std.testing.expect(cand.job == .merge_l0);
+}
+
+test "compaction: a tree runs an L0 merge beside its L1 job" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // As above: L0 holds a merge run, L1 is over its target.
+    var cfg = config.Config{ .max_levels = 3, .l0_merge_min_tables = 3 };
+    cfg.dir = dir_path;
+    var fx: TombstoneFixture = undefined;
+    try setupPlacedTreeCfg(alloc, &fx, dir_path, cfg, .rows, &.{
+        .{ .id = 2, .level = 0, .egids = &.{101} },
+        .{ .id = 3, .level = 0, .egids = &.{102} },
+        .{ .id = 4, .level = 0, .egids = &.{103} },
+        .{ .id = 9, .level = 0, .egids = &.{104} },
+        .{ .id = 5, .level = 1, .egids = &egidRun(100, 450) },
+        .{ .id = 6, .level = 1, .egids = &egidRun(1000, 450) },
+        .{ .id = 7, .level = 1, .egids = &egidRun(2000, 450) },
+        .{ .id = 8, .level = 1, .egids = &egidRun(3000, 450) },
+    });
+    defer fx.deinit();
+
+    var l0_bytes: u64 = 0;
+    for (fx.tree.levels[0].tables.items) |e| l0_bytes += e.table.fileSize();
+    var buf: [64]u8 = undefined;
+    try fx.live.update(try std.fmt.bufPrint(
+        &buf,
+        "lmax_target_bytes={d}",
+        .{5 * (l0_bytes + 1)},
+    ));
+    try fx.tree.updateCompactCandidate();
+
+    // The merge is taken first; L0 is then busy, and the tree offers
+    // its L1 job in its place.
+    const merge = try fx.tree.reserveJob() orelse
+        return error.TestExpectedJob;
+    try std.testing.expect(merge.job == .merge_l0);
+    try std.testing.expect(fx.tree.busy_levels.isSet(0));
+    const below = try fx.tree.reserveJob() orelse
+        return error.TestExpectedJob;
+    try std.testing.expectEqual(@as(u8, 1), below.level);
+    try std.testing.expect(below.job == .merge_down);
+
+    // Every level is now busy or writes to a busy one: nothing more.
+    try std.testing.expect(fx.tree.compact_candidate == null);
+    try std.testing.expect((try fx.tree.reserveJob()) == null);
+
+    // Both build and install, in either order.
+    {
+        var changes = try fx.tree.buildCompaction(below, 0);
+        defer changes.deinit(alloc);
+        try fx.tree.applyCompaction(10, changes.items);
+    }
+    {
+        var changes = try fx.tree.buildCompaction(merge, 0);
+        defer changes.deinit(alloc);
+        try fx.tree.applyCompaction(11, changes.items);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fx.tree.numTablesAt(0));
+    try std.testing.expect(fx.tree.numTablesAt(2) > 0);
+
+    fx.tree.releaseJob(merge);
+    fx.tree.releaseJob(below);
+    try std.testing.expectEqual(@as(usize, 0), fx.tree.busy_levels.count());
+    try expectEgids(alloc, fx.tree, &.{ 101, 102, 103, 104, 100, 549, 3449 });
 }
 
 test "compaction: a push with few tables scores by L0's bytes" {

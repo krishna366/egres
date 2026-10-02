@@ -7,6 +7,7 @@ const utils = @import("utils");
 const String = utils.String;
 const zdb = @import("zdb");
 const createTree = @import("testing.zig").createTree;
+const buildCompaction = @import("testing.zig").buildCompaction;
 const flags = @import("flags");
 const vfs = zdb.vfs;
 
@@ -1319,7 +1320,7 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     // Builder, so meta has to survive the merge iterator and the re-encode.
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
     defer tree.release();
-    var comp = try tree.buildCompaction(0);
+    var comp = try buildCompaction(tree, 0);
     defer comp.deinit(alloc);
     // Guard against the compaction being a silent no-op, which would make the
     // assertions below vacuous.
@@ -1490,7 +1491,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
     // a version at or below the floor.
     _ = f.setSnapshotTs(15);
     {
-        var comp = try tree.buildCompaction(f.snapshotTs());
+        var comp = try buildCompaction(tree, f.snapshotTs());
         defer comp.deinit(alloc);
         index += 1;
         try tree.applyCompaction(index, comp.items);
@@ -1511,7 +1512,7 @@ test "forest: a bottom-level compaction discards under the read floor" {
         defer flush.changes.deinit(alloc);
         index += 1;
         try f.applyFlush(index, flush.changes.items, flush.newest_memtable_id);
-        var comp = try tree.buildCompaction(f.snapshotTs());
+        var comp = try buildCompaction(tree, f.snapshotTs());
         defer comp.deinit(alloc);
         index += 1;
         try tree.applyCompaction(index, comp.items);
@@ -2745,7 +2746,7 @@ test "forest: rollup is read-invariant across flush and compactions" {
     const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
     defer tree.release();
     for (0..2) |_| {
-        var comp = try tree.buildCompaction(0);
+        var comp = try buildCompaction(tree, 0);
         defer comp.deinit(alloc);
         try std.testing.expect(comp.items.len > 0);
         try tree.applyCompaction(1, comp.items);
@@ -2950,7 +2951,7 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     };
     defer pinned.decrRef();
 
-    var comp = try tree.buildCompaction(0);
+    var comp = try buildCompaction(tree, 0);
     defer comp.deinit(alloc);
     try std.testing.expect(comp.items.len > 0);
 
@@ -3261,7 +3262,7 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     }
     defer for (pinned) |t| t.decrRef();
 
-    var comp = try tree.buildCompaction(0);
+    var comp = try buildCompaction(tree, 0);
     defer comp.deinit(alloc);
     try tree.applyCompaction(20, comp.items);
 
@@ -3398,7 +3399,7 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
             const tree = f.getTree(1, 0) orelse return error.TestExpectedTree;
             defer tree.release();
             try std.testing.expect(tree.compact_candidate == null);
-            var none = try tree.buildCompaction(0);
+            var none = try buildCompaction(tree, 0);
             defer none.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 0), none.items.len);
         }
@@ -3420,7 +3421,7 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
         newest_index = ents[ents.len - 1].raft_index;
     }
 
-    var merge = try tree.buildCompaction(0);
+    var merge = try buildCompaction(tree, 0);
     defer merge.deinit(alloc);
     // Five L0 deletes and ONE L0 create, listed under the newest input's
     // index so it stands where its inputs stood.

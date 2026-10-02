@@ -303,6 +303,10 @@ pub const Tree = struct {
     cache: *TableCache,
     levels: []Level,
     compact_candidate: ?CompactCandidate = null,
+    /// Levels with a job running on them (`reserveJob`): the candidate
+    /// never names one, so two jobs of this tree run at once only on
+    /// disjoint levels.
+    busy_levels: _compaction.LevelSet = _compaction.LevelSet.initEmpty(),
     key_range: KeyRange,
     /// What this tree holds (`buffers.TreeKind`): read off the manifest
     /// record at open, fixed for the tree's life. Picks the SST filter
@@ -321,9 +325,10 @@ pub const Tree = struct {
     /// tables they select there.
     refs: std.atomic.Value(u32) = .init(1),
     /// The one lock over this tree's mutable state: every level's table
-    /// list and `compact_candidate`. Shared to read — a point get, a merge
-    /// open, the split-key and compaction pickers, stats — and exclusive to
-    /// install: flush, compaction, backfill, and the candidate refresh.
+    /// list, `compact_candidate` and `busy_levels`. Shared to read — a
+    /// point get, a merge open, the split-key and compaction pickers,
+    /// stats — and exclusive to install: flush, compaction, backfill,
+    /// and the candidate refresh.
     /// Levels have no lock of their own: every `Level` method takes the
     /// token this lock mints (`hold`), so a level cannot be touched without
     /// it, and so do the tree methods that read levels on a caller's behalf
@@ -341,6 +346,10 @@ pub const Tree = struct {
     pub const updateCompactCandidate = _compaction.updateCompactCandidate;
     pub const updateCompactCandidate_ = _compaction.updateCompactCandidate_;
     pub const clearCandidate = _compaction.clearCandidate;
+    pub const reserveJob = _compaction.reserveJob;
+    pub const releaseJob = _compaction.releaseJob;
+    pub const reserveAll = _compaction.reserveAll;
+    pub const releaseAll = _compaction.releaseAll;
     pub const Emitter = _compaction.Emitter;
     pub const buildCompaction = _compaction.buildCompaction;
     pub const mergeAndWrite = _compaction.mergeAndWrite;

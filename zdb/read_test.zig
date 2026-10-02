@@ -8,6 +8,7 @@ const utils = @import("utils");
 const String = utils.String;
 const zdb = @import("zdb");
 const createTree = @import("testing.zig").createTree;
+const buildCompaction = @import("testing.zig").buildCompaction;
 const flags = @import("flags");
 const vfs = zdb.vfs;
 const zroar = zdb.zroar;
@@ -135,7 +136,7 @@ const Fixture = struct {
         const tree = self.f.getTree(ns, self.tree_id) orelse
             return error.TestExpectedTree;
         defer tree.release();
-        var comp = try tree.buildCompaction(0);
+        var comp = try buildCompaction(tree, 0);
         defer comp.deinit(self.alloc);
         try std.testing.expect(comp.items.len > 0);
         try tree.applyCompaction(self.nextIndex(), comp.items);
