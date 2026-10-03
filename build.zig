@@ -77,8 +77,8 @@ pub fn build(b: *std.Build) void {
     const allocator_backend = b.option(
         AllocatorBackend,
         "allocator",
-        "Allocator backing the process gpa (default: mimalloc)",
-    ) orelse .mimalloc;
+        "Allocator backing the process gpa (default: jemalloc)",
+    ) orelse .jemalloc;
     const optimize: std.builtin.OptimizeMode = if (release_mode)
         .ReleaseFast
     else
@@ -127,6 +127,8 @@ pub fn build(b: *std.Build) void {
     });
     galloc.link_libc = true;
     galloc.addObjectFile(b.path(allocator_dep.library));
+    // The engine's admin `mem` prints the backend's own counters.
+    mods.engine.addImport("galloc", galloc);
 
     addZbufCli(b, target, optimize, mods);
     // `zig build check`: type-check the server binary and every test file with

@@ -240,7 +240,7 @@ ORDERS = {
     # `create` false loads a further id range into the table as it is.
     "load": {"first": 1, "last": 600_000_000, "streams": 16,
              "chunk": 100_000, "stop_bytes": None, "stop_secs": None,
-             "create": True},
+             "create": True, "after_secs": 1800},
     "vars": {"customers": ORDERS_CUSTOMERS, "skus": ORDERS_SKUS,
              "days": ORDERS_DAYS},
     "scripts": {

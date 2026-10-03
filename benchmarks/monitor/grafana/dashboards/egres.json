@@ -1206,6 +1206,63 @@
     },
     {
       "type": "timeseries",
+      "title": "I/O limiter waits",
+      "description": "Time I/O spent waiting for the bandwidth limiter's pages, by priority: p0 reads never wait, p1 is the WAL and L0 work, p2 the L1+ compactions. A timeout is a grant that waited 100 ms and took the minimum.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (priority) (rate(vfs_bandwidth_wait_us_total[1m])) / 1000",
+          "legendFormat": "{{priority}} ms slept per second"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (priority) (rate(vfs_bandwidth_timeouts_total[1m]))",
+          "legendFormat": "{{priority}} timeouts per second"
+        }
+      ],
+      "id": 24,
+      "gridPos": {
+        "x": 0,
+        "y": 91,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "timeseries",
       "title": "Memtables",
       "description": "",
       "datasource": {
@@ -1258,9 +1315,9 @@
           "legendFormat": "L0 bytes"
         }
       ],
-      "id": 24,
+      "id": 25,
       "gridPos": {
-        "x": 0,
+        "x": 12,
         "y": 91,
         "w": 12,
         "h": 8
@@ -1315,10 +1372,10 @@
           "legendFormat": "largest tree"
         }
       ],
-      "id": 25,
+      "id": 26,
       "gridPos": {
-        "x": 12,
-        "y": 91,
+        "x": 0,
+        "y": 99,
         "w": 12,
         "h": 8
       }
@@ -1377,9 +1434,9 @@
           "legendFormat": "immutable memtables"
         }
       ],
-      "id": 26,
+      "id": 27,
       "gridPos": {
-        "x": 0,
+        "x": 12,
         "y": 99,
         "w": 12,
         "h": 8
@@ -1389,7 +1446,7 @@
       "type": "row",
       "title": "Postgres (P1 run)",
       "collapsed": false,
-      "id": 27,
+      "id": 28,
       "gridPos": {
         "x": 0,
         "y": 107,
@@ -1446,7 +1503,7 @@
           "legendFormat": "rollbacks/s"
         }
       ],
-      "id": 28,
+      "id": 29,
       "gridPos": {
         "x": 0,
         "y": 108,
@@ -1503,7 +1560,7 @@
           "legendFormat": "wal dir (bridge)"
         }
       ],
-      "id": 29,
+      "id": 30,
       "gridPos": {
         "x": 12,
         "y": 108,
@@ -1565,7 +1622,7 @@
           "legendFormat": "requested ckpt/min"
         }
       ],
-      "id": 30,
+      "id": 31,
       "gridPos": {
         "x": 0,
         "y": 116,
@@ -1627,7 +1684,7 @@
           "legendFormat": "processes"
         }
       ],
-      "id": 31,
+      "id": 32,
       "gridPos": {
         "x": 12,
         "y": 116,
@@ -1639,7 +1696,7 @@
       "type": "row",
       "title": "Host",
       "collapsed": false,
-      "id": 32,
+      "id": 33,
       "gridPos": {
         "x": 0,
         "y": 124,
@@ -1701,7 +1758,7 @@
           "legendFormat": "iowait %"
         }
       ],
-      "id": 33,
+      "id": 34,
       "gridPos": {
         "x": 0,
         "y": 125,
@@ -1778,10 +1835,144 @@
           "legendFormat": "total"
         }
       ],
-      "id": 34,
+      "id": 35,
       "gridPos": {
         "x": 12,
         "y": 125,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Egres memory: live vs allocator",
+      "description": "The cache cap is the total (--cache total_mb, live bytes) less the margin, the recent peak of what the rest of egres holds. jemalloc resident is what the cgroup charges for the heap; the gap above live is the allocator's overhead, which the default total's tenth covers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "egres_mem_live_bytes",
+          "legendFormat": "live (held by egres)"
+        },
+        {
+          "refId": "B",
+          "expr": "egres_mem_block_cache_bytes",
+          "legendFormat": "block cache"
+        },
+        {
+          "refId": "C",
+          "expr": "egres_governor_cache_cap_bytes",
+          "legendFormat": "cache cap"
+        },
+        {
+          "refId": "D",
+          "expr": "egres_governor_margin_bytes",
+          "legendFormat": "margin"
+        },
+        {
+          "refId": "E",
+          "expr": "egres_governor_total_bytes",
+          "legendFormat": "total (live)"
+        },
+        {
+          "refId": "F",
+          "expr": "egres_jemalloc_resident_bytes",
+          "legendFormat": "jemalloc resident"
+        },
+        {
+          "refId": "G",
+          "expr": "egres_cgroup_memory_max_bytes",
+          "legendFormat": "cgroup cap"
+        }
+      ],
+      "id": 36,
+      "gridPos": {
+        "x": 0,
+        "y": 133,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Allocator overhead",
+      "description": "1.0 is no overhead. The default total leaves a tenth of the memory, so past ~1.08 it no longer leaves room for bursts and the kernel's own charges.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "egres_jemalloc_resident_bytes / egres_mem_live_bytes",
+          "legendFormat": "jemalloc resident / live"
+        }
+      ],
+      "id": 37,
+      "gridPos": {
+        "x": 12,
+        "y": 133,
         "w": 12,
         "h": 8
       }
@@ -1835,10 +2026,10 @@
           "legendFormat": "open fds"
         }
       ],
-      "id": 35,
+      "id": 38,
       "gridPos": {
         "x": 0,
-        "y": 133,
+        "y": 141,
         "w": 12,
         "h": 8
       }
@@ -1892,10 +2083,10 @@
           "legendFormat": "egres up"
         }
       ],
-      "id": 36,
+      "id": 39,
       "gridPos": {
         "x": 12,
-        "y": 133,
+        "y": 141,
         "w": 12,
         "h": 8
       }

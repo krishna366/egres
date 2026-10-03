@@ -514,6 +514,12 @@ test "table binary fuse contains keys" {
     try std.testing.expect(!t.containsPrimary("missing-1"));
     try std.testing.expect(!t.containsPrimary("missing-2"));
     try std.testing.expect(!t.containsPrimary("missing-3"));
+
+    // What the open table pins: its index and the fuse filter, no
+    // egid bitmap (`Table.resident` sums these over open tables).
+    try std.testing.expect(t.resident.index > 0);
+    try std.testing.expectEqual(t.binary_fuse.?.sizeInBytes(), t.resident.filter);
+    try std.testing.expectEqual(@as(u64, 0), t.resident.egids);
 }
 
 test "table egid filter is exact and replaces the fuse filter" {
@@ -536,6 +542,10 @@ test "table egid filter is exact and replaces the fuse filter" {
 
     const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
     defer destroyTable(t);
+
+    // An egid table pins its bitmap in place of a fuse filter.
+    try std.testing.expectEqual(@as(u64, 0), t.resident.filter);
+    try std.testing.expect(t.resident.egids > 0);
     try std.testing.expect(t.egid_bm != null);
     try std.testing.expect(t.binary_fuse == null);
 

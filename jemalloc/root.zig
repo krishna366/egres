@@ -44,8 +44,15 @@ pub const default_configuration =
     "percpu_arena:percpu," ++
     "background_thread:true," ++
     "max_background_threads:2," ++
-    "dirty_decay_ms:1000," ++
-    "muzzy_decay_ms:0";
+    // Freed pages return to the kernel within ~2 s: long enough that
+    // a page freed and wanted again soon is reused, short enough that
+    // the block cache's churn does not pile up resident.
+    "dirty_decay_ms:2000," ++
+    "muzzy_decay_ms:0," ++
+    // No spare page per large allocation for cache-line randomization:
+    // a 16 KiB block cost 20 KiB with it, and the cache governor counts
+    // live bytes, leaving the allocator's overhead to the reserve.
+    "cache_oblivious:false";
 
 /// The archive supplies a weak default. This strong definition embeds the
 /// egres policy and is read by jemalloc before `main` starts.
@@ -210,7 +217,9 @@ pub fn snapshot() Snapshot {
     };
 }
 
-pub const VerifyError = error{JemallocNotInUse};
+/// `LibcNotJemalloc`: the gpa routes to jemalloc but libc's malloc does
+/// not, so C libraries' allocations go elsewhere (a link-order fault).
+pub const VerifyError = error{ JemallocNotInUse, LibcNotJemalloc };
 
 /// Startup probe: allocate through `gpa`, confirm this thread's jemalloc
 /// counters moved, free, confirm again — then repeat through libc
@@ -236,17 +245,21 @@ pub fn verifyInUse(gpa: Allocator) VerifyError!void {
         return error.JemallocNotInUse;
     }
 
+    // `malloc`/`free` are builtins to the optimizer: a pair whose
+    // memory is never read is removed in release builds, and the
+    // counters would not move. The pointer has to escape.
     const c_probe = libc.malloc(probe_len) orelse
-        return error.JemallocNotInUse;
+        return error.LibcNotJemalloc;
     @as([*]u8, @ptrCast(c_probe))[0] = 0xa5;
-    const c_during = threadActivity() orelse return error.JemallocNotInUse;
+    std.mem.doNotOptimizeAway(c_probe);
+    const c_during = threadActivity() orelse return error.LibcNotJemalloc;
     libc.free(c_probe);
 
-    const c_after = threadActivity() orelse return error.JemallocNotInUse;
+    const c_after = threadActivity() orelse return error.LibcNotJemalloc;
     if (c_during.allocated < after.allocated + probe_len or
         c_after.deallocated < after.deallocated + probe_len)
     {
-        return error.JemallocNotInUse;
+        return error.LibcNotJemalloc;
     }
 }
 

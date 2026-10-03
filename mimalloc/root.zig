@@ -15,7 +15,9 @@
 //!
 //! The library is built with MI_OVERRIDE=ON (see
 //! scripts/bootstrap-mimalloc.sh): its archive defines libc malloc/free
-//! too, so in a mimalloc build (`-Dallocator=mimalloc`, the default)
+//! too, so in a mimalloc build (`-Dallocator=mimalloc`; jemalloc is the
+//! default: on the orders benchmark mimalloc held 20 GiB of freed 64 KiB
+//! blocks beside a 30 GiB block cache, jemalloc under 2 GiB)
 //! the whole process allocates through mimalloc — the Zig gpa via this
 //! adapter, C libraries (libpg_query, lz4/zstd) via the overridden libc
 //! entry points. Symmetric with a jemalloc build, where jemalloc's

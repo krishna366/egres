@@ -35,6 +35,7 @@ const _engine = @import("engine.zig");
 
 /// The admin protocol + its front-end server (wire format + the listener).
 pub const admin = @import("admin.zig");
+pub const governor = @import("governor.zig");
 
 /// The replicated storage engine (forest + raft node + apply + loops).
 pub const Engine = _engine.Engine;

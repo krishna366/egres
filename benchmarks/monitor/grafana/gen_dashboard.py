@@ -189,6 +189,15 @@ PANELS = [
                     "memtables wait for a flush: 20 ms per table or "
                     "memtable over, 500 ms at most. Batches that did "
                     "not sleep are not counted."),
+    ts("I/O limiter waits", "none", [
+        ('sum by (priority) (rate(vfs_bandwidth_wait_us_total[1m])) / 1000',
+         "{{priority}} ms slept per second"),
+        ('sum by (priority) (rate(vfs_bandwidth_timeouts_total[1m]))',
+         "{{priority}} timeouts per second"),
+    ], fill=0, desc="Time I/O spent waiting for the bandwidth limiter's "
+                    "pages, by priority: p0 reads never wait, p1 is the "
+                    "WAL and L0 work, p2 the L1+ compactions. A timeout "
+                    "is a grant that waited 100 ms and took the minimum."),
     ts("Memtables", "bytes", [
         ('egres_memtable_active_bytes', "active"),
         ('egres_memtable_immutable_bytes', "immutable, pending flush"),
@@ -257,6 +266,26 @@ PANELS = [
         ('node_memory_Cached_bytes', "page cache"),
         ('node_memory_MemTotal_bytes', "total"),
     ], fill=0),
+    ts("Egres memory: live vs allocator", "bytes", [
+        ('egres_mem_live_bytes', "live (held by egres)"),
+        ('egres_mem_block_cache_bytes', "block cache"),
+        ('egres_governor_cache_cap_bytes', "cache cap"),
+        ('egres_governor_margin_bytes', "margin"),
+        ('egres_governor_total_bytes', "total (live)"),
+        ('egres_jemalloc_resident_bytes', "jemalloc resident"),
+        ('egres_cgroup_memory_max_bytes', "cgroup cap"),
+    ], fill=0, desc="The cache cap is the total (--cache total_mb, live "
+                    "bytes) less the margin, the recent peak of what the "
+                    "rest of egres holds. jemalloc resident is what the "
+                    "cgroup charges for the heap; the gap above live is "
+                    "the allocator's overhead, which the default total's "
+                    "tenth covers."),
+    ts("Allocator overhead", "none", [
+        ('egres_jemalloc_resident_bytes / egres_mem_live_bytes',
+         "jemalloc resident / live"),
+    ], fill=0, desc="1.0 is no overhead. The default total leaves a "
+                    "tenth of the memory, so past ~1.08 it no longer "
+                    "leaves room for bursts and the kernel's own charges."),
     ts("Egres threads and open files", "none", [
         (f'namedprocess_namegroup_num_threads{{{EGRES}}}', "threads"),
         (f'namedprocess_namegroup_open_filedesc{{{EGRES}}}', "open fds"),

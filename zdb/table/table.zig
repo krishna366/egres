@@ -27,6 +27,41 @@ const _cache = @import("../cache.zig");
 /// zero collision risk across the node_id-namespaced file_id space.
 pub var block_cache: ?*_cache.ShardedCache(u128) = null;
 
+/// What an open table pins in memory for its lifetime, in bytes: the
+/// block index (its serialized size less the filter and bitmap it
+/// carries, within a few percent of the decoded struct, plus the
+/// `cached` bitset), the filter, and the egid bitmap. Summed over the
+/// open tables in `resident`, what the block cache's budget has to
+/// leave room for.
+pub const Resident = struct {
+    index: u64 = 0,
+    filter: u64 = 0,
+    egids: u64 = 0,
+};
+
+pub const ResidentTotals = struct {
+    tables: std.atomic.Value(u64) = .init(0),
+    index: std.atomic.Value(u64) = .init(0),
+    filter: std.atomic.Value(u64) = .init(0),
+    egids: std.atomic.Value(u64) = .init(0),
+
+    fn add(self: *ResidentTotals, r: Resident) void {
+        _ = self.tables.fetchAdd(1, .monotonic);
+        _ = self.index.fetchAdd(r.index, .monotonic);
+        _ = self.filter.fetchAdd(r.filter, .monotonic);
+        _ = self.egids.fetchAdd(r.egids, .monotonic);
+    }
+
+    fn sub(self: *ResidentTotals, r: Resident) void {
+        _ = self.tables.fetchSub(1, .monotonic);
+        _ = self.index.fetchSub(r.index, .monotonic);
+        _ = self.filter.fetchSub(r.filter, .monotonic);
+        _ = self.egids.fetchSub(r.egids, .monotonic);
+    }
+};
+
+pub var resident: ResidentTotals = .{};
+
 /// How `Table.open` opens SST files. `.direct` goes with a block cache:
 /// blocks are cached decompressed there, so the page cache would hold
 /// the same data twice. The default keeps tests and tools on buffered
@@ -79,6 +114,8 @@ pub const Table = struct {
     /// Atomic words, since readers on different workers insert
     /// concurrently.
     cached: []std.atomic.Value(u64),
+    /// This table's share of `resident`, taken back when it is freed.
+    resident: Resident,
 
     pub fn fileSize(self: *const Table) u64 {
         return self.handle.file_size;
@@ -196,6 +233,21 @@ pub const Table = struct {
         else
             null;
         errdefer if (egid_bm) |*bm| @constCast(bm).deinit();
+
+        // The serialized index carries the filter and the bitmap too;
+        // `index` is the rest: the block list and the `cached` bitset.
+        const filter_bytes: u64 = if (binary_fuse) |*bf|
+            bf.sizeInBytes()
+        else
+            0;
+        const egid_bytes: u64 = table_index.egid_bitmap.len;
+        const res: Resident = .{
+            .index = (index_len -| (filter_bytes + egid_bytes)) +
+                cached.len * @sizeOf(std.atomic.Value(u64)),
+            .filter = filter_bytes,
+            .egids = egid_bytes,
+        };
+
         allocator.free(table_index.egid_bitmap);
         table_index.egid_bitmap = &.{};
 
@@ -206,6 +258,7 @@ pub const Table = struct {
             .index = table_index,
             .binary_fuse = binary_fuse,
             .egid_bm = egid_bm,
+            .resident = res,
             .smallest = if (smallest_raw.len >= min_key_len)
                 Key{ .primary = smallest_raw }
             else
@@ -220,6 +273,7 @@ pub const Table = struct {
             .path_len = 0,
             .cached = cached,
         };
+        resident.add(res);
         return t;
     }
 
@@ -238,6 +292,7 @@ pub const Table = struct {
         if (block_cache) |cache| _ = self.purgeCachedBlocks(cache);
 
         if (self.claimPath()) |p| self.allocator.free(p);
+        resident.sub(self.resident);
         self.allocator.free(self.cached);
         self.index.destroy(self.allocator);
         if (self.binary_fuse) |*bf| bf.deinit(self.allocator);

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const std = @import("std");
+const mem = @import("mem.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -15,6 +16,10 @@ pub const Context = struct {
     io: Io,
     args: std.process.Args,
     environ_map: *std.process.Environ.Map,
+    /// The allocator `gpa` is: the one passed to `initGlobal...`,
+    /// counted. Its live bytes are what the cache governor and the admin
+    /// `mem` command read (`counting()`).
+    counting: mem.CountingAlloc,
 
     /// argv as `[]const []const u8`, allocated in arena (no caller free).
     /// Callers that want sentinel-terminated strings can use `args.toSlice`
@@ -41,22 +46,33 @@ pub fn initGlobal(init: std.process.Init) void {
     initGlobalWithAllocator(init, init.gpa);
 }
 
-/// Production can replace `init.gpa` while tests and tools retain Zig's
-/// normal process allocator. The initialization arena is intentionally kept:
-/// it owns only process-lifetime arguments and other startup state.
+/// Production can replace `init.gpa` (with jemalloc); tests and tools
+/// keep Zig's process allocator. Either way `gpa` is that allocator
+/// counted: `global` is static, so `gpa`'s pointer to `counting` stays
+/// valid. The initialization arena is intentionally kept: it owns only
+/// process-lifetime arguments and other startup state.
 pub fn initGlobalWithAllocator(
     init: std.process.Init,
-    gpa: Allocator,
+    inner: Allocator,
 ) void {
     std.debug.assert(!inited);
     global = .{
-        .gpa = gpa,
+        .gpa = undefined,
+        .counting = .init(inner),
         .arena = init.arena.allocator(),
         .io = init.io,
         .args = init.minimal.args,
         .environ_map = init.environ_map,
     };
+    global.gpa = global.counting.allocator();
     inited = true;
+}
+
+/// The counting allocator behind `gpa`, mutable: the governor sets its
+/// limit.
+pub fn counting() *mem.CountingAlloc {
+    std.debug.assert(inited);
+    return &global.counting;
 }
 
 pub fn g() *const Context {

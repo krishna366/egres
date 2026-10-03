@@ -13,9 +13,17 @@
 const std = @import("std");
 const fiber = @import("zfiber");
 const galloc = @import("galloc");
+const utils = @import("utils");
 
 test "galloc: verifyInUse accepts its own allocator" {
     try galloc.verifyInUse(galloc.allocator());
+}
+
+test "galloc: verifyInUse accepts the counting wrapper main uses" {
+    var counting = utils.mem.CountingAlloc.init(
+        galloc.allocator(),
+    );
+    try galloc.verifyInUse(counting.allocator());
 }
 
 test "galloc: verifyInUse rejects a foreign allocator" {

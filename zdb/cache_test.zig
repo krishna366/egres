@@ -433,3 +433,51 @@ test "ShardedCache remove" {
     try std.testing.expect(!c.remove(7));
     try std.testing.expectEqual(@as(?*Value, null), c.get(7));
 }
+
+test "ShardedCache counts a put of a key its ghost ring remembers" {
+    const alloc = std.testing.allocator;
+    // One shard; S holds one 4 KiB block, so each put evicts the last.
+    var c = try ShardedCache(u128).init(alloc, 5 * (4096 + 16) + 16, 1);
+    defer c.deinit();
+    for (1..4) |i| {
+        const v = try Value.init(alloc, try alloc.alloc(u8, 4096));
+        defer v.decrRef();
+        try c.put(i, v);
+    }
+    try std.testing.expectEqual(@as(u64, 0), c.ghostHits());
+
+    // Back after its eviction from S: the ghost ring remembers it.
+    const v = try Value.init(alloc, try alloc.alloc(u8, 4096));
+    defer v.decrRef();
+    try c.put(1, v);
+    try std.testing.expectEqual(@as(u64, 1), c.ghostHits());
+}
+
+test "ShardedCache setCapacity: a shrink evicts to the new budget" {
+    const alloc = std.testing.allocator;
+    // One shard, room for about eight 4 KiB blocks.
+    var c = try ShardedCache(u128).init(alloc, 8 * (4096 + 16), 1);
+    defer c.deinit();
+    for (1..9) |i| {
+        const v = try Value.init(alloc, try alloc.alloc(u8, 4096));
+        defer v.decrRef();
+        try c.put(i, v);
+        if (c.get(i)) |got| got.decrRef(); // into M at the next put
+    }
+    try std.testing.expect(c.byteSize() > 4 * 4096);
+
+    c.setCapacity(4 * (4096 + 16));
+    try std.testing.expectEqual(@as(usize, 4 * (4096 + 16)), c.capacity());
+    try std.testing.expect(c.byteSize() <= 4 * (4096 + 16));
+    try std.testing.expect(c.count() <= 4);
+
+    // Grown again, it admits more without evicting what it kept.
+    const kept = c.count();
+    c.setCapacity(16 * (4096 + 16));
+    for (20..24) |i| {
+        const v = try Value.init(alloc, try alloc.alloc(u8, 4096));
+        defer v.decrRef();
+        try c.put(i, v);
+    }
+    try std.testing.expect(c.count() >= kept + 1);
+}

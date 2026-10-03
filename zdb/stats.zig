@@ -51,11 +51,32 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
     if (_table.table.block_cache) |bc| {
         try w.print("  block_cache: entries={d} bytes=", .{bc.count()});
         try writeBytes(w, bc.byteSize());
-        try w.print(" hits={d} misses={d}\n", .{
-            bc.hits.load(.monotonic),
-            bc.misses.load(.monotonic),
+        const hits = bc.hits.load(.monotonic);
+        const misses = bc.misses.load(.monotonic);
+        const ghost = bc.ghostHits();
+        try w.print(" hits={d} ({d:.1}%) misses={d} ({d:.1}%) " ++
+            "ghost_hits={d} ({d:.1}% of misses)\n", .{
+            hits,   pct(hits, hits + misses),
+            misses, pct(misses, hits + misses),
+            ghost,  pct(ghost, misses),
         });
     }
+    // What the open tables pin besides the cache (`Table.resident`).
+    const res = &_table.table.resident;
+    const index = res.index.load(.monotonic);
+    const filter = res.filter.load(.monotonic);
+    const egids = res.egids.load(.monotonic);
+    try w.print("  tables: open={d} resident=", .{
+        res.tables.load(.monotonic),
+    });
+    try writeBytes(w, index + filter + egids);
+    try w.print(" (index ", .{});
+    try writeBytes(w, index);
+    try w.print(", filters ", .{});
+    try writeBytes(w, filter);
+    try w.print(", egid bitmaps ", .{});
+    try writeBytes(w, egids);
+    try w.print(")\n", .{});
 
     // Per-level aggregate (sum + max-with-tree).
     const max_levels = self.live.cur().max_levels;
@@ -198,16 +219,27 @@ pub fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tk: TreeKey) !void {
     // Numbers first, under the lock; printing after — the writer may be
     // a socket, and a slow client must not hold up installs into this
     // tree.
-    const LevelStat = struct { tables: usize, bytes: u64 };
+    // Per level: tables, bytes on disk and before compression (each
+    // table's index records both), so a tree's ratio is visible.
+    const LevelStat = struct { tables: usize, bytes: u64, raw: u64 };
     const per_level = try self.allocator.alloc(LevelStat, tree.levels.len);
     defer self.allocator.free(per_level);
+    var pinned: _table.table.Resident = .{};
     const total: i64, const candidate: ?_tree.CompactCandidate = blk: {
         const held = tree.mu.hold(.shared, @src());
         defer held.release();
         for (tree.levels, per_level) |*lv, *st| {
+            var raw: u64 = 0;
+            for (lv.entries(held)) |e| {
+                raw += e.table.index.uncompressed_size;
+                pinned.index += e.table.resident.index;
+                pinned.filter += e.table.resident.filter;
+                pinned.egids += e.table.resident.egids;
+            }
             st.* = .{
                 .tables = lv.numTables(held),
                 .bytes = @intCast(lv.getTotalSize(held)),
+                .raw = raw,
             };
         }
         break :blk .{ tree.totalSize(held), tree.compact_candidate };
@@ -224,8 +256,21 @@ pub fn writeTreeStats(self: *Forest, w: *std.Io.Writer, tk: TreeKey) !void {
         if (st.tables == 0 and st.bytes == 0) continue;
         try w.print("  L{d}: {d} tables, ", .{ idx, st.tables });
         try writeBytes(w, st.bytes);
-        try w.print("\n", .{});
+        try w.print(" (raw ", .{});
+        try writeBytes(w, st.raw);
+        const ratio = @as(f64, @floatFromInt(st.raw)) /
+            @as(f64, @floatFromInt(@max(st.bytes, 1)));
+        try w.print(", {d:.1}x)\n", .{ratio});
     }
+    try w.print("  resident: ", .{});
+    try writeBytes(w, pinned.index + pinned.filter + pinned.egids);
+    try w.print(" (index ", .{});
+    try writeBytes(w, pinned.index);
+    try w.print(", filters ", .{});
+    try writeBytes(w, pinned.filter);
+    try w.print(", egid bitmaps ", .{});
+    try writeBytes(w, pinned.egids);
+    try w.print(")\n", .{});
     if (candidate) |c| {
         try w.print(
             "  compact_candidate: L{d} {t} score={d:.2}\n",
@@ -251,6 +296,13 @@ pub fn writeNamespaceStats(self: *Forest, w: *std.Io.Writer, ns_id: u64) !void {
 
 /// Pretty-print a byte count: KiB / MiB / GiB / TiB. Two decimal places
 /// of precision past the smallest meaningful unit.
+/// `part` of `whole` in percent; 0 for an empty whole.
+fn pct(part: u64, whole: u64) f64 {
+    if (whole == 0) return 0;
+    return @as(f64, @floatFromInt(part)) * 100.0 /
+        @as(f64, @floatFromInt(whole));
+}
+
 pub fn writeBytes(w: *std.Io.Writer, b: u64) !void {
     const kib: u64 = 1024;
     const mib: u64 = 1024 * kib;

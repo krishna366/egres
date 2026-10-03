@@ -128,13 +128,16 @@ def percentile(sorted_vals, pct: float):
     return sorted_vals[rank - 1]
 
 
-def parse_latencies(chunk: bytes, into: dict, until=None):
+def parse_latencies(chunk: bytes, into: dict, until=None, since=None,
+                    started: dict = None):
     """Add a log chunk's latencies (microseconds) to `into`, a dict of
     script number -> array. A line is
     `client txn_no time_us script_no epoch epoch_us [...]`, the epoch
     being when the transaction ended; a failed transaction has a word
-    where the time is, and is skipped. `until` (epoch seconds) leaves
-    out transactions that started after it."""
+    where the time is, and is skipped. `until` and `since` (epoch
+    seconds) leave out transactions that started after, or before,
+    them. `started`, when given, collects each kept transaction's
+    start time the same way."""
     for line in chunk.splitlines():
         parts = line.split()
         if len(parts) < 6:
@@ -144,11 +147,18 @@ def parse_latencies(chunk: bytes, into: dict, until=None):
             ended = int(parts[4]) + int(parts[5]) / 1e6
         except ValueError:
             continue
-        if until is not None and ended - us / 1e6 > until:
+        t0 = ended - us / 1e6
+        if until is not None and t0 > until:
+            continue
+        if since is not None and t0 < since:
             continue
         if script not in into:
             into[script] = array.array("L")
         into[script].append(us)
+        if started is not None:
+            if script not in started:
+                started[script] = array.array("d")
+            started[script].append(t0)
 
 
 def poll_latencies(h: Handle):
@@ -174,26 +184,58 @@ def poll_latencies(h: Handle):
 
 
 def latency_summary(prefixes: list, scripts: list,
-                    whole_paths: bool = False, until=None) -> dict:
+                    whole_paths: bool = False, until=None,
+                    since=None) -> dict:
     """Per script name, over every log file under the given prefixes
     (or the files themselves with `whole_paths`): n (logged
     transactions; a sample when the run samples) and p50, p95, p99,
-    p999, max in milliseconds. `until`: only transactions started by
-    that time (epoch seconds)."""
+    p999, max in milliseconds. `until` and `since`: only transactions
+    started by, or from, that time (epoch seconds)."""
     vals: dict = {}
     for prefix in prefixes:
         paths = [prefix] if whole_paths else sorted(glob.glob(f"{prefix}.*"))
         for path in paths:
             with open(path, "rb") as f:
-                parse_latencies(f.read(), vals, until)
+                parse_latencies(f.read(), vals, until, since)
     out = {}
     for script, arr in sorted(vals.items()):
-        ordered = sorted(arr)
         name = scripts[script] if script < len(scripts) else str(script)
-        out[name] = {"n": len(ordered), "max": ordered[-1] / 1000.0}
-        for key, pct in (("p50", 50), ("p95", 95), ("p99", 99),
-                         ("p999", 99.9)):
-            out[name][key] = percentile(ordered, pct) / 1000.0
+        out[name] = spread(arr)
+    return out
+
+
+def latency_slices(paths: list, scripts: list, since: float,
+                   until: float, step: float) -> dict:
+    """Per script name, the latency spread of each `step`-second slice
+    of [since, until), by when the transaction started: a list of
+    {"from": seconds after `since`, "n", "p50", ...}, oldest first,
+    with a slice left out when nothing started in it."""
+    vals: dict = {}
+    starts: dict = {}
+    for path in paths:
+        with open(path, "rb") as f:
+            parse_latencies(f.read(), vals, until, since, starts)
+    out = {}
+    for script, arr in sorted(vals.items()):
+        name = scripts[script] if script < len(scripts) else str(script)
+        by_slice: dict = {}
+        for us, t0 in zip(arr, starts[script]):
+            by_slice.setdefault(int((t0 - since) // step), []).append(us)
+        out[name] = [dict(spread(v), **{"from": k * step})
+                     for k, v in sorted(by_slice.items())]
+    return out
+
+
+def spread(vals) -> dict:
+    """n, p50, p95, p99, p999 and max (milliseconds) of latencies in
+    microseconds; {"n": 0} when there are none."""
+    ordered = sorted(vals)
+    if not ordered:
+        return {"n": 0}
+    out = {"n": len(ordered), "max": ordered[-1] / 1000.0}
+    for key, pct in (("p50", 50), ("p95", 95), ("p99", 99),
+                     ("p999", 99.9)):
+        out[key] = percentile(ordered, pct) / 1000.0
     return out
 
 

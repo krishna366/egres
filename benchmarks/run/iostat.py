@@ -1,7 +1,7 @@
 # Copyright 2026 Manish R Jain
 # SPDX-License-Identifier: Apache-2.0
 
-"""Disk bytes read and written over a span of a run.
+"""Disk bytes read and written, and CPU time, over a span of a run.
 
 Two sources, both counters the kernel keeps anyway:
 
@@ -15,10 +15,15 @@ Two sources, both counters the kernel keeps anyway:
     counters with it when it exits, so there only the disks are
     reported.
 
-`snapshot` reads both; `delta` subtracts two snapshots. `device_of`
-names the disk under a path so a report can say which disk holds the
-data dir and which the WAL: a partition resolves to its disk, a ZFS
-dataset to the disks of its pool.
+CPU the same way: the host's busy time from /proc/stat, and the
+server's from its cgroup's cpu.stat when it runs in one (the harness's
+memory cap puts it in a scope, which covers every Postgres process),
+else from /proc/<pid>/stat for a single-process server.
+
+`snapshot` reads all of it; `delta` subtracts two snapshots.
+`device_of` names the disk under a path so a report can say which
+disk holds the data dir and which the WAL: a partition resolves to
+its disk, a ZFS dataset to the disks of its pool.
 """
 
 import os
@@ -30,14 +35,16 @@ SECTOR = 512  # /proc/diskstats counts 512-byte sectors on any device
 
 
 def disks() -> dict:
-    """Whole disks: name -> (bytes read, bytes written) since boot."""
+    """Whole disks: name -> (bytes read, bytes written, reads, writes)
+    since boot; the last two are completed requests."""
     names = {p.name for p in Path("/sys/block").iterdir()
              if not p.name.startswith(("loop", "ram", "zram", "zd"))}
     out = {}
     for line in Path("/proc/diskstats").read_text().splitlines():
         f = line.split()
         if len(f) >= 10 and f[2] in names:
-            out[f[2]] = (int(f[5]) * SECTOR, int(f[9]) * SECTOR)
+            out[f[2]] = (int(f[5]) * SECTOR, int(f[9]) * SECTOR,
+                         int(f[3]), int(f[7]))
     return out
 
 
@@ -93,20 +100,65 @@ def proc_io(pid):
     return int(vals["read_bytes"]), int(vals["write_bytes"])
 
 
-def snapshot(pid=None) -> dict:
+def host_cpu() -> tuple:
+    """(busy, total) CPU seconds of the host since boot, summed over
+    every CPU: busy is everything but idle and iowait."""
+    f = Path("/proc/stat").read_text().split("\n", 1)[0].split()
+    ticks = [int(x) for x in f[1:9]]
+    hz = os.sysconf("SC_CLK_TCK")
+    idle = ticks[3] + ticks[4]
+    return (sum(ticks) - idle) / hz, sum(ticks) / hz
+
+
+def server_cpu(pid, cgroup, single_process: bool):
+    """CPU seconds the server has used: its cgroup's, else its own
+    process's when that is the whole server, else None."""
+    if cgroup:
+        try:
+            for line in (Path(cgroup) / "cpu.stat").read_text().splitlines():
+                key, val = line.split()
+                if key == "usage_usec":
+                    return int(val) / 1e6
+        except OSError:
+            return None
+    if pid and single_process:
+        try:
+            f = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1]
+        except OSError:
+            return None
+        utime, stime = f.split()[11:13]
+        return (int(utime) + int(stime)) / os.sysconf("SC_CLK_TCK")
+    return None
+
+
+def snapshot(pid=None, cgroup=None, single_process=False) -> dict:
     return {"time": time.time(), "disks": disks(),
-            "pid": pid, "proc": proc_io(pid) if pid else None}
+            "pid": pid, "proc": proc_io(pid) if pid else None,
+            "host_cpu": host_cpu(),
+            "server_cpu": server_cpu(pid, cgroup, single_process)}
 
 
 def delta(a: dict, b: dict) -> dict:
     """What happened between snapshots `a` and `b`. `proc` is None
-    when the process is not the same one at both ends (a restart)."""
+    when the process is not the same one at both ends (a restart).
+    `cpu`: the host's cores busy on average, its core count, and the
+    cores the server used on average (None when unknown)."""
     out = {"secs": b["time"] - a["time"], "disks": {}, "proc": None}
-    for name, (r1, w1) in b["disks"].items():
-        r0, w0 = a["disks"].get(name, (0, 0))
-        if r1 - r0 or w1 - w0:
-            out["disks"][name] = (r1 - r0, w1 - w0)
+    for name, now in b["disks"].items():
+        then = a["disks"].get(name, (0, 0, 0, 0))
+        d = tuple(x1 - x0 for x1, x0 in zip(now, then))
+        if any(d):
+            out["disks"][name] = d
     if a["proc"] and b["proc"] and a["pid"] == b["pid"]:
         out["proc"] = (b["proc"][0] - a["proc"][0],
                        b["proc"][1] - a["proc"][1])
+    busy = b["host_cpu"][0] - a["host_cpu"][0]
+    total = b["host_cpu"][1] - a["host_cpu"][1]
+    ncpu = os.cpu_count() or 1
+    server = None
+    if a["server_cpu"] is not None and b["server_cpu"] is not None \
+            and a["pid"] == b["pid"]:
+        server = (b["server_cpu"] - a["server_cpu"]) / max(out["secs"], 1)
+    out["cpu"] = {"host_cores_busy": busy / max(total, 1e-9) * ncpu,
+                  "host_cores": ncpu, "server_cores": server}
     return out

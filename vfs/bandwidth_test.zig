@@ -125,6 +125,19 @@ test "P1 demand blocks P2" {
     defer p2.deinit();
     const granted = p2.acquireBytes();
     try testing.expectEqual(@as(usize, page_size), granted);
+
+    // The wait is on P2's account: one grant, one timeout, about the
+    // timeout's worth of sleep; P1 asked for nothing yet.
+    const w2 = &limiter.stats[@intFromEnum(vfs.Priority.p2)];
+    try testing.expectEqual(@as(u64, 1), w2.grants.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), w2.timeouts.load(.monotonic));
+    // Charged 2 ms a sleep, up to the timeout: at least one sleep, and
+    // fewer than the timeout allows when a sleep runs long.
+    const slept_us = w2.wait_us.load(.monotonic);
+    try testing.expect(slept_us >= 2000 and slept_us % 2000 == 0);
+    try testing.expect(slept_us <= (limiter.conf.timeout_ms + 2) * 1000);
+    const w1 = &limiter.stats[@intFromEnum(vfs.Priority.p1)];
+    try testing.expectEqual(@as(u64, 0), w1.grants.load(.monotonic));
 }
 
 // ── 9. Grants are always page-aligned ──────────────────────────────

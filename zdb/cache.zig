@@ -95,6 +95,11 @@ pub fn Cache(comptime K: type) type {
         allocator: Allocator,
         map: Map,
         ghost_set: std.AutoHashMap(u64, void),
+        /// Puts of a key the ghost ring remembered: misses a cache a
+        /// few times larger would have served. Measured at 0.07% of
+        /// misses on the orders workload: the misses are cold, and a
+        /// larger or compressed cache would not catch them.
+        ghost_hits: u64 = 0,
 
         /// S ring: stores only keys; val + freq live in the map Entry.
         s_ring: std.ArrayList(K),
@@ -123,9 +128,9 @@ pub fn Cache(comptime K: type) type {
         // Public API
         // ----------------------------------------------------------------
 
-        pub fn init(alloc: Allocator, capacity: usize) !Self {
-            const s_cap_bytes = @max(1, capacity / 10);
-            const m_cap_bytes = capacity - s_cap_bytes;
+        pub fn init(alloc: Allocator, budget: usize) !Self {
+            const s_cap_bytes = @max(1, budget / 10);
+            const m_cap_bytes = budget - s_cap_bytes;
             const g_cap = @max(16, m_cap_bytes / 512);
 
             const s_ring_len = @max(16, s_cap_bytes / 4096);
@@ -213,6 +218,7 @@ pub fn Cache(comptime K: type) type {
 
             const h = hashKey(K, key);
             if (self.ghost_set.contains(h)) {
+                self.ghost_hits += 1;
                 // Ghost hit: skip S, go directly to M.
                 // pushMain takes ownership of a ref, so incrRef here.
                 _ = val.incrRef();
@@ -287,6 +293,24 @@ pub fn Cache(comptime K: type) type {
         /// Total live bytes in S + M.
         pub fn byteSize(self: *const Self) usize {
             return self.s_bytes + self.m_bytes;
+        }
+
+        /// The byte budget, S and M together.
+        pub fn capacity(self: *const Self) usize {
+            return self.s_cap_bytes + self.m_cap_bytes;
+        }
+
+        /// Re-budgets the cache to `budget` bytes, S keeping its tenth.
+        /// A shrink evicts down to the new budget here, so the memory is
+        /// released now and not at the next put. The ghost ring keeps
+        /// its size: it was sized once and holds hashes only.
+        pub fn setCapacity(self: *Self, budget: usize) void {
+            self.s_cap_bytes = @max(1, budget / 10);
+            self.m_cap_bytes = budget - self.s_cap_bytes;
+            while (self.s_bytes > self.s_cap_bytes and self.s_len > 0)
+                self.evictSmall() catch break;
+            while (self.m_bytes > self.m_cap_bytes and self.m_len > 0)
+                self.evictMain();
         }
 
         /// Total live entry count (S + M).
@@ -537,6 +561,39 @@ pub fn ShardedCache(comptime K: type) type {
         pub fn admissionBudget(self: *const Self) usize {
             var total: usize = 0;
             for (self.shards) |*s| total += s.cache.s_cap_bytes;
+            return total;
+        }
+
+        /// Ghost hits across shards (`Cache.ghost_hits`).
+        pub fn ghostHits(self: *Self) u64 {
+            var total: u64 = 0;
+            for (self.shards) |*s| {
+                s.lock.lockShared(@src());
+                defer s.lock.unlockShared();
+                total += s.cache.ghost_hits;
+            }
+            return total;
+        }
+
+        /// Re-budgets every shard to its share of `total_capacity`
+        /// (`Cache.setCapacity`).
+        pub fn setCapacity(self: *Self, total_capacity: usize) void {
+            const per = @max(total_capacity / self.shards.len, 2);
+            for (self.shards) |*s| {
+                s.lock.lock(@src());
+                defer s.lock.unlock();
+                s.cache.setCapacity(per);
+            }
+        }
+
+        /// The byte budget across shards.
+        pub fn capacity(self: *Self) usize {
+            var total: usize = 0;
+            for (self.shards) |*s| {
+                s.lock.lockShared(@src());
+                defer s.lock.unlockShared();
+                total += s.cache.capacity();
+            }
             return total;
         }
 

@@ -11,6 +11,7 @@ pub const date = @import("date.zig");
 /// here, at the bottom of the module graph, so every layer including
 /// the fiber runtime reaches them without a cycle.
 pub const context = @import("context.zig");
+pub const mem = @import("mem.zig");
 pub const coarse_clock = @import("coarse_clock.zig");
 pub const coarseMs = coarse_clock.ms;
 pub const timestampNow = coarse_clock.timestampNow;

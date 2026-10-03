@@ -13,6 +13,7 @@ pub const compaction = @import("zdb/compaction.zig");
 pub const forest = @import("zdb/forest.zig");
 pub const sstPath = forest.sstPath;
 pub const cache = @import("zdb/cache.zig");
+pub const stats = @import("zdb/stats.zig");
 pub const binaryfusefilter = @import("zdb/binaryfusefilter.zig");
 pub const metrics = @import("zdb/metrics.zig");
 pub const validate = @import("zdb/validate.zig");

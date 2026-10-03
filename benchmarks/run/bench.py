@@ -75,8 +75,10 @@ autovacuum_max_workers = 4
 
 # A server: ports, the database the workload lives in, its config.
 SERVERS = {
+    # `cache` is the server's --cache flag body ("total_mb=.."); empty
+    # leaves the server's default (90% of RAM or of the cgroup cap).
     "egres": {"sql_port": 3210, "admin_port": 5210, "dbname": "egres",
-              "zdb_extra": "num_compactors=8"},
+              "zdb_extra": "num_compactors=8", "cache": ""},
     "postgres": {"port": 5434, "dbname": "bench", "conf": PG_CONF},
 }
 
@@ -323,6 +325,8 @@ def start_egres(run: Run):
     cmd = scope_prefix(run) + [
         str(run.egres_bin), "--raft=id=1", f"--listen={listen}",
         f"--zdb=dir={run.data};{srv['zdb_extra']}", f"--wal=dir={run.wal}"]
+    if srv["cache"]:
+        cmd.append(f"--cache={srv['cache']}")
     with open(run.server_log, "w") as log:
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL,

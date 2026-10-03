@@ -4,6 +4,7 @@
 const std = @import("std");
 const raft = @import("raft");
 const zdb = @import("zdb");
+const _governor = @import("governor.zig");
 const fiber = @import("zfiber");
 const m = @import("metrics");
 const flags = @import("flags");
@@ -559,6 +560,25 @@ pub const Engine = struct {
         try self.bg.spawn(.{}, runRaft, .{&self.raft_rt});
         try self.bg.spawn(.{}, runCompactions, .{self});
         try self.bg.spawn(.{}, runSnapshot, .{self});
+        // High priority, so a shrink for a burst does not wait behind
+        // a busy worker's queue; high fibers are pinned, to worker 0.
+        if (_governor.g() != null)
+            try self.bg.spawn(
+                .{ .priority = .high, .worker_id = 0 },
+                runGovernor,
+                .{self},
+            );
+    }
+
+    /// Sizes the block cache from the rest of the process's memory
+    /// (`governor.Governor.tick`), ten times a second: live bytes pass
+    /// the total by at most what 100 ms allocates past the margin.
+    fn runGovernor(self: *Engine) void {
+        const gov = _governor.g().?;
+        while (!self.node.isShuttingDown()) {
+            gov.tick();
+            if (self.node.shutdown.waitForStart(.shutdown, 100)) return;
+        }
     }
 
     /// The raft runtime loop. Runs on the .raft lane directly (no re-spawn).

@@ -13,6 +13,10 @@ pub const Config = struct {
     min_alloc_bytes: u64 = 8 * _vfs.page_size, // default: write_cost (8) * page_size
 };
 
+/// How long a grant that finds the bucket short sleeps before it looks
+/// again; each such sleep is charged to its priority's `wait_us`.
+const sleep_ms = 2;
+
 /// Atomically subtract `n` from `v`, clamping at zero.
 fn atomicSaturatingSub(v: *std.atomic.Value(u64), n: u64) void {
     while (true) {
@@ -85,6 +89,8 @@ pub const Spinner = struct {
 
         const limiter = self.limiter;
         const start = utils.coarseMs();
+        const stats = &limiter.stats[@intFromEnum(self.priority)];
+        _ = stats.grants.fetchAdd(1, .monotonic);
 
         while (true) {
             limiter.tryRefill();
@@ -109,10 +115,18 @@ pub const Spinner = struct {
                 if (utils.coarseMs() - start >= timeout_ms) {
                     // Timeout fallback: round min_alloc_pages up to the
                     // factor so the result is still a usable multiple.
+                    _ = stats.timeouts.fetchAdd(1, .monotonic);
                     const fallback = limiter.min_alloc_pages;
                     return ((fallback + factor - 1) / factor) * factor;
                 }
-                fiber.sleepMs(2);
+                // Only a sleep is a wait, charged at what was asked for:
+                // a grant that never sleeps charges nothing, and an
+                // oversleep under load goes uncounted.
+                fiber.sleepMs(sleep_ms);
+                _ = stats.wait_us.fetchAdd(
+                    sleep_ms * std.time.us_per_ms,
+                    .monotonic,
+                );
                 continue;
             }
 
@@ -151,6 +165,19 @@ pub const Limiter = struct {
     pages_per_sec: u64,
     min_alloc_pages: u64,
     conf: Config,
+    /// What the budget cost each priority: grants asked for, the
+    /// microseconds they slept waiting for pages in all, and the grants
+    /// that gave up waiting and took `min_alloc_pages` (`timeout_ms`). A
+    /// nonzero P1 wait says the WAL and flushes were held by the
+    /// limiter; the brake has `zdb_write_backpressure_ms` for the
+    /// same question on the write path.
+    stats: [3]Stats = .{ .{}, .{}, .{} },
+
+    pub const Stats = struct {
+        grants: std.atomic.Value(u64) = .init(0),
+        wait_us: std.atomic.Value(u64) = .init(0),
+        timeouts: std.atomic.Value(u64) = .init(0),
+    };
 
     /// Snapshot of the live limiter state, all counted in pages
     /// (multiply by `vfs.page_size` for bytes). `available_p2` shows

@@ -5,6 +5,8 @@ const std = @import("std");
 const fiber = @import("zfiber");
 const raft = @import("raft");
 const zdb = @import("zdb");
+const galloc = @import("galloc");
+const _governor = @import("governor.zig");
 const m = @import("metrics");
 const flags = @import("flags");
 const utils = @import("raft").utils;
@@ -36,6 +38,7 @@ pub const Command = union(enum) {
     zdb: ZdbCmd,
     raft: RaftCmd,
     vfs: VfsCmd,
+    mem: MemCmd,
     locks: LocksCmd,
     workers: WorkersCmd,
     profile: ProfileCmd,
@@ -44,6 +47,8 @@ pub const Command = union(enum) {
 };
 
 pub const VfsCmd = struct {};
+
+pub const MemCmd = struct {};
 
 pub const LocksCmd = struct {};
 
@@ -107,6 +112,8 @@ pub const help_text =
     \\  raft entry <N>                  dump WAL entry N (one human-readable line)
     \\  raft entry <lo> <hi>            dump WAL entries [lo, hi], one per line
     \\  vfs                             VFS bandwidth limiter snapshot
+    \\  mem                             memory as egres sees it (live bytes,
+    \\                                  cache, tables) and as the allocator does
     \\  locks                           dump every tracked mutex: holder src,
     \\                                  waiter count, last-waiter src
     \\  workers                         per-worker CPU histogram + imbalance
@@ -594,6 +601,8 @@ pub fn parseLine(line: String) !Command {
         return .{ .raft = .{ .sub = .entry, .lo = lo, .hi = hi } };
     } else if (std.mem.eql(u8, cmd, "vfs")) {
         return .{ .vfs = .{} };
+    } else if (std.mem.eql(u8, cmd, "mem")) {
+        return .{ .mem = .{} };
     } else if (std.mem.eql(u8, cmd, "locks")) {
         return .{ .locks = .{} };
     } else if (std.mem.eql(u8, cmd, "workers")) {
@@ -862,6 +871,9 @@ pub const AdminServer = struct {
                 },
                 .vfs => {
                     self.handleVfs(stream) catch return;
+                },
+                .mem => {
+                    self.handleMem(stream) catch return;
                 },
                 .locks => {
                     self.handleLocks(stream) catch return;
@@ -1188,7 +1200,102 @@ pub const AdminServer = struct {
         try w.print("  total_read:    {d}\n", .{s.total_read_pages});
         try w.print("  total_write:   {d}\n", .{s.total_write_pages});
         try w.print("  note: p0 is unbounded (saturating subtract)\n", .{});
+        // What each priority paid for the budget (`Limiter.stats`).
+        for (&vfs.g().bw.stats, 0..) |*wt, i| {
+            const grants = wt.grants.load(.monotonic);
+            const wait_us = wt.wait_us.load(.monotonic);
+            try w.print("  p{d}: grants={d} wait_us={d} timeouts={d}" ++
+                " mean_wait_us={d}\n", .{
+                i,                         grants,
+                wait_us,                   wt.timeouts.load(.monotonic),
+                wait_us / @max(grants, 1),
+            });
+        }
         try w.flush();
+    }
+
+    /// The limiter's wait counters in Prometheus text, beside the zdb
+    /// and raft registries, so the dashboard reads them the same way.
+    fn writeLimiterMetrics(w: *std.Io.Writer) !void {
+        const names = [_]String{
+            "vfs_bandwidth_grants_total",
+            "vfs_bandwidth_wait_us_total",
+            "vfs_bandwidth_timeouts_total",
+        };
+        for (names) |n| try w.print("# TYPE {s} counter\n", .{n});
+        for (&vfs.g().bw.stats, 0..) |*wt, i| {
+            const vals = [_]u64{
+                wt.grants.load(.monotonic),
+                wt.wait_us.load(.monotonic),
+                wt.timeouts.load(.monotonic),
+            };
+            for (names, vals) |n, v| {
+                try w.print("{s}{{priority=\"p{d}\"}} {d}\n", .{ n, i, v });
+            }
+        }
+    }
+
+    /// Where the process's memory is, as Egres sees it (the bytes it
+    /// holds through `CountingAlloc`, and what holds them; `other
+    /// live` is live minus the three accounted owners), then as the
+    /// allocator sees it (`galloc.snapshot`: resident, retained, and so
+    /// on). Resident minus live is the allocator's own.
+    fn handleMem(self: *AdminServer, stream: fiber.net.Stream) !void {
+        var buf: [4096]u8 = undefined;
+        var sw = stream.writer(&buf);
+        const w = &sw.interface;
+        const counting = utils.context.counting();
+        const live = counting.live_bytes.load(.monotonic);
+        const cache: u64 = if (zdb.table.table.block_cache) |bc|
+            bc.byteSize()
+        else
+            0;
+        const res = &zdb.table.table.resident;
+        const tables = res.index.load(.monotonic) +
+            res.filter.load(.monotonic) + res.egids.load(.monotonic);
+        const mt = self.engine.forest.memtables.stats();
+        const memtables = mt.active_bytes + mt.immutable_bytes;
+
+        try w.print("egres:\n", .{});
+        try memLine(w, "live", live, "held by the program");
+        try w.print("  over_limit:   {d}   (allocations past the " ++
+            "total)\n", .{counting.over_limit.load(.monotonic)});
+        try memLine(w, "block_cache", cache, "block bytes");
+        try memLine(w, "tables", tables, "index, filters, egid bitmaps");
+        try memLine(w, "memtables", memtables, "active + immutable");
+        // Includes the cache's maps and rings, and blocks it evicted that
+        // readers still hold.
+        const other = live -| (cache + tables + memtables);
+        try memLine(w, "other live", other, "");
+        if (_governor.g()) |gov| {
+            try w.print("governor:\n", .{});
+            try memLine(w, "total", gov.total, "--cache total_mb");
+            try memLine(w, "margin", gov.margin, "recent peak of the rest");
+            try memLine(w, "cache_cap", gov.knob.now, "in force");
+        }
+        try w.print("{s}:\n", .{galloc.kind});
+        const snap = galloc.snapshot();
+        inline for (std.meta.fields(@TypeOf(snap))) |f| {
+            if (@field(snap, f.name)) |v| try memLine(w, f.name, v, "");
+        }
+        try w.flush();
+    }
+
+    fn memLine(
+        w: *std.Io.Writer,
+        name: String,
+        bytes: ?u64,
+        note: String,
+    ) !void {
+        try w.print("  {s}:", .{name});
+        var pad: usize = 14 -| (name.len + 1);
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        if (bytes) |b|
+            try zdb.stats.writeBytes(w, b)
+        else
+            try w.print("unknown", .{});
+        if (note.len > 0) try w.print("   ({s})", .{note});
+        try w.print("\n", .{});
     }
 
     fn handleConf(self: *AdminServer, stream: fiber.net.Stream, req: proto.ConfCmd) !void {
@@ -1346,6 +1453,7 @@ pub const AdminServer = struct {
                 // walk through the same writer so they appear in one blob.
                 try m.write(zdb.metrics.g(), &body.writer);
                 try m.write(raft.metrics.g(), &body.writer);
+                try writeLimiterMetrics(&body.writer);
             },
             .forest => {
                 try self.engine.forest.writeStats(&body.writer, .{ .scope = .forest });

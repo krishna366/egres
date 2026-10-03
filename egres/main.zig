@@ -79,22 +79,21 @@ const RaftCfg = struct {
     };
 };
 
-/// `--cache` — the memory Egres may hold in caches. `total_mb` is the
-/// budget for all of them; `block_mb` the share for SST blocks, today
-/// the only user. Both default to auto: total = a quarter of the memory
-/// this process may use (host RAM, or the cgroup limit under Docker and
-/// Kubernetes), never below 64 MiB; block = all of total.
+/// `--cache` — the live bytes Egres may hold. `total_mb` defaults to
+/// 90% of the memory this process may use (host RAM, or the cgroup
+/// limit under Docker and Kubernetes); the tenth is for what the
+/// allocator holds on top. The cache governor gives the SST block
+/// cache what the rest of the process leaves under it.
 const CacheCfg = struct {
     total_mb: u64 = 0,
-    block_mb: u64 = 0,
 
     pub const docs = .{
         .self = "Cache memory. The budget is a cap, not a reservation:" ++
             " memory is used as blocks are read.",
-        .total_mb = "All cache memory, in MiB. 0 = a quarter of host RAM or" ++
-            " of the cgroup limit, at least 64. Set it explicitly when" ++
-            " several nodes share one host.",
-        .block_mb = "The SST block cache's share of total_mb. 0 = all of it.",
+        .total_mb = "The overall memory Egres aims to hold, in MiB. 0 =" ++
+            " 90% of host RAM or of the cgroup limit. The block cache is" ++
+            " auto-resized based on what the rest of the process uses." ++
+            " Set it on a host shared with other processes.",
     };
 };
 
@@ -236,6 +235,7 @@ const Args = struct {
 
 pub fn main(init: std.process.Init) !void {
     defer log.info("shutdown complete", .{});
+    // The process allocator, counted (`mem`, the cache governor).
     utils.context.initGlobalWithAllocator(init, galloc.allocator());
     const allocator = utils.context.g().gpa;
     // Fail fast if the gpa above ever stops routing to the build-selected
@@ -525,21 +525,16 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // open table. With blocks cached decompressed here, tables open
     // O_DIRECT: the page cache would otherwise hold the same data twice.
     const mem = utils.host.memory();
-    const total_bytes: u64 = if (cache_cfg.total_mb > 0)
+    const total: u64 = if (cache_cfg.total_mb > 0)
         cache_cfg.total_mb << 20
     else
-        @max(mem.bytes / 4, 64 << 20);
-    const block_bytes: u64 = if (cache_cfg.block_mb > 0)
-        cache_cfg.block_mb << 20
-    else
-        total_bytes;
-    if (block_bytes > total_bytes) {
-        std.log.err("--cache block_mb exceeds total_mb", .{});
-        std.process.exit(1);
-    }
+        mem.bytes / 10 * 9;
+    // Starts at the cap the governor's first tick would set.
+    const Governor = engine.governor.Governor;
+    const start_cap = @max(Governor.min_cap, total -| Governor.min_margin);
     var block_cache = try zdb.cache.ShardedCache(u128).init(
         allocator,
-        @intCast(block_bytes),
+        @intCast(start_cap),
         16,
     );
     defer block_cache.deinit();
@@ -549,15 +544,11 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         zdb.table.table.block_cache = null;
         zdb.table.table.read_mode = .default;
     }
+    engine.governor.init(total, &block_cache);
     log.info(
-        "block cache {d} MiB of {d} MiB cache total (host memory {d} MiB " ++
-            "via {s}); sst reads direct",
-        .{
-            block_bytes >> 20,
-            total_bytes >> 20,
-            mem.bytes >> 20,
-            mem.source,
-        },
+        "block cache governed under total {d} MiB live (host memory " ++
+            "{d} MiB via {s}); sst reads direct",
+        .{ total >> 20, mem.bytes >> 20, mem.source },
     );
 
     // Open zdb forest.

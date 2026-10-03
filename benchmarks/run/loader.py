@@ -52,6 +52,10 @@ them. A group's progress goes to results/readers-<group>.log and
 readers-<group>.prom under run="load-<group>", each transaction's
 latency to results/latency/. Reads during writes are part of the
 measurement: work a server defers to a later pass is paid here.
+
+After the load the groups run on for the load's `after_secs` over
+every id, so the summary also shows how reads settle once the
+writes stop, per five-minute slice (`Readers after the load`).
 """
 
 import array
@@ -136,6 +140,9 @@ class Progress:
         self.failed = 0
         self.running = 0
         self.stop = False
+        # When the last stream finished; the readers' settle phase
+        # counts from it.
+        self.load_end = None
         self.threads: list = []
         self.insert = Latency()
         # Per stream: its slice's first id and the last id it has
@@ -145,6 +152,15 @@ class Progress:
 
     def loading(self) -> bool:
         return any(t.is_alive() for t in self.threads)
+
+    def reading(self, after_secs: float) -> bool:
+        """Whether the readers start another round: during the load,
+        and for `after_secs` past its end."""
+        if self.stop:
+            return False
+        if self.loading() or self.load_end is None:
+            return True
+        return time.time() - self.load_end < after_secs
 
     def per(self) -> int:
         """Ids loaded in every slice: the shortest loaded prefix."""
@@ -351,8 +367,9 @@ def readers(run, prog: Progress, total: int, group: dict):
     log = run.results / f"readers-{name}.log"
     events = run.out / "load.log"
     min_rows = min(1_000_000, total // 10)
+    after = run.env["load"].get("after_secs") or 0
     round_no = 0
-    while not prog.stop and prog.loading():
+    while prog.reading(after):
         with prog.lock:
             rows, per = prog.rows, prog.per()
         # Every slice needs rows before a script may draw from it.
@@ -457,7 +474,7 @@ def run_load(run, resume: bool):
     t0 = time.time()
     rows0 = prog.rows
     data_disks = iostat.device_of(run.data)
-    io0 = iostat.snapshot(run.pid("server.pid"))
+    io0 = io_snapshot(run)
     io_prev = io0
     last_log = t0
     last_rows = rows0
@@ -474,7 +491,7 @@ def run_load(run, resume: bool):
             rate = (rows - last_rows) / max(now - last_log, 1)
             size = dir_bytes(run.data)
             ins = spread(window)
-            io_now = iostat.snapshot(run.pid("server.pid"))
+            io_now = io_snapshot(run)
             io = iostat.delta(io_prev, io_now)
             io_prev = io_now
             mib = 2**20 * max(io["secs"], 1)
@@ -490,7 +507,8 @@ def run_load(run, resume: bool):
                             if ins["n"] else "")
                          + f" disk_MiBps read={rd / mib:.0f} "
                            f"write={wr / mib:.0f} "
-                           f"mem={mem / GIB:.1f}GiB\n")
+                           f"mem={mem / GIB:.1f}GiB"
+                         + cpu_text(io["cpu"]) + "\n")
             last_log, last_rows = now, rows
             if cfg["stop_bytes"] and size >= cfg["stop_bytes"]:
                 prog.stop = True
@@ -508,17 +526,151 @@ def run_load(run, resume: bool):
                 ef.write(f"{utc()} stop: ran {cfg['stop_secs']} s\n")
         time.sleep(5)
     # The load's own span: the snapshot before the readers wind down.
-    io1 = iostat.snapshot(run.pid("server.pid"))
+    io1 = io_snapshot(run)
     secs = time.time() - t0
+    prog.load_end = time.time()
     write_prom(prom, prog, total)
-    for t in reader_threads:
-        t.join()
     # `per` lets a later workload run draw only ids that exist.
     with open(events, "a") as ef:
         ef.write(f"{utc()} load done rows={prog.rows} failed={prog.failed} "
                  f"per={prog.per()} in {secs:.0f}s\n")
     summarize(run, prog, prog.rows - rows0, t0, secs,
               iostat.delta(io0, io1), {"peak": mem_peak, "end": mem})
+
+    # The settle phase: the readers go on while the server catches up
+    # on the load's deferred work. A STOP file ends it early; a round
+    # in progress still finishes.
+    after = cfg.get("after_secs") or 0
+    if after and reader_threads and not prog.stop:
+        with open(events, "a") as ef:
+            ef.write(f"{utc()} readers settle for {after} s\n")
+        while prog.reading(after):
+            if (run.out / "STOP").exists():
+                prog.stop = True
+                with open(events, "a") as ef:
+                    ef.write(f"{utc()} stop: STOP file\n")
+            time.sleep(5)
+    for t in reader_threads:
+        t.join()
+    if after and reader_threads:
+        summarize_after(run, prog.load_end, time.time(),
+                        iostat.delta(io1, io_snapshot(run)))
+
+
+def io_snapshot(run) -> dict:
+    """Disk and CPU counters now. The server's CPU comes from its
+    cgroup under a memory cap (`bench.py` records the path), else from
+    its process when the server is one process (Egres)."""
+    cg = run.out / "cgroup.path"
+    cgroup = cg.read_text().strip() if cg.exists() else None
+    return iostat.snapshot(run.pid("server.pid"), cgroup,
+                           run.kind == "egres")
+
+
+def cpu_text(cpu: dict) -> str:
+    """` cpu host=12.3/32 server=8.1` cores, server `-` when unknown."""
+    server = cpu["server_cores"]
+    return (f" cpu host={cpu['host_cores_busy']:.1f}/{cpu['host_cores']}"
+            f" server={server:.1f}" if server is not None else
+            f" cpu host={cpu['host_cores_busy']:.1f}/{cpu['host_cores']}"
+            " server=-")
+
+
+def summarize_after(run, since: float, until: float, io: dict):
+    """Appends `Readers after the load` to load-summary.md and
+    `readers_after` to .json: each group's latency over the settle
+    phase, whole and per five-minute slice of it, and the bytes each
+    disk read and wrote meanwhile."""
+    step = 300.0
+    groups = []
+    for group in run.env["workload"]["reads"]:
+        name = group["name"]
+        if run.env["readers"][name] <= 0:
+            continue
+        paths = glob.glob(reader_prefix(run, name, "*") + ".*")
+        scripts = [script for script, _weight in group["scripts"]]
+        groups.append({
+            "name": name, "clients": run.env["readers"][name],
+            "sample": group.get("sample", 1.0),
+            "scripts": pgbench.latency_summary(
+                paths, scripts, whole_paths=True, until=until,
+                since=since),
+            "slices": pgbench.latency_slices(
+                paths, scripts, since, until, step),
+        })
+    secs = until - since
+    path = run.out / "load-summary.json"
+    data = json.loads(path.read_text())
+    disks = {d: dict(data["disks"].get(d, {"roles": []}),
+                     read_bytes=r, written_bytes=w, reads=ro, writes=wo)
+             for d, (r, w, ro, wo) in sorted(io["disks"].items())}
+    data["readers_after"] = {"secs": secs, "slice_secs": step,
+                             "groups": groups, "disks": disks,
+                             "data_dir_bytes": dir_bytes(run.data),
+                             "cpu": io["cpu"]}
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+    def ms(d, key):
+        return f"{d[key]:.2f}" if key in d else "-"
+
+    md = [
+        "\n## Readers after the load\n",
+        f"The reader groups ran on for {secs:.0f} s after the load "
+        "ended, over every id. Latency in ms per script: the whole "
+        f"period, then each {step / 60:.0f}-minute slice of it by when "
+        "the transaction started.\n",
+        "| group | script | minutes | txns/s | p50 | p95 | p99 | p99.9 "
+        "| max |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for g in groups:
+        for script, d in g["scripts"].items():
+            rows = [("all", d, secs)]
+            rows += [(f"{s['from'] / 60:.0f}-{(s['from'] + step) / 60:.0f}",
+                      s, min(step, secs - s["from"]))
+                     for s in g["slices"].get(script, [])]
+            for label, s, span in rows:
+                txns = s["n"] / g["sample"]
+                md.append(
+                    f"| {g['name']} | {script} | {label} | "
+                    f"{txns / max(span, 1):,.1f} | {ms(s, 'p50')} | "
+                    f"{ms(s, 'p95')} | {ms(s, 'p99')} | {ms(s, 'p999')} | "
+                    f"{ms(s, 'max')} |")
+    md += [
+        "\nDisk bytes meanwhile, whole disks:\n",
+        "| disk | holds | read GiB | written GiB | read MiB/s "
+        "| write MiB/s | reads | writes | read/s | write/s |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for disk, d in disks.items():
+        md.append(disk_row(disk, d, secs))
+    md.append(f"\nData dir at the end: "
+              f"{data['readers_after']['data_dir_bytes'] / GIB:.1f} GiB.")
+    md.append(cpu_line(io["cpu"]))
+    with open(run.out / "load-summary.md", "a") as f:
+        f.write("\n".join(md) + "\n")
+
+
+def disk_row(disk: str, d: dict, secs: float) -> str:
+    """One disk's row of the summary's disk table: bytes and completed
+    requests, totals and per second."""
+    r, w = d["read_bytes"], d["written_bytes"]
+    ro, wo = d["reads"], d["writes"]
+    s = max(secs, 1)
+    return (f"| {disk} | {', '.join(d['roles']) or '-'} | {r / GIB:.1f} | "
+            f"{w / GIB:.1f} | {r / 2**20 / s:.0f} | {w / 2**20 / s:.0f} | "
+            f"{ro / 1e6:.1f}M | {wo / 1e6:.1f}M | {ro / s:,.0f} | "
+            f"{wo / s:,.0f} |")
+
+
+def cpu_line(cpu: dict) -> str:
+    """The summary's CPU line: cores busy on average, host and server
+    (user and system time, from the cgroup or the process)."""
+    server = cpu["server_cores"]
+    return (f"- CPU, cores busy on average: host "
+            f"{cpu['host_cores_busy']:.1f} of {cpu['host_cores']}; "
+            + (f"server {server:.1f}." if server is not None else
+               "server unknown (no cgroup, more than one process)."))
 
 
 def zdb_bytes(run) -> dict:
@@ -570,10 +722,10 @@ def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
         "wal_dir_bytes": dir_bytes(run.wal),
         "insert_ms": ins, "readers": groups,
         "disks": {d: {"roles": roles.get(d, []), "read_bytes": r,
-                      "written_bytes": w}
-                  for d, (r, w) in sorted(io["disks"].items())},
+                      "written_bytes": w, "reads": ro, "writes": wo}
+                  for d, (r, w, ro, wo) in sorted(io["disks"].items())},
         "server_process": io["proc"], "zdb_bytes_written": zdb,
-        "server_memory_bytes": mem,
+        "server_memory_bytes": mem, "cpu": io["cpu"],
     }
     (run.out / "load-summary.json").write_text(
         json.dumps(data, indent=2) + "\n")
@@ -592,7 +744,8 @@ def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
         f"WAL dir: {data['wal_dir_bytes'] / GIB:.1f} GiB.",
         f"- Server memory, resident (`server_mem`; page cache not "
         f"counted): peak {mem['peak'] / GIB:.1f} GiB, "
-        f"{mem['end'] / GIB:.1f} GiB as the load ended.\n",
+        f"{mem['end'] / GIB:.1f} GiB as the load ended.",
+        cpu_line(io["cpu"]) + "\n",
         "## Insert latency\n",
         "One INSERT statement's round trip as psql timed it, in ms.\n",
         "| statements | p50 | p95 | p99 | p99.9 | max |",
@@ -618,17 +771,13 @@ def summarize(run, prog: Progress, rows: int, t0: float, secs: float,
     md += [
         "\n## Disk bytes during the load\n",
         "Whole disks, from /proc/diskstats: everything the device "
-        "served.\n",
+        "served, bytes and completed requests.\n",
         "| disk | holds | read GiB | written GiB | read MiB/s "
-        "| write MiB/s |",
-        "|---|---|---|---|---|---|",
+        "| write MiB/s | reads | writes | read/s | write/s |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for disk, d in data["disks"].items():
-        r, w = d["read_bytes"], d["written_bytes"]
-        md.append(
-            f"| {disk} | {', '.join(d['roles']) or '-'} | {r / GIB:.1f} | "
-            f"{w / GIB:.1f} | {r / 2**20 / max(secs, 1):.0f} | "
-            f"{w / 2**20 / max(secs, 1):.0f} |")
+        md.append(disk_row(disk, d, secs))
     if io["proc"]:
         r, w = io["proc"]
         # Buffered writes count when a page is dirtied, not when it

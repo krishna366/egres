@@ -106,13 +106,17 @@ def forest_gauges(text: str) -> dict[str, int]:
         g["egres_memtable_active_bytes"] = size_bytes(m.group(1))
         g["egres_memtable_immutable_count"] = int(m.group(2))
         g["egres_memtable_immutable_bytes"] = size_bytes(m.group(3))
-    m = re.search(r"block_cache: entries=(\d+) bytes=(\S+) hits=(\d+) "
-                  r"misses=(\d+)", text)
+    # Counts may be followed by a percentage: `hits=N (83.7%)`.
+    m = re.search(r"block_cache: entries=(\d+) bytes=(\S+) hits=(\d+)"
+                  r"(?: \([\d.]+%\))? misses=(\d+)"
+                  r"(?: \([\d.]+%\))?(?: ghost_hits=(\d+))?", text)
     if m:
         g["egres_block_cache_entries"] = int(m.group(1))
         g["egres_block_cache_bytes"] = size_bytes(m.group(2))
         g["egres_block_cache_hits_total"] = int(m.group(3))
         g["egres_block_cache_misses_total"] = int(m.group(4))
+        if m.group(5):
+            g["egres_block_cache_ghost_hits_total"] = int(m.group(5))
     m = re.search(r"trees: (\d+)", text)
     if m:
         g["egres_trees"] = int(m.group(1))
@@ -132,6 +136,29 @@ def forest_gauges(text: str) -> dict[str, int]:
         g["egres_inflight_jobs"] = (
             0 if "(none)" in body else len([l for l in body.splitlines()
                                             if l.strip()]))
+    return g
+
+
+MEM_LINE = re.compile(r"^\s+([a-z_ ]+):\s+(\S+)")
+MEM_PREFIX = {"egres": "egres_mem_", "governor": "egres_governor_",
+              "jemalloc": "egres_jemalloc_", "mimalloc": "egres_mimalloc_"}
+
+
+def mem_gauges(text: str) -> dict[str, int]:
+    """Gauges from the admin `mem` text: its sections (`egres:` the
+    program's live bytes and what holds them, `governor:` total,
+    margin and cache cap, `jemalloc:` the allocator's own counts),
+    every line whose value is a size, as `<prefix><key>_bytes`."""
+    g: dict[str, int] = {}
+    prefix = None
+    for line in text.splitlines():
+        if line and not line[0].isspace() and line.endswith(":"):
+            prefix = MEM_PREFIX.get(line[:-1])
+            continue
+        m = MEM_LINE.match(line)
+        if prefix and m and SIZE_RE.match(m.group(2)):
+            key = m.group(1).strip().replace(" ", "_")
+            g[f"{prefix}{key}_bytes"] = size_bytes(m.group(2))
     return g
 
 
@@ -181,6 +208,13 @@ class Handler(BaseHTTPRequestHandler):
                     lines.append(f"{name} {value}")
             except OSError as e:
                 print(f"zdb forest failed: {e}", file=sys.stderr)
+            try:
+                for name, value in mem_gauges(
+                        admin(self.admin_addr, "mem")).items():
+                    lines.append(f"# TYPE {name} gauge")
+                    lines.append(f"{name} {value}")
+            except OSError as e:
+                print(f"mem failed: {e}", file=sys.stderr)
         lines.append("# TYPE egres_up gauge")
         lines.append(f"egres_up {up}")
         lines.append("# TYPE egres_admin_seconds gauge")
