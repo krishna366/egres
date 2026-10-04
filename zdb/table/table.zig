@@ -64,8 +64,8 @@ pub var resident: ResidentTotals = .{};
 
 /// How `Table.open` opens SST files. `.direct` goes with a block cache:
 /// blocks are cached decompressed there, so the page cache would hold
-/// the same data twice. The default keeps tests and tools on buffered
-/// reads.
+/// the same data twice. Buffered (`.default`, for tests and tools)
+/// reads with readahead off.
 pub var read_mode: vfs.Mode = .default;
 
 pub const Error = _idx.Error || _buffers.Error || compress.Error ||
@@ -132,6 +132,7 @@ pub const Table = struct {
     ) !*Table {
         const handle = try vfs.g().openFile(allocator, path, .{
             .mode = read_mode,
+            .flags = .{ .random = true },
         });
         const t = try initFromHandle(allocator, handle, priority);
         errdefer t.decrRef();

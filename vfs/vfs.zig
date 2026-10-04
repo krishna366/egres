@@ -39,6 +39,11 @@ pub const Flags = struct {
     /// the actual I/O. POSIX-portable; on macOS the kernel treats DSYNC
     /// like full SYNC, which is still correct (data is durable).
     dsync: bool = false,
+    /// Reads land at random offsets: the kernel reads nothing ahead of
+    /// them (POSIX_FADV_RANDOM on Linux, F_RDAHEAD off on macOS). For
+    /// SST files read through the page cache, which readahead would
+    /// fill with blocks no one asked for.
+    random: bool = false,
 };
 
 pub const FileOptions = struct {
@@ -693,6 +698,20 @@ pub fn openDirect(path: String, opts: FileOptions) !posix.fd_t {
         // F_NOCACHE = 48 on macOS — bypass the unified buffer cache.
         _ = posix.fcntl(fd, 48, 1) catch {};
     }
+    if (opts.flags.random and !direct_io) adviseRandom(fd);
 
     return fd;
+}
+
+/// Turns readahead off for `fd` (`Flags.random`); best effort.
+fn adviseRandom(fd: posix.fd_t) void {
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            _ = linux.fadvise(fd, 0, 0, linux.POSIX_FADV.RANDOM);
+        },
+        // F_RDAHEAD = 45; 0 turns readahead off.
+        .macos => _ = posix.fcntl(fd, 45, 0) catch {},
+        else => {},
+    }
 }

@@ -3,12 +3,13 @@
 
 //! S3-FIFO block cache for ZDB.
 //!
-//! Three FIFO queues: S (small, 10%), M (main, 90%), G (ghost, fixed count).
+//! Two FIFO queues and a ghost: S (small, 10%), M (main, 90%), G.
 //!
 //!   S  — admission filter; byte budget = 10% of total capacity.
 //!   M  — proven-reuse entries; byte budget = 90% of total capacity.
-//!   G  — key hashes of recently evicted S one-hit-wonders;
-//!          capacity = @max(16, m_cap_bytes / 512) slots.
+//!   G  — key hashes of recently evicted S one-hit-wonders, an
+//!          approximate set (`Ghost`) remembering about as many as M
+//!          holds entries.
 //!
 //! Eviction triggers when s_bytes + entry_bytes > s_cap_bytes (for S) or
 //! m_bytes + entry_bytes > m_cap_bytes (for M), where entry_bytes =
@@ -61,6 +62,106 @@ fn keySize(comptime K: type, key: K) usize {
     return @sizeOf(K);
 }
 
+/// What S evicted lately, as an approximate set: two bloom filters.
+/// Inserts go to the active one and a lookup asks both; once the
+/// active one has taken `quota` inserts the other is cleared and
+/// takes over, so a hash is remembered for one to two quotas of
+/// evictions, about what a ring of `quota` slots remembers, at 4
+/// bytes a slot instead of 32. S3-FIFO keeps as many ghost entries as
+/// M holds, so each generation's quota is M's entry count when it
+/// starts. The error is bounded whatever the workload: a remembered
+/// hash is never inserted again (its key goes to M), so a filter
+/// holds at most `quota` hashes and its false positive rate stays at
+/// the design point; and a false positive only puts a block into M
+/// at freq 0, which M's next pass drops.
+pub const Ghost = struct {
+    filters: [2]BitSet,
+    active: u1 = 0,
+    /// Inserts into the active filter so far.
+    inserted: usize = 0,
+    /// Inserts the active generation takes.
+    quota: usize = min_quota,
+
+    const BitSet = std.bit_set.DynamicBitSetUnmanaged;
+
+    /// 16 bits a key and 11 probes: about 0.05% false positives at
+    /// the quota, 0.1% across both filters. Kept low so a long scan
+    /// leaks almost nothing into M.
+    pub const bits_per_key = 16;
+    pub const probes = 11;
+    /// A generation's floor, for an M still filling.
+    pub const min_quota = 1024;
+
+    pub fn init(alloc: Allocator) !Ghost {
+        var a = try BitSet.initEmpty(alloc, bitsFor(min_quota));
+        errdefer a.deinit(alloc);
+        const b = try BitSet.initEmpty(alloc, bitsFor(min_quota));
+        return .{ .filters = .{ a, b } };
+    }
+
+    pub fn deinit(self: *Ghost, alloc: Allocator) void {
+        self.filters[0].deinit(alloc);
+        self.filters[1].deinit(alloc);
+    }
+
+    /// Bits for a filter taking `quota` hashes: a power of two, so a
+    /// probe wraps with a mask.
+    fn bitsFor(quota: usize) usize {
+        return std.math.ceilPowerOfTwo(usize, quota * bits_per_key) catch
+            unreachable;
+    }
+
+    /// The bit `h`'s probe `i` lands on in `f`: double hashing over
+    /// the two halves of the hash.
+    inline fn bit(f: BitSet, h: u64, i: u64) usize {
+        const h1: u64 = @as(u32, @truncate(h));
+        const h2: u64 = @as(u32, @truncate(h >> 32)) | 1;
+        return @intCast((h1 +% i *% h2) & (f.bit_length - 1));
+    }
+
+    /// `m_len` is M's entry count now. Once the active filter has
+    /// taken `quota` inserts the other takes over, sized for `m_len`:
+    /// reallocated when its bit count changes, cleared when not. If
+    /// the allocation fails the old size serves one more generation.
+    pub fn insert(self: *Ghost, alloc: Allocator, h: u64, m_len: usize) void {
+        if (self.inserted == self.quota) self.turnover(alloc, m_len);
+        var f = &self.filters[self.active];
+        for (0..probes) |i| f.set(bit(f.*, h, i));
+        self.inserted += 1;
+    }
+
+    fn turnover(self: *Ghost, alloc: Allocator, m_len: usize) void {
+        self.active +%= 1;
+        self.inserted = 0;
+        self.quota = @max(min_quota, m_len);
+
+        var f = &self.filters[self.active];
+        const bits = bitsFor(self.quota);
+        if (bits == f.bit_length) {
+            f.unsetAll();
+            return;
+        }
+        const next = BitSet.initEmpty(alloc, bits) catch {
+            f.unsetAll();
+            return;
+        };
+        f.deinit(alloc);
+        f.* = next;
+    }
+
+    pub fn contains(self: *const Ghost, h: u64) bool {
+        return containsIn(self.filters[self.active], h) or
+            containsIn(self.filters[self.active +% 1], h);
+    }
+
+    fn containsIn(f: BitSet, h: u64) bool {
+        for (0..probes) |i| {
+            if (!f.isSet(bit(f, h, i))) return false;
+        }
+        return true;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Cache(K) — single shard, not thread-safe
 // ---------------------------------------------------------------------------
@@ -82,11 +183,17 @@ pub fn Cache(comptime K: type) type {
             tag: Tag,
         };
 
-        /// HashMap specialised for string keys when K = String.
+        /// The key → entry map, String keys specialised. An array hash
+        /// map: its index deletes by shifting back, with no tombstones.
+        /// `std.HashMap` leaves one per removal and rehashes only when
+        /// out of room, which removals keep from happening, so under the
+        /// cache's put and evict churn it filled with tombstones until a
+        /// missing key probed the whole table (a page-cache run spent 82%
+        /// of its CPU in that probe).
         const Map = if (isSliceOfU8(K))
-            std.StringHashMap(Entry)
+            std.StringArrayHashMapUnmanaged(Entry)
         else
-            std.AutoHashMap(K, Entry);
+            std.AutoArrayHashMapUnmanaged(K, Entry);
 
         // ----------------------------------------------------------------
         // Fields
@@ -94,8 +201,8 @@ pub fn Cache(comptime K: type) type {
 
         allocator: Allocator,
         map: Map,
-        ghost_set: std.AutoHashMap(u64, void),
-        /// Puts of a key the ghost ring remembered: misses a cache a
+        ghost: Ghost,
+        /// Puts of a key the ghost remembered: misses a cache a
         /// few times larger would have served. Measured at 0.07% of
         /// misses on the orders workload: the misses are cold, and a
         /// larger or compressed cache would not catch them.
@@ -117,13 +224,6 @@ pub fn Cache(comptime K: type) type {
         m_cap_bytes: usize, // byte budget for M (90% of total capacity)
         m_bytes: usize, // current live bytes in M
 
-        /// G ring (fixed size; stores only u64 hashes).
-        g_ring: []u64,
-        g_head: usize,
-        g_tail: usize,
-        g_len: usize,
-        g_cap: usize,
-
         // ----------------------------------------------------------------
         // Public API
         // ----------------------------------------------------------------
@@ -131,7 +231,8 @@ pub fn Cache(comptime K: type) type {
         pub fn init(alloc: Allocator, budget: usize) !Self {
             const s_cap_bytes = @max(1, budget / 10);
             const m_cap_bytes = budget - s_cap_bytes;
-            const g_cap = @max(16, m_cap_bytes / 512);
+            var ghost = try Ghost.init(alloc);
+            errdefer ghost.deinit(alloc);
 
             const s_ring_len = @max(16, s_cap_bytes / 4096);
             var s_ring = try std.ArrayList(K).initCapacity(alloc, s_ring_len);
@@ -142,18 +243,10 @@ pub fn Cache(comptime K: type) type {
             errdefer m_ring.deinit(alloc);
             m_ring.expandToCapacity();
 
-            const g_ring = try alloc.alloc(u64, g_cap);
-            errdefer alloc.free(g_ring);
-
-            var map = Map.init(alloc);
-            errdefer map.deinit();
-
-            const ghost_set = std.AutoHashMap(u64, void).init(alloc);
-
             return Self{
                 .allocator = alloc,
-                .map = map,
-                .ghost_set = ghost_set,
+                .map = .empty,
+                .ghost = ghost,
                 .s_ring = s_ring,
                 .s_head = 0,
                 .s_tail = 0,
@@ -166,11 +259,6 @@ pub fn Cache(comptime K: type) type {
                 .m_len = 0,
                 .m_cap_bytes = m_cap_bytes,
                 .m_bytes = 0,
-                .g_ring = g_ring,
-                .g_head = 0,
-                .g_tail = 0,
-                .g_len = 0,
-                .g_cap = g_cap,
             };
         }
 
@@ -180,11 +268,10 @@ pub fn Cache(comptime K: type) type {
                 self.freeKey(kv.key_ptr.*);
                 kv.value_ptr.val.decrRef();
             }
-            self.map.deinit();
-            self.ghost_set.deinit();
+            self.map.deinit(self.allocator);
+            self.ghost.deinit(self.allocator);
             self.s_ring.deinit(self.allocator);
             self.m_ring.deinit(self.allocator);
-            self.allocator.free(self.g_ring);
         }
 
         /// Returns the cached value for `key`, marking it as recently used.
@@ -217,7 +304,7 @@ pub fn Cache(comptime K: type) type {
             }
 
             const h = hashKey(K, key);
-            if (self.ghost_set.contains(h)) {
+            if (self.ghost.contains(h)) {
                 self.ghost_hits += 1;
                 // Ghost hit: skip S, go directly to M.
                 // pushMain takes ownership of a ref, so incrRef here.
@@ -245,7 +332,7 @@ pub fn Cache(comptime K: type) type {
             }
             const slot = self.s_head;
             _ = val.incrRef(); // cache's ref
-            self.map.put(key, .{
+            self.map.put(self.allocator, key, .{
                 .tag = .s_queue,
                 .slot = slot,
                 .val = val,
@@ -270,7 +357,7 @@ pub fn Cache(comptime K: type) type {
         /// the map's entry for that key points at a newer slot. Returns
         /// whether the key was present.
         pub fn remove(self: *Self, key: K) bool {
-            const entry = self.map.fetchRemove(key) orelse return false;
+            const entry = self.map.fetchSwapRemove(key) orelse return false;
             const bytes = keySize(K, entry.key) + entry.value.val.data.len;
             switch (entry.value.tag) {
                 .s_queue => self.s_bytes -= bytes,
@@ -302,8 +389,8 @@ pub fn Cache(comptime K: type) type {
 
         /// Re-budgets the cache to `budget` bytes, S keeping its tenth.
         /// A shrink evicts down to the new budget here, so the memory is
-        /// released now and not at the next put. The ghost ring keeps
-        /// its size: it was sized once and holds hashes only.
+        /// released now and not at the next put. The ghost keeps its
+        /// size: it was sized once and holds hashes only.
         pub fn setCapacity(self: *Self, budget: usize) void {
             self.s_cap_bytes = @max(1, budget / 10);
             self.m_cap_bytes = budget - self.s_cap_bytes;
@@ -372,20 +459,6 @@ pub fn Cache(comptime K: type) type {
             }
         }
 
-        fn pushGhost(self: *Self, h: u64) !void {
-            if (self.g_cap == 0) return;
-            if (self.g_len == self.g_cap) {
-                const old = self.g_ring[self.g_tail];
-                _ = self.ghost_set.remove(old);
-                self.g_tail = (self.g_tail + 1) % self.g_cap;
-                self.g_len -= 1;
-            }
-            self.g_ring[self.g_head] = h;
-            try self.ghost_set.put(h, {});
-            self.g_head = (self.g_head + 1) % self.g_cap;
-            self.g_len += 1;
-        }
-
         /// Push (key, val) into M, evicting first if M is over byte budget.
         /// Takes ownership of one ref on val AND key (for String).
         /// On error, val is decrRef'd and key is freed.
@@ -402,7 +475,7 @@ pub fn Cache(comptime K: type) type {
                 };
             }
             const slot = self.m_head;
-            self.map.put(key, .{
+            self.map.put(self.allocator, key, .{
                 .tag = .m_queue,
                 .slot = slot,
                 .val = val,
@@ -432,12 +505,13 @@ pub fn Cache(comptime K: type) type {
                 if (!self.liveSlot(.s_queue, key, slot)) continue;
 
                 const entry = self.map.get(key).?;
-                _ = self.map.remove(key);
+                _ = self.map.swapRemove(key);
                 self.s_bytes -= keySize(K, key) + entry.val.data.len;
                 if (entry.freq.load(.acquire)) {
                     return self.pushMain(key, entry.val);
                 } else {
-                    self.pushGhost(hashKey(K, key)) catch {}; // best-effort
+                    const h = hashKey(K, key);
+                    self.ghost.insert(self.allocator, h, self.m_len);
                     self.freeKey(key);
                     entry.val.decrRef();
                 }
@@ -473,7 +547,7 @@ pub fn Cache(comptime K: type) type {
                 } else {
                     self.m_bytes -= keySize(K, key) + entry.val.data.len;
                     entry.val.decrRef();
-                    _ = self.map.remove(key);
+                    _ = self.map.swapRemove(key);
                     self.freeKey(key);
                     return;
                 }

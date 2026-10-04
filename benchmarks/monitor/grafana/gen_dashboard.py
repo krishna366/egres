@@ -278,14 +278,15 @@ PANELS = [
                     "bytes) less the margin, the recent peak of what the "
                     "rest of egres holds. jemalloc resident is what the "
                     "cgroup charges for the heap; the gap above live is "
-                    "the allocator's overhead, which the default total's "
-                    "tenth covers."),
+                    "the allocator's overhead, which the governor measures "
+                    "and keeps total (resident) under the cap."),
     ts("Allocator overhead", "none", [
         ('egres_jemalloc_resident_bytes / egres_mem_live_bytes',
          "jemalloc resident / live"),
-    ], fill=0, desc="1.0 is no overhead. The default total leaves a "
-                    "tenth of the memory, so past ~1.08 it no longer "
-                    "leaves room for bursts and the kernel's own charges."),
+        ('egres_governor_ratio', "governor's ratio (recent peak)"),
+    ], fill=0, desc="1.0 is no overhead. The governor allows total / "
+                    "ratio live bytes, the ratio being the recent peak "
+                    "of resident / live, so resident stays near total."),
     ts("Egres threads and open files", "none", [
         (f'namedprocess_namegroup_num_threads{{{EGRES}}}', "threads"),
         (f'namedprocess_namegroup_open_filedesc{{{EGRES}}}', "open fds"),

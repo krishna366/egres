@@ -1846,7 +1846,7 @@
     {
       "type": "timeseries",
       "title": "Egres memory: live vs allocator",
-      "description": "The cache cap is the total (--cache total_mb, live bytes) less the margin, the recent peak of what the rest of egres holds. jemalloc resident is what the cgroup charges for the heap; the gap above live is the allocator's overhead, which the default total's tenth covers.",
+      "description": "The cache cap is the total (--cache total_mb, live bytes) less the margin, the recent peak of what the rest of egres holds. jemalloc resident is what the cgroup charges for the heap; the gap above live is the allocator's overhead, which the governor measures and keeps total (resident) under the cap.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1928,7 +1928,7 @@
     {
       "type": "timeseries",
       "title": "Allocator overhead",
-      "description": "1.0 is no overhead. The default total leaves a tenth of the memory, so past ~1.08 it no longer leaves room for bursts and the kernel's own charges.",
+      "description": "1.0 is no overhead. The governor allows total / ratio live bytes, the ratio being the recent peak of resident / live, so resident stays near total.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1967,6 +1967,11 @@
           "refId": "A",
           "expr": "egres_jemalloc_resident_bytes / egres_mem_live_bytes",
           "legendFormat": "jemalloc resident / live"
+        },
+        {
+          "refId": "B",
+          "expr": "egres_governor_ratio",
+          "legendFormat": "governor's ratio (recent peak)"
         }
       ],
       "id": 37,

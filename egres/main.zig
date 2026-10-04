@@ -79,21 +79,24 @@ const RaftCfg = struct {
     };
 };
 
-/// `--cache` — the live bytes Egres may hold. `total_mb` defaults to
-/// 90% of the memory this process may use (host RAM, or the cgroup
-/// limit under Docker and Kubernetes); the tenth is for what the
-/// allocator holds on top. The cache governor gives the SST block
-/// cache what the rest of the process leaves under it.
+/// `--cache` — the memory Egres may hold, resident: what the allocator
+/// holds, as the cgroup and `top` count it. `total_mb` defaults to 90%
+/// of the memory this process may use (host RAM, or the cgroup limit
+/// under Docker and Kubernetes); the tenth is for the WAL's page cache,
+/// the kernel and thread stacks. The cache governor measures the
+/// allocator's overhead and gives the SST block cache what the rest of
+/// the process leaves under it.
 const CacheCfg = struct {
     total_mb: u64 = 0,
 
     pub const docs = .{
         .self = "Cache memory. The budget is a cap, not a reservation:" ++
             " memory is used as blocks are read.",
-        .total_mb = "The overall memory Egres aims to hold, in MiB. 0 =" ++
-            " 90% of host RAM or of the cgroup limit. The block cache is" ++
-            " auto-resized based on what the rest of the process uses." ++
-            " Set it on a host shared with other processes.",
+        .total_mb = "The overall memory Egres aims to hold, resident," ++
+            " in MiB. 0 = 90% of host RAM or of the cgroup limit. The" ++
+            " block cache is auto-resized based on what the rest of the" ++
+            " process uses and the allocator's measured overhead. Set it" ++
+            " on a host shared with other processes.",
     };
 };
 
@@ -530,8 +533,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     else
         mem.bytes / 10 * 9;
     // Starts at the cap the governor's first tick would set.
-    const Governor = engine.governor.Governor;
-    const start_cap = @max(Governor.min_cap, total -| Governor.min_margin);
+    const start_cap = engine.governor.startCap(total);
     var block_cache = try zdb.cache.ShardedCache(u128).init(
         allocator,
         @intCast(start_cap),
@@ -546,8 +548,8 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     }
     engine.governor.init(total, &block_cache);
     log.info(
-        "block cache governed under total {d} MiB live (host memory " ++
-            "{d} MiB via {s}); sst reads direct",
+        "block cache governed under total {d} MiB resident (host " ++
+            "memory {d} MiB via {s}); sst reads direct",
         .{ total >> 20, mem.bytes >> 20, mem.source },
     );
 

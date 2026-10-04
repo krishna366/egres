@@ -65,7 +65,7 @@ test "Cache one-hit-wonder: evicted to ghost, not M" {
     if (c.get("k1")) |v| v.decrRef(); // still present
     try std.testing.expectEqual(@as(usize, 0), c.m_len); // k0 did NOT go to M
     const h0 = hashKey(String, "k0");
-    try std.testing.expect(c.ghost_set.contains(h0)); // hash in ghost
+    try std.testing.expect(c.ghost.contains(h0)); // hash in ghost
 }
 
 test "Cache reused key promoted S → M" {
@@ -480,4 +480,119 @@ test "ShardedCache setCapacity: a shrink evicts to the new budget" {
         try c.put(i, v);
     }
     try std.testing.expect(c.count() >= kept + 1);
+}
+
+test "Cache sizes its ghost by M's entry count at turnover" {
+    const Ghost = zdb.cache.Ghost;
+    const alloc = std.testing.allocator;
+    // 1 MiB: S takes ~1450 entries of 72 bytes, M ~13000.
+    var c = try Cache(u64).init(alloc, 1 << 20);
+    defer c.deinit();
+    try std.testing.expectEqual(Ghost.min_quota, c.ghost.quota);
+
+    // Put and get: S evicts these to M, not the ghost.
+    for (0..4000) |i| {
+        const v = try Value.init(alloc, try alloc.alloc(u8, 64));
+        defer v.decrRef();
+        try c.put(i, v);
+        const got = c.get(i) orelse return error.Missing;
+        got.decrRef();
+    }
+    // One-hit wonders: once S holds only these, each put evicts one
+    // to the ghost, past the first generation's quota.
+    for (0..4000) |i| {
+        const v = try Value.init(alloc, try alloc.alloc(u8, 64));
+        defer v.decrRef();
+        try c.put(1_000_000 + i, v);
+    }
+    // The quota is M's count at the turnover; a ghost false positive
+    // puts the odd one-hit wonder into M after it, so M may have grown
+    // by a few since.
+    try std.testing.expect(c.ghost.quota >= 4000);
+    try std.testing.expect(c.ghost.quota <= c.m_len);
+    try std.testing.expect(c.m_len - c.ghost.quota < 10);
+    const bits = try std.math.ceilPowerOfTwo(
+        usize,
+        c.ghost.quota * Ghost.bits_per_key,
+    );
+    const f = c.ghost.filters[c.ghost.active];
+    try std.testing.expectEqual(bits, f.bit_length);
+}
+
+test "Ghost remembers a hash for one to two generations" {
+    const Ghost = zdb.cache.Ghost;
+    const alloc = std.testing.allocator;
+    var g = try Ghost.init(alloc);
+    defer g.deinit(alloc);
+    // M empty: the floor, 1024 a generation, sizes it.
+    const quota = Ghost.min_quota;
+
+    // Hashes are uniform: a splitmix of the index.
+    const H = struct {
+        fn of(i: u64) u64 {
+            var z = i +% 0x9e3779b97f4a7c15;
+            z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+            z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+            return z ^ (z >> 31);
+        }
+    };
+
+    g.insert(alloc, H.of(0), 0);
+    try std.testing.expect(g.contains(H.of(0)));
+    // Through the rest of this generation and all of the next: kept.
+    for (1..2 * quota) |i| g.insert(alloc, H.of(i), 0);
+    try std.testing.expect(g.contains(H.of(0)));
+    // The third generation clears the first: forgotten.
+    g.insert(alloc, H.of(2 * quota), 0);
+    try std.testing.expect(!g.contains(H.of(0)));
+    try std.testing.expect(g.contains(H.of(1500)));
+    try std.testing.expectEqual(quota, g.quota);
+
+    // Both filters full: never-inserted hashes read as present at
+    // the bloom's rate, about 0.1%; under 0.3% leaves room.
+    for (2 * quota + 1..3 * quota) |i| g.insert(alloc, H.of(i), 0);
+    var false_hits: usize = 0;
+    for (1_000_000..1_100_000) |i| {
+        if (g.contains(H.of(i))) false_hits += 1;
+    }
+    try std.testing.expect(false_hits < 300);
+
+    // The next turnover takes M's count: 5000 keys at 16 bits each
+    // is 80000 bits, a 128 Ki bit filter; the other keeps its size.
+    const before = g.filters[g.active].bit_length;
+    g.insert(alloc, H.of(3 * quota), 5000);
+    try std.testing.expectEqual(@as(usize, 5000), g.quota);
+    const grown = g.filters[g.active].bit_length;
+    try std.testing.expectEqual(@as(usize, 128 << 10), grown);
+    try std.testing.expectEqual(before, g.filters[g.active +% 1].bit_length);
+}
+
+test "Cache lookups of missing keys stay fast through put and evict churn" {
+    // A tombstone-deleting map fills with tombstones under this churn
+    // until each missing key probes the whole table; the array map's
+    // index shifts entries back on delete, so its probes stay short.
+    const alloc = std.testing.allocator;
+    // About 14k entries of 72 bytes (8-byte key, 64-byte value).
+    var c = try Cache(u64).init(alloc, 1 << 20);
+    defer c.deinit();
+    for (0..300_000) |i| {
+        const v = try Value.init(alloc, try alloc.alloc(u8, 64));
+        defer v.decrRef();
+        try c.put(i, v);
+        // Every third key gets a hit, so some reach M and churn it too.
+        if (i % 3 == 0) if (c.get(i)) |got| got.decrRef();
+    }
+    try std.testing.expect(c.byteSize() <= 1 << 20);
+    try std.testing.expect(c.count() > 1000);
+
+    const io = utils.context.g().io;
+    const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
+    for (0..100_000) |i| {
+        try std.testing.expectEqual(@as(?*Value, null), c.get(1_000_000 + i));
+    }
+    const t1 = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const ms = @divTrunc(t1 - t0, 1_000_000);
+    // Microseconds of work in all; a full-table probe per miss would
+    // take seconds. Generous for a loaded test box.
+    try std.testing.expect(ms < 2000);
 }

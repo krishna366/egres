@@ -146,11 +146,12 @@ MEM_PREFIX = {"egres": "egres_mem_", "governor": "egres_governor_",
               "jemalloc": "egres_jemalloc_", "mimalloc": "egres_mimalloc_"}
 
 
-def mem_gauges(text: str) -> dict[str, int]:
+def mem_gauges(text: str) -> dict[str, float]:
     """Gauges from the admin `mem` text: its sections (`egres:` the
     program's live bytes and what holds them, `governor:` total,
-    margin and cache cap, `jemalloc:` the allocator's own counts),
-    every line whose value is a size, as `<prefix><key>_bytes`."""
+    ratio, live target, margin and cache cap, `jemalloc:` the
+    allocator's own counts), every line whose value is a size, as
+    `<prefix><key>_bytes`, and the governor's ratio as is."""
     g: dict[str, int] = {}
     prefix = None
     for line in text.splitlines():
@@ -158,9 +159,14 @@ def mem_gauges(text: str) -> dict[str, int]:
             prefix = MEM_PREFIX.get(line[:-1])
             continue
         m = MEM_LINE.match(line)
-        if prefix and m and SIZE_RE.match(m.group(2)):
-            key = m.group(1).strip().replace(" ", "_")
+        if not (prefix and m):
+            continue
+        key = m.group(1).strip().replace(" ", "_")
+        if SIZE_RE.match(m.group(2)):
             g[f"{prefix}{key}_bytes"] = size_bytes(m.group(2))
+        elif key == "ratio":
+            # The governor's resident bytes per live byte.
+            g[f"{prefix}ratio"] = float(m.group(2))
     return g
 
 
