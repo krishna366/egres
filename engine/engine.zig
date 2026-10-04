@@ -1300,6 +1300,18 @@ pub const Engine = struct {
         const t1 = utils.coarseMs();
         log.info("compact cid={d} build_done changes={d} build_ms={d}", .{ cid, changes.items.len, t1 - t0 });
 
+        // The build, merge and write, of merges only: a move renames one
+        // file and would pull its level pair's times toward zero.
+        const dest: ?u8 = switch (job.cand.job) {
+            .merge_l0 => 0,
+            .merge_down => src + 1,
+            .move_down, .split => null,
+        };
+        if (dest) |d| metrics.g().compaction_ms.observe(
+            .{ .src = src, .dest = d },
+            @intCast(@max(t1 - t0, 0)),
+        ) catch {};
+
         try self.distributeNewFiles(changes.items);
         const t2 = utils.coarseMs();
         log.info("compact cid={d} distribute_done distribute_ms={d}", .{ cid, t2 - t1 });

@@ -46,6 +46,22 @@ const backpressure_buckets: []const u64 = &.{
 };
 pub const BackpressureHist = m.Histogram(u64, backpressure_buckets);
 
+/// Labels for `compaction_ms`: the level pair a job merged, with no
+/// tree, so the series stay a handful (L0->L0, L0->L1, L1->L2, ...).
+pub const CompactionJobLabels = struct {
+    src: u8,
+    dest: u8,
+};
+
+// Millisecond buckets for a compaction's build, merge and write: an
+// L0 merge takes about a second, an L2 merge minutes.
+const compaction_buckets: []const u64 = &.{
+    100,   250,   500,    1000,   2500,   5000,
+    10000, 30000, 60000, 120000, 300000, 600000,
+};
+pub const CompactionHist =
+    m.HistogramVec(u64, CompactionJobLabels, compaction_buckets);
+
 /// Top-level handle. Construct once in main, pass to Forest/Tree/server.
 /// Adding a new metric is a one-line field here plus a call-site update.
 pub const Metrics = struct {
@@ -62,6 +78,10 @@ pub const Metrics = struct {
     /// (`Engine.applyWriteBackpressure`); batches that did not sleep
     /// are not observed, so the count is the number of braked batches.
     write_backpressure_ms: BackpressureHist,
+    /// How long each merge's build took (merge and write, not the
+    /// propose and apply), per level pair (`Engine.proposeCompaction`).
+    /// Moves and splits are not merges and are not observed.
+    compaction_ms: CompactionHist,
 
     pub fn init(allocator: std.mem.Allocator) !Metrics {
         const io = utils.context.g().io;
@@ -100,6 +120,13 @@ pub const Metrics = struct {
                 .{},
                 .{},
             ),
+            .compaction_ms = try CompactionHist.init(
+                allocator,
+                io,
+                "zdb_compaction_ms",
+                .{},
+                .{},
+            ),
         };
     }
 
@@ -108,6 +135,7 @@ pub const Metrics = struct {
         self.compactions.deinit();
         self.rollups.deinit();
         self.bytes_written.deinit();
+        self.compaction_ms.deinit();
     }
 
     /// noop returns a Metrics instance where every metric is a no-op. Useful
