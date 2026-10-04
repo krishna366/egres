@@ -276,6 +276,12 @@ def cmd_begin(run: Run):
     out = run.out_root / f"{run.name}-{stamp}"
     out.mkdir(parents=True)
     (run.out_root / f"{run.name}.latest").write_text(f"{out}\n")
+    # `current` follows the newest run of any env. Swapped in by rename,
+    # so it never goes missing.
+    tmp = run.out_root / ".current.tmp"
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(out.name)
+    os.replace(tmp, run.out_root / "current")
     run.out, run.textfile, run.results = out, out / "textfile", \
         out / "results"
     run.server_log = out / run.server_log.name

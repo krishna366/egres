@@ -7,7 +7,7 @@ const String = utils.String;
 
 pub const Error = error{
     InvalidNumCompactors,
-    InvalidPushFibers,
+    InvalidCompactionFibers,
     InvalidTableSize,
     InvalidBlockSize,
     InvalidMaxLevels,
@@ -42,12 +42,12 @@ pub const Config = struct {
 
     block_bytes: usize = 64 * 1024,
     num_compactors: u8 = 2,
-    /// Fibers one L0→L1 push splits into, along L1 table boundaries
-    /// (compaction.partitions), each merging and writing its own key
-    /// range. A push was one fiber, up to 36 s of merge and codec
-    /// work while L0 grew past the write brake's trigger. Bounded by
-    /// `compaction.max_push_fibers`.
-    l0_push_fibers: u8 = 3,
+    /// Fibers one merge into the level beneath splits into, along that
+    /// level's table boundaries (compaction.partitions), each merging
+    /// and writing its own key range. A merge on one fiber was up to
+    /// 36 s of merge and codec work on one core. Bounded by
+    /// `compaction.max_compaction_fibers`.
+    compaction_fibers: u8 = 3,
 
     // Level sizes. `lmax_target_bytes` is the bottom level's target; upper
     // levels cascade by dividing by `level_size_multiplier`. There is no
@@ -179,8 +179,8 @@ pub const Config = struct {
         .block_bytes = "Target size of one SST data block, the unit of" ++
             " reads and of the block cache.",
         .num_compactors = "Compaction worker fibers. Must not be 1.",
-        .l0_push_fibers = "Fibers an L0 to L1 compaction splits into" ++
-            " along L1 table boundaries, 1 to 16.",
+        .compaction_fibers = "Fibers a compaction into the level below" ++
+            " splits into along that level's table boundaries, 1 to 16.",
         .level_size_multiplier = "Each level's byte target is the next" ++
             " deeper level's divided by this.",
         .max_levels = "Levels per tree, L0 included. At least 2.",
@@ -246,8 +246,8 @@ pub const Config = struct {
         // Badger semantics: exactly one compactor causes pathological level
         // behavior.
         if (self.num_compactors == 1) return error.InvalidNumCompactors;
-        if (self.l0_push_fibers == 0 or self.l0_push_fibers > 16)
-            return error.InvalidPushFibers;
+        if (self.compaction_fibers == 0 or self.compaction_fibers > 16)
+            return error.InvalidCompactionFibers;
         if (self.table_bytes == 0) return error.InvalidTableSize;
         if (self.block_bytes == 0) return error.InvalidBlockSize;
         // L0 needs an L1 to push into, and only a level below L0 rolls

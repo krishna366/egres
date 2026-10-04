@@ -30,9 +30,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 METRIC_RE = re.compile(r"^[A-Za-z_:][A-Za-z0-9_:]*(\{[^}]*\})? -?[0-9.eE+\-]+|^[A-Za-z_:][A-Za-z0-9_:]*(\{[^}]*\})? [+-]?(Inf|NaN)")
 
 
-def admin(addr: tuple[str, int], command: str, timeout: float = 8.0) -> str:
+def admin(addr: tuple[str, int], command: str, timeout: float = 2.0) -> str:
     """One admin round trip: send the command, read to the blank line
-    that ends the reply (or until the server closes)."""
+    that ends the reply (or until the server closes). A scrape makes
+    three in a row inside Prometheus's 8 s, so a reply that never ends
+    costs at most `timeout`, not the whole scrape."""
     with socket.create_connection(addr, timeout=timeout) as s:
         s.sendall((command + "\n").encode())
         out = b""

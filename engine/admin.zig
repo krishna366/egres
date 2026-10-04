@@ -1211,6 +1211,8 @@ pub const AdminServer = struct {
                 wait_us / @max(grants, 1),
             });
         }
+        // Clients read to the blank line.
+        try w.writeByte('\n');
         try w.flush();
     }
 
@@ -1278,6 +1280,8 @@ pub const AdminServer = struct {
         inline for (std.meta.fields(@TypeOf(snap))) |f| {
             if (@field(snap, f.name)) |v| try memLine(w, f.name, v, "");
         }
+        // Clients read to the blank line.
+        try w.writeByte('\n');
         try w.flush();
     }
 

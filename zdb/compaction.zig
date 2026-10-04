@@ -795,9 +795,9 @@ pub const MergeJob = struct {
 /// read in, and the bottom tables it rewrites, already opened as one
 /// concat. A boundary is a bottom table's smallest key, so no version
 /// of a primary is split across two slices and each slice's outputs
-/// sit between its neighbours' in key order. The range bounds the L0
-/// sources, which span the whole tree; the concat bounds only the L1
-/// side.
+/// sit between its neighbours' in key order. The range bounds the
+/// sources (L0's span the whole tree); the concat bounds only the
+/// destination side.
 const Partition = struct {
     range: KeyRange,
     bot: ConcatIterator,
@@ -847,11 +847,12 @@ fn partitions(
 }
 
 /// Merge `job.src` with `job.bot`, write the output SSTs, and return the
-/// manifest changes that swap the inputs for the outputs. An L0 push is
-/// split into `l0_push_fibers` partitions along L1 table boundaries
-/// (`partitions`), each merged and written by its own fiber: the
-/// sources are read once over, each fiber taking its own range, and
-/// the outputs are installed by one manifest entry as before.
+/// manifest changes that swap the inputs for the outputs. The job is
+/// split into `compaction_fibers` partitions along the destination's
+/// table boundaries (`partitions`), each merged and written by its own
+/// fiber: the sources are read once over, each fiber taking its own
+/// range, and the outputs are installed by one manifest entry. An L0
+/// to L0 merge has no bottom tables, so it stays one partition.
 pub fn mergeAndWrite(
     self: *Tree,
     job: MergeJob,
@@ -866,9 +867,14 @@ pub fn mergeAndWrite(
     const bot_iters = try self.allocator.alloc(TableIterator, job.bot.len);
     defer self.allocator.free(bot_iters);
 
-    var part_buf: [max_push_fibers]Partition = undefined;
-    const num_fibers: usize = if (src == 0 and dest == 1) opts.l0_push_fibers else 1;
-    const parts = partitions(self, job, num_fibers, bot_iters, &part_buf);
+    var part_buf: [max_compaction_fibers]Partition = undefined;
+    const parts = partitions(
+        self,
+        job,
+        opts.compaction_fibers,
+        bot_iters,
+        &part_buf,
+    );
 
     var group = fiber.Group(?Emitter.Result).init(self.allocator);
     defer group.deinit();
@@ -991,8 +997,8 @@ fn reportJob(
     }
 }
 
-/// The bound on `l0_push_fibers`: partitions live on the stack.
-pub const max_push_fibers = 16;
+/// The bound on `compaction_fibers`: partitions live on the stack.
+pub const max_compaction_fibers = 16;
 
 /// One partition of a job on its own fiber: merge the sources over the
 /// partition's range with its bottom tables, write the outputs, wait

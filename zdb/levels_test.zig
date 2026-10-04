@@ -851,7 +851,7 @@ test "levels: an L0 push splits into a fiber per L1 range" {
         .dir = dir_path,
         .max_levels = 2,
         .lmax_target_bytes = push_lmax,
-        .l0_push_fibers = 3,
+        .compaction_fibers = 3,
     };
     var cache = TableCache.init(alloc, opts.dir);
     defer cache.deinit();
@@ -868,6 +868,95 @@ test "levels: an L0 push splits into a fiber per L1 range" {
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(0));
     try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(1));
     for ([_][]const u8{ "aa", "bb", "cc", "dd", "ee", "ff", "gg" }) |k| {
+        const item = try tree.get(.{ .key = .{ .primary = k } });
+        try std.testing.expect(item != null);
+        defer item.?.free(alloc);
+        try std.testing.expectEqualStrings(k, item.?.newest().value[1..]);
+    }
+}
+
+test "levels: an L1 merge splits into a fiber per L2 range" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    // L1 holds aa, cc, ee, gg in one table; L2 holds bb, dd, ff, one
+    // table each. The L1 table overlaps all three, so it merges down,
+    // and three fibers get [-inf, dd), [dd, ff) and [ff, inf): one
+    // output each, every key present afterwards.
+    const test_tree_id: u64 = 1;
+    var manifest = _manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+    const l1 = [_][]const MetaEntry{
+        &.{
+            .{ .key = "aa", .ts = 1, .val = "vaa" },
+            .{ .key = "cc", .ts = 1, .val = "vcc" },
+            .{ .key = "ee", .ts = 1, .val = "vee" },
+            .{ .key = "gg", .ts = 1, .val = "vgg" },
+        },
+    };
+    const l2 = [_][]const MetaEntry{
+        &.{.{ .key = "bb", .ts = 1, .val = "vbb" }},
+        &.{.{ .key = "dd", .ts = 1, .val = "vdd" }},
+        &.{.{ .key = "ff", .ts = 1, .val = "vff" }},
+    };
+    var id: u64 = 1;
+    var changes: std.ArrayList(_manifest.SSTableChange) = .empty;
+    defer changes.deinit(alloc);
+    for ([_]struct { tables: []const []const MetaEntry, level: u8 }{
+        .{ .tables = &l1, .level = 1 },
+        .{ .tables = &l2, .level = 2 },
+    }) |lvl| {
+        for (lvl.tables) |entries| {
+            var tb = try buildTableMeta(alloc, entries);
+            defer tb.deinit();
+            const p = try zdb.sstPath(alloc, dir_path, id);
+            defer alloc.free(p);
+            try vfs.writeFile(p, tb.bytes);
+            try changes.append(
+                alloc,
+                createSSTableChange(id, 0, test_tree_id, lvl.level),
+            );
+            id += 1;
+        }
+    }
+    try manifest.commit(1, &.{}, &.{
+        createTreeChange(test_tree_id, 0, &.{}, &.{}, .posting_index),
+    });
+    try manifest.commit(2, changes.items, &.{});
+
+    // A one-byte bottom target puts L1 over its target; L0 is empty.
+    const opts = config.Config{
+        .dir = dir_path,
+        .max_levels = 3,
+        .lmax_target_bytes = push_lmax,
+        .compaction_fibers = 3,
+    };
+    var cache = TableCache.init(alloc, opts.dir);
+    defer cache.deinit();
+    var live = flags.Live(config.Config).initFrom(alloc, opts);
+    defer live.deinit();
+    const tree = try Tree.open(
+        alloc,
+        &live,
+        0,
+        test_tree_id,
+        &manifest,
+        &cache,
+    );
+    defer tree.release();
+
+    try std.testing.expectEqual(@as(usize, 1), tree.numTablesAt(1));
+    try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(2));
+
+    try compact(tree, 1, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
+    try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(2));
+    for ([_]String{ "aa", "bb", "cc", "dd", "ee", "ff", "gg" }) |k| {
         const item = try tree.get(.{ .key = .{ .primary = k } });
         try std.testing.expect(item != null);
         defer item.?.free(alloc);
