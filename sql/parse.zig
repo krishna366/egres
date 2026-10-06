@@ -205,8 +205,17 @@ pub const Update = struct {
     param_count: u16 = 0,
 };
 
+/// CREATE DATABASE `name` [TEMPLATE `source`]: with a source, the new
+/// database is a branch of it, every row as of the statement
+/// (zdb.forest_ddl.buildNsBranch). Postgres's keyword; its TEMPLATE
+/// copies the data too.
+pub const CreateDatabase = struct {
+    name: String, // borrowed
+    source: ?String = null, // borrowed
+};
+
 pub const Stmt = union(enum) {
-    create_database: String, // database name (borrowed)
+    create_database: CreateDatabase,
     drop_database: String, // database name (borrowed)
     create_table: CreateTable,
     drop_table: DropTable,
@@ -249,7 +258,7 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     // CREATE and DROP DATABASE are their own kinds, both carrying the
     // name in `dbname`.
     if (parser.cast(c.CreatedbStmt, node)) |s|
-        return .{ .create_database = try dup(alloc, s.dbname) };
+        return parseCreateDatabase(alloc, s);
     if (parser.cast(c.DropdbStmt, node)) |s|
         return .{ .drop_database = try dup(alloc, s.dbname) };
     if (parser.cast(c.CreateStmt, node)) |s| return parseCreateTable(alloc, s);
@@ -269,6 +278,25 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
 // Integer / Float / String / Boolean, an enum a C enum. Every string a
 // Stmt keeps is copied into the arena.
 // ---------------------------------------------------------------------------
+
+/// Of the options, only TEMPLATE means anything here; the rest
+/// (OWNER, ENCODING, ...) are accepted and ignored, as the catalog
+/// they describe does not exist.
+fn parseCreateDatabase(
+    alloc: std.mem.Allocator,
+    s: *c.CreatedbStmt,
+) parser.ParseError!Stmt {
+    var cd: CreateDatabase = .{ .name = try dup(alloc, s.dbname) };
+    for (parser.items(s.options)) |cell| {
+        const de = parser.cast(c.DefElem, cell.ptr_value) orelse continue;
+        if (!std.mem.eql(u8, parser.str(de.defname), "template")) continue;
+
+        const arg = parser.cast(c.String, de.arg) orelse
+            return invalid("TEMPLATE takes a database name");
+        cd.source = try dup(alloc, arg.sval);
+    }
+    return .{ .create_database = cd };
+}
 
 fn dup(alloc: std.mem.Allocator, s: [*c]const u8) parser.ParseError!String {
     return alloc.dupe(u8, parser.str(s));

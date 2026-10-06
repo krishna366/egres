@@ -63,11 +63,12 @@ pub const Op = schema.EnumDef(&.{
 /// binary fuse filter.
 // What a tree holds, fixed at create. The key encoding follows from
 // it: rows are keyed by egid, both index kinds by the indexed bytes.
-// Only a posting index holds roaring states and deltas. Tag 0 is the
-// unset value of a change that never named a kind: `unknown`, which
-// the manifest refuses at create.
+// Only a posting index holds roaring states and deltas. Tag 0, `none`,
+// is a change that names no kind: the unset default, which the manifest
+// refuses at create, and a branch's carrier, whose trees take the
+// source's kinds.
 pub const TreeKind = schema.EnumDef(&.{
-    .{ .name = "unknown", .tag = 0 },
+    .{ .name = "none", .tag = 0 },
     .{ .name = "rows", .tag = 1 },
     .{ .name = "unique_index", .tag = 2 },
     .{ .name = "posting_index", .tag = 3 },
@@ -136,6 +137,13 @@ pub const Command = schema.EnumDef(&.{
     // CREATE INDEX backfill install: CREATEs into the bottom level,
     // valid only while that level is empty (Tree.applyBackfill).
     .{ .name = "index_backfill", .tag = 9 },
+    // CREATE DATABASE dst TEMPLATE src: dst gets every tree of
+    // `branch_from` listing the same SST files (shared, refcounted) and
+    // the versions still in memtables, as of the entry. `tree_changes`
+    // holds dst's tree-0 change alone, for its id and name; the rest is
+    // derived from the manifest at apply, the same on every node
+    // (Manifest.applyBranch).
+    .{ .name = "branch_ns", .tag = 10 },
 });
 
 pub const ManifestChange = schema.Table(&.{
@@ -148,6 +156,8 @@ pub const ManifestChange = schema.Table(&.{
     .{ .id = 5, .name = "namespaces", .ty = schema.Array(Namespace) },
     // snapshot only: global namespace counter
     .{ .id = 6, .name = "next_ns_id", .ty = schema.U64 },
+    // branch_ns only: the namespace copied.
+    .{ .id = 7, .name = "branch_from", .ty = schema.U64 },
 });
 
 /// A single key-value write. `key` is a marshaled zdb key

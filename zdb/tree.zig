@@ -423,7 +423,7 @@ pub const Tree = struct {
         errdefer for (levels) |*l| l.deinit();
 
         var kr: KeyRange = .{};
-        var kind: _manifest.TreeKind = .unknown;
+        var kind: _manifest.TreeKind = .none;
         errdefer {
             kr.left.free(allocator);
             kr.right.free(allocator);

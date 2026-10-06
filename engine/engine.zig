@@ -240,7 +240,7 @@ pub const StorageImpl = struct {
                 }, total_bytes);
             },
             .ManifestChange => |mc| {
-                try self.applyManifestChange(entry.index, mc);
+                try self.applyManifestChange(entry.index, entry.timestamp, mc);
             },
             else => {
                 log.err("on_apply: unhandled message type at index={d}", .{entry.index});
@@ -248,7 +248,14 @@ pub const StorageImpl = struct {
         }
     }
 
-    fn applyManifestChange(self: *StorageImpl, index: u64, mc: zdb_bufs.ManifestChangeReader) !void {
+    /// `ts` is the entry's commit timestamp: what a branch takes as its
+    /// as-of point.
+    fn applyManifestChange(
+        self: *StorageImpl,
+        index: u64,
+        ts: u64,
+        mc: zdb_bufs.ManifestChangeReader,
+    ) !void {
         const mcs = try mc.toStruct(self.allocator);
         defer {
             mcs.deinit(self.allocator);
@@ -301,10 +308,14 @@ pub const StorageImpl = struct {
                 }
             },
             .tree_split => try self.forest.applySplit(index, mcs.*),
-            .create_ns => try self.forest.applyNamespaceCreate(index, mcs.*),
-            .drop_ns => try self.forest.applyNamespaceDrop(index, mcs.*),
-            .create_tree => try self.forest.applyCreateTree(index, mcs.*),
-            .drop_tree => try self.forest.applyDropTree(index, mcs.*),
+            .create_ns, .drop_ns, .create_tree, .drop_tree => {
+                try self.forest.applyTrees(index, mcs.*);
+            },
+            .branch_ns => try self.forest.applyNsBranch(
+                index,
+                ts,
+                mcs.*,
+            ),
             else => log.err("unknown ManifestChange cmd={d}", .{@intFromEnum(mcs.cmd)}),
         }
         // Whatever this change unlisted has no level pointing at it;
@@ -1549,7 +1560,8 @@ pub const Engine = struct {
     /// change (leader side), this makes it real everywhere. Control plane uses
     /// `.apply` — the change must be locally visible when the caller returns.
     pub fn proposeMC(self: *Engine, mc: _manifest.ManifestChange, wait_for: Wait) !void {
-        const payload = try encodeManifestChange(self.allocator, mc.cmd, mc.sstable_changes, mc.tree_changes, mc.memtable_id);
+        // The whole change: a branch names its source in `branch_from`.
+        const payload = try zdb_bufs.marshalRoot(self.allocator, mc);
         defer self.allocator.free(payload);
         try self.proposeAndWait(payload, .manifest, wait_for);
     }

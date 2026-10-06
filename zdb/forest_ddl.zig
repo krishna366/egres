@@ -20,6 +20,7 @@ const TableKey = @import("kv.zig").TableKey;
 const makeTreeId = @import("kv.zig").makeTreeId;
 const treeTableId = @import("kv.zig").treeTableId;
 const Forest = @import("forest.zig").Forest;
+const TableTrees = @import("forest.zig").TableTrees;
 const Tree = @import("tree.zig").Tree;
 
 /// installTree opens the in-memory Tree for the given id and adds it to its
@@ -83,7 +84,24 @@ pub fn openTablesFromManifest(self: *Forest) !void {
     for (keys) |tk| try self.installTree(tk.namespace, tk.tree_id);
 }
 
-/// buildNamespaceCreate is Phase A of the Raft-replicated namespace create:
+/// Which namespace id a create takes.
+pub const NsId = union(enum) {
+    /// The next unused id, reserved here (SQL: CREATE DATABASE).
+    /// applyTrees advances the same counter on every node, so a
+    /// re-elected leader never re-issues an id.
+    next,
+    /// An id the caller holds (the admin protocol's create_ns, genesis).
+    given: u64,
+};
+
+/// A namespace create or branch: the id it takes and the change to
+/// propose. Caller owns `change.tree_changes`.
+pub const NsResult = struct {
+    namespace: u64,
+    change: _manifest.ManifestChange,
+};
+
+/// buildNsCreate is Phase A of the Raft-replicated namespace create:
 /// returns a ManifestChange with one TreeChange per system table
 /// (manifest.namespace_system_table_ids) — the namespace's default
 /// (raw-KV) table (table_id 0, tree_id 0, carrying the namespace's `name`:
@@ -92,14 +110,18 @@ pub fn openTablesFromManifest(self: *Forest) !void {
 /// mutates, so a failed propose costs nothing. Caller owns the returned
 /// slice; `name` must outlive the change (it is marshalled at propose).
 ///
-/// Errors with `NamespaceAlreadyExists` if `namespace_id`'s default table
+/// Errors with `NamespaceAlreadyExists` if a given id's default table
 /// already exists, `NameExists` if another namespace holds `name`.
-pub fn buildNamespaceCreate(
+pub fn buildNsCreate(
     self: *Forest,
     alloc: std.mem.Allocator,
-    namespace_id: u64,
+    id: NsId,
     name: String,
-) !_manifest.ManifestChange {
+) !NsResult {
+    const namespace_id = switch (id) {
+        .next => self.manifest.nextNamespace(),
+        .given => |n| n,
+    };
     std.debug.assert(namespace_id > 0);
     if (self.hasNamespace(namespace_id)) return error.NamespaceAlreadyExists;
     if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
@@ -124,77 +146,135 @@ pub fn buildNamespaceCreate(
     tree_changes[0].name = @constCast(name);
 
     return .{
-        .tree_changes = tree_changes,
-        .sstable_changes = &.{},
-        .cmd = .create_ns,
-        .memtable_id = 0,
+        .namespace = namespace_id,
+        .change = .{
+            .tree_changes = tree_changes,
+            .sstable_changes = &.{},
+            .cmd = .create_ns,
+            .memtable_id = 0,
+        },
     };
 }
 
-/// Result of buildCreateNamespace: the allocated namespace id plus the
-/// ns_create ManifestChange carrying the database name.
-pub const CreateNamespaceResult = struct {
-    namespace: u64,
-    change: _manifest.ManifestChange,
-};
-
-/// buildCreateNamespace is the allocating namespace create (SQL: CREATE
-/// DATABASE `name`): reserve the next namespace id and build its ns_create
-/// change. applyNamespaceCreate advances the same counter and records the
-/// name on every node, so a re-elected leader never re-issues a namespace
-/// and name → namespace resolution is manifest state everywhere. Caller
-/// owns `change.tree_changes`.
-pub fn buildCreateNamespace(
-    self: *Forest,
-    alloc: std.mem.Allocator,
-    name: String,
-) !CreateNamespaceResult {
-    const namespace = self.manifest.nextNamespace();
-    return .{
-        .namespace = namespace,
-        .change = try self.buildNamespaceCreate(alloc, namespace, name),
-    };
-}
-
-/// applyNamespaceCreate is Phase B: applies the change to the manifest —
-/// which records the namespace's name and advances the global namespace
-/// counter — then installs the in-memory Tree + namespace route for each
-/// created tree. Called on all nodes after Raft commit (create_ns).
-///
-/// Skips installing any tree the forest already holds (re-apply).
-pub fn applyNamespaceCreate(
+/// applyTrees is Phase B of create_ns, create_tree, drop_ns and
+/// drop_tree. The manifest apply does what the command means (records
+/// names, advances or forgets counters, retires files whose last
+/// listing a drop removes); then each created tree the forest lacks is
+/// installed and each deleted one torn down. Idempotent, per tree: a
+/// re-apply finds the creates present and the deletes gone. Called on
+/// all nodes after Raft commit, on the apply loop.
+pub fn applyTrees(
     self: *Forest,
     index: u64,
     mc: _manifest.ManifestChange,
 ) !void {
     try self.manifest.apply(index, mc);
-    for (mc.tree_changes) |tc| {
-        if (tc.op != .create) continue; // only CREATE for ns_create
-        // Per-tree, not per-namespace: an ns_create carries the default
-        // AND catalog trees — checking only table 0 would skip the rest.
-        if (self.hasTree(tc.namespace_id, tc.tree_id)) {
-            std.log.warn(
-                "applyNamespaceCreate: ns={d} tree_id={d} already exists, " ++
-                    "skipping",
-                .{ tc.namespace_id, tc.tree_id },
-            );
-            continue;
-        }
-        // Empty left/right encodes the infinite range; each tree lands in
-        // its table derived from the tree_id (0 = raw-KV, 1 = catalog).
-        try self.installTree(tc.namespace_id, tc.tree_id);
-    }
+    for (mc.tree_changes) |tc| switch (tc.op) {
+        .create => {
+            if (self.hasTree(tc.namespace_id, tc.tree_id)) continue;
+            try self.installTree(tc.namespace_id, tc.tree_id);
+        },
+        .delete => dropTree(self, tc),
+        // A range update is a split's (applySplit), never a create or
+        // drop's; the enum is open on the wire.
+        .update, _ => unreachable,
+    };
 }
 
-/// Result of buildCreateTables: one allocated table_id per requested name
+/// Removes a dropped tree from its table and tears it down. The tree
+/// leaves the list under the table lock, so no reader finds it from
+/// here on; dropping the list's ref closes it once readers that hold
+/// it let go. The TableTrees stays in the map, empty: table ids are
+/// never reused, and a reader may still hold its pointer.
+fn dropTree(self: *Forest, tc: _manifest.TreeChange) void {
+    const trees = self.getTable(.{
+        .namespace = tc.namespace_id,
+        .table_id = treeTableId(tc.tree_id),
+    }) orelse return;
+
+    const gone = blk: {
+        const held = trees.mu.hold(.exclusive, @src());
+        defer held.release();
+        break :blk trees.removeTree(held, tc.tree_id);
+    };
+
+    if (gone) |tree| tree.release();
+}
+
+/// buildNsBranch is Phase A of CREATE DATABASE `name` TEMPLATE
+/// `source`: reserves the target's namespace id and returns the
+/// branch_ns change naming the source. The copy itself is derived at
+/// apply (Manifest.applyBranch), so nothing here goes stale between
+/// propose and apply. Errors `NamespaceNotFound` for a source that
+/// does not exist and `NameExists` for a taken name. Caller owns
+/// `change.tree_changes`; `name` must outlive the change.
+pub fn buildNsBranch(
+    self: *Forest,
+    alloc: std.mem.Allocator,
+    source: u64,
+    name: String,
+) !NsResult {
+    if (!self.hasNamespace(source)) return error.NamespaceNotFound;
+    if (self.manifest.lookupNamespace(name)) |_| return error.NameExists;
+
+    const namespace = self.manifest.nextNamespace();
+    // A carrier for the target's id and name: the branch's trees take
+    // the source's kinds (Manifest.applyBranch).
+    const tree_changes = try alloc.alloc(_manifest.TreeChange, 1);
+    tree_changes[0] = _manifest.createTreeChange(
+        makeTreeId(0, 0),
+        namespace,
+        "",
+        "",
+        .none,
+    );
+    tree_changes[0].name = @constCast(name);
+    return .{
+        .namespace = namespace,
+        .change = .{
+            .tree_changes = tree_changes,
+            .sstable_changes = &.{},
+            .cmd = .branch_ns,
+            .memtable_id = 0,
+            .branch_from = source,
+        },
+    };
+}
+
+/// applyNsBranch is Phase B: the manifest lists the target's
+/// trees over the source's files, each is installed, and the source's
+/// versions still in memtables, those committed before the entry
+/// (`ts`, its commit timestamp), are written again under the target
+/// (Forest.forkMemtables). Together that is every version the source
+/// held as of the entry; later writes to either side stay on that
+/// side. Called on all nodes after Raft commit (branch_ns); skips
+/// trees the forest already holds (re-apply).
+pub fn applyNsBranch(
+    self: *Forest,
+    index: u64,
+    ts: u64,
+    mc: _manifest.ManifestChange,
+) !void {
+    try self.manifest.apply(index, mc);
+    const dst = mc.tree_changes[0].namespace_id;
+    const keys = try self.manifest.treeKeys(self.allocator, dst);
+    defer self.allocator.free(keys);
+    for (keys) |tk| {
+        if (self.hasTree(tk.namespace, tk.tree_id)) continue;
+        try self.installTree(tk.namespace, tk.tree_id);
+    }
+    try self.forkMemtables(mc.branch_from, dst, ts);
+}
+
+/// Result of buildTableCreate: one allocated table_id per requested name
 /// (same order) plus the single create_tree ManifestChange creating them
 /// all. Caller owns `table_ids` and `change.tree_changes`.
-pub const CreateTablesResult = struct {
+pub const TableResult = struct {
     table_ids: []u32,
     change: _manifest.ManifestChange,
 };
 
-/// buildCreateTables creates N sibling tables in ONE change — a
+/// buildTableCreate creates N sibling tables in ONE change — a
 /// SQL table plus its index tables, so they commit atomically. Each
 /// name gets its own freshly allocated table_id (at split 0) and a create
 /// TreeChange carrying that name; apply registers every name → table_id on
@@ -205,7 +285,7 @@ pub const CreateTablesResult = struct {
 /// caller's bug (the second would install unnamed). Caller owns both
 /// returned slices; each name must outlive the change (marshalled at
 /// propose).
-pub fn buildCreateTables(
+pub fn buildTableCreate(
     self: *Forest,
     alloc: std.mem.Allocator,
     namespace_id: u64,
@@ -213,7 +293,7 @@ pub fn buildCreateTables(
     /// One per name: what that tree holds (`buffers.TreeKind`). A SQL
     /// base table's rows tree, then its index trees.
     kinds: []const _manifest.TreeKind,
-) !CreateTablesResult {
+) !TableResult {
     std.debug.assert(kinds.len == names.len);
     for (names) |name|
         if (name.len > 0 and self.manifest.lookupTable(namespace_id, name) != null)
@@ -251,28 +331,7 @@ pub fn buildCreateTables(
     };
 }
 
-/// applyCreateTree is Phase B: apply the change to the manifest — which
-/// registers each table's name and advances the namespace's table_id
-/// counter past it (this is what keeps a re-elected leader's allocator
-/// current) — then install an empty infinite-range tree in its
-/// (namespace, table_id) table, registering the namespace/table if absent.
-/// Idempotent on (namespace, tree_id). Called on all nodes after Raft
-/// commit (create_tree).
-pub fn applyCreateTree(
-    self: *Forest,
-    index: u64,
-    mc: _manifest.ManifestChange,
-) !void {
-    try self.manifest.apply(index, mc);
-    for (mc.tree_changes) |tc| {
-        if (tc.op != .create) continue;
-        // already applied
-        if (self.hasTree(tc.namespace_id, tc.tree_id)) continue;
-        try self.installTree(tc.namespace_id, tc.tree_id);
-    }
-}
-
-/// buildDropTables is Phase A of DROP TABLE: emit a delete change for
+/// buildTableDrop is Phase A of DROP TABLE: emit a delete change for
 /// every tree of every given table_id — a table can span >1 tree after
 /// splits, and a SQL table drops alongside its index tables in one atomic
 /// change. table_id counters are NOT rewound (ids are never reused, since
@@ -282,142 +341,87 @@ pub fn applyCreateTree(
 /// The dropped tables' rows in the namespace's CATALOG trees are NOT
 /// touched — with their names gone and table_ids never reused they are
 /// unreachable garbage. TODO: issue tombstones for them.
-pub fn buildDropTables(
+pub fn buildTableDrop(
     self: *Forest,
     alloc: std.mem.Allocator,
     namespace_id: u64,
     table_ids: []const u32,
 ) !_manifest.ManifestChange {
-    var ids: std.ArrayList(u64) = .empty;
-    defer ids.deinit(alloc);
-    for (table_ids) |table_id|
-        if (self.getTable(.{
-            .namespace = namespace_id,
-            .table_id = table_id,
-        })) |trees| {
-            const held = trees.mu.hold(.shared, @src());
-            defer held.release();
-            for (trees.list(held)) |e| try ids.append(alloc, e.tree_id);
-        };
-
-    const tree_changes = try alloc.alloc(_manifest.TreeChange, ids.items.len);
-    for (ids.items, 0..) |tree_id, i| {
-        tree_changes[i] = _manifest.deleteTreeChange(tree_id, namespace_id);
-    }
     return .{
-        .tree_changes = tree_changes,
+        .tree_changes = try buildTreeDeletes(
+            self,
+            alloc,
+            namespace_id,
+            table_ids,
+        ),
         .sstable_changes = &.{},
         .cmd = .drop_tree,
         .memtable_id = 0,
     };
 }
 
-/// applyDropTree is Phase B of DROP: for each delete change, remove the route
-/// entry (dropping the table once empty), tear down the in-memory tree
-/// (Tree.close releases its level refs on its SSTs — SSTs shared with another
-/// tree survive via refcount), and remove the tree from the manifest.
-/// Idempotent. drop_tree.
-///
-/// NOTE: dropped SST *files* are not eagerly unlinked from disk (Tree.close
-/// detaches, and the table cache holds its own ref). The data is immediately
-/// unqueryable (route + manifest gone); the manifest apply below retires
-/// every file whose last listing the drop removes, and `Forest.deleteFiles`
-/// unlinks it once this node's snapshot index passes `index`.
-pub fn applyDropTree(
-    self: *Forest,
-    index: u64,
-    mc: _manifest.ManifestChange,
-) !void {
-    // The manifest apply removes each tree's record (and, for drop_tree,
-    // each dropped table's name); the walk below only tears down the live
-    // trees, reading nothing the freed records owned.
-    try self.manifest.apply(index, mc);
-    applyTreeDeletes(self, mc);
-}
-
-/// The live-tree teardown shared by applyDropTree and applyNamespaceDrop.
-/// Runs on the apply loop, like every other create and drop, and after the
-/// manifest apply that removed the same trees' records.
-fn applyTreeDeletes(self: *Forest, mc: _manifest.ManifestChange) void {
-    for (mc.tree_changes) |tc| {
-        if (tc.op != .delete) continue;
-
-        // Remove the tree from its table (derived from the tree_id's
-        // high 32 bits) and tear it down (releases its level refs on its
-        // SSTs). Drop the table once it has no trees left.
-        // The tree leaves the list under the table lock, so no reader can
-        // find it from here on; dropping the list's ref then closes it
-        // as soon as the readers that already hold it let go. The
-        // TableTrees itself stays in the map, empty: table ids are never
-        // reused, and a reader may still be holding its pointer.
-        if (self.getTable(.{
-            .namespace = tc.namespace_id,
-            .table_id = treeTableId(tc.tree_id),
-        })) |trees| {
-            const gone = blk: {
-                const held = trees.mu.hold(.exclusive, @src());
-                defer held.release();
-                break :blk trees.removeTree(held, tc.tree_id);
-            };
-            if (gone) |tree| tree.release();
-        }
-    }
-}
-
-/// buildDropNamespace is Phase A of DROP DATABASE: emit a delete change for
+/// buildNsDrop is Phase A of DROP DATABASE: emit a delete change for
 /// every tree in every table of the namespace — the default table, system
 /// tables (catalog etc.), and user tables alike. drop_ns. Namespace ids are
-/// never reused, so no counter rewind is needed; applyNamespaceDrop forgets
+/// never reused, so no counter rewind is needed; the apply forgets
 /// the counter entirely. Returns an empty change set for an unknown
 /// namespace (idempotent). Caller owns the returned slice.
-pub fn buildDropNamespace(
+pub fn buildNsDrop(
     self: *Forest,
     alloc: std.mem.Allocator,
     namespace_id: u64,
 ) !_manifest.ManifestChange {
-    var changes: std.ArrayList(_manifest.TreeChange) = .empty;
-    defer changes.deinit(alloc);
-    {
-        var it = self.tables.iterator();
-        defer it.deinit();
-        while (it.next()) |kv| {
-            if (kv.key_ptr.namespace != namespace_id) continue;
-            const trees = kv.value_ptr.*;
-            const held = trees.mu.hold(.shared, @src());
-            defer held.release();
-            for (trees.list(held)) |e| {
-                try changes.append(
-                    alloc,
-                    _manifest.deleteTreeChange(e.tree_id, namespace_id),
-                );
-            }
-        }
-    }
     return .{
-        .tree_changes = try changes.toOwnedSlice(alloc),
+        .tree_changes = try buildTreeDeletes(self, alloc, namespace_id, null),
         .sstable_changes = &.{},
         .cmd = .drop_ns,
         .memtable_id = 0,
     };
 }
 
-/// applyNamespaceDrop is Phase B of DROP DATABASE: tear down every tree of
-/// the namespace (same per-tree semantics as applyDropTree — SSTs shared via
-/// refcount survive; the rest are retired here and unlinked by
-/// `Forest.deleteFiles`), then forget the
-/// namespace's manifest state (table_id counter + name, freeing the name
-/// for re-CREATE). Leftover memtable entries for the namespace are dropped
-/// at flush (buildFlush skips items with no route). Idempotent. drop_ns.
-pub fn applyNamespaceDrop(
+/// A delete change for every tree of `table_ids` in the namespace, or
+/// of every table in it when null. Each table's tree list is read under
+/// its shared lock. Caller owns the slice.
+fn buildTreeDeletes(
     self: *Forest,
-    index: u64,
-    mc: _manifest.ManifestChange,
+    alloc: std.mem.Allocator,
+    namespace_id: u64,
+    table_ids: ?[]const u32,
+) ![]_manifest.TreeChange {
+    var changes: std.ArrayList(_manifest.TreeChange) = .empty;
+    defer changes.deinit(alloc);
+    if (table_ids) |ids| {
+        for (ids) |table_id| {
+            const trees = self.getTable(.{
+                .namespace = namespace_id,
+                .table_id = table_id,
+            }) orelse continue;
+            try appendTreeDeletes(&changes, alloc, trees, namespace_id);
+        }
+    } else {
+        var it = self.tables.iterator();
+        defer it.deinit();
+        while (it.next()) |kv| {
+            if (kv.key_ptr.namespace != namespace_id) continue;
+            const trees = kv.value_ptr.*;
+            try appendTreeDeletes(&changes, alloc, trees, namespace_id);
+        }
+    }
+    return changes.toOwnedSlice(alloc);
+}
+
+fn appendTreeDeletes(
+    changes: *std.ArrayList(_manifest.TreeChange),
+    alloc: std.mem.Allocator,
+    trees: *TableTrees,
+    namespace_id: u64,
 ) !void {
-    // The manifest apply removes every tree record and forgets the
-    // namespace's counter and names; the walk below tears down the live
-    // trees.
-    try self.manifest.apply(index, mc);
-    applyTreeDeletes(self, mc);
+    const held = trees.mu.hold(.shared, @src());
+    defer held.release();
+    for (trees.list(held)) |e| try changes.append(
+        alloc,
+        _manifest.deleteTreeChange(e.tree_id, namespace_id),
+    );
 }
 
 /// buildSplit is Phase A: finds the split key, classifies tables, and returns

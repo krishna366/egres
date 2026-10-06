@@ -444,9 +444,9 @@ pub const Builder = struct {
                 const egid = std.mem.readInt(u64, key.primary[0..8], .big);
                 _ = try self.egid_bm.?.set(egid);
             },
-            // Unset, or a kind this build does not know (the wire enum
-            // is open): no filter it can write.
-            .unknown, _ => return error.UnknownTreeKind,
+            // None named, or a kind this build does not know (the wire
+            // enum is open): no filter it can write.
+            .none, _ => return error.UnknownTreeKind,
         }
 
         // The stored key is the primary alone: the namespace and table_id

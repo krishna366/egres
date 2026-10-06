@@ -194,6 +194,43 @@ expect "same table name in app" "CREATE TABLE" psql "$A" -X -c "CREATE TABLE t (
 expect "DROP DATABASE with tables" "DROP DATABASE" psql "$E" -X -c "DROP DATABASE app;"
 expect "dropped-db session fails" "database does not exist" psql "$A" -X -c "CREATE TABLE y (a int);"
 
+# --- CREATE DATABASE ... TEMPLATE: a branch of the template ----------------
+# The branch holds every row of the source as of the statement, rows
+# flushed to SSTs (the restart above flushed the early ones) and rows
+# still in memtables alike; after it, each side's writes stay its own.
+B="host=127.0.0.1 port=3210 dbname=app2 sslmode=disable"
+psql "$E" -X -qc "CREATE DATABASE app;" >/dev/null
+psql "$A" -X -qc "CREATE TABLE br (id int PRIMARY KEY, v text);" >/dev/null
+psql "$A" -X -qc "CREATE INDEX br_v ON br (v);" >/dev/null
+psql "$A" -X -qc "INSERT INTO br VALUES (1,'one'),(2,'two'),(3,'one');" >/dev/null
+expect "CREATE DATABASE TEMPLATE" "CREATE DATABASE" \
+    psql "$E" -X -c "CREATE DATABASE app2 TEMPLATE app;"
+expect "missing source errors" "template database does not exist" \
+    psql "$E" -X -c "CREATE DATABASE app3 TEMPLATE nope;"
+expect "branch has the rows" "(3 rows)" psql "$B" -X -c "SELECT id FROM br;"
+expect "branch index answers" "(2 rows)" \
+    psql "$B" -X -c "SELECT id FROM br WHERE v = 'one';"
+expect "branch takes its own writes" "INSERT 0 1" \
+    psql "$B" -X -c "INSERT INTO br VALUES (4,'four');"
+expect "source write stays in the source" "UPDATE 1" \
+    psql "$A" -X -c "UPDATE br SET v = 'uno' WHERE id = 1;"
+expect "branch unchanged by the source" "(2 rows)" \
+    psql "$B" -X -c "SELECT id FROM br WHERE v = 'one';"
+expect "source unchanged by the branch" "(3 rows)" \
+    psql "$A" -X -c "SELECT id FROM br;"
+expect "branch sees its own row" "(4 rows)" psql "$B" -X -c "SELECT id FROM br;"
+expect "branch allocates fresh row ids" "INSERT 0 1" \
+    psql "$B" -X -c "INSERT INTO br VALUES (5,'five');"
+expect "DROP the source" "DROP DATABASE" psql "$E" -X -c "DROP DATABASE app;"
+expect "branch outlives the source" "(5 rows)" \
+    psql "$B" -X -c "SELECT id FROM br;"
+stop_server
+start_server
+expect "branch survives a restart" "(5 rows)" psql "$B" -X -c "SELECT id FROM br;"
+expect "branch index survives a restart" "(2 rows)" \
+    psql "$B" -X -c "SELECT id FROM br WHERE v = 'one';"
+psql "$E" -X -qc "DROP DATABASE app2;" >/dev/null
+
 # --- secondary indexes: create / backfill / DML / drop ----------------------
 expect "CREATE TABLE items" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE items (id int PRIMARY KEY, color text);"
 expect "INSERT pre-index rows" "INSERT 0 3" psql "$E" -X -c "INSERT INTO items VALUES (1,'blue'),(2,'red'),(3,'blue');"

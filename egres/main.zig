@@ -171,7 +171,7 @@ const default_database = sql.default_database;
 fn seedGenesis(allocator: std.mem.Allocator, wal: *raft.DiskWAL) !void {
     if (wal.lastIndex() != 0) return;
 
-    // Same trees as forest.buildNamespaceCreate — one per system table,
+    // Same trees as forest.buildNsCreate — one per system table,
     // posting indexes as there; tree 0 (the raw-KV default table)
     // carries the database name.
     const sys = zdb.manifest.namespace_system_table_ids;

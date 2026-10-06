@@ -54,7 +54,7 @@ pub const TreeState = struct {
     right: Key = Key.inf,
     /// See `buffers.TreeKind`. Set at create, inherited by a split's new
     /// tree, kept by the snapshot manifest.
-    kind: TreeKind = .unknown,
+    kind: TreeKind = .none,
 };
 
 pub const TreeKind = _zen.TreeKindEnum;
@@ -65,7 +65,7 @@ pub const TreeKind = _zen.TreeKindEnum;
 pub const first_table_id: u32 = 16;
 
 /// The namespace's SQL catalog table (schema rows for its tables). Its tree
-/// is created with the namespace itself (see forest.buildNamespaceCreate).
+/// is created with the namespace itself (see forest.buildNsCreate).
 pub const catalog_table_id: u32 = 1;
 
 /// The namespace's SQL index catalog (one row per index). Like the catalog,
@@ -73,7 +73,7 @@ pub const catalog_table_id: u32 = 1;
 pub const index_catalog_table_id: u32 = 2;
 
 /// Every tree a namespace is born with, by table_id: the default raw-KV
-/// table plus the SQL catalogs. forest.buildNamespaceCreate and the genesis
+/// table plus the SQL catalogs. forest.buildNsCreate and the genesis
 /// seeder both loop over this — extend the list to add a system tree.
 pub const namespace_system_table_ids =
     [_]u32{ 0, catalog_table_id, index_catalog_table_id };
@@ -691,7 +691,7 @@ pub const Manifest = struct {
         if (tc.op == .create) {
             // Every create names what the tree holds; the filter, move
             // and rollup rules all read it.
-            std.debug.assert(tc.kind != .unknown);
+            std.debug.assert(tc.kind != .none);
             // A re-apply during WAL replay over snapshot-restored state is a
             // no-op: putting over the existing record would leak its keys.
             if (self.trees.contains(key)) return;
@@ -770,12 +770,11 @@ pub const Manifest = struct {
     /// SSTs — trees first, because an SST can only attach to a tree that
     /// exists) plus the name-registry and id-counter effects its `cmd`
     /// implies. This is the single implementation of what a committed DDL
-    /// entry does to manifest state: the live apply path (Forest's
-    /// applyNamespaceCreate / applyCreateTree / applyDropTree /
-    /// applyNamespaceDrop) and the snapshot draft replay both go through it,
-    /// so a name or counter can never be recorded on one path and missed on
-    /// the other. `index` is the log index of the applying entry, used as a
-    /// new SST's `raft_index` exactly as in `commit`.
+    /// entry does to manifest state: the live apply path
+    /// (Forest.applyTrees) and the snapshot draft replay both go through
+    /// it, so a name or counter can never be recorded on one path and
+    /// missed on the other. `index` is the log index of the applying
+    /// entry, used as a new SST's `raft_index` exactly as in `commit`.
     ///
     /// Two phases, like `restoreFrom`: the structural changes under one
     /// exclusive hold, then the name and counter helpers, each of which
@@ -785,6 +784,7 @@ pub const Manifest = struct {
     /// TODO: We probably should move table names over to the table schema,
     /// and avoid storing them in the MANIFEST.
     pub fn apply(self: *Manifest, index: u64, mc: ManifestChange) !void {
+        if (mc.cmd == .branch_ns) return self.applyBranch(mc);
         {
             const held = self.mu.hold(.exclusive, @src());
             defer held.release();
@@ -823,6 +823,91 @@ pub const Manifest = struct {
                 self.dropNamespace(mc.tree_changes[0].namespace_id);
             },
             else => {},
+        }
+    }
+
+    /// branch_ns: the target namespace (`mc.tree_changes[0]`, which
+    /// carries its id and name) gets a tree for every tree of
+    /// `mc.branch_from` with the same id, range, kind and files. A
+    /// file listed again keeps its record and its raft_index, so the
+    /// target's L0 reads in the source's order, and its refcount keeps
+    /// it on disk until both let go. The source's table names and
+    /// table-id counter come along, so the target resolves the same
+    /// names and never reuses an id the source minted. Read from this
+    /// node's manifest, which every node holds identically at this
+    /// index. A target that already has trees was applied before
+    /// (replay): nothing changes.
+    fn applyBranch(self: *Manifest, mc: ManifestChange) !void {
+        std.debug.assert(mc.tree_changes.len == 1);
+        const target = mc.tree_changes[0];
+        const dst = target.namespace_id;
+        const src = mc.branch_from;
+        {
+            const held = self.mu.hold(.exclusive, @src());
+            defer held.release();
+
+            // The keys first: `put` below may rehash the map.
+            var keys: std.ArrayList(TreeKey) = .empty;
+            defer keys.deinit(self.allocator);
+            var it = self.trees.keyIterator();
+            while (it.next()) |tk| {
+                if (tk.namespace == dst) return; // This ns was already applied.
+                if (tk.namespace == src) try keys.append(self.allocator, tk.*);
+            }
+            for (keys.items) |sk| try self.copyTree(sk, dst);
+
+            // Names and the counter, under the same hold: the register
+            // helpers take the lock themselves.
+            const dst_slot = try self.namespaces.getOrPut(dst);
+            if (!dst_slot.found_existing) dst_slot.value_ptr.* = .{};
+
+            if (self.namespaces.getPtr(src)) |src_ns| {
+                dst_slot.value_ptr.next_table_id = src_ns.next_table_id;
+                var titr = src_ns.tables.iterator();
+                while (titr.next()) |kv| {
+                    const owned = try self.allocator.dupe(u8, kv.key_ptr.*);
+                    errdefer self.allocator.free(owned);
+                    try dst_slot.value_ptr.tables.put(
+                        self.allocator,
+                        owned,
+                        kv.value_ptr.*,
+                    );
+                }
+            }
+        }
+        self.advanceNamespace(dst);
+        try self.registerNamespaceName(dst, target.name);
+    }
+
+    /// Lists tree `sk` under namespace `dst`, which has no trees yet: a
+    /// copy of its record, every file it lists taking one more ref.
+    /// Caller holds the lock exclusively.
+    fn copyTree(self: *Manifest, sk: TreeKey, dst: u64) !void {
+        const dk = TreeKey{ .namespace = dst, .tree_id = sk.tree_id };
+        var tree: TreeState = .{
+            .namespace_id = dst,
+            .levels = .empty,
+        };
+        errdefer self.freeTree(&tree);
+        {
+            const s = self.trees.getPtr(sk).?;
+            tree.left = try s.left.dupe(self.allocator);
+            tree.right = try s.right.dupe(self.allocator);
+            tree.kind = s.kind;
+            for (s.levels.items) |lm| {
+                var copy = LevelState{
+                    .tables = std.AutoHashMap(u64, void).init(self.allocator),
+                };
+                errdefer copy.tables.deinit();
+                var tit = lm.tables.keyIterator();
+                while (tit.next()) |id| try copy.tables.put(id.*, {});
+                try tree.levels.append(self.allocator, copy);
+            }
+        }
+        try self.trees.put(dk, tree);
+        for (tree.levels.items) |lm| {
+            var tit = lm.tables.keyIterator();
+            while (tit.next()) |id| self.ssts.getPtr(id.*).?.refs += 1;
         }
     }
 

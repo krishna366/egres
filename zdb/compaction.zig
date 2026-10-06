@@ -195,7 +195,7 @@ pub fn l0MergeRun(
 fn canMove(self: *const Tree) bool {
     return switch (self.kind) {
         .rows, .unique_index => true,
-        .posting_index, .unknown, _ => false,
+        .posting_index, .none, _ => false,
     };
 }
 

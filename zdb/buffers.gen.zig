@@ -15,7 +15,7 @@ pub const OpEnum = enum(u8) {
 };
 
 pub const TreeKindEnum = enum(u8) {
-    unknown = 0,
+    none = 0,
     rows = 1,
     unique_index = 2,
     posting_index = 3,
@@ -33,6 +33,7 @@ pub const CommandEnum = enum(u8) {
     create_tree = 7,
     drop_tree = 8,
     index_backfill = 9,
+    branch_ns = 10,
     _,
 };
 
@@ -1207,6 +1208,7 @@ pub const ManifestChangeStruct = struct {
     memtable_id: u64 = 0,
     namespaces: []NamespaceStruct = &.{},
     next_ns_id: u64 = 0,
+    branch_from: u64 = 0,
     pub fn deinit(self: *ManifestChangeStruct, alloc: std.mem.Allocator) void {
         for (self.tree_changes) |*_b| _b.deinit(alloc);
         alloc.free(self.tree_changes);
@@ -1229,6 +1231,7 @@ pub const ManifestChangeStruct = struct {
             .cmd = self.cmd,
             .memtable_id = self.memtable_id,
             .next_ns_id = self.next_ns_id,
+            .branch_from = self.branch_from,
         };
         errdefer s.deinit(alloc);
         {
@@ -1291,6 +1294,7 @@ pub const ManifestChangeStruct = struct {
             try writer.setNamespaces(offsets);
         }
         try writer.setNextNsId(self.next_ns_id);
+        try writer.setBranchFrom(self.branch_from);
         const result = try writer.finish();
         return result.offset;
     }
@@ -1301,7 +1305,7 @@ pub const ManifestChangeReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 43;
+    pub const SIZE_BYTES: u16 = 51;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -1347,6 +1351,10 @@ pub const ManifestChangeReader = struct {
         return self.t.scalar(u64, 35);
     }
 
+    pub fn branchFrom(self: Self) u64 {
+        return self.t.scalar(u64, 43);
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try ManifestChangeWriter.initWithBuf(alloc, out);
         const count_treeChanges: u32 = self.treeChangesLen();
@@ -1385,6 +1393,7 @@ pub const ManifestChangeReader = struct {
             try writer.setNamespaces(child_offsets_namespaces);
         }
         try writer.setNextNsId(self.nextNsId());
+        try writer.setBranchFrom(self.branchFrom());
         const result = try writer.finish();
         return result.offset;
     }
@@ -1409,6 +1418,7 @@ pub const ManifestChangeReader = struct {
             .cmd = self.cmd(),
             .memtable_id = self.memtableId(),
             .next_ns_id = self.nextNsId(),
+            .branch_from = self.branchFrom(),
         };
         errdefer s.deinit(alloc);
         {
@@ -1455,7 +1465,7 @@ pub const ManifestChangeWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46598;
-    pub const SIZE_BYTES: u16 = 43;
+    pub const SIZE_BYTES: u16 = 51;
     /// Slots of nested tables, null until set.
     const child_slots = [_]u16{};
 
@@ -1491,6 +1501,10 @@ pub const ManifestChangeWriter = struct {
         return self.w.setScalar(u64, 35, v);
     }
 
+    pub fn setBranchFrom(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 43, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -1502,6 +1516,7 @@ pub const ManifestChangeWriter = struct {
         if (@hasField(Values, "memtable_id")) try self.setMemtableId(@field(values, "memtable_id"));
         if (@hasField(Values, "namespaces")) try self.setNamespaces(@field(values, "namespaces"));
         if (@hasField(Values, "next_ns_id")) try self.setNextNsId(@field(values, "next_ns_id"));
+        if (@hasField(Values, "branch_from")) try self.setBranchFrom(@field(values, "branch_from"));
     }
 
     pub fn finish(self: *Self) Error!ManifestChangeBuffer {

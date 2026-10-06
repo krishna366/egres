@@ -34,15 +34,39 @@ const replyErrorCode = _server.replyErrorCode;
 const replyLockErr = _server.replyLockErr;
 const default_database = _server.default_database;
 
-pub fn createDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !void {
+/// With a source (TEMPLATE), the new database is a branch of it: its
+/// trees share the source's SST files and get the source's unflushed
+/// versions, all as of the entry's commit. Both then take writes on
+/// their own. Taken under ddl_mu like every DDL, so the source's
+/// catalog is not mid-change (a CREATE INDEX backfill, say) when it
+/// is copied.
+pub fn createDatabase(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    cd: _parse.CreateDatabase,
+) !void {
     const eng = self.srv.engine;
+    const name = cd.name;
     self.srv.ddl_mu.lock(@src());
     defer self.srv.ddl_mu.unlock();
     if (!try self.ddlReady(state)) return;
 
     var arena = std.heap.ArenaAllocator.init(eng.allocator);
     defer arena.deinit();
-    const created = eng.forest.buildCreateNamespace(arena.allocator(), name) catch |err| switch (err) {
+    var src: ?u64 = null;
+    if (cd.source) |src_name| {
+        src = eng.forest.manifest.lookupNamespace(src_name) orelse
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.invalid_catalog_name,
+                "template database does not exist",
+            );
+    }
+    const built = if (src) |s|
+        eng.forest.buildNsBranch(arena.allocator(), s, name)
+    else
+        eng.forest.buildNsCreate(arena.allocator(), .next, name);
+    const created = built catch |err| switch (err) {
         error.NameExists => return replyError(state, "database already exists"),
         else => |e| {
             log.err("create database '{s}': {s}", .{ name, @errorName(e) });
@@ -92,7 +116,7 @@ pub fn dropDatabase(self: *Handler, state: *pgwire.ConnState, name: String) !voi
         m.unlock();
     }
 
-    const mc = eng.forest.buildDropNamespace(arena.allocator(), ns) catch |err| {
+    const mc = eng.forest.buildNsDrop(arena.allocator(), ns) catch |err| {
         log.err("drop database '{s}': {s}", .{ name, @errorName(err) });
         db.dropped.store(false, .release);
         return replyError(state, "drop database failed");
@@ -165,7 +189,7 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
         try kinds.append(a, .unique_index);
     }
 
-    const created = eng.forest.buildCreateTables(
+    const created = eng.forest.buildTableCreate(
         a,
         ns,
         names.items,
@@ -313,7 +337,8 @@ pub fn dropTable(self: *Handler, state: *pgwire.ConnState, dt: _parse.DropTable)
     // as unreachable garbage (ids are never reused). TODO: issue
     // tombstones for them.
     try scan.table_ids.append(a, table_id);
-    const mc = eng.forest.buildDropTables(a, ns, scan.table_ids.items) catch |err| {
+    const ids = scan.table_ids.items;
+    const mc = eng.forest.buildTableDrop(a, ns, ids) catch |err| {
         log.err("drop table '{s}': {s}", .{ dt.name, @errorName(err) });
         return replyError(state, "drop table failed");
     };

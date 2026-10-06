@@ -14,10 +14,21 @@ test "sql.parse: CREATE/DROP DATABASE parse to typed statements" {
     const alloc = arena.allocator();
 
     const create = try parse.statement(alloc, "CREATE DATABASE app;");
-    try testing.expectEqualStrings("app", create.create_database);
+    try testing.expectEqualStrings("app", create.create_database.name);
+    try testing.expect(create.create_database.source == null);
 
     const drop = try parse.statement(alloc, "drop database app");
     try testing.expectEqualStrings("app", drop.drop_database);
+
+    // Both spellings Postgres accepts for a source database.
+    const b1 = try parse.statement(alloc, "CREATE DATABASE b TEMPLATE app");
+    try testing.expectEqualStrings("b", b1.create_database.name);
+    try testing.expectEqualStrings("app", b1.create_database.source.?);
+    const b2 = try parse.statement(
+        alloc,
+        "CREATE DATABASE b WITH TEMPLATE = app OWNER = me",
+    );
+    try testing.expectEqualStrings("app", b2.create_database.source.?);
 }
 
 test "sql.parse: everything else is unsupported; bad SQL is a syntax error" {

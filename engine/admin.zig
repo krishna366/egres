@@ -1481,7 +1481,7 @@ pub const AdminServer = struct {
             try proto.writeNotLeader(stream, leader);
             return;
         }
-        // buildNamespaceCreate reads applied state (ns existence), so the
+        // buildNsCreate reads applied state (ns existence), so the
         // leader must be caught up first (see Engine.catchUp).
         self.engine.catchUp() catch |err| {
             log.err("ns create: catch-up barrier: {s}", .{@errorName(err)});
@@ -1490,12 +1490,16 @@ pub const AdminServer = struct {
         };
         var arena = std.heap.ArenaAllocator.init(self.engine.allocator);
         defer arena.deinit();
-        const mc = self.engine.forest.buildNamespaceCreate(arena.allocator(), req.ns, "") catch |err| {
+        const nr = self.engine.forest.buildNsCreate(
+            arena.allocator(),
+            .{ .given = req.ns },
+            "",
+        ) catch |err| {
             log.err("ns create failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;
         };
-        self.engine.proposeMC(mc, .apply) catch |err| {
+        self.engine.proposeMC(nr.change, .apply) catch |err| {
             log.err("ns create failed: {s}", .{@errorName(err)});
             try proto.writeErr(stream, @errorName(err));
             return;

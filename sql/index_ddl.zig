@@ -153,7 +153,7 @@ pub fn createIndex(
     // what's needed.
     const column_id = col.column_id;
 
-    const created = eng.forest.buildCreateTables(
+    const created = eng.forest.buildTableCreate(
         arloc,
         ns,
         &.{name},
@@ -874,7 +874,7 @@ fn removeIndex(
     }};
     try eng.proposeWrites(ns, &kvs, .apply);
 
-    const mc = try eng.forest.buildDropTables(a, ns, &.{index_tid});
+    const mc = try eng.forest.buildTableDrop(a, ns, &.{index_tid});
     try eng.proposeMC(mc, .apply);
     try self.srv.forgetTable(.{ .namespace = ns, .table_id = base_tid });
 }

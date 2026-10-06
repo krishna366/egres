@@ -64,7 +64,7 @@ pub const Server = struct {
     /// same compiled-in schema in every namespace — one compile serves all.
     index_catalog_ps: _schema.PhysicalSchema,
     /// Serializes DDL: the leader-side name-uniqueness checks in
-    /// buildCreateNamespace/buildCreateTable are only sound if one DDL
+    /// buildNsCreate/buildCreateTable are only sound if one DDL
     /// runs at a time.
     ddl_mu: fiber.Mutex(.tracked) = .{},
     /// Per-database txn state (see Database), keyed by namespace id.
@@ -727,7 +727,7 @@ pub const Handler = struct {
         }
 
         switch (stmt) {
-            .create_database => |name| try _ddl.createDatabase(self, state, name),
+            .create_database => |cd| try _ddl.createDatabase(self, state, cd),
             .drop_database => |name| try _ddl.dropDatabase(self, state, name),
             .create_table => |ct| try _ddl.createTable(self, state, ct),
             .drop_table => |dt| try _ddl.dropTable(self, state, dt),

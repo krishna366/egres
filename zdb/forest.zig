@@ -538,17 +538,16 @@ pub const Forest = struct {
     pub const installTree = _ddl.installTree;
     pub const collectMissingFileIds = _ddl.collectMissingFileIds;
     pub const openTablesFromManifest = _ddl.openTablesFromManifest;
-    pub const buildNamespaceCreate = _ddl.buildNamespaceCreate;
-    pub const CreateNamespaceResult = _ddl.CreateNamespaceResult;
-    pub const buildCreateNamespace = _ddl.buildCreateNamespace;
-    pub const applyNamespaceCreate = _ddl.applyNamespaceCreate;
-    pub const CreateTablesResult = _ddl.CreateTablesResult;
-    pub const buildCreateTables = _ddl.buildCreateTables;
-    pub const applyCreateTree = _ddl.applyCreateTree;
-    pub const buildDropTables = _ddl.buildDropTables;
-    pub const applyDropTree = _ddl.applyDropTree;
-    pub const buildDropNamespace = _ddl.buildDropNamespace;
-    pub const applyNamespaceDrop = _ddl.applyNamespaceDrop;
+    pub const NsId = _ddl.NsId;
+    pub const NsResult = _ddl.NsResult;
+    pub const buildNsCreate = _ddl.buildNsCreate;
+    pub const applyTrees = _ddl.applyTrees;
+    pub const buildNsBranch = _ddl.buildNsBranch;
+    pub const applyNsBranch = _ddl.applyNsBranch;
+    pub const TableResult = _ddl.TableResult;
+    pub const buildTableCreate = _ddl.buildTableCreate;
+    pub const buildTableDrop = _ddl.buildTableDrop;
+    pub const buildNsDrop = _ddl.buildNsDrop;
     pub const buildSplit = _ddl.buildSplit;
     pub const applySplit = _ddl.applySplit;
     pub const splitTreeForTests = _ddl.splitTreeForTests;
@@ -639,6 +638,42 @@ pub const Forest = struct {
         for (items) |item| {
             try self.memtables.putItem(item);
         }
+    }
+
+    /// Writes every version of namespace `src` still in a memtable,
+    /// active or frozen, with a timestamp at or under `ts`, again under
+    /// namespace `dst`: the half of a branch that the manifest's file
+    /// sharing does not cover (applyNsBranch). The copies land
+    /// in the active memtable and flush with it into `dst`'s trees.
+    /// Runs on the apply fiber, the only writer, so the walk and the
+    /// writes never race; the writes sort past the walk's range (`dst`
+    /// is the newer id), so it never meets them.
+    pub fn forkMemtables(self: *Forest, src: u64, dst: u64, ts: u64) !void {
+        std.debug.assert(dst > src);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arloc = arena.allocator();
+
+        const srcs = try self.memtables.getIterators(arloc, .{}, .{});
+        var iter = try _mitr.MergeIterator.init(arloc, srcs);
+        defer iter.deinit();
+        try iter.seekRange(
+            Key.tableLeft(.{ .namespace = src, .table_id = 0 }),
+            Key.tableRight(.{
+                .namespace = src,
+                .table_id = std.math.maxInt(u32),
+            }),
+        );
+        var copied: usize = 0;
+        while (iter.itemRef()) |item| : (try iter.next()) {
+            var copy = item.visibleAt(ts) orelse continue;
+            copy.key.namespace = dst;
+            try self.memtables.putItem(copy);
+            copied += 1;
+        }
+        log.info("forkMemtables: ns={d} -> ns={d} at ts={d}: {d} keys", .{
+            src, dst, ts, copied,
+        });
     }
 
     /// Create a new memtable, freezing the current one.
