@@ -149,12 +149,11 @@ pub fn insert(self: *Handler, state: *pgwire.ConnState, ins: _parse.Insert) !voi
     // on this session sees the rows.
     const egids = try arloc.alloc(u64, num_rows);
     for (row_bytes, egids) |bytes, *egid| {
-        egid.* = self.allocEgid(table_key) catch |err| switch (err) {
-            error.NotLeader => return replyError(state, "not the leader"),
-            else => {
-                log.err("insert into '{s}': alloc egid: {s}", .{ ins.table, @errorName(err) });
-                return replyError(state, "row id allocation failed");
-            },
+        egid.* = self.allocEgid(table_key) catch |err| {
+            log.err("insert into '{s}': alloc egid: {s}", .{
+                ins.table, @errorName(err),
+            });
+            return replyError(state, "row id allocation failed");
         };
         const ekey = _key.encodeEgid(egid.*);
         try tx.put(table_id, &ekey, bytes, .{});

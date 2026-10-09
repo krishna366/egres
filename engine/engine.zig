@@ -316,6 +316,11 @@ pub const StorageImpl = struct {
                 ts,
                 mcs.*,
             ),
+            .branch_table => try self.forest.applyTableBranch(
+                index,
+                ts,
+                mcs.*,
+            ),
             else => log.err("unknown ManifestChange cmd={d}", .{@intFromEnum(mcs.cmd)}),
         }
         // Whatever this change unlisted has no level pointing at it;

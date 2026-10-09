@@ -8,6 +8,8 @@ const KeyRange = @import("kv.zig").KeyRange;
 const TreeKey = @import("kv.zig").TreeKey;
 const TableKey = @import("kv.zig").TableKey;
 const treeTableId = @import("kv.zig").treeTableId;
+const treeSplitId = @import("kv.zig").treeSplitId;
+const makeTreeId = @import("kv.zig").makeTreeId;
 const fiber = @import("zfiber");
 const utils = @import("utils");
 const vfs = @import("vfs");
@@ -784,7 +786,8 @@ pub const Manifest = struct {
     /// TODO: We probably should move table names over to the table schema,
     /// and avoid storing them in the MANIFEST.
     pub fn apply(self: *Manifest, index: u64, mc: ManifestChange) !void {
-        if (mc.cmd == .branch_ns) return self.applyBranch(mc);
+        if (mc.cmd == .branch_ns) return self.applyNsBranch(mc);
+        if (mc.cmd == .branch_table) return self.applyTableBranch(mc);
         {
             const held = self.mu.hold(.exclusive, @src());
             defer held.release();
@@ -837,7 +840,7 @@ pub const Manifest = struct {
     /// node's manifest, which every node holds identically at this
     /// index. A target that already has trees was applied before
     /// (replay): nothing changes.
-    fn applyBranch(self: *Manifest, mc: ManifestChange) !void {
+    fn applyNsBranch(self: *Manifest, mc: ManifestChange) !void {
         std.debug.assert(mc.tree_changes.len == 1);
         const target = mc.tree_changes[0];
         const dst = target.namespace_id;
@@ -854,7 +857,10 @@ pub const Manifest = struct {
                 if (tk.namespace == dst) return; // This ns was already applied.
                 if (tk.namespace == src) try keys.append(self.allocator, tk.*);
             }
-            for (keys.items) |sk| try self.copyTree(sk, dst);
+            for (keys.items) |sk| try self.copyTree(sk, .{
+                .namespace = dst,
+                .tree_id = sk.tree_id,
+            });
 
             // Names and the counter, under the same hold: the register
             // helpers take the lock themselves.
@@ -879,13 +885,51 @@ pub const Manifest = struct {
         try self.registerNamespaceName(dst, target.name);
     }
 
-    /// Lists tree `sk` under namespace `dst`, which has no trees yet: a
-    /// copy of its record, every file it lists taking one more ref.
-    /// Caller holds the lock exclusively.
-    fn copyTree(self: *Manifest, sk: TreeKey, dst: u64) !void {
-        const dk = TreeKey{ .namespace = dst, .tree_id = sk.tree_id };
+    /// branch_table: each change names a new table (its tree-0 change,
+    /// for the id and name) and `from_table_id`, the table whose trees
+    /// it lists again, split by split, with the same ranges, kinds and
+    /// files, as applyBranch does for a namespace. Then the name and
+    /// the counter, as a create_tree. A new table that already has
+    /// trees was applied before (replay): nothing changes.
+    fn applyTableBranch(self: *Manifest, mc: ManifestChange) !void {
+        {
+            const held = self.mu.hold(.exclusive, @src());
+            defer held.release();
+            for (mc.tree_changes) |tc| {
+                const ns = tc.namespace_id;
+                const dst_tid = treeTableId(tc.tree_id);
+                // The keys first: `put` below may rehash the map.
+                var keys: std.ArrayList(TreeKey) = .empty;
+                defer keys.deinit(self.allocator);
+                var it = self.trees.keyIterator();
+                while (it.next()) |tk| {
+                    if (tk.namespace != ns) continue;
+                    if (treeTableId(tk.tree_id) == dst_tid) return;
+                    if (treeTableId(tk.tree_id) == tc.from_table_id)
+                        try keys.append(self.allocator, tk.*);
+                }
+                for (keys.items) |sk| try self.copyTree(sk, .{
+                    .namespace = ns,
+                    .tree_id = makeTreeId(dst_tid, treeSplitId(sk.tree_id)),
+                });
+            }
+        }
+        for (mc.tree_changes) |tc| {
+            const table_key: TableKey = .{
+                .namespace = tc.namespace_id,
+                .table_id = treeTableId(tc.tree_id),
+            };
+            try self.advanceTableId(table_key);
+            try self.registerTableName(table_key, tc.name);
+        }
+    }
+
+    /// Lists tree `sk` again as `dk`, a key no tree holds yet: a copy of
+    /// its record, every file it lists taking one more ref. Caller
+    /// holds the lock exclusively.
+    fn copyTree(self: *Manifest, sk: TreeKey, dk: TreeKey) !void {
         var tree: TreeState = .{
-            .namespace_id = dst,
+            .namespace_id = dk.namespace,
             .levels = .empty,
         };
         errdefer self.freeTree(&tree);
@@ -1184,6 +1228,17 @@ pub fn createTreeChange(
         .namespace_id = namespace_id,
         .left_key = @constCast(left_key),
         .right_key = @constCast(right_key),
+        .kind = kind,
+    };
+}
+
+/// A table to create, for Forest.buildTables: `kind` for a create,
+/// `from_table_id` (set after) for a branch; the builder fills the ids.
+/// `name` must outlive the change.
+pub fn newTableChange(name: String, kind: TreeKind) TreeChange {
+    return .{
+        .op = .create,
+        .name = @constCast(name),
         .kind = kind,
     };
 }

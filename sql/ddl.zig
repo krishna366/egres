@@ -155,12 +155,10 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
     // all created with the table in one atomic change; a name
     // collision on any of them fails the CREATE.
     const columns = try a.alloc(_schema.LogicalColumn, ct.columns.len);
-    var names: std.ArrayList(String) = .empty;
-    try names.append(a, ct.name);
     // The base table's rows tree, then a unique index tree per primary
     // key or UNIQUE column.
-    var kinds: std.ArrayList(zdb.manifest.TreeKind) = .empty;
-    try kinds.append(a, .rows);
+    var changes: std.ArrayList(zdb.manifest.TreeChange) = .empty;
+    try changes.append(a, zdb.manifest.newTableChange(ct.name, .rows));
 
     var unique_cols: std.ArrayList(u32) = .empty;
     for (ct.columns, columns, 1..) |c, *lc, id| {
@@ -182,18 +180,23 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
                 "indexes on interval columns are not supported",
             );
         try unique_cols.append(a, lc.column_id);
-        try names.append(a, if (c.pkey)
-            try std.fmt.allocPrint(a, "{s}_pkey", .{ct.name})
-        else
-            try std.fmt.allocPrint(a, "{s}_{s}_key", .{ ct.name, c.name }));
-        try kinds.append(a, .unique_index);
+        const index_name = try _table.indexName(
+            a,
+            ct.name,
+            c.name,
+            if (c.pkey) .pkey else .unique,
+        );
+        try changes.append(
+            a,
+            zdb.manifest.newTableChange(index_name, .unique_index),
+        );
     }
 
-    const created = eng.forest.buildTableCreate(
+    const created = eng.forest.buildTables(
         a,
         ns,
-        names.items,
-        kinds.items,
+        changes.items,
+        .create_tree,
     ) catch |err| switch (err) {
         error.NameExists => return replyErrorCode(state, pgwire.sqlstate.duplicate_table, "table or index name already exists"),
         else => |e| {
@@ -233,6 +236,154 @@ pub fn createTable(self: *Handler, state: *pgwire.ConnState, ct: _parse.CreateTa
         .{ ct.name, ns, table_id, ct.columns.len, indexes.len },
     );
     try state.sendCommandComplete("CREATE TABLE");
+}
+
+/// CREATE TABLE `name` AS TABLE `source`: the new table is a branch of
+/// the source, its rows and its indexes as of the entry's commit, the
+/// SST files shared and the memtable versions copied
+/// (zdb.forest_ddl.buildTables), then the source's catalog rows
+/// written again under the new ids. Postgres copies the rows and not
+/// the indexes; here the indexes come too, under the generated names
+/// (`name_pkey`, `name_col_key`, `name_col_idx`). WITH NO DATA makes
+/// the same tables empty. Under ddl_mu like every DDL, so the source's
+/// catalog is not mid-change when it is copied; an index still marked
+/// building is a crashed CREATE INDEX, refused rather than branched
+/// incomplete.
+pub fn createTableAs(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    cta: _parse.CreateTableAs,
+) !void {
+    const eng = self.srv.engine;
+    self.srv.ddl_mu.lock(@src());
+    defer self.srv.ddl_mu.unlock();
+    if (!try self.ddlReady(state)) return;
+
+    const ns = try self.sessionNamespace(state) orelse return;
+    if (eng.forest.manifest.lookupTable(ns, cta.name) != null) {
+        if (cta.if_not_exists)
+            return state.sendCommandComplete("CREATE TABLE AS");
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.duplicate_table,
+            "table already exists",
+        );
+    }
+    const src_tid = eng.forest.manifest.lookupTable(ns, cta.source) orelse
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.undefined_table,
+            "source table does not exist",
+        );
+    const src_key: zdb.kv.TableKey = .{ .namespace = ns, .table_id = src_tid };
+    const src = self.srv.openTable(src_key) catch |err| {
+        log.err("create table as '{s}': load schema: {s}", .{
+            cta.name, @errorName(err),
+        });
+        return replyError(state, "failed to load source table schema");
+    };
+
+    var arena = std.heap.ArenaAllocator.init(eng.allocator);
+    defer arena.deinit();
+    const arloc = arena.allocator();
+
+    // Every column row of the source, dropped ones included: the rows
+    // in the shared files were laid out by that history.
+    const columns = _table.loadColumnRows(
+        arloc,
+        eng.forest,
+        &self.srv.catalog_ps,
+        src_key,
+    ) catch |err| {
+        log.err("create table as '{s}': catalog rows: {s}", .{
+            cta.name, @errorName(err),
+        });
+        return replyError(state, "failed to load source table schema");
+    };
+
+    // The new tables: the base, then one per index, each a branch of
+    // its source table (or, WITH NO DATA, an empty tree of its kind).
+    // Index changes pair with `src_indexes` by position, for their
+    // catalog rows below.
+    var changes: std.ArrayList(zdb.manifest.TreeChange) = .empty;
+    var src_indexes: std.ArrayList(_table.Index) = .empty;
+
+    var base = zdb.manifest.newTableChange(cta.name, .rows);
+    base.from_table_id = src_tid;
+    try changes.append(arloc, base);
+
+    for (src.indexes) |idx| {
+        if (idx.isBuilding())
+            return replyErrorCode(
+                state,
+                pgwire.sqlstate.object_in_use,
+                "source table has an index still being built",
+            );
+
+        var tc = zdb.manifest.newTableChange(
+            try idx.nameFor(arloc, cta.name),
+            idx.treeKind(),
+        );
+        tc.from_table_id = idx.index_table_id;
+        try changes.append(arloc, tc);
+        try src_indexes.append(arloc, idx);
+    }
+
+    const built = eng.forest.buildTables(
+        arloc,
+        ns,
+        changes.items,
+        if (cta.with_data) .branch_table else .create_tree,
+    );
+    const created = built catch |err| switch (err) {
+        error.NameExists => return replyErrorCode(
+            state,
+            pgwire.sqlstate.duplicate_table,
+            "table or index name already exists",
+        ),
+        else => |e| {
+            log.err("create table as '{s}': {s}", .{ cta.name, @errorName(e) });
+            return replyError(state, "create table failed");
+        },
+    };
+    eng.proposeMC(created.change, .apply) catch |err| {
+        log.err("create table as '{s}': propose: {s}", .{
+            cta.name, @errorName(err),
+        });
+        return replyError(state, "create table proposal failed");
+    };
+
+    // Phase 2, as createTable: the catalog rows under the new ids. The
+    // column ids stay the source's, so the index descriptors and the
+    // shared rows keep naming the same columns. A branched index is
+    // valid from when its source was; an empty one from the start.
+    const table_id = created.table_ids[0];
+    const indexes = try arloc.alloc(_catalog.IndexDef, src_indexes.items.len);
+    for (src_indexes.items, created.table_ids[1..], indexes) |idx, tid, *def| {
+        def.* = .{
+            .base_table_id = table_id,
+            .index_table_id = tid,
+            .column_id = idx.column.column_id,
+            .unique = idx.unique,
+            .valid_ts = if (cta.with_data) idx.valid_ts else 0,
+        };
+    }
+    writeCatalogRows(self, arloc, .{
+        .namespace = ns,
+        .table_id = table_id,
+    }, columns, indexes) catch |err| {
+        log.err("create table as '{s}': catalog rows: {s}", .{
+            cta.name, @errorName(err),
+        });
+        return replyError(state, "create table failed writing catalog rows");
+    };
+
+    log.info(
+        "created table '{s}' as table '{s}' -> ns={d} table_id={d} " ++
+            "indexes={d} data={}",
+        .{ cta.name, cta.source, ns, table_id, indexes.len, cta.with_data },
+    );
+    try state.sendCommandComplete("CREATE TABLE AS");
 }
 
 /// Marshal one catalog row per column plus one per index descriptor and

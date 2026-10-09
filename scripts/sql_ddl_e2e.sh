@@ -231,6 +231,60 @@ expect "branch index survives a restart" "(2 rows)" \
     psql "$B" -X -c "SELECT id FROM br WHERE v = 'one';"
 psql "$E" -X -qc "DROP DATABASE app2;" >/dev/null
 
+# --- CREATE TABLE ... AS TABLE: a branch of one table ------------------------
+# The branch holds every row of the source as of the statement, with
+# its indexes; after it, each side's writes stay its own. WITH NO DATA
+# takes the definition and the indexes, empty.
+psql "$E" -X -qc "CREATE DATABASE tb;" >/dev/null
+T="host=127.0.0.1 port=3210 dbname=tb sslmode=disable"
+psql "$T" -X -qc "CREATE TABLE src (id int PRIMARY KEY, v text, u int UNIQUE);" \
+    >/dev/null
+psql "$T" -X -qc "CREATE INDEX src_v ON src (v);" >/dev/null
+psql "$T" -X -qc "INSERT INTO src VALUES (1,'one',10),(2,'two',20),(3,'one',30);" \
+    >/dev/null
+expect "CREATE TABLE AS TABLE" "CREATE TABLE AS" \
+    psql "$T" -X -c "CREATE TABLE dst AS TABLE src;"
+expect "missing source errors" "source table does not exist" \
+    psql "$T" -X -c "CREATE TABLE dst2 AS TABLE nope;"
+expect "duplicate branch name" "already exists" \
+    psql "$T" -X -c "CREATE TABLE dst AS TABLE src;"
+expect "branch has the rows" "(3 rows)" psql "$T" -X -c "SELECT id FROM dst;"
+expect "branch index answers" "(2 rows)" \
+    psql "$T" -X -c "SELECT id FROM dst WHERE v = 'one';"
+expect "branch pkey answers" "(1 row)" \
+    psql "$T" -X -c "SELECT v FROM dst WHERE id = 2;"
+expect "branch unique index holds" "duplicate key" \
+    psql "$T" -X -c "INSERT INTO dst VALUES (9,'nine',10);"
+expect "branch takes its own writes" "INSERT 0 1" \
+    psql "$T" -X -c "INSERT INTO dst VALUES (4,'four',40);"
+expect "source write stays in the source" "UPDATE 1" \
+    psql "$T" -X -c "UPDATE src SET v = 'uno' WHERE id = 1;"
+expect "branch unchanged by the source" "(2 rows)" \
+    psql "$T" -X -c "SELECT id FROM dst WHERE v = 'one';"
+expect "source unchanged by the branch" "(3 rows)" \
+    psql "$T" -X -c "SELECT id FROM src;"
+expect "branch sees its own row" "(4 rows)" psql "$T" -X -c "SELECT id FROM dst;"
+expect "branch index names follow the branch" "CREATE INDEX" \
+    psql "$T" -X -c "CREATE INDEX IF NOT EXISTS dst_v_idx ON dst (v);"
+expect "WITH NO DATA is empty" "CREATE TABLE AS" \
+    psql "$T" -X -c "CREATE TABLE empty AS TABLE src WITH NO DATA;"
+expect "empty branch has no rows" "(0 rows)" \
+    psql "$T" -X -c "SELECT id FROM empty;"
+expect "empty branch has the index" "already indexed" \
+    psql "$T" -X -c "CREATE INDEX another ON empty (v);"
+expect "empty branch takes rows" "INSERT 0 1" \
+    psql "$T" -X -c "INSERT INTO empty VALUES (1,'one',10);"
+expect "DROP the source" "DROP TABLE" psql "$T" -X -c "DROP TABLE src;"
+expect "branch outlives the source" "(4 rows)" \
+    psql "$T" -X -c "SELECT id FROM dst;"
+stop_server
+start_server
+expect "table branch survives a restart" "(4 rows)" \
+    psql "$T" -X -c "SELECT id FROM dst;"
+expect "table branch index survives a restart" "(2 rows)" \
+    psql "$T" -X -c "SELECT id FROM dst WHERE v = 'one';"
+psql "$E" -X -qc "DROP DATABASE tb;" >/dev/null
+
 # --- secondary indexes: create / backfill / DML / drop ----------------------
 expect "CREATE TABLE items" "CREATE TABLE" psql "$E" -X -c "CREATE TABLE items (id int PRIMARY KEY, color text);"
 expect "INSERT pre-index rows" "INSERT 0 3" psql "$E" -X -c "INSERT INTO items VALUES (1,'blue'),(2,'red'),(3,'blue');"

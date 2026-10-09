@@ -17,6 +17,7 @@ const String = utils.String;
 const _manifest = @import("manifest.zig");
 const KeyRange = @import("kv.zig").KeyRange;
 const TableKey = @import("kv.zig").TableKey;
+const Key = @import("kv.zig").Key;
 const makeTreeId = @import("kv.zig").makeTreeId;
 const treeTableId = @import("kv.zig").treeTableId;
 const Forest = @import("forest.zig").Forest;
@@ -245,7 +246,7 @@ pub fn buildNsBranch(
 /// trees over the source's files, each is installed, and the source's
 /// versions still in memtables, those committed before the entry
 /// (`ts`, its commit timestamp), are written again under the target
-/// (Forest.forkMemtables). Together that is every version the source
+/// (Memtables.fork). Together that is every version the source
 /// held as of the entry; later writes to either side stay on that
 /// side. Called on all nodes after Raft commit (branch_ns); skips
 /// trees the forest already holds (re-apply).
@@ -263,69 +264,118 @@ pub fn applyNsBranch(
         if (self.hasTree(tk.namespace, tk.tree_id)) continue;
         try self.installTree(tk.namespace, tk.tree_id);
     }
-    try self.forkMemtables(mc.branch_from, dst, ts);
+    const src = mc.branch_from;
+    std.debug.assert(dst > src);
+    const copied = try self.memtables.fork(.{
+        .left = Key.tableLeft(.{ .namespace = src, .table_id = 0 }),
+        .right = Key.tableRight(.{
+            .namespace = src,
+            .table_id = std.math.maxInt(u32),
+        }),
+    }, ts, .{ .namespace = dst, .table_id = null });
+    std.log.info("branch ns={d} -> ns={d} at ts={d}: {d} memtable keys", .{
+        src, dst, ts, copied,
+    });
 }
 
-/// Result of buildTableCreate: one allocated table_id per requested name
-/// (same order) plus the single create_tree ManifestChange creating them
-/// all. Caller owns `table_ids` and `change.tree_changes`.
+/// Result of buildTables: one allocated table_id per change (same
+/// order) plus the single ManifestChange creating them all, listing
+/// the caller's changes. Caller owns `table_ids`.
 pub const TableResult = struct {
     table_ids: []u32,
     change: _manifest.ManifestChange,
 };
 
-/// buildTableCreate creates N sibling tables in ONE change — a
-/// SQL table plus its index tables, so they commit atomically. Each
-/// name gets its own freshly allocated table_id (at split 0) and a create
-/// TreeChange carrying that name; apply registers every name → table_id on
-/// all nodes and advances the id counter past each. A non-empty name
-/// already taken in the namespace errors `NameExists` (sound while the
-/// caller serializes DDL); an empty name registers nothing (system trees).
-/// `names` must be pairwise distinct — an intra-batch duplicate is the
-/// caller's bug (the second would install unnamed). Caller owns both
-/// returned slices; each name must outlive the change (marshalled at
-/// propose).
-pub fn buildTableCreate(
+/// applyTableBranch is Phase B: the manifest lists each new table's
+/// trees over its source's files, each is installed, and the source's
+/// versions still in memtables, those committed before the entry
+/// (`ts`), are written again under the new table (Memtables.fork),
+/// as applyNsBranch does for a namespace. Called on all nodes after
+/// Raft commit (branch_table); skips trees the forest already holds.
+pub fn applyTableBranch(
+    self: *Forest,
+    index: u64,
+    ts: u64,
+    mc: _manifest.ManifestChange,
+) !void {
+    try self.manifest.apply(index, mc);
+    for (mc.tree_changes) |tc| {
+        const ns = tc.namespace_id;
+        const dst_tid = treeTableId(tc.tree_id);
+        const keys = try self.manifest.treeKeys(self.allocator, ns);
+        defer self.allocator.free(keys);
+
+        for (keys) |tk| {
+            if (treeTableId(tk.tree_id) != dst_tid) continue;
+            if (self.hasTree(tk.namespace, tk.tree_id)) continue;
+            try self.installTree(tk.namespace, tk.tree_id);
+        }
+
+        const src: TableKey = .{
+            .namespace = ns,
+            .table_id = tc.from_table_id,
+        };
+        std.debug.assert(dst_tid > src.table_id);
+        const copied = try self.memtables.fork(.{
+            .left = Key.tableLeft(src),
+            .right = Key.tableRight(src),
+        }, ts, .{ .namespace = ns, .table_id = dst_tid });
+        std.log.info("branch ns={d} table={d} -> table={d} at ts={d}: {d} " ++
+            "memtable keys", .{ ns, src.table_id, dst_tid, ts, copied });
+    }
+}
+
+/// buildTables is Phase A of CREATE TABLE and CREATE INDEX (`cmd`
+/// create_tree) and of CREATE TABLE AS TABLE (branch_table): N sibling
+/// tables in ONE change — a SQL table plus its index tables, so they
+/// commit atomically. `changes` are the caller's
+/// (`manifest.newTableChange`), `name` set, and `kind` for a create or
+/// `from_table_id` for a branch; each gets a freshly allocated table_id
+/// here. A create's apply installs one empty tree of its kind per
+/// table and registers every name → table_id on all nodes, advancing
+/// the id counter past each. A branch's apply lists its source's trees
+/// again, files shared (Manifest.applyTableBranch), so a branch change
+/// names no kind. A non-empty name already taken in the namespace
+/// errors `NameExists` (sound while the caller serializes DDL); an
+/// empty name registers nothing (system trees). Names must be pairwise
+/// distinct — an intra-batch duplicate is the caller's bug (the second
+/// would install unnamed). A branch of a table with no trees errors
+/// `TableNotFound`. Caller owns `table_ids` and `changes`, which the
+/// result's change lists; each name must outlive the change
+/// (marshalled at propose).
+pub fn buildTables(
     self: *Forest,
     alloc: std.mem.Allocator,
     namespace_id: u64,
-    names: []const String,
-    /// One per name: what that tree holds (`buffers.TreeKind`). A SQL
-    /// base table's rows tree, then its index trees.
-    kinds: []const _manifest.TreeKind,
+    changes: []_manifest.TreeChange,
+    cmd: _manifest.Command,
 ) !TableResult {
-    std.debug.assert(kinds.len == names.len);
-    for (names) |name|
-        if (name.len > 0 and self.manifest.lookupTable(namespace_id, name) != null)
+    std.debug.assert(cmd == .create_tree or cmd == .branch_table);
+    for (changes) |tc| {
+        if (tc.name.len > 0 and
+            self.manifest.lookupTable(namespace_id, tc.name) != null)
             return error.NameExists;
-
-    const table_ids = try alloc.alloc(u32, names.len);
-    errdefer alloc.free(table_ids);
-    const tree_changes = try alloc.alloc(_manifest.TreeChange, names.len);
-    errdefer alloc.free(tree_changes);
-
-    for (names, 0..) |name, i| {
-        const table_id = try self.manifest.nextTableId(namespace_id);
-        table_ids[i] = table_id;
-        const tree_id = self.nextTreeId(.{
+        if (cmd == .branch_table and !self.hasTable(.{
             .namespace = namespace_id,
-            .table_id = table_id,
-        });
-        tree_changes[i] = _manifest.createTreeChange(
-            tree_id,
-            namespace_id,
-            "",
-            "",
-            kinds[i],
-        );
-        tree_changes[i].name = @constCast(name);
+            .table_id = tc.from_table_id,
+        })) return error.TableNotFound;
+    }
+
+    const table_ids = try alloc.alloc(u32, changes.len);
+    errdefer alloc.free(table_ids);
+    for (changes, table_ids) |*tc, *table_id| {
+        table_id.* = try self.manifest.nextTableId(namespace_id);
+        tc.op = .create;
+        tc.namespace_id = namespace_id;
+        tc.tree_id = makeTreeId(table_id.*, 0);
+        if (cmd == .branch_table) tc.kind = .none;
     }
     return .{
         .table_ids = table_ids,
         .change = .{
-            .tree_changes = tree_changes,
+            .tree_changes = changes,
             .sstable_changes = &.{},
-            .cmd = .create_tree,
+            .cmd = cmd,
             .memtable_id = 0,
         },
     };

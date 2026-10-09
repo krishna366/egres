@@ -84,6 +84,8 @@ pub const TreeChange = schema.Table(&.{
     .{ .id = 6, .name = "name", .ty = schema.Bytes },
     // create only: fixed for the tree's life, inherited by a split.
     .{ .id = 7, .name = "kind", .ty = TreeKind },
+    // branch_table only: the table whose trees this table lists again.
+    .{ .id = 8, .name = "from_table_id", .ty = schema.U32 },
 });
 
 // SSTableChange records one SST file (`sst_id`) entering or leaving a tree at a
@@ -144,6 +146,12 @@ pub const Command = schema.EnumDef(&.{
     // derived from the manifest at apply, the same on every node
     // (Manifest.applyBranch).
     .{ .name = "branch_ns", .tag = 10 },
+    // CREATE TABLE dst AS TABLE src: one create change per new table
+    // (the base table and each of its indexes), carrying its name and
+    // `from_table_id`; each lists every tree of its source under its
+    // own id, the files shared, and takes the source's versions still
+    // in memtables, as of the entry (Manifest.applyTableBranch).
+    .{ .name = "branch_table", .tag = 11 },
 });
 
 pub const ManifestChange = schema.Table(&.{

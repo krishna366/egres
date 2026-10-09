@@ -22,6 +22,7 @@ const zroar = @import("zroar");
 const flags = @import("flags");
 
 const Key = @import("kv.zig").Key;
+const KeyRange = @import("kv.zig").KeyRange;
 const TreeKey = @import("kv.zig").TreeKey;
 const TableKey = @import("kv.zig").TableKey;
 const makeTreeId = @import("kv.zig").makeTreeId;
@@ -245,6 +246,40 @@ pub const Memtables = struct {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
         try self.current.putItem(item);
+    }
+
+    /// Where a fork writes: the namespace, and the table unless the key
+    /// keeps its own (a namespace fork).
+    pub const ForkTo = struct { namespace: u64, table_id: ?u32 };
+
+    /// Writes every version in `range`, active or frozen memtable, with
+    /// a timestamp at or under `ts`, again rewritten to `to`: the half
+    /// of a branch that the manifest's file sharing does not cover
+    /// (applyNsBranch, applyTableBranch). The copies land in the active
+    /// memtable and flush with it into the target's trees. Runs on the
+    /// apply fiber, the only writer, so the walk and the writes never
+    /// race; `to` is the newer id, so the writes sort past the range
+    /// and the walk never meets them. Returns the keys written.
+    pub fn fork(self: *Memtables, range: KeyRange, ts: u64, to: ForkTo) !usize {
+        // The entry's commit timestamp: 0 would copy nothing.
+        std.debug.assert(ts > 0);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arloc = arena.allocator();
+
+        const srcs = try self.getIterators(arloc, .{}, .{});
+        var iter = try _mitr.MergeIterator.init(arloc, srcs);
+        defer iter.deinit();
+        try iter.seekRange(range.left, range.right);
+        var copied: usize = 0;
+        while (iter.itemRef()) |item| : (try iter.next()) {
+            var copy = item.visibleAt(ts) orelse continue;
+            copy.key.namespace = to.namespace;
+            if (to.table_id) |tid| copy.key.table_id = tid;
+            try self.putItem(copy);
+            copied += 1;
+        }
+        return copied;
     }
 
     pub fn memoryUsage(self: *Memtables) usize {
@@ -544,8 +579,9 @@ pub const Forest = struct {
     pub const applyTrees = _ddl.applyTrees;
     pub const buildNsBranch = _ddl.buildNsBranch;
     pub const applyNsBranch = _ddl.applyNsBranch;
+    pub const applyTableBranch = _ddl.applyTableBranch;
     pub const TableResult = _ddl.TableResult;
-    pub const buildTableCreate = _ddl.buildTableCreate;
+    pub const buildTables = _ddl.buildTables;
     pub const buildTableDrop = _ddl.buildTableDrop;
     pub const buildNsDrop = _ddl.buildNsDrop;
     pub const buildSplit = _ddl.buildSplit;
@@ -638,42 +674,6 @@ pub const Forest = struct {
         for (items) |item| {
             try self.memtables.putItem(item);
         }
-    }
-
-    /// Writes every version of namespace `src` still in a memtable,
-    /// active or frozen, with a timestamp at or under `ts`, again under
-    /// namespace `dst`: the half of a branch that the manifest's file
-    /// sharing does not cover (applyNsBranch). The copies land
-    /// in the active memtable and flush with it into `dst`'s trees.
-    /// Runs on the apply fiber, the only writer, so the walk and the
-    /// writes never race; the writes sort past the walk's range (`dst`
-    /// is the newer id), so it never meets them.
-    pub fn forkMemtables(self: *Forest, src: u64, dst: u64, ts: u64) !void {
-        std.debug.assert(dst > src);
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const arloc = arena.allocator();
-
-        const srcs = try self.memtables.getIterators(arloc, .{}, .{});
-        var iter = try _mitr.MergeIterator.init(arloc, srcs);
-        defer iter.deinit();
-        try iter.seekRange(
-            Key.tableLeft(.{ .namespace = src, .table_id = 0 }),
-            Key.tableRight(.{
-                .namespace = src,
-                .table_id = std.math.maxInt(u32),
-            }),
-        );
-        var copied: usize = 0;
-        while (iter.itemRef()) |item| : (try iter.next()) {
-            var copy = item.visibleAt(ts) orelse continue;
-            copy.key.namespace = dst;
-            try self.memtables.putItem(copy);
-            copied += 1;
-        }
-        log.info("forkMemtables: ns={d} -> ns={d} at ts={d}: {d} keys", .{
-            src, dst, ts, copied,
-        });
     }
 
     /// Create a new memtable, freezing the current one.

@@ -39,6 +39,25 @@ comptime {
         zdb.manifest.index_catalog_table_id);
 }
 
+/// What an index is on its column, for its generated name.
+pub const IndexShape = enum { pkey, unique, plain };
+
+/// Postgres's generated name for an index on `table`(`column`):
+/// `<t>_pkey` for the primary key, `<t>_<c>_key` for a unique column,
+/// `<t>_<c>_idx` otherwise.
+pub fn indexName(
+    alloc: std.mem.Allocator,
+    table: String,
+    column: String,
+    shape: IndexShape,
+) ![]u8 {
+    return switch (shape) {
+        .pkey => std.fmt.allocPrint(alloc, "{s}_pkey", .{table}),
+        .unique => std.fmt.allocPrint(alloc, "{s}_{s}_key", .{ table, column }),
+        .plain => std.fmt.allocPrint(alloc, "{s}_{s}_idx", .{ table, column }),
+    };
+}
+
 /// One live column of a loaded table. `name` is owned by the Table's arena.
 /// Statements hold a `*const Column` (into `Table.columns`, stable for the
 /// Table's life) and never a bare position or column_id: `column_id` is
@@ -96,6 +115,26 @@ pub const Index = struct {
     /// index, and no writer bumps to its `valid_ts`.
     pub inline fn isBuilding(self: *const Index) bool {
         return self.valid_ts == _catalog.IndexDef.building;
+    }
+
+    /// The tree kind an index of this shape holds.
+    pub fn treeKind(self: *const Index) zdb.manifest.TreeKind {
+        return if (self.unique) .unique_index else .posting_index;
+    }
+
+    /// `indexName` for this index, were it on `table`.
+    pub fn nameFor(
+        self: *const Index,
+        alloc: std.mem.Allocator,
+        table: String,
+    ) ![]u8 {
+        const shape: IndexShape = if (!self.unique)
+            .plain
+        else if (self.column.pkey_position != null)
+            .pkey
+        else
+            .unique;
+        return indexName(alloc, table, self.column.name, shape);
     }
 
     /// The index keys one cell contributes: none for NULL under a
@@ -217,41 +256,45 @@ const CatalogWindow = struct {
     }
 };
 
-const LoadCtx = struct {
-    a: std.mem.Allocator, // arena
+/// Every column row of `table_key` in its namespace's catalog, live or
+/// dropped, ascending by column_id, in `arloc`. The full history is
+/// what a layout compiles from, and what a branch of the table copies.
+/// Returns `error.UndefinedTable` if the table has no catalog rows.
+pub fn loadColumnRows(
+    arloc: std.mem.Allocator,
+    forest: *Forest,
     catalog_ps: *const _schema.PhysicalSchema,
-    all: std.ArrayList(_schema.LogicalColumn) = .empty, // every column, live or dropped
-    scratch: _value.Row = .{}, // reused across catalog rows
-    err: ?anyerror = null,
+    table_key: TableKey,
+) ![]_schema.LogicalColumn {
+    // `win` owns the boundary key bytes, so it lives for the whole
+    // walk below.
+    const win = CatalogWindow.init(.{
+        .namespace = table_key.namespace,
+        .table_id = _catalog.table_id,
+    }, table_key.table_id);
+    var cur = try forest.openCursor(arloc, win.table_key, win.range(), .{});
+    defer cur.deinit();
 
-    fn emit(c: *LoadCtx, item: Item) anyerror!bool {
+    var all: std.ArrayList(_schema.LogicalColumn) = .empty;
+    var scratch: _value.Row = .{}; // reused across catalog rows
+    while (try cur.next()) |item| {
         // Decode all seven catalog cells (column_id order = SELECT *).
-        // TODO: How do we know the version of the row, and whether the physical
-        // schema corresponds to that version?
+        // TODO: How do we know the version of the row, and whether the
+        // physical schema corresponds to that version?
         const val = item.newest().value;
-        _row.unmarshalRow(c.a, c.catalog_ps, val, &.{}, &c.scratch) catch |e| {
-            c.err = e;
-            return false;
-        };
-        const tc = _catalog.decodeColumn(&c.scratch) catch |e| {
-            c.err = e;
-            return false;
-        };
-        // Dupe the name out of the borrowed row buffer into the arena.
-        // TODO: See if we can avoid this copy.
-        const name = c.a.dupe(u8, tc.column.name) catch |e| {
-            c.err = e;
-            return false;
-        };
-        var lc = tc.column;
-        lc.name = name;
-        c.all.append(c.a, lc) catch |e| {
-            c.err = e;
-            return false;
-        };
-        return true;
+        try _row.unmarshalRow(arloc, catalog_ps, val, &.{}, &scratch);
+        var lc = (try _catalog.decodeColumn(&scratch)).column;
+        // The name borrows the row buffer, which the next item
+        // overwrites.
+        lc.name = try arloc.dupe(u8, lc.name);
+        try all.append(arloc, lc);
     }
-};
+    if (all.items.len == 0) return error.UndefinedTable;
+    // The walk already yields column_id order; sort defends against any
+    // future reordering.
+    std.mem.sort(_schema.LogicalColumn, all.items, {}, lessByColumnId);
+    return all.items;
+}
 
 /// Load `table_key`'s schema from its namespace's catalog. `catalog_ps` is
 /// the caller's compiled catalog layout (Server.catalog_ps). Returns
@@ -267,37 +310,16 @@ pub fn loadTableSchema(
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    // Scan the catalog tree for this table's column rows; `win` owns the
-    // boundary key bytes, so it lives for the whole synchronous scan below.
-    const win = CatalogWindow.init(.{
-        .namespace = table_key.namespace,
-        .table_id = _catalog.table_id,
-    }, table_key.table_id);
-    var ctx = LoadCtx{ .a = a, .catalog_ps = catalog_ps };
-    // scan uses `alloc` for its own transient arena (freed at scan end); the
-    // callback dupes anything it keeps into `a` (the Table's arena).
-    _ = try forest.scan(
-        alloc,
-        win.table_key,
-        win.range(),
-        .{},
-        &ctx,
-        LoadCtx.emit,
-    );
-    if (ctx.err) |e| return e;
-    if (ctx.all.items.len == 0) return error.UndefinedTable;
-
-    // Ascending by column_id (the scan already yields this order; sort defends
-    // against any future reordering). compile() derives the layout from the
-    // full history; reconstruct() derives current_version across all columns.
-    std.mem.sort(_schema.LogicalColumn, ctx.all.items, {}, lessByColumnId);
-    const logical = _catalog.reconstruct(ctx.all.items);
+    const all = try loadColumnRows(a, forest, catalog_ps, table_key);
+    // compile() derives the layout from the full history; reconstruct()
+    // derives current_version across all columns.
+    const logical = _catalog.reconstruct(all);
     const ps = try _schema.compile(a, logical, logical.current_version);
 
     // Expose only the columns live at the current version, in ps order:
     // `pos` is the slot in both, asserted here where it is minted.
     var cols: std.ArrayList(Column) = .empty;
-    for (ctx.all.items) |lc| {
+    for (all) |lc| {
         if (!lc.liveAt(logical.current_version)) continue;
         const pos = cols.items.len;
         std.debug.assert(ps.columns[pos].column_id == lc.column_id);
@@ -339,31 +361,6 @@ pub fn loadTableSchema(
     };
 }
 
-const IndexLoadCtx = struct {
-    a: std.mem.Allocator,
-    ips: *const _schema.PhysicalSchema,
-    out: std.ArrayList(_catalog.IndexDef) = .empty,
-    scratch: _value.Row = .{}, // reused across index rows
-    err: ?anyerror = null,
-
-    fn emit(c: *IndexLoadCtx, item: Item) anyerror!bool {
-        const value = item.newest().value;
-        _row.unmarshalRow(c.a, c.ips, value, &.{}, &c.scratch) catch |e| {
-            c.err = e;
-            return false;
-        };
-        const def = _catalog.decodeIndex(&c.scratch) catch |e| {
-            c.err = e;
-            return false;
-        };
-        c.out.append(c.a, def) catch |e| {
-            c.err = e;
-            return false;
-        };
-        return true;
-    }
-};
-
 /// Load every index of the base table `table_key` from its namespace's
 /// index catalog (table 2), prefix-scanned by its table_id (empty if
 /// none). The returned
@@ -374,56 +371,24 @@ pub fn loadIndexes(
     index_catalog_ps: *const _schema.PhysicalSchema,
     table_key: TableKey,
 ) ![]_catalog.IndexDef {
-    var ctx = IndexLoadCtx{ .a = alloc, .ips = index_catalog_ps };
-    errdefer ctx.out.deinit(alloc);
-
     const win = CatalogWindow.init(.{
         .namespace = table_key.namespace,
         .table_id = _catalog.index_table_id,
     }, table_key.table_id);
-    _ = try forest.scan(
-        alloc,
-        win.table_key,
-        win.range(),
-        .{},
-        &ctx,
-        IndexLoadCtx.emit,
-    );
+    var cur = try forest.openCursor(alloc, win.table_key, win.range(), .{});
+    defer cur.deinit();
 
-    ctx.scratch.deinit(alloc);
-    if (ctx.err) |e| return e;
-    return ctx.out.toOwnedSlice(alloc);
-}
-
-/// A key-only index catalog scan classifying `target`. Row keys are
-/// (base_table_id, index_table_id), so both answers come from key bytes
-/// alone — no value decode.
-const IndexKeyCtx = struct {
-    a: std.mem.Allocator,
-    target: u32,
-    is_index: bool = false,
-    base_table_id: ?u32 = null,
-    table_ids: std.ArrayList(u32) = .empty,
-    err: ?anyerror = null,
-
-    fn emit(c: *IndexKeyCtx, item: Item) anyerror!bool {
-        const def = _catalog.decodeIndexKey(item.key.primary) orelse {
-            c.err = error.CorruptCatalogKey;
-            return false;
-        };
-        if (def.index_table_id == c.target) {
-            c.is_index = true;
-            c.base_table_id = def.base_table_id;
-            return false; // an index has no indexes; nothing more to learn
-        }
-        if (def.base_table_id == c.target)
-            c.table_ids.append(c.a, def.index_table_id) catch |e| {
-                c.err = e;
-                return false;
-            };
-        return true;
+    var out: std.ArrayList(_catalog.IndexDef) = .empty;
+    errdefer out.deinit(alloc);
+    var scratch: _value.Row = .{}; // reused across index rows
+    defer scratch.deinit(alloc);
+    while (try cur.next()) |item| {
+        const value = item.newest().value;
+        try _row.unmarshalRow(alloc, index_catalog_ps, value, &.{}, &scratch);
+        try out.append(alloc, try _catalog.decodeIndex(&scratch));
     }
-};
+    return out.toOwnedSlice(alloc);
+}
 
 /// What one key-only pass over the index catalog says about a table_id:
 /// it is itself an index (`base_table_id` then names its base and
@@ -448,19 +413,33 @@ pub fn scanIndexKeys(
     forest: *Forest,
     table_key: TableKey,
 ) !IndexScan {
-    var ctx = IndexKeyCtx{ .a = alloc, .target = table_key.table_id };
-    errdefer ctx.table_ids.deinit(alloc);
+    const target = table_key.table_id;
+    var out: IndexScan = .{
+        .is_index = false,
+        .base_table_id = null,
+        .table_ids = .empty,
+    };
+    errdefer out.table_ids.deinit(alloc);
     const index_key = TableKey{
         .namespace = table_key.namespace,
         .table_id = _catalog.index_table_id,
     };
-    _ = try forest.scan(alloc, index_key, .all, .{}, &ctx, IndexKeyCtx.emit);
-    if (ctx.err) |e| return e;
-    return .{
-        .is_index = ctx.is_index,
-        .base_table_id = ctx.base_table_id,
-        .table_ids = ctx.table_ids,
-    };
+    var cur = try forest.openCursor(alloc, index_key, .all, .{});
+    defer cur.deinit();
+    // Row keys are (base_table_id, index_table_id): both answers come
+    // from key bytes alone, no value decode.
+    while (try cur.next()) |item| {
+        const def = _catalog.decodeIndexKey(item.key.primary) orelse
+            return error.CorruptCatalogKey;
+        if (def.index_table_id == target) {
+            out.is_index = true;
+            out.base_table_id = def.base_table_id;
+            break; // an index has no indexes; nothing more to learn
+        }
+        if (def.base_table_id == target)
+            try out.table_ids.append(alloc, def.index_table_id);
+    }
+    return out;
 }
 
 fn lessByColumnId(_: void, x: _schema.LogicalColumn, y: _schema.LogicalColumn) bool {

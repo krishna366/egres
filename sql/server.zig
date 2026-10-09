@@ -730,6 +730,7 @@ pub const Handler = struct {
             .create_database => |cd| try _ddl.createDatabase(self, state, cd),
             .drop_database => |name| try _ddl.dropDatabase(self, state, name),
             .create_table => |ct| try _ddl.createTable(self, state, ct),
+            .create_table_as => |cta| try _ddl.createTableAs(self, state, cta),
             .drop_table => |dt| try _ddl.dropTable(self, state, dt),
             .create_index => |ci| try _index_ddl.createIndex(self, state, ci),
             .drop_index => |di| try _index_ddl.dropIndex(self, state, di),

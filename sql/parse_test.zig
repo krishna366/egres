@@ -31,6 +31,41 @@ test "sql.parse: CREATE/DROP DATABASE parse to typed statements" {
     try testing.expectEqualStrings("app", b2.create_database.source.?);
 }
 
+test "sql.parse: CREATE TABLE AS TABLE / SELECT * FROM parse to a branch" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const t1 = try parse.statement(alloc, "CREATE TABLE y AS TABLE x;");
+    try testing.expectEqualStrings("y", t1.create_table_as.name);
+    try testing.expectEqualStrings("x", t1.create_table_as.source);
+    try testing.expect(t1.create_table_as.with_data);
+    try testing.expect(!t1.create_table_as.if_not_exists);
+
+    const t2 = try parse.statement(
+        alloc,
+        "CREATE TABLE IF NOT EXISTS y AS SELECT * FROM x WITH NO DATA",
+    );
+    try testing.expectEqualStrings("x", t2.create_table_as.source);
+    try testing.expect(!t2.create_table_as.with_data);
+    try testing.expect(t2.create_table_as.if_not_exists);
+
+    // A result, not a table: refused.
+    const where = try parse.statement(
+        alloc,
+        "CREATE TABLE y AS SELECT * FROM x WHERE id > 1",
+    );
+    try testing.expect(where == .invalid);
+    const cols = try parse.statement(
+        alloc,
+        "CREATE TABLE y AS SELECT id FROM x",
+    );
+    try testing.expect(cols == .invalid);
+    const named = try parse.statement(alloc, "CREATE TABLE y (a) AS TABLE x");
+    try testing.expect(named == .invalid);
+}
+
 test "sql.parse: everything else is unsupported; bad SQL is a syntax error" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

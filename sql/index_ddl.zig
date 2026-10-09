@@ -20,6 +20,7 @@ const _key = @import("key.zig");
 const _table = @import("table.zig");
 const _txn = @import("txn.zig");
 const _database = @import("database.zig");
+const _exec = @import("exec.zig");
 const _value = @import("value.zig");
 const _server = @import("server.zig");
 
@@ -129,7 +130,7 @@ pub fn createIndex(
     // IF NOT EXISTS idempotence case — before the one-index-per-
     // column limit, which is about a SECOND index on the column.
     const name = ci.name orelse
-        try std.fmt.allocPrint(arloc, "{s}_{s}_idx", .{ ci.table, ci.column });
+        try _table.indexName(arloc, ci.table, ci.column, .plain);
     if (eng.forest.manifest.lookupTable(ns, name) != null) {
         if (ci.if_not_exists)
             return state.sendCommandComplete("CREATE INDEX");
@@ -153,11 +154,15 @@ pub fn createIndex(
     // what's needed.
     const column_id = col.column_id;
 
-    const created = eng.forest.buildTableCreate(
+    var changes = [_]zdb.manifest.TreeChange{zdb.manifest.newTableChange(
+        name,
+        if (ci.unique) .unique_index else .posting_index,
+    )};
+    const created = eng.forest.buildTables(
         arloc,
         ns,
-        &.{name},
-        &.{if (ci.unique) .unique_index else .posting_index},
+        &changes,
+        .create_tree,
     ) catch |err| switch (err) {
         error.NameExists => return replyErrorCode(
             state,
@@ -593,32 +598,22 @@ const IndexBuild = struct {
         const eng = self.handler.srv.engine;
         const at = try self.index();
         var rows = RowIndexKeys{ .a = self.a, .unique = self.def.unique };
-        const Scan = struct {
-            build: *IndexBuild,
-            at: @TypeOf(at),
-            rows: *RowIndexKeys,
-
-            fn emit(ctx: *@This(), item: zdb.kv.Item) anyerror!bool {
-                // The backfill is the longest statement there is: a
-                // yield point per row, one atomic load each.
-                try fiber.ctx().maybeYield();
-
-                const egid = _key.decodeEgid(item.key.primary) orelse
-                    return true; // not row-shaped: nothing to index
-                const keys = try ctx.build.rowKeys(ctx.at, item);
-                try ctx.rows.setV1(egid, keys);
-                return true;
-            }
-        };
-        var ctx = Scan{ .build = self, .at = at, .rows = &rows };
-        _ = try eng.forest.scan(
+        var cur = try eng.forest.openCursor(
             self.a,
             self.baseKey(),
             .all,
             .{ .read_ts = self.read_ts, .priority = .p2 },
-            &ctx,
-            Scan.emit,
         );
+        defer cur.deinit();
+        var seen: usize = 0;
+        while (try cur.next()) |item| : (seen += 1) {
+            // The backfill is the longest statement there is: a yield
+            // point every batch of rows, as a DML scan has.
+            if (seen % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+            const egid = _key.decodeEgid(item.key.primary) orelse
+                continue; // not row-shaped: nothing to index
+            try rows.setV1(egid, try self.rowKeys(at, item));
+        }
         log.info(
             "backfill index={d}: scanned rows={d}",
             .{ self.def.index_table_id, rows.count() },
@@ -640,40 +635,25 @@ const IndexBuild = struct {
         const eng = self.handler.srv.engine;
         try eng.catchUp();
         const at = try self.index();
-        const Scan = struct {
-            build: *IndexBuild,
-            at: @TypeOf(at),
-            rows: *RowIndexKeys,
-            changed: usize = 0,
-
-            fn emit(ctx: *@This(), item: zdb.kv.Item) anyerror!bool {
-                try fiber.ctx().maybeYield();
-                const egid = _key.decodeEgid(item.key.primary) orelse
-                    return true;
-                ctx.changed += 1;
-                const keys: []const String =
-                    if (item.newest().meta.isDeleted())
-                        &.{}
-                    else
-                        try ctx.build.rowKeys(ctx.at, item);
-                try ctx.rows.setV2(egid, keys);
-                return true;
-            }
-        };
-        var ctx = Scan{ .build = self, .at = at, .rows = rows };
-        _ = try eng.forest.scan(
-            self.a,
-            self.baseKey(),
-            .all,
-            .{
-                .read_ts = eng.node.appliedTs(),
-                .min_ts = self.read_ts,
-                .include_deleted = true,
-                .priority = .p2,
-            },
-            &ctx,
-            Scan.emit,
-        );
+        var cur = try eng.forest.openCursor(self.a, self.baseKey(), .all, .{
+            .read_ts = eng.node.appliedTs(),
+            .min_ts = self.read_ts,
+            .include_deleted = true,
+            .priority = .p2,
+        });
+        defer cur.deinit();
+        var changed: usize = 0;
+        var seen: usize = 0;
+        while (try cur.next()) |item| : (seen += 1) {
+            if (seen % _exec.row_cap == 0) try fiber.ctx().maybeYield();
+            const egid = _key.decodeEgid(item.key.primary) orelse continue;
+            changed += 1;
+            const keys: []const String = if (item.newest().meta.isDeleted())
+                &.{}
+            else
+                try self.rowKeys(at, item);
+            try rows.setV2(egid, keys);
+        }
 
         const tx = try self.handler.newTxn(self.ns);
         defer self.handler.destroyTxn(tx);
@@ -682,7 +662,7 @@ const IndexBuild = struct {
         self.valid_ts = eng.node.appliedTs();
         log.info(
             "backfill index={d}: merged changed rows={d} valid_ts={d}",
-            .{ self.def.index_table_id, ctx.changed, self.valid_ts },
+            .{ self.def.index_table_id, changed, self.valid_ts },
         );
     }
 

@@ -48,6 +48,18 @@ pub const DropTable = struct {
     missing_ok: bool = false, // IF EXISTS
 };
 
+/// CREATE TABLE `name` AS TABLE `source` [WITH [NO] DATA], or AS
+/// SELECT * FROM `source`: the new table is a branch of the source,
+/// every row and index as of the statement
+/// (zdb.forest_ddl.buildTables). WITH NO DATA takes the
+/// definition and the indexes, empty.
+pub const CreateTableAs = struct {
+    name: String, // borrowed
+    source: String, // borrowed
+    if_not_exists: bool = false,
+    with_data: bool = true,
+};
+
 pub const CreateIndex = struct {
     name: ?String, // borrowed; null = derive "{table}_{column}_idx"
     table: String, // borrowed
@@ -218,6 +230,7 @@ pub const Stmt = union(enum) {
     create_database: CreateDatabase,
     drop_database: String, // database name (borrowed)
     create_table: CreateTable,
+    create_table_as: CreateTableAs,
     drop_table: DropTable,
     create_index: CreateIndex,
     drop_index: DropIndex,
@@ -262,6 +275,8 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     if (parser.cast(c.DropdbStmt, node)) |s|
         return .{ .drop_database = try dup(alloc, s.dbname) };
     if (parser.cast(c.CreateStmt, node)) |s| return parseCreateTable(alloc, s);
+    if (parser.cast(c.CreateTableAsStmt, node)) |s|
+        return parseCreateTableAs(alloc, s);
     if (parser.cast(c.DropStmt, node)) |s| return parseDropTable(alloc, s);
     if (parser.cast(c.IndexStmt, node)) |s| return parseCreateIndex(alloc, s);
     if (parser.cast(c.InsertStmt, node)) |s| return parseInsert(alloc, s);
@@ -484,6 +499,50 @@ fn parseDropTable(
 /// methods, DESC / NULLS FIRST ordering) is a clean `.invalid`.
 /// ASC / NULLS LAST are accepted: they are this index's semantics
 /// already (the NULL tag byte sorts last).
+/// The query must be the whole of one table: `TABLE x` or `SELECT *
+/// FROM x`, nothing else (no WHERE, LIMIT, column list or ordering),
+/// since the branch is of the table, not of a result. Only a table
+/// (not a materialized view), with no column names of its own.
+fn parseCreateTableAs(
+    alloc: std.mem.Allocator,
+    s: *const c.CreateTableAsStmt,
+) parser.ParseError!Stmt {
+    if (s.objtype != c.OBJECT_TABLE) return .unsupported;
+    if (s.into == null) return .unsupported;
+    const into = s.into.*;
+    if (into.rel == null) return .unsupported;
+    const rel = into.rel.*;
+    if (into.colNames != null)
+        return invalid("CREATE TABLE AS takes no column list");
+    const ss = parser.cast(c.SelectStmt, s.query) orelse return .unsupported;
+    const whole_table = ss.whereClause == null and ss.limitCount == null and
+        ss.sortClause == null and ss.groupClause == null and
+        ss.distinctClause == null and ss.havingClause == null and
+        ss.limitOffset == null and ss.lockingClause == null and
+        ss.withClause == null and ss.valuesLists == null;
+    if (!whole_table)
+        return invalid("CREATE TABLE AS supports TABLE x or SELECT * FROM x");
+    const from = parser.items(ss.fromClause);
+    if (from.len != 1) return invalid("CREATE TABLE AS reads one table");
+    const rv = parser.cast(c.RangeVar, from[0].ptr_value) orelse
+        return invalid("CREATE TABLE AS reads one table");
+    const targets = parser.items(ss.targetList);
+    if (targets.len != 1) return invalid("CREATE TABLE AS takes SELECT *");
+    const rt = parser.cast(c.ResTarget, targets[0].ptr_value) orelse
+        return .unsupported;
+    const cr = parser.cast(c.ColumnRef, rt.val) orelse
+        return invalid("CREATE TABLE AS takes SELECT *");
+    const fields = parser.items(cr.fields);
+    if (fields.len != 1 or parser.cast(c.A_Star, fields[0].ptr_value) == null)
+        return invalid("CREATE TABLE AS takes SELECT *");
+    return .{ .create_table_as = .{
+        .name = try dup(alloc, rel.relname),
+        .source = try dup(alloc, rv.relname),
+        .if_not_exists = s.if_not_exists,
+        .with_data = !into.skipData,
+    } };
+}
+
 fn parseCreateIndex(
     alloc: std.mem.Allocator,
     is: *const c.IndexStmt,

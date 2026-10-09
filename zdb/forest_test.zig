@@ -26,7 +26,7 @@ const _manifest = zdb.manifest;
 /// A create of one tree for a NEW table at `table_key`, as one manifest
 /// change to run through `applyTrees`: the tree_id a fresh table
 /// starts at (split 0, so table_id << 32), infinite range within its
-/// table. Lets a test pick the table_id, which `buildTableCreate`
+/// table. Lets a test pick the table_id, which `buildTables`
 /// allocates itself. Caller owns the change's tree_changes.
 fn buildCreateTree(
     f: *Forest,
@@ -494,14 +494,11 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     defer alloc.free(sys.tree_changes);
     try f.applyTrees(1, sys);
 
-    const ct = try f.buildTableCreate(
-        alloc,
-        7,
-        &.{"users"},
-        &.{.posting_index},
-    );
+    var ct_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users", .posting_index),
+    };
+    const ct = try f.buildTables(alloc, 7, &ct_tc, .create_tree);
     defer alloc.free(ct.table_ids);
-    defer alloc.free(ct.change.tree_changes);
     try f.applyTrees(1, ct.change);
     try std.testing.expectEqual(_manifest.first_table_id, ct.table_ids[0]);
     try std.testing.expectEqual(
@@ -545,14 +542,11 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const nc2 = (try f.buildNsCreate(alloc, .{ .given = 7 }, "seven")).change;
     defer alloc.free(nc2.tree_changes);
     try f.applyTrees(1, nc2);
-    const ct2 = try f.buildTableCreate(
-        alloc,
-        7,
-        &.{"users"},
-        &.{.posting_index},
-    );
+    var ct2_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users", .posting_index),
+    };
+    const ct2 = try f.buildTables(alloc, 7, &ct2_tc, .create_tree);
     defer alloc.free(ct2.table_ids);
-    defer alloc.free(ct2.change.tree_changes);
     try std.testing.expectEqual(_manifest.first_table_id, ct2.table_ids[0]);
     try std.testing.expectEqual(
         @as(?u64, 7),
@@ -632,10 +626,10 @@ test "forest: drop_tree keeps an SST shared with another tree" {
 }
 
 // ---------------------------------------------------------------------------
-// 6d. buildTableCreate allocates table_ids; DROP never reuses one
+// 6d. buildTables allocates table_ids; DROP never reuses one
 // ---------------------------------------------------------------------------
 
-test "forest: buildTableCreate allocates and never reuses a dropped id" {
+test "forest: buildTables allocates and never reuses a dropped id" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -653,16 +647,20 @@ test "forest: buildTableCreate allocates and never reuses a dropped id" {
 
     // First user table in namespace 2 gets first_table_id; second gets +1.
     // (Unnamed — id allocation is what's under test here.)
-    const r1 = try f.buildTableCreate(alloc, 2, &.{""}, &.{.posting_index});
+    var r1_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("", .posting_index),
+    };
+    const r1 = try f.buildTables(alloc, 2, &r1_tc, .create_tree);
     defer alloc.free(r1.table_ids);
-    defer alloc.free(r1.change.tree_changes);
     try std.testing.expectEqual(first, r1.table_ids[0]);
     try f.applyTrees(1, r1.change);
     try std.testing.expect(f.hasTable(.{ .namespace = 2, .table_id = first }));
 
-    const r2 = try f.buildTableCreate(alloc, 2, &.{""}, &.{.posting_index});
+    var r2_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("", .posting_index),
+    };
+    const r2 = try f.buildTables(alloc, 2, &r2_tc, .create_tree);
     defer alloc.free(r2.table_ids);
-    defer alloc.free(r2.change.tree_changes);
     try std.testing.expectEqual(first + 1, r2.table_ids[0]);
     try f.applyTrees(1, r2.change);
 
@@ -675,9 +673,11 @@ test "forest: buildTableCreate allocates and never reuses a dropped id" {
         .table_id = r1.table_ids[0],
     }));
 
-    const r3 = try f.buildTableCreate(alloc, 2, &.{""}, &.{.posting_index});
+    var r3_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("", .posting_index),
+    };
+    const r3 = try f.buildTables(alloc, 2, &r3_tc, .create_tree);
     defer alloc.free(r3.table_ids);
-    defer alloc.free(r3.change.tree_changes);
     try std.testing.expectEqual(first + 2, r3.table_ids[0]);
 }
 
@@ -789,9 +789,11 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     const nc = (try f.buildNsCreate(alloc, .{ .given = src }, "seven")).change;
     defer alloc.free(nc.tree_changes);
     try f.applyTrees(1, nc);
-    const ct = try f.buildTableCreate(alloc, src, &.{"users"}, &.{.rows});
+    var ct_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users", .rows),
+    };
+    const ct = try f.buildTables(alloc, src, &ct_tc, .create_tree);
     defer alloc.free(ct.table_ids);
-    defer alloc.free(ct.change.tree_changes);
     try f.applyTrees(2, ct.change);
 
     try f.newMemtable(3);
@@ -895,6 +897,198 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     );
 }
 
+/// An item in `key`'s table.
+fn tableItem(
+    key: zdb.kv.TableKey,
+    primary: String,
+    ts: u64,
+    value: String,
+) zdb.kv.Item {
+    return .{
+        .key = .{
+            .namespace = key.namespace,
+            .table_id = key.table_id,
+            .primary = primary,
+        },
+        .versions = .{ .one = .{ .ts = ts, .meta = .{}, .value = value } },
+    };
+}
+
+/// The newest value of `primary` in `key`'s table, or null.
+fn expectTableRow(
+    f: *Forest,
+    alloc: std.mem.Allocator,
+    key: zdb.kv.TableKey,
+    primary: String,
+    want: ?String,
+) !void {
+    const got = try f.get(alloc, .{
+        .key = .{
+            .namespace = key.namespace,
+            .table_id = key.table_id,
+            .primary = primary,
+        },
+        .read_ts = std.math.maxInt(u64),
+    });
+    defer if (got) |g| g.free(alloc);
+    if (want) |w| {
+        const g = got orelse return error.TestExpectedRow;
+        try std.testing.expectEqualStrings(w, g.newest().value);
+    } else {
+        try std.testing.expect(got == null);
+    }
+}
+
+test "forest: branch_table shares files and forks memtables as of its ts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpPath(alloc, &tmp);
+    defer alloc.free(dir_path);
+
+    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    defer f_live.destroy();
+    const f = try Forest.open(alloc, f_live);
+    defer f.close();
+
+    // The source: a table and its index in one namespace, one row
+    // flushed to an SST, two still in memtables, one of those after
+    // the branch.
+    const ns: u64 = 7;
+    const nc = (try f.buildNsCreate(alloc, .{ .given = ns }, "seven")).change;
+    defer alloc.free(nc.tree_changes);
+    try f.applyTrees(1, nc);
+    // Both bytes-keyed, so the primaries below are plain strings.
+    var ct_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users", .posting_index),
+        _manifest.newTableChange("users_name_idx", .posting_index),
+    };
+    const ct = try f.buildTables(alloc, ns, &ct_tc, .create_tree);
+    defer alloc.free(ct.table_ids);
+    try f.applyTrees(2, ct.change);
+    const src: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = ct.table_ids[0],
+    };
+    const src_idx: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = ct.table_ids[1],
+    };
+
+    try f.newMemtable(3);
+    try f.put(&.{tableItem(src, "a", 10, "a10")});
+    try f.newMemtable(4);
+    var flush = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush.changes.deinit(alloc);
+    try f.applyFlush(5, flush.changes.items, flush.newest_memtable_id);
+    const shared_sst = flush.changes.items[0].sst_id;
+
+    try f.put(&.{
+        tableItem(src, "a", 20, "a20"),
+        tableItem(src, "b", 20, "b20"),
+        tableItem(src_idx, "i", 20, "i20"),
+    });
+    try f.newMemtable(6);
+    try f.put(&.{tableItem(src, "c", 40, "c40")});
+
+    // Branch at ts 30: a (both versions), b and the index row, not c.
+    var br_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users2", .none),
+        _manifest.newTableChange("users2_name_idx", .none),
+    };
+    br_tc[0].from_table_id = src.table_id;
+    br_tc[1].from_table_id = src_idx.table_id;
+    const br = try f.buildTables(alloc, ns, &br_tc, .branch_table);
+    defer alloc.free(br.table_ids);
+    try std.testing.expectEqual(_manifest.Command.branch_table, br.change.cmd);
+    try std.testing.expectEqual(
+        src.table_id,
+        br.change.tree_changes[0].from_table_id,
+    );
+    try f.applyTableBranch(7, 30, br.change);
+    const dst: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = br.table_ids[0],
+    };
+    const dst_idx: zdb.kv.TableKey = .{
+        .namespace = ns,
+        .table_id = br.table_ids[1],
+    };
+
+    try std.testing.expect(dst.table_id > src.table_id);
+    try std.testing.expectEqual(
+        @as(?u32, dst.table_id),
+        f.manifest.lookupTable(ns, "users2"),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, dst_idx.table_id),
+        f.manifest.lookupTable(ns, "users2_name_idx"),
+    );
+    try std.testing.expect(f.hasTable(dst));
+    try std.testing.expect(f.hasTable(dst_idx));
+    // The flushed file is listed by both rows trees.
+    try std.testing.expectEqual(@as(u32, 2), sstRefs(f, shared_sst));
+
+    try expectTableRow(f, alloc, dst, "a", "a20");
+    try expectTableRow(f, alloc, dst, "b", "b20");
+    try expectTableRow(f, alloc, dst, "c", null);
+    try expectTableRow(f, alloc, dst_idx, "i", "i20");
+    try expectTableRow(f, alloc, src, "c", "c40");
+
+    // From here on the two take writes apart.
+    try f.put(&.{tableItem(src, "d", 50, "d50")});
+    try f.put(&.{tableItem(dst, "e", 50, "e50")});
+    try expectTableRow(f, alloc, dst, "d", null);
+    try expectTableRow(f, alloc, src, "e", null);
+    try expectTableRow(f, alloc, dst, "e", "e50");
+
+    // A flush routes each side's rows, forked copies included, to its
+    // own trees; the reads hold.
+    try f.newMemtable(8);
+    var flush2 = (try f.buildFlush()) orelse return error.TestExpectedFlush;
+    defer flush2.changes.deinit(alloc);
+    try f.applyFlush(9, flush2.changes.items, flush2.newest_memtable_id);
+    try expectTableRow(f, alloc, dst, "a", "a20");
+    try expectTableRow(f, alloc, dst, "b", "b20");
+    try expectTableRow(f, alloc, dst, "c", null);
+    try expectTableRow(f, alloc, dst, "e", "e50");
+    try expectTableRow(f, alloc, dst_idx, "i", "i20");
+    try expectTableRow(f, alloc, src, "c", "c40");
+    try expectTableRow(f, alloc, src, "d", "d50");
+    try expectTableRow(f, alloc, src, "e", null);
+
+    // Re-apply (replay) changes nothing.
+    try f.applyTableBranch(7, 30, br.change);
+    try std.testing.expectEqual(@as(u32, 2), sstRefs(f, shared_sst));
+
+    // Dropping the source keeps the shared file for the branch.
+    const dc = try f.buildTableDrop(
+        alloc,
+        ns,
+        &.{ src.table_id, src_idx.table_id },
+    );
+    defer alloc.free(dc.tree_changes);
+    try f.applyTrees(10, dc);
+    try std.testing.expect(!f.hasTable(src));
+    try std.testing.expectEqual(@as(u32, 1), sstRefs(f, shared_sst));
+    try expectTableRow(f, alloc, dst, "a", "a20");
+
+    // The snapshot manifest carries the branch: trees, files and names.
+    const bytes = try f.manifest.serialize(alloc);
+    defer alloc.free(bytes);
+    var restored = _manifest.Manifest.init(alloc);
+    defer restored.deinit();
+    try restored.restoreFrom(bytes);
+    try std.testing.expectEqual(
+        @as(?u32, dst.table_id),
+        restored.lookupTable(ns, "users2"),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        restored.ssts.get(shared_sst).?.refs,
+    );
+}
+
 test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -952,14 +1146,11 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     const f = try Forest.open(alloc, f_live);
     defer f.close();
 
-    const ct = try f.buildTableCreate(
-        alloc,
-        3,
-        &.{"users"},
-        &.{.posting_index},
-    );
+    var ct_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users", .posting_index),
+    };
+    const ct = try f.buildTables(alloc, 3, &ct_tc, .create_tree);
     defer alloc.free(ct.table_ids);
-    defer alloc.free(ct.change.tree_changes);
     try f.applyTrees(1, ct.change);
     try std.testing.expectEqual(
         @as(?u32, ct.table_ids[0]),
@@ -967,9 +1158,12 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     );
 
     // A taken name is rejected at build; re-applying the create is a no-op.
+    var dup_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users", .posting_index),
+    };
     try std.testing.expectError(
         error.NameExists,
-        f.buildTableCreate(alloc, 3, &.{"users"}, &.{.posting_index}),
+        f.buildTables(alloc, 3, &dup_tc, .create_tree),
     );
     try f.applyTrees(1, ct.change);
     try std.testing.expectEqual(
@@ -983,14 +1177,11 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     try f.applyTrees(1, dc);
     try std.testing.expect(f.manifest.lookupTable(3, "users") == null);
 
-    const ct2 = try f.buildTableCreate(
-        alloc,
-        3,
-        &.{"users"},
-        &.{.posting_index},
-    );
+    var ct2_tc = [_]_manifest.TreeChange{
+        _manifest.newTableChange("users", .posting_index),
+    };
+    const ct2 = try f.buildTables(alloc, 3, &ct2_tc, .create_tree);
     defer alloc.free(ct2.table_ids);
-    defer alloc.free(ct2.change.tree_changes);
     try f.applyTrees(1, ct2.change);
     try std.testing.expect(ct2.table_ids[0] > ct.table_ids[0]);
     try std.testing.expectEqual(

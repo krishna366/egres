@@ -34,6 +34,7 @@ pub const CommandEnum = enum(u8) {
     drop_tree = 8,
     index_backfill = 9,
     branch_ns = 10,
+    branch_table = 11,
     _,
 };
 
@@ -768,6 +769,7 @@ pub const TreeChangeStruct = struct {
     right_key: []const u8 = &.{},
     name: []const u8 = &.{},
     kind: TreeKindEnum = @enumFromInt(0),
+    from_table_id: u32 = 0,
     pub fn deinit(self: *TreeChangeStruct, alloc: std.mem.Allocator) void {
         alloc.free(self.left_key);
         self.left_key = &.{};
@@ -788,6 +790,7 @@ pub const TreeChangeStruct = struct {
             .namespace_id = self.namespace_id,
             .tree_id = self.tree_id,
             .kind = self.kind,
+            .from_table_id = self.from_table_id,
         };
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.left_key);
@@ -812,6 +815,7 @@ pub const TreeChangeStruct = struct {
         try writer.setRightKey(self.right_key);
         try writer.setName(self.name);
         try writer.setKind(self.kind);
+        try writer.setFromTableId(self.from_table_id);
         const result = try writer.finish();
         return result.offset;
     }
@@ -822,7 +826,7 @@ pub const TreeChangeReader = struct {
     t: zbuf.Table,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 44;
+    pub const SIZE_BYTES: u16 = 48;
 
     pub fn parseRoot(buf: []const u8) Error!Self {
         return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
@@ -860,6 +864,10 @@ pub const TreeChangeReader = struct {
         return @enumFromInt(self.t.scalar(u8, 43));
     }
 
+    pub fn fromTableId(self: Self) u32 {
+        return self.t.scalar(u32, 44);
+    }
+
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try TreeChangeWriter.initWithBuf(alloc, out);
         try writer.setOp(self.op());
@@ -869,6 +877,7 @@ pub const TreeChangeReader = struct {
         try writer.setRightKey(self.rightKey());
         try writer.setName(self.name());
         try writer.setKind(self.kind());
+        try writer.setFromTableId(self.fromTableId());
         const result = try writer.finish();
         return result.offset;
     }
@@ -885,6 +894,7 @@ pub const TreeChangeReader = struct {
             .namespace_id = self.namespaceId(),
             .tree_id = self.treeId(),
             .kind = self.kind(),
+            .from_table_id = self.fromTableId(),
         };
         errdefer s.deinit(alloc);
         s.left_key = try alloc.dupe(u8, self.leftKey());
@@ -907,7 +917,7 @@ pub const TreeChangeWriter = struct {
     w: zbuf.TableWriter,
 
     pub const TABLE_ID: u16 = 46596;
-    pub const SIZE_BYTES: u16 = 44;
+    pub const SIZE_BYTES: u16 = 48;
     /// Slots of nested tables, null until set.
     const child_slots = [_]u16{};
 
@@ -947,6 +957,10 @@ pub const TreeChangeWriter = struct {
         return self.w.setScalar(u8, 43, @intFromEnum(v));
     }
 
+    pub fn setFromTableId(self: *Self, v: u32) Error!void {
+        return self.w.setScalar(u32, 44, v);
+    }
+
     pub fn set(self: *Self, values: anytype) Error!void {
         const Values = @TypeOf(values);
         if (@typeInfo(Values) != .@"struct") {
@@ -959,6 +973,7 @@ pub const TreeChangeWriter = struct {
         if (@hasField(Values, "right_key")) try self.setRightKey(@field(values, "right_key"));
         if (@hasField(Values, "name")) try self.setName(@field(values, "name"));
         if (@hasField(Values, "kind")) try self.setKind(@field(values, "kind"));
+        if (@hasField(Values, "from_table_id")) try self.setFromTableId(@field(values, "from_table_id"));
     }
 
     pub fn finish(self: *Self) Error!TreeChangeBuffer {
