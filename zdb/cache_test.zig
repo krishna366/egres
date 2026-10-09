@@ -485,6 +485,11 @@ test "ShardedCache setCapacity: a shrink evicts to the new budget" {
 test "Cache sizes its ghost by M's entry count at turnover" {
     const Ghost = zdb.cache.Ghost;
     const alloc = std.testing.allocator;
+    // Values on an arena, declared before the cache so it outlives the
+    // cache's deinit: the test allocator traces every alloc and free.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arloc = arena.allocator();
     // 1 MiB: S takes ~1450 entries of 72 bytes, M ~13000.
     var c = try Cache(u64).init(alloc, 1 << 20);
     defer c.deinit();
@@ -492,7 +497,7 @@ test "Cache sizes its ghost by M's entry count at turnover" {
 
     // Put and get: S evicts these to M, not the ghost.
     for (0..4000) |i| {
-        const v = try Value.init(alloc, try alloc.alloc(u8, 64));
+        const v = try Value.init(arloc, try arloc.alloc(u8, 64));
         defer v.decrRef();
         try c.put(i, v);
         const got = c.get(i) orelse return error.Missing;
@@ -501,7 +506,7 @@ test "Cache sizes its ghost by M's entry count at turnover" {
     // One-hit wonders: once S holds only these, each put evicts one
     // to the ghost, past the first generation's quota.
     for (0..4000) |i| {
-        const v = try Value.init(alloc, try alloc.alloc(u8, 64));
+        const v = try Value.init(arloc, try arloc.alloc(u8, 64));
         defer v.decrRef();
         try c.put(1_000_000 + i, v);
     }
@@ -572,11 +577,18 @@ test "Cache lookups of missing keys stay fast through put and evict churn" {
     // until each missing key probes the whole table; the array map's
     // index shifts entries back on delete, so its probes stay short.
     const alloc = std.testing.allocator;
+    // Values on an arena: the test allocator traces every alloc and
+    // free, and 300k values through it take tens of seconds. A
+    // value's decrRef frees through the arena, a no-op. Declared
+    // before the cache, so it outlives the cache's deinit.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arloc = arena.allocator();
     // About 14k entries of 72 bytes (8-byte key, 64-byte value).
     var c = try Cache(u64).init(alloc, 1 << 20);
     defer c.deinit();
     for (0..300_000) |i| {
-        const v = try Value.init(alloc, try alloc.alloc(u8, 64));
+        const v = try Value.init(arloc, try arloc.alloc(u8, 64));
         defer v.decrRef();
         try c.put(i, v);
         // Every third key gets a hit, so some reach M and churn it too.
