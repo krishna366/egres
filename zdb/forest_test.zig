@@ -8,6 +8,7 @@ const String = utils.String;
 const zdb = @import("zdb");
 const createTree = @import("testing.zig").createTree;
 const buildCompaction = @import("testing.zig").buildCompaction;
+const probeExtent = @import("testing.zig").probeExtent;
 const flags = @import("flags");
 const vfs = zdb.vfs;
 
@@ -157,11 +158,13 @@ test "forest: open close empty" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     f.close();
 }
 
@@ -176,11 +179,13 @@ test "forest: create tree and get" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // Create a tree for namespace 1's default table (table_id 0). A fresh
@@ -208,14 +213,22 @@ test "forest: create tree and get" {
 // 6. Tree splitting
 // ---------------------------------------------------------------------------
 
-// Helper: build a minimal SST table containing one key and write it to disk.
-fn buildAndWriteTable(alloc: std.mem.Allocator, path: String, primary: String) !void {
+// Helper: build a minimal SST holding one key and put it in the store.
+fn buildAndWriteTable(
+    alloc: std.mem.Allocator,
+    store: *vfs.RemoteStore,
+    file_id: u64,
+    primary: String,
+) !_manifest.Extent {
     var bld = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer bld.deinit();
     try bld.add(.{ .primary = primary }, 1, "v");
     var tb = try bld.finish();
     defer tb.deinit();
-    try vfs.writeFile(path, tb.bytes);
+    const name = try zdb.sstName(alloc, file_id);
+    defer alloc.free(name);
+    try store.put(name, tb.bytes);
+    return tb.extent();
 }
 
 test "forest: split tree" {
@@ -229,9 +242,11 @@ test "forest: split tree" {
     // candidates from there. Install 10 single-key SSTs ("k01"…"k10")
     // directly into L3 (default max_levels=4 → lmax_idx=3) so the
     // splitter has a clean, evenly-sized Lmax to work with.
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
     defer f_live.destroy();
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // Default table (table_id 0) → derived tree_id 0.
@@ -239,17 +254,24 @@ test "forest: split tree" {
     try std.testing.expectEqual(@as(u64, 0), tree_id);
 
     const table_keys = [_]String{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
-    for (table_keys, 1..) |key, tbl_id| {
-        const path = try zdb.sstPath(alloc, dir_path, tbl_id);
-        defer alloc.free(path);
-        try buildAndWriteTable(alloc, path, key);
+    var extents: [table_keys.len]_manifest.Extent = undefined;
+    for (table_keys, &extents, 1..) |key, *ext, tbl_id| {
+        ext.* = try buildAndWriteTable(alloc, &store, tbl_id, key);
     }
 
     {
         const tree_ptr = f.getTree(42, tree_id).?;
         defer tree_ptr.release();
         var changes: [10]_manifest.SSTableChange = undefined;
-        for (&changes, 1..) |*c, tbl_id| c.* = _manifest.createSSTableChange(@intCast(tbl_id), 42, tree_id, 3); // L3
+        for (&changes, extents, 1..) |*c, ext, tbl_id| {
+            c.* = _manifest.createSSTableChange(
+                @intCast(tbl_id),
+                42,
+                tree_id,
+                3, // L3
+                ext,
+            );
+        }
         try tree_ptr.applyCompaction(1, &changes);
         try std.testing.expectEqual(@as(usize, 10), tree_ptr.numTablesAt(3));
     }
@@ -293,17 +315,21 @@ test "forest: split tree" {
 // the stored key is table-specific, and write it to disk.
 fn buildAndWriteTableKV(
     alloc: std.mem.Allocator,
-    path: String,
+    store: *vfs.RemoteStore,
+    file_id: u64,
     key: Key,
     ts: u64,
     value: String,
-) !void {
+) !_manifest.Extent {
     var bld = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer bld.deinit();
     try bld.add(key, ts, value);
     var tb = try bld.finish();
     defer tb.deinit();
-    try vfs.writeFile(path, tb.bytes);
+    const name = try zdb.sstName(alloc, file_id);
+    defer alloc.free(name);
+    try store.put(name, tb.bytes);
+    return tb.extent();
 }
 
 test "forest: two-level routing isolates by table_id" {
@@ -313,11 +339,13 @@ test "forest: two-level routing isolates by table_id" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // Three tables in namespace 2: table_id 0 (the default), 1, and 2. Each is its
@@ -348,14 +376,14 @@ test "forest: two-level routing isolates by table_id" {
         .{ .tid = 2, .tree = t2, .val = "v2" },
     };
     for (cases, 1..) |b, file_id| {
-        const path = try zdb.sstPath(alloc, dir_path, file_id);
-        defer alloc.free(path);
-        try buildAndWriteTableKV(alloc, path, .{
+        const ext = try buildAndWriteTableKV(alloc, &store, file_id, .{
             .namespace = 2,
             .table_id = b.tid,
             .primary = "row",
         }, 1, b.val);
-        const changes = [_]_manifest.SSTableChange{_manifest.createSSTableChange(@intCast(file_id), 2, b.tree, 1)};
+        const changes = [_]_manifest.SSTableChange{
+            _manifest.createSSTableChange(@intCast(file_id), 2, b.tree, 1, ext),
+        };
         {
             const t = f.getTree(2, b.tree).?;
             defer t.release();
@@ -394,11 +422,13 @@ test "forest: create_tree + drop_tree round-trip" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // Create a new table (ns=2, table_id=100) via the manifest op.
@@ -414,15 +444,15 @@ test "forest: create_tree + drop_tree round-trip" {
     );
 
     // Install one SST and confirm the row reads back through routing.
-    const path = try zdb.sstPath(alloc, dir_path, 1);
-    defer alloc.free(path);
-    try buildAndWriteTableKV(alloc, path, .{
+    const ext = try buildAndWriteTableKV(alloc, &store, 1, .{
         .namespace = 2,
         .table_id = 100,
         .primary = "row",
     }, 1, "v");
     {
-        const ch = [_]_manifest.SSTableChange{_manifest.createSSTableChange(1, 2, tree_id, 1)};
+        const ch = [_]_manifest.SSTableChange{
+            _manifest.createSSTableChange(1, 2, tree_id, 1, ext),
+        };
         {
             const t = f.getTree(2, tree_id).?;
             defer t.release();
@@ -460,11 +490,13 @@ test "forest: drop_ns removes every table and forgets the id counter" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // Namespace 7 with five tables: the default + column + index catalogs
@@ -561,11 +593,13 @@ test "forest: drop_tree keeps an SST shared with another tree" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // Two tables (tables 100 and 101) that share one SST file (id 1) — the
@@ -586,16 +620,18 @@ test "forest: drop_tree keeps an SST shared with another tree" {
     try f.applyTrees(1, mcB);
     const treeB = mcB.tree_changes[0].tree_id;
 
-    const path = try zdb.sstPath(alloc, dir_path, 1);
-    defer alloc.free(path);
-    try buildAndWriteTableKV(alloc, path, .{
+    const ext = try buildAndWriteTableKV(alloc, &store, 1, .{
         .namespace = 2,
         .table_id = 100,
         .primary = "row",
     }, 1, "shared");
     {
-        const cha = [_]_manifest.SSTableChange{_manifest.createSSTableChange(1, 2, treeA, 1)};
-        const chb = [_]_manifest.SSTableChange{_manifest.createSSTableChange(1, 2, treeB, 1)};
+        const cha = [_]_manifest.SSTableChange{
+            _manifest.createSSTableChange(1, 2, treeA, 1, ext),
+        };
+        const chb = [_]_manifest.SSTableChange{
+            _manifest.createSSTableChange(1, 2, treeB, 1, ext),
+        };
         {
             const t = f.getTree(2, treeA).?;
             defer t.release();
@@ -636,11 +672,13 @@ test "forest: buildTables allocates and never reuses a dropped id" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     const first = _manifest.first_table_id;
@@ -688,11 +726,13 @@ test "forest: buildNsCreate allocates global namespace ids" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     const first = _manifest.first_namespace;
@@ -778,9 +818,11 @@ test "forest: branch_ns shares the files and forks the memtables as of its ts" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
     defer f_live.destroy();
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // The source: namespace "seven" with a named table, one row flushed
@@ -946,9 +988,11 @@ test "forest: branch_table shares files and forks memtables as of its ts" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
     defer f_live.destroy();
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // The source: a table and its index in one namespace, one row
@@ -1096,11 +1140,13 @@ test "forest: ns_create installs default + catalog trees, idempotent re-apply" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     const nc = (try f.buildNsCreate(alloc, .{ .given = 9 }, "nine")).change;
@@ -1139,11 +1185,13 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     var ct_tc = [_]_manifest.TreeChange{
@@ -1196,7 +1244,7 @@ test "forest: table names — create registers, duplicate rejects, drop frees" {
 //
 // Build a forest with two trees (ns=42 with key range, ns=43 covering all)
 // plus an SST file at L1 of the first tree. Serialize the manifest, install
-// it into a fresh forest pointing at the same on-disk dir, and assert: tree
+// it into a fresh forest over the same store, and assert: tree
 // set, namespace routes, level membership, and ID counters are all restored.
 
 test "forest: snapshot manifest round-trip" {
@@ -1212,13 +1260,15 @@ test "forest: snapshot manifest round-trip" {
     const mk = try (Key{ .namespace = 42, .primary = "m" }).marshal(alloc);
     defer alloc.free(mk);
 
+    // One store for both forests: the source writes the SST, the
+    // destination reads it.
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+
     const bytes = blk: {
-        const src_live = try flags.Live(Config).create(
-            alloc,
-            .{ .dir = dir_path },
-        );
+        const src_live = try flags.Live(Config).create(alloc, .{});
         defer src_live.destroy();
-        const src = try Forest.open(alloc, src_live);
+        const src = try Forest.open(alloc, src_live, &store);
         defer src.close();
 
         // Tree in ns=42, range [a, m). Tree in ns=43, infinite. Both are the
@@ -1234,14 +1284,15 @@ test "forest: snapshot manifest round-trip" {
         }, .{}, .posting_index);
         try src.manifest.registerNamespaceName(42, "answers");
 
-        // Drop one SST into the ns=42 tree's L1, both on disk and in the manifest.
-        const sst_path = try zdb.sstPath(alloc, dir_path, 1);
-        defer alloc.free(sst_path);
-        try buildAndWriteTable(alloc, sst_path, "ccc");
+        // Drop one SST into the ns=42 tree's L1, in the store and the
+        // manifest.
+        const ext = try buildAndWriteTable(alloc, &store, 1, "ccc");
 
         const tree1 = src.getTree(42, 0).?;
         defer tree1.release();
-        const changes = [_]_manifest.SSTableChange{_manifest.createSSTableChange(1, 42, 0, 1)};
+        const changes = [_]_manifest.SSTableChange{
+            _manifest.createSSTableChange(1, 42, 0, 1, ext),
+        };
         try tree1.applyCompaction(1, &changes);
 
         break :blk try src.manifest.serialize(alloc);
@@ -1249,9 +1300,9 @@ test "forest: snapshot manifest round-trip" {
     defer alloc.free(bytes);
 
     // Phase 2: fresh forest, install snapshot, verify.
-    const dst_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const dst_live = try flags.Live(Config).create(alloc, .{});
     defer dst_live.destroy();
-    const dst = try Forest.open(alloc, dst_live);
+    const dst = try Forest.open(alloc, dst_live, &store);
     defer dst.close();
 
     try dst.manifest.restoreFrom(bytes);
@@ -1452,11 +1503,13 @@ test "forest: routes to correct tree" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     // Create two trees in different namespaces.
@@ -1494,11 +1547,13 @@ test "forest: maxKey finds the largest row id (memtable), or null when empty" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     const ns: u64 = 16;
@@ -1553,11 +1608,13 @@ test "forest: maxKey counts a tombstoned max key" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     const ns: u64 = 16;
@@ -1614,13 +1671,14 @@ test "forest: meta survives put, flush to L0, compaction, and get" {
     defer alloc.free(dir_path);
 
     const f_live = try flags.Live(Config).create(alloc, .{
-        .dir = dir_path,
         .lmax_target_bytes = push_lmax,
     });
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
@@ -1711,11 +1769,13 @@ test "forest: a tombstone reads as absent" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -1769,11 +1829,13 @@ test "forest: snapshotTs rejects older reads and only moves forward" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -1818,13 +1880,14 @@ test "forest: a bottom-level compaction discards under the read floor" {
     const f_live = try flags.Live(Config).create(
         alloc,
         .{
-            .dir = dir_path,
             .max_levels = 2,
             .lmax_target_bytes = push_lmax,
         },
     );
     defer f_live.destroy();
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
@@ -1966,11 +2029,13 @@ test "scan: by default emits one version per key and hides deleted keys" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -1994,11 +2059,13 @@ test "scan: num_versions returns extra versions but still stops at a tombstone" 
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2029,11 +2096,13 @@ test "scan: include_deleted surfaces tombstones and the versions behind them" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2070,11 +2139,13 @@ test "scan: num_versions caps deleted runs too" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2102,11 +2173,13 @@ test "scan: num_versions 0 behaves as 1 rather than returning nothing" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2123,11 +2196,13 @@ test "scan: max_rows bounds emitted items, not versions walked" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2148,11 +2223,13 @@ test "scan: read_ts reports the world as of that timestamp" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2189,11 +2266,13 @@ test "scan: min_ts emits only what changed after it" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -2287,11 +2366,13 @@ test "scan: versions above read_ts do not consume num_versions" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2317,11 +2398,13 @@ test "scan: read_ts at the delete sees the key as gone" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2341,11 +2424,13 @@ test "scan: rejects a read_ts below snapshotTs" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2418,11 +2503,13 @@ test "cursor: agrees with scan under every option" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2452,11 +2539,13 @@ test "cursor: null is sticky and emitted counts hand-outs" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2496,11 +2585,13 @@ test "cursor: max_rows 0 opens exhausted without the min-read check" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
     _ = f.setSnapshotTs(100);
@@ -2546,11 +2637,13 @@ test "cursor: deinit mid-walk releases the sources" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     try seedVersionedForest(f);
 
@@ -2577,11 +2670,13 @@ test "cursor: a flush between two next calls does not disturb the walk" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -2635,11 +2730,13 @@ test "cursor: pin_values holds handed-out values until releasePins" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -2719,13 +2816,12 @@ test "cursor: pin_values holds handed-out values until releasePins" {
 
 /// Ten one-key L3 SSTs k01..k10 in (namespace 42, table 0), value = the
 /// key, in one tree. Returns its id.
-fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: String) !u64 {
+fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest) !u64 {
     const tree_id = try createTree(f, ns42_table0, .{}, .posting_index);
     const keys = [_]String{ "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10" };
-    for (keys, 1..) |k, tbl_id| {
-        const path = try zdb.sstPath(alloc, dir_path, tbl_id);
-        defer alloc.free(path);
-        try buildAndWriteTableKV(alloc, path, .{
+    var extents: [keys.len]_manifest.Extent = undefined;
+    for (keys, &extents, 1..) |k, *ext, tbl_id| {
+        ext.* = try buildAndWriteTableKV(alloc, f.store, tbl_id, .{
             .namespace = 42,
             .table_id = 0,
             .primary = k,
@@ -2735,7 +2831,15 @@ fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: String) !u64 
         const tree_ptr = f.getTree(42, tree_id).?;
         defer tree_ptr.release();
         var changes: [keys.len]_manifest.SSTableChange = undefined;
-        for (&changes, 1..) |*c, tbl_id| c.* = _manifest.createSSTableChange(@intCast(tbl_id), 42, tree_id, 3); // L3
+        for (&changes, extents, 1..) |*c, ext, tbl_id| {
+            c.* = _manifest.createSSTableChange(
+                @intCast(tbl_id),
+                42,
+                tree_id,
+                3, // L3
+                ext,
+            );
+        }
         try tree_ptr.applyCompaction(1, &changes);
     }
     return tree_id;
@@ -2743,8 +2847,8 @@ fn seedTenKeyTable(alloc: std.mem.Allocator, f: *Forest, dir_path: String) !u64 
 
 /// `seedTenKeyTable`, then a split: two trees, the boundary somewhere in
 /// the middle.
-fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest, dir_path: String) !void {
-    const tree_id = try seedTenKeyTable(alloc, f, dir_path);
+fn seedSplitForest(alloc: std.mem.Allocator, f: *Forest) !void {
+    const tree_id = try seedTenKeyTable(alloc, f);
     try f.splitTreeForTests(42, tree_id);
     try std.testing.expectEqual(@as(usize, 2), treeCount(f));
 }
@@ -2756,13 +2860,15 @@ test "cursor: a split applied by another fiber mid-walk loses and repeats nothin
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
-    const tree_id = try seedTenKeyTable(alloc, f, dir_path);
+    const tree_id = try seedTenKeyTable(alloc, f);
 
     // Three keys in: the merge is open with the tree's tables pinned, and
     // between calls the cursor holds neither a lock nor a tree ref.
@@ -2810,13 +2916,15 @@ test "split: a reader holding the old tree keeps its full range until it lets go
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
-    const tree_id = try seedTenKeyTable(alloc, f, dir_path);
+    const tree_id = try seedTenKeyTable(alloc, f);
 
     // Take a ref the way a reader does, then split underneath it.
     const old = f.getTree(42, tree_id) orelse return error.TestExpectedTree;
@@ -2851,13 +2959,15 @@ test "cursor: hops across a split like scan does" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
-    try seedSplitForest(alloc, f, dir_path);
+    try seedSplitForest(alloc, f);
 
     try expectCursorMatchesScan(alloc, f, ns42_table0, .{});
     // A cap that lands inside the second tree.
@@ -2979,11 +3089,13 @@ test "forest: getBitmap folds deltas from memtable, L0, and history" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -3026,11 +3138,13 @@ test "forest: getBitmap tombstone resets, absent key is empty" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -3066,13 +3180,14 @@ test "forest: rollup is read-invariant across flush and compactions" {
     defer alloc.free(dir_path);
 
     const f_live = try flags.Live(Config).create(alloc, .{
-        .dir = dir_path,
         .lmax_target_bytes = push_lmax,
     });
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -3131,11 +3246,13 @@ test "forest: getBitmap rejects non-roaring chains and old reads" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -3180,11 +3297,13 @@ test "forest: index backfill installs bottom states below live deltas" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
     try f.newMemtable(1);
@@ -3253,15 +3372,47 @@ fn putRow(f: *Forest, primary: String, ts: u64, value: String) !void {
     try f.put(&items);
 }
 
-/// Whether `id`'s SST file is still on disk.
-fn sstExists(alloc: std.mem.Allocator, dir: String, id: u64) !bool {
-    const path = try zdb.sstPath(alloc, dir, id);
-    defer alloc.free(path);
-    vfs.access(path) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
+/// Whether `id`'s SST is still in the store.
+fn sstExists(alloc: std.mem.Allocator, store: *vfs.RemoteStore, id: u64) !bool {
+    const name = try zdb.sstName(alloc, id);
+    defer alloc.free(name);
+    return store.exists(name);
+}
+
+/// The file behind `id` in a file store at `dir`, for the tests that
+/// reach under the store (backdating, non-SST bytes). Caller frees.
+fn sstFilePath(alloc: std.mem.Allocator, dir: String, id: u64) ![]u8 {
+    const name = try zdb.sstName(alloc, id);
+    defer alloc.free(name);
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name });
+}
+
+/// Copy SST `from` to id `to` in the store and pre-open the copy into
+/// the table cache, the way a follower's announce prefetch does.
+/// Returns the copy's extent, for a CREATE or load that names it.
+fn copySst(
+    alloc: std.mem.Allocator,
+    f: *Forest,
+    from: u64,
+    to: u64,
+) !_manifest.Extent {
+    const from_name = try zdb.sstName(alloc, from);
+    defer alloc.free(from_name);
+    const to_name = try zdb.sstName(alloc, to);
+    defer alloc.free(to_name);
+    const st = try f.store.stat(from_name);
+    var obj = try f.store.open(from_name, st.size, .{});
+    defer obj.close();
+    // readAligned: put needs a page-aligned buffer.
+    const r = try obj.readAligned(alloc, 0, @intCast(obj.size()), .p1);
+    defer r.free();
+    try f.store.put(to_name, r.data);
+    const ext = try probeExtent(alloc, f.store, to_name, .p1);
+    var needed = [_]zdb.tree.TableNeed{
+        .{ .id = to, .level = 0, .extent = ext },
     };
-    return true;
+    try f.prefetch(&needed);
+    return ext;
 }
 
 test "forest: deleteFiles unlinks compaction inputs at the retire index" {
@@ -3272,13 +3423,14 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     defer alloc.free(dir_path);
 
     const f_live = try flags.Live(Config).create(alloc, .{
-        .dir = dir_path,
         .lmax_target_bytes = push_lmax,
     });
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
@@ -3337,19 +3489,19 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
 
     // Applying the compaction retires the inputs but leaves them on disk.
     for (inputs.items) |id|
-        try std.testing.expect(try sstExists(alloc, dir_path, id));
+        try std.testing.expect(try sstExists(alloc, &store, id));
 
     // A snapshot index one short of the retire index unlinks nothing.
     try f.deleteFiles(k - 1);
     for (inputs.items) |id|
-        try std.testing.expect(try sstExists(alloc, dir_path, id));
+        try std.testing.expect(try sstExists(alloc, &store, id));
 
     // At the retire index the inputs go; the output stays.
     try f.deleteFiles(k);
     for (inputs.items) |id|
-        try std.testing.expect(!try sstExists(alloc, dir_path, id));
+        try std.testing.expect(!try sstExists(alloc, &store, id));
     for (outputs.items) |id|
-        try std.testing.expect(try sstExists(alloc, dir_path, id));
+        try std.testing.expect(try sstExists(alloc, &store, id));
 
     // The compaction output still reads back through the forest.
     {
@@ -3387,11 +3539,13 @@ test "table cache: a table loaded for an install survives an evict before it is 
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
@@ -3406,15 +3560,13 @@ test "table cache: a table loaded for an install survives an evict before it is 
     // A real SST under an id the manifest has not heard of yet, pre-opened
     // the way a follower's prefetch does: the cache's ref is its only one.
     const pending: u64 = 0x5eed;
-    {
-        const read = f.readFile(alloc, listed) orelse return error.TestExpectedFile;
-        defer read.free();
-        f.writeFile(pending, read.data);
-    }
+    const ext = try copySst(alloc, f, listed, pending);
     try std.testing.expect(f.table_cache.contains(pending));
 
     // An apply looks the table up for its install...
-    var needs = [_]zdb.tree.TableNeed{.{ .id = pending, .level = 0 }};
+    var needs = [_]zdb.tree.TableNeed{
+        .{ .id = pending, .level = 0, .extent = ext },
+    };
     try f.table_cache.loadTables(&needs);
     const t = needs[0].table orelse return error.TestExpectedTable;
 
@@ -3451,11 +3603,13 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
@@ -3474,7 +3628,7 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     const old_junk = [_]u64{ 0xdead, 0xbeef, 0xcafe };
     const young_junk: u64 = 0xf00d;
     for (old_junk ++ [_]u64{young_junk}, 0..) |id, i| {
-        const path = try zdb.sstPath(alloc, dir_path, id);
+        const path = try sstFilePath(alloc, dir_path, id);
         defer alloc.free(path);
         try vfs.writeFile(path, "not a real sst");
         const age_s: i64 = if (i < old_junk.len)
@@ -3495,11 +3649,9 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
     // its open fd keeps the unlinked file's blocks.
     const prewarmed: u64 = 0xabcd;
     {
-        const read = f.readFile(alloc, listed) orelse return error.TestExpectedFile;
-        defer read.free();
-        f.writeFile(prewarmed, read.data);
+        _ = try copySst(alloc, f, listed, prewarmed);
         try std.testing.expect(f.table_cache.contains(prewarmed));
-        const path = try zdb.sstPath(alloc, dir_path, prewarmed);
+        const path = try sstFilePath(alloc, dir_path, prewarmed);
         defer alloc.free(path);
         try backdate(path, now - 2 * std.time.s_per_hour);
     }
@@ -3510,9 +3662,9 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
         if (with_snapshot) snapshotAt(f, now - 3 * std.time.s_per_hour);
         try f.removeOrphans(0);
         for (old_junk) |id|
-            try std.testing.expect(try sstExists(alloc, dir_path, id));
-        try std.testing.expect(try sstExists(alloc, dir_path, prewarmed));
-        try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
+            try std.testing.expect(try sstExists(alloc, &store, id));
+        try std.testing.expect(try sstExists(alloc, &store, prewarmed));
+        try std.testing.expect(try sstExists(alloc, &store, young_junk));
     }
 
     // A snapshot between the old files and the young one.
@@ -3521,34 +3673,34 @@ test "forest: removeOrphans unlinks only unknown files at or before the cutoff" 
 
     // Only the old unknown SSTs go, the pre-opened one with its cache entry.
     for (old_junk) |id|
-        try std.testing.expect(!try sstExists(alloc, dir_path, id));
-    try std.testing.expect(!try sstExists(alloc, dir_path, prewarmed));
+        try std.testing.expect(!try sstExists(alloc, &store, id));
+    try std.testing.expect(!try sstExists(alloc, &store, prewarmed));
     try std.testing.expect(!f.table_cache.contains(prewarmed));
-    try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
-    try std.testing.expect(try sstExists(alloc, dir_path, listed));
+    try std.testing.expect(try sstExists(alloc, &store, young_junk));
+    try std.testing.expect(try sstExists(alloc, &store, listed));
     try vfs.access(other);
 
     // A listed file is left alone however old it is.
     {
-        const path = try zdb.sstPath(alloc, dir_path, listed);
+        const path = try sstFilePath(alloc, dir_path, listed);
         defer alloc.free(path);
         try backdate(path, now - 2 * std.time.s_per_hour);
     }
     try f.removeOrphans(0);
-    try std.testing.expect(try sstExists(alloc, dir_path, listed));
-    try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
+    try std.testing.expect(try sstExists(alloc, &store, listed));
+    try std.testing.expect(try sstExists(alloc, &store, young_junk));
 
     // A snapshot past the young file does not remove it while it is
     // younger than the minimum age.
     snapshotAt(f, now);
     try f.removeOrphans(std.time.s_per_hour);
-    try std.testing.expect(try sstExists(alloc, dir_path, young_junk));
+    try std.testing.expect(try sstExists(alloc, &store, young_junk));
 
     // Without that age it goes too, and still nothing the manifest
     // lists.
     try f.removeOrphans(0);
-    try std.testing.expect(!try sstExists(alloc, dir_path, young_junk));
-    try std.testing.expect(try sstExists(alloc, dir_path, listed));
+    try std.testing.expect(!try sstExists(alloc, &store, young_junk));
+    try std.testing.expect(try sstExists(alloc, &store, listed));
     try vfs.access(other);
 }
 
@@ -3566,13 +3718,14 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     defer cache.deinit();
 
     const f_live = try flags.Live(Config).create(alloc, .{
-        .dir = dir_path,
         .lmax_target_bytes = push_lmax,
     });
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
@@ -3676,11 +3829,13 @@ test "forest: one flush covers every waiting memtable" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
@@ -3732,10 +3887,12 @@ test "forest: an L0 to L0 merge folds small tables into one and keeps L0's read 
     // Four tables to a merge, so three ask for nothing below.
     const f_live = try flags.Live(Config).create(
         alloc,
-        .{ .dir = dir_path, .l0_merge_min_tables = 4 },
+        .{ .l0_merge_min_tables = 4 },
     );
     defer f_live.destroy();
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
@@ -3857,11 +4014,12 @@ test "buildFlush takes the oldest memtables up to job_max_bytes" {
     // A budget one memtable's writes exceed: each flush takes exactly
     // the oldest frozen memtable, and the rest wait.
     const f_live = try flags.Live(Config).create(alloc, .{
-        .dir = dir_path,
         .job_max_bytes = 1,
     });
     defer f_live.destroy();
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     _ = try createTree(f, ns1_table0, .{}, .posting_index);
 
@@ -3910,11 +4068,12 @@ test "maxL0TableCountForKeys counts each key's own table" {
 
     // One memtable per flush, so three flushes leave three L0 tables.
     const f_live = try flags.Live(Config).create(alloc, .{
-        .dir = dir_path,
         .job_max_bytes = 1,
     });
     defer f_live.destroy();
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
     const table1: TableKey = .{ .namespace = 1, .table_id = 1 };
     _ = try createTree(f, ns1_table0, .{}, .posting_index);

@@ -34,6 +34,9 @@ const Fixture = struct {
     forest: *Forest,
     /// The forest reads its options through this; freed after it.
     live: *flags.Live(Config),
+    /// The forest's SSTs; heap-held so its address survives the move out
+    /// of setup. Freed after the forest.
+    store: *zdb.vfs.RemoteStore,
     db: sql.database.Database,
 
     fn setup(rows: []const zdb.kv.Item) !Fixture {
@@ -45,13 +48,17 @@ const Fixture = struct {
             testing.allocator,
         );
         errdefer testing.allocator.free(dir_path);
+        const store = try testing.allocator.create(zdb.vfs.RemoteStore);
+        errdefer testing.allocator.destroy(store);
+        store.* = try zdb.vfs.RemoteStore.initFile(testing.allocator, dir_path);
+        errdefer store.deinit();
 
         const f_live = try flags.Live(Config).create(
             testing.allocator,
-            .{ .dir = dir_path },
+            .{},
         );
         errdefer f_live.destroy();
-        const f = try Forest.open(testing.allocator, f_live);
+        const f = try Forest.open(testing.allocator, f_live, store);
         errdefer f.close();
         _ = try createTree(f, .{
             .namespace = ns,
@@ -64,6 +71,7 @@ const Fixture = struct {
             .dir_path = dir_path,
             .forest = f,
             .live = f_live,
+            .store = store,
             .db = try sql.database.Database.init(testing.allocator, ns),
         };
     }
@@ -72,6 +80,8 @@ const Fixture = struct {
         self.db.deinit();
         self.forest.close();
         self.live.destroy();
+        self.store.deinit();
+        testing.allocator.destroy(self.store);
         testing.allocator.free(self.dir_path);
         self.tmp.cleanup();
     }

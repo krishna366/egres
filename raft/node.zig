@@ -44,10 +44,6 @@ pub const Config = struct {
     /// this cutoff get their own AE to avoid shipping huge duplicate prefixes.
     lockstep_cutoff: u32 = 32,
     enable_prevote: bool = true,
-    /// Whether this node is backed by a shared file store (SST
-    /// distribution). Policy bit only: a leader without one rejects joins,
-    /// since a joiner could never fetch the cluster's SSTs.
-    has_file_store: bool = false,
 
     pub fn validate(self: Config) !void {
         if (self.election_timeout_min_ticks == 0) return error.InvalidConfig;
@@ -186,11 +182,14 @@ pub const Node = struct {
         /// state machine must NOT loop on transient errors itself — it would
         /// block the raft fiber from observing shutdown.
         applyFn: *const fn (*anyopaque, Entry, String) anyerror!void,
-        /// Ensure the given file ids are present on local disk, downloading
-        /// from the shared object store as needed. Behind the announce
-        /// prefetch: raft only relays ids, never file bytes. Single attempt
-        /// — the caller reports failure (announce fail-ack).
-        ensureFilesFn: ?*const fn (*anyopaque, []const u64) anyerror!void = null,
+        /// Open the given file ids from the store into the table cache.
+        /// Behind the announce prefetch: raft only relays ids, never file
+        /// bytes. Single attempt — the caller reports failure (announce
+        /// fail-ack).
+        ensureFilesFn: ?*const fn (
+            *anyopaque,
+            []const zen.FileRefStruct,
+        ) anyerror!void = null,
         /// Cheap predicate the leader checks in `propose` before
         /// queuing a `.data` proposal — typically "recovery done AND a real
         /// memtable exists". Must be non-blocking. When null, the gate is
@@ -211,8 +210,12 @@ pub const Node = struct {
         pub fn apply(self: *StateMachine, entry: Entry, data: String) anyerror!void {
             try self.applyFn(self.ctx, entry, data);
         }
-        pub fn ensureFiles(self: *StateMachine, file_ids: []const u64) anyerror!void {
-            try (self.ensureFilesFn orelse return error.NoEnsureFiles)(self.ctx, file_ids);
+        pub fn ensureFiles(
+            self: *StateMachine,
+            files: []const zen.FileRefStruct,
+        ) anyerror!void {
+            const f = self.ensureFilesFn orelse return error.NoEnsureFiles;
+            try f(self.ctx, files);
         }
         pub fn isReady(self: *StateMachine) bool {
             if (self.isReadyFn) |f| return f(self.ctx);
@@ -587,7 +590,6 @@ pub const Node = struct {
         pub const cluster_mismatch: u32 = 2;
         pub const conf_change_rejected: u32 = 3;
         pub const invalid_addr: u32 = 4;
-        pub const no_file_store: u32 = 5;
     };
 
     fn handleJoinRequest(self: *Node, conn: *Serial, payload: String) void {
@@ -602,14 +604,6 @@ pub const Node = struct {
                     self.sendJoinResponse(conn, false, self.getLeaderId(), JoinReason.not_leader);
                     return;
                 }
-                // No shared file store ⇒ a joiner could never fetch the
-                // cluster's SSTs. Refuse up front with a distinct reason.
-                if (!self.config.has_file_store) {
-                    raft_log.err("join rejected: no --store configured; multi-node requires a shared file store", .{});
-                    self.sendJoinResponse(conn, false, self.id, JoinReason.no_file_store);
-                    return;
-                }
-
                 const peer_id: NodeId = @intCast(req.nodeId());
                 if (peer_id == self.id or self.peers.contains(peer_id)) {
                     dbg("handleJoinRequest: peer {d} already part of the cluster", .{peer_id});
@@ -702,13 +696,17 @@ pub const Node = struct {
         }
     }
 
-    /// Announce a batch of file ids (already uploaded to the shared object
-    /// store by the caller) to all peers, and wait until a quorum of nodes
-    /// (self included) HAS every file locally. A prefetch optimization:
-    /// followers download from the store on the announce and batch-ack, so
-    /// the manifest entry lands on nodes that already hold the files and
-    /// their apply loops never stall. Apply-time fetch remains the backstop.
-    pub fn announceAndWaitForFileQuorum(self: *Node, file_ids: []const u64) !void {
+    /// Announce a batch of file ids (already in the store, put by the
+    /// caller) to all peers, and wait until a quorum of nodes (self
+    /// included) has every one open. A prefetch optimization: followers
+    /// open the tables from the store on the announce and batch-ack, so
+    /// the manifest entry lands on nodes whose table cache already holds
+    /// them and their apply loops never stall. The apply-time open
+    /// remains the backstop.
+    pub fn announceAndWaitForFileQuorum(
+        self: *Node,
+        files: []const zen.FileRefStruct,
+    ) !void {
         const tr = self.transport orelse return error.NoTransport;
 
         const announce_id = self.next_announce_id.fetchAdd(1, .monotonic);
@@ -733,9 +731,9 @@ pub const Node = struct {
         const payload = try zen.marshalRoot(self.allocator, zen.AnnounceFilesStruct{
             .announce_id = announce_id,
             .sender_id = self.id,
-            // marshalTo only reads; the Struct field is []u64 because a
+            // marshalTo only reads; the Struct field is mutable because a
             // parsed Struct owns its slice.
-            .file_ids = @constCast(file_ids),
+            .files = @constCast(files),
         });
         // Wrap once; sendMsg incrRefs per peer enqueued, no per-peer copy.
         const value = utils.RefValue.init(self.allocator, payload) catch |err| {
@@ -776,9 +774,9 @@ pub const Node = struct {
         ann.nodes.put(resp.nodeId(), status) catch return;
     }
 
-    /// Detached fiber: ensure every announced file exists locally (the
-    /// state machine downloads missing ones from the shared object store),
-    /// then send the announcer one batch response. Must not run inline in
+    /// Detached fiber: open every announced file (the state machine
+    /// opens them from the store into its table cache), then send the
+    /// announcer one batch response. Must not run inline in
     /// the conn reader loop — see the msg_type_announce arm. Owns +
     /// destroys `ann`.
     fn handleFileAnnounce(self: *Node, ann: *zen.AnnounceFilesStruct) void {
@@ -787,7 +785,7 @@ pub const Node = struct {
         var status: zen.AnnounceStatusEnum = .ok;
         var fail_error: String = "";
         if (self.state_machine) |sm| {
-            sm.ensureFiles(ann.file_ids) catch |err| {
+            sm.ensureFiles(ann.files) catch |err| {
                 status = .fail;
                 fail_error = @errorName(err);
             };

@@ -88,45 +88,53 @@ const RaftCfg = struct {
 /// the process leaves under it.
 const CacheCfg = struct {
     total_mb: u64 = 0,
+    disk_path: String = "",
+    disk_mb: u64 = 0,
+    chunk_mb: u64 = 0,
 
     pub const docs = .{
-        .self = "Cache memory. The budget is a cap, not a reservation:" ++
+        .self = "Cache memory and the local-disk chunk cache for an s3" ++
+            " remote. The memory budget is a cap, not a reservation:" ++
             " memory is used as blocks are read.",
         .total_mb = "The overall memory Egres aims to hold, resident," ++
             " in MiB. 0 = 90% of host RAM or of the cgroup limit. The" ++
             " block cache is auto-resized based on what the rest of the" ++
             " process uses and the allocator's measured overhead. Set it" ++
             " on a host shared with other processes.",
+        .disk_path = "Slot file of the chunk cache: SST chunks fetched" ++
+            " from an s3 remote, kept on local disk. Empty = no disk" ++
+            " cache (not built yet; the flag reserves the shape).",
+        .disk_mb = "Chunk cache capacity in MiB.",
+        .chunk_mb = "Chunk size in MiB, fixed when the slot file is" ++
+            " created. 0 = calibrate against the endpoint then.",
     };
 };
 
-/// `--store` — the shared object store that distributes SST files across
-/// nodes (upload before propose; download at apply). Required for any
-/// multi-node cluster: a seeded node refuses to start without one, and a
-/// leader without one rejects joins. Single-node runs need none. The
-/// depot directory is write-once blobs only — NEVER a node's live data
-/// dir.
-const StoreCfg = struct {
-    kind: String = "",
-    path: String = "",
+/// `--remote` — the remote store that holds every SST: a compaction or
+/// flush puts its output there before proposing the manifest change,
+/// and every node reads SSTs from it. Required. A cluster's nodes must
+/// share one (an s3 bucket, or a dir on a shared mount); a plain local
+/// dir serves a single node. The dir is write-once blobs only — never
+/// the WAL dir. Exactly one of `dir_path` and `s3_endpoint` is set.
+const RemoteCfg = struct {
+    dir_path: String = "",
     s3_endpoint: String = "",
     s3_bucket: String = "",
-    s3_region: String = "us-east-1",
     s3_prefix: String = "",
 
     pub const docs = .{
-        .self = "Shared object store for SST distribution (multi-node).",
-        .kind = "Backend: '' (none, single-node only), 'dir' (shared" ++
-            " write-once depot directory, e.g. an NFS mount), or 's3'" ++
-            " (S3-compatible store; creds via" ++
-            " AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).",
-        .path = "Depot directory when kind=dir.",
-        .s3_endpoint = "S3 endpoint URL: http://host[:port] or" ++
-            " https://host[:port]. The scheme decides TLS; host may be a DNS" ++
-            " name or IP literal. E.g." ++
-            " https://s3.us-east-005.backblazeb2.com or http://127.0.0.1:8333.",
-        .s3_bucket = "Bucket name when kind=s3.",
-        .s3_region = "SigV4 signing region when kind=s3.",
+        .self = "Object store holding every SST. Required: either" ++
+            " dir_path or the s3_* fields.",
+        .dir_path = "Write-once directory: local, or a shared mount such" ++
+            " as NFS for a cluster.",
+        .s3_endpoint = "S3-compatible endpoint URL: http://host[:port]" ++
+            " or https://host[:port]. The scheme decides TLS; the host" ++
+            " may be a DNS name or IP literal, and names the SigV4" ++
+            " region (s3.<region>.<domain>, else us-east-1). E.g." ++
+            " https://s3.us-east-005.backblazeb2.com or" ++
+            " http://127.0.0.1:8333. Creds via AWS_ACCESS_KEY_ID /" ++
+            " AWS_SECRET_ACCESS_KEY.",
+        .s3_bucket = "Bucket name. Required with s3_endpoint.",
         .s3_prefix = "Optional key prefix inside the bucket (unreserved URI" ++
             " characters only).",
     };
@@ -223,8 +231,7 @@ fn deinitWithLog(comptime msg: String, ptr: anytype) void {
 /// Bundle passed to appMain — the parsed-flags snapshots plus derived
 /// fields. `raft_addr` / `client_addr` are computed from
 /// `host:port+offset` once at startup and own their backing buffers.
-/// `seeds` is the comma-split version of `raft.seeds`. `wal_dir` is
-/// `data.wal_dir` if set, else `data.dir`.
+/// `seeds` is the comma-split version of `raft.seeds`.
 const Args = struct {
     listen: ListenCfg,
     raft: RaftCfg,
@@ -300,10 +307,11 @@ fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const String) void {
 /// Scheduler knobs for A/B runs; the defaults are the measured-best
 /// settings. See zfiber.Runtime.steal_lone / prepark_poll_us.
 /// `--wal` — where the raft WAL lives and how its log files are laid
-/// out. `dir` defaults to the data dir; point it at a faster device for
-/// write-ahead throughput. The layout defaults suit a local SSD on any
-/// filesystem: `prezero=auto` zero-fills log files on ext4 and xfs and
-/// skips it on ZFS, btrfs and tmpfs.
+/// out. The WAL (with the raft snapshot and hard state) is the one thing
+/// Egres keeps on local disk; SSTs live in `--remote`. The layout
+/// defaults suit a local SSD on any filesystem: `prezero=auto`
+/// zero-fills log files on ext4 and xfs and skips it on ZFS, btrfs and
+/// tmpfs.
 const WalCfg = struct {
     dir: String = "",
     log_file_mib: u64 = 256,
@@ -313,7 +321,7 @@ const WalCfg = struct {
     pub const docs = .{
         .self = "Raft WAL location and log files (see raft/diskwal.zig" ++
             " OpenOptions).",
-        .dir = "Directory holding the raft WAL. Empty = the data dir.",
+        .dir = "Directory holding the raft WAL. Required.",
         .log_file_mib = "Log file size in MiB; a record that would cross it" ++
             " rotates to a pre-created log file.",
         .prezero = "Zero-fill a log file when it is created so appends never" ++
@@ -350,7 +358,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const live_raft = try flags.g().register("raft", RaftCfg);
     const live_shutdown = try flags.g().register("shutdown", ShutdownCfg);
     const live_zdb = try flags.g().register("zdb", zdb.config.Config);
-    const live_store = try flags.g().register("store", StoreCfg);
+    const live_remote = try flags.g().register("remote", RemoteCfg);
     const live_cache = try flags.g().register("cache", CacheCfg);
     const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
     const live_runtime = try flags.g().register("runtime", RuntimeCfg);
@@ -387,7 +395,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const raft_cfg = live_raft.cur();
     const shutdown_cfg = live_shutdown.cur();
     const zdb_cfg = live_zdb.cur();
-    const store_cfg = live_store.cur();
+    const remote_cfg = live_remote.cur();
     const cache_cfg = live_cache.cur();
     const runtime_cfg = live_runtime.cur();
     const wal_cfg = live_wal.cur();
@@ -396,33 +404,22 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // on it directly, before any listener spawns a connection fiber.
     fiber.runtime().steal_lone = runtime_cfg.steal_lone;
     fiber.runtime().prepark_poll_us = runtime_cfg.poll_us;
-    if (raft_cfg.id == 0 or zdb_cfg.dir.len == 0) {
-        std.log.err("--raft requires id (>0); --zdb requires dir", .{});
+    if (raft_cfg.id == 0 or wal_cfg.dir.len == 0) {
+        std.log.err("--raft requires id (>0); --wal requires dir", .{});
         usage(allocator);
         std.process.exit(1);
     }
-    // Multi-node needs the shared store: every joiner would fetch its SSTs
-    // from it. The bootstrapping first node is gated at join time instead
-    // (it can't know it will ever have peers).
-    if (raft_cfg.seeds.len > 0 and store_cfg.kind.len == 0) {
-        std.log.err("--store is required when joining a cluster (seeds set): SSTs are distributed via the shared object store", .{});
+    const remote_dir = remote_cfg.dir_path.len > 0;
+    if (remote_dir == (remote_cfg.s3_endpoint.len > 0)) {
+        std.log.err("--remote needs dir_path or s3_endpoint, not both", .{});
         std.process.exit(1);
     }
-    if (std.mem.eql(u8, store_cfg.kind, "dir") and store_cfg.path.len == 0) {
-        std.log.err("--store kind=dir requires path", .{});
+    if (!remote_dir and remote_cfg.s3_bucket.len == 0) {
+        std.log.err("--remote s3_endpoint requires s3_bucket", .{});
         std.process.exit(1);
     }
-    if (std.mem.eql(u8, store_cfg.kind, "s3") and
-        (store_cfg.s3_endpoint.len == 0 or store_cfg.s3_bucket.len == 0))
-    {
-        std.log.err("--store kind=s3 requires s3_endpoint and s3_bucket", .{});
-        std.process.exit(1);
-    }
-    if (store_cfg.kind.len > 0 and
-        !std.mem.eql(u8, store_cfg.kind, "dir") and
-        !std.mem.eql(u8, store_cfg.kind, "s3"))
-    {
-        std.log.err("--store kind must be '', 'dir', or 's3' (got '{s}')", .{store_cfg.kind});
+    if (remote_dir and std.mem.eql(u8, remote_cfg.dir_path, wal_cfg.dir)) {
+        std.log.err("--remote dir_path and --wal dir must differ", .{});
         std.process.exit(1);
     }
 
@@ -435,9 +432,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const sql_addr = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ listen.host, listen.sql_port + listen.offset });
     defer allocator.free(sql_addr);
 
-    // The WAL dir defaults to the data dir, the common single-disk case.
-    // Setting it puts the WAL on a faster device than the LSM.
-    const wal_dir = if (wal_cfg.dir.len > 0) wal_cfg.dir else zdb_cfg.dir;
+    const wal_dir = wal_cfg.dir;
 
     const seeds = try parseSeedList(raft_cfg.seeds, allocator);
     defer allocator.free(seeds);
@@ -455,37 +450,55 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // The I/O limiter, from the disk's measured profile unless a flag
     // pins it. The probe runs before the limiter exists (its own reads
     // and writes must not be throttled) and before anything else
-    // touches the device.
-    const bw_config = try zdb.vfs.calibrate.bwConfig(allocator, io_cfg, zdb_cfg.dir);
+    // touches the device. The SST device is the dir remote's; an s3
+    // remote has none to probe.
+    const bw_config = try zdb.vfs.calibrate.bwConfig(
+        allocator,
+        io_cfg,
+        remote_cfg.dir_path,
+    );
     zdb.vfs.VFS.initGlobal(bw_config);
 
-    log.info("starting egres id={d} cluster={d} raft={s} admin={s} sql={s} dir={s} wal={s} tick={d}ms seeds={d}", .{
-        raft_cfg.id, raft_cfg.cluster_id, raft_addr, client_addr, sql_addr, zdb_cfg.dir, wal_dir, raft_cfg.tick_ms, seeds.len,
-    });
+    log.info(
+        "starting egres id={d} cluster={d} raft={s} admin={s} sql={s} " ++
+            "wal={s} tick={d}ms seeds={d}",
+        .{
+            raft_cfg.id,      raft_cfg.cluster_id, raft_addr,
+            client_addr,      sql_addr,            wal_dir,
+            raft_cfg.tick_ms, seeds.len,
+        },
+    );
 
-    // The shared object store (SST distribution). `.none` on single node.
-    var store: zdb.vfs.FileStore = if (std.mem.eql(u8, store_cfg.kind, "dir"))
-        try zdb.vfs.FileStore.initDir(allocator, store_cfg.path)
-    else if (std.mem.eql(u8, store_cfg.kind, "s3"))
-        try zdb.vfs.FileStore.initS3(allocator, .{
-            .endpoint = store_cfg.s3_endpoint,
-            .bucket = store_cfg.s3_bucket,
-            .region = store_cfg.s3_region,
-            .prefix = store_cfg.s3_prefix,
-        })
+    // The remote store every SST lives in.
+    var store: zdb.vfs.RemoteStore = if (remote_dir)
+        try zdb.vfs.RemoteStore.initFile(allocator, remote_cfg.dir_path)
     else
-        .none;
+        try zdb.vfs.RemoteStore.initS3(allocator, .{
+            .endpoint = remote_cfg.s3_endpoint,
+            .bucket = remote_cfg.s3_bucket,
+            .prefix = remote_cfg.s3_prefix,
+            .cache = .{
+                .path = cache_cfg.disk_path,
+                .capacity_bytes = cache_cfg.disk_mb << 20,
+                .chunk_bytes = cache_cfg.chunk_mb << 20,
+            },
+        });
     defer store.deinit();
-    if (store != .none) log.info("file store: kind={s} path={s} s3={s}/{s}", .{
-        store_cfg.kind, store_cfg.path, store_cfg.s3_endpoint, store_cfg.s3_bucket,
-    });
+    if (remote_dir) {
+        log.info("remote: dir {s}", .{remote_cfg.dir_path});
+    } else {
+        log.info("remote: s3 {s}/{s}/{s}", .{
+            remote_cfg.s3_endpoint, remote_cfg.s3_bucket,
+            remote_cfg.s3_prefix,
+        });
+    }
     // Size the future read-lookahead to this endpoint's latency knee.
     // Non-fatal: a probe hiccup shouldn't block boot; lookahead stays 0.
-    if (store != .none) {
-        _ = store.calibrateLookahead(zdb_cfg.block_bytes) catch |err| {
-            log.warn("store lookahead calibration failed: {s}", .{@errorName(err)});
-        };
-    }
+    _ = store.calibrateLookahead(zdb_cfg.block_bytes) catch |err| {
+        log.warn("remote lookahead calibration failed: {s}", .{
+            @errorName(err),
+        });
+    };
 
     // Initialize global metrics before anything that might increment them.
     // zdb owns storage-layer metrics; raft owns its own propose-phase
@@ -517,7 +530,6 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
             .cluster_id = raft_cfg.cluster_id,
             .listen_addr = raft_addr,
             .tick_interval_ms = raft_cfg.tick_ms,
-            .has_file_store = store != .none,
         },
     );
     defer deinitWithLog("node", node);
@@ -554,12 +566,12 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     );
 
     // Open zdb forest.
-    log.info("opening forest at {s}", .{zdb_cfg.dir});
+    log.info("opening forest", .{});
     zdb_cfg.validate() catch |err| {
         std.log.err("--zdb: invalid storage options: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
-    var forest = try zdb.forest.Forest.open(allocator, live_zdb);
+    var forest = try zdb.forest.Forest.open(allocator, live_zdb, &store);
     defer {
         // Closing the forest frees every table, and a table drops its
         // blocks from the block cache as it goes. The whole cache is
@@ -578,7 +590,6 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         node,
         forest,
         live_snapshot,
-        &store,
     );
     defer deinitWithLog("engine", eng);
 

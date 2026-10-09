@@ -766,6 +766,7 @@ fn moveDown(
         self.namespace,
         self.tree_id,
         @intCast(dest),
+        e.table.extent,
     );
     create.raft_index = e.raft_index;
     changes.appendAssumeCapacity(create);
@@ -876,9 +877,11 @@ pub fn mergeAndWrite(
         &part_buf,
     );
 
-    var group = fiber.Group(?Emitter.Result).init(self.allocator);
+    var group = try fiber.Group(?Emitter.Result).initCapacity(
+        self.allocator,
+        parts.len,
+    );
     defer group.deinit();
-    try group.ensureTotalCapacity(parts.len);
 
     // A partition not handed to a fiber still owns its concat.
     var spawned: usize = 0;
@@ -890,11 +893,8 @@ pub fn mergeAndWrite(
     }
     const results = group.wait();
 
-    // Start dir sync while we're waiting for file syncs to be done. We can do
-    // dir sync here because files have already been created and written. So,
-    // dir should have everything it needs.
-    var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.live.cur().dir});
-    defer dir_sync.join();
+    // Every partition's puts are done; this makes their names durable.
+    try self.cache.store.sync();
 
     // The manifest changes: every partition's CREATEs, in partition
     // order and listed at the job's raft index, then the DELETEs of
@@ -1061,7 +1061,7 @@ fn runPartition_(
     try merge.seekRange(part.range.left, part.range.right);
 
     // --- merge loop ---
-    var emitter = Emitter.init(self, dest, prio, snapshot_ts);
+    var emitter = try Emitter.init(self, dest, prio, snapshot_ts);
     defer emitter.deinit();
     while (merge.itemRef()) |item| {
         try emitter.push(item);

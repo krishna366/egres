@@ -38,6 +38,8 @@ const Fixture = struct {
     dir: [:0]u8,
     /// The forest reads its options through this; freed after it.
     live: *flags.Live(Config),
+    /// The forest's SSTs; freed after it.
+    store: vfs.RemoteStore,
     f: *Forest,
     tree_id: u64,
     /// Stands in for the raft log: every fixture step that would be its
@@ -51,6 +53,7 @@ const Fixture = struct {
             .tmp = std.testing.tmpDir(.{}),
             .dir = undefined,
             .live = undefined,
+            .store = undefined,
             .f = undefined,
             .tree_id = undefined,
             .next_index = 0,
@@ -59,10 +62,10 @@ const Fixture = struct {
         // A bottom target of one byte makes a push L0's job at any
         // size (`pickJob`), so `compactL0` below pushes into L1.
         self.live = try flags.Live(Config).create(alloc, .{
-            .dir = self.dir,
             .lmax_target_bytes = 1,
         });
-        self.f = try Forest.open(alloc, self.live);
+        self.store = try vfs.RemoteStore.initFile(alloc, self.dir);
+        self.f = try Forest.open(alloc, self.live, &self.store);
         self.tree_id = try createTree(self.f, table_key, .{}, .posting_index);
         // Forest.open leaves an id-0 placeholder memtable that a swap
         // discards rather than freezes; start on a real one.
@@ -76,6 +79,7 @@ const Fixture = struct {
 
     fn teardown(self: *Fixture) void {
         self.f.close();
+        self.store.deinit();
         self.live.destroy();
         self.alloc.free(self.dir);
         self.tmp.cleanup();
@@ -362,20 +366,21 @@ test "multiget: rejects a read_ts below snapshotTs" {
 
 fn writeOneKeyTable(
     alloc: std.mem.Allocator,
-    dir: String,
+    store: *vfs.RemoteStore,
     file_id: u64,
     k: Key,
     ts: u64,
     value: String,
-) !void {
-    const path = try zdb.sstPath(alloc, dir, file_id);
-    defer alloc.free(path);
+) !_manifest.Extent {
+    const name = try zdb.sstName(alloc, file_id);
+    defer alloc.free(name);
     var bld = Builder.init(alloc, .{ .block_bytes = 4 * 1024 });
     defer bld.deinit();
     try bld.add(k, ts, value);
     var tb = try bld.finish();
     defer tb.deinit();
-    try vfs.writeFile(path, tb.bytes);
+    try store.put(name, tb.bytes);
+    return tb.extent();
 }
 
 test "multiget: keys across two trees and several bottom tables" {
@@ -388,20 +393,29 @@ test "multiget: keys across two trees and several bottom tables" {
     const keys = [_]String{
         "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10",
     };
-    for (keys, 1..) |k, file_id| {
-        try writeOneKeyTable(alloc, fx.dir, file_id, Fixture.key(k), 1, k);
+    var extents: [keys.len]_manifest.Extent = undefined;
+    for (keys, &extents, 1..) |k, *ext, file_id| {
+        ext.* = try writeOneKeyTable(
+            alloc,
+            &fx.store,
+            file_id,
+            Fixture.key(k),
+            1,
+            k,
+        );
     }
     {
         const tree = fx.f.getTree(ns, fx.tree_id) orelse
             return error.TestExpectedTree;
         defer tree.release();
         var changes: [keys.len]_manifest.SSTableChange = undefined;
-        for (&changes, 1..) |*c, file_id| {
+        for (&changes, extents, 1..) |*c, ext, file_id| {
             c.* = _manifest.createSSTableChange(
                 @intCast(file_id),
                 ns,
                 fx.tree_id,
                 3,
+                ext,
             );
         }
         try tree.applyCompaction(1, &changes);

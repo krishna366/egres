@@ -1,17 +1,19 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! FileStore — the S3-equivalent object store that distributes immutable
-//! files (SSTs) across nodes. The creator uploads an object BEFORE
-//! proposing the manifest change that references it, so store durability
-//! precedes consensus; followers download at apply time. Objects are keyed
-//! by name (callers own the naming — e.g. the SST filename), write-once,
-//! and single-writer by construction, which is what lets the `dir` backend
-//! share a plain directory between nodes without any locking.
+//! RemoteStore — the store that holds every SST, backed by a FileStore
+//! (a directory, local or a shared mount) or an S3Store. The creator
+//! uploads an object BEFORE proposing the manifest change that references
+//! it, so store durability precedes consensus; every node opens the same
+//! object to read it. Objects are keyed by name (callers own the naming —
+//! e.g. the SST filename), write-once, and single-writer by construction,
+//! which is what lets the `file` backend share a plain directory between
+//! nodes without any locking.
 //!
-//! Reads go through an `Object` handle (open once, read ranges) so block
-//! consumers — today whole-object `getAll`, later tiered/lazy table
-//! reads — map onto ranged GETs instead of whole-file transfers.
+//! Reads go through an `Object` handle (open once, read ranges). It has
+//! the read shape `Table` wants — `readAligned`, `batchRead` — so a table
+//! over a file object reads exactly as a local file did, and one over an
+//! s3 object turns each read into a ranged GET.
 
 const std = @import("std");
 const fiber = @import("zfiber");
@@ -23,69 +25,79 @@ const _lookahead = @import("lookahead.zig");
 
 pub const S3Config = _s3.S3Config;
 
-pub const FileStore = union(enum) {
-    /// No store configured — single-node deployments. Multi-node requires
-    /// a store: seeded nodes fail fast at startup and the leader rejects
-    /// joins without one.
-    none,
-    dir: DirStore,
+pub const RemoteStore = union(enum) {
+    file: FileStore,
     s3: _s3.S3Store,
 
-    pub fn initDir(a: std.mem.Allocator, depot: String) !FileStore {
-        return .{ .dir = try DirStore.init(a, depot) };
+    pub fn initFile(a: std.mem.Allocator, depot: String) !RemoteStore {
+        return .{ .file = try FileStore.init(a, depot) };
     }
 
-    pub fn initS3(a: std.mem.Allocator, cfg: S3Config) !FileStore {
+    pub fn initS3(a: std.mem.Allocator, cfg: S3Config) !RemoteStore {
         return .{ .s3 = try _s3.S3Store.init(a, cfg) };
     }
 
-    pub fn deinit(self: *FileStore) void {
+    pub fn deinit(self: *RemoteStore) void {
         switch (self.*) {
-            .none => {},
-            .dir => |*d| d.deinit(),
+            .file => |*f| f.deinit(),
             .s3 => |*s| s.deinit(),
         }
     }
 
+    /// The file backend's depot path; empty for s3. For the callers that
+    /// need a local device to probe (the `--io` calibration).
+    pub fn localPath(self: *const RemoteStore) String {
+        return switch (self.*) {
+            .file => |*f| f.depot,
+            .s3 => "",
+        };
+    }
+
     /// Upload a whole object. Idempotent: re-putting an existing name
     /// rewrites identical bytes (write-once contract). `data` must be
-    /// page-aligned and a page multiple — the dir backend writes
+    /// page-aligned and a page multiple — the file backend writes
     /// O_DIRECT and rejects anything else (error.UnalignedPut). SST
     /// buffers satisfy this by construction.
-    pub fn put(self: *FileStore, name: String, data: String) !void {
+    pub fn put(self: *RemoteStore, name: String, data: String) !void {
         switch (self.*) {
-            .none => return error.NoFileStore,
-            .dir => |*d| try d.put(name, data),
+            .file => |*f| try f.put(name, data),
             .s3 => |*s| try s.put(name, data),
         }
     }
 
     /// Durability barrier for prior puts. put fsyncs each object's BYTES;
-    /// the dir backend's rename leaves the NAME's durability to a depot
+    /// the file backend's rename leaves the NAME's durability to a depot
     /// directory fsync — done here, once per batch, instead of per put.
     /// s3: no-op, every PUT is durable when the response arrives. Call
     /// after a batch of puts, before proposing changes that reference them.
-    pub fn sync(self: *FileStore) !void {
+    pub fn sync(self: *RemoteStore) !void {
         switch (self.*) {
-            .none => return error.NoFileStore,
-            .dir => |*d| d.sync(),
+            .file => |*f| f.sync(),
             .s3 => {},
         }
     }
 
-    pub fn exists(self: *FileStore, name: String) !bool {
+    pub fn exists(self: *RemoteStore, name: String) !bool {
         switch (self.*) {
-            .none => return error.NoFileStore,
-            .dir => |*d| return d.exists(name),
+            .file => |*f| return f.exists(name),
             .s3 => |*s| return s.exists(name),
         }
     }
 
-    pub fn delete(self: *FileStore, name: String) !void {
+    pub fn delete(self: *RemoteStore, name: String) !void {
         switch (self.*) {
-            .none => return error.NoFileStore,
-            .dir => |*d| try d.delete(name),
+            .file => |*f| try f.delete(name),
             .s3 => |*s| try s.delete(name),
+        }
+    }
+
+    /// One object's size and modification time. error.FileNotFound if
+    /// absent. For a caller that needs a few objects out of a large
+    /// store: `list(.stat)` stats every one.
+    pub fn stat(self: *RemoteStore, name: String) !_vfs.FileStat {
+        switch (self.*) {
+            .file => |*f| return f.stat(name),
+            .s3 => |*s| return s.stat(name),
         }
     }
 
@@ -93,135 +105,175 @@ pub const FileStore = union(enum) {
     /// modification time. Caller releases the result with
     /// `_vfs.freeObjectInfos`.
     ///
-    /// The dir backend lists only the regular files at the top of the
+    /// The file backend lists only the regular files at the top of the
     /// depot, so the `tmp/` staging directory (a directory, not a file)
     /// and the partial puts inside it are skipped. The s3 backend pages
     /// through ListObjectsV2 under the configured prefix.
     pub fn list(
-        self: *FileStore,
+        self: *RemoteStore,
         alloc: std.mem.Allocator,
         detail: _vfs.ListDetail,
     ) ![]_vfs.ObjectInfo {
         switch (self.*) {
-            .none => return error.NoFileStore,
-            .dir => |*d| return _vfs.listFiles(alloc, d.depot, detail),
+            .file => |*f| return _vfs.listFiles(alloc, f.depot, detail),
             .s3 => |*s| return s.list(alloc, detail),
         }
     }
 
-    /// Open an object for ranged reads. error.FileNotFound if absent.
-    pub fn open(self: *FileStore, name: String) !Object {
+    /// Open an object for ranged reads; `size` is its size, which the
+    /// caller knows (the manifest records every SST's; `stat` for the
+    /// rest), so no request goes out here. error.FileNotFound if absent,
+    /// from the file backend; s3 reports it on the first read. `opts` is
+    /// how the file backend opens the file (direct, mmap, ...); s3
+    /// ignores it.
+    pub fn open(
+        self: *RemoteStore,
+        name: String,
+        size: u64,
+        opts: _vfs.FileOptions,
+    ) !Object {
         switch (self.*) {
-            .none => return error.NoFileStore,
-            .dir => |*d| return d.open(name),
-            .s3 => |*s| {
-                const sz = try s.head(name);
-                return .{ .s3 = .{
-                    .store = s,
-                    .name = try s.a.dupe(u8, name),
-                    .sz = sz,
-                } };
-            },
+            .file => |*f| return f.open(name, opts),
+            .s3 => |*s| return .{ .s3 = .{
+                .store = s,
+                .name = try s.a.dupe(u8, name),
+                .sz = size,
+            } },
         }
-    }
-
-    /// Convenience: fetch a whole object. Caller owns the bytes.
-    pub fn getAll(self: *FileStore, a: std.mem.Allocator, name: String) ![]u8 {
-        var obj = try self.open(name);
-        defer obj.close();
-        return obj.read(a, 0, obj.size());
     }
 
     /// Measure the ideal readahead for this store endpoint (see
     /// lookahead.calibrate): the size whose transfer time equals the
     /// per-request fixed cost — a network round trip for s3, syscall +
-    /// device latency for dir.
-    pub fn calibrateLookahead(self: *FileStore, block_size: u64) !u64 {
+    /// device latency for file.
+    pub fn calibrateLookahead(self: *RemoteStore, block_size: u64) !u64 {
         switch (self.*) {
-            .none => return 0,
-            .dir => |*d| return d.calibrateLookahead(block_size),
+            .file => |*f| return f.calibrateLookahead(block_size),
             .s3 => |*s| return s.calibrateLookahead(block_size),
         }
     }
 
     /// The calibrated readahead in bytes; 0 = none needed/uncalibrated.
-    pub fn lookahead(self: *const FileStore) u64 {
+    pub fn lookahead(self: *const RemoteStore) u64 {
         switch (self.*) {
-            .none => return 0,
-            .dir => |*d| return d.lookahead,
+            .file => |*f| return f.lookahead,
             .s3 => |*s| return s.lookahead,
         }
     }
 };
 
-/// A readable object: open once, read many ranges. Mirrors the shape of
-/// vfs.FileHandle so the tiered-storage stage can swap it in under Table.
+/// A readable object: open once, read many ranges. `.file` is a VFS
+/// handle — a file object opened as the caller asked, or a memory-backed
+/// handle (tests, benches) — so direct I/O, mmap and the bandwidth
+/// limiter apply as they do to any local file. `.s3` reads are ranged
+/// GETs.
 pub const Object = union(enum) {
-    dir: DirObject,
+    file: _vfs.FileHandle,
     s3: S3Object,
 
     pub fn size(self: *const Object) u64 {
         switch (self.*) {
-            .dir => |*o| return o.sz,
+            .file => |*f| return f.file_size,
             .s3 => |*o| return o.sz,
         }
     }
 
-    /// Read `len` bytes at `offset`. Caller owns the returned buffer.
-    pub fn read(self: *Object, a: std.mem.Allocator, offset: u64, len: u64) ![]u8 {
+    /// True when reads are memory copies, not I/O: a mapped or
+    /// memory-backed file. Nothing to gain from batching those.
+    pub fn isResident(self: *const Object) bool {
         switch (self.*) {
-            .dir => |*o| return o.read(a, offset, len),
-            .s3 => |*o| return o.store.readRange(a, o.name, offset, len),
+            .file => |*f| return f.mapped != null or f.owned_buf != null,
+            .s3 => return false,
+        }
+    }
+
+    /// `FileHandle.readAligned` over this object: a page-aligned buffer
+    /// (or a slice into resident bytes) that `result.free()` releases.
+    pub fn readAligned(
+        self: *const Object,
+        a: std.mem.Allocator,
+        offset: u64,
+        len: usize,
+        priority: _vfs.Priority,
+    ) !_vfs.ReadResult {
+        switch (self.*) {
+            .file => |*f| return f.readAligned(a, offset, len, priority),
+            .s3 => |*o| {
+                // The same aligned-buffer contract as the file path, so a
+                // caller cannot tell which backend served it.
+                const buf = try a.alignedAlloc(u8, _vfs.page_alignment, len);
+                errdefer a.free(buf);
+                try o.store.read(o.name, o.sz, offset, buf);
+                return .{ .buf = buf, .data = buf, .allocator = a };
+            },
+        }
+    }
+
+    /// `FileHandle.batchRead` over this object: one io_uring submission
+    /// for a file, coalesced concurrent GETs for s3 (S3Store.batchRead).
+    /// Either way `data` lives in `arena`.
+    pub fn batchRead(
+        self: *const Object,
+        arena: *std.heap.ArenaAllocator,
+        requests: []_vfs.FileHandle.ReadRequest,
+        priority: _vfs.Priority,
+    ) !void {
+        switch (self.*) {
+            .file => |*f| return f.batchRead(arena, requests, priority),
+            .s3 => |*o| return o.store.batchRead(
+                o.name,
+                o.sz,
+                arena,
+                requests,
+            ),
         }
     }
 
     pub fn close(self: *Object) void {
         switch (self.*) {
-            .dir => |*o| o.close(),
+            .file => |*f| f.close(),
             .s3 => |*o| o.store.a.free(o.name),
         }
     }
 };
 
-/// Each read is one ranged GET; the handle is where keep-alive
-/// connection reuse lands later.
+/// Each read is one or more ranged GETs on the store's connection slots.
 const S3Object = struct {
     store: *_s3.S3Store,
     name: String,
     sz: u64,
 };
 
-/// A write-once blob store on a filesystem: a shared depot today (local
-/// dir, NFS mount), and the home of a node's SSTs once SST operations move
-/// behind `FileStore` (see the egres todo). put() is tmp+rename so a
-/// reader can never observe a partial object, and only the creating node
-/// ever writes a given name, so tmp names cannot collide across nodes.
-pub const DirStore = struct {
+/// A write-once blob store on a filesystem: a local directory or a
+/// shared mount (NFS). put() is tmp+rename so a reader can never observe
+/// a partial object, and only the creating node ever writes a given
+/// name, so tmp names cannot collide across nodes.
+pub const FileStore = struct {
     a: std.mem.Allocator,
     depot: String,
     /// calibrateLookahead at startup. 0 = uncalibrated. Not consumed yet —
     /// tiered reads will size their readahead from it.
     lookahead: u64 = 0,
 
-    pub fn init(a: std.mem.Allocator, depot: String) !DirStore {
+    pub fn init(a: std.mem.Allocator, depot: String) !FileStore {
         const tmp_dir = try std.fmt.allocPrint(a, "{s}/tmp", .{depot});
         defer a.free(tmp_dir);
         try _vfs.createDirPath(tmp_dir);
         return .{ .a = a, .depot = try a.dupe(u8, depot) };
     }
 
-    pub fn deinit(self: *DirStore) void {
+    pub fn deinit(self: *FileStore) void {
         self.a.free(self.depot);
     }
 
-    fn objectPath(self: *DirStore, name: String) ![]u8 {
+    fn objectPath(self: *FileStore, name: String) ![]u8 {
         return std.fmt.allocPrint(self.a, "{s}/{s}", .{ self.depot, name });
     }
 
-    pub fn put(self: *DirStore, name: String, data: String) !void {
+    pub fn put(self: *FileStore, name: String, data: String) !void {
         // O_DIRECT requires it, and every legit caller already complies
-        // (the SST builder pads + aligns its output; forest.readFile
-        // returns page-aligned reads) — reject rather than bounce.
+        // (the SST builder pads + aligns its output) — reject rather
+        // than bounce.
         if (@intFromPtr(data.ptr) % _vfs.page_size != 0 or data.len % _vfs.page_size != 0)
             return error.UnalignedPut;
 
@@ -235,13 +287,12 @@ pub const DirStore = struct {
         defer self.a.free(final);
         // fsync-before-rename (inside writeAndSync): uploads must be
         // durable before the manifest change referencing them is proposed.
-        // Direct I/O — depot objects are write-once distribution bytes
-        // this node never reads back; they must not churn the page cache.
-        // truncate — a crashed put can leave a partial tmp file;
-        // re-putting must overwrite it. .p1: uploads gate proposes, the
-        // same class as flush I/O. The NAME's durability (dir entry) is
-        // the caller's batch-level barrier: one FileStore.sync after all
-        // puts.
+        // Direct I/O — a fresh SST is read back through its own direct
+        // handle; the write must not churn the page cache. truncate — a
+        // crashed put can leave a partial tmp file; re-putting must
+        // overwrite it. .p1: uploads gate proposes, the same class as
+        // flush I/O. The NAME's durability (dir entry) is the caller's
+        // batch-level barrier: one RemoteStore.sync after all puts.
         try _vfs.writeAndSync(
             tmp,
             data,
@@ -251,11 +302,11 @@ pub const DirStore = struct {
         try _vfs.renameFile(tmp, final);
     }
 
-    fn sync(self: *DirStore) void {
+    fn sync(self: *FileStore) void {
         _vfs.syncDir(self.depot);
     }
 
-    fn exists(self: *DirStore, name: String) !bool {
+    fn exists(self: *FileStore, name: String) !bool {
         const path = try self.objectPath(name);
         defer self.a.free(path);
 
@@ -263,29 +314,28 @@ pub const DirStore = struct {
         return true;
     }
 
-    fn delete(self: *DirStore, name: String) !void {
+    fn delete(self: *FileStore, name: String) !void {
         const path = try self.objectPath(name);
         defer self.a.free(path);
 
         try _vfs.deleteFile(path);
     }
 
-    fn open(self: *DirStore, name: String) !Object {
+    fn open(self: *FileStore, name: String, opts: _vfs.FileOptions) !Object {
         const path = try self.objectPath(name);
         defer self.a.free(path);
-
-        const f = try fiber.Dir.cwd().openFile(path, .{});
-        errdefer f.close();
-
-        const sz = (try f.stat()).size;
-        return .{ .dir = .{ .f = f, .sz = sz } };
+        return .{ .file = try _vfs.g().openFile(self.a, path, opts) };
     }
 
     /// Object size in bytes; errors if absent.
-    pub fn head(self: *DirStore, name: String) !u64 {
+    pub fn head(self: *FileStore, name: String) !u64 {
+        return (try self.stat(name)).size;
+    }
+
+    fn stat(self: *FileStore, name: String) !_vfs.FileStat {
         const path = try self.objectPath(name);
         defer self.a.free(path);
-        return _vfs.fileSize(path);
+        return _vfs.fileStat(path);
     }
 
     /// Measure this depot's ideal readahead (policy in vfs/lookahead.zig;
@@ -293,7 +343,7 @@ pub const DirStore = struct {
     /// in `lookahead`. Meaningful locally too: the knee is device latency
     /// × device bandwidth (~100s of KB on NVMe) instead of network round
     /// trip × link bandwidth (~MBs).
-    pub fn calibrateLookahead(self: *DirStore, block_size: u64) !u64 {
+    pub fn calibrateLookahead(self: *FileStore, block_size: u64) !u64 {
         self.lookahead = try _lookahead.calibrate(self.a, self, block_size);
         return self.lookahead;
     }
@@ -310,7 +360,7 @@ pub const DirStore = struct {
     /// trips that production reads never pay. Opened O_DIRECT so the
     /// page cache can't serve repeats and turn the numbers into memory
     /// bandwidth.
-    pub fn probeRead(self: *DirStore, off: u64, len: u64) !_lookahead.Probe {
+    pub fn probeRead(self: *FileStore, off: u64, len: u64) !_lookahead.Probe {
         const path = try self.objectPath(_lookahead.probe_object);
         defer self.a.free(path);
         // O_DIRECT needs page-aligned offset/length/buffer; align the
@@ -351,27 +401,5 @@ pub const DirStore = struct {
             @intCast(utils.timestampNow(.monotonic, .nanos) - t1);
         if (!_lookahead.verifyProbeData(a_off, buf)) return error.BadProbeData;
         return .{ .size = a_len, .ttfb_ns = fixed_ns, .total_ns = total };
-    }
-};
-
-const DirObject = struct {
-    f: fiber.File,
-    sz: u64,
-
-    fn read(self: *DirObject, a: std.mem.Allocator, offset: u64, len: u64) ![]u8 {
-        const buf = try a.alloc(u8, @intCast(len));
-        errdefer a.free(buf);
-
-        var off: u64 = 0;
-        while (off < len) {
-            const n = try self.f.read(buf[@intCast(off)..], offset + off);
-            if (n == 0) return error.UnexpectedEof;
-            off += n;
-        }
-        return buf;
-    }
-
-    fn close(self: *DirObject) void {
-        self.f.close();
     }
 };

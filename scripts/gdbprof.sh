@@ -15,7 +15,8 @@
 # The load command runs once the server answers on the SQL port; its
 # port is taken from `--listen=offset=N` in the egres args (3210 + N).
 # Example:
-#   scripts/gdbprof.sh -n 200 -- --raft=id=1 --zdb=dir=/data/egres \
+#   scripts/gdbprof.sh -n 200 -- --raft=id=1 \
+#     --remote=dir_path=/data/egres/sst --wal=dir=/data/egres/wal \
 #     --listen=offset=1 :: pgbench "host=127.0.0.1 port=3211 dbname=egres \
 #     sslmode=disable" -n -S -c 64 -j 16 -T 40
 set -euo pipefail

@@ -14,7 +14,7 @@ const Key = zdb.kv.Key;
 /// directly so we don't need to retain pointers into the table after it's
 /// dropped (smallest/biggest live in the table's index memory).
 /// The file id an SST's name encodes (`<id:016x>.sst`, see
-/// `zdb.sstPath`). 0 when the name does not follow that layout — this
+/// `zdb.sstName`). 0 when the name does not follow that layout — this
 /// tool only reports the id, so a stray name is not an error.
 fn idFromName(basename: String) u64 {
     if (!std.mem.endsWith(u8, basename, ".sst")) return 0;
@@ -23,16 +23,54 @@ fn idFromName(basename: String) u64 {
     return std.fmt.parseInt(u64, stem, 16) catch 0;
 }
 
-fn verifyOne(allocator: std.mem.Allocator, path: String) bool {
-    const base = std.fs.path.basename(path);
+/// The extent the manifest would hold for `name`, read from the file:
+/// its size and, from the trailer ([u32 index_len][u64 hash]), where
+/// the index starts. This tool has no manifest to ask.
+fn probeExtent(
+    allocator: std.mem.Allocator,
+    store: *vfs.RemoteStore,
+    name: String,
+) !Table.Extent {
+    const trailer_len = zdb.table.index.trailer_len;
+    const size = (try store.stat(name)).size;
+    if (size < trailer_len) return error.CorruptTable;
 
-    const t = Table.open(allocator, path, idFromName(base), .p2) catch |err| {
+    var obj = try store.open(name, size, .{});
+    defer obj.close();
+
+    const trailer_at = size - trailer_len;
+    const res = try obj.readAligned(allocator, trailer_at, trailer_len, .p2);
+    defer res.free();
+
+    if (res.data.len < trailer_len) return error.CorruptTable;
+    const index_len = std.mem.readInt(u32, res.data[0..4], .little);
+    if (index_len > trailer_at) return error.CorruptTable;
+
+    return .{ .size = size, .index_offset = trailer_at - index_len };
+}
+
+fn verifyOne(
+    allocator: std.mem.Allocator,
+    store: *vfs.RemoteStore,
+    base: String,
+) bool {
+    const extent = probeExtent(allocator, store, base) catch |err| {
+        std.debug.print("FAIL {s} probe={s}\n", .{ base, @errorName(err) });
+        return false;
+    };
+    const t = Table.open(
+        allocator,
+        store,
+        idFromName(base),
+        extent,
+        .p2,
+    ) catch |err| {
         std.debug.print("FAIL {s} open={s}\n", .{ base, @errorName(err) });
         return false;
     };
     defer t.decrRef();
 
-    const file_size = t.handle.file_size;
+    const file_size = t.fileSize();
     const fid = t.file_id;
 
     // The file carries no namespace or table_id; a standalone check
@@ -107,23 +145,25 @@ pub fn main(init: std.process.Init) !void {
     // Same defaults the server uses; the verifier only reads, but the global
     // VFS still needs a bandwidth controller.
     vfs.VFS.initGlobal(.{ .bytes_per_sec = 500 * 1024 * 1024 });
+    // The dir as a store, so tables open the way the server opens them.
+    var store = try vfs.RemoteStore.initFile(allocator, dir_path);
+    defer store.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
 
-    var paths: std.ArrayList(String) = .empty;
+    var names: std.ArrayList(String) = .empty;
     defer {
-        for (paths.items) |p| allocator.free(p);
-        paths.deinit(allocator);
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
     }
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".sst")) continue;
-        const full = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-        try paths.append(allocator, full);
+        try names.append(allocator, try allocator.dupe(u8, entry.name));
     }
-    std.mem.sort(String, paths.items, {}, struct {
+    std.mem.sort(String, names.items, {}, struct {
         fn lt(_: void, a: String, b: String) bool {
             return std.mem.lessThan(u8, a, b);
         }
@@ -131,8 +171,8 @@ pub fn main(init: std.process.Init) !void {
 
     var ok: u64 = 0;
     var bad: u64 = 0;
-    for (paths.items) |p| {
-        if (verifyOne(allocator, p)) ok += 1 else bad += 1;
+    for (names.items) |n| {
+        if (verifyOne(allocator, &store, n)) ok += 1 else bad += 1;
     }
     std.debug.print("\nsummary: {d} OK, {d} FAIL\n", .{ ok, bad });
     if (bad > 0) std.process.exit(1);

@@ -43,6 +43,14 @@ pub fn Group(comptime T: type) type {
             return .{ .alloc = alloc };
         }
 
+        /// `init` with room for `n` spawns, so none of them allocates.
+        pub fn initCapacity(alloc: std.mem.Allocator, n: usize) !Self {
+            var g = init(alloc);
+            errdefer g.deinit();
+            try g.ensureTotalCapacity(n);
+            return g;
+        }
+
         pub fn deinit(self: *Self) void {
             // `wait()` consumes (joins → frees) the handles, so after a wait
             // there's nothing to dispose here — just free our own lists. A Group

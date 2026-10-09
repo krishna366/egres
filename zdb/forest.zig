@@ -36,22 +36,7 @@ const SkipList = _skl.SkipList;
 const Emitter = _tree.Tree.Emitter;
 const _mitr = _table.merge_iterator;
 
-/// Build the SST path for `file_id`. Filename layout is `<id:016x>.sst` —
-/// fixed-width hex, so directory listings sort by id lexicographically.
-/// Pass `dir = ""` to get the bare filename without any prefix; otherwise
-/// the result is `<dir>/<filename>`. Caller owns the returned slice.
-pub fn sstPath(allocator: std.mem.Allocator, dir: String, file_id: u64) ![]u8 {
-    if (dir.len == 0) return std.fmt.allocPrint(
-        allocator,
-        "{x:0>16}.sst",
-        .{file_id},
-    );
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{x:0>16}.sst",
-        .{ dir, file_id },
-    );
-}
+pub const sstName = _table.table.sstName;
 
 // ---------------------------------------------------------------------------
 // TableTrees
@@ -526,6 +511,8 @@ pub const Forest = struct {
     /// the next one; the fields in `Config.fixed` never change. The
     /// caller keeps it alive past `close`.
     live: *flags.Live(_config.Config),
+    /// Where every SST lives. The caller keeps it alive past `close`.
+    store: *vfs.RemoteStore,
     manifest: _manifest.Manifest,
     /// One TableTrees per table, keyed by its `{namespace, table_id}` identity.
     /// The TableTreess own the live `*Tree` objects (in their sorted entries);
@@ -571,7 +558,6 @@ pub const Forest = struct {
 
     // Building and applying manifest changes, from forest_ddl.zig.
     pub const installTree = _ddl.installTree;
-    pub const collectMissingFileIds = _ddl.collectMissingFileIds;
     pub const openTablesFromManifest = _ddl.openTablesFromManifest;
     pub const NsId = _ddl.NsId;
     pub const NsResult = _ddl.NsResult;
@@ -594,8 +580,8 @@ pub const Forest = struct {
     pub fn open(
         allocator: std.mem.Allocator,
         live: *flags.Live(_config.Config),
+        store: *vfs.RemoteStore,
     ) !*Forest {
-        const opts = live.cur();
         var manifest = _manifest.Manifest.init(allocator);
         errdefer manifest.deinit();
 
@@ -611,9 +597,10 @@ pub const Forest = struct {
         self.* = .{
             .allocator = allocator,
             .live = live,
+            .store = store,
             .manifest = manifest,
             .tables = fiber.SafeHashMap(TableKey, *TableTrees).init(allocator),
-            .table_cache = TableCache.init(allocator, opts.dir),
+            .table_cache = TableCache.init(allocator, store),
             .memtables = Memtables.init(allocator, mt),
             .snapshot_ts = std.atomic.Value(u64).init(0),
             .read_marks = .{},
@@ -789,15 +776,8 @@ pub const Forest = struct {
             try changes.appendSlice(self.allocator, r.changes.items);
         }
 
-        // Best-effort directory sync.
-        if (self.live.cur().dir.len > 0) {
-            var dir_sync = try fiber.spawn(
-                .{},
-                vfs.syncDir,
-                .{self.live.cur().dir},
-            );
-            defer dir_sync.join();
-        }
+        // The names' durability barrier: every put above is synced.
+        try self.store.sync();
 
         if (srcs.len > 1) log.info(
             "buildFlush: {d} memtables up to id={d} into {d} table(s)",
@@ -833,7 +813,7 @@ pub const Forest = struct {
         const em = try self.allocator.create(Emitter);
         errdefer self.allocator.destroy(em);
 
-        em.* = Emitter.init(tree, 0, .p0, snapshot_ts);
+        em.* = try Emitter.init(tree, 0, .p0, snapshot_ts);
         errdefer em.deinit();
 
         try emitters.append(self.allocator, em);
@@ -858,7 +838,7 @@ pub const Forest = struct {
     /// safe, and the files are disjoint + sorted — a valid sorted
     /// run. Writes+syncs run in a fiber group, one per output file,
     /// like buildFlush; files reach followers exactly like
-    /// flush/compaction outputs (uploaded to the shared file store
+    /// flush/compaction outputs (uploaded to the shared remote store
     /// before propose; apply downloads what's missing). The caller
     /// guarantees the table is un-split —
     /// one tree — which holds for a freshly created index table
@@ -880,7 +860,7 @@ pub const Forest = struct {
         const tree = try self.singleTree(table_key);
         defer tree.release();
 
-        var em = Emitter.init(tree, bottom, .p2, self.snapshotTs());
+        var em = try Emitter.init(tree, bottom, .p2, self.snapshotTs());
         defer em.deinit();
 
         for (items) |item| try em.push(item);
@@ -889,10 +869,7 @@ pub const Forest = struct {
         defer r.changes.deinit(self.allocator);
         try changes.appendSlice(allocator, r.changes.items);
 
-        if (self.live.cur().dir.len > 0) {
-            var dir_sync = try fiber.spawn(.{}, vfs.syncDir, .{self.live.cur().dir});
-            defer dir_sync.join();
-        }
+        try self.store.sync();
         return changes;
     }
 
@@ -949,12 +926,12 @@ pub const Forest = struct {
         changes: []const _manifest.SSTableChange,
         memtable_id: u64,
     ) !void {
-        // Load all new L0 tables concurrently via the cache. writeFile may
-        // have pre-opened these (follower path) → cache hit. On the leader,
-        // flush writes bytes directly, so these will typically be misses.
-        // This is the step that can fail (I/O), so it runs before any
-        // state changes: a retry of the entry then starts from a clean
-        // manifest and clean levels.
+        // Load all new L0 tables concurrently via the cache. The announce
+        // prefetch may have pre-opened these (follower path) → cache hit.
+        // On the leader they will typically be misses. This is the step
+        // that can fail (I/O), so it runs before any state changes: a
+        // retry of the entry then starts from a clean manifest and clean
+        // levels.
         var needed: std.ArrayList(_tree.TableNeed) = .empty;
         defer needed.deinit(self.allocator);
         for (changes) |c| {
@@ -962,6 +939,7 @@ pub const Forest = struct {
             try needed.append(self.allocator, .{
                 .id = c.sst_id,
                 .level = c.level,
+                .extent = .{ .size = c.size, .index_offset = c.index_offset },
             });
         }
         try self.table_cache.loadTables(needed.items);
@@ -1116,16 +1094,13 @@ pub const Forest = struct {
         return true;
     }
 
-    /// Check if an SST file exists on disk.
-    pub fn hasFile(self: *Forest, file_id: u64) bool {
-        const path = sstPath(
-            self.allocator,
-            self.live.cur().dir,
-            file_id,
-        ) catch return false;
-        defer self.allocator.free(path);
-        vfs.access(path) catch return false;
-        return true;
+    /// Open SSTs from the store into the table cache, ahead of the
+    /// manifest entry that lists them (the announce prefetch). Misses
+    /// open concurrently; a hit costs nothing, so a retry after a
+    /// partial failure only opens what is still missing.
+    pub fn prefetch(self: *Forest, needed: []_tree.TableNeed) !void {
+        try self.table_cache.loadTables(needed);
+        TableCache.decrRefs(needed);
     }
 
     /// Let go of every file the manifest unlisted since the last call:
@@ -1165,30 +1140,30 @@ pub const Forest = struct {
 
         for (to_delete) |r| {
             // The table cache let go of the file when the manifest
-            // unlisted it (`evictTables`); only the file is left.
-            const path = try sstPath(self.allocator, self.live.cur().dir, r.sst_id);
-            defer self.allocator.free(path);
-            vfs.deleteFile(path) catch |err| switch (err) {
+            // unlisted it (`evictTables`); only the object is left.
+            const name = try sstName(self.allocator, r.sst_id);
+            defer self.allocator.free(name);
+            self.store.delete(name) catch |err| switch (err) {
                 // Already gone — removeOrphans took it, or a previous
                 // sweep did and the process restarted mid-way.
                 error.FileNotFound => {},
                 else => {
                     log.warn(
-                        "deleteFiles: unlink {s}: {s}",
-                        .{ path, @errorName(err) },
+                        "deleteFiles: delete {s}: {s}",
+                        .{ name, @errorName(err) },
                     );
                     continue;
                 },
             };
         }
         log.info(
-            "deleteFiles: unlinked {d} SST file(s) retired at or below " ++
+            "deleteFiles: deleted {d} SST(s) retired at or below " ++
                 "snapshot index {d}",
             .{ to_delete.len, snapshot_index },
         );
     }
 
-    /// Unlink every SST-shaped file in the data dir that the manifest does
+    /// Delete every SST-shaped object in the store that the manifest does
     /// not know and that was last written at or before a cutoff, the
     /// earlier of two moments:
     ///   - `snapshot_ts`, 0 before the first snapshot, and then the scan
@@ -1206,12 +1181,10 @@ pub const Forest = struct {
     /// the cutoff when the node comes back, which is why the scan runs
     /// periodically and not just at startup.
     ///
-    /// The directory is listed by name only, and only the files the
+    /// The store is listed by name only, and only the objects the
     /// manifest does not know are stat'ed: normally a handful out of
     /// hundreds of thousands.
     pub fn removeOrphans(self: *Forest, min_age_secs: u64) !void {
-        // TODO: Switch to using DirStore.
-
         // Whole seconds on the realtime clock, like a file's mtime.
         const snapshot_hlc = utils.hlc.HLC.fromU64(self.snapshotTs());
         const snapshot_s: i64 = snapshot_hlc.seconds;
@@ -1224,7 +1197,7 @@ pub const Forest = struct {
             defer arena.deinit();
             const arloc = arena.allocator();
 
-            const entries = try vfs.listFiles(arloc, self.live.cur().dir, .names);
+            const entries = try self.store.list(arloc, .names);
             break :blk try self.manifest.unknownFiles(self.allocator, entries);
         };
         defer self.allocator.free(unknowns);
@@ -1235,21 +1208,21 @@ pub const Forest = struct {
 
         var removed: usize = 0;
         for (unknowns) |id| {
-            const path = try sstPath(arloc, self.live.cur().dir, id);
-            // Gone between the listing and here: someone else's unlink.
-            const st = vfs.fileStat(path) catch continue;
+            const name = try sstName(arloc, id);
+            // Gone between the listing and here: someone else's delete.
+            const st = self.store.stat(name) catch continue;
             if (st.mtime_s > cutoff_s) continue;
 
             // A pre-opened table for a create that never applied sits in
-            // the cache with an open fd; unlinked without this, the file
-            // would keep its blocks until the process exits.
+            // the cache with an open handle; without this, it would keep
+            // its blocks until the process exits.
             self.table_cache.evict(id);
-            vfs.deleteFile(path) catch |err| switch (err) {
+            self.store.delete(name) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => {
                     log.warn(
-                        "removeOrphans: unlink {s}: {s}",
-                        .{ path, @errorName(err) },
+                        "removeOrphans: delete {s}: {s}",
+                        .{ name, @errorName(err) },
                     );
                     continue;
                 },
@@ -1257,156 +1230,10 @@ pub const Forest = struct {
             removed += 1;
         }
         if (removed > 0) log.info(
-            "removeOrphans: unlinked {d} of {d} unknown SST file(s) last " ++
+            "removeOrphans: deleted {d} of {d} unknown SST(s) last " ++
                 "written at or before the cutoff",
             .{ removed, unknowns.len },
         );
-    }
-
-    /// Write an SST file to disk and pre-open it into the table cache.
-    /// Skips the write when the file is already cached, or already on disk with
-    /// a matching size — file_id → content is deterministic in this system, and
-    /// a size match is a strong signal the bytes are correct (no cross-ID
-    /// collisions possible). If a size mismatch is detected, we log and
-    /// rewrite.
-    pub fn writeFile(self: *Forest, file_id: u64, data: String) void {
-        const fe = std.log.scoped(.file_event);
-        if (self.table_cache.contains(file_id)) {
-            fe.info("event=write_file file_id={d} path=cache_hit", .{file_id});
-            return;
-        }
-
-        const path = sstPath(
-            self.allocator,
-            self.live.cur().dir,
-            file_id,
-        ) catch return;
-        defer self.allocator.free(path);
-
-        // Probe existence + size via vfs (no allocation, just open +
-        // getEndPos).
-        const existing_size: ?u64 = if (vfs.g().openFile(
-            self.allocator,
-            path,
-            .{},
-        )) |fh| blk: {
-            defer fh.close();
-            break :blk fh.file_size;
-        } else |_| null;
-
-        const size_matches = existing_size != null and
-            existing_size.? == data.len;
-        if (existing_size != null and !size_matches) {
-            log.warn(
-                "writeFile: size mismatch for {d} ({d} on disk vs {d}), " ++
-                    "rewriting",
-                .{ file_id, existing_size.?, data.len },
-            );
-        }
-
-        if (!size_matches) {
-            const fh = vfs.g().createFile(path, .{
-                .mode = .direct,
-                .flags = .{ .truncate = true },
-            }) catch |err| {
-                log.err(
-                    "writeFile: createFile failed for {d}: {s}",
-                    .{ file_id, @errorName(err) },
-                );
-                return;
-            };
-            // `data` is a slice into a network frame (see node.zig p1_recv), so
-            // its ADDRESS isn't page-aligned — copy it into a page-aligned
-            // buffer for the O_DIRECT write. Its LENGTH must already be page
-            // aligned: every SST the builder produces is page-padded, so a
-            // non-aligned length means a corrupt/unexpected file — log and bail
-            // rather than reshape it.
-            if (data.len % vfs.page_size != 0) {
-                log.err(
-                    "writeFile: file {d} length {d} not page-aligned; " ++
-                        "refusing O_DIRECT write",
-                    .{ file_id, data.len },
-                );
-                fh.close();
-                return;
-            }
-            const buf = self.allocator.alignedAlloc(
-                u8,
-                vfs.page_alignment,
-                data.len,
-            ) catch |err| {
-                log.err(
-                    "writeFile: bounce alloc failed for {d}: {s}",
-                    .{ file_id, @errorName(err) },
-                );
-                fh.close();
-                return;
-            };
-            defer self.allocator.free(buf);
-            @memcpy(buf, data);
-            fh.write(buf, 0, .p1) catch |err| {
-                log.err(
-                    "writeFile: write failed for {d}: {s}",
-                    .{ file_id, @errorName(err) },
-                );
-                fh.close();
-                return;
-            };
-            fh.sync() catch {};
-            fh.close();
-            fe.info(
-                "event=write_file file_id={d} path=wrote bytes={d}",
-                .{ file_id, data.len },
-            );
-        } else {
-            fe.info(
-                "event=write_file file_id={d} path=disk_hit bytes={d}",
-                .{ file_id, data.len },
-            );
-        }
-
-        // Pre-open the table into the cache so it's ready when compaction needs
-        // it.
-        const t = Table.open(self.allocator, path, file_id, .p1) catch |err| {
-            log.err(
-                "writeFile: Table.open failed for {d}: {s}",
-                .{ file_id, @errorName(err) },
-            );
-            return;
-        };
-        // `own` takes the cache's own ref when it adopts the table; when it
-        // does not (the apply loop cached the same id first, or the insert
-        // failed) the open-time ref below is the only one and frees it.
-        _ = self.table_cache.own(file_id, t) catch |err| log.err(
-            "writeFile: table_cache.own failed for {d}: {s}",
-            .{ file_id, @errorName(err) },
-        );
-        t.decrRef();
-    }
-
-    /// Read an SST file from disk. The bytes are `result.data`; the caller
-    /// releases them with `result.free()`, which knows the page-aligned
-    /// buffer behind the slice (a plain `allocator.free` on the slice frees
-    /// with the wrong alignment).
-    pub fn readFile(
-        self: *Forest,
-        allocator: std.mem.Allocator,
-        file_id: u64,
-    ) ?vfs.ReadResult {
-        const path = sstPath(
-            self.allocator,
-            self.live.cur().dir,
-            file_id,
-        ) catch return null;
-        defer self.allocator.free(path);
-        const handle = vfs.g().openFile(allocator, path, .{}) catch return null;
-        defer handle.close();
-        return handle.readAligned(
-            allocator,
-            0,
-            @intCast(handle.file_size),
-            .p1,
-        ) catch return null;
     }
 
     // -----------------------------------------

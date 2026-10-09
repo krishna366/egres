@@ -33,7 +33,8 @@ expect() {
 # Ready = listener up AND election won — the listener opens a few hundred
 # ms before become-leader, and proposals before that fail NotCommitted.
 start_server() {
-    ./zig-out/bin/egres --raft="id=1" --zdb="dir=$DATA" >"$LOG" 2>&1 &
+    ./zig-out/bin/egres --raft="id=1" \
+        --remote="dir_path=$DATA/sst" --wal="dir=$DATA/wal" >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 50); do
         if grep -q "sql listener started" "$LOG" 2>/dev/null &&
@@ -106,7 +107,8 @@ expect "PK index name collision fails CREATE" "already exists" \
 # snapshot flags make the leader take one within a second or two.
 stop_server
 ./zig-out/bin/egres --raft="id=1" \
-    --zdb="dir=$DATA;table-bytes=4096;flush-min-memtables=1" \
+    --remote="dir_path=$DATA/sst" --wal="dir=$DATA/wal" \
+    --zdb="table-bytes=4096;flush-min-memtables=1" \
     --snapshot="min-bytes=1;min-age-seconds=1;poll-interval-seconds=1" \
     >"$LOG" 2>&1 &
 SERVER_PID=$!

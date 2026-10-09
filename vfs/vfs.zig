@@ -8,8 +8,10 @@ const fiber = @import("zfiber");
 const utils = @import("utils");
 const String = utils.String;
 pub const bandwidth = @import("bandwidth.zig");
-pub const filestore = @import("filestore.zig");
-pub const FileStore = filestore.FileStore;
+pub const remotestore = @import("remotestore.zig");
+pub const RemoteStore = remotestore.RemoteStore;
+pub const ChunkCache = @import("chunkcache.zig").ChunkCache;
+pub const Object = remotestore.Object;
 pub const sigv4 = @import("sigv4.zig");
 pub const s3 = @import("s3.zig");
 pub const lookahead = @import("lookahead.zig");
@@ -561,7 +563,7 @@ fn linuxFsMagic(path: String) ?i64 {
 
 /// Create (truncating if it exists), write `data` in one shot, and fsync:
 /// whole-file writers want the bytes durable, not dirty page cache — the
-/// dir store renames these into place as upload targets, and a rename
+/// file store renames these into place as upload targets, and a rename
 /// must never expose a name whose data could still be lost.
 pub fn writeFile(path: String, data: String) !void {
     const f = try fiber.Dir.cwd().createFile(path, .{});
@@ -674,7 +676,7 @@ pub fn listFiles(alloc: std.mem.Allocator, dir: String, detail: ListDetail) ![]O
 ///
 /// Takes `FileOptions` rather than expanding into one parameter per flag
 /// so this function's signature stays stable as new flags are added.
-/// Pub for the dir store's calibration probe reads, which need O_DIRECT
+/// Pub for the file store's calibration probe reads, which need O_DIRECT
 /// without a FileHandle's bandwidth accounting.
 pub fn openDirect(path: String, opts: FileOptions) !posix.fd_t {
     const direct_io = opts.mode == .direct;

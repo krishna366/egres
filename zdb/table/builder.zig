@@ -246,11 +246,17 @@ const BlockInfo = struct {
 
 pub const TableBuffer = struct {
     allocator: std.mem.Allocator,
-    // Page-aligned so O_DIRECT writers (SST flush in tree.zig, memtable flush
-    // in forest.zig) can hand it straight to `vfs.FileHandle.write` — O_DIRECT
-    // requires the buffer ADDRESS (as well as length + offset) to be page
+    // Page-aligned so `RemoteStore.put` (O_DIRECT in a file store) can take
+    // it as is: the buffer ADDRESS as well as its length must be page
     // aligned, and `finish()` already pads the length to a page multiple.
     bytes: []align(vfs.page_size) u8,
+    /// Where the index starts; with `bytes.len` it is the table's
+    /// extent, recorded in the manifest so an open is one read.
+    index_offset: u64,
+
+    pub fn extent(self: *const TableBuffer) _idx.Extent {
+        return .{ .size = self.bytes.len, .index_offset = self.index_offset };
+    }
 
     pub fn deinit(self: *TableBuffer) void {
         self.allocator.free(self.bytes);
@@ -540,7 +546,11 @@ pub const Builder = struct {
         try self.finishBlock();
 
         if (self.block_infos.items.len == 0) {
-            return .{ .allocator = self.allocator, .bytes = try self.allocator.alignedAlloc(u8, vfs.page_alignment, 0) };
+            return .{
+                .allocator = self.allocator,
+                .bytes = try self.allocator.alignedAlloc(u8, vfs.page_alignment, 0),
+                .index_offset = 0,
+            };
         }
 
         var index_bytes = std.ArrayList(u8).empty;
@@ -661,7 +671,11 @@ pub const Builder = struct {
         const bytes = try self.allocator.alignedAlloc(u8, vfs.page_alignment, len);
         self.table_buf.copyTo(bytes);
         self.table_buf.reset();
-        return .{ .allocator = self.allocator, .bytes = bytes };
+        return .{
+            .allocator = self.allocator,
+            .bytes = bytes,
+            .index_offset = len - index_bytes.items.len,
+        };
     }
 
     fn shouldFinishBlock(self: *Builder, new_entry_est: usize) bool {

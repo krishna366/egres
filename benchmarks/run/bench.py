@@ -330,7 +330,9 @@ def start_egres(run: Run):
               f"raft-port={srv['sql_port'] + 1500}")
     cmd = scope_prefix(run) + [
         str(run.egres_bin), "--raft=id=1", f"--listen={listen}",
-        f"--zdb=dir={run.data};{srv['zdb_extra']}", f"--wal=dir={run.wal}"]
+        f"--remote=dir_path={run.data}", f"--wal=dir={run.wal}"]
+    if srv["zdb_extra"]:
+        cmd.append(f"--zdb={srv['zdb_extra']}")
     if srv["cache"]:
         cmd.append(f"--cache={srv['cache']}")
     with open(run.server_log, "w") as log:

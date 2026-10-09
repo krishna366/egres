@@ -34,6 +34,14 @@ pub const format_version: u32 = 1;
 /// trailer from here; nothing may hardcode 12.
 pub const trailer_len: usize = 4 + 8;
 
+/// A table's size and where its index starts, as the manifest records
+/// them: [index_offset, size) is the index plus the trailer, so an open
+/// is one read with no stat and no trailer round trip.
+pub const Extent = struct {
+    size: u64,
+    index_offset: u64,
+};
+
 pub const Error = error{
     CorruptTable,
     OutOfBounds,

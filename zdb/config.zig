@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const utils = @import("utils");
-const String = utils.String;
 
 pub const Error = error{
     InvalidNumCompactors,
@@ -11,14 +10,11 @@ pub const Error = error{
     InvalidTableSize,
     InvalidBlockSize,
     InvalidMaxLevels,
-    InvalidDirForInMemory,
     InvalidL0MergeMinTables,
     InvalidL0BackpressureStartCount,
 };
 
 pub const Config = struct {
-    dir: String = "",
-    in_memory: bool = false,
     read_only: bool = false,
 
     /// The size a table is aimed at, in memory and on disk: a memtable
@@ -161,12 +157,10 @@ pub const Config = struct {
     /// `--zdb`: every field is a flag; the defaults above are what
     /// `--help` prints. Read once when the forest opens.
     pub const docs = .{
-        .self = "LSM forest storage: paths, memtable and flush policy," ++
-            " level shape, compaction and backpressure. Live: an update" ++
-            " reaches the next flush, compaction job or check.",
-        .dir = "Directory holding the LSM forest. Required.",
-        .in_memory = "Keep the forest in memory only; `dir` must be empty." ++
-            " For tests.",
+        .self = "LSM forest storage: memtable and flush policy, level" ++
+            " shape, compaction and backpressure. SSTs live in the" ++
+            " --remote store. Live: an update reaches the next flush," ++
+            " compaction job or check.",
         .read_only = "Open the forest without writing to it.",
         .table_bytes = "Bytes a memtable holds before it is frozen and" ++
             " flushed, and the size every SST is cut at. Small values" ++
@@ -213,13 +207,11 @@ pub const Config = struct {
             " level, fetching its base if needed.",
     };
 
-    /// Read once when the forest opens: the paths and mode, the level
-    /// count (each tree's level array is sized by it) and the worker
-    /// count (the fibers are spawned then). A live update to one of
-    /// these is refused.
+    /// Read once when the forest opens: the mode, the level count (each
+    /// tree's level array is sized by it) and the worker count (the
+    /// fibers are spawned then). A live update to one of these is
+    /// refused.
     pub const fixed = .{
-        "dir",
-        "in_memory",
         "read_only",
         "max_levels",
         "num_compactors",
@@ -253,8 +245,6 @@ pub const Config = struct {
         // L0 needs an L1 to push into, and only a level below L0 rolls
         // postings up and discards old versions.
         if (self.max_levels < 2) return error.InvalidMaxLevels;
-        if (self.in_memory and
-            self.dir.len != 0) return error.InvalidDirForInMemory;
         // A merge of one table is a copy.
         if (self.l0_merge_min_tables == 1) return error.InvalidL0MergeMinTables;
         // The L0 score is a fraction of it.

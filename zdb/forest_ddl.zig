@@ -51,24 +51,6 @@ pub fn installTree(self: *Forest, namespace_id: u64, tree_id: u64) !void {
     try tbl_trees.addTree(held, tree);
 }
 
-/// Walk every tree's level table list and append the file_ids of any SST
-/// not currently on disk. The returned slice is owned by the caller.
-pub fn collectMissingFileIds(
-    self: *Forest,
-    allocator: std.mem.Allocator,
-) ![]u64 {
-    // The ids come out under the manifest lock; the disk check (a stat
-    // per file) runs after it is released.
-    const listed = try self.manifest.listedFileIds(allocator);
-    defer allocator.free(listed);
-    var out: std.ArrayList(u64) = .empty;
-    errdefer out.deinit(allocator);
-    for (listed) |fid| {
-        if (!self.hasFile(fid)) try out.append(allocator, fid);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
 /// Walk `self.manifest.trees` and install each tree (Tree + TableTrees entries).
 /// Used after `Manifest.restoreFrom(snapshot.data)` at recovery — the
 /// manifest already names every tree and table, but the in-memory Tree
@@ -528,6 +510,7 @@ pub fn buildSplit(
                     namespace_id,
                     new_tree_id,
                     @intCast(llv_idx),
+                    tbe.table.extent,
                 ));
             } else if (tbe.table.biggest.orderPrimary(
                 split_key,
@@ -540,6 +523,7 @@ pub fn buildSplit(
                     namespace_id,
                     new_tree_id,
                     @intCast(llv_idx),
+                    tbe.table.extent,
                 ));
             }
             // Left-only: no manifest change needed.

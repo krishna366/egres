@@ -14,7 +14,6 @@ const String = utils.String;
 const _manifest = @import("manifest.zig");
 const _table = @import("table.zig");
 const vfs = @import("vfs");
-const _forest = @import("forest.zig");
 const _read = @import("read.zig");
 const zroar = @import("zroar");
 const _tree = @import("tree.zig");
@@ -355,8 +354,13 @@ pub const Emitter = struct {
     /// merge, read per key by the rollup policy.
     opts: _config.Config,
     bld: Builder,
-    /// One sync fiber per table written; joined by `finish`.
+    /// One put fiber per table written; joined by `finish`.
     group: fiber.Group(?FlushResult),
+    /// One seat per put in flight, `max_inflight` of them. A finished
+    /// table sits in memory until its put returns, so `flush` takes a
+    /// seat before spawning and parks when none is free instead of
+    /// running ahead of a slow store; `putFile` gives it back.
+    inflight: fiber.Channel(void),
     stats: Metrics = .{},
     /// An output table is cut once it reaches this. An L0 table has
     /// no limit: an L0→L0 merge writes one output, whatever it weighs,
@@ -371,7 +375,7 @@ pub const Emitter = struct {
         dest: usize,
         prio: vfs.Priority,
         snapshot_ts: u64,
-    ) Emitter {
+    ) !Emitter {
         const opts = tree.live.cur();
         const cfg = _table.builder.Config{
             .block_bytes = opts.block_bytes,
@@ -383,6 +387,10 @@ pub const Emitter = struct {
             .tree = tree,
             .bld = Builder.init(tree.allocator, cfg),
             .group = fiber.Group(?FlushResult).init(tree.allocator),
+            .inflight = try fiber.Channel(void).initAlloc(
+                tree.allocator,
+                max_inflight,
+            ),
             .file_sz = if (dest == 0)
                 std.math.maxInt(usize)
             else
@@ -401,14 +409,18 @@ pub const Emitter = struct {
         };
     }
 
-    /// Safe after `finish` and after an error: every sync still
+    /// Safe after `finish` and after an error: every put still
     /// running is joined before the builder goes.
     pub fn deinit(e: *Emitter) void {
         e.tracker.deinit();
         _ = e.group.wait();
         e.group.deinit();
+        e.inflight.deinit();
         e.bld.deinit();
     }
+
+    /// Finished tables an emitter holds while their puts run.
+    const max_inflight = 3;
 
     /// Feed one item — one primary with its versions — in merge
     /// (consumption) order. Nothing is held across calls: the merge
@@ -463,29 +475,25 @@ pub const Emitter = struct {
         }
     }
 
-    /// The open table out: finished, written to a new SST file, its
-    /// sync spawned into the group; the builder is reset for the next.
-    /// Nothing happens for an empty builder.
+    /// The open table out: finished, its upload to the store spawned
+    /// into the group; the builder is reset for the next. Nothing
+    /// happens for an empty builder.
     pub fn flush(e: *Emitter) !void {
         var tb = try e.bld.finish();
-        defer tb.deinit();
+        errdefer tb.deinit();
         defer e.bld.reset();
-        if (tb.bytes.len == 0) return;
+        if (tb.bytes.len == 0) {
+            tb.deinit();
+            return;
+        }
 
         const tree = e.tree;
         const id = tree.manifest.newFileId();
-        const path = try _forest.sstPath(
-            tree.allocator,
-            tree.live.cur().dir,
-            id,
-        );
-        errdefer tree.allocator.free(path);
-
-        const wh = try vfs.g().createFile(path, .{ .mode = .direct });
-        try wh.write(tb.bytes, 0, e.prio);
-
-        // Sync in a fiber.
-        try e.group.spawn(.{}, syncFile, .{ tree.allocator, wh, path, id });
+        e.inflight.send({}) catch return error.FlushFailed;
+        errdefer _ = e.inflight.tryReceive() catch {};
+        // The fiber owns `tb` from here: the builder's next table is
+        // built while this one uploads.
+        try e.group.spawn(.{}, putFile, .{ e, tb, id });
     }
 
     /// Close the stream: the last table out, every sync joined, and
@@ -503,22 +511,30 @@ pub const Emitter = struct {
                 tree.namespace,
                 tree.tree_id,
                 @intCast(e.dest),
+                r.extent,
             ));
         }
         return .{ .changes = changes, .stats = e.stats };
     }
 };
 
-const FlushResult = struct { file_id: u64 };
+const FlushResult = struct { file_id: u64, extent: _table.Table.Extent };
 
-fn syncFile(
-    allocator: std.mem.Allocator,
-    wh: vfs.FileHandle,
-    path: String,
+/// Upload one finished table. put syncs the bytes; the caller's
+/// `store.sync()` after the group covers the names.
+fn putFile(
+    e: *Emitter,
+    tb_in: _table.builder.TableBuffer,
     file_id: u64,
 ) ?FlushResult {
-    defer allocator.free(path);
-    wh.sync() catch return null;
-    wh.close();
-    return .{ .file_id = file_id };
+    var tb = tb_in;
+    defer tb.deinit();
+    defer _ = e.inflight.tryReceive() catch {};
+    const name = _table.table.sstName(tb.allocator, file_id) catch return null;
+    defer tb.allocator.free(name);
+    e.tree.cache.store.put(name, tb.bytes) catch |err| {
+        log.err("put {s}: {s}", .{ name, @errorName(err) });
+        return null;
+    };
+    return .{ .file_id = file_id, .extent = tb.extent() };
 }

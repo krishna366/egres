@@ -13,6 +13,7 @@ const makeTreeId = @import("kv.zig").makeTreeId;
 const fiber = @import("zfiber");
 const utils = @import("utils");
 const vfs = @import("vfs");
+pub const Extent = @import("table/index.zig").Extent;
 const String = utils.String;
 
 /// The manifest lock. Shared for the name lookups on the query path and
@@ -41,6 +42,10 @@ pub const SstInfo = struct {
     /// Log index of the entry that first listed this id. L0 recency comes
     /// from this, not from the id: ids are random, log indexes are not.
     raft_index: u64,
+    /// Size and index start, from the CREATE that first listed the file;
+    /// every later open (apply, recovery, re-list, snapshot) reads just
+    /// that extent.
+    extent: Extent,
     /// How many (tree, level) listings name this id. A split hands the
     /// same file to a second tree, so one file can be listed more than
     /// once; the record dies when the last listing goes.
@@ -408,23 +413,6 @@ pub const Manifest = struct {
         return out.toOwnedSlice(alloc);
     }
 
-    /// Every SST id any tree lists (a table shared by two trees appears
-    /// twice), copied out under the lock. Caller frees the slice.
-    pub fn listedFileIds(self: *Manifest, alloc: std.mem.Allocator) ![]u64 {
-        self.mu.lockShared(@src());
-        defer self.mu.unlockShared();
-        var out: std.ArrayList(u64) = .empty;
-        errdefer out.deinit(alloc);
-        var it = self.trees.valueIterator();
-        while (it.next()) |tree| {
-            for (tree.levels.items) |lm| {
-                var tit = lm.tables.keyIterator();
-                while (tit.next()) |fid| try out.append(alloc, fid.*);
-            }
-        }
-        return out.toOwnedSlice(alloc);
-    }
-
     /// A fresh SST file id, drawn from the process CSPRNG.
     ///
     /// Ids are unique by probability: with n ids in play the chance that
@@ -452,8 +440,8 @@ pub const Manifest = struct {
 
     /// Whether the manifest knows `id` at all — listed by some tree, or
     /// retired and awaiting its unlink. `Forest.removeOrphans` asks this of
-    /// every SST-shaped filename it finds on disk; anything unknown is not
-    /// the manifest's file.
+    /// every SST-shaped name it finds in the store; anything unknown is
+    /// not the manifest's file.
     pub fn knowsFile(self: *Manifest, id: u64) bool {
         self.mu.lockShared(@src());
         defer self.mu.unlockShared();
@@ -464,7 +452,7 @@ pub const Manifest = struct {
     /// manifest does not know: neither listed by a tree nor retired and
     /// awaiting its unlink. Caller frees the slice.
     ///
-    /// Takes a `.names` listing, no stat: a data dir holds hundreds of
+    /// Takes a `.names` listing, no stat: a store holds hundreds of
     /// thousands of SSTs and nearly all of them are the manifest's, so
     /// the caller stats just the few ids this returns. One shared hold
     /// for the whole pass rather than a lock per name.
@@ -527,6 +515,13 @@ pub const Manifest = struct {
         }
         for (out.items) |r| _ = self.to_delete.remove(r.sst_id);
         return out.toOwnedSlice(alloc);
+    }
+
+    /// The extent a listed file was created with. Caller holds the lock.
+    pub fn extent(self: *Manifest, held: Lock.Shared, sst_id: u64) ?Extent {
+        self.mu.assertHeld(held);
+        const info = self.ssts.get(sst_id) orelse return null;
+        return info.extent;
     }
 
     /// A tree's manifest record, borrowed for as long as `held` is: the
@@ -599,6 +594,10 @@ pub const Manifest = struct {
             const slot = try self.ssts.getOrPut(tc.sst_id);
             if (!slot.found_existing) slot.value_ptr.* = .{
                 .raft_index = if (tc.raft_index != 0) tc.raft_index else index,
+                .extent = .{
+                    .size = tc.size,
+                    .index_offset = tc.index_offset,
+                },
                 .refs = 0,
             };
             slot.value_ptr.refs += 1;
@@ -1034,14 +1033,15 @@ pub const Manifest = struct {
             for (tree.levels.items, 0..) |lm, level_idx| {
                 var tit = lm.tables.iterator();
                 while (tit.next()) |tkv| {
+                    const info = self.ssts.get(tkv.key_ptr.*).?;
                     var sst_change = createSSTableChange(
                         tkv.key_ptr.*,
                         tk.namespace,
                         tk.tree_id,
                         @intCast(level_idx),
+                        info.extent,
                     );
-                    sst_change.raft_index =
-                        self.ssts.get(tkv.key_ptr.*).?.raft_index;
+                    sst_change.raft_index = info.raft_index;
                     try table_changes.append(a, sst_change);
                 }
             }
@@ -1126,6 +1126,8 @@ pub const Manifest = struct {
                     .namespace_id = tc.namespaceId(),
                     .tree_id = tc.treeId(),
                     .level = tc.level(),
+                    .size = tc.size(),
+                    .index_offset = tc.indexOffset(),
                     .raft_index = tc.raftIndex(),
                 });
             }
@@ -1190,6 +1192,7 @@ pub fn createSSTableChange(
     namespace_id: u64,
     tree_id: u64,
     level: u32,
+    extent: Extent,
 ) SSTableChange {
     return .{
         .op = .create,
@@ -1197,6 +1200,8 @@ pub fn createSSTableChange(
         .namespace_id = namespace_id,
         .tree_id = tree_id,
         .level = level,
+        .size = extent.size,
+        .index_offset = extent.index_offset,
     };
 }
 

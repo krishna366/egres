@@ -77,7 +77,8 @@ Output lives under `--workdir` (default: repo root — use a roomy throwaway
 filesystem like `/data/egres`, since a 10 GiB load expands further on disk via
 the WAL + write amplification before compaction and snapshots catch up):
 
-- `data/node1/` — the LSM forest + raft WAL
+- `data/sst/` — the SSTs, one remote store shared by every node
+- `data/node1/wal/` — node 1's raft WAL
 - `logs/node1.log` — the server log (grep here first on any problem)
 - `logs/stats-node1.txt` — final `/stats` dump, including latency histograms
 - `metrics.tsv` — periodic samples (flushes, compactions, bytes, disk usage)
@@ -101,13 +102,17 @@ python3 scripts/loadtest.py clean            # wipe data/ logs/ metrics.tsv
 ### 3. Manual single-server run (for debugging)
 
 When you want to poke at a running server yourself, start one directly. With
-`offset=0` it binds the admin port at `5210` and raft at `4210`:
+`offset=0` it binds the admin port at `5210` and raft at `4210`. SSTs live in
+the remote store (`--remote`: `dir_path=` for a local directory or shared
+mount, or `s3_endpoint=`/`s3_bucket=` for an s3 bucket); the WAL is the only
+thing on local disk:
 
 ```bash
 rm -rf /data/egres/node1 && mkdir -p /data/egres/node1 /tmp/zdb
 ./zig-out/bin/egres \
     --raft="id=1; cluster-id=1" \
-    --zdb="dir=/data/egres/node1" \
+    --remote="dir_path=/data/egres/node1/sst" \
+    --wal="dir=/data/egres/node1/wal" \
     --listen="client-port=5210; raft-port=4210" \
     > /tmp/zdb/server.log 2>&1 &
 ```

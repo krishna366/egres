@@ -55,7 +55,8 @@ pub const Cfg = struct {
 
 /// The bandwidth config `--io` asks for. With auto_calibrate the probe
 /// of `data_dir` supplies both values; a failed probe says so and falls
-/// back to the flags, as does auto_calibrate=false.
+/// back to the flags, as does auto_calibrate=false or an empty
+/// `data_dir` (no local device holds the SSTs: an s3 remote).
 pub fn bwConfig(
     allocator: std.mem.Allocator,
     io_cfg: Cfg,
@@ -70,6 +71,13 @@ pub fn bwConfig(
         .write_cost = io_cfg.write_cost,
     };
     if (!io_cfg.auto_calibrate) return pinned;
+    if (data_dir.len == 0) {
+        log.info("no local SST device to calibrate; using --io " ++
+            "bandwidth_mib={d} write_cost={d}", .{
+            io_cfg.bandwidth_mib, io_cfg.write_cost,
+        });
+        return pinned;
+    }
 
     try _vfs.createDirPath(data_dir);
     const p = runCalibration(allocator, data_dir) catch |err| {

@@ -697,7 +697,7 @@ const IndexBuild = struct {
         );
         defer changes.deinit(self.a);
 
-        try eng.distributeNewFiles(changes.items);
+        try eng.announceNewFiles(changes.items);
         try eng.proposeMC(.{
             .cmd = .index_backfill,
             .sstable_changes = changes.items,

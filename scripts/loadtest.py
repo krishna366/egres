@@ -169,7 +169,10 @@ def spawn_server(
         str(SERVER_BIN),
         f"--listen=raft-port={ports.raft_base}; client-port={ports.client_base}; offset={node}",
         f"--raft={raft}",
-        f"--zdb=dir={data_dir}",
+        # One remote shared by every node (followers read the leader's
+        # SSTs from it); the WAL stays per node.
+        f"--remote=dir_path={data_dir.parent / 'sst'}",
+        f"--wal=dir={data_dir / 'wal'}",
     ]
     log_file = open(log_path, "w")
     # start_new_session detaches the server into its own session so it

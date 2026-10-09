@@ -9,6 +9,7 @@ const flags = @import("flags");
 const sql = @import("sql");
 const utils = @import("utils");
 
+const vfs = zdb.vfs;
 const Forest = zdb.forest.Forest;
 const Config = zdb.config.Config;
 const Key = zdb.kv.Key;
@@ -32,11 +33,13 @@ test "sql.table: load reconstructs a user table's schema from catalog rows" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     const ns: u64 = 16;
@@ -211,11 +214,13 @@ test "sql.table: load returns UndefinedTable when no catalog rows exist" {
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
 
-    const f_live = try flags.Live(Config).create(alloc, .{ .dir = dir_path });
+    const f_live = try flags.Live(Config).create(alloc, .{});
 
     defer f_live.destroy();
 
-    const f = try Forest.open(alloc, f_live);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    defer store.deinit();
+    const f = try Forest.open(alloc, f_live, &store);
     defer f.close();
 
     const ns: u64 = 16;

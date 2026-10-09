@@ -62,10 +62,17 @@ pub const ResidentTotals = struct {
 
 pub var resident: ResidentTotals = .{};
 
-/// How `Table.open` opens SST files. `.direct` goes with a block cache:
-/// blocks are cached decompressed there, so the page cache would hold
-/// the same data twice. Buffered (`.default`, for tests and tools)
-/// reads with readahead off.
+/// The store object name of SST `file_id`: `<id:016x>.sst` — fixed-width
+/// hex, so a store listing sorts by id lexicographically. Caller owns the
+/// returned slice.
+pub fn sstName(allocator: std.mem.Allocator, file_id: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{x:0>16}.sst", .{file_id});
+}
+
+/// How `Table.open` opens an SST in a file store. `.direct` goes with a
+/// block cache: blocks are cached decompressed there, so the page cache
+/// would hold the same data twice. Buffered (`.default`, for tests and
+/// tools) reads with readahead off. An s3 store ignores it.
 pub var read_mode: vfs.Mode = .default;
 
 pub const Error = _idx.Error || _buffers.Error || compress.Error ||
@@ -88,7 +95,8 @@ const min_key_len: usize = 1;
 
 pub const Table = struct {
     allocator: std.mem.Allocator,
-    handle: vfs.FileHandle,
+    /// The SST's bytes, wherever the store keeps them.
+    obj: vfs.Object,
     index: *_buffers.TableIndexStruct,
     /// The table's filter, one of the two (see `builder.Config.kind`),
     /// or neither for a table written without one.
@@ -103,10 +111,9 @@ pub const Table = struct {
     /// that opened it. 0 for in-memory tables — also the sentinel "skip
     /// block-cache" value, since 0 is never handed out as a file id.
     file_id: u64,
-    // Owned path split into atomic pointer + length for thread-safe detach.
-    // Use getPath() to read, claimPath() to atomically take ownership.
-    path_ptr: std.atomic.Value(?[*]const u8),
-    path_len: usize,
+    /// What the manifest records for the file; a re-list of this table
+    /// (move, split, branch) copies it into the new CREATE.
+    extent: Extent,
     /// One bit per block: set when this table put the block into the
     /// global block cache, so `purgeCachedBlocks` can drop exactly this
     /// file's entries without walking the cache. A set bit for a block
@@ -118,69 +125,78 @@ pub const Table = struct {
     resident: Resident,
 
     pub fn fileSize(self: *const Table) u64 {
-        return self.handle.file_size;
+        return self.obj.size();
     }
 
-    /// open opens an SST file through the global VFS instance (vfs.g),
-    /// in `read_mode`; readAligned transparently handles mmap, direct,
-    /// and memory-backed file handles.
+    pub const Extent = _idx.Extent;
+
+    /// Open SST `file_id` from the store, in `read_mode`. `extent` is
+    /// what the manifest recorded at create: the open is then one read
+    /// of the index and trailer, no stat and no trailer round trip.
     pub fn open(
         allocator: std.mem.Allocator,
-        path: String,
+        store: *vfs.RemoteStore,
         file_id: u64,
+        extent: Extent,
         priority: vfs.Priority,
     ) !*Table {
-        const handle = try vfs.g().openFile(allocator, path, .{
+        const name = try sstName(allocator, file_id);
+        defer allocator.free(name);
+        const obj = try store.open(name, extent.size, .{
             .mode = read_mode,
             .flags = .{ .random = true },
         });
-        const t = try initFromHandle(allocator, handle, priority);
-        errdefer t.decrRef();
+        const t = try openObject(allocator, obj, extent, priority);
         t.file_id = file_id;
-        const duped = try allocator.dupe(u8, path);
-        t.path_ptr = std.atomic.Value(?[*]const u8).init(duped.ptr);
-        t.path_len = duped.len;
         return t;
     }
 
-    /// openHandle creates a Table from a pre-opened FileHandle.
-    /// Takes ownership of handle (closes it on error or when Table is freed).
-    /// The resulting table has no path (decrRef frees memory only, no file deletion).
-    pub fn openHandle(allocator: std.mem.Allocator, handle: vfs.FileHandle, priority: vfs.Priority) !*Table {
-        return initFromHandle(allocator, handle, priority);
-    }
+    /// A Table over an already-open object (a memory-backed handle in
+    /// tests and benches): one read of [index_offset, size) — the index
+    /// and its trailer. Takes ownership of `obj_in`, closing it on error
+    /// or when the table is freed. file_id stays 0.
+    pub fn openObject(
+        allocator: std.mem.Allocator,
+        obj_in: vfs.Object,
+        extent: Extent,
+        priority: vfs.Priority,
+    ) !*Table {
+        var obj = obj_in;
+        errdefer obj.close();
 
-    /// Single code path: reads trailer + index via handle.readAligned.
-    fn initFromHandle(allocator: std.mem.Allocator, handle: vfs.FileHandle, priority: vfs.Priority) !*Table {
-        errdefer handle.close();
-
-        if (handle.file_size == 0) return error.CorruptTable;
-        const size: usize = @intCast(handle.file_size);
+        const size = extent.size;
+        if (size == 0 or size != obj.size()) return error.CorruptTable;
+        if (extent.index_offset + _idx.trailer_len > size) {
+            return error.CorruptTable;
+        }
+        const tail_len: usize = @intCast(size - extent.index_offset);
+        const index_len: usize = tail_len - _idx.trailer_len;
 
         const t = try allocator.create(Table);
         errdefer allocator.destroy(t);
 
-        // Read the trailer: [u32 index_len][u64 index_hash] (idx.trailer_len bytes).
-        if (size < _idx.trailer_len) return error.CorruptTable;
-        const trailer_offset: u64 = @intCast(size - _idx.trailer_len);
-        const trailer_result = try handle.readAligned(allocator, trailer_offset, _idx.trailer_len, priority);
-        defer trailer_result.free();
+        const tail = try obj.readAligned(
+            allocator,
+            extent.index_offset,
+            tail_len,
+            priority,
+        );
+        defer tail.free();
 
-        if (trailer_result.data.len < _idx.trailer_len) return error.CorruptTable;
-        const index_len = _idx.readU32LE(trailer_result.data, 0) catch return error.CorruptTable;
-        const stored_checksum = _idx.readU64LE(trailer_result.data, 4) catch return error.CorruptTable;
+        if (tail.data.len < tail_len) return error.CorruptTable;
+        const index_bytes = tail.data[0..index_len];
+        const trailer = tail.data[index_len..tail_len];
 
-        // Read index bytes.
-        const index_end: u64 = @intCast(size - _idx.trailer_len);
-        if (index_len > index_end) return error.CorruptTable;
-        const index_offset = index_end - index_len;
-        const index_result = try handle.readAligned(allocator, index_offset, index_len, priority);
-        defer index_result.free();
-
-        if (index_result.data.len < index_len) return error.CorruptTable;
-        const index_bytes = index_result.data[0..index_len];
-        const got_checksum = zbuf.hash(index_bytes);
-        if (got_checksum != stored_checksum) return error.ChecksumMismatch;
+        // Trailer: [u32 index_len][u64 index_hash]. The length must
+        // agree with the manifest's extent; the hash covers the index.
+        const trailer_len = _idx.readU32LE(trailer, 0) catch
+            return error.CorruptTable;
+        if (trailer_len != index_len) return error.CorruptTable;
+        const stored_checksum = _idx.readU64LE(trailer, 4) catch
+            return error.CorruptTable;
+        if (zbuf.hash(index_bytes) != stored_checksum) {
+            return error.ChecksumMismatch;
+        }
 
         const index_reader = try _buffers.TableIndexReader.init(index_bytes, 0);
         var table_index = try index_reader.toStruct(allocator);
@@ -255,7 +271,7 @@ pub const Table = struct {
         const smallest_raw = if (table_index.blocks.len > 0) table_index.blocks[0].key else &.{};
         t.* = .{
             .allocator = allocator,
-            .handle = handle,
+            .obj = obj,
             .index = table_index,
             .binary_fuse = binary_fuse,
             .egid_bm = egid_bm,
@@ -270,19 +286,11 @@ pub const Table = struct {
                 .{},
             .ref = std.atomic.Value(i32).init(1),
             .file_id = 0,
-            .path_ptr = std.atomic.Value(?[*]const u8).init(null),
-            .path_len = 0,
+            .extent = extent,
             .cached = cached,
         };
         resident.add(res);
         return t;
-    }
-
-    /// Atomically claim ownership of the path, returning the slice if we won the race.
-    fn claimPath(self: *Table) ?String {
-        const ptr = self.path_ptr.swap(null, .acq_rel);
-        if (ptr) |p| return p[0..self.path_len];
-        return null;
     }
 
     fn deinit(self: *Table) void {
@@ -292,13 +300,12 @@ pub const Table = struct {
         // weight: drop them now, while the bits still say which they are.
         if (block_cache) |cache| _ = self.purgeCachedBlocks(cache);
 
-        if (self.claimPath()) |p| self.allocator.free(p);
         resident.sub(self.resident);
         self.allocator.free(self.cached);
         self.index.destroy(self.allocator);
         if (self.binary_fuse) |*bf| bf.deinit(self.allocator);
         if (self.egid_bm) |*bm| bm.deinit();
-        self.handle.close();
+        self.obj.close();
     }
 
     /// Increment the reference count. Call this when sharing a Table pointer.
@@ -308,7 +315,7 @@ pub const Table = struct {
     }
 
     /// Decrement the reference count. The last `decrRef` frees the table:
-    /// index, filter, file handle, path and the `*Table` allocation itself,
+    /// index, filter, object handle and the `*Table` allocation itself,
     /// and the blocks it put into the block cache are dropped from it.
     /// Every holder of a `*Table` holds a ref (the level entry, the table
     /// cache, a reader that pinned it), so whoever releases last frees it,
@@ -466,7 +473,7 @@ pub const Table = struct {
         if (bi.len < 4) return error.CorruptTable;
 
         // Read raw bytes (temporary)
-        const result = self.handle.readAligned(
+        const result = self.obj.readAligned(
             self.allocator,
             @intCast(bi.offset),
             bi.len,
@@ -509,9 +516,7 @@ pub const Table = struct {
         priority: vfs.Priority,
     ) Error!usize {
         if (self.file_id == 0) return 0;
-        if (self.handle.mapped != null or self.handle.owned_buf != null) {
-            return 0;
-        }
+        if (self.obj.isResident()) return 0;
         const blocks = self.index.blocks;
         if (blocks.len == 0) return 0;
         const per_block = @max(self.index.uncompressed_size / blocks.len, 1);
@@ -540,7 +545,7 @@ pub const Table = struct {
         }
         if (reqs.items.len == 0) return 0;
 
-        self.handle.batchRead(&arena, reqs.items, priority) catch
+        self.obj.batchRead(&arena, reqs.items, priority) catch
             return error.CorruptTable;
 
         for (reqs.items, wanted.items) |req, idx| {

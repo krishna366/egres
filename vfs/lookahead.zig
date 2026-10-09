@@ -18,7 +18,7 @@
 //!                                      probe object
 //!   head / put                       — check + upload the probe object
 //! Today that is vfs.s3.S3Store (fixed cost = network round trip) and
-//! the dir store (fixed cost = syscall + device latency, read O_DIRECT
+//! the file store (fixed cost = syscall + device latency, read O_DIRECT
 //! so the page cache can't stand in for the device).
 
 const std = @import("std");
@@ -240,7 +240,7 @@ pub fn verifyProbeData(off: u64, bytes: String) bool {
 }
 
 fn uploadProbe(a: std.mem.Allocator, store: anytype) !void {
-    // Page-aligned: the dir store writes puts O_DIRECT and rejects
+    // Page-aligned: the file store writes puts O_DIRECT and rejects
     // unaligned buffers (probe_max is a page multiple already).
     const data = try a.alignedAlloc(u8, .fromByteUnits(4096), @intCast(probe_max));
     defer a.free(data);

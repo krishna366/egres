@@ -204,16 +204,24 @@ pub const JoinResponse = schema.Table(&.{
 });
 
 // File-distribution control plane: after uploading a batch of new SSTs to
-// the shared object store, the creator announces the file ids; each peer
-// downloads what its local disk lacks FROM THE STORE, then replies with one
-// batch AnnounceFilesResp. A prefetch optimization — apply-time store fetch
-// is the backstop — so raft relays ids, never file bytes.
+// the shared remote store, the creator announces them; each peer opens
+// them from the store into its table cache, then replies with one batch
+// AnnounceFilesResp. A prefetch optimization — the apply-time open is the
+// backstop — so raft relays file references, never file bytes.
+
+// One announced SST: its id and what the manifest will say about it, so
+// the peer's open is the same single read the apply's would be.
+pub const FileRef = schema.Table(&.{
+    .{ .id = 1, .name = "id", .ty = schema.U64 },
+    .{ .id = 2, .name = "size", .ty = schema.U64 },
+    .{ .id = 3, .name = "index_offset", .ty = schema.U64 },
+});
 
 pub const AnnounceFiles = schema.Table(&.{
     .{ .id = 1, .name = "announce_id", .ty = schema.U64 },
     // sender_id in case the files are available on a non-leader peer.
     .{ .id = 2, .name = "sender_id", .ty = schema.U64 },
-    .{ .id = 3, .name = "file_ids", .ty = schema.Array(schema.U64) },
+    .{ .id = 3, .name = "files", .ty = schema.Array(FileRef) },
 });
 
 // tag 0 reserved — a freshly-zeroed byte never decodes as a real status.
@@ -256,4 +264,5 @@ pub const records: []const schema.Named = &.{
     .{ .name = "WalHeader", .ty = WalHeader, .id = tableId(15) },
     .{ .name = "AnnounceFiles", .ty = AnnounceFiles, .id = tableId(16) },
     .{ .name = "AnnounceFilesResp", .ty = AnnounceFilesResp, .id = tableId(17) },
+    .{ .name = "FileRef", .ty = FileRef, .id = tableId(18) },
 };

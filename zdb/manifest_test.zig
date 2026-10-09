@@ -16,6 +16,8 @@ const deleteTreeChange = _manifest.deleteTreeChange;
 const updateTreeChange = _manifest.updateTreeChange;
 
 const tree_id: u64 = 1;
+// CREATEs here name ids with no file behind them.
+const no_extent: _manifest.Extent = .{ .size = 0, .index_offset = 0 };
 
 /// Shorthand for a tree's global identity (namespace, namespace-local tree_id).
 fn tk(namespace: u64, id: u64) TreeKey {
@@ -35,9 +37,9 @@ test "manifest commit applies tree + table changes" {
         createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(2, &.{
-        createSSTableChange(1, 0, tree_id, 0),
-        createSSTableChange(2, 0, tree_id, 1),
-        createSSTableChange(3, 0, tree_id, 2),
+        createSSTableChange(1, 0, tree_id, 0, no_extent),
+        createSSTableChange(2, 0, tree_id, 1, no_extent),
+        createSSTableChange(3, 0, tree_id, 2, no_extent),
     }, &.{});
 
     try std.testing.expectEqual(@as(u32, 3), manifest.tableCount());
@@ -61,8 +63,8 @@ test "manifest tree create and delete" {
         createTreeChange(2, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(2, &.{
-        createSSTableChange(10, 0, 1, 0),
-        createSSTableChange(20, 0, 2, 0),
+        createSSTableChange(10, 0, 1, 0, no_extent),
+        createSSTableChange(20, 0, 2, 0, no_extent),
     }, &.{});
 
     // Delete tree 2 — its tables are automatically cleaned up.
@@ -93,8 +95,8 @@ test "manifest multi-tree table" {
 
     // Same table_id=100 belongs to both trees (post-split shared SST scenario).
     try manifest.commit(2, &.{
-        createSSTableChange(100, 0, 1, 0),
-        createSSTableChange(100, 0, 2, 0),
+        createSSTableChange(100, 0, 1, 0, no_extent),
+        createSSTableChange(100, 0, 2, 0, no_extent),
     }, &.{});
 
     // Delete from tree 1 — table should still exist in tree 2.
@@ -165,7 +167,9 @@ test "manifest applySSTableChange on missing tree errors" {
 
     try std.testing.expectError(
         ManifestError.TreeNotFound,
-        manifest.commit(1, &.{createSSTableChange(1, 0, 999, 0)}, &.{}),
+        manifest.commit(1, &.{
+            createSSTableChange(1, 0, 999, 0, no_extent),
+        }, &.{}),
     );
 }
 
@@ -215,14 +219,14 @@ test "manifest serialize/restoreFrom round-trip" {
     });
     try src.registerTableName(.{ .namespace = 7, .table_id = 16 }, "users");
     try src.commit(2, &.{
-        createSSTableChange(10, 7, 1, 0),
-        createSSTableChange(11, 7, 1, 0),
-        createSSTableChange(12, 7, 1, 1),
-        createSSTableChange(13, 7, 1, 3),
-        createSSTableChange(20, 7, 2, 2),
+        createSSTableChange(10, 7, 1, 0, no_extent),
+        createSSTableChange(11, 7, 1, 0, no_extent),
+        createSSTableChange(12, 7, 1, 1, no_extent),
+        createSSTableChange(13, 7, 1, 3, no_extent),
+        createSSTableChange(20, 7, 2, 2, no_extent),
         // Same table_id present in both trees — shared post-split SST.
-        createSSTableChange(50, 7, 1, 3),
-        createSSTableChange(50, 7, 2, 3),
+        createSSTableChange(50, 7, 1, 3, no_extent),
+        createSSTableChange(50, 7, 2, 3, no_extent),
     }, &.{});
 
     // Serialize.
@@ -276,7 +280,7 @@ test "manifest restoreFrom replaces existing state" {
     try src.commit(1, &.{}, &.{
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
     });
-    try src.commit(2, &.{createSSTableChange(10, 0, 1, 0)}, &.{});
+    try src.commit(2, &.{createSSTableChange(10, 0, 1, 0, no_extent)}, &.{});
     const bytes = try src.serialize(alloc);
     defer alloc.free(bytes);
 
@@ -286,7 +290,7 @@ test "manifest restoreFrom replaces existing state" {
     try dst.commit(3, &.{}, &.{
         createTreeChange(99, 0, &.{}, &.{}, .posting_index),
     });
-    try dst.commit(4, &.{createSSTableChange(999, 0, 99, 0)}, &.{});
+    try dst.commit(4, &.{createSSTableChange(999, 0, 99, 0, no_extent)}, &.{});
     try dst.registerTableName(.{ .namespace = 0, .table_id = 55 }, "stale");
     try std.testing.expect(dst.trees.contains(tk(0, 99)));
 
@@ -373,14 +377,14 @@ test "manifest clone is independent of source" {
     try src.commit(1, &.{}, &.{
         createTreeChange(1, 5, &.{}, &.{}, .posting_index),
     });
-    try src.commit(2, &.{createSSTableChange(10, 5, 1, 0)}, &.{});
+    try src.commit(2, &.{createSSTableChange(10, 5, 1, 0, no_extent)}, &.{});
 
     var copy = _manifest.Manifest.init(alloc);
     defer copy.deinit();
     try src.cloneInto(&copy);
 
     // Mutating src must not affect copy.
-    try src.commit(3, &.{createSSTableChange(11, 5, 1, 0)}, &.{});
+    try src.commit(3, &.{createSSTableChange(11, 5, 1, 0, no_extent)}, &.{});
     try std.testing.expectEqual(@as(u32, 2), src.tableCount());
     try std.testing.expectEqual(@as(u32, 1), copy.tableCount());
     try std.testing.expect(
@@ -469,8 +473,8 @@ test "manifest newFileId draws nonzero, distinct ids" {
         createTreeChange(tree_id, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(2, &.{
-        createSSTableChange(10, 0, tree_id, 0),
-        createSSTableChange(20, 0, tree_id, 1),
+        createSSTableChange(10, 0, tree_id, 0, no_extent),
+        createSSTableChange(20, 0, tree_id, 1, no_extent),
     }, &.{});
 
     // Every draw is nonzero, pairwise distinct, and never a listed id.
@@ -500,8 +504,12 @@ test "manifest retires a file at the index that drops its last listing" {
     });
 
     // Listed by tree 1 at index 2, shared with tree 2 at index 3.
-    try manifest.commit(2, &.{createSSTableChange(10, 0, 1, 0)}, &.{});
-    try manifest.commit(3, &.{createSSTableChange(10, 0, 2, 0)}, &.{});
+    try manifest.commit(2, &.{
+        createSSTableChange(10, 0, 1, 0, no_extent),
+    }, &.{});
+    try manifest.commit(3, &.{
+        createSSTableChange(10, 0, 2, 0, no_extent),
+    }, &.{});
     try std.testing.expectEqual(@as(u32, 2), manifest.ssts.get(10).?.refs);
 
     // The first delete leaves a listing standing: nothing to retire.
@@ -536,9 +544,9 @@ test "manifest tree delete retires every table of the tree" {
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(4, &.{
-        createSSTableChange(11, 0, 1, 0),
-        createSSTableChange(12, 0, 1, 0),
-        createSSTableChange(13, 0, 1, 1),
+        createSSTableChange(11, 0, 1, 0, no_extent),
+        createSSTableChange(12, 0, 1, 0, no_extent),
+        createSSTableChange(13, 0, 1, 1, no_extent),
     }, &.{});
 
     try manifest.commit(9, &.{}, &.{deleteTreeChange(1, 0)});
@@ -557,8 +565,8 @@ test "manifest restoreFrom leaves the retire list empty" {
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
     });
     try src.commit(4, &.{
-        createSSTableChange(10, 0, 1, 0),
-        createSSTableChange(20, 0, 1, 0),
+        createSSTableChange(10, 0, 1, 0, no_extent),
+        createSSTableChange(20, 0, 1, 0, no_extent),
     }, &.{});
     try src.commit(6, &.{deleteSSTableChange(20, 0, 1, 0)}, &.{});
     try std.testing.expectEqual(@as(u32, 1), src.to_delete.count());
@@ -573,7 +581,7 @@ test "manifest restoreFrom leaves the retire list empty" {
     try dst.commit(1, &.{}, &.{
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
     });
-    try dst.commit(2, &.{createSSTableChange(99, 0, 1, 0)}, &.{});
+    try dst.commit(2, &.{createSSTableChange(99, 0, 1, 0, no_extent)}, &.{});
     try dst.commit(3, &.{deleteSSTableChange(99, 0, 1, 0)}, &.{});
     try std.testing.expectEqual(@as(u32, 1), dst.to_delete.count());
 
@@ -592,8 +600,8 @@ test "manifest knowsFile covers listed and retired ids" {
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(4, &.{
-        createSSTableChange(10, 0, 1, 0),
-        createSSTableChange(20, 0, 1, 0),
+        createSSTableChange(10, 0, 1, 0, no_extent),
+        createSSTableChange(20, 0, 1, 0, no_extent),
     }, &.{});
     try manifest.commit(6, &.{deleteSSTableChange(20, 0, 1, 0)}, &.{});
 
@@ -618,8 +626,8 @@ test "manifest unknownFiles picks SST-named files the manifest does not know" {
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(4, &.{
-        createSSTableChange(0x10, 0, 1, 0),
-        createSSTableChange(0x20, 0, 1, 0),
+        createSSTableChange(0x10, 0, 1, 0, no_extent),
+        createSSTableChange(0x20, 0, 1, 0, no_extent),
     }, &.{});
     try manifest.commit(6, &.{deleteSSTableChange(0x20, 0, 1, 0)}, &.{});
 
@@ -653,8 +661,8 @@ test "manifest newFileId never draws a listed or retired id" {
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(4, &.{
-        createSSTableChange(10, 0, 1, 0),
-        createSSTableChange(20, 0, 1, 0),
+        createSSTableChange(10, 0, 1, 0, no_extent),
+        createSSTableChange(20, 0, 1, 0, no_extent),
     }, &.{});
     // 20 leaves the manifest but stays in the retire list: its file may
     // still be on disk under that name until the next sweep.
@@ -680,13 +688,17 @@ test "manifest sst refs across create, share, and delete" {
     });
 
     // One file listed by tree 1 at index 5.
-    try manifest.commit(5, &.{createSSTableChange(77, 0, 1, 0)}, &.{});
+    try manifest.commit(5, &.{
+        createSSTableChange(77, 0, 1, 0, no_extent),
+    }, &.{});
     try std.testing.expectEqual(@as(u32, 1), manifest.ssts.get(77).?.refs);
     try std.testing.expectEqual(@as(u64, 5), manifest.raftIndexOf(77));
 
     // A split hands the same file to tree 2 later: a second listing, but
     // the file keeps the index that introduced it.
-    try manifest.commit(9, &.{createSSTableChange(77, 0, 2, 0)}, &.{});
+    try manifest.commit(9, &.{
+        createSSTableChange(77, 0, 2, 0, no_extent),
+    }, &.{});
     try std.testing.expectEqual(@as(u32, 2), manifest.ssts.get(77).?.refs);
     try std.testing.expectEqual(@as(u64, 5), manifest.raftIndexOf(77));
 
@@ -707,9 +719,9 @@ test "manifest serialize round-trip preserves raft_index" {
     try src.commit(1, &.{}, &.{
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
     });
-    try src.commit(4, &.{createSSTableChange(10, 0, 1, 0)}, &.{});
-    try src.commit(6, &.{createSSTableChange(20, 0, 1, 0)}, &.{});
-    try src.commit(8, &.{createSSTableChange(30, 0, 1, 1)}, &.{});
+    try src.commit(4, &.{createSSTableChange(10, 0, 1, 0, no_extent)}, &.{});
+    try src.commit(6, &.{createSSTableChange(20, 0, 1, 0, no_extent)}, &.{});
+    try src.commit(8, &.{createSSTableChange(30, 0, 1, 1, no_extent)}, &.{});
 
     const bytes = try src.serialize(alloc);
     defer alloc.free(bytes);
@@ -873,11 +885,13 @@ test "manifest takeToEvict hands over ids whose last listing went, once" {
         createTreeChange(2, 0, &.{}, &.{}, .posting_index),
     });
     try manifest.commit(2, &.{
-        createSSTableChange(10, 0, 1, 0),
-        createSSTableChange(20, 0, 1, 0),
+        createSSTableChange(10, 0, 1, 0, no_extent),
+        createSSTableChange(20, 0, 1, 0, no_extent),
     }, &.{});
     // 20 is shared with tree 2: one delete leaves it listed.
-    try manifest.commit(3, &.{createSSTableChange(20, 0, 2, 0)}, &.{});
+    try manifest.commit(3, &.{
+        createSSTableChange(20, 0, 2, 0, no_extent),
+    }, &.{});
 
     try manifest.commit(4, &.{
         deleteSSTableChange(10, 0, 1, 0),
@@ -911,13 +925,15 @@ test "manifest split move in one entry keeps the file listed and unretired" {
         createTreeChange(1, 0, &.{}, &.{}, .posting_index),
         createTreeChange(2, 0, &.{}, &.{}, .posting_index),
     });
-    try manifest.commit(5, &.{createSSTableChange(77, 0, 1, 0)}, &.{});
+    try manifest.commit(5, &.{
+        createSSTableChange(77, 0, 1, 0, no_extent),
+    }, &.{});
 
     // A split moves the file: the delete from the old tree is listed
     // before the create in the new one, as buildSplit emits them.
     try manifest.commit(9, &.{
         deleteSSTableChange(77, 0, 1, 0),
-        createSSTableChange(77, 0, 2, 0),
+        createSSTableChange(77, 0, 2, 0, no_extent),
     }, &.{});
     try std.testing.expectEqual(@as(u32, 1), manifest.ssts.get(77).?.refs);
     try std.testing.expectEqual(@as(u64, 5), manifest.raftIndexOf(77));
@@ -929,7 +945,7 @@ test "manifest split move in one entry keeps the file listed and unretired" {
     // The same pair through `apply` (the snapshot draft's path).
     var scs = [_]_manifest.SSTableChange{
         deleteSSTableChange(77, 0, 2, 0),
-        createSSTableChange(77, 0, 1, 0),
+        createSSTableChange(77, 0, 1, 0, no_extent),
     };
     try manifest.apply(10, .{ .cmd = .tree_split, .sstable_changes = &scs });
     try std.testing.expectEqual(@as(u32, 1), manifest.ssts.get(77).?.refs);

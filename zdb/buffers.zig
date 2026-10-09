@@ -103,12 +103,15 @@ pub const SSTableChange = schema.Table(&.{
     .{ .id = 5, .name = "namespace_id", .ty = schema.U64 },
     // CRC32 of the SST file (CREATE only). Reserved: nothing sets it yet.
     .{ .id = 6, .name = "checksum", .ty = schema.U32 },
-    // file size in bytes (CREATE only)
+    // File size in bytes and where its index starts (CREATE only): with
+    // both, opening the table is one read of [index_offset, size) —
+    // no stat, no trailer round trip against the remote.
     .{ .id = 7, .name = "size", .ty = schema.U64 },
+    .{ .id = 8, .name = "index_offset", .ty = schema.U64 },
     // log index of the entry that first listed this SST; 0 on a live
     // proposal (the apply fills it from its own entry), set in a snapshot
     // so restore recovers L0 order.
-    .{ .id = 8, .name = "raft_index", .ty = schema.U64 },
+    .{ .id = 9, .name = "raft_index", .ty = schema.U64 },
 });
 
 // Per-namespace manifest state, persisted ONLY inside a snapshot (a

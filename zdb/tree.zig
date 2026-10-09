@@ -42,7 +42,14 @@ const Lookup = @import("read.zig").Lookup;
 // TableCache
 // ---------------------------------------------------------------------------
 
-pub const TableNeed = struct { id: u64, level: usize, table: ?*Table = null };
+/// One table to load: its id, the level it is wanted at, and the extent
+/// the manifest recorded for it, which is all `Table.open` needs.
+pub const TableNeed = struct {
+    id: u64,
+    level: usize,
+    extent: Table.Extent,
+    table: ?*Table = null,
+};
 
 /// TableCache is a Forest-owned registry of open *Table objects keyed by
 /// table_id. Tree.open() calls loadTables() instead of opening SST files
@@ -50,14 +57,17 @@ pub const TableNeed = struct { id: u64, level: usize, table: ?*Table = null };
 /// needed by another tree (e.g. shared tables after a split).
 pub const TableCache = struct {
     allocator: std.mem.Allocator,
-    dir: String,
+    store: *vfs.RemoteStore,
     tables: std.AutoHashMap(u64, *Table),
     mu: fiber.RWMutex(.tracked),
 
-    pub fn init(allocator: std.mem.Allocator, dir: String) TableCache {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        store: *vfs.RemoteStore,
+    ) TableCache {
         return .{
             .allocator = allocator,
-            .dir = dir,
+            .store = store,
             .tables = std.AutoHashMap(u64, *Table).init(allocator),
             .mu = .{},
         };
@@ -138,18 +148,6 @@ pub const TableCache = struct {
     /// ref is left with the caller.
     pub fn loadTables(self: *TableCache, needed: []TableNeed) !void {
         errdefer decrRefs(needed);
-        try self.loadTablesInner(needed);
-    }
-
-    /// Release the refs `loadTables` handed out, and forget the pointers.
-    pub fn decrRefs(needed: []TableNeed) void {
-        for (needed) |*n| {
-            if (n.table) |t| t.decrRef();
-            n.table = null;
-        }
-    }
-
-    fn loadTablesInner(self: *TableCache, needed: []TableNeed) !void {
         // Phase 1: serve cache hits under read lock; collect pointers for
         // misses.
         var misses: std.ArrayList(*TableNeed) = .empty;
@@ -182,15 +180,22 @@ pub const TableCache = struct {
         defer done.deinit();
 
         const total = misses.items.len;
-        var g = fiber.Group(void).init(self.allocator);
+        var g = try fiber.Group(void).initCapacity(self.allocator, 1 + total);
         defer g.deinit();
-        try g.ensureTotalCapacity(1 + misses.items.len);
         g.spawn(.{}, loadTablesWatchdog, .{ total, &completed, &done }) catch {};
         for (misses.items) |n| {
             try g.spawn(.{}, openFiber, .{ self, n, &tse, &completed, &done });
         }
         g.wait();
         if (tse.get()) |err| return err;
+    }
+
+    /// Release the refs `loadTables` handed out, and forget the pointers.
+    pub fn decrRefs(needed: []TableNeed) void {
+        for (needed) |*n| {
+            if (n.table) |t| t.decrRef();
+            n.table = null;
+        }
     }
 
     /// Sibling of the `openFiber` spawns: log every 15 s while opens
@@ -237,19 +242,16 @@ pub const TableCache = struct {
         }
         self.mu.unlock();
 
-        // Phase B: open the SST file WITHOUT holding the lock.
-        // Table.open may yield the fiber (async I/O); holding the lock here
-        // would deadlock cooperative fibers on the same OS thread (EDEADLK).
-        const path = _forest.sstPath(
+        // Phase B: open the SST WITHOUT holding the lock. Table.open
+        // yields the fiber (I/O); holding the lock here would deadlock
+        // cooperative fibers on the same OS thread (EDEADLK).
+        const t = Table.open(
             self.allocator,
-            self.dir,
+            self.store,
             need.id,
+            need.extent,
+            .p0,
         ) catch |err| {
-            tse.set(err);
-            return;
-        };
-        defer self.allocator.free(path);
-        const t = Table.open(self.allocator, path, need.id, .p0) catch |err| {
             tse.set(err);
             return;
         };
@@ -451,6 +453,7 @@ pub const Tree = struct {
                         try needed.append(allocator, .{
                             .id = tid.*,
                             .level = level_idx,
+                            .extent = manifest.extent(held, tid.*).?,
                         });
                     }
                 }
@@ -847,6 +850,10 @@ pub const Tree = struct {
                 try needed.append(self.allocator, .{
                     .id = c.sst_id,
                     .level = c.level,
+                    .extent = .{
+                        .size = c.size,
+                        .index_offset = c.index_offset,
+                    },
                 });
             }
         }

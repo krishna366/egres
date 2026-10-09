@@ -1,7 +1,7 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! lookahead-probe — run the FileStore lookahead calibration against any
+//! lookahead-probe — run the RemoteStore lookahead calibration against any
 //! store backend — an S3-compatible endpoint or a local filesystem
 //! depot — and print the latency profile. The same probing egres runs at
 //! startup, as a standalone tool for sizing up a bucket provider
@@ -9,8 +9,7 @@
 //!
 //! Usage:
 //!   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-//!   lookahead-probe <endpoint-url> <bucket> [--region r] [--prefix p]
-//!            [--block n]
+//!   lookahead-probe <endpoint-url> <bucket> [--prefix p] [--block n]
 //!   lookahead-probe --dir <depot-path> [--block n]
 //!
 //! The endpoint is a URL — https://s3.us-east-005.backblazeb2.com or
@@ -53,7 +52,8 @@ fn probe(a: std.mem.Allocator) !void {
     const argv = try utils.context.g().argv();
     if (argv.len < 3) {
         std.debug.print(
-            "usage: lookahead-probe <endpoint-url> <bucket> [--region r] [--prefix p] [--block n]\n" ++
+            "usage: lookahead-probe <endpoint-url> <bucket>" ++
+                " [--prefix p] [--block n]\n" ++
                 "       lookahead-probe --dir <depot-path> [--block n]\n" ++
                 "endpoint-url: https://s3.us-east-005.backblazeb2.com or http://127.0.0.1:8333\n",
             .{},
@@ -73,7 +73,7 @@ fn probe(a: std.mem.Allocator) !void {
                 return error.BadUsage;
             }
         }
-        var store = try vfs.FileStore.initDir(a, argv[2]);
+        var store = try vfs.RemoteStore.initFile(a, argv[2]);
         defer store.deinit();
         const la = try store.calibrateLookahead(block_size);
         std.debug.print("ideal lookahead: {d} bytes ({d} KiB)\n", .{ la, la / 1024 });
@@ -85,10 +85,7 @@ fn probe(a: std.mem.Allocator) !void {
     var i: usize = 3;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--region") and i + 1 < argv.len) {
-            i += 1;
-            cfg.region = argv[i];
-        } else if (std.mem.eql(u8, arg, "--prefix") and i + 1 < argv.len) {
+        if (std.mem.eql(u8, arg, "--prefix") and i + 1 < argv.len) {
             i += 1;
             cfg.prefix = argv[i];
         } else if (std.mem.eql(u8, arg, "--block") and i + 1 < argv.len) {

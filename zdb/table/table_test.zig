@@ -6,6 +6,7 @@ const utils = @import("utils");
 const compress = utils.compression;
 const String = utils.String;
 const zdb = @import("zdb");
+const openBuffer = @import("../testing.zig").openBuffer;
 const zbuf = @import("zbuf").zbuf;
 const Key = zdb.kv.Key;
 const TableKey = zdb.kv.TableKey;
@@ -27,15 +28,6 @@ fn destroyTable(t: *Table) void {
 }
 
 /// Test helper: create an in-memory FileHandle from a buffer (dupes the data).
-fn fromBuf(allocator: std.mem.Allocator, buf: String) !vfs.FileHandle {
-    const owned = try allocator.dupe(u8, buf);
-    return .{
-        .file_size = @intCast(owned.len),
-        .owned_buf = owned,
-        .buf_allocator = allocator,
-        .vfs = vfs.g(),
-    };
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -133,7 +125,7 @@ test "table builder/reader roundtrip and seek" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const r = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, tb.bytes), .p0);
+    const r = try openBuffer(std.testing.allocator, &tb, .p0);
     defer destroyTable(r);
 
     try std.testing.expectEqual(@as(u32, 4), r.index.key_count);
@@ -170,11 +162,7 @@ test "table elects no codec when its sample does not compress" {
         var tb = try b.finish();
         defer tb.deinit();
 
-        const r = try Table.openHandle(
-            std.testing.allocator,
-            try fromBuf(std.testing.allocator, tb.bytes),
-            .p0,
-        );
+        const r = try openBuffer(std.testing.allocator, &tb, .p0);
         defer destroyTable(r);
         try std.testing.expectEqual(case.want, blockCodec(tb.bytes, r, 0));
 
@@ -230,11 +218,7 @@ test "table election over many blocks, blocks stored per their own codec" {
         var tb = try b.finish();
         defer tb.deinit();
 
-        const r = try Table.openHandle(
-            alloc,
-            try fromBuf(alloc, tb.bytes),
-            .p0,
-        );
+        const r = try openBuffer(alloc, &tb, .p0);
         defer destroyTable(r);
         // `want` is what the election chose, null when the table was
         // too small to hold one; a random block is stored raw either way.
@@ -313,7 +297,7 @@ test "seekGe: prefix-length and version ordering" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const t = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(t);
 
     // One block, so every seek exercises the in-block search.
@@ -373,7 +357,7 @@ test "table stores primaries only and the iterator stamps the tree's ids" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const t = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(t);
 
     // ...leave no trace of them in the file: the bounds and the block
@@ -429,7 +413,7 @@ test "table iterator reads the table's infinity as no bound" {
     }
     var tb = try b.finish();
     defer tb.deinit();
-    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const t = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(t);
 
     const count = struct {
@@ -502,7 +486,7 @@ test "table binary fuse contains keys" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const t = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(t);
 
     // Sample present keys.
@@ -540,7 +524,7 @@ test "table egid filter is exact and replaces the fuse filter" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const t = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(t);
 
     // An egid table pins its bitmap in place of a fuse filter.
@@ -582,7 +566,7 @@ test "table egid filter of dense ids is far smaller than a fuse filter" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const t = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(t);
     // The bitmap's buffer is the filter as stored; the index struct's
     // copy of it is released on open.
@@ -619,7 +603,7 @@ test "table binary fuse large keyset contains sampled keys" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const t = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(t);
 
     const seed: u64 = @intCast(std.Io.Timestamp.now(utils.context.g().io, .real).nanoseconds);
@@ -658,13 +642,13 @@ test "table checksum mismatch is detected" {
     var tb = try b.finish();
     defer tb.deinit();
 
-    const r = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, tb.bytes), .p0);
+    const r = try openBuffer(std.testing.allocator, &tb, .p0);
     defer destroyTable(r);
 
     const first_meta = r.index.blocks[0];
     const block_start: usize = first_meta.offset;
     const block_end = block_start + first_meta.len;
-    r.handle.owned_buf.?[block_end - 5] ^= 0x01;
+    r.obj.file.owned_buf.?[block_end - 5] ^= 0x01;
 
     try std.testing.expectError(error.ChecksumMismatch, r.readBlock(0, .p0));
 }
@@ -684,9 +668,9 @@ test "merge iterator merges sorted streams" {
     var t2 = try b2.finish();
     defer t2.deinit();
 
-    const r1 = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, t1.bytes), .p0);
+    const r1 = try openBuffer(std.testing.allocator, &t1, .p0);
     defer destroyTable(r1);
-    const r2 = try Table.openHandle(std.testing.allocator, try fromBuf(std.testing.allocator, t2.bytes), .p0);
+    const r2 = try openBuffer(std.testing.allocator, &t2, .p0);
     defer destroyTable(r2);
 
     var iters = [_]zdb.table.merge_iterator.Iterator{
@@ -749,11 +733,11 @@ test "merge iterator gathers one primary from every source" {
     var t3 = try b3.finish();
     defer t3.deinit();
 
-    const r1 = try Table.openHandle(alloc, try fromBuf(alloc, t1.bytes), .p0);
+    const r1 = try openBuffer(alloc, &t1, .p0);
     defer destroyTable(r1);
-    const r2 = try Table.openHandle(alloc, try fromBuf(alloc, t2.bytes), .p0);
+    const r2 = try openBuffer(alloc, &t2, .p0);
     defer destroyTable(r2);
-    const r3 = try Table.openHandle(alloc, try fromBuf(alloc, t3.bytes), .p0);
+    const r3 = try openBuffer(alloc, &t3, .p0);
     defer destroyTable(r3);
 
     var iters = [_]zdb.table.merge_iterator.Iterator{
@@ -809,7 +793,7 @@ fn buildItems(alloc: std.mem.Allocator, items: []const Item) !*Table {
     for (items) |item| try b.addItem(item);
     var tb = try b.finish();
     defer tb.deinit();
-    return Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    return openBuffer(alloc, &tb, .p0);
 }
 
 test "packed: one entry holds every version of a key" {
@@ -882,7 +866,7 @@ test "packed: a chain past the block target is still one entry" {
     try b.add(.{ .primary = "z" }, 1, "z");
     var tb = try b.finish();
     defer tb.deinit();
-    const t = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const t = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(t);
 
     var it = TableIterator.init(alloc, t, .p0, zero_table_key);
@@ -961,7 +945,7 @@ test "table iterator: forward scan" {
     for ([_]usize{ 99, 100, 101 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+        const tbl = try openBuffer(alloc, &tb, .p0);
         defer destroyTable(tbl);
 
         var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -994,7 +978,7 @@ test "seek to first" {
     for ([_]usize{ 99, 100, 101, 199, 200, 250, 9999, 10000 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+        const tbl = try openBuffer(alloc, &tb, .p0);
         defer destroyTable(tbl);
 
         var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1015,7 +999,7 @@ test "seek: various targets" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "k", 10000, 4096);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1052,7 +1036,7 @@ test "iterate from start: full scan" {
     for ([_]usize{ 99, 100, 101, 199, 200, 250, 9999, 10000 }) |n| {
         var tb = try buildTestTable(alloc, "key", n, 4096);
         defer tb.deinit();
-        const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+        const tbl = try openBuffer(alloc, &tb, .p0);
         defer destroyTable(tbl);
 
         var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1075,7 +1059,7 @@ test "table: seek and iterate to end" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "key", 10000, 4096);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1121,7 +1105,7 @@ test "table: max_version" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     try std.testing.expectEqual(@as(u64, n), tbl.index.max_version);
@@ -1135,7 +1119,7 @@ test "table: smallest and biggest keys" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "key", 200, 256);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     try std.testing.expectEqualStrings("key0000", tbl.smallest.primary);
@@ -1171,7 +1155,7 @@ test "table: big values" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     try std.testing.expectEqual(@as(u32, n), tbl.index.key_count);
@@ -1200,7 +1184,7 @@ test "seekRange: end truncates iteration" {
     // 100 keys: k0000..k0099
     var tb = try buildTestTable(alloc, "k", 100, 4096);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1220,7 +1204,7 @@ test "seekRange: end after all keys returns everything" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "k", 100, 4096);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1239,7 +1223,7 @@ test "seekRange: end before all keys returns nothing" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "k", 100, 4096);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1254,7 +1238,7 @@ test "seekRange: no end restores full iteration" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "k", 100, 4096);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1275,7 +1259,7 @@ test "seekRange: start + end combined" {
     const alloc = std.testing.allocator;
     var tb = try buildTestTable(alloc, "k", 100, 4096);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1303,7 +1287,7 @@ test "seekRange: multiple blocks within a single table" {
     // 200 keys with tiny block size → many blocks.
     var tb = try buildTestTable(alloc, "k", 200, 64);
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     // Sanity: we have more than one block.
@@ -1340,11 +1324,11 @@ test "seekRange: ConcatIterator across multiple tables" {
     var tb2 = try buildRangeTable(alloc, "k", 200, 300, 64);
     defer tb2.deinit();
 
-    const tbl0 = try Table.openHandle(alloc, try fromBuf(alloc, tb0.bytes), .p0);
+    const tbl0 = try openBuffer(alloc, &tb0, .p0);
     defer destroyTable(tbl0);
-    const tbl1 = try Table.openHandle(alloc, try fromBuf(alloc, tb1.bytes), .p0);
+    const tbl1 = try openBuffer(alloc, &tb1, .p0);
     defer destroyTable(tbl1);
-    const tbl2 = try Table.openHandle(alloc, try fromBuf(alloc, tb2.bytes), .p0);
+    const tbl2 = try openBuffer(alloc, &tb2, .p0);
     defer destroyTable(tbl2);
 
     var table_iters = [_]TableIterator{
@@ -1460,7 +1444,7 @@ test "table: meta round-trips through builder and iterator" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     var it = TableIterator.init(alloc, tbl, .p0, zero_table_key);
@@ -1502,7 +1486,7 @@ test "table: meta survives random access via seekGe" {
 
     var tb = try b.finish();
     defer tb.deinit();
-    const tbl = try Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    const tbl = try openBuffer(alloc, &tb, .p0);
     defer destroyTable(tbl);
 
     // setIdx is reached by binary search too, not just forward scans, so seek
@@ -1546,8 +1530,9 @@ test "table: SST written before format_version is rejected" {
     std.mem.writeInt(u32, version_slot, 0, .little);
     std.mem.writeInt(u64, bytes[trailer_at + 4 ..][0..8], zbuf.hash(index_bytes), .little);
 
+    // The patch is in place in `tb`, so opening it reads the zeroed slot.
     try std.testing.expectError(
         error.UnsupportedTableFormat,
-        Table.openHandle(alloc, try fromBuf(alloc, bytes), .p0),
+        openBuffer(alloc, &tb, .p0),
     );
 }

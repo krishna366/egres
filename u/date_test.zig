@@ -76,3 +76,19 @@ test "formatTimestampUtc prints the ISO form with a full fraction" {
         out.writer.buffered(),
     );
 }
+
+test "parseHttpDate reads RFC 1123 Last-Modified headers" {
+    try testing.expectEqual(
+        @as(i64, 1_445_412_480),
+        try date.parseHttpDate("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+    try testing.expectEqual(
+        @as(i64, 0),
+        try date.parseHttpDate("Thu, 01 Jan 1970 00:00:00 GMT"),
+    );
+    try testing.expectError(
+        error.BadDate,
+        date.parseHttpDate("Wed, 21 Foo 2015 07:28:00 GMT"),
+    );
+    try testing.expectError(error.BadDate, date.parseHttpDate("2015-10-21"));
+}

@@ -1,10 +1,14 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! S3-compatible object store client — the `s3` FileStore backend. A
+//! S3-compatible object store client — the `s3` RemoteStore backend. A
 //! minimal HTTP/1.1 client over fiber.net with SigV4-signed
 //! PUT/GET/HEAD/DELETE, path-style URLs (`/bucket/prefix/key`), TLS, and
-//! a keep-alive connection pool. The endpoint is a URL —
+//! a keep-alive connection pool. HTTP/1.1 carries one response at a
+//! time per connection and S3 offers neither multiplexing nor
+//! multi-range GETs, so concurrency is connections: `max_inflight`
+//! slots, each a fiber holding one connection, and `batchRead` fans a
+//! batch out over them. The endpoint is a URL —
 //! `http://host[:port]` or `https://host[:port]` — the scheme decides
 //! TLS, the host may be a DNS name or IP literal (resolved ONCE at init;
 //! per-dial re-resolution for endpoint DNS rotation is a recorded
@@ -21,12 +25,12 @@ const String = utils.String;
 const _sigv4 = @import("sigv4.zig");
 const _lookahead = @import("lookahead.zig");
 const _vfs = @import("vfs.zig");
+const _chunkcache = @import("chunkcache.zig");
 
 const log = std.log.scoped(.s3);
 
 const max_put_bytes: u64 = 5 << 30; // single-PUT ceiling (S3 hard limit)
 const attempts_max = 3; // connect/5xx retries per request
-const pool_cap = 8; // idle keep-alive connections held per store
 const idle_ttl_ms = 30_000; // drop idle conns older than this at checkout
 
 pub const S3Config = struct {
@@ -36,11 +40,15 @@ pub const S3Config = struct {
     /// ("127.0.0.1"), or a bracketed IPv6 literal ("[::1]").
     endpoint: String,
     bucket: String,
-    region: String = "us-east-1",
     /// Optional key prefix inside the bucket. Unreserved URI characters
     /// only — keys are used verbatim in the request path (no
     /// percent-encoding pass).
     prefix: String = "",
+    /// Requests in flight at once, which is also the number of
+    /// keep-alive connections held: one response at a time per
+    /// connection.
+    max_inflight: u32 = 32,
+    cache: _chunkcache.ChunkCache.Config = .{},
 };
 
 pub const S3Store = struct {
@@ -49,6 +57,7 @@ pub const S3Store = struct {
     /// Original endpoint URL, for logs.
     endpoint: String,
     bucket: String,
+    /// SigV4 signing region, taken from the host (regionFromHost).
     region: String,
     prefix: String,
     /// Bare host name — TLS SNI + certificate verification.
@@ -67,21 +76,28 @@ pub const S3Store = struct {
     // System trust roots, loaded once at init when use_tls.
     ca_bundle: std.crypto.Certificate.Bundle = .empty,
     ca_lock: std.Io.RwLock = .init,
-    // Keep-alive connection pool, shared by every caller (prefetch, apply,
-    // recovery, uploads, Object reads). A conn is reusable only after its
-    // response was fully drained — parseResponse guarantees that.
-    pool_mu: fiber.Mutex(.untracked) = .{},
-    idle: std.ArrayList(IdleConn) = .empty,
+    /// Connection slots, `max_inflight` of them, shared by every caller
+    /// (prefetch, apply, uploads, Object reads). A request holds one
+    /// slot from `receive` to `send`; when all are out the next caller
+    /// parks FIFO, so the channel is both the pool and the in-flight
+    /// cap. A slot's conn is reusable only after its response was
+    /// fully drained — parseResponse guarantees that.
+    conns: fiber.Channel(Slot),
     /// Ideal readahead in bytes for this endpoint, set by
-    /// calibrateLookahead at startup. 0 = uncalibrated. Not consumed yet —
-    /// the tiered/lazy read stage will size its chunk fetches from it.
+    /// calibrateLookahead at startup. 0 = uncalibrated. Informs the
+    /// chunk size the cache is created with (chunkcache.zig).
     lookahead: u64 = 0,
+    /// Local-disk chunk cache in front of every read (chunkcache.zig).
+    cache: _chunkcache.ChunkCache,
 
     const Conn = fiber.net.Conn;
 
-    const IdleConn = struct {
-        conn: *Conn,
-        since_ms: i64,
+    /// One connection slot. `conn` is null before the first dial and
+    /// after a failure closed it; `since_ms` is when it was last
+    /// returned, for the idle TTL.
+    const Slot = struct {
+        conn: ?*Conn = null,
+        since_ms: i64 = 0,
     };
 
     pub fn init(a: std.mem.Allocator, cfg: S3Config) !S3Store {
@@ -115,7 +131,7 @@ pub const S3Store = struct {
             .arena = undefined,
             .endpoint = try arloc.dupe(u8, cfg.endpoint),
             .bucket = try arloc.dupe(u8, cfg.bucket),
-            .region = try arloc.dupe(u8, cfg.region),
+            .region = try arloc.dupe(u8, regionFromHost(ep.host)),
             .prefix = try arloc.dupe(u8, cfg.prefix),
             .host = try arloc.dupe(u8, ep.host),
             .host_header = if (default_port)
@@ -126,9 +142,13 @@ pub const S3Store = struct {
             .use_tls = ep.tls,
             .access_key = access,
             .secret_key = secret,
-            .idle = try std.ArrayList(IdleConn).initCapacity(arloc, pool_cap),
+            .conns = try fiber.Channel(Slot).initAlloc(a, cfg.max_inflight),
+            .cache = try _chunkcache.ChunkCache.init(a, cfg.cache),
         };
         ret.arena = arena;
+        // Every slot starts in the channel, empty; capacity equals the
+        // slot count, so a send can never block.
+        for (0..cfg.max_inflight) |_| ret.conns.trySend(.{}) catch unreachable;
         if (ep.tls) {
             const io = ctx.io;
             ret.ca_bundle.rescan(a, io, std.Io.Timestamp.now(io, .real)) catch |err| {
@@ -140,9 +160,13 @@ pub const S3Store = struct {
     }
 
     pub fn deinit(self: *S3Store) void {
-        for (self.idle.items) |c| c.conn.deinit(self.a);
+        self.conns.close(.graceful);
+        while (self.conns.tryReceive()) |slot| {
+            if (slot.conn) |c| c.deinit(self.a);
+        } else |_| {}
+        self.conns.deinit();
+        self.cache.deinit();
         self.arena.deinit();
-        self.pool_mu.deinit();
         if (self.use_tls) self.ca_bundle.deinit(self.a);
     }
 
@@ -155,133 +179,333 @@ pub const S3Store = struct {
         } else null);
     }
 
-    /// Get a connection: a pooled keep-alive one when available, else a
-    /// fresh dial. Pooled conns that idled past the TTL are discarded
-    /// (servers close quiet keep-alives; a dead one would waste a retry).
-    /// `fresh` skips the pool entirely — retries pass true so a batch of
-    /// stale idle conns can never exhaust the retry budget.
-    fn getConn(self: *S3Store, fresh: bool) !*Conn {
-        if (!fresh) {
-            // The block-scoped defer unlocks before the dial below.
-            self.pool_mu.lock(@src());
-            defer self.pool_mu.unlock();
-
-            const now = utils.coarseMs();
-            while (self.idle.pop()) |c| {
-                if (now - c.since_ms > idle_ttl_ms) {
-                    c.conn.deinit(self.a);
-                    continue;
-                }
-                return c.conn;
-            }
+    /// Take a slot, parking while all are in flight. A conn idle past
+    /// the TTL is closed (servers drop quiet keep-alives; a dead one
+    /// would waste a retry) and the next slot tried — the channel is
+    /// FIFO, so later slots are fresher — until one has a live conn or
+    /// none; the caller dials into an empty slot. Emptied slots go back
+    /// to the tail, so the loop ends within one pass.
+    fn acquire(self: *S3Store) !Slot {
+        var slot = self.conns.receive() catch return error.Shutdown;
+        const now = utils.coarseMs();
+        while (slot.conn) |conn| {
+            if (now - slot.since_ms <= idle_ttl_ms) break;
+            conn.deinit(self.a);
+            slot.conn = null;
+            const next = self.conns.tryReceive() catch break;
+            // Only a closed channel (deinit) refuses; the slot is empty.
+            self.conns.send(slot) catch {};
+            slot = next;
         }
-        return self.newConn();
+        return slot;
     }
 
-    /// Return a healthy, fully-drained connection to the pool (or close it
-    /// when the pool is full).
-    fn putConn(self: *S3Store, conn: *Conn) void {
-        self.pool_mu.lock(@src());
-        defer self.pool_mu.unlock();
-
-        // A pooled conn that has spent 70% of its idle TTL is a fair
-        // displacement victim — it would likely be discarded at checkout
-        // anyway. Comptime integer math (7/10 of 30s = 21s exactly), so
-        // the i64 time comparison never touches floats.
-        const displace_age_ms = idle_ttl_ms * 7 / 10;
-        const now = utils.coarseMs();
-        if (self.idle.items.len >= pool_cap) {
-            for (self.idle.items, 0..) |prev, i| {
-                if (now - prev.since_ms < displace_age_ms) {
-                    continue;
-                }
-                // Displace a stale or soon to be stale connection.
-                prev.conn.deinit(self.a);
-                self.idle.items[i] = .{
-                    .conn = conn,
-                    .since_ms = now,
-                };
-                return;
-            }
-            conn.deinit(self.a);
-            return;
-        }
-        self.idle.appendAssumeCapacity(.{
-            .conn = conn,
-            .since_ms = now,
-        });
+    /// Return a slot. Capacity equals the slot count, so this never
+    /// blocks; a closed channel (deinit) just drops the conn.
+    fn release(self: *S3Store, slot_in: Slot) void {
+        var slot = slot_in;
+        slot.since_ms = utils.coarseMs();
+        self.conns.send(slot) catch {
+            if (slot.conn) |c| c.deinit(self.a);
+        };
     }
 
     pub fn put(self: *S3Store, name: String, data: String) !void {
         if (data.len > max_put_bytes) return error.ObjectTooLarge;
-        var resp = try self.objectRequest("PUT", name, data, null, false);
+        var resp = try self.objectRequest(name, .{
+            .method = .PUT,
+            .body = data,
+        });
         defer resp.deinit(self.a);
-        if (resp.status != 200) return self.statusErr("PUT", name, &resp);
+        if (resp.status != 200) return self.statusErr(.PUT, name, &resp);
     }
 
     pub fn exists(self: *S3Store, name: String) !bool {
-        var resp = try self.objectRequest("HEAD", name, null, null, false);
+        var resp = try self.objectRequest(name, .{ .method = .HEAD });
         defer resp.deinit(self.a);
 
         return switch (resp.status) {
             200 => true,
             404 => false,
-            else => self.statusErr("HEAD", name, &resp),
+            else => self.statusErr(.HEAD, name, &resp),
         };
     }
 
     pub fn delete(self: *S3Store, name: String) !void {
-        var resp = try self.objectRequest("DELETE", name, null, null, false);
+        var resp = try self.objectRequest(name, .{ .method = .DELETE });
         defer resp.deinit(self.a);
         // S3 DELETE is idempotent: 204 whether or not the key existed.
         switch (resp.status) {
             200, 204, 404 => {},
-            else => return self.statusErr("DELETE", name, &resp),
+            else => return self.statusErr(.DELETE, name, &resp),
         }
+        self.cache.forget(name);
     }
 
     /// HEAD for size + existence; ranged GETs happen per read().
     pub fn head(self: *S3Store, name: String) !u64 {
-        var resp = try self.objectRequest("HEAD", name, null, null, false);
+        return (try self.stat(name)).size;
+    }
+
+    /// HEAD for size and modification time. error.FileNotFound if
+    /// absent.
+    pub fn stat(self: *S3Store, name: String) !_vfs.FileStat {
+        var resp = try self.objectRequest(name, .{ .method = .HEAD });
         defer resp.deinit(self.a);
 
         return switch (resp.status) {
-            200 => resp.content_length,
+            200 => .{
+                .size = resp.content_length,
+                .mtime_s = resp.last_modified_s,
+            },
             404 => error.FileNotFound,
-            else => self.statusErr("HEAD", name, &resp),
+            else => self.statusErr(.HEAD, name, &resp),
         };
     }
 
-    /// Ranged GET of [offset, offset+len). Caller owns the bytes.
-    pub fn readRange(self: *S3Store, a: std.mem.Allocator, name: String, offset: u64, len: u64) ![]u8 {
-        var resp = try self.objectRequest("GET", name, null, .{ offset, len }, true);
-        errdefer resp.deinit(self.a);
+    /// One ranged GET: [offset, offset+buf.len) of `name` straight into
+    /// `buf`, written once, off the socket. The wire primitive every
+    /// read builds on; `read` is the one that goes through the cache.
+    pub fn get(self: *S3Store, name: String, offset: u64, buf: []u8) !void {
+        if (buf.len == 0) return;
+        var resp = try self.objectRequest(name, .{
+            .method = .GET,
+            .range = .{ offset, buf.len },
+            .sink = .{ .into = buf },
+        });
+        defer resp.deinit(self.a);
         switch (resp.status) {
             // 206 for a partial range; some servers reply 200 when the
             // range covers the whole object.
             200, 206 => {},
-            404 => {
-                resp.deinit(self.a);
-                return error.FileNotFound;
-            },
-            else => {
-                const e = self.statusErr("GET", name, &resp);
-                resp.deinit(self.a);
-                return e;
-            },
+            404 => return error.FileNotFound,
+            else => return self.statusErr(.GET, name, &resp),
         }
-        const body = resp.body orelse return error.MissingBody;
-        if (body.len != len) {
-            log.err("s3 GET {s}: range asked {d} bytes, got {d}", .{ name, len, body.len });
-            resp.deinit(self.a);
-            return error.ShortRead;
-        }
-        resp.body = null; // ownership moves to the caller
-        defer resp.deinit(self.a);
+    }
 
-        if (a.ptr == self.a.ptr) return body;
-        defer self.a.free(body);
-        return a.dupe(u8, body);
+    /// Read [offset, offset+dst.len) of `name`, an object of `size`
+    /// bytes. Through the chunk cache when it is on: each covering chunk
+    /// (usually one) is copied from disk on a hit, or fetched whole and
+    /// stored on a miss. Otherwise one exact ranged GET.
+    pub fn read(
+        self: *S3Store,
+        name: String,
+        size: u64,
+        offset: u64,
+        dst: []u8,
+    ) !void {
+        if (dst.len == 0) return;
+        if (!self.cache.enabled()) return self.get(name, offset, dst);
+
+        const c = self.cache.chunkBytes();
+        var it = Ranges.init(c, offset, dst.len);
+        while (it.next()) |rng| {
+            const part = dst[rng.at..][0..rng.len()];
+            if (try self.cache.read(name, rng.idx, rng.lo, part)) continue;
+            var chunk = Chunk{
+                .idx = rng.idx,
+                .lo = 0,
+                .hi = chunkLen(c, size, rng.idx),
+            };
+            chunk.buf = try self.a.alloc(u8, chunk.hi);
+            defer self.a.free(chunk.buf);
+            try self.fetchChunk(name, &chunk);
+            @memcpy(part, chunk.bytes(rng));
+        }
+    }
+
+    /// Bytes in chunk `idx` of an object of `size` bytes: `c`, or the
+    /// tail for the last chunk.
+    fn chunkLen(c: u64, size: u64, idx: u64) u64 {
+        return @min(c, size - idx * c);
+    }
+
+    /// Byte range [off, off+len) on a grid of `chunk_bytes` chunks,
+    /// walked as one range per chunk it touches, in order.
+    pub const Ranges = struct {
+        chunk_bytes: u64,
+        off: u64,
+        end: u64,
+        idx: u64,
+
+        /// The part of the byte range inside one chunk.
+        pub const Range = struct {
+            idx: u64,
+            /// Bounds within the chunk.
+            lo: u64,
+            hi: u64,
+            /// Position within the whole byte range.
+            at: u64,
+
+            pub fn len(self: Range) u64 {
+                return self.hi - self.lo;
+            }
+        };
+
+        pub fn init(chunk_bytes: u64, off: u64, len: u64) Ranges {
+            return .{
+                .chunk_bytes = chunk_bytes,
+                .off = off,
+                .end = off + len,
+                .idx = off / chunk_bytes,
+            };
+        }
+
+        pub fn next(self: *Ranges) ?Range {
+            const start = self.idx * self.chunk_bytes;
+            // An empty byte range yields nothing though its chunk exists.
+            if (self.off >= self.end or start >= self.end) return null;
+            defer self.idx += 1;
+            const lo = @max(self.off, start) - start;
+            return .{
+                .idx = self.idx,
+                .lo = lo,
+                .hi = @min(self.end, start + self.chunk_bytes) - start,
+                .at = start + lo - self.off,
+            };
+        }
+
+        /// The byte range assembled from loaded chunks: a slice into the
+        /// chunk when it lies in one, else a copy in `arloc` stitched
+        /// from each — the one case that copies.
+        pub fn gather(
+            self: *Ranges,
+            arloc: std.mem.Allocator,
+            chunks: *const ChunkMap,
+        ) ![]u8 {
+            const total = self.end - self.off;
+            const first = self.next() orelse return &.{};
+
+            const lead = chunks.get(first.idx).?.bytes(first);
+            if (first.len() == total) return lead;
+
+            const out = try arloc.alloc(u8, total);
+            @memcpy(out[0..lead.len], lead);
+            while (self.next()) |rng| {
+                const src = chunks.get(rng.idx).?.bytes(rng);
+                @memcpy(out[rng.at..][0..src.len], src);
+            }
+            return out;
+        }
+    };
+
+    /// The chunk's span [lo, hi) from the remote into its buffer, then
+    /// offered to the cache, which keeps a whole chunk and drops the
+    /// rest (planChunks asks for whole chunks whenever the cache is on).
+    /// TODO: bypass the cache for one-pass readers. A compaction reads
+    /// each input once; admitting those chunks churns the whole cache.
+    /// Carry a flag from the read priority (compaction opens its inputs
+    /// at a known one) through read/batchRead and skip the put.
+    fn fetchChunk(self: *S3Store, name: String, chunk: *Chunk) !void {
+        const off = chunk.idx * self.cache.chunkBytes() + chunk.lo;
+        try self.get(name, off, chunk.buf);
+        try self.cache.put(name, chunk.idx, chunk.lo, chunk.buf);
+    }
+
+    /// Fill a batch of reads of `name`, an object of `size` bytes, with
+    /// every `req.data` in `arena`. The requests are mapped onto the
+    /// chunk grid (`planChunks`) and the chunks loaded concurrently — one
+    /// fiber and one connection per chunk, bounded by the slot count —
+    /// then each request is sliced out of its chunk (`Ranges.gather`).
+    /// A chunk comes from the cache on a hit; on a miss it is fetched
+    /// whole and stored when the cache is on, else only the span the
+    /// requests want. No copy after the socket. Requests may come in any
+    /// order.
+    pub fn batchRead(
+        self: *S3Store,
+        name: String,
+        size: u64,
+        arena: *std.heap.ArenaAllocator,
+        requests: []_vfs.FileHandle.ReadRequest,
+    ) !void {
+        if (requests.len == 0) return;
+        const arloc = arena.allocator();
+        const cbytes = self.cache.chunkBytes();
+        var chunks = try planChunks(
+            arloc,
+            cbytes,
+            size,
+            requests,
+            self.cache.enabled(),
+        );
+
+        var group = try fiber.Group(anyerror!void).initCapacity(
+            self.a,
+            chunks.count(),
+        );
+        defer group.deinit();
+        for (chunks.values()) |*chunk| {
+            try group.spawn(.{}, loadChunk, .{ self, name, chunk });
+        }
+        for (group.wait()) |res| try res;
+
+        for (requests) |*req| {
+            var it = Ranges.init(cbytes, req.offset, req.len);
+            req.data = try it.gather(arloc, &chunks);
+        }
+    }
+
+    /// One chunk of a batch. `buf` holds the chunk's bytes [lo, hi):
+    /// the whole chunk when it is to be cached, else just the span the
+    /// batch wants of it.
+    pub const Chunk = struct {
+        idx: u64,
+        lo: u64,
+        hi: u64,
+        buf: []u8 = &.{},
+
+        /// The loaded bytes of `rng`, a range inside this chunk.
+        pub fn bytes(self: Chunk, rng: Ranges.Range) []u8 {
+            return self.buf[rng.lo - self.lo .. rng.hi - self.lo];
+        }
+    };
+
+    /// The chunks one batch covers, by index.
+    pub const ChunkMap = std.AutoArrayHashMapUnmanaged(u64, Chunk);
+
+    /// Map `requests` onto the chunk grid: each chunk touched once, with
+    /// the span the requests want of it, widened to the whole chunk when
+    /// `whole` (it will be cached). Buffers are allocated here, before
+    /// any fan-out: the arena is not shared across fibers. Pure, so it
+    /// is testable without a store.
+    pub fn planChunks(
+        arloc: std.mem.Allocator,
+        chunk_bytes: u64,
+        size: u64,
+        requests: []const _vfs.FileHandle.ReadRequest,
+        whole: bool,
+    ) !ChunkMap {
+        var chunks: ChunkMap = .empty;
+        for (requests) |req| {
+            var it = Ranges.init(chunk_bytes, req.offset, req.len);
+            while (it.next()) |rng| {
+                const got = try chunks.getOrPut(arloc, rng.idx);
+                if (!got.found_existing) {
+                    got.value_ptr.* = .{
+                        .idx = rng.idx,
+                        .lo = rng.lo,
+                        .hi = rng.hi,
+                    };
+                    continue;
+                }
+                got.value_ptr.lo = @min(got.value_ptr.lo, rng.lo);
+                got.value_ptr.hi = @max(got.value_ptr.hi, rng.hi);
+            }
+        }
+        for (chunks.values()) |*chunk| {
+            if (whole) {
+                chunk.lo = 0;
+                chunk.hi = chunkLen(chunk_bytes, size, chunk.idx);
+            }
+            chunk.buf = try arloc.alloc(u8, chunk.hi - chunk.lo);
+        }
+        return chunks;
+    }
+
+    /// One chunk of a batch: the cache, else the remote.
+    fn loadChunk(self: *S3Store, name: String, chunk: *Chunk) anyerror!void {
+        if (try self.cache.read(name, chunk.idx, chunk.lo, chunk.buf)) return;
+        try self.fetchChunk(name, chunk);
     }
 
     /// Every object under the configured prefix, paged through
@@ -289,7 +513,7 @@ pub const S3Store = struct {
     /// the result with `_vfs.freeObjectInfos`. Names come back with the
     /// prefix stripped, so they match what `put`/`open` take. ListObjectsV2
     /// carries size and mtime whatever `detail` asks, so `stat` is always
-    /// set; the parameter exists for the shared `FileStore.list` shape.
+    /// set; the parameter exists for the shared `RemoteStore.list` shape.
     pub fn list(
         self: *S3Store,
         alloc: std.mem.Allocator,
@@ -310,10 +534,15 @@ pub const S3Store = struct {
             const query = try self.listQuery(token);
             defer self.a.free(query);
 
-            var resp = try self.request("GET", path, query, null, null, true);
+            var resp = try self.request(.{
+                .method = .GET,
+                .path = path,
+                .query = query,
+                .sink = .alloc,
+            });
             defer resp.deinit(self.a);
             if (resp.status != 200)
-                return self.statusErr("GET", path, &resp);
+                return self.statusErr(.GET, path, &resp);
             const body = resp.body orelse return error.MissingBody;
 
             try appendListPage(alloc, body, self.prefix, detail, &out);
@@ -354,17 +583,42 @@ pub const S3Store = struct {
         return buf.toOwnedSlice(self.a);
     }
 
-    fn statusErr(self: *S3Store, method: String, name: String, resp: *const Response) error{S3Error} {
+    fn statusErr(
+        self: *S3Store,
+        method: Method,
+        name: String,
+        resp: *const Response,
+    ) error{S3Error} {
         _ = self;
         log.err("s3 {s} {s}: status={d} body={s}", .{
-            method, name, resp.status, if (resp.body) |b| b else "",
+            @tagName(method), name, resp.status, if (resp.body) |b| b else "",
         });
         return error.S3Error;
     }
 
+    pub const Method = enum { GET, PUT, HEAD, DELETE };
+
+    /// One request. `path` and `query` are the canonical forms SigV4
+    /// signs (the query sorted and URI-encoded); `range` rides unsigned
+    /// (SigV4 requires host + x-amz-* only).
+    pub const Req = struct {
+        method: Method,
+        /// `objectRequest` fills it from the object name.
+        path: String = "",
+        query: String = "",
+        body: ?String = null,
+        range: ?[2]u64 = null,
+        sink: BodySink = .discard,
+        /// Non-null → record time-to-first-byte (request flushed →
+        /// first response byte on the wire). Calibration only.
+        ttfb_ns: ?*u64 = null,
+    };
+
     pub const Response = struct {
         status: u16,
         content_length: u64 = 0,
+        /// The Last-Modified header as Unix seconds; 0 when absent.
+        last_modified_s: i64 = 0,
         body: ?[]u8 = null,
         /// Server refused keep-alive (Connection: close / HTTP/1.0) —
         /// the conn must not go back to the pool.
@@ -376,43 +630,48 @@ pub const S3Store = struct {
         }
     };
 
-    /// One signed HTTP request over a pooled keep-alive connection.
-    /// Bounded retries on connect failures and 5xx; definitive statuses
-    /// (2xx/4xx) return immediately. Only the FIRST attempt may use a
-    /// pooled conn — a failure closes it and every retry dials fresh, so a
-    /// batch of stale idle conns can never exhaust the retry budget.
-    /// `range` rides unsigned (SigV4 requires host + x-amz-* only).
-    fn request(
-        self: *S3Store,
-        method: String,
-        path: String,
-        query: String,
-        body: ?String,
-        range: ?[2]u64,
-        want_body: bool,
-    ) !Response {
+    /// One signed HTTP request on a connection slot. Bounded retries on
+    /// connect failures, transport errors and 5xx; definitive statuses
+    /// (2xx/4xx) return immediately. A failure closes the slot's conn and
+    /// the retry dials a fresh one into the same slot, so a stale
+    /// keep-alive costs one attempt, never the slot.
+    fn request(self: *S3Store, req: Req) !Response {
+        const method = @tagName(req.method);
+        var slot = try self.acquire();
+        defer self.release(slot);
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
-            const conn = self.getConn(attempt > 0) catch |err| {
+            const conn = slot.conn orelse self.newConn() catch |err| {
                 if (attempt + 1 >= attempts_max) return err;
-                log.warn("s3 {s} {s}: connect: {s}, retrying", .{ method, path, @errorName(err) });
+                log.warn("s3 {s} {s}: connect: {s}, retrying", .{
+                    method, req.path, @errorName(err),
+                });
                 fiber.sleepMs(100 * (attempt + 1));
                 continue;
             };
-            const resp = self.requestOnce(conn, method, path, query, body, range, want_body, null) catch |err| {
+            slot.conn = conn;
+            const resp = self.requestOnce(conn, req) catch |err| {
                 conn.deinit(self.a);
+                slot.conn = null;
                 if (attempt + 1 >= attempts_max) return err;
-                log.warn("s3 {s} {s}: {s}, retrying", .{ method, path, @errorName(err) });
+                log.warn("s3 {s} {s}: {s}, retrying", .{
+                    method, req.path, @errorName(err),
+                });
                 fiber.sleepMs(100 * (attempt + 1));
                 continue;
             };
             // The response is fully drained — the conn is reusable unless
             // the server said otherwise.
-            if (resp.conn_close) conn.deinit(self.a) else self.putConn(conn);
+            if (resp.conn_close) {
+                conn.deinit(self.a);
+                slot.conn = null;
+            }
             if (resp.status >= 500 and attempt + 1 < attempts_max) {
                 var r = resp;
                 r.deinit(self.a);
-                log.warn("s3 {s} {s}: status={d}, retrying", .{ method, path, resp.status });
+                log.warn("s3 {s} {s}: status={d}, retrying", .{
+                    method, req.path, resp.status,
+                });
                 fiber.sleepMs(100 * (attempt + 1));
                 continue;
             }
@@ -422,17 +681,11 @@ pub const S3Store = struct {
 
     /// `request` against one object, whose key is `name` under the
     /// bucket and the configured prefix. No query parameters.
-    fn objectRequest(
-        self: *S3Store,
-        method: String,
-        name: String,
-        body: ?String,
-        range: ?[2]u64,
-        want_body: bool,
-    ) !Response {
-        const path = try self.objectPath(name);
-        defer self.a.free(path);
-        return self.request(method, path, "", body, range, want_body);
+    fn objectRequest(self: *S3Store, name: String, req_in: Req) !Response {
+        var req = req_in;
+        req.path = try self.objectPath(name);
+        defer self.a.free(req.path);
+        return self.request(req);
     }
 
     /// The request path of object `name`: `/bucket[/prefix]/name`.
@@ -446,23 +699,12 @@ pub const S3Store = struct {
         return std.fmt.allocPrint(self.a, "/{s}/{s}", .{ self.bucket, name });
     }
 
-    fn requestOnce(
-        self: *S3Store,
-        conn: *Conn,
-        method: String,
-        path: String,
-        /// Canonical query string (sorted, URI-encoded), or empty. It is
-        /// both what SigV4 signs and what goes after the `?` on the
-        /// request line.
-        query: String,
-        body: ?String,
-        range: ?[2]u64,
-        want_body: bool,
-        // Non-null → record time-to-first-byte (request flushed → first
-        // response byte on the wire). Calibration only.
-        ttfb_ns: ?*u64,
-    ) !Response {
+    fn requestOnce(self: *S3Store, conn: *Conn, req: Req) !Response {
         const a = self.a;
+        const method = @tagName(req.method);
+        const path = req.path;
+        const query = req.query;
+        const body = req.body;
         const now_s: u64 = @intCast(@divTrunc(utils.coarseMs(), 1000));
         const amz = _sigv4.AmzDate.fromEpochSeconds(now_s);
         const payload_hash = _sigv4.hashHex(body orelse "");
@@ -497,8 +739,10 @@ pub const S3Store = struct {
             &amz.stamp,                 &payload_hash, auth,
             if (body) |b| b.len else 0,
         });
-        if (range) |r| {
-            try head_buf.print(a, "Range: bytes={d}-{d}\r\n", .{ r[0], r[0] + r[1] - 1 });
+        if (req.range) |r| {
+            try head_buf.print(a, "Range: bytes={d}-{d}\r\n", .{
+                r[0], r[0] + r[1] - 1,
+            });
         }
         try head_buf.appendSlice(a, "\r\n");
 
@@ -508,12 +752,12 @@ pub const S3Store = struct {
         conn.flushAll() catch return error.BrokenPipe;
 
         const reader = conn.rd();
-        if (ttfb_ns) |out| {
+        if (req.ttfb_ns) |out| {
             const sent = utils.timestampNow(.monotonic, .nanos);
             _ = reader.peekByte() catch return error.BadResponse;
             out.* = @intCast(utils.timestampNow(.monotonic, .nanos) - sent);
         }
-        return parseResponse(reader, a, method, want_body);
+        return parseResponse(reader, a, req.method, req.sink);
     }
 
     /// Measure this endpoint's ideal readahead (the calibration policy
@@ -522,24 +766,32 @@ pub const S3Store = struct {
     /// callers treat failure as non-fatal.
     pub fn calibrateLookahead(self: *S3Store, block_size: u64) !u64 {
         self.lookahead = try _lookahead.calibrate(self.a, self, block_size);
+        const chunk = self.cache.chunkBytes();
+        if (self.cache.enabled() and chunk != self.lookahead) {
+            log.info("chunk cache: {d}-byte chunks; endpoint knee {d}", .{
+                chunk, self.lookahead,
+            });
+        }
         return self.lookahead;
     }
 
     /// One timed ranged GET of the calibration probe object — the
-    /// measurement primitive behind lookahead.calibrate.
+    /// measurement primitive behind lookahead.calibrate. A retry inside
+    /// `request` inflates one sample; calibrate takes medians.
     pub fn probeRead(self: *S3Store, off: u64, len: u64) !_lookahead.Probe {
         const path = try self.objectPath(_lookahead.probe_object);
         defer self.a.free(path);
-        const conn = try self.getConn(false);
         var ttfb: u64 = 0;
         const t0 = utils.timestampNow(.monotonic, .nanos);
-        var resp = self.requestOnce(conn, "GET", path, "", null, .{ off, len }, true, &ttfb) catch |err| {
-            conn.deinit(self.a);
-            return err;
-        };
+        var resp = try self.request(.{
+            .method = .GET,
+            .path = path,
+            .range = .{ off, len },
+            .sink = .alloc,
+            .ttfb_ns = &ttfb,
+        });
         const total: u64 =
             @intCast(utils.timestampNow(.monotonic, .nanos) - t0);
-        if (resp.conn_close) conn.deinit(self.a) else self.putConn(conn);
         defer resp.deinit(self.a);
         if (resp.status != 200 and resp.status != 206) return error.S3Error;
         // The probe object carries a position-dependent pattern — verify
@@ -551,17 +803,29 @@ pub const S3Store = struct {
     }
 };
 
-/// Parse one HTTP/1.1 response: status line, headers, then the body when
-/// `want_body` (or on an error status, whose XML body we log) — HEAD
-/// advertises Content-Length but never carries a body. ALWAYS consumes
+/// Where a response body goes. An error status (>= 300) is allocated
+/// whatever the sink says, so `statusErr` can log the XML.
+pub const BodySink = union(enum) {
+    /// Drain it so the connection stays reusable (PUT, HEAD, DELETE).
+    discard,
+    /// `Response.body`, owned by the store allocator (list, probe).
+    alloc,
+    /// Read exactly `len` bytes straight into this buffer; a body of
+    /// another length is drained and reported as ShortRead.
+    into: []u8,
+};
+
+/// Parse one HTTP/1.1 response: status line, headers, then the body where
+/// `sink` says (or allocated on an error status, whose XML body we log)
+/// — HEAD advertises Content-Length but never carries a body. ALWAYS consumes
 /// the response through its final body byte (unwanted bodies are
 /// discarded), so on return the connection is clean for the next request.
 /// Pub for tests (canned buffers via std.Io.Reader.fixed).
 pub fn parseResponse(
     reader: *std.Io.Reader,
     a: std.mem.Allocator,
-    method: String,
-    want_body: bool,
+    method: S3Store.Method,
+    sink: BodySink,
 ) !S3Store.Response {
     // Status line: "HTTP/1.1 200 OK".
     const status_line = reader.takeDelimiterInclusive('\n') catch return error.BadResponse;
@@ -592,6 +856,9 @@ pub fn parseResponse(
 
         if (std.ascii.eqlIgnoreCase(hname, "content-length")) {
             resp.content_length = std.fmt.parseInt(u64, hval, 10) catch return error.BadResponse;
+        } else if (std.ascii.eqlIgnoreCase(hname, "last-modified")) {
+            resp.last_modified_s = utils.date.parseHttpDate(hval) catch
+                return error.BadResponse;
         } else if (std.ascii.eqlIgnoreCase(hname, "transfer-encoding")) {
             chunked = true;
         } else if (std.ascii.eqlIgnoreCase(hname, "connection")) {
@@ -600,19 +867,47 @@ pub fn parseResponse(
     }
     if (chunked) return error.UnsupportedChunkedEncoding;
 
-    const has_body = resp.content_length > 0 and !std.mem.eql(u8, method, "HEAD");
-    if (has_body) {
-        if (want_body or resp.status >= 300) {
-            const buf = try a.alloc(u8, @intCast(resp.content_length));
-            errdefer a.free(buf);
-            reader.readSliceAll(buf) catch return error.BadResponse;
-            resp.body = buf;
-        } else {
-            // Drain the unwanted body so the connection stays reusable.
-            reader.discardAll64(resp.content_length) catch return error.BadResponse;
-        }
+    const has_body = resp.content_length > 0 and method != .HEAD;
+    if (!has_body) return resp;
+    if (resp.status >= 300 or sink == .alloc) {
+        const buf = try a.alloc(u8, @intCast(resp.content_length));
+        errdefer a.free(buf);
+        reader.readSliceAll(buf) catch return error.BadResponse;
+        resp.body = buf;
+        return resp;
+    }
+    if (sink == .into and sink.into.len == resp.content_length) {
+        reader.readSliceAll(sink.into) catch return error.BadResponse;
+        return resp;
+    }
+    // Drain the unwanted body so the connection stays reusable.
+    reader.discardAll64(resp.content_length) catch return error.BadResponse;
+    if (sink == .into) {
+        log.err("s3 {s}: asked {d} bytes, got {d}", .{
+            @tagName(method), sink.into.len, resp.content_length,
+        });
+        return error.ShortRead;
     }
     return resp;
+}
+
+/// The SigV4 signing region for an endpoint host. AWS and Backblaze
+/// put it in the host (`s3.us-west-2.amazonaws.com`,
+/// `s3-us-west-2.amazonaws.com`, `s3.us-east-005.backblazeb2.com`);
+/// MinIO, SeaweedFS and IP endpoints carry none and accept the
+/// default.
+pub fn regionFromHost(host: String) String {
+    const rest = if (std.mem.startsWith(u8, host, "s3."))
+        host[3..]
+    else if (std.mem.startsWith(u8, host, "s3-"))
+        host[3..]
+    else
+        return "us-east-1";
+    const end = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+    // "s3.amazonaws.com": the label after "s3." is the domain, not a
+    // region. A region always has at least two labels after it.
+    if (std.mem.count(u8, rest[end..], ".") < 2) return "us-east-1";
+    return rest[0..end];
 }
 
 // ───────────────────────── ListObjectsV2 parsing ─────────────────────────

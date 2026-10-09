@@ -37,7 +37,7 @@ pub const SnapshotCfg = struct {
             " removed only once older than this and not written after the" ++
             " snapshot; must exceed one compaction's window from first" ++
             " output write to proposal.",
-        .orphan_scan_interval_seconds = "How often the data directory is" ++
+        .orphan_scan_interval_seconds = "How often the remote store is" ++
             " scanned for orphan SST files.",
         .max_txn_age_seconds = "How long an open transaction on any" ++
             " voting node holds back the read floor, and with it the" ++
@@ -54,7 +54,6 @@ const Item = zdb.kv.Item;
 const Key = zdb.kv.Key;
 const Meta = zdb.kv.Meta;
 const TreeKey = zdb.kv.TreeKey;
-const vfs = zdb.vfs;
 const metrics = zdb.metrics;
 const log = std.log.scoped(.engine);
 
@@ -79,10 +78,6 @@ pub const StorageImpl = struct {
     forest: *Forest,
     allocator: std.mem.Allocator,
     node: *raft.Node,
-    /// The shared object store (SST distribution): the apply path downloads
-    /// files the manifest references but the local disk lacks. `.none` on
-    /// single node, where the local disk always has them.
-    store: *zdb.vfs.FileStore,
     /// For `max_txn_age_seconds`, read when this node reports its
     /// oldest read to the leader (`minReadTs`).
     snapshot_cfg: *flags.Live(SnapshotCfg),
@@ -103,23 +98,12 @@ pub const StorageImpl = struct {
     /// `oldest_memtable_index` field (0 if no snapshot, equivalent to "no
     /// skipping"). Read-only after `recovery_done` flips, so no atomic.
     oldest_memtable_index: u64 = 0,
-    /// Per-file locks around ensureFileLocal: the announce prefetch,
-    /// apply loop, and recovery can chase the SAME file concurrently,
-    /// and two racing forest.writeFile calls trip the table cache's
-    /// double-install assert. Under the file's lock the loser's hasFile
-    /// re-check turns its download into a no-op — it waits for the
-    /// in-flight download instead of duplicating it — while DIFFERENT
-    /// files download in parallel. Mutexes are heap pointers (a by-value
-    /// mutex would move on rehash while parked on) and entries are never
-    /// removed (a parked waiter may hold the pointer): one tiny entry
-    /// per distinct file ever ensured.
-    file_locks: fiber.SafeHashMap(u64, *fiber.Mutex(.untracked)),
 
     pub fn asStateMachine(self: *StorageImpl) raft.Node.StateMachine {
         return .{
             .ctx = @ptrCast(self),
             .applyFn = &applyEntry,
-            .ensureFilesFn = &ensureFiles,
+            .ensureFilesFn = &prefetchFiles,
             .isReadyFn = &isReady,
             .snapshotInstallFn = &snapshotInstall,
             .minReadTsFn = &minReadTs,
@@ -262,15 +246,6 @@ pub const StorageImpl = struct {
             self.allocator.destroy(mcs);
         }
 
-        // Backstop: every SST this change creates must be on local disk
-        // before the forest installs it. Normally the announce prefetch
-        // already pulled them; a store failure here errors out and the
-        // apply loop parks + retries (never loop internally).
-        // TODO: Switch to disk cache, so we can tolerate remote files.
-        for (mcs.sstable_changes) |sc| {
-            if (sc.op == .create) try self.ensureFileLocal(sc.sst_id);
-        }
-
         // TRACE: pinpoints which entry / cmd hangs the apply path. Last
         // "enter" without a matching "exit" is the wedge.
         log.info("applyManifestChange enter idx={d} cmd={t} mt={d} tcs={d}", .{
@@ -330,96 +305,38 @@ pub const StorageImpl = struct {
     }
 
     /// StateMachine hook behind the announce prefetch: a peer announced
-    /// these ids are in the store; download whatever the local disk lacks.
-    fn ensureFiles(ctx: *anyopaque, file_ids: []const u64) anyerror!void {
+    /// these files are in the store; open them into the table cache so
+    /// the manifest entry that follows applies without waiting on the
+    /// store. One batch open, retried until it succeeds — the files that
+    /// opened are cache hits on the retry — with error.ShuttingDown the
+    /// only exit short of success.
+    fn prefetchFiles(
+        ctx: *anyopaque,
+        files: []const raft.buffers.FileRefStruct,
+    ) anyerror!void {
         const self: *StorageImpl = @ptrCast(@alignCast(ctx));
-        try self.ensureFilesLocal(file_ids);
-    }
+        if (files.len == 0) return;
+        const needed = try self.allocator.alloc(zdb.tree.TableNeed, files.len);
+        defer self.allocator.free(needed);
+        for (needed, files) |*n, f| n.* = .{
+            .id = f.id,
+            .level = 0,
+            .extent = .{ .size = f.size, .index_offset = f.index_offset },
+        };
 
-    /// Download every listed file, retrying each until it lands —
-    /// error.ShuttingDown is the only exit short of success, so a caller
-    /// that returns cleanly holds every file. A few workers pull ids off
-    /// a shared cursor, so distinct files download in parallel (same-file
-    /// chasers already serialize on file_locks). Behind both the announce
-    /// prefetch and snapshot recovery. A file another fiber fetched
-    /// meanwhile costs a no-op retry (ensureFileLocal re-checks hasFile
-    /// under the file's ensure lock), so a list that staled is harmless.
-    fn ensureFilesLocal(self: *StorageImpl, file_ids: []const u64) !void {
-        const workers = @min(file_ids.len, 3);
-        if (workers == 0) return;
-
-        var next = std.atomic.Value(usize).init(0);
-        var ensure_err: utils.SafeError = .{};
-        var g = fiber.Group(void).init(self.allocator);
-        // wait-in-defer: a failed spawn must still join the workers
-        // already running before `next`/`ensure_err` leave scope.
-        defer {
-            _ = g.wait();
-            g.deinit();
+        var attempt: u64 = 1;
+        while (true) : (attempt += 1) {
+            if (self.node.isShuttingDown()) return error.ShuttingDown;
+            self.forest.prefetch(needed) catch |err| {
+                log.warn(
+                    "prefetch: {d} files attempt={d} failed: {s}; retrying",
+                    .{ files.len, attempt, @errorName(err) },
+                );
+                fiber.sleepMs(300);
+                continue;
+            };
+            return;
         }
-        for (0..workers) |_| {
-            try g.spawn(.{}, ensureFileWorker, .{ self, file_ids, &next, &ensure_err });
-        }
-        _ = g.wait();
-        if (ensure_err.get()) |err| return err;
-    }
-
-    /// One ensureFilesLocal worker: pull the next id off the shared
-    /// cursor, ensure it (retrying until it lands), repeat until the
-    /// list drains or shutdown starts. Errors go to `err_out` — the
-    /// fiber.Group + SafeError idiom (see forest.buildFlush).
-    fn ensureFileWorker(
-        self: *StorageImpl,
-        file_ids: []const u64,
-        next: *std.atomic.Value(usize),
-        err_out: *utils.SafeError,
-    ) void {
-        while (true) {
-            const i = next.fetchAdd(1, .monotonic);
-            if (i >= file_ids.len) return;
-
-            var attempt: u64 = 1;
-            while (true) : (attempt += 1) {
-                if (self.node.isShuttingDown()) {
-                    err_out.set(error.ShuttingDown);
-                    return;
-                }
-                self.ensureFileLocal(file_ids[i]) catch |err| {
-                    log.warn("ensureFiles: file_id={d} attempt={d} failed: {s}; retrying", .{
-                        file_ids[i], attempt, @errorName(err),
-                    });
-                    fiber.sleepMs(1000);
-                    continue;
-                };
-                break;
-            }
-        }
-    }
-
-    /// Ensure one SST is on local disk, downloading it from the shared
-    /// object store if missing. Single attempt — callers retry (the apply
-    /// park-loop, ensureFilesLocal's per-file loop).
-    fn ensureFileLocal(self: *StorageImpl, file_id: u64) !void {
-        const fresh = try self.allocator.create(fiber.Mutex(.untracked));
-        fresh.* = .{};
-        const mu = try self.file_locks.getOrPut(file_id, fresh);
-        if (mu != fresh) self.allocator.destroy(fresh);
-        mu.lock(@src());
-        defer mu.unlock();
-
-        if (self.forest.hasFile(file_id)) return;
-
-        const name = try zdb.sstPath(self.allocator, "", file_id);
-        defer self.allocator.free(name);
-
-        const data = try self.store.getAll(self.allocator, name);
-        defer self.allocator.free(data);
-
-        self.forest.writeFile(file_id, data);
-        std.log.scoped(.file_event).info(
-            "node={d} event=store_get file_id={d} bytes={d}",
-            .{ self.node.id, file_id, data.len },
-        );
     }
 
     /// Publish the result of recovery to the apply path: install the
@@ -467,9 +384,6 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
     forest: *Forest,
     node: *raft.Node,
-    /// The shared object store: new SSTs are uploaded here before their
-    /// manifest change is proposed (see uploadNewFiles).
-    store: *zdb.vfs.FileStore,
     /// The apply state machine (owned). Loops/handlers gate on
     /// `storage_impl.recovery_done` (and, for data mutations, on the forest
     /// also having a real memtable) so the SM is valid before any proposal.
@@ -516,7 +430,6 @@ pub const Engine = struct {
         node: *raft.Node,
         forest: *Forest,
         snapshot_cfg: *flags.Live(SnapshotCfg),
-        store: *zdb.vfs.FileStore,
     ) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
@@ -524,15 +437,11 @@ pub const Engine = struct {
             .allocator = allocator,
             .forest = forest,
             .node = node,
-            .store = store,
             .storage_impl = .{
                 .forest = forest,
                 .allocator = allocator,
                 .node = node,
-                .store = store,
                 .snapshot_cfg = snapshot_cfg,
-                .file_locks = fiber.SafeHashMap(u64, *fiber.Mutex(.untracked))
-                    .init(allocator),
             },
             .sm = undefined,
             .raft_rt = raft.RaftRuntime.init(allocator, node),
@@ -549,12 +458,6 @@ pub const Engine = struct {
         self.in_flight.deinit(self.allocator);
         self.in_flight_mu.unlock();
         self.in_flight_mu.deinit();
-        var lock_it = self.storage_impl.file_locks.valueIterator();
-        while (lock_it.next()) |mu| {
-            mu.*.deinit();
-            self.allocator.destroy(mu.*);
-        }
-        self.storage_impl.file_locks.deinit();
         self.flush_split_mu.deinit();
         self.bg.deinit();
         self.raft_rt.deinit();
@@ -801,17 +704,13 @@ pub const Engine = struct {
         }
     }
 
-    /// Restore the manifest from `wal.snapshot().data` and bring the in-memory
-    /// trees online. If any SST files referenced by the manifest are missing
-    /// from disk, fetch them from the leader (retry until success or shutdown).
-    /// No-op when there is no snapshot on disk.
+    /// Restore the manifest from `wal.snapshot().data` and bring the
+    /// in-memory trees online, opening every SST it lists from the
+    /// store. No-op when there is no snapshot on disk.
     ///
-    /// Must run AFTER `node.initTransport()` so file fetches can use the
-    /// transport, and AFTER raft has started so a leader is reachable
-    /// (followers learn `leader_id` via AppendEntries; nodes that joined via
-    /// seeds learn it via the join response). The apply loop tolerates a brief
-    /// window where this hasn't completed: `applyEntry` errors retry until
-    /// the manifest is in place.
+    /// The apply loop tolerates a brief window where this hasn't
+    /// completed: `applyEntry` errors retry until the manifest is in
+    /// place.
     pub fn recoverFromSnapshot(self: *Engine) !void {
         // Always publish a result — even on the no-snapshot fast path or
         // mid-recovery failure — so the apply gate doesn't wedge forever.
@@ -825,18 +724,6 @@ pub const Engine = struct {
         try self.forest.manifest.restoreFrom(snap.data);
         oldest_idx = snap.oldest_memtable_index;
         _ = self.forest.setSnapshotTs(snap.timestamp);
-
-        // Download every missing SST from the shared object store before
-        // proceeding — opening a partial forest would start a node with
-        // holes in its data. ensureFilesLocal retries each file until it
-        // lands; its only other exit, error.ShuttingDown, propagates and
-        // aborts startup instead of falling through.
-        const missing = try self.forest.collectMissingFileIds(self.allocator);
-        defer self.allocator.free(missing);
-        if (missing.len > 0) {
-            log.info("recovery: fetching {d} missing SST files from the store", .{missing.len});
-            try self.storage_impl.ensureFilesLocal(missing);
-        }
 
         try self.forest.openTablesFromManifest();
         log.info("recovery: snapshot manifest installed", .{});
@@ -856,12 +743,9 @@ pub const Engine = struct {
     /// directory for files the manifest does not know
     /// (`Forest.removeOrphans`); the first tick as leader runs a scan.
     ///
-    /// Leader-only because SST files are meant to live on shared storage,
-    /// where one node must own deletion (see the TODO in the loop). Both
-    /// calls unlink in this node's own data directory today, so a
-    /// follower's local copies, written by `Forest.writeFile`, are not
-    /// removed by anything while it stays a follower, and its `to_delete`
-    /// records accumulate until it becomes leader.
+    /// Leader-only because the store is shared: one node must own
+    /// deletion. A follower's `to_delete` records accumulate until it
+    /// becomes leader.
     pub fn runSnapshotLoop(self: *Engine) void {
         // Same barrier as runCompactionLoop — snapshot proposal would
         // race the WAL-tail replay otherwise.
@@ -884,10 +768,6 @@ pub const Engine = struct {
             const poll_ms = cfg.poll_interval_seconds * 1000;
             if (self.node.shutdown.waitForStart(.shutdown, poll_ms)) return;
             if (!self.node.isLeader()) continue;
-
-            // TODO: Only leader is allowed to delete files because
-            // they should be sitting on remote storage. But, the file accessors
-            // are intermixed local and remote. Need to clean it all up.
 
             const snap_index = self.node.log.snapshot().index;
             if (snap_index > swept_upto) {
@@ -1260,7 +1140,7 @@ pub const Engine = struct {
         defer changes.deinit(self.allocator);
         if (changes.items.len == 0) return;
 
-        try self.distributeNewFiles(changes.items);
+        try self.announceNewFiles(changes.items);
 
         const payload = try encodeManifestChange(
             self.allocator,
@@ -1328,7 +1208,7 @@ pub const Engine = struct {
             @intCast(@max(t1 - t0, 0)),
         ) catch {};
 
-        try self.distributeNewFiles(changes.items);
+        try self.announceNewFiles(changes.items);
         const t2 = utils.coarseMs();
         log.info("compact cid={d} distribute_done distribute_ms={d}", .{ cid, t2 - t1 });
 
@@ -1355,7 +1235,7 @@ pub const Engine = struct {
         // encodeManifestChange copies the bytes into a self-owned payload,
         // so the arena can be torn down right after encode. No new SST
         // files are produced (split just remaps existing tables between
-        // trees), so distributeNewFiles is unnecessary here. tree_split routes
+        // trees), so announceNewFiles is unnecessary here. tree_split routes
         // through applyManifestChange to applySplit on every node.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -1397,41 +1277,29 @@ pub const Engine = struct {
         try self.node.proposeAndWaitForApply(payload, .manifest);
     }
 
-    /// Distribute new SST files, BEFORE their manifest change is proposed:
-    /// upload each `.create` to the shared object store, then announce the
-    /// ids to all peers and wait until a quorum has downloaded them (batch
-    /// acks). Consensus on the entry then implies the files are fetchable,
-    /// and the announce prefetch means the entry usually lands on followers
-    /// that already hold the files — apply never stalls. Apply-time store
-    /// fetch remains the backstop. No-op without a store (single node:
-    /// joins are rejected without one, so peers imply a store). Pub: SST
-    /// creators outside the engine (sql index backfill) call it too.
-    pub fn distributeNewFiles(self: *Engine, changes: []const _manifest.SSTableChange) !void {
-        if (self.store.* == .none) return;
-        const fe = std.log.scoped(.file_event);
-        var file_ids = std.ArrayList(u64).empty;
-        defer file_ids.deinit(self.allocator);
+    /// Announce new SST files, BEFORE their manifest change is proposed:
+    /// the builder put each `.create` in the store already; tell every
+    /// peer the ids and wait until a quorum has opened them (batch acks),
+    /// so the entry usually lands on followers whose table cache already
+    /// holds the tables — apply never stalls. The apply-time open remains
+    /// the backstop. Pub: SST creators outside the engine (sql index
+    /// backfill) call it too.
+    pub fn announceNewFiles(
+        self: *Engine,
+        changes: []const _manifest.SSTableChange,
+    ) !void {
+        var files: std.ArrayList(raft.buffers.FileRefStruct) = .empty;
+        defer files.deinit(self.allocator);
         for (changes) |c| {
             if (c.op != .create) continue;
-
-            try file_ids.append(self.allocator, c.sst_id);
-            const name = try zdb.sstPath(self.allocator, "", c.sst_id);
-            defer self.allocator.free(name);
-
-            // Retried proposes and splits re-reference already-uploaded ids.
-            if (try self.store.exists(name)) continue;
-
-            const read = self.forest.readFile(self.allocator, c.sst_id) orelse return error.FileNotFound;
-            defer read.free();
-
-            try self.store.put(name, read.data);
-            fe.info("node={d} event=store_put file_id={d} bytes={d}", .{ self.node.id, c.sst_id, read.data.len });
+            try files.append(self.allocator, .{
+                .id = c.sst_id,
+                .size = c.size,
+                .index_offset = c.index_offset,
+            });
         }
-        if (file_ids.items.len == 0) return;
-        // One durability barrier for the whole batch (put syncs bytes;
-        // this syncs the names) before peers are told to fetch.
-        try self.store.sync();
-        try self.node.announceAndWaitForFileQuorum(file_ids.items);
+        if (files.items.len == 0) return;
+        try self.node.announceAndWaitForFileQuorum(files.items);
     }
 
     /// Write backpressure: sleep proportional to how many L0 tables the

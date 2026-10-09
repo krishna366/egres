@@ -79,6 +79,7 @@ pub fn parseMessageWithTail(buf: []const u8) Error!MessageReader {
         WalHeaderReader.TABLE_ID => .{ .WalHeader = try WalHeaderReader.init(payload_buf, 0) },
         AnnounceFilesReader.TABLE_ID => .{ .AnnounceFiles = try AnnounceFilesReader.init(payload_buf, 0) },
         AnnounceFilesRespReader.TABLE_ID => .{ .AnnounceFilesResp = try AnnounceFilesRespReader.init(payload_buf, 0) },
+        FileRefReader.TABLE_ID => .{ .FileRef = try FileRefReader.init(payload_buf, 0) },
         else => zbuf.Error.Invalid,
     };
 }
@@ -101,6 +102,7 @@ pub const MessageReader = union(enum) {
     WalHeader: WalHeaderReader,
     AnnounceFiles: AnnounceFilesReader,
     AnnounceFilesResp: AnnounceFilesRespReader,
+    FileRef: FileRefReader,
 };
 
 pub const ConfChangeStruct = struct {
@@ -2967,10 +2969,11 @@ pub const AnnounceFilesStruct = struct {
     pub const TABLE_ID: u16 = 42256;
     announce_id: u64 = 0,
     sender_id: u64 = 0,
-    file_ids: []u64 = &.{},
+    files: []FileRefStruct = &.{},
     pub fn deinit(self: *AnnounceFilesStruct, alloc: std.mem.Allocator) void {
-        alloc.free(self.file_ids);
-        self.file_ids = &.{};
+        for (self.files) |*_b| _b.deinit(alloc);
+        alloc.free(self.files);
+        self.files = &.{};
     }
 
     pub fn destroy(self: *AnnounceFilesStruct, alloc: std.mem.Allocator) void {
@@ -2984,7 +2987,13 @@ pub const AnnounceFilesStruct = struct {
             .sender_id = self.sender_id,
         };
         errdefer s.deinit(alloc);
-        s.file_ids = try alloc.dupe(u64, self.file_ids);
+        {
+            s.files = try alloc.alloc(FileRefStruct, self.files.len);
+            @memset(s.files, .{});
+            for (self.files, 0..) |_child, _i| {
+                s.files[_i] = try _child.cloneValue(alloc);
+            }
+        }
         return s;
     }
 
@@ -2999,7 +3008,14 @@ pub const AnnounceFilesStruct = struct {
         var writer = try AnnounceFilesWriter.initWithBuf(alloc, out);
         try writer.setAnnounceId(self.announce_id);
         try writer.setSenderId(self.sender_id);
-        if (self.file_ids.len > 0) try writer.setFileIds(self.file_ids);
+        if (self.files.len > 0) {
+            const offsets = try alloc.alloc(u32, self.files.len);
+            defer alloc.free(offsets);
+            for (self.files, 0..) |child, ci| {
+                offsets[ci] = try child.marshalTo(alloc, out);
+            }
+            try writer.setFiles(offsets);
+        }
         const result = try writer.finish();
         return result.offset;
     }
@@ -3028,32 +3044,39 @@ pub const AnnounceFilesReader = struct {
         return self.t.scalar(u64, 10);
     }
 
-    pub fn fileIdsLen(self: Self) u32 {
-        return self.t.arrayLen(18, 8);
+    pub fn filesLen(self: Self) u32 {
+        return self.t.arrayLen(18, 4);
     }
 
-    pub fn fileIdsAt(self: Self, i: u32) Error!u64 {
-        return self.t.arrayScalar(u64, 18, i);
-    }
-
-    pub fn fileIdsToSliceAlloc(self: Self, alloc: std.mem.Allocator) Error![]u64 {
-        return self.t.arrayToSliceAlloc(u64, 18, alloc);
+    pub fn filesAt(self: Self, i: u32) Error!FileRefReader {
+        return FileRefReader.init(self.t.buf, try self.t.arrayChild(18, i));
     }
 
     pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
         var writer = try AnnounceFilesWriter.initWithBuf(alloc, out);
         try writer.setAnnounceId(self.announceId());
         try writer.setSenderId(self.senderId());
-        const values_fileIds = try self.fileIdsToSliceAlloc(alloc);
-        defer alloc.free(values_fileIds);
-        if (values_fileIds.len > 0) try writer.setFileIds(values_fileIds);
+        const count_files: u32 = self.filesLen();
+        if (count_files != 0) {
+            var child_offsets_files = try alloc.alloc(u32, @intCast(count_files));
+            defer alloc.free(child_offsets_files);
+            var i_files: u32 = 0;
+            while (i_files < count_files) : (i_files += 1) {
+                const child = try self.filesAt(i_files);
+                child_offsets_files[@intCast(i_files)] = try child.cloneInto(alloc, out);
+            }
+            try writer.setFiles(child_offsets_files);
+        }
         const result = try writer.finish();
         return result.offset;
     }
 
     pub fn verify(self: Self) Error!void {
         try self.t.verifyHeader();
-        try self.t.verifyArray(18, 8);
+        try self.t.verifyArray(18, 4);
+        for (0..self.filesLen()) |i| {
+            try (try self.filesAt(@intCast(i))).verify();
+        }
     }
     pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!AnnounceFilesStruct {
         var s = AnnounceFilesStruct{
@@ -3061,7 +3084,15 @@ pub const AnnounceFilesReader = struct {
             .sender_id = self.senderId(),
         };
         errdefer s.deinit(alloc);
-        s.file_ids = try self.fileIdsToSliceAlloc(alloc);
+        {
+            const _cnt = self.filesLen();
+            s.files = try alloc.alloc(FileRefStruct, @intCast(_cnt));
+            @memset(s.files, .{});
+            for (0.._cnt) |_i| {
+                const _child = try self.filesAt(@intCast(_i));
+                s.files[_i] = try _child.toStructValue(alloc);
+            }
+        }
         return s;
     }
     pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*AnnounceFilesStruct {
@@ -3099,8 +3130,8 @@ pub const AnnounceFilesWriter = struct {
         return self.w.setScalar(u64, 10, v);
     }
 
-    pub fn setFileIds(self: *Self, values: []const u64) Error!void {
-        return self.w.setArray(u64, 18, values);
+    pub fn setFiles(self: *Self, values: []const u32) Error!void {
+        return self.w.setArray(u32, 18, values);
     }
 
     pub fn set(self: *Self, values: anytype) Error!void {
@@ -3110,7 +3141,7 @@ pub const AnnounceFilesWriter = struct {
         }
         if (@hasField(Values, "announce_id")) try self.setAnnounceId(@field(values, "announce_id"));
         if (@hasField(Values, "sender_id")) try self.setSenderId(@field(values, "sender_id"));
-        if (@hasField(Values, "file_ids")) try self.setFileIds(@field(values, "file_ids"));
+        if (@hasField(Values, "files")) try self.setFiles(@field(values, "files"));
     }
 
     pub fn finish(self: *Self) Error!AnnounceFilesBuffer {
@@ -3290,6 +3321,160 @@ pub const AnnounceFilesRespWriter = struct {
     /// first on an empty buffer.
     pub fn finishWithTail(self: *Self) Error!AnnounceFilesRespBuffer {
         return self.w.finishWithTail(AnnounceFilesRespBuffer, TABLE_ID);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.w.deinit();
+    }
+};
+
+pub const FileRefStruct = struct {
+    pub const TABLE_ID: u16 = 42258;
+    id: u64 = 0,
+    size: u64 = 0,
+    index_offset: u64 = 0,
+    pub fn deinit(self: *FileRefStruct, alloc: std.mem.Allocator) void {
+        _ = self;
+        _ = alloc;
+    }
+
+    pub fn destroy(self: *FileRefStruct, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn cloneValue(self: FileRefStruct, alloc: std.mem.Allocator) Error!FileRefStruct {
+        var s = FileRefStruct{
+            .id = self.id,
+            .size = self.size,
+            .index_offset = self.index_offset,
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+
+    pub fn clone(self: FileRefStruct, alloc: std.mem.Allocator) Error!*FileRefStruct {
+        const ptr = try alloc.create(FileRefStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.cloneValue(alloc);
+        return ptr;
+    }
+
+    pub fn marshalTo(self: FileRefStruct, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try FileRefWriter.initWithBuf(alloc, out);
+        try writer.setId(self.id);
+        try writer.setSize(self.size);
+        try writer.setIndexOffset(self.index_offset);
+        const result = try writer.finish();
+        return result.offset;
+    }
+};
+
+pub const FileRefReader = struct {
+    const Self = @This();
+    t: zbuf.Table,
+
+    pub const TABLE_ID: u16 = 42258;
+    pub const SIZE_BYTES: u16 = 26;
+
+    pub fn parseRoot(buf: []const u8) Error!Self {
+        return .{ .t = try zbuf.Table.parseRoot(buf, TABLE_ID) };
+    }
+
+    pub fn init(buf: []const u8, base: u32) Error!Self {
+        return .{ .t = try zbuf.Table.init(buf, base) };
+    }
+
+    pub fn id(self: Self) u64 {
+        return self.t.scalar(u64, 2);
+    }
+
+    pub fn size(self: Self) u64 {
+        return self.t.scalar(u64, 10);
+    }
+
+    pub fn indexOffset(self: Self) u64 {
+        return self.t.scalar(u64, 18);
+    }
+
+    pub fn cloneInto(self: Self, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!u32 {
+        var writer = try FileRefWriter.initWithBuf(alloc, out);
+        try writer.setId(self.id());
+        try writer.setSize(self.size());
+        try writer.setIndexOffset(self.indexOffset());
+        const result = try writer.finish();
+        return result.offset;
+    }
+
+    pub fn verify(self: Self) Error!void {
+        try self.t.verifyHeader();
+    }
+    pub fn toStructValue(self: Self, alloc: std.mem.Allocator) Error!FileRefStruct {
+        var s = FileRefStruct{
+            .id = self.id(),
+            .size = self.size(),
+            .index_offset = self.indexOffset(),
+        };
+        errdefer s.deinit(alloc);
+        return s;
+    }
+    pub fn toStruct(self: Self, alloc: std.mem.Allocator) Error!*FileRefStruct {
+        const ptr = try alloc.create(FileRefStruct);
+        errdefer alloc.destroy(ptr);
+        ptr.* = try self.toStructValue(alloc);
+        return ptr;
+    }
+};
+
+pub const FileRefBuffer = zbuf.Buffer(FileRefReader);
+
+pub const FileRefWriter = struct {
+    const Self = @This();
+    w: zbuf.TableWriter,
+
+    pub const TABLE_ID: u16 = 42258;
+    pub const SIZE_BYTES: u16 = 26;
+    /// Slots of nested tables, null until set.
+    const child_slots = [_]u16{};
+
+    pub fn initWithBuf(alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) Error!Self {
+        return .{ .w = try zbuf.TableWriter.initWithBuf(alloc, buf, SIZE_BYTES, &child_slots) };
+    }
+
+    pub fn init(alloc: std.mem.Allocator) Error!Self {
+        return .{ .w = try zbuf.TableWriter.init(alloc, SIZE_BYTES, &child_slots) };
+    }
+
+    pub fn setId(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 2, v);
+    }
+
+    pub fn setSize(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 10, v);
+    }
+
+    pub fn setIndexOffset(self: *Self, v: u64) Error!void {
+        return self.w.setScalar(u64, 18, v);
+    }
+
+    pub fn set(self: *Self, values: anytype) Error!void {
+        const Values = @TypeOf(values);
+        if (@typeInfo(Values) != .@"struct") {
+            @compileError("set() expects a struct literal like .{ .field = value }");
+        }
+        if (@hasField(Values, "id")) try self.setId(@field(values, "id"));
+        if (@hasField(Values, "size")) try self.setSize(@field(values, "size"));
+        if (@hasField(Values, "index_offset")) try self.setIndexOffset(@field(values, "index_offset"));
+    }
+
+    pub fn finish(self: *Self) Error!FileRefBuffer {
+        return self.w.finish(FileRefBuffer);
+    }
+
+    /// Root must be at payload offset 0: initialize the root writer
+    /// first on an empty buffer.
+    pub fn finishWithTail(self: *Self) Error!FileRefBuffer {
+        return self.w.finishWithTail(FileRefBuffer, TABLE_ID);
     }
 
     pub fn deinit(self: *Self) void {

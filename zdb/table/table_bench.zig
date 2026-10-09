@@ -10,7 +10,7 @@
 //!                 Keys are striped so the winner changes every step, the
 //!                 worst case for the heap.
 //!   point seeks — TableIterator.seekRange to a random key. Includes the
-//!                 per-seek readBlock (openHandle tables have file_id 0,
+//!                 per-seek readBlock (openBuffer tables have file_id 0,
 //!                 the block-cache skip sentinel), so it moves less than
 //!                 `block seekGe` does.
 //!   block seekGe— the in-block binary search alone: one cached block,
@@ -28,6 +28,7 @@ const utils = @import("utils");
 const fiber = @import("zfiber");
 const String = utils.String;
 const zdb = @import("zdb");
+const openBuffer = @import("../testing.zig").openBuffer;
 const bench = fiber.bench;
 const Bench = bench.Bench;
 const Key = zdb.kv.Key;
@@ -47,16 +48,6 @@ const merge = zdb.table.merge_iterator;
 
 fn destroyTable(t: *Table) void {
     t.decrRef(); // the bench's ref is the last one; this frees the table
-}
-
-fn fromBuf(alloc: std.mem.Allocator, buf: String) !vfs.FileHandle {
-    const owned = try alloc.dupe(u8, buf);
-    return .{
-        .file_size = @intCast(owned.len),
-        .owned_buf = owned,
-        .buf_allocator = alloc,
-        .vfs = vfs.g(),
-    };
 }
 
 fn keyAt(buf: []u8, i: usize) !String {
@@ -101,7 +92,7 @@ fn openStriped(
 ) !*Table {
     var tb = try buildStriped(alloc, stripe, stride, n, block_size, val_len);
     defer tb.deinit();
-    return Table.openHandle(alloc, try fromBuf(alloc, tb.bytes), .p0);
+    return openBuffer(alloc, &tb, .p0);
 }
 
 const value_len: usize = 16;
@@ -200,7 +191,7 @@ fn benchMergeScanShared(b: *Bench) !void {
     while (opened < shared_sources) : (opened += 1) {
         var tb = try buildShared(a, shared_keys, shared_vers, 100 - 10 * opened, 4096, value_len);
         defer tb.deinit();
-        tables[opened] = try Table.openHandle(a, try fromBuf(a, tb.bytes), .p0);
+        tables[opened] = try openBuffer(a, &tb, .p0);
     }
 
     b.resetTimer();
@@ -428,7 +419,7 @@ fn benchBlockEntryWalkZipf(b: *Bench, val_len: usize) !void {
     const a = gpa;
     var tb = try buildZipfVersions(a, single_keys, 64 * 1024, val_len);
     defer tb.deinit();
-    const t = try Table.openHandle(a, try fromBuf(a, tb.bytes), .p0);
+    const t = try openBuffer(a, &tb, .p0);
     defer destroyTable(t);
 
     const bpos = t.blockCount() / 2;

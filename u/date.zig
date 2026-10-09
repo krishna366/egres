@@ -3,9 +3,10 @@
 
 //! Dates and timestamps: proleptic-Gregorian calendar arithmetic (any
 //! year, no tables) and the ISO-8601 text codecs built on it, `YYYY-MM-DD`
-//! and `YYYY-MM-DD[T| ]HH:MM:SS[.ffffff][Z|±HH[:MM]]`. SQL date and
-//! timestamp values, S3 `LastModified` stamps and SigV4 `x-amz-date` all
-//! go through here; storage is int days or int Unix µs, always UTC.
+//! and `YYYY-MM-DD[T| ]HH:MM:SS[.ffffff][Z|±HH[:MM]]`, plus the RFC 1123
+//! form HTTP headers use. SQL date and timestamp values, S3
+//! `LastModified` stamps, `Last-Modified` headers and SigV4 `x-amz-date`
+//! all go through here; storage is int days or int Unix µs, always UTC.
 
 const std = @import("std");
 const String = @import("utils.zig").String;
@@ -198,6 +199,33 @@ pub fn parseTimestamp(text: String, with_tz: bool) !i64 {
     // `12:00+02` is 10:00 UTC: local time minus its offset.
     if (with_tz) us -= offset_us;
     return us;
+}
+
+/// An RFC 1123 HTTP date (`Wed, 21 Oct 2015 07:28:00 GMT`, the only
+/// form S3 sends in `Last-Modified`) as Unix seconds.
+pub fn parseHttpDate(text: String) !i64 {
+    var it = std.mem.tokenizeAny(u8, text, " ,:");
+    _ = it.next() orelse return error.BadDate; // weekday
+    const day = try httpDateInt(&it);
+    const mon_name = it.next() orelse return error.BadDate;
+    const year = try httpDateInt(&it);
+    const hh = try httpDateInt(&it);
+    const mm = try httpDateInt(&it);
+    const ss = try httpDateInt(&it);
+    const months = [_]String{
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    const month: i64 = for (months, 1..) |m, i| {
+        if (std.mem.eql(u8, m, mon_name)) break @intCast(i);
+    } else return error.BadDate;
+    const days = daysFromCivil(year, month, day);
+    return days * std.time.s_per_day + hh * 3600 + mm * 60 + ss;
+}
+
+fn httpDateInt(it: *std.mem.TokenIterator(u8, .any)) !i64 {
+    const tok = it.next() orelse return error.BadDate;
+    return std.fmt.parseInt(i64, tok, 10) catch error.BadDate;
 }
 
 /// Render Unix µs as `YYYY-MM-DD HH:MM:SS[.ffffff]`, the fraction
