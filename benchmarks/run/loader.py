@@ -680,7 +680,7 @@ def zdb_bytes(run) -> dict:
         return {}
     import watchdog
     try:
-        text = watchdog.admin("zdb", run.env["server"]["admin_port"])
+        text = watchdog.admin("zdb metrics", run.env["server"]["admin_port"])
     except OSError:
         return {}
     # One series per source, tree and level; summed here by source.

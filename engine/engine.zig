@@ -354,7 +354,7 @@ pub const StorageImpl = struct {
 /// Snapshot of work the compaction/flush loops are currently building.
 /// Lives only between the moment we start writing SSTs / building changes
 /// and the moment the resulting manifest entry is appended via
-/// `proposeAndWaitForApply`. Surfaced through `zdb forest` so an operator
+/// `proposeAndWaitForApply`. Surfaced through `zdb` so an operator
 /// can tell whether a "compactions wanted" entry is genuinely starved or
 /// just waiting on an in-flight build to finish.
 pub const InFlight = struct {
@@ -1160,7 +1160,7 @@ pub const Engine = struct {
         // Assigned BEFORE addInFlight so the watchdog warning carries it.
         const cid = self.next_compaction_id.fetchAdd(1, .monotonic);
 
-        // Track the compaction so `zdb forest` can show whether a
+        // Track the compaction so `zdb` can show whether a
         // "compactions wanted" entry is genuinely starved or just waiting
         // on a build/sync that hasn't proposed yet.
         const tree = job.tree;

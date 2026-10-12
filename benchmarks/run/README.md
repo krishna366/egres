@@ -31,7 +31,7 @@ same commands rerun the same benchmark on any machine.
   (:3000, dashboard "Egres run", anonymous viewer), node exporter
   (host CPU, memory, disks, and a textfile collector), process
   exporter, postgres exporter, and `bridge/exporter.py`, which serves
-  the Egres admin `zdb` counters, `zdb forest` gauges, the data dir
+  the Egres admin `zdb metrics` counters, `zdb` gauges, the data dir
   size and the capped server's cgroup memory at :9877.
 
 ## A run

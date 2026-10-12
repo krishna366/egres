@@ -77,8 +77,12 @@ autovacuum_max_workers = 4
 SERVERS = {
     # `cache` is the server's --cache flag body ("total_mib=.."); empty
     # leaves the server's default (90% of RAM or of the cgroup cap).
+    # `remote` is the --remote body; empty means the run's data dir
+    # ("dir_path=<data>"), an s3 body ("s3_endpoint=..;s3_bucket=..")
+    # puts the SSTs on an object store, with AWS_ACCESS_KEY_ID and
+    # AWS_SECRET_ACCESS_KEY taken from this process's environment.
     "egres": {"sql_port": 3210, "admin_port": 5210, "dbname": "egres",
-              "zdb_extra": "num_compactors=8", "cache": ""},
+              "zdb_extra": "num_compactors=8", "cache": "", "remote": ""},
     "postgres": {"port": 5434, "dbname": "bench", "conf": PG_CONF},
 }
 
@@ -222,13 +226,29 @@ def utc() -> str:
 
 
 def alive(pid) -> bool:
+    """Whether `pid` is a running process. A zombie — exited, not yet
+    reaped — is dead: a server the watchdog itself started becomes one
+    when it exits, and `kill(pid, 0)` alone would keep reporting it
+    alive forever. Reaping is attempted in case it is our child."""
     if not pid:
         return False
+    pid = int(pid)
     try:
-        os.kill(int(pid), 0)
-        return True
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    try:
+        os.kill(pid, 0)
     except OSError:
         return False
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    return "Z" not in line.split()[1]
+    except OSError:
+        return False
+    return True
 
 
 def load_local() -> dict:
@@ -328,9 +348,10 @@ def start_egres(run: Run):
     # server on the box; sql_port + 1500 stays clear of the admin port.
     listen = (f"sql-port={srv['sql_port']};client-port={srv['admin_port']};"
               f"raft-port={srv['sql_port'] + 1500}")
+    remote = srv["remote"] or f"dir_path={run.data}"
     cmd = scope_prefix(run) + [
         str(run.egres_bin), "--raft=id=1", f"--listen={listen}",
-        f"--remote=dir_path={run.data}", f"--wal=dir={run.wal}"]
+        f"--remote={remote}", f"--wal=dir={run.wal}"]
     if srv["zdb_extra"]:
         cmd.append(f"--zdb={srv['zdb_extra']}")
     if srv["cache"]:

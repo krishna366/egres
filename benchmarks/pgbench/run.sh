@@ -125,7 +125,7 @@ printf '%s\n' "$HEADER" > "$RUNTSV"
 # Wait until the Egres LSM has nothing left to flush or compact, so a
 # read run measures the steady shape (L1 and below) and not a merge
 # across L0 tables left behind by the previous write run.  Polls the
-# admin port's `zdb forest` dump; gives up after 10 minutes.
+# admin port's `zdb` dump; gives up after 10 minutes.
 wait_quiet() {
   [ -n "$ADMIN" ] || return 0
   local host="${ADMIN%%:*}" port="${ADMIN##*:}" i dump
@@ -133,7 +133,7 @@ wait_quiet() {
     dump="$(python3 - "$host" "$port" <<'PY' || true
 import socket, sys
 s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
-s.sendall(b"zdb forest\n")
+s.sendall(b"zdb\n")
 out = b""
 try:
     while True:

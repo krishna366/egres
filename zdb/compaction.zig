@@ -835,16 +835,28 @@ fn partitions(
                 .left = if (i == 0)
                     self.key_range.left
                 else
-                    bot[lo].table.smallest,
+                    buildTableBoundKey(table_key, bot[lo].table.smallest),
                 .right = if (i == n - 1)
                     self.key_range.right
                 else
-                    bot[hi].table.smallest,
+                    buildTableBoundKey(table_key, bot[hi].table.smallest),
             },
             .bot = ConcatIterator.init(bot_iters[lo..hi]),
         };
     }
     return out[0..n];
+}
+
+/// A table's edge key as a seek key of the tree: a `Table` knows only
+/// primaries (its `smallest`/`biggest` carry no namespace or table
+/// id), and the iterators assert that a seek key is the tree's own.
+fn buildTableBoundKey(table_key: TableKey, k: Key) Key {
+    return .{
+        .namespace = table_key.namespace,
+        .table_id = table_key.table_id,
+        .primary = k.primary,
+        .bound = k.bound,
+    };
 }
 
 /// Merge `job.src` with `job.bot`, write the output SSTs, and return the

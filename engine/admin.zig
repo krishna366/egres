@@ -104,8 +104,8 @@ pub const help_text =
     \\  conf <action> <node_id> [<addr>] cluster membership change
     \\                                  actions: add, to_voter, to_learner, remove, addr
     \\  ns create <ns>                  create a namespace
-    \\  zdb                             Prometheus-format storage metrics dump
-    \\  zdb forest                      hierarchical forest summary
+    \\  zdb                             hierarchical forest summary
+    \\  zdb metrics                     Prometheus-format storage metrics dump
     \\  zdb tree=<ns>:<id>              forest summary scoped to one tree
     \\  zdb namespace=<id>              forest summary for trees in one namespace
     \\  raft                            cluster topology + per-peer log progress
@@ -131,12 +131,12 @@ pub const NsCreateCmd = struct {
     ns: u32,
 };
 
-/// `zdb`                 → Prometheus dump (existing behavior; loadtest scrapes this)
-/// `zdb forest`          → hierarchical forest summary
+/// `zdb`                 → hierarchical forest summary
+/// `zdb metrics`         → Prometheus dump (the scrapers read this)
 /// `zdb tree=<ns>:<N>`   → forest summary scoped to one tree
 /// `zdb namespace=<N>`   → forest summary for trees in one namespace
 pub const ZdbCmd = struct {
-    filter: Filter = .prom,
+    filter: Filter = .forest,
     tree_id: u64 = 0,
     ns_id: u32 = 0,
 
@@ -565,8 +565,8 @@ pub fn parseLine(line: String) !Command {
         return .{ .ns_create = .{ .ns = ns } };
     } else if (std.mem.eql(u8, cmd, "zdb")) {
         const sub = it.next() orelse return .{ .zdb = .{} };
-        if (std.mem.eql(u8, sub, "forest")) {
-            return .{ .zdb = .{ .filter = .forest } };
+        if (std.mem.eql(u8, sub, "metrics")) {
+            return .{ .zdb = .{ .filter = .prom } };
         }
         // Look for `tree=<N>` or `namespace=<N>`. Anything else is an error.
         const eq = std.mem.indexOfScalar(u8, sub, '=') orelse return error.InvalidZdbFilter;

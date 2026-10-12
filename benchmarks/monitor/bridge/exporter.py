@@ -97,7 +97,7 @@ def size_bytes(text: str) -> int:
 
 
 def forest_gauges(text: str) -> dict[str, int]:
-    """Gauges from the admin `zdb forest` text: the memtables, block
+    """Gauges from the admin `zdb` text: the memtables, block
     cache, tree count, L0 shape and in-flight job count. The text is
     for people, so this is by pattern, and a line that does not match
     contributes nothing rather than failing the scrape."""
@@ -200,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
         lines = []
         t0 = time.monotonic()
         try:
-            blob = admin(self.admin_addr, "zdb")
+            blob = admin(self.admin_addr, "zdb metrics")
             up = 1
             for line in blob.splitlines():
                 if line.startswith("#") or METRIC_RE.match(line):
@@ -211,11 +211,11 @@ class Handler(BaseHTTPRequestHandler):
         if up:
             try:
                 for name, value in forest_gauges(
-                        admin(self.admin_addr, "zdb forest")).items():
+                        admin(self.admin_addr, "zdb")).items():
                     lines.append(f"# TYPE {name} gauge")
                     lines.append(f"{name} {value}")
             except OSError as e:
-                print(f"zdb forest failed: {e}", file=sys.stderr)
+                print(f"zdb failed: {e}", file=sys.stderr)
             try:
                 for name, value in mem_gauges(
                         admin(self.admin_addr, "mem")).items():

@@ -901,8 +901,12 @@ test "levels: an L1 merge splits into a fiber per L2 range" {
     // L1 holds aa, cc, ee, gg in one table; L2 holds bb, dd, ff, one
     // table each. The L1 table overlaps all three, so it merges down,
     // and three fibers get [-inf, dd), [dd, ff) and [ff, inf): one
-    // output each, every key present afterwards.
-    const test_tree_id: u64 = 1;
+    // output each, every key present afterwards. The tree belongs to
+    // SQL table 16: the partition bounds are cut from L2 tables' keys,
+    // which a Table holds as bare primaries, and the iterators assert
+    // that a seek key carries the tree's own table id (a tree id of 1
+    // has table id 0, which the bare keys matched by accident).
+    const test_tree_id: u64 = 16 << 32;
     var manifest = _manifest.Manifest.init(alloc);
     defer manifest.deinit();
     const l1 = [_][]const MetaEntry{
@@ -977,7 +981,9 @@ test "levels: an L1 merge splits into a fiber per L2 range" {
     try std.testing.expectEqual(@as(usize, 0), tree.numTablesAt(1));
     try std.testing.expectEqual(@as(usize, 3), tree.numTablesAt(2));
     for ([_]String{ "aa", "bb", "cc", "dd", "ee", "ff", "gg" }) |k| {
-        const item = try tree.get(.{ .key = .{ .primary = k } });
+        const item = try tree.get(.{
+            .key = .{ .table_id = 16, .primary = k },
+        });
         try std.testing.expect(item != null);
         defer item.?.free(alloc);
         try std.testing.expectEqualStrings(k, item.?.newest().value[1..]);

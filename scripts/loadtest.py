@@ -92,7 +92,7 @@ def admin_dump(ports: Ports, node: int, command: str) -> str:
 
 
 def fetch_stats(ports: Ports, node: int) -> str:
-    return admin_dump(ports, node, "zdb")
+    return admin_dump(ports, node, "zdb metrics")
 
 
 def sum_metric(blob: str, prefix: str, label: str | None = None) -> int:

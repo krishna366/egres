@@ -130,7 +130,7 @@ class Watch:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         # Admin dumps are Egres's; a Postgres run has only its log.
         cmds = () if self.run.kind != "egres" else \
-            ("zdb forest", "workers", "locks", "raft")
+            ("zdb", "workers", "locks", "raft")
         port = self.run.env["server"].get("admin_port", 0)
         for cmd in cmds:
             name = f"{stamp}-{tag}-{cmd.replace(' ', '_')}.txt"
