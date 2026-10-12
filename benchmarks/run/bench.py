@@ -75,7 +75,7 @@ autovacuum_max_workers = 4
 
 # A server: ports, the database the workload lives in, its config.
 SERVERS = {
-    # `cache` is the server's --cache flag body ("total_mb=.."); empty
+    # `cache` is the server's --cache flag body ("total_mib=.."); empty
     # leaves the server's default (90% of RAM or of the cgroup cap).
     "egres": {"sql_port": 3210, "admin_port": 5210, "dbname": "egres",
               "zdb_extra": "num_compactors=8", "cache": ""},

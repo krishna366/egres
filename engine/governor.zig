@@ -5,7 +5,7 @@
 //! the process holds, so the cache takes the memory nothing else needs
 //! and gives it back when something does.
 //!
-//! `total` (`--cache total_mb`) is the memory the process may hold as
+//! `total` (`--cache total_mib`) is the memory the process may hold as
 //! the allocator holds it: resident, what the cgroup charges. The
 //! program counts its own live bytes (the counting allocator); the
 //! allocator holds more on top (size-class rounding, freed pages not
@@ -77,7 +77,7 @@ pub const Ratio = struct {
 };
 
 pub const Governor = struct {
-    /// The memory the process may hold, resident (`--cache total_mb`).
+    /// The memory the process may hold, resident (`--cache total_mib`).
     total: u64,
     /// Kept for what the process holds outside the cache: the recent
     /// peak of it, never under `min_margin`.
@@ -137,7 +137,7 @@ pub const Governor = struct {
         // What the cap governs is the cache's block bytes. Blocks it
         // evicted that readers still hold come from its allocator too
         // but not under the cap, so they count with the rest.
-        const others = live -| self.knob.cache.byteSize();
+        const others = live -| self.knob.cache.totalCost();
         const cap = self.nextCap(others);
         if (cap != self.knob.now) {
             self.knob.set(cap);

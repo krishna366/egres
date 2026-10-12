@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const raft = @import("raft");
+const vfs = @import("vfs");
 const zen = raft.buffers;
 const meta = raft.meta;
 
@@ -56,7 +57,7 @@ test "meta: fresh open creates two valid slots with default HardState" {
         alloc.free(dir);
     }
 
-    var ms = try meta.MetaStore.openPath(dir, alloc);
+    var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
     defer ms.deinit();
 
     const hs = ms.hardState();
@@ -79,7 +80,7 @@ test "meta: setHardState round-trip survives reopen" {
     }
 
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         defer ms.deinit();
         try ms.setHardState(.{
             .current_term = 5,
@@ -89,7 +90,7 @@ test "meta: setHardState round-trip survives reopen" {
         });
     }
 
-    var ms2 = try meta.MetaStore.openPath(dir, alloc);
+    var ms2 = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
     defer ms2.deinit();
     const hs = ms2.hardState();
     try std.testing.expectEqual(@as(u64, 5), hs.current_term);
@@ -107,7 +108,7 @@ test "meta: setHardState alternates slots" {
     }
 
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         defer ms.deinit();
         // After fresh open, slot B (idx=1) is active. The next 5 writes
         // should toggle 0, 1, 0, 1, 0.
@@ -144,7 +145,7 @@ test "meta: torn write to newer slot recovers older value" {
 
     // Write two distinct values; the second is the "newer" durable state.
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         defer ms.deinit();
         try ms.setHardState(.{ .current_term = 100, .voted_for = 0, .raft_id = 0, .checkpoint_index = 0 });
         try ms.setHardState(.{ .current_term = 200, .voted_for = 0, .raft_id = 0, .checkpoint_index = 0 });
@@ -157,14 +158,14 @@ test "meta: torn write to newer slot recovers older value" {
     // we go around the API and pwrite directly.
     var newer: u8 = undefined;
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         newer = ms.active_slot;
         ms.deinit();
     }
     try corruptSlotCrc(alloc, dir, newer);
 
     // Reopen — recovery should fall back to the older valid slot (term=100).
-    var ms3 = try meta.MetaStore.openPath(dir, alloc);
+    var ms3 = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
     defer ms3.deinit();
     try std.testing.expectEqual(@as(u64, 100), ms3.hardState().current_term);
 }
@@ -178,13 +179,16 @@ test "meta: both slots corrupt returns MetaCorrupt" {
     }
 
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         ms.deinit();
     }
     try corruptSlotCrc(alloc, dir, 0);
     try corruptSlotCrc(alloc, dir, 1);
 
-    try std.testing.expectError(meta.Error.MetaCorrupt, meta.MetaStore.openPath(dir, alloc));
+    try std.testing.expectError(
+        meta.Error.MetaCorrupt,
+        meta.MetaStore.openPath(vfs.g(), dir, alloc),
+    );
 }
 
 test "meta: setSnapshot round-trip survives reopen" {
@@ -207,7 +211,7 @@ test "meta: setSnapshot round-trip survives reopen" {
     const conf: zen.ConfStateStruct = .{ .peers = peers };
 
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         defer ms.deinit();
         try ms.setSnapshot(.{
             .index = 100,
@@ -217,7 +221,7 @@ test "meta: setSnapshot round-trip survives reopen" {
         });
     }
 
-    var ms2 = try meta.MetaStore.openPath(dir, alloc);
+    var ms2 = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
     defer ms2.deinit();
     const recovered = ms2.snapshotState();
     try std.testing.expectEqual(@as(u64, 100), recovered.index);
@@ -238,7 +242,7 @@ test "meta: stale snapshot.tmp is cleaned on reopen" {
 
     // First open creates the directory + state.bin.
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         ms.deinit();
     }
 
@@ -251,7 +255,7 @@ test "meta: stale snapshot.tmp is cleaned on reopen" {
 
     // Reopen — should silently delete the stale tmp.
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         defer ms.deinit();
     }
 
@@ -270,7 +274,7 @@ test "meta: corrupt snapshot.bin returns SnapshotCorrupt" {
 
     // Write a real snapshot first so snapshot.bin exists.
     {
-        var ms = try meta.MetaStore.openPath(dir, alloc);
+        var ms = try meta.MetaStore.openPath(vfs.g(), dir, alloc);
         defer ms.deinit();
         try ms.setSnapshot(.{
             .index = 5,
@@ -290,5 +294,8 @@ test "meta: corrupt snapshot.bin returns SnapshotCorrupt" {
     b[0] ^= 0xFF;
     _ = try f.pwriteAll(&b, 0);
 
-    try std.testing.expectError(meta.Error.SnapshotCorrupt, meta.MetaStore.openPath(dir, alloc));
+    try std.testing.expectError(
+        meta.Error.SnapshotCorrupt,
+        meta.MetaStore.openPath(vfs.g(), dir, alloc),
+    );
 }

@@ -53,42 +53,94 @@ pub const Cfg = struct {
     };
 };
 
-/// The bandwidth config `--io` asks for. With auto_calibrate the probe
-/// of `data_dir` supplies both values; a failed probe says so and falls
-/// back to the flags, as does auto_calibrate=false or an empty
-/// `data_dir` (no local device holds the SSTs: an s3 remote).
-pub fn bwConfig(
-    allocator: std.mem.Allocator,
-    io_cfg: Cfg,
-    data_dir: String,
-) !_bandwidth.Config {
+/// A device given its own VFS by `deviceVfs`.
+pub const Device = struct {
+    /// `st_dev` of its directories.
+    dev: u64,
+    /// The first of its directories, for the dump.
+    path: String,
+    vfs: *const _vfs.VFS,
+};
+
+/// The devices in `deviceVfs` order; startup-only mutation.
+var g_devices: std.ArrayList(Device) = .empty;
+
+pub fn devices() []const Device {
+    return g_devices.items;
+}
+
+/// Validate `--io` and give the global VFS its pinned budget: what
+/// files on no `deviceVfs` device charge.
+pub fn initGlobal(io_cfg: Cfg) !void {
     if (io_cfg.write_cost < 1 or io_cfg.write_cost > 32) {
         log.err("--io write_cost must be between [1, 32]", .{});
         return error.InvalidFlag;
     }
-    const pinned: _bandwidth.Config = .{
+    _vfs.VFS.initGlobal(pinnedConfig(io_cfg));
+}
+
+/// The VFS to open `dir`'s files through: one per device, so
+/// directories on one disk share one budget and disks never throttle
+/// each other. The first directory on a device probes it (with
+/// auto_calibrate; a failed probe, or auto_calibrate=false, pins the
+/// flag's numbers) and makes its VFS; later ones get the same. Startup
+/// only, before any file on the device is opened: the device list is
+/// read without a lock.
+pub fn deviceVfs(
+    allocator: std.mem.Allocator,
+    io_cfg: Cfg,
+    dir: String,
+) !*const _vfs.VFS {
+    try _vfs.createDirPath(dir);
+    const dev = try _vfs.deviceOfPath(dir);
+    for (g_devices.items) |d| {
+        if (d.dev != dev) continue;
+        log.info("{s} shares its device with {s}", .{ dir, d.path });
+        return d.vfs;
+    }
+
+    const cfg = deviceConfig(allocator, io_cfg, pinnedConfig(io_cfg), dir);
+    const bw = try allocator.create(_bandwidth.Limiter);
+    bw.* = _bandwidth.Limiter.init(cfg);
+    const v = try allocator.create(_vfs.VFS);
+    v.* = _vfs.VFS.new(bw);
+    try g_devices.append(allocator, .{
+        .dev = dev,
+        .path = dir,
+        .vfs = v,
+    });
+
+    return v;
+}
+
+/// The `--io` numbers as a limiter config.
+fn pinnedConfig(io_cfg: Cfg) _bandwidth.Config {
+    return .{
         .bytes_per_sec = io_cfg.bandwidth_mib << 20,
         .write_cost = io_cfg.write_cost,
     };
-    if (!io_cfg.auto_calibrate) return pinned;
-    if (data_dir.len == 0) {
-        log.info("no local SST device to calibrate; using --io " ++
-            "bandwidth_mib={d} write_cost={d}", .{
-            io_cfg.bandwidth_mib, io_cfg.write_cost,
-        });
-        return pinned;
-    }
+}
 
-    try _vfs.createDirPath(data_dir);
-    const p = runCalibration(allocator, data_dir) catch |err| {
-        log.warn("disk calibration failed: {s}; using --io bandwidth_mib={d} " ++
-            "write_cost={d}", .{ @errorName(err), io_cfg.bandwidth_mib, io_cfg.write_cost });
+/// The limiter config for the device holding `dir`: probed, or pinned.
+fn deviceConfig(
+    allocator: std.mem.Allocator,
+    io_cfg: Cfg,
+    pinned: _bandwidth.Config,
+    dir: String,
+) _bandwidth.Config {
+    if (!io_cfg.auto_calibrate) return pinned;
+    const p = runCalibration(allocator, dir) catch |err| {
+        log.warn("disk calibration of {s} failed: {s}; using --io " ++
+            "bandwidth_mib={d} write_cost={d}", .{
+            dir, @errorName(err), io_cfg.bandwidth_mib, io_cfg.write_cost,
+        });
         return pinned;
     };
     const cfg = bwConfigFrom(p);
-    log.info("disk calibrated: read {d} MiB/s, write {d} MiB/s; " ++
-        "setting --io bandwidth_mib={d} write_cost={d}", .{
-        p.read_bps >> 20, p.write_bps >> 20, cfg.bytes_per_sec >> 20, cfg.write_cost,
+    log.info("disk calibrated: {s}: read {d} MiB/s, write {d} MiB/s; " ++
+        "setting bandwidth_mib={d} write_cost={d}", .{
+        dir,                     p.read_bps >> 20, p.write_bps >> 20,
+        cfg.bytes_per_sec >> 20, cfg.write_cost,
     });
     return cfg;
 }

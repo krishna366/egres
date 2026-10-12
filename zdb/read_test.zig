@@ -64,7 +64,7 @@ const Fixture = struct {
         self.live = try flags.Live(Config).create(alloc, .{
             .lmax_target_bytes = 1,
         });
-        self.store = try vfs.RemoteStore.initFile(alloc, self.dir);
+        self.store = try vfs.RemoteStore.initFile(alloc, self.dir, vfs.g());
         self.f = try Forest.open(alloc, self.live, &self.store);
         self.tree_id = try createTree(self.f, table_key, .{}, .posting_index);
         // Forest.open leaves an id-0 placeholder memtable that a swap

@@ -19,7 +19,7 @@ test "remotestore: file backend put/get/exists/delete round-trip" {
     const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
     defer alloc.free(depot);
 
-    var store = try vfs.RemoteStore.initFile(alloc, depot);
+    var store = try vfs.RemoteStore.initFile(alloc, depot, vfs.g());
     defer store.deinit();
 
     // Missing object: exists false, open fails.
@@ -73,7 +73,7 @@ test "remotestore: file probeRead times an O_DIRECT ranged read" {
     const depot = try std.fmt.allocPrint(alloc, "{s}/depot", .{root});
     defer alloc.free(depot);
 
-    var store = try vfs.RemoteStore.initFile(alloc, depot);
+    var store = try vfs.RemoteStore.initFile(alloc, depot, vfs.g());
     defer store.deinit();
 
     // A small probe-patterned object (position-dependent bytes from 0);

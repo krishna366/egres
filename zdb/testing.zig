@@ -73,6 +73,8 @@ pub fn openBuffer(
         .owned_buf = owned,
         .buf_allocator = alloc,
         .vfs = vfs.g(),
+        // Memory-backed: reads never charge the limiter.
+        .bw = vfs.g().bw,
     };
     return Table.openObject(alloc, .{ .file = handle }, tb.extent(), priority);
 }

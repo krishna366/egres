@@ -204,7 +204,7 @@ const Pins = struct {
 /// going through `DiskWAL` is unsafe under concurrency.
 pub const wal = struct {
     allocator: std.mem.Allocator,
-    vfs_inst: *const _vfs.VFS,
+    vfs: *const _vfs.VFS,
     dir_path: []u8,
     files: std.ArrayList(LogFile), // all files; last is current
     current: *LogFile, // points to files.items[files.items.len - 1]
@@ -260,7 +260,7 @@ pub const wal = struct {
         const cache_capacity = opts_in.cache_capacity;
         // The header takes the first MiB; a log file needs room past it.
         std.debug.assert(opts_in.log_file_size >= log_file_offset + (1 << 20));
-        const vfs_inst = _vfs.g();
+        const vfs = opts_in.vfs orelse _vfs.g();
         const io = utils.context.g().io;
         const cwd = std.Io.Dir.cwd();
         cwd.access(io, path, .{}) catch |err| switch (err) {
@@ -310,7 +310,7 @@ pub const wal = struct {
         // (`bumpFid`).
         var next_log = NextLog{
             .allocator = alloc,
-            .vfs_inst = vfs_inst,
+            .vfs = vfs,
             .dir_path = dir_copy,
             .opts = opts,
             .next_fid = 0,
@@ -330,7 +330,7 @@ pub const wal = struct {
 
             next_log.bumpFid(0);
             try files.append(alloc, try LogFile.createCurrent(
-                vfs_inst,
+                vfs,
                 alloc,
                 path,
                 next_log.takeFid(),
@@ -342,7 +342,7 @@ pub const wal = struct {
 
             return .{
                 .allocator = alloc,
-                .vfs_inst = vfs_inst,
+                .vfs = vfs,
                 .dir_path = dir_copy,
                 .files = files,
                 .current = &files.items[files.items.len - 1],
@@ -371,7 +371,7 @@ pub const wal = struct {
             // inside openRotated; only a file whose records are
             // corrupt drops the tail.
             var lf = LogFile.openRotated(
-                vfs_inst,
+                vfs,
                 alloc,
                 path,
                 fid,
@@ -419,14 +419,14 @@ pub const wal = struct {
             next_log.bumpFid(last_fid);
 
             break :blk try LogFile.createCurrent(
-                vfs_inst,
+                vfs,
                 alloc,
                 path,
                 next_log.takeFid(),
                 opts,
             );
         } else try LogFile.openCurrent(
-            vfs_inst,
+            vfs,
             alloc,
             path,
             found_fids.items[found_fids.items.len - 1],
@@ -441,7 +441,7 @@ pub const wal = struct {
         next_log.bumpFid(cur_lf.fid);
         return .{
             .allocator = alloc,
-            .vfs_inst = vfs_inst,
+            .vfs = vfs,
             .dir_path = dir_copy,
             .files = opened,
             .current = &opened.items[opened.items.len - 1],
@@ -659,7 +659,14 @@ pub const wal = struct {
     /// cached) fails the read rather than returning bad bytes. No wal
     /// lock is held; the caller unpins after.
     pub fn readPlanned(self: *const wal, planned: *PlannedRead) !EntriesResult {
-        try self.vfs_inst.batchRead(&planned.arena, planned.reqs.items, .p0);
+        // Every segment is in the WAL directory: one device, charged
+        // through the current file's limiter.
+        try self.vfs.batchRead(
+            self.current.handle.bw,
+            &planned.arena,
+            planned.reqs.items,
+            .p0,
+        );
 
         for (planned.reqs.items, planned.sentry_offs.items) |req, off| {
             planned.sentries.items[off].bytes = try zbuf.Frame.read(req.data);
@@ -912,7 +919,11 @@ pub const DiskWAL = struct {
         allocator: std.mem.Allocator,
         opts: OpenOptions,
     ) !DiskWAL {
-        var ms = try _meta.MetaStore.openPath(path, allocator);
+        var ms = try _meta.MetaStore.openPath(
+            opts.vfs orelse _vfs.g(),
+            path,
+            allocator,
+        );
         errdefer ms.deinit();
 
         var wf = try wal.openPath(path, allocator, opts);

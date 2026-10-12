@@ -29,8 +29,14 @@ pub const RemoteStore = union(enum) {
     file: FileStore,
     s3: _s3.S3Store,
 
-    pub fn initFile(a: std.mem.Allocator, depot: String) !RemoteStore {
-        return .{ .file = try FileStore.init(a, depot) };
+    /// `vfs` is the depot device's VFS: what every object opens
+    /// through.
+    pub fn initFile(
+        a: std.mem.Allocator,
+        depot: String,
+        vfs: *const _vfs.VFS,
+    ) !RemoteStore {
+        return .{ .file = try FileStore.init(a, depot, vfs) };
     }
 
     pub fn initS3(a: std.mem.Allocator, cfg: S3Config) !RemoteStore {
@@ -88,6 +94,16 @@ pub const RemoteStore = union(enum) {
         switch (self.*) {
             .file => |*f| try f.delete(name),
             .s3 => |*s| try s.delete(name),
+        }
+    }
+
+    /// Drop the object's chunks from the disk cache: it left the
+    /// manifest, so no reader will ask for them again. The object
+    /// itself stays until `delete`. Nothing to do for a file store.
+    pub fn forget(self: *RemoteStore, name: String) void {
+        switch (self.*) {
+            .file => {},
+            .s3 => |*s| s.cache.forget(name),
         }
     }
 
@@ -153,6 +169,15 @@ pub const RemoteStore = union(enum) {
         }
     }
 
+    /// The disk chunk cache in front of this store's reads; none for a
+    /// file store, whose objects are already local.
+    pub fn chunkCache(self: *RemoteStore) ?*_vfs.ChunkCache {
+        switch (self.*) {
+            .file => return null,
+            .s3 => |*s| return &s.cache,
+        }
+    }
+
     /// The calibrated readahead in bytes; 0 = none needed/uncalibrated.
     pub fn lookahead(self: *const RemoteStore) u64 {
         switch (self.*) {
@@ -203,7 +228,7 @@ pub const Object = union(enum) {
                 // caller cannot tell which backend served it.
                 const buf = try a.alignedAlloc(u8, _vfs.page_alignment, len);
                 errdefer a.free(buf);
-                try o.store.read(o.name, o.sz, offset, buf);
+                try o.store.read(o.name, o.sz, offset, buf, priority);
                 return .{ .buf = buf, .data = buf, .allocator = a };
             },
         }
@@ -225,6 +250,7 @@ pub const Object = union(enum) {
                 o.sz,
                 arena,
                 requests,
+                priority,
             ),
         }
     }
@@ -251,15 +277,20 @@ const S3Object = struct {
 pub const FileStore = struct {
     a: std.mem.Allocator,
     depot: String,
+    vfs: *const _vfs.VFS,
     /// calibrateLookahead at startup. 0 = uncalibrated. Not consumed yet —
     /// tiered reads will size their readahead from it.
     lookahead: u64 = 0,
 
-    pub fn init(a: std.mem.Allocator, depot: String) !FileStore {
+    pub fn init(
+        a: std.mem.Allocator,
+        depot: String,
+        vfs: *const _vfs.VFS,
+    ) !FileStore {
         const tmp_dir = try std.fmt.allocPrint(a, "{s}/tmp", .{depot});
         defer a.free(tmp_dir);
         try _vfs.createDirPath(tmp_dir);
-        return .{ .a = a, .depot = try a.dupe(u8, depot) };
+        return .{ .a = a, .depot = try a.dupe(u8, depot), .vfs = vfs };
     }
 
     pub fn deinit(self: *FileStore) void {
@@ -324,7 +355,7 @@ pub const FileStore = struct {
     fn open(self: *FileStore, name: String, opts: _vfs.FileOptions) !Object {
         const path = try self.objectPath(name);
         defer self.a.free(path);
-        return .{ .file = try _vfs.g().openFile(self.a, path, opts) };
+        return .{ .file = try self.vfs.openFile(self.a, path, opts) };
     }
 
     /// Object size in bytes; errors if absent.

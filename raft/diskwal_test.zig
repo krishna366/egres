@@ -1878,7 +1878,7 @@ test "diskwal: a reused log file opens empty" {
     {
         var next = raft.diskwal.NextLog{
             .allocator = alloc,
-            .vfs_inst = vfs.g(),
+            .vfs = vfs.g(),
             .dir_path = wal_dir,
             .opts = reuse_opts,
             .next_fid = 9,

@@ -73,7 +73,7 @@ fn probe(a: std.mem.Allocator) !void {
                 return error.BadUsage;
             }
         }
-        var store = try vfs.RemoteStore.initFile(a, argv[2]);
+        var store = try vfs.RemoteStore.initFile(a, argv[2], vfs.g());
         defer store.deinit();
         const la = try store.calibrateLookahead(block_size);
         std.debug.print("ideal lookahead: {d} bytes ({d} KiB)\n", .{ la, la / 1024 });

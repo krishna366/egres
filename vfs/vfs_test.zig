@@ -397,7 +397,12 @@ test "write bandwidth enforcement" {
     defer (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(ioOf());
 
     var v = VFS.new(&limiter);
-    const fh = vfs.FileHandle{ .file = fiber.File.fromFd(fd), .file_size = file_size, .vfs = &v };
+    const fh = vfs.FileHandle{
+        .file = fiber.File.fromFd(fd),
+        .file_size = file_size,
+        .vfs = &v,
+        .bw = &limiter,
+    };
 
     // Drain the bucket.
     _ = blk: {
@@ -539,4 +544,28 @@ test "batchRead 512 requests" {
             try testing.expectEqual(expected_fill, b);
         }
     }
+}
+
+test "openFile: a file charges the limiter of the VFS it opened through" {
+    const path = "/tmp/vfs_test_handle_bw";
+    try writeTempFile(path, "x");
+    defer deleteFileAbs(path) catch {};
+    var limiter = bandwidth.Limiter.init(.{ .bytes_per_sec = 1_000_000 });
+    var v = VFS.new(&limiter);
+    const handle = try v.openFile(testing.allocator, path, .{});
+    defer handle.close();
+    try testing.expectEqual(&limiter, handle.bw);
+    const global = try vfs.g().openFile(testing.allocator, path, .{});
+    defer global.close();
+    try testing.expectEqual(vfs.g().bw, global.bw);
+}
+
+test "deviceOfPath: a directory and one under it are on one device" {
+    const dir = "/tmp/vfs_test_device_of_path";
+    try vfs.createDirPath(dir);
+    defer vfs.deleteTree(dir) catch {};
+    try testing.expectEqual(
+        try vfs.deviceOfPath("/tmp"),
+        try vfs.deviceOfPath(dir),
+    );
 }

@@ -80,33 +80,34 @@ const RaftCfg = struct {
 };
 
 /// `--cache` — the memory Egres may hold, resident: what the allocator
-/// holds, as the cgroup and `top` count it. `total_mb` defaults to 90%
+/// holds, as the cgroup and `top` count it. `total_mib` defaults to 90%
 /// of the memory this process may use (host RAM, or the cgroup limit
 /// under Docker and Kubernetes); the tenth is for the WAL's page cache,
 /// the kernel and thread stacks. The cache governor measures the
 /// allocator's overhead and gives the SST block cache what the rest of
 /// the process leaves under it.
 const CacheCfg = struct {
-    total_mb: u64 = 0,
+    total_mib: u64 = 0,
     disk_path: String = "",
-    disk_mb: u64 = 0,
-    chunk_mb: u64 = 0,
+    disk_mib: u64 = 0,
+    chunk_kib: u64 = 0,
 
     pub const docs = .{
         .self = "Cache memory and the local-disk chunk cache for an s3" ++
             " remote. The memory budget is a cap, not a reservation:" ++
             " memory is used as blocks are read.",
-        .total_mb = "The overall memory Egres aims to hold, resident," ++
+        .total_mib = "The overall memory Egres aims to hold, resident," ++
             " in MiB. 0 = 90% of host RAM or of the cgroup limit. The" ++
             " block cache is auto-resized based on what the rest of the" ++
             " process uses and the allocator's measured overhead. Set it" ++
             " on a host shared with other processes.",
-        .disk_path = "Slot file of the chunk cache: SST chunks fetched" ++
-            " from an s3 remote, kept on local disk. Empty = no disk" ++
-            " cache (not built yet; the flag reserves the shape).",
-        .disk_mb = "Chunk cache capacity in MiB.",
-        .chunk_mb = "Chunk size in MiB, fixed when the slot file is" ++
-            " created. 0 = calibrate against the endpoint then.",
+        .disk_path = "Slot file of the chunk cache: pages of SSTs" ++
+            " fetched from an s3 remote, kept on local disk. Empty =" ++
+            " no disk cache.",
+        .disk_mib = "Chunk cache capacity in MiB.",
+        .chunk_kib = "Chunk size in KiB: what a miss fetches from the" ++
+            " remote and the unit of eviction, a power of two in" ++
+            " [8, 8192], fixed when the slot file is created. 0 = 128.",
     };
 };
 
@@ -447,17 +448,26 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         .wal_dir = wal_dir,
     };
 
-    // The I/O limiter, from the disk's measured profile unless a flag
-    // pins it. The probe runs before the limiter exists (its own reads
-    // and writes must not be throttled) and before anything else
-    // touches the device. The SST device is the dir remote's; an s3
-    // remote has none to probe.
-    const bw_config = try zdb.vfs.calibrate.bwConfig(
-        allocator,
-        io_cfg,
-        remote_cfg.dir_path,
-    );
-    zdb.vfs.VFS.initGlobal(bw_config);
+    // The I/O limiters: one per device egres writes, each from its
+    // disk's measured profile unless a flag pins it, held by the VFS
+    // the files on that device open through. The probes run before
+    // anything else touches the devices. An s3 remote has no SST
+    // device; its chunk cache's is probed instead.
+    const calibrate = zdb.vfs.calibrate;
+    try calibrate.initGlobal(io_cfg);
+    const wal_vfs = try calibrate.deviceVfs(allocator, io_cfg, wal_dir);
+    const data_vfs = if (remote_dir)
+        try calibrate.deviceVfs(allocator, io_cfg, remote_cfg.dir_path)
+    else
+        null;
+    const cache_vfs = if (cache_cfg.disk_path.len == 0)
+        null
+    else
+        try calibrate.deviceVfs(
+            allocator,
+            io_cfg,
+            std.fs.path.dirname(cache_cfg.disk_path) orelse ".",
+        );
 
     log.info(
         "starting egres id={d} cluster={d} raft={s} admin={s} sql={s} " ++
@@ -471,7 +481,11 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
 
     // The remote store every SST lives in.
     var store: zdb.vfs.RemoteStore = if (remote_dir)
-        try zdb.vfs.RemoteStore.initFile(allocator, remote_cfg.dir_path)
+        try zdb.vfs.RemoteStore.initFile(
+            allocator,
+            remote_cfg.dir_path,
+            data_vfs.?,
+        )
     else
         try zdb.vfs.RemoteStore.initS3(allocator, .{
             .endpoint = remote_cfg.s3_endpoint,
@@ -479,8 +493,9 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
             .prefix = remote_cfg.s3_prefix,
             .cache = .{
                 .path = cache_cfg.disk_path,
-                .capacity_bytes = cache_cfg.disk_mb << 20,
-                .chunk_bytes = cache_cfg.chunk_mb << 20,
+                .capacity_bytes = cache_cfg.disk_mib << 20,
+                .chunk_bytes = cache_cfg.chunk_kib << 10,
+                .vfs = cache_vfs,
             },
         });
     defer store.deinit();
@@ -512,6 +527,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // Open raft WAL.
     log.info("opening raft WAL at {s}", .{wal_dir});
     var wal = try raft.DiskWAL.openPath(wal_dir, allocator, .{
+        .vfs = wal_vfs,
         .log_file_size = wal_cfg.log_file_mib << 20,
         .prezero = wal_cfg.prezero,
         .max_spare_log_files = wal_cfg.max_spare_log_files,
@@ -540,8 +556,8 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // open table. With blocks cached decompressed here, tables open
     // O_DIRECT: the page cache would otherwise hold the same data twice.
     const mem = utils.host.memory();
-    const total: u64 = if (cache_cfg.total_mb > 0)
-        cache_cfg.total_mb << 20
+    const total: u64 = if (cache_cfg.total_mib > 0)
+        cache_cfg.total_mib << 20
     else
         mem.bytes / 10 * 9;
     // Starts at the cap the governor's first tick would set.

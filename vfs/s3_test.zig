@@ -256,7 +256,7 @@ test "s3: into sink rejects a body of another length" {
     try testing.expectEqualStrings("hello", &buf);
 }
 
-test "s3: Ranges walks a byte range across the chunk grid" {
+test "s3: Ranges walks a byte range chunk by chunk" {
     const Ranges = s3.S3Store.Ranges;
     // Inside one chunk.
     var one = Ranges.init(100, 120, 30);
@@ -303,9 +303,10 @@ test "s3: Ranges.gather slices one chunk, stitches across chunks" {
         for (buf, 0..) |*b, i| b.* = @intCast((idx * 100 + i) % 251);
         try chunks.put(arloc, idx, .{
             .idx = idx,
-            .lo = 0,
-            .hi = 100,
-            .buf = buf,
+            .chunk_len = 100,
+            .req_lo = 0,
+            .req_hi = 100,
+            .req_buf = buf,
         });
     }
     const check = struct {
@@ -320,7 +321,7 @@ test "s3: Ranges.gather slices one chunk, stitches across chunks" {
     var one = S.Ranges.init(100, 120, 30);
     const in_one = try one.gather(arloc, &chunks);
     try testing.expectEqual(@as(usize, 30), in_one.len);
-    try testing.expectEqual(chunks.get(1).?.buf.ptr + 20, in_one.ptr);
+    try testing.expectEqual(chunks.get(1).?.req_buf.ptr + 20, in_one.ptr);
     try check.run(in_one, 120);
 
     // 180..300 crosses chunks 1 and 2: stitched into a fresh buffer.
@@ -334,7 +335,7 @@ test "s3: Ranges.gather slices one chunk, stitches across chunks" {
     try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
-test "s3: planChunks wants spans, or whole chunks for the cache" {
+test "s3: planChunks maps requests onto chunk spans" {
     const S = s3.S3Store;
     const Req = @import("vfs").FileHandle.ReadRequest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -347,20 +348,13 @@ test "s3: planChunks wants spans, or whole chunks for the cache" {
         .{ .offset = 190, .len = 30 },
     };
 
-    const spans = try S.planChunks(arena.allocator(), 100, 250, &reqs, false);
+    const spans = try S.planChunks(arena.allocator(), 100, 250, &reqs);
     try testing.expectEqual(@as(usize, 3), spans.count());
-    try testing.expectEqual(@as(u64, 10), spans.get(0).?.lo);
-    try testing.expectEqual(@as(u64, 80), spans.get(0).?.hi);
-    try testing.expectEqual(@as(usize, 70), spans.get(0).?.buf.len);
-    try testing.expectEqual(@as(u64, 90), spans.get(1).?.lo);
-    try testing.expectEqual(@as(u64, 100), spans.get(1).?.hi);
-    try testing.expectEqual(@as(u64, 0), spans.get(2).?.lo);
-    try testing.expectEqual(@as(u64, 20), spans.get(2).?.hi);
-
-    const whole = try S.planChunks(arena.allocator(), 100, 250, &reqs, true);
-    try testing.expectEqual(@as(u64, 0), whole.get(0).?.lo);
-    try testing.expectEqual(@as(u64, 100), whole.get(0).?.hi);
-    try testing.expectEqual(@as(u64, 0), whole.get(1).?.lo);
-    try testing.expectEqual(@as(u64, 100), whole.get(1).?.hi);
-    try testing.expectEqual(@as(u64, 50), whole.get(2).?.hi); // tail
+    try testing.expectEqual(@as(u64, 10), spans.get(0).?.req_lo);
+    try testing.expectEqual(@as(u64, 80), spans.get(0).?.req_hi);
+    try testing.expectEqual(@as(usize, 70), spans.get(0).?.req_buf.len);
+    try testing.expectEqual(@as(u64, 90), spans.get(1).?.req_lo);
+    try testing.expectEqual(@as(u64, 100), spans.get(1).?.req_hi);
+    try testing.expectEqual(@as(u64, 0), spans.get(2).?.req_lo);
+    try testing.expectEqual(@as(u64, 20), spans.get(2).?.req_hi);
 }

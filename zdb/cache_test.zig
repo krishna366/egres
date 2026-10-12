@@ -256,7 +256,7 @@ test "Cache update existing key frees old value" {
     try std.testing.expectEqual(@as(usize, 1), c.count()); // still one entry
 }
 
-test "Cache byteSize reflects inserted bytes and respects capacity" {
+test "Cache totalCost reflects inserted bytes and respects capacity" {
     // capacity=1000 → s_cap=100, m_cap=900.
     var c = try Cache(u64).init(std.testing.allocator, 1000);
     defer c.deinit();
@@ -268,14 +268,14 @@ test "Cache byteSize reflects inserted bytes and respects capacity" {
         defer v1.decrRef();
         try c.put(1, v1);
     }
-    const per = c.byteSize();
+    const per = c.totalCost();
     try std.testing.expect(per > 2 + @sizeOf(Value));
     {
         const v2 = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "hi"));
         defer v2.decrRef();
         try c.put(2, v2);
     }
-    try std.testing.expectEqual(2 * per, c.byteSize());
+    try std.testing.expectEqual(2 * per, c.totalCost());
 
     // Insert 100 more entries, each ~100 bytes charged: far over 1000,
     // so evictions must fire to stay in budget.
@@ -284,7 +284,7 @@ test "Cache byteSize reflects inserted bytes and respects capacity" {
         defer val.decrRef();
         try c.put(@intCast(i), val);
     }
-    try std.testing.expect(c.byteSize() <= 1000);
+    try std.testing.expect(c.totalCost() <= 1000);
 }
 
 test "ShardedCache basic get/put" {
@@ -551,11 +551,11 @@ test "ShardedCache setCapacity: a shrink evicts to the new budget" {
         try c.put(i, v);
         if (c.get(i)) |got| got.decrRef(); // into M at the next put
     }
-    try std.testing.expect(c.byteSize() > 4 * 4096);
+    try std.testing.expect(c.totalCost() > 4 * 4096);
 
     c.setCapacity(4 * 4096);
     try std.testing.expectEqual(@as(usize, 4 * 4096), c.capacity());
-    try std.testing.expect(c.byteSize() <= 4 * 4096);
+    try std.testing.expect(c.totalCost() <= 4 * 4096);
     try std.testing.expect(c.count() <= 4);
 
     // Grown again, it admits more without evicting what it kept.
@@ -686,7 +686,7 @@ test "Cache lookups of missing keys stay fast through put and evict churn" {
         // Every third key gets a hit, so some reach M and churn it too.
         if (i % 3 == 0) if (c.get(i)) |got| got.decrRef();
     }
-    try std.testing.expect(c.byteSize() <= 1 << 20);
+    try std.testing.expect(c.totalCost() <= 1 << 20);
     try std.testing.expect(c.count() > 1000);
 
     const io = utils.context.g().io;

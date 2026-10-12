@@ -26,8 +26,10 @@ const _sigv4 = @import("sigv4.zig");
 const _lookahead = @import("lookahead.zig");
 const _vfs = @import("vfs.zig");
 const _chunkcache = @import("chunkcache.zig");
+const Chunk = _chunkcache.Chunk;
 
 const log = std.log.scoped(.s3);
+const page_size = _vfs.page_size;
 
 const max_put_bytes: u64 = 5 << 30; // single-PUT ceiling (S3 hard limit)
 const attempts_max = 3; // connect/5xx retries per request
@@ -266,7 +268,7 @@ pub const S3Store = struct {
     /// One ranged GET: [offset, offset+buf.len) of `name` straight into
     /// `buf`, written once, off the socket. The wire primitive every
     /// read builds on; `read` is the one that goes through the cache.
-    pub fn get(self: *S3Store, name: String, offset: u64, buf: []u8) !void {
+    pub fn getNoCache(self: *S3Store, name: String, offset: u64, buf: []u8) !void {
         if (buf.len == 0) return;
         var resp = try self.objectRequest(name, .{
             .method = .GET,
@@ -283,35 +285,106 @@ pub const S3Store = struct {
         }
     }
 
+    /// Whether a read at `prio` goes through the chunk cache, lookup
+    /// and admission both: user reads only. A compaction (p1, p2)
+    /// reads each input once; caching those chunks would churn the
+    /// cache for hits that never come, and its inputs were mostly
+    /// written by this node, so they are not in the cache to be hit
+    /// either.
+    /// TODO: the priority stands in for the intent. Every reader today
+    /// at p1 or p2 is a compaction, but a background scan that picks a
+    /// lower priority to queue behind users would lose the cache
+    /// without saying so. The read's context should carry both the
+    /// priority and whether to skip the cache; gate on that here.
+    fn useCache(self: *const S3Store, prio: _vfs.Priority) bool {
+        return self.cache.enabled() and prio == .p0;
+    }
+
     /// Read [offset, offset+dst.len) of `name`, an object of `size`
-    /// bytes. Through the chunk cache when it is on: each covering chunk
-    /// (usually one) is copied from disk on a hit, or fetched whole and
-    /// stored on a miss. Otherwise one exact ranged GET.
+    /// bytes. Through the chunk cache when `cached`: each covering chunk
+    /// is copied from disk on a hit, or fetched whole and stored on a
+    /// miss. Otherwise one exact ranged GET.
     pub fn read(
         self: *S3Store,
         name: String,
         size: u64,
         offset: u64,
         dst: []u8,
+        prio: _vfs.Priority,
     ) !void {
         if (dst.len == 0) return;
-        if (!self.cache.enabled()) return self.get(name, offset, dst);
+        if (!self.useCache(prio)) return self.getNoCache(name, offset, dst);
 
+        // A range across chunks goes through the batch path: its
+        // chunks are fetched concurrently, not one after another.
         const c = self.cache.chunkBytes();
-        var it = Ranges.init(c, offset, dst.len);
-        while (it.next()) |rng| {
-            const part = dst[rng.at..][0..rng.len()];
-            if (try self.cache.read(name, rng.idx, rng.lo, part)) continue;
-            var chunk = Chunk{
-                .idx = rng.idx,
-                .lo = 0,
-                .hi = chunkLen(c, size, rng.idx),
+        if (offset / c != (offset + dst.len - 1) / c) {
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            var reqs = [_]_vfs.FileHandle.ReadRequest{
+                .{ .offset = offset, .len = dst.len },
             };
-            chunk.buf = try self.a.alloc(u8, chunk.hi);
-            defer self.a.free(chunk.buf);
-            try self.fetchChunk(name, &chunk);
-            @memcpy(part, chunk.bytes(rng));
+            try self.batchRead(name, size, &arena, &reqs, prio);
+            @memcpy(dst, reqs[0].data);
+            return;
         }
+
+        // One chunk: loaded straight into `dst`, no arena or fan-out.
+        var chunk = Chunk{
+            .idx = offset / c,
+            .chunk_len = chunkLen(c, size, offset / c),
+            .req_lo = offset % c,
+            .req_hi = offset % c + dst.len,
+            .req_buf = dst,
+        };
+        try self.loadChunk(name, c, &chunk, prio);
+    }
+
+    /// One chunk's span of a batch: for a cached read the slot file,
+    /// else the whole chunk fetched and stored; for an uncached read
+    /// the span from the remote.
+    fn loadChunk(
+        self: *S3Store,
+        name: String,
+        chunk_bytes: u64,
+        chunk: *Chunk,
+        prio: _vfs.Priority,
+    ) anyerror!void {
+        const c = chunk;
+        if (!self.useCache(prio)) {
+            // Uncached: just the span [req_lo, req_hi) from the remote.
+            const off = c.idx * chunk_bytes + c.req_lo;
+            return self.getNoCache(name, off, c.req_buf);
+        }
+
+        if (try self.cache.read(name, c, prio)) return;
+        try self.getAndCache(name, c, prio);
+    }
+
+    /// A cached read's miss: the chunk whole from the remote, stored,
+    /// and its span [req_lo, req_hi) copied to `req_buf`.
+    fn getAndCache(
+        self: *S3Store,
+        name: String,
+        chunk: *const Chunk,
+        prio: _vfs.Priority,
+    ) !void {
+        const c = self.cache.chunkBytes();
+        const buf = try allocChunk(self.a, chunk.chunk_len);
+        defer self.a.free(buf);
+
+        // buf.len might be longer because it allocates page-aligned buffer.
+        const whole = buf[0..chunk.chunk_len];
+        try self.getNoCache(name, chunk.idx * c, whole);
+        try self.cache.write(name, chunk.idx, whole, prio);
+        @memcpy(chunk.req_buf, whole[chunk.req_lo..chunk.req_hi]);
+    }
+
+    /// A chunk buffer the cache can write to its slot file as is:
+    /// page-aligned, whole pages. The caller slices it to `len`.
+    fn allocChunk(a: std.mem.Allocator, len: u64) ![]align(page_size) u8 {
+        const full = std.mem.alignForward(usize, @intCast(len), page_size);
+        return a.alignedAlloc(u8, _vfs.page_alignment, full);
     }
 
     /// Bytes in chunk `idx` of an object of `size` bytes: `c`, or the
@@ -320,7 +393,7 @@ pub const S3Store = struct {
         return @min(c, size - idx * c);
     }
 
-    /// Byte range [off, off+len) on a grid of `chunk_bytes` chunks,
+    /// Byte range [off, off+len) cut into `chunk_bytes` chunks,
     /// walked as one range per chunk it touches, in order.
     pub const Ranges = struct {
         chunk_bytes: u64,
@@ -376,39 +449,40 @@ pub const S3Store = struct {
             const total = self.end - self.off;
             const first = self.next() orelse return &.{};
 
-            const lead = chunks.get(first.idx).?.bytes(first);
+            const lead = chunks.get(first.idx).?.bytes(first.lo, first.hi);
             if (first.len() == total) return lead;
 
             const out = try arloc.alloc(u8, total);
             @memcpy(out[0..lead.len], lead);
             while (self.next()) |rng| {
-                const src = chunks.get(rng.idx).?.bytes(rng);
+                const src = chunks.get(rng.idx).?.bytes(rng.lo, rng.hi);
                 @memcpy(out[rng.at..][0..src.len], src);
             }
             return out;
         }
     };
 
-    /// The chunk's span [lo, hi) from the remote into its buffer, then
-    /// offered to the cache, which keeps a whole chunk and drops the
-    /// rest (planChunks asks for whole chunks whenever the cache is on).
-    /// TODO: bypass the cache for one-pass readers. A compaction reads
-    /// each input once; admitting those chunks churns the whole cache.
-    /// Carry a flag from the read priority (compaction opens its inputs
-    /// at a known one) through read/batchRead and skip the put.
-    fn fetchChunk(self: *S3Store, name: String, chunk: *Chunk) !void {
-        const off = chunk.idx * self.cache.chunkBytes() + chunk.lo;
-        try self.get(name, off, chunk.buf);
-        try self.cache.put(name, chunk.idx, chunk.lo, chunk.buf);
+    /// The chunk size a batch is planned on: the cache's for a cached
+    /// read, so each chunk is fetched and kept whole; for an uncached
+    /// one (compaction) the endpoint's knee, so a run of blocks is one
+    /// request however small the cache's chunks are.
+    fn planChunkBytes(self: *const S3Store, prio: _vfs.Priority) u64 {
+        const c = self.cache.chunkBytes();
+        if (self.useCache(prio)) return c;
+        return @max(c, @max(self.lookahead, default_span));
     }
 
+    /// The uncached batch chunk size when the endpoint is uncalibrated.
+    const default_span: u64 = 4 << 20;
+
     /// Fill a batch of reads of `name`, an object of `size` bytes, with
-    /// every `req.data` in `arena`. The requests are mapped onto the
-    /// chunk grid (`planChunks`) and the chunks loaded concurrently — one
-    /// fiber and one connection per chunk, bounded by the slot count —
-    /// then each request is sliced out of its chunk (`Ranges.gather`).
+    /// every `req.data` in `arena`. The requests are mapped onto chunks
+    /// (`planChunkBytes`, `planChunks`), loaded concurrently —
+    /// one fiber and one connection per chunk, bounded by the slot
+    /// count — then each request is sliced out of its chunk
+    /// (`Ranges.gather`).
     /// A chunk comes from the cache on a hit; on a miss it is fetched
-    /// whole and stored when the cache is on, else only the span the
+    /// whole and stored for a `cached` read, else only the span the
     /// requests want. No copy after the socket. Requests may come in any
     /// order.
     pub fn batchRead(
@@ -417,17 +491,12 @@ pub const S3Store = struct {
         size: u64,
         arena: *std.heap.ArenaAllocator,
         requests: []_vfs.FileHandle.ReadRequest,
+        prio: _vfs.Priority,
     ) !void {
         if (requests.len == 0) return;
         const arloc = arena.allocator();
-        const cbytes = self.cache.chunkBytes();
-        var chunks = try planChunks(
-            arloc,
-            cbytes,
-            size,
-            requests,
-            self.cache.enabled(),
-        );
+        const chunk_bytes = self.planChunkBytes(prio);
+        var chunks = try planChunks(arloc, chunk_bytes, size, requests);
 
         var group = try fiber.Group(anyerror!void).initCapacity(
             self.a,
@@ -435,77 +504,58 @@ pub const S3Store = struct {
         );
         defer group.deinit();
         for (chunks.values()) |*chunk| {
-            try group.spawn(.{}, loadChunk, .{ self, name, chunk });
+            try group.spawn(.{}, loadChunk, .{
+                self, name, chunk_bytes, chunk, prio,
+            });
         }
         for (group.wait()) |res| try res;
 
         for (requests) |*req| {
-            var it = Ranges.init(cbytes, req.offset, req.len);
+            var it = Ranges.init(chunk_bytes, req.offset, req.len);
             req.data = try it.gather(arloc, &chunks);
         }
     }
 
-    /// One chunk of a batch. `buf` holds the chunk's bytes [lo, hi):
-    /// the whole chunk when it is to be cached, else just the span the
-    /// batch wants of it.
-    pub const Chunk = struct {
-        idx: u64,
-        lo: u64,
-        hi: u64,
-        buf: []u8 = &.{},
-
-        /// The loaded bytes of `rng`, a range inside this chunk.
-        pub fn bytes(self: Chunk, rng: Ranges.Range) []u8 {
-            return self.buf[rng.lo - self.lo .. rng.hi - self.lo];
-        }
-    };
-
     /// The chunks one batch covers, by index.
     pub const ChunkMap = std.AutoArrayHashMapUnmanaged(u64, Chunk);
 
-    /// Map `requests` onto the chunk grid: each chunk touched once, with
-    /// the span the requests want of it, widened to the whole chunk when
-    /// `whole` (it will be cached). Buffers are allocated here, before
-    /// any fan-out: the arena is not shared across fibers. Pure, so it
-    /// is testable without a store.
+    /// Map `requests` onto chunks: each chunk touched once, with
+    /// the span the requests want of it. Buffers are allocated here,
+    /// before any fan-out: the arena is not shared across fibers. Pure,
+    /// so it is testable without a store.
     pub fn planChunks(
         arloc: std.mem.Allocator,
         chunk_bytes: u64,
         size: u64,
         requests: []const _vfs.FileHandle.ReadRequest,
-        whole: bool,
     ) !ChunkMap {
         var chunks: ChunkMap = .empty;
         for (requests) |req| {
             var it = Ranges.init(chunk_bytes, req.offset, req.len);
+            // If we get multiple ranges here, that means our read request is
+            // crossing a chunk boundary.
             while (it.next()) |rng| {
-                const got = try chunks.getOrPut(arloc, rng.idx);
-                if (!got.found_existing) {
-                    got.value_ptr.* = .{
+                const res = try chunks.getOrPut(arloc, rng.idx);
+                if (!res.found_existing) {
+                    res.value_ptr.* = .{
                         .idx = rng.idx,
-                        .lo = rng.lo,
-                        .hi = rng.hi,
+                        .chunk_len = chunkLen(chunk_bytes, size, rng.idx),
+                        .req_lo = rng.lo,
+                        .req_hi = rng.hi,
                     };
                     continue;
                 }
-                got.value_ptr.lo = @min(got.value_ptr.lo, rng.lo);
-                got.value_ptr.hi = @max(got.value_ptr.hi, rng.hi);
+                const chunk = res.value_ptr;
+                chunk.req_lo = @min(chunk.req_lo, rng.lo);
+                chunk.req_hi = @max(chunk.req_hi, rng.hi);
             }
         }
         for (chunks.values()) |*chunk| {
-            if (whole) {
-                chunk.lo = 0;
-                chunk.hi = chunkLen(chunk_bytes, size, chunk.idx);
-            }
-            chunk.buf = try arloc.alloc(u8, chunk.hi - chunk.lo);
+            chunk.req_hi = @min(chunk.req_hi, chunk.chunk_len);
+            const len = chunk.req_hi - chunk.req_lo;
+            chunk.req_buf = (try allocChunk(arloc, len))[0..len];
         }
         return chunks;
-    }
-
-    /// One chunk of a batch: the cache, else the remote.
-    fn loadChunk(self: *S3Store, name: String, chunk: *Chunk) anyerror!void {
-        if (try self.cache.read(name, chunk.idx, chunk.lo, chunk.buf)) return;
-        try self.fetchChunk(name, chunk);
     }
 
     /// Every object under the configured prefix, paged through
@@ -763,13 +813,13 @@ pub const S3Store = struct {
     /// Measure this endpoint's ideal readahead (the calibration policy
     /// lives in vfs/lookahead.zig; this store contributes probeRead and
     /// the object ops) and record it in `lookahead`. Run at startup;
-    /// callers treat failure as non-fatal.
+    /// callers treat failure as non-fatal. Logged beside the chunk
+    /// size, which is what a miss actually asks for.
     pub fn calibrateLookahead(self: *S3Store, block_size: u64) !u64 {
         self.lookahead = try _lookahead.calibrate(self.a, self, block_size);
-        const chunk = self.cache.chunkBytes();
-        if (self.cache.enabled() and chunk != self.lookahead) {
-            log.info("chunk cache: {d}-byte chunks; endpoint knee {d}", .{
-                chunk, self.lookahead,
+        if (self.cache.enabled()) {
+            log.info("chunk cache: {d} KiB chunks; endpoint knee {d} KiB", .{
+                self.cache.chunkBytes() >> 10, self.lookahead >> 10,
             });
         }
         return self.lookahead;

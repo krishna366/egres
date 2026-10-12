@@ -517,8 +517,10 @@ pub const Table = struct {
     ) Error!usize {
         if (self.file_id == 0) return 0;
         if (self.obj.isResident()) return 0;
+
         const blocks = self.index.blocks;
         if (blocks.len == 0) return 0;
+
         const per_block = @max(self.index.uncompressed_size / blocks.len, 1);
         const max_blocks = cache.admissionBudget() / 2 / per_block;
         if (max_blocks == 0) return 0;
@@ -526,6 +528,7 @@ pub const Table = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const arloc = arena.allocator();
+
         var reqs: std.ArrayList(vfs.FileHandle.ReadRequest) = .empty;
         var wanted: std.ArrayList(usize) = .empty;
         for (idxs) |idx| {

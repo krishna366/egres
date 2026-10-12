@@ -508,7 +508,7 @@ test "levels: open" {
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     // Write SST 1 at L0, SST 2 at L1.
@@ -577,7 +577,7 @@ test "levels: pick compact level" {
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     // Create an empty manifest (no SST files needed for this test).
@@ -637,7 +637,7 @@ test "levels: compact L0 L1" {
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     // Write three L0 SST files with non-overlapping keys.
@@ -718,7 +718,7 @@ test "levels: compact L0 L1 with dest overlap" {
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     const test_tree_id: u64 = 1;
@@ -815,7 +815,7 @@ test "levels: an L0 push splits into a fiber per L1 range" {
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     // L0 holds aa, cc, ee, gg in two tables; L1 holds bb, dd, ff, one
@@ -895,7 +895,7 @@ test "levels: an L1 merge splits into a fiber per L2 range" {
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     // L1 holds aa, cc, ee, gg in one table; L2 holds bb, dd, ff, one
@@ -995,7 +995,7 @@ test "levels: compact L1 L2" {
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     // L1: {aa, bb}; L2: {cc} — non-overlapping, so compacting L1 doesn't
@@ -1092,7 +1092,7 @@ test "levels: get L0 shadows L1" {
     defer tmp.cleanup();
     const dir_path = try tmpPath(alloc, &tmp);
     defer alloc.free(dir_path);
-    var store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    var store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     defer store.deinit();
 
     const test_tree_id: u64 = 1;
@@ -1246,7 +1246,7 @@ fn setupTombstoneTree(
     entries: []const MetaEntry,
 ) !void {
     const tree_id: u64 = 1;
-    fx.store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    fx.store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     errdefer fx.store.deinit();
     fx.manifest = _manifest.Manifest.init(alloc);
     errdefer fx.manifest.deinit();
@@ -1312,7 +1312,7 @@ fn setupPlacedTreeCfg(
     tables: []const PlacedTable,
 ) !void {
     const tree_id: u64 = 1;
-    fx.store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    fx.store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     errdefer fx.store.deinit();
     fx.manifest = _manifest.Manifest.init(alloc);
     errdefer fx.manifest.deinit();
@@ -2309,7 +2309,7 @@ fn setupTreeWithTables(
     tables: []const []const MetaEntry,
 ) !void {
     const tree_id: u64 = 1;
-    fx.store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    fx.store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     errdefer fx.store.deinit();
     fx.manifest = _manifest.Manifest.init(alloc);
     errdefer fx.manifest.deinit();
@@ -2742,7 +2742,7 @@ fn setupTreeMulti(
     tables: []const LevelTable,
 ) !void {
     const tree_id: u64 = 1;
-    fx.store = try vfs.RemoteStore.initFile(alloc, dir_path);
+    fx.store = try vfs.RemoteStore.initFile(alloc, dir_path, vfs.g());
     errdefer fx.store.deinit();
     fx.manifest = _manifest.Manifest.init(alloc);
     errdefer fx.manifest.deinit();

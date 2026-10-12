@@ -107,6 +107,9 @@ pub const Prezero = enum {
 };
 
 pub const OpenOptions = struct {
+    /// The VFS the log files and meta open through, which carries the
+    /// WAL device's limiter. Null = the global one.
+    vfs: ?*const _vfs.VFS = null,
     /// Entries kept in memory for reads (`EntryCache`).
     cache_capacity: usize = 1024,
     /// Log file size. Every log file is created at this size, zero-filled
@@ -242,7 +245,7 @@ pub const LogFile = struct {
     /// file still has the empty header it was created with. Its
     /// records are then found by a scan (`openScanned`).
     pub fn openRotated(
-        vfs_inst: *const _vfs.VFS,
+        vfs: *const _vfs.VFS,
         alloc: std.mem.Allocator,
         dir_path: String,
         fid: u64,
@@ -254,7 +257,7 @@ pub const LogFile = struct {
 
         // O_DSYNC as for the current log file: `truncateFrom` can make
         // this one current again, and the batch writes rely on it.
-        var handle = try vfs_inst.openFile(alloc, path, .{
+        var handle = try vfs.openFile(alloc, path, .{
             .mode = .default,
             .flags = .{ .writable = true, .dsync = true },
         });
@@ -264,12 +267,12 @@ pub const LogFile = struct {
         var slots_list = readHeader(alloc, handle) catch |err| {
             handle.close();
             if (err != error.InvalidLogHeader) return err;
-            return openScanned(vfs_inst, alloc, dir_path, fid);
+            return openScanned(vfs, alloc, dir_path, fid);
         };
         if (slots_list.items.len == 0) {
             slots_list.deinit(alloc);
             handle.close();
-            return openScanned(vfs_inst, alloc, dir_path, fid);
+            return openScanned(vfs, alloc, dir_path, fid);
         }
         errdefer handle.close();
         errdefer slots_list.deinit(alloc);
@@ -367,7 +370,7 @@ pub const LogFile = struct {
     /// Open the current (highest fid) log file: its entries come from
     /// `scanFrames`, whatever the header says.
     pub fn openCurrent(
-        vfs_inst: *const _vfs.VFS,
+        vfs: *const _vfs.VFS,
         alloc: std.mem.Allocator,
         dir_path: String,
         fid: u64,
@@ -378,7 +381,7 @@ pub const LogFile = struct {
         const path = try fullPath(alloc, dir_path, try fname(fid, &name_buf));
         defer alloc.free(path);
 
-        var handle = try vfs_inst.openFile(alloc, path, .{
+        var handle = try vfs.openFile(alloc, path, .{
             .mode = .default,
             .flags = .{ .writable = true, .dsync = true },
         });
@@ -388,7 +391,7 @@ pub const LogFile = struct {
         // (crash during createCurrent). Re-create it.
         if (handle.file_size < log_file_offset) {
             handle.close();
-            return createCurrent(vfs_inst, alloc, dir_path, fid, opts);
+            return createCurrent(vfs, alloc, dir_path, fid, opts);
         }
 
         var lf = try scanFrames(fid, handle, alloc);
@@ -406,20 +409,21 @@ pub const LogFile = struct {
     /// header parses cleanly via openRotated; the wal layer derives the
     /// first append's index from the previous file's lastEntry.
     pub fn createCurrent(
-        vfs_inst: *const _vfs.VFS,
+        vfs: *const _vfs.VFS,
         alloc: std.mem.Allocator,
         dir_path: String,
         fid: u64,
         opts: OpenOptions,
     ) !LogFile {
         var name_buf: LogFile.NameBuf = undefined;
-        return createNamed(vfs_inst, alloc, dir_path, try fname(fid, &name_buf), fid, opts);
+        const name = try fname(fid, &name_buf);
+        return createNamed(vfs, alloc, dir_path, name, fid, opts);
     }
 
     /// `createCurrent` under a caller-chosen name: the log file prepared
     /// ahead of rotation is created as <fid>.wal.tmp (see `wal.rotate`).
     pub fn createNamed(
-        vfs_inst: *const _vfs.VFS,
+        vfs: *const _vfs.VFS,
         alloc: std.mem.Allocator,
         dir_path: String,
         name: String,
@@ -436,7 +440,7 @@ pub const LogFile = struct {
         // NVMe) because the log file is zero-filled to its full size when
         // it is created, so no write ever grows it; a write that extends
         // a file journals the size and costs 6 ms, O_DSYNC or not.
-        const handle = try vfs_inst.createFile(path, .{
+        const handle = try vfs.createFile(path, .{
             .mode = .default,
             .flags = .{ .writable = true, .truncate = true, .dsync = true },
         });
@@ -636,7 +640,7 @@ pub const LogFile = struct {
     /// crash between a rotation and the writer's finalization of the
     /// outgoing file leaves exactly this.
     pub fn openScanned(
-        vfs_inst: *const _vfs.VFS,
+        vfs: *const _vfs.VFS,
         alloc: std.mem.Allocator,
         dir_path: String,
         fid: u64,
@@ -645,7 +649,7 @@ pub const LogFile = struct {
         const path = try fullPath(alloc, dir_path, try fname(fid, &name_buf));
         defer alloc.free(path);
 
-        var handle = try vfs_inst.openFile(alloc, path, .{
+        var handle = try vfs.openFile(alloc, path, .{
             .mode = .default,
             .flags = .{ .writable = true, .dsync = true },
         });
@@ -674,7 +678,7 @@ pub const LogFile = struct {
 /// itself only hands back its result through the join handle.
 pub const NextLog = struct {
     allocator: std.mem.Allocator,
-    vfs_inst: *const _vfs.VFS,
+    vfs: *const _vfs.VFS,
     dir_path: String,
     opts: OpenOptions,
     /// Every log file fid comes from here, prepared or created inline.
@@ -754,7 +758,7 @@ pub const NextLog = struct {
         }
         var name_buf: LogFile.NameBuf = undefined;
         return LogFile.createNamed(
-            self.vfs_inst,
+            self.vfs,
             self.allocator,
             self.dir_path,
             try LogFile.tmpName(fid, &name_buf),
@@ -774,7 +778,7 @@ pub const NextLog = struct {
         const path = try self.fullPath(fid, .tmp);
         defer alloc.free(path);
 
-        const handle = try self.vfs_inst.openFile(alloc, path, .{
+        const handle = try self.vfs.openFile(alloc, path, .{
             .mode = .default,
             .flags = .{ .writable = true, .dsync = true },
         });
@@ -936,7 +940,7 @@ pub const NextLog = struct {
                     .{},
                 );
                 return LogFile.createCurrent(
-                    self.vfs_inst,
+                    self.vfs,
                     self.allocator,
                     self.dir_path,
                     self.takeFid(),
@@ -971,7 +975,7 @@ pub const NextLog = struct {
             }
         }
         return LogFile.createCurrent(
-            self.vfs_inst,
+            self.vfs,
             self.allocator,
             self.dir_path,
             self.takeFid(),

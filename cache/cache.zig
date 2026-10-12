@@ -358,7 +358,7 @@ pub fn Cache(
         pub fn makeRoom(self: *Self, cost: usize) void {
             while (self.s.needsRoom(cost))
                 self.evictSmall() catch break;
-            while (self.byteSize() + cost > self.capacity() and
+            while (self.totalCost() + cost > self.capacity() and
                 self.m.len > 0)
                 self.evictMain();
         }
@@ -385,12 +385,13 @@ pub fn Cache(
             return true;
         }
 
-        /// Total live cost in S + M.
-        pub fn byteSize(self: *const Self) usize {
+        /// Total live cost in S + M, in whatever unit `V.cost()`
+        /// charges: bytes for the block cache, slots for the chunk cache.
+        pub fn totalCost(self: *const Self) usize {
             return self.s.cost + self.m.cost;
         }
 
-        /// The cost budget, S and M together.
+        /// The cost budget, S and M together, in the same unit.
         pub fn capacity(self: *const Self) usize {
             return self.s.cap + self.m.cap;
         }
@@ -690,12 +691,12 @@ pub fn ShardedCache(
         }
 
         /// Approximate total cost across shards.
-        pub fn byteSize(self: *Self) usize {
+        pub fn totalCost(self: *Self) usize {
             var total: usize = 0;
             for (self.shards) |*s| {
                 s.lock.lockShared(@src());
                 defer s.lock.unlockShared();
-                total += s.cache.byteSize();
+                total += s.cache.totalCost();
             }
             return total;
         }

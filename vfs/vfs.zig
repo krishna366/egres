@@ -11,6 +11,7 @@ pub const bandwidth = @import("bandwidth.zig");
 pub const remotestore = @import("remotestore.zig");
 pub const RemoteStore = remotestore.RemoteStore;
 pub const ChunkCache = @import("chunkcache.zig").ChunkCache;
+pub const Chunk = @import("chunkcache.zig").Chunk;
 pub const Object = remotestore.Object;
 pub const sigv4 = @import("sigv4.zig");
 pub const s3 = @import("s3.zig");
@@ -63,10 +64,13 @@ pub const Mode = enum {
     memory, // read entire file into owned buffer
 };
 
+/// Who waits for whom at the limiter. P0 never waits: its subtract
+/// saturates. P1 sees the full bucket; P2 sees what P1's demand
+/// leaves, so an L0 backlog is cleared before deeper merges run.
 pub const Priority = enum(u2) {
-    p0, // highest — Any user facing real-time reads
-    p1, // medium  — WAL and L0 compaction RW
-    p2, // lowest  — L1+ compaction RW
+    p0, // what a user waits on: the WAL, and queries' reads
+    p1, // L0 compaction
+    p2, // L1+ compaction, log file prezero
 };
 
 pub const IOKind = enum(u1) {
@@ -91,6 +95,9 @@ pub const FileHandle = struct {
     owned_buf: ?[]u8 = null, // memory mode: entire file read into this buffer
     buf_allocator: ?std.mem.Allocator = null, // for freeing owned_buf on close
     vfs: *const VFS,
+    /// The limiter of the VFS this file was opened through, charged
+    /// for every read and write through the handle.
+    bw: *bandwidth.Limiter,
     /// fd was actually opened O_DIRECT (Linux + mode==.direct, no tmpfs
     /// fallback) → writes must be page-aligned, so `write` bounce-buffers
     /// unaligned data. False for default/mmap/memory handles.
@@ -118,7 +125,7 @@ pub const FileHandle = struct {
         if (self.mapped) |mapped| {
             // MMAP: slice from mapped memory. Fault in pages under bandwidth
             // control so mmap I/O respects the same rate limits as pread.
-            var s = self.vfs.bw.spinner(priority, aligned_size, .read);
+            var s = self.bw.spinner(priority, aligned_size, .read);
             defer s.deinit();
             var sink: u8 = 0;
             var total_touched: usize = 0;
@@ -141,7 +148,7 @@ pub const FileHandle = struct {
         errdefer allocator.free(buf);
 
         const f = self.file.?;
-        var s = self.vfs.bw.spinner(priority, aligned_size, .read);
+        var s = self.bw.spinner(priority, aligned_size, .read);
         defer s.deinit();
         var total_read: usize = 0;
         while (true) {
@@ -180,7 +187,7 @@ pub const FileHandle = struct {
         priority: Priority,
     ) !void {
         for (requests) |*req| req.file = self.file.?;
-        return self.vfs.batchRead(arena, requests, priority);
+        return self.vfs.batchRead(self.bw, arena, requests, priority);
     }
 
     pub fn write(
@@ -204,7 +211,7 @@ pub const FileHandle = struct {
             std.debug.assert(offset % page_size == 0);
         }
 
-        var s = self.vfs.bw.spinner(priority, data.len, .write);
+        var s = self.bw.spinner(priority, data.len, .write);
         defer s.deinit();
         var written: usize = 0;
         while (true) {
@@ -270,6 +277,11 @@ pub fn g() *VFS {
     return &g_vfs;
 }
 
+/// A VFS is a device's view of the disk: every file opened through it
+/// charges `bw`, the device's budget in device time, whatever the file
+/// holds (SSTs, the WAL, the chunk cache). Each owner opens through
+/// the VFS of its directory's device (`calibrate.deviceVfs`); `g()` is
+/// the global one, for tests and files on no calibrated device.
 pub const VFS = struct {
     bw: *bandwidth.Limiter,
 
@@ -288,8 +300,11 @@ pub const VFS = struct {
     // also fails. Keep a margin below 256 for other concurrent I/O.
     const max_batch_size: usize = 200;
 
+    /// `bw` is the limiter of the device the requests' files are on:
+    /// one batch, one device (a WAL's segments share its directory).
     pub fn batchRead(
         self: *const VFS,
+        bw: *bandwidth.Limiter,
         arena: *std.heap.ArenaAllocator,
         requests: []FileHandle.ReadRequest,
         priority: Priority,
@@ -300,24 +315,26 @@ pub const VFS = struct {
         var offset: usize = 0;
         while (offset < requests.len) {
             const end = @min(offset + max_batch_size, requests.len);
-            try self.batchReadChunk(arena, requests[offset..end], priority);
+            try self.batchReadChunk(bw, arena, requests[offset..end], priority);
             offset = end;
         }
     }
 
     fn batchReadChunk(
         self: *const VFS,
+        bw: *bandwidth.Limiter,
         arena: *std.heap.ArenaAllocator,
         requests: []FileHandle.ReadRequest,
         priority: Priority,
     ) !void {
+        _ = self;
         const alloc = arena.allocator();
 
         // Bandwidth: acquire total bytes for this chunk before submitting.
         {
             var total: usize = 0;
             for (requests) |r| total += r.len;
-            var s = self.bw.spinner(priority, total, .read);
+            var s = bw.spinner(priority, total, .read);
             defer s.deinit();
             while (true) {
                 if (s.acquireBytes() == 0) break;
@@ -356,7 +373,7 @@ pub const VFS = struct {
         }
     }
 
-    /// Initialize the global VFS instance with a specific bandwidth config.
+    /// Initialize the global VFS instance at `config`'s budget.
     pub fn initGlobal(config: Config) void {
         g_limiter = bandwidth.Limiter.init(config);
         g_vfs = .{ .bw = &g_limiter };
@@ -378,7 +395,13 @@ pub const VFS = struct {
 
                 const file_size = try fdSize(fd);
                 const mapped = try posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
-                return .{ .file = fiber.File.fromFd(fd), .file_size = file_size, .mapped = mapped, .vfs = self };
+                return .{
+                    .file = fiber.File.fromFd(fd),
+                    .file_size = file_size,
+                    .mapped = mapped,
+                    .vfs = self,
+                    .bw = self.bw,
+                };
             },
             .default, .direct => {
                 const fd = try openDirect(path, opts);
@@ -389,6 +412,7 @@ pub const VFS = struct {
                     .file = fiber.File.fromFd(fd),
                     .file_size = file_size,
                     .vfs = self,
+                    .bw = self.bw,
                     .direct = builtin.os.tag == .linux and opts.mode == .direct,
                 };
             },
@@ -409,6 +433,7 @@ pub const VFS = struct {
                     .owned_buf = buf,
                     .buf_allocator = allocator,
                     .vfs = self,
+                    .bw = self.bw, // never charged: no I/O after this
                 };
             },
         }
@@ -443,10 +468,40 @@ pub const VFS = struct {
             .file = fiber.File.fromFd(fd),
             .file_size = 0,
             .vfs = self,
+            .bw = self.bw,
             .direct = builtin.os.tag == .linux and opts.mode == .direct,
         };
     }
 };
+
+/// The device (`st_dev`) holding `fd`. `std.Io.File.Stat` leaves it
+/// out, so the system call is made here: statx on Linux, fstat on
+/// macOS.
+fn deviceOf(fd: posix.fd_t) !u64 {
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            var stx: linux.Statx = undefined;
+            const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{}, &stx);
+            if (linux.errno(rc) != .SUCCESS) return error.StatFailed;
+            return (@as(u64, stx.dev_major) << 32) | stx.dev_minor;
+        },
+        .macos => {
+            var st: std.c.Stat = undefined;
+            if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
+            return @bitCast(@as(i64, st.dev));
+        },
+        else => return error.Unsupported,
+    }
+}
+
+/// The device (`st_dev`) holding the directory `path`: what tells
+/// directories on one disk from those on different ones.
+pub fn deviceOfPath(path: String) !u64 {
+    const fd = try openDirect(path, .{});
+    defer closeFd(fd);
+    return deviceOf(fd);
+}
 
 /// Create `path`, write `data` through the accounted FileHandle path,
 /// fsync, and close — the durable whole-file write behind SST flushes

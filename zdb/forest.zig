@@ -1110,12 +1110,19 @@ pub const Forest = struct {
     /// the last ref, and the table frees itself, blocks in the block
     /// cache included. A reader or compaction that pinned such a table
     /// before the apply holds its own ref and keeps the open `Table`
-    /// until it releases. The files themselves wait for `deleteFiles`.
+    /// until it releases. The disk chunk cache lets go here too — not
+    /// when the table closes, which a shutdown also does. The files
+    /// themselves wait for `deleteFiles`.
     pub fn evictTables(self: *Forest) !void {
         const ids = try self.manifest.takeToEvict();
         defer self.allocator.free(ids);
 
-        for (ids) |id| self.table_cache.evict(id);
+        for (ids) |id| {
+            self.table_cache.evict(id);
+            const name = try sstName(self.allocator, id);
+            defer self.allocator.free(name);
+            self.store.forget(name);
+        }
         if (ids.len > 0) log.debug(
             "evictTables: evicted {d} unlisted file(s)",
             .{ids.len},

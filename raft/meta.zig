@@ -29,7 +29,7 @@
 // use `std.fs.cwd()` because they're path-metadata operations, not data I/O.
 
 const std = @import("std");
-const vfs = @import("vfs");
+const _vfs = @import("vfs");
 const utils = @import("utils");
 const String = utils.String;
 const zen = @import("buffers_gen");
@@ -55,7 +55,9 @@ pub const MetaStore = struct {
     /// Owned dup of the directory path. All file paths are derived from this.
     dir_path: []u8,
     /// Open with O_DSYNC so per-write fdatasync is implicit.
-    state_file: vfs.FileHandle,
+    /// What the files open through: the WAL device's VFS.
+    vfs: *const _vfs.VFS,
+    state_file: _vfs.FileHandle,
 
     /// Authoritative in-memory state. Updated only after the corresponding
     /// disk write has been durable.
@@ -72,7 +74,11 @@ pub const MetaStore = struct {
     /// The recovery sequence number lives in `hard_state.seq`.
     active_slot: u8,
 
-    pub fn openPath(path: String, alloc: std.mem.Allocator) !MetaStore {
+    pub fn openPath(
+        vfs: *const _vfs.VFS,
+        path: String,
+        alloc: std.mem.Allocator,
+    ) !MetaStore {
         // Directory creation is path metadata, not data I/O — go through
         // std.Io.Dir (cheap) rather than vfs (which is bandwidth-limited
         // for data ops).
@@ -92,12 +98,18 @@ pub const MetaStore = struct {
         // Open the existing state.bin if present; otherwise create + initialise.
         // Both branches set DSYNC so subsequent writes are durable on return —
         // we never call state_file.sync() in the hot path.
-        const state_opts: vfs.FileOptions = .{ .flags = .{ .writable = true, .dsync = true } };
+        const state_opts: _vfs.FileOptions = .{
+            .flags = .{ .writable = true, .dsync = true },
+        };
         var fresh = false;
-        var state_file = vfs.g().openFile(alloc, state_path, state_opts) catch |err| switch (err) {
+        var state_file = vfs.openFile(
+            alloc,
+            state_path,
+            state_opts,
+        ) catch |err| switch (err) {
             error.FileNotFound => blk: {
                 fresh = true;
-                break :blk try vfs.g().createFile(state_path, .{
+                break :blk try vfs.createFile(state_path, .{
                     .flags = .{ .writable = true, .truncate = true, .dsync = true },
                 });
             },
@@ -120,6 +132,7 @@ pub const MetaStore = struct {
         var ms: MetaStore = .{
             .allocator = alloc,
             .dir_path = dir_path,
+            .vfs = vfs,
             .state_file = state_file,
             .hard_state = .{},
             .snapshot = empty_snap,
@@ -142,7 +155,7 @@ pub const MetaStore = struct {
         // run yet — the half-written tmp is just discarded.
         const tmp_path = try std.fs.path.join(alloc, &.{ dir_path, snapshot_tmp_name });
         defer alloc.free(tmp_path);
-        vfs.deleteFile(tmp_path) catch |err| switch (err) {
+        _vfs.deleteFile(tmp_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
@@ -220,7 +233,7 @@ pub const MetaStore = struct {
         // Stage the bytes in snapshot.tmp. O_DSYNC means write() returns
         // only after the bytes AND the file-size update are durable.
         {
-            var tmp = try vfs.g().createFile(tmp_path, .{
+            var tmp = try self.vfs.createFile(tmp_path, .{
                 .flags = .{ .writable = true, .truncate = true, .dsync = true },
             });
             defer tmp.close();
@@ -229,11 +242,11 @@ pub const MetaStore = struct {
 
         // Atomic rename — POSIX guarantees the directory entry flips
         // either fully to the new inode or stays at the old one.
-        try vfs.renameFile(tmp_path, final_path);
+        try _vfs.renameFile(tmp_path, final_path);
 
         // dir-fsync so the rename itself is durable across power loss.
         // VFS.syncDir is best-effort (some filesystems don't support it).
-        vfs.syncDir(self.dir_path);
+        _vfs.syncDir(self.dir_path);
 
         // Replace the in-memory snapshot. clone returns a heap-allocated
         // *SnapshotStruct that deeply owns its data + conf_state, so after
@@ -253,7 +266,11 @@ pub const MetaStore = struct {
         // Page-aligned heap buffer (fibers have small stacks; we don't
         // put 4 KiB on the stack). The alignment is forward-compat for a
         // possible later O_DIRECT switch.
-        const page = try self.allocator.alignedAlloc(u8, vfs.page_alignment, slot_size);
+        const page = try self.allocator.alignedAlloc(
+            u8,
+            _vfs.page_alignment,
+            slot_size,
+        );
         defer self.allocator.free(page);
         @memset(page, 0);
 
@@ -316,7 +333,11 @@ pub const MetaStore = struct {
         const final_path = try std.fs.path.join(self.allocator, &.{ self.dir_path, snapshot_file_name });
         defer self.allocator.free(final_path);
 
-        var handle = vfs.g().openFile(self.allocator, final_path, .{}) catch |err| switch (err) {
+        var handle = self.vfs.openFile(
+            self.allocator,
+            final_path,
+            .{},
+        ) catch |err| switch (err) {
             error.FileNotFound => return, // No snapshot yet; keep default-zero.
             else => return err,
         };

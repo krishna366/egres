@@ -146,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
     // VFS still needs a bandwidth controller.
     vfs.VFS.initGlobal(.{ .bytes_per_sec = 500 * 1024 * 1024 });
     // The dir as a store, so tables open the way the server opens them.
-    var store = try vfs.RemoteStore.initFile(allocator, dir_path);
+    var store = try vfs.RemoteStore.initFile(allocator, dir_path, vfs.g());
     defer store.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });

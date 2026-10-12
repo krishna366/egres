@@ -1181,27 +1181,44 @@ pub const AdminServer = struct {
 
     fn handleVfs(self: *AdminServer, stream: fiber.net.Stream) !void {
         _ = self;
-        // Pretty-printed snapshot of the global VFS bandwidth limiter,
-        // counted in pages (multiply by VFS page size for bytes). P0
-        // always wins (saturating subtract — never blocks); P1 sees the
-        // full bucket; P2 sees `bucket - demand_p1`. If `available_p2`
-        // is 0 while compaction work is pending, P1 demand is starving
-        // P2 — a likely culprit for L≥1 compaction wedges.
+        // One section per device limiter, then the global VFS's (files
+        // on no calibrated device), counted in pages (multiply by VFS page
+        // size for bytes). P0 always wins (saturating subtract — never
+        // blocks); P1 sees the full bucket; P2 sees `bucket -
+        // demand_p1`. If `available_p2` is 0 while compaction work is
+        // pending, P1 demand is starving P2 on that device — a likely
+        // culprit for L≥1 compaction wedges.
         var buf: [4096]u8 = undefined;
         var sw = stream.writer(&buf);
         const w = &sw.interface;
-        const s = vfs.g().bw.status();
-        try w.print("vfs bandwidth (pages):\n", .{});
+        for (vfs.calibrate.devices()) |d| {
+            try writeLimiter(w, d.path, d.vfs.bw);
+        }
+        try writeLimiter(w, "global", vfs.g().bw);
+        try w.print("  note: p0 is unbounded (saturating subtract)\n", .{});
+        // Clients read to the blank line.
+        try w.writeByte('\n');
+        try w.flush();
+    }
+
+    fn writeLimiter(
+        w: *std.Io.Writer,
+        name: String,
+        bw: *const vfs.bandwidth.Limiter,
+    ) !void {
+        const s = bw.status();
+        try w.print("vfs bandwidth {s} (pages):\n", .{name});
         try w.print("  rate:          {d} pages/s\n", .{s.pages_per_sec});
         try w.print("  bucket:        {d}\n", .{s.bucket});
         try w.print("  demand_p1:     {d}\n", .{s.demand_p1});
         try w.print("  available_p1:  {d}\n", .{s.available_p1});
-        try w.print("  available_p2:  {d}   (bucket - demand_p1)\n", .{s.available_p2});
+        try w.print("  available_p2:  {d}   (bucket - demand_p1)\n", .{
+            s.available_p2,
+        });
         try w.print("  total_read:    {d}\n", .{s.total_read_pages});
         try w.print("  total_write:   {d}\n", .{s.total_write_pages});
-        try w.print("  note: p0 is unbounded (saturating subtract)\n", .{});
         // What each priority paid for the budget (`Limiter.stats`).
-        for (&vfs.g().bw.stats, 0..) |*wt, i| {
+        for (&bw.stats, 0..) |*wt, i| {
             const grants = wt.grants.load(.monotonic);
             const wait_us = wt.wait_us.load(.monotonic);
             try w.print("  p{d}: grants={d} wait_us={d} timeouts={d}" ++
@@ -1211,13 +1228,11 @@ pub const AdminServer = struct {
                 wait_us / @max(grants, 1),
             });
         }
-        // Clients read to the blank line.
-        try w.writeByte('\n');
-        try w.flush();
     }
 
-    /// The limiter's wait counters in Prometheus text, beside the zdb
-    /// and raft registries, so the dashboard reads them the same way.
+    /// The limiters' wait counters in Prometheus text, beside the zdb
+    /// and raft registries, so the dashboard reads them the same way;
+    /// one series per device and priority.
     fn writeLimiterMetrics(w: *std.Io.Writer) !void {
         const names = [_]String{
             "vfs_bandwidth_grants_total",
@@ -1225,15 +1240,58 @@ pub const AdminServer = struct {
             "vfs_bandwidth_timeouts_total",
         };
         for (names) |n| try w.print("# TYPE {s} counter\n", .{n});
-        for (&vfs.g().bw.stats, 0..) |*wt, i| {
+        for (vfs.calibrate.devices()) |d| {
+            try writeLimiterSeries(w, &names, d.path, d.vfs.bw);
+        }
+        try writeLimiterSeries(w, &names, "global", vfs.g().bw);
+    }
+
+    fn writeLimiterSeries(
+        w: *std.Io.Writer,
+        names: []const String,
+        device: String,
+        bw: *const vfs.bandwidth.Limiter,
+    ) !void {
+        for (&bw.stats, 0..) |*wt, i| {
             const vals = [_]u64{
                 wt.grants.load(.monotonic),
                 wt.wait_us.load(.monotonic),
                 wt.timeouts.load(.monotonic),
             };
-            for (names, vals) |n, v| {
-                try w.print("{s}{{priority=\"p{d}\"}} {d}\n", .{ n, i, v });
+            for (names, vals) |n, val| {
+                try w.print("{s}{{device=\"{s}\",priority=\"p{d}\"}} {d}\n", .{
+                    n, device, i, val,
+                });
             }
+        }
+    }
+
+    /// The chunk cache's counters in Prometheus text; nothing when
+    /// there is no slot file.
+    fn writeChunkCacheMetrics(
+        self: *AdminServer,
+        w: *std.Io.Writer,
+    ) !void {
+        const cc = self.engine.forest.store.chunkCache() orelse return;
+        if (!cc.enabled()) return;
+        const st = cc.stats();
+        const Metric = struct { String, String, u64 };
+        const rows = [_]Metric{
+            .{ "chunk_cache_slots", "gauge", st.slots },
+            .{ "chunk_cache_used", "gauge", st.used },
+            .{ "chunk_cache_hits_total", "counter", st.hits },
+            .{ "chunk_cache_misses_total", "counter", st.misses },
+            .{ "chunk_cache_puts_total", "counter", st.puts },
+            .{ "chunk_cache_drops_total", "counter", st.drops },
+            .{ "chunk_cache_corrupt_total", "counter", st.corrupt },
+            .{ "chunk_cache_evicted_pages_total", "counter", st.evicted_pages },
+            .{ "chunk_cache_unread_pages_total", "counter", st.unread_pages },
+            .{ "chunk_cache_unread_chunks_total", "counter", st.unread_chunks },
+        };
+        for (rows) |mt| {
+            try w.print("# TYPE {s} {s}\n{s} {d}\n", .{
+                mt[0], mt[1], mt[0], mt[2],
+            });
         }
     }
 
@@ -1249,7 +1307,7 @@ pub const AdminServer = struct {
         const counting = utils.context.counting();
         const live = counting.live_bytes.load(.monotonic);
         const cache: u64 = if (zdb.table.table.block_cache) |bc|
-            bc.byteSize()
+            bc.totalCost()
         else
             0;
         const res = &zdb.table.table.resident;
@@ -1271,7 +1329,7 @@ pub const AdminServer = struct {
         try memLine(w, "other live", other, "");
         if (_governor.g()) |gov| {
             try w.print("governor:\n", .{});
-            try memLine(w, "total", gov.total, "--cache total_mb, resident");
+            try memLine(w, "total", gov.total, "--cache total_mib, resident");
             try w.print("  ratio:        {d:.3}   (resident per live " ++
                 "byte, recent peak; last {d:.3})\n", .{
                 gov.ratio.cur, gov.ratio.measured,
@@ -1463,6 +1521,7 @@ pub const AdminServer = struct {
                 try m.write(zdb.metrics.g(), &body.writer);
                 try m.write(raft.metrics.g(), &body.writer);
                 try writeLimiterMetrics(&body.writer);
+                try self.writeChunkCacheMetrics(&body.writer);
             },
             .forest => {
                 try self.engine.forest.writeStats(&body.writer, .{ .scope = .forest });

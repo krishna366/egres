@@ -107,7 +107,11 @@ const Fixture = struct {
         errdefer testing.allocator.free(dir_path);
         const store = try testing.allocator.create(zdb.vfs.RemoteStore);
         errdefer testing.allocator.destroy(store);
-        store.* = try zdb.vfs.RemoteStore.initFile(testing.allocator, dir_path);
+        store.* = try zdb.vfs.RemoteStore.initFile(
+            testing.allocator,
+            dir_path,
+            zdb.vfs.g(),
+        );
         errdefer store.deinit();
 
         const f_live = try flags.Live(Config).create(

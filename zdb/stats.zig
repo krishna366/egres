@@ -50,7 +50,7 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
     try w.print("  flush_pending: {d}\n", .{mt.immutable_count});
     if (_table.table.block_cache) |bc| {
         try w.print("  block_cache: entries={d} bytes=", .{bc.count()});
-        try writeBytes(w, bc.byteSize());
+        try writeBytes(w, bc.totalCost());
         const hits = bc.hits.load(.monotonic);
         const misses = bc.misses.load(.monotonic);
         const ghost = bc.ghostHits();
@@ -60,6 +60,29 @@ pub fn writeForestStats(self: *Forest, w: *std.Io.Writer) !void {
             misses, pct(misses, hits + misses),
             ghost,  pct(ghost, misses),
         });
+    }
+    if (self.store.chunkCache()) |cc| {
+        if (!cc.enabled()) {
+            try w.print("  chunk_cache: off\n", .{});
+        } else {
+            const st = cc.stats();
+            try w.print("  chunk_cache: slots={d} used={d} chunk=", .{
+                st.slots, st.used,
+            });
+            try writeBytes(w, st.chunk_bytes);
+            try w.print(" hits={d} ({d:.1}%) misses={d} puts={d} " ++
+                "drops={d} corrupt={d}", .{
+                st.hits,  pct(st.hits, st.hits + st.misses),
+                st.misses, st.puts,
+                st.drops, st.corrupt,
+            });
+            // Wastage: pages fetched and never read, over retired slots.
+            try w.print(" unread={d}/{d} pages ({d:.1}%) chunks={d}\n", .{
+                st.unread_pages, st.evicted_pages,
+                pct(st.unread_pages, st.evicted_pages),
+                st.unread_chunks,
+            });
+        }
     }
     // What the open tables pin besides the cache (`Table.resident`).
     const res = &_table.table.resident;
