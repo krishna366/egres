@@ -220,4 +220,10 @@ pub const RefValue = struct {
     pub fn byteSize(self: *const RefValue) usize {
         return self.data.len;
     }
+
+    /// What a cache charges for holding this value: its bytes and
+    /// this header, which is its own allocation.
+    pub fn cost(self: *const RefValue) usize {
+        return self.data.len + @sizeOf(RefValue);
+    }
 };

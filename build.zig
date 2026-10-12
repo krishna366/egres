@@ -26,6 +26,7 @@ const Modules = struct {
     // Infra
     flags: *std.Build.Module, // u/flags.zig
     utils: *std.Build.Module, // u/utils.zig (lz4/zstd C includes baked in)
+    cache: *std.Build.Module, // cache/cache.zig (S3-FIFO policy)
     vfs: *std.Build.Module, // vfs/vfs.zig
 
     // Wire
@@ -228,6 +229,13 @@ fn makeModules(
     flags.addImport("zfiber", fiber);
     vfs.addImport("zfiber", fiber);
 
+    // The S3-FIFO policy, shared by the block cache (zdb) and the disk
+    // chunk cache (vfs).
+    const cache = makeModule(b, target, optimize, "cache/cache.zig");
+    cache.addImport("utils", utils);
+    cache.addImport("zfiber", fiber);
+    vfs.addImport("cache", cache);
+
     // Wire
     const serial = makeModule(b, target, optimize, "net/serial.zig");
     serial.addImport("zfiber", fiber);
@@ -261,6 +269,7 @@ fn makeModules(
     zdb.addImport("utils", utils);
     zdb.addImport("zfiber", fiber);
     zdb.addImport("vfs", vfs);
+    zdb.addImport("cache", cache);
     zdb.addImport("metrics", metrics);
     zdb.addImport("zroar", zroar);
     zdb.addImport("flags", flags);
@@ -310,6 +319,7 @@ fn makeModules(
         .buffers_gen = buffers_gen,
         .flags = flags,
         .utils = utils,
+        .cache = cache,
         .vfs = vfs,
         .serial = serial,
         .transport = transport,
@@ -557,7 +567,7 @@ fn addAllTests(
     const test_imports = .{
         "zbuf",    "zdb",         "raft",      "utils",  "zio",    "vfs",
         "metrics", "buffers_gen", "transport", "serial", "pgwire", "zfiber",
-        "sql",     "engine",      "flags",     "zroar",
+        "sql",     "engine",      "flags",     "zroar",  "cache",
     };
 
     const root_mod = b.createModule(.{
