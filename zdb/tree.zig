@@ -702,72 +702,47 @@ pub const Tree = struct {
     /// tables. Below that, return empty (no split this round; the
     /// caller refreshes the candidate and tries again later).
     ///
-    /// For the balance score, we ignore tables that STRADDLE the
-    /// candidate K — they go to BOTH children in `buildSplit`, so
-    /// they cost the same on each side and don't differentiate
-    /// candidates. Only strict-left and strict-right bytes count.
-    /// Null when the tree is not worth splitting: Lmax too small, or
-    /// no candidate.
+    /// Every L>=1 table counts, by its block index (`Table.splitAround`):
+    /// a table straddling the candidate puts the blocks below it left
+    /// and the rest right, so a few large tables cannot hide most of the
+    /// bytes from the score. Null when the tree is not worth splitting:
+    /// Lmax too small, or no candidate.
     pub fn findSplitKey(self: *Tree, allocator: std.mem.Allocator) !?Key {
-        // Use a per-call arena for keys we collect under each level's
-        // read lock — once the lock drops, the source Table could be
-        // freed by a concurrent delete, so we must not keep raw
-        // pointers into table memory.
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        // Step 1: snapshot Lmax candidate keys (smallest-of-table for
-        // each table, skipping items[0] whose smallest is the level's
-        // left boundary — using it would put nothing on the old side).
-        // Bail if Lmax doesn't have enough tables for a meaningful split.
-        const lmax_idx = self.live.cur().max_levels - 1;
-        var cand_keys: std.ArrayList(Key) = .empty;
-        // Steps 1-2 read the level lists (keys are duped into the arena);
-        // step 3 is arithmetic on the copies. No I/O anywhere, so one
-        // shared hold covers the whole function.
+        // No I/O anywhere, so one shared hold covers the whole function;
+        // it also keeps the tables alive while their indexes are read.
         const held = self.mu.hold(.shared, @src());
         defer held.release();
-        {
-            const lv = &self.levels[lmax_idx];
-            const lmax = lv.entries(held);
-            if (lmax.len < min_lmax_tables_for_split) return null;
-            for (lmax[1..]) |tbe| {
-                try cand_keys.append(a, try tbe.table.smallest.dupe(a));
-            }
-        }
 
-        // Step 2: snapshot all L≥1 tables (smallest, biggest, size)
-        // across every level so we can score each candidate by its
-        // L≥1-wide balance, not just within Lmax.
-        const Entry = struct { smallest: Key, biggest: Key, size: u64 };
-        var all_entries: std.ArrayList(Entry) = .empty;
+        // Candidates: each Lmax table's smallest key but the first, whose
+        // smallest is the tree's left bound (nothing would go left).
+        const lmax_idx = self.live.cur().max_levels - 1;
+        const lmax = self.levels[lmax_idx].entries(held);
+        if (lmax.len < min_lmax_tables_for_split) return null;
+
+        var tables: std.ArrayList(*const Table) = .empty;
+        defer tables.deinit(allocator);
         for (self.levels[1..]) |*lv| {
             for (lv.entries(held)) |tbe| {
-                try all_entries.append(a, .{
-                    .smallest = try tbe.table.smallest.dupe(a),
-                    .biggest = try tbe.table.biggest.dupe(a),
-                    .size = tbe.table.fileSize(),
-                });
+                try tables.append(allocator, tbe.table);
             }
         }
 
-        // Step 3: for each candidate K, count strict-left and
-        // strict-right bytes; pick the K with smallest difference.
+        // The candidate with the smallest |left - right| over every
+        // table's bytes.
         var best_key: ?Key = null;
         var best_score: u64 = std.math.maxInt(u64);
-        for (cand_keys.items) |k| {
-            var left: u64 = 0;
-            var right: u64 = 0;
-            for (all_entries.items) |e| {
-                if (e.biggest.orderPrimary(k) == .lt) {
-                    left += e.size;
-                } else if (e.smallest.orderPrimary(k) != .lt) {
-                    right += e.size;
-                }
-                // else: straddles K → goes to BOTH children → skip.
+        for (lmax[1..]) |cand| {
+            const k = cand.table.smallest;
+            var sizes: Table.Sizes = .{};
+            for (tables.items) |tbl| {
+                const s = tbl.splitAround(k);
+                sizes.left += s.left;
+                sizes.right += s.right;
             }
-            const score = if (left > right) left - right else right - left;
+            const score = if (sizes.left > sizes.right)
+                sizes.left - sizes.right
+            else
+                sizes.right - sizes.left;
             if (score < best_score) {
                 best_score = score;
                 best_key = k;
@@ -775,10 +750,9 @@ pub const Tree = struct {
         }
 
         const chosen = best_key orelse return null;
-        // Re-dupe into the caller's allocator (arena dies on return).
         // Tree bounds name primaries, so every version of the split key
         // goes to the right tree: no primary is split across trees. The
-        // table bounds it came from carry no namespace or table_id; the
+        // table bound it came from carries no namespace or table_id; the
         // tree's go on, since the key becomes a tree bound.
         const key = self.stamp(try chosen.dupe(allocator));
         std.debug.assert(key.primary.len > 0);

@@ -398,6 +398,28 @@ pub const Table = struct {
         return if (above > 0) above - 1 else 0;
     }
 
+    /// The table's bytes on either side of `k`, from the block index
+    /// alone: a block counts left when its base key is below `k`, else
+    /// right, so the block `k` lands in goes left whole. Blocks are
+    /// laid out back to back from offset 0, so a block's offset is the
+    /// bytes before it. No I/O.
+    pub fn splitAround(self: *const Table, k: Key) Sizes {
+        const blocks = self.index.blocks;
+        if (blocks.len == 0) return .{};
+        const Base = _buffers.BlockIndexStruct;
+        const from = utils.search(Base, blocks, k, struct {
+            fn f(sk: Key, b: Base) bool {
+                return baseKeyOf(b).orderPrimary(sk) != .lt;
+            }
+        }.f);
+        const last = blocks[blocks.len - 1];
+        const total: u64 = last.offset + last.len;
+        const left: u64 = if (from < blocks.len) blocks[from].offset else total;
+        return .{ .left = left, .right = total - left };
+    }
+
+    pub const Sizes = struct { left: u64 = 0, right: u64 = 0 };
+
     /// The block cache key: file_id in the high 64 bits, block_idx in
     /// the low 64 — no hashing, no collision. 0 = "skip cache" (file_id
     /// 0 is the in-memory / non-SST marker).
