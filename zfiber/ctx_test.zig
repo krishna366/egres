@@ -8,25 +8,26 @@ fn ctxOffFiber(out: **fiber.Ctx) void {
     out.* = fiber.ctx();
 }
 
-test "ctx: no statement means the background context, record is a no-op" {
-    // The test fiber has no context attached.
-    const bg = fiber.ctx();
-    try std.testing.expectEqual(0, bg.name.len);
-    bg.record("dropped", .{});
-    bg.record("dropped {d}", .{1});
-    try std.testing.expectEqual(0, bg.records.items.len);
+test "ctx: no statement means record is a no-op; off a fiber, bg" {
+    // The test fiber's own context, with no statement started.
+    const own = fiber.ctx();
+    try std.testing.expect(own.arena == null);
+    try std.testing.expectEqual(0, own.name.len);
+    own.record("dropped", .{});
+    own.record("dropped {d}", .{1});
+    try std.testing.expectEqual(0, own.records.items.len);
 
-    // Off any fiber: the same background context.
+    // Off any fiber: the shared background context.
     var seen: *fiber.Ctx = undefined;
     const t = try std.Thread.spawn(.{}, ctxOffFiber, .{&seen});
     t.join();
-    try std.testing.expectEqual(bg, seen);
+    try std.testing.expectEqual(&fiber.Ctx.bg, seen);
 }
 
 test "ctx: records carry labels and offsets, a slow statement is kept" {
-    var qctx = fiber.Ctx.init("select 1");
-    try qctx.attach();
-    try std.testing.expectEqual(&qctx, fiber.ctx());
+    const qctx = fiber.ctx();
+    try qctx.start("select 1");
+    try std.testing.expect(qctx.arena != null);
 
     fiber.ctx().record("first", .{});
     fiber.sleepMs(3);
@@ -37,9 +38,11 @@ test "ctx: records carry labels and offsets, a slow statement is kept" {
     try std.testing.expectEqualStrings("n=7", recs[1].label);
     try std.testing.expect(recs[1].at_us >= recs[0].at_us + 2_000);
 
-    // Over 1 ms: the sampler keeps it, records included.
-    qctx.detach();
-    try std.testing.expectEqual(null, fiber.currentFiber().ctx);
+    // Over 1 ms: the sampler keeps it, records included, and the
+    // fiber's context is fresh again.
+    qctx.finish();
+    try std.testing.expect(fiber.ctx().arena == null);
+    try std.testing.expectEqual(0, fiber.ctx().records.items.len);
     var body: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer body.deinit();
     try fiber.writeTraces(&body.writer, 0);
@@ -58,33 +61,42 @@ fn recordHelper() void {
     fiber.ctx().record("helper", .{});
 }
 
-fn noteCtx(out: *std.atomic.Value(usize)) void {
-    out.store(@intFromPtr(fiber.ctx()), .release);
+/// A helper's helper: its records must reach the statement too.
+fn nestedHelper() void {
+    var h = fiber.spawn(.{}, recordHelper, .{}) catch return;
+    h.join();
 }
 
-test "ctx: a joined helper records into the statement, detached does not" {
-    const bg = fiber.ctx();
-    var qctx = fiber.Ctx.init("select 2");
-    try qctx.attach();
-    defer qctx.detach();
+fn noteClass(out: *std.atomic.Value(u8)) void {
+    fiber.ctx().record("detached", .{});
+    out.store(@intFromEnum(fiber.ctx().prio), .release);
+}
+
+test "ctx: helpers record into the statement, a detached fiber does not" {
+    const qctx = fiber.ctx();
+    try qctx.start("select 2");
+    defer qctx.finish();
 
     var h = try fiber.spawn(.{}, recordHelper, .{});
     h.join();
     try std.testing.expectEqual(1, qctx.records.items.len);
     try std.testing.expectEqualStrings("helper", qctx.records.items[0].label);
 
-    var seen: std.atomic.Value(usize) = .init(0);
-    try fiber.spawnDetached(.{}, noteCtx, .{&seen});
-    while (seen.load(.acquire) == 0) fiber.sleepMs(1);
-    try std.testing.expectEqual(@intFromPtr(bg), seen.load(.acquire));
-
-    // An explicit context wins over inheritance.
-    var other = fiber.Ctx.init("other");
-    var h2 = try fiber.spawn(.{ .ctx = &other }, recordHelper, .{});
+    var h2 = try fiber.spawn(.{}, nestedHelper, .{});
     h2.join();
-    try std.testing.expectEqual(1, other.records.items.len);
-    try std.testing.expectEqual(1, qctx.records.items.len);
-    other.arena.deinit();
+    try std.testing.expectEqual(2, qctx.records.items.len);
+
+    // A detached fiber inherits the I/O class but records nowhere.
+    qctx.prio = .p2;
+    defer qctx.prio = .p0;
+    var seen: std.atomic.Value(u8) = .init(255);
+    try fiber.spawnDetached(.{}, noteClass, .{&seen});
+    while (seen.load(.acquire) == 255) fiber.sleepMs(1);
+    try std.testing.expectEqual(
+        @intFromEnum(fiber.IoPriority.p2),
+        seen.load(.acquire),
+    );
+    try std.testing.expectEqual(2, qctx.records.items.len);
 }
 
 test "ctx: a bucket keeps the newest traces and drops the oldest" {
@@ -95,10 +107,10 @@ test "ctx: a bucket keeps the newest traces and drops the oldest" {
     var names: [9][5]u8 = undefined;
     for (&names, 0..) |*name, i| {
         name.* = .{ 'r', 'i', 'n', 'g', '0' + @as(u8, @intCast(i)) };
-        var qctx = fiber.Ctx.init(name);
+        const qctx = fiber.ctx();
+        try qctx.start(name);
         qctx.start_mono_us -= 200_000;
-        try qctx.attach();
-        qctx.detach();
+        qctx.finish();
     }
     var body: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer body.deinit();

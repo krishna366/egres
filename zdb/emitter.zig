@@ -207,7 +207,6 @@ pub const VersionTracker = struct {
             external = e.tree.rollupBitmap(alloc, .{
                 .key = item.key,
                 .read_ts = oldest - 1,
-                .priority = e.prio,
             }, e.dest + 1) catch |err| switch (err) {
                 // The chain below can't be folded (mixed or corrupt):
                 // keep everything verbatim, reads keep folding.
@@ -367,20 +366,17 @@ pub const Emitter = struct {
     /// since a second would share its raft_index with the first.
     file_sz: usize,
     dest: usize,
-    prio: vfs.Priority,
     tracker: VersionTracker,
 
     pub fn init(
         tree: *Tree,
         dest: usize,
-        prio: vfs.Priority,
         snapshot_ts: u64,
     ) !Emitter {
         const opts = tree.live.cur();
         const cfg = _table.builder.Config{
             .block_bytes = opts.block_bytes,
             .codec = opts.codecFor(dest),
-            .priority = prio,
             .kind = tree.kind,
         };
         return .{
@@ -396,7 +392,6 @@ pub const Emitter = struct {
             else
                 opts.table_bytes,
             .dest = dest,
-            .prio = prio,
             .opts = opts,
             // Only the bottom level may discard history: lower
             // levels could still contain a version that an early

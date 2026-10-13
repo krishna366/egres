@@ -250,7 +250,6 @@ pub const TableCache = struct {
             self.store,
             need.id,
             need.extent,
-            .p0,
         ) catch |err| {
             tse.set(err);
             return;
@@ -516,7 +515,6 @@ pub const Tree = struct {
             &keys,
             .{
                 .read_ts = lookup.read_ts,
-                .priority = lookup.priority,
                 .include_deleted = true,
             },
         );
@@ -572,7 +570,6 @@ pub const Tree = struct {
         self: *Tree,
         allocator: std.mem.Allocator,
         range: KeyRange,
-        priority: vfs.Priority,
         min_ts: u64,
         extras: []const Iterator,
     ) !MergeIterator {
@@ -619,7 +616,6 @@ pub const Tree = struct {
                         .table = TableIterator.init(
                             allocator,
                             e.table,
-                            priority,
                             .{
                                 .namespace = self.namespace,
                                 .table_id = self.tableId(),
@@ -635,7 +631,6 @@ pub const Tree = struct {
                     const sub = TableIterator.init(
                         allocator,
                         tbl,
-                        priority,
                         .{
                             .namespace = self.namespace,
                             .table_id = self.tableId(),
@@ -794,7 +789,7 @@ pub const Tree = struct {
             allocator,
             lookup.key.tableKey(),
             &keys,
-            .{ .read_ts = lookup.read_ts, .priority = lookup.priority },
+            .{ .read_ts = lookup.read_ts },
         );
         defer mg.deinit();
         try mg.walkTree(self, mg.pending.items, from_level);

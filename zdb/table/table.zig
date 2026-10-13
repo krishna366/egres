@@ -17,6 +17,7 @@ const compress = utils.compression;
 const _binaryfuse = @import("../binaryfusefilter.zig");
 const zroar = @import("zroar");
 const vfs = @import("vfs");
+const fiber = @import("zfiber");
 const _cache = @import("../cache.zig");
 
 /// Module-level block cache singleton. Set before opening tables to enable
@@ -138,7 +139,6 @@ pub const Table = struct {
         store: *vfs.RemoteStore,
         file_id: u64,
         extent: Extent,
-        priority: vfs.Priority,
     ) !*Table {
         const name = try sstName(allocator, file_id);
         defer allocator.free(name);
@@ -146,7 +146,7 @@ pub const Table = struct {
             .mode = read_mode,
             .flags = .{ .random = true },
         });
-        const t = try openObject(allocator, obj, extent, priority);
+        const t = try openObject(allocator, obj, extent);
         t.file_id = file_id;
         return t;
     }
@@ -159,7 +159,6 @@ pub const Table = struct {
         allocator: std.mem.Allocator,
         obj_in: vfs.Object,
         extent: Extent,
-        priority: vfs.Priority,
     ) !*Table {
         var obj = obj_in;
         errdefer obj.close();
@@ -179,7 +178,6 @@ pub const Table = struct {
             allocator,
             extent.index_offset,
             tail_len,
-            priority,
         );
         defer tail.free();
 
@@ -483,12 +481,26 @@ pub const Table = struct {
             return error.OutOfMemory;
     }
 
-    pub fn readBlock(self: *const Table, block_idx: usize, priority: vfs.Priority) Error!*_cache.Value {
+    pub fn readBlock(self: *const Table, block_idx: usize) Error!*_cache.Value {
+        return self.readBlock_(block_cache, block_idx);
+    }
+
+    /// `readBlock` through `cache` instead of the process's block cache.
+    pub fn readBlock_(
+        self: *const Table,
+        cache: ?*_cache.ShardedCache(u128),
+        block_idx: usize,
+    ) Error!*_cache.Value {
         if (block_idx >= self.index.blocks.len) return error.CorruptTable;
 
+        // A bypass reader (compaction) takes a resident block without
+        // marking it reused, and keeps the blocks it reads out of the
+        // cache: each is wanted once.
+        const bypass = fiber.ctx().cache == .bypass;
         const cache_key = self.cacheKey(block_idx);
-        if (block_cache != null and cache_key != 0) {
-            if (block_cache.?.get(cache_key)) |val| return val; // incrRef'd by get.
+        if (cache != null and cache_key != 0) {
+            const hit: _cache.Hit = if (bypass) .once else .reuse;
+            if (cache.?.get(cache_key, hit)) |val| return val; // incrRef'd.
         }
 
         const bi = self.index.blocks[block_idx];
@@ -499,7 +511,6 @@ pub const Table = struct {
             self.allocator,
             @intCast(bi.offset),
             bi.len,
-            priority,
         ) catch return error.CorruptTable;
         defer result.free();
 
@@ -507,8 +518,8 @@ pub const Table = struct {
         errdefer val.decrRef();
 
         // Cache insert (best-effort); put incrRefs on success → ref=2
-        if (block_cache != null and cache_key != 0) {
-            if (block_cache.?.put(cache_key, val)) |_| {
+        if (cache != null and cache_key != 0 and !bypass) {
+            if (cache.?.put(cache_key, val)) |_| {
                 self.setCachedBit(block_idx);
             } else |err| {
                 log.warn("block cache put failed: {s}; file_id={d} block={d}", .{
@@ -535,7 +546,6 @@ pub const Table = struct {
         cache: *_cache.ShardedCache(u128),
         allocator: std.mem.Allocator,
         idxs: []const usize,
-        priority: vfs.Priority,
     ) Error!usize {
         if (self.file_id == 0) return 0;
         if (self.obj.isResident()) return 0;
@@ -556,7 +566,7 @@ pub const Table = struct {
         for (idxs) |idx| {
             if (wanted.items.len == max_blocks) break;
             if (idx >= blocks.len) return error.CorruptTable;
-            if (cache.get(self.cacheKey(idx))) |val| {
+            if (cache.get(self.cacheKey(idx), .reuse)) |val| {
                 val.decrRef();
                 continue;
             }
@@ -570,7 +580,7 @@ pub const Table = struct {
         }
         if (reqs.items.len == 0) return 0;
 
-        self.obj.batchRead(&arena, reqs.items, priority) catch
+        self.obj.batchRead(&arena, reqs.items) catch
             return error.CorruptTable;
 
         for (reqs.items, wanted.items) |req, idx| {
@@ -876,14 +886,19 @@ pub const TableIterator = struct {
     bi: ?BlockIterator,
     current_block: ?*_cache.Value = null,
     valid: bool,
-    priority: vfs.Priority,
     /// Exclusive upper bound, borrowed from the caller of `seekRange`.
     end_key: ?Key = null,
     end_bpos: usize = 0, // block index where end_key lives
+    /// Set by a reader that walks the table once (compaction): raw
+    /// bytes are read ahead in spans of up to this many bytes, whole
+    /// blocks, and decoded out of the span, so the table costs a few
+    /// large reads rather than one per block. The block cache is not
+    /// consulted or filled. 0 reads block by block through `readBlock`.
+    window_bytes: u64 = 0,
+    window: ?vfs.ReadResult = null,
     pub fn init(
         allocator: std.mem.Allocator,
         table: *Table,
-        priority: vfs.Priority,
         table_key: TableKey,
     ) TableIterator {
         table.incrRef();
@@ -895,7 +910,6 @@ pub const TableIterator = struct {
             .bi = null,
             .current_block = null,
             .valid = false,
-            .priority = priority,
         };
     }
 
@@ -903,6 +917,7 @@ pub const TableIterator = struct {
         self.table.decrRef();
         if (self.bi) |*bi| bi.deinit();
         if (self.current_block) |b| b.decrRef();
+        if (self.window) |w| w.free();
     }
 
     /// Seek to the first entry >= start, stopping before any entry with key >= end.
@@ -1058,7 +1073,10 @@ pub const TableIterator = struct {
         if (self.current_block) |b| b.decrRef();
         self.current_block = null;
 
-        const val = try self.table.readBlock(bpos, self.priority);
+        const val = if (self.window_bytes > 0)
+            try self.readWindowed(bpos)
+        else
+            try self.table.readBlock(bpos);
         self.current_block = val;
 
         const base_key = try self.table.blockBaseKey(bpos);
@@ -1069,5 +1087,39 @@ pub const TableIterator = struct {
             self.table_key,
         );
         self.bpos = bpos;
+    }
+
+    /// Block `bpos` decoded out of the window, which is read anew when
+    /// it does not hold the block: from the block's start through the
+    /// last whole block within `window_bytes`, the block itself at
+    /// least. Blocks are laid out back to back, so the span is exact.
+    fn readWindowed(self: *TableIterator, bpos: usize) Error!*_cache.Value {
+        const blocks = self.table.index.blocks;
+        if (bpos >= blocks.len) return error.CorruptTable;
+
+        const block = blocks[bpos];
+        const held = if (self.window) |w|
+            block.offset >= w.offset and
+                block.offset + block.len <= w.offset + w.data.len
+        else
+            false;
+
+        if (!held) {
+            if (self.window) |w| w.free();
+            self.window = null;
+
+            var len: usize = block.len;
+            for (blocks[bpos + 1 ..]) |cur| {
+                if (len + cur.len > self.window_bytes) break;
+                len += cur.len;
+            }
+            self.window = self.table.obj.readAligned(
+                self.allocator,
+                block.offset,
+                len,
+            ) catch return error.CorruptTable;
+        }
+        const at: usize = @intCast(block.offset - self.window.?.offset);
+        return self.table.decodeBlock(self.window.?.data[at..][0..block.len]);
     }
 };

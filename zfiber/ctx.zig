@@ -1,26 +1,32 @@
 // Copyright 2026 Manish R Jain
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-statement context: the record of a statement's path through the
-//! system, and the latency-bucketed traces kept for the admin port.
+//! Every fiber's context: the I/O class its reads and writes run as,
+//! and, while a statement runs, the record of the statement's path
+//! through the system, kept as latency-bucketed traces for the admin
+//! port.
 //!
-//! A statement creates a `Ctx`, attaches it to its fiber, and any code
-//! it calls stamps the moment it was reached with
-//! `fiber.ctx().record("loaded {d} tables", .{n})`. The records are a
-//! flat timeline, not nested spans: read top to bottom they show where
-//! the time went. `ctx()` is never null. Code running off a fiber, or
-//! on a fiber with no statement, gets the background context, whose
-//! `record` does nothing, so library code never branches on it.
+//! A fiber owns its `Ctx` (`Fiber.ctx`), reached with `current()`, and
+//! sets its own I/O class there; a spawn copies the class into the
+//! child. A statement runs `start` and `finish` on its fiber's
+//! context, and any code it calls stamps the moment it was reached
+//! with `fiber.ctx().record("loaded {d} tables", .{n})`. The records
+//! are a flat timeline, not nested spans: read top to bottom they
+//! show where the time went. A joinable helper fiber's context points
+//! at the statement's (`parent`), so its records go there.
+//! `current()` is never null: off any fiber, or on a fiber with no
+//! statement, `record` does nothing, so library code never branches
+//! on it.
 //!
-//! When the statement finishes, `detach` offers the context to the
+//! When the statement finishes, `finish` offers the context to the
 //! sampler: one ring of the newest few traces per latency bucket (at
 //! least 1 ms, 10 ms, ...), the shape of Go's net/trace. A statement
 //! goes into the highest bucket it qualifies for, so the slow ones are
 //! not pushed out by the merely slow. `writeTraces` prints them for
 //! the admin command `traces [min_ms]`.
 //!
-//! Memory: a context owns one arena over the runtime allocator holding
-//! the name, the formatted labels and the record list. Keeping a trace
+//! Memory: a statement's arena over the runtime allocator holds the
+//! name, the formatted labels and the record list. Keeping a trace
 //! moves the arena into the ring, so nothing is copied at the end of a
 //! statement, and evicting a trace frees it whole.
 //!
@@ -56,66 +62,94 @@ pub const Record = struct {
     at_us: u64,
 };
 
+/// The I/O class of the work under a context: the bandwidth limiter
+/// (vfs/bandwidth) serves the lower number first.
+pub const IoPriority = enum(u2) {
+    p0, // what a user waits on: the WAL, and queries' reads
+    p1, // L0 compaction, flushes and their uploads
+    p2, // L1+ compaction, log file prezero
+};
+
+/// Whether the block and chunk caches serve and keep the reads made
+/// under a context. A compaction streams each block once: keeping
+/// them would evict what queries reuse, and the hits it does get
+/// must not count as reuse either.
+pub const CachePolicy = enum { use, bypass };
+
 pub const Ctx = struct {
-    arena: std.heap.ArenaAllocator,
-    name: String,
+    /// A statement runs on this fiber: the arena, live from `start` to
+    /// `finish`, holds the name, the labels and the record list, and
+    /// is moved to the sampler or freed at the end. Null otherwise,
+    /// and then records are dropped.
+    arena: ?std.heap.ArenaAllocator = null,
+    name: String = "",
     /// Realtime, read once, so a trace can be placed on an absolute
     /// timeline; durations use the monotonic clock.
-    start_unix_us: i64,
-    start_mono_us: i64,
+    start_unix_us: i64 = 0,
+    start_mono_us: i64 = 0,
     records: std.ArrayList(Record) = .empty,
-    /// Set by `attach` when the installed Shutdown (`shutdown.zig`)
-    /// counted this context in, so `detach` counts it out on the same
-    /// instance and a context attached before `install` is never
+    /// Set by `start` when the installed Shutdown (`shutdown.zig`)
+    /// counted the statement in, so `finish` counts it out on the
+    /// same instance and one started before `install` is never
     /// counted out.
     counted: bool = false,
+    /// What every read and write on the fiber runs as; vfs and the
+    /// caches look them up with `current()`, nothing passes them. A
+    /// fiber sets its own; a spawn copies the spawner's.
+    prio: IoPriority = .p0,
+    cache: CachePolicy = .use,
+    /// The statement this fiber helps, set at spawn for a joinable
+    /// fiber: `record` forwards to it. The spawner's frame joins the
+    /// helper, so the root outlives it. Null on a root and on a fiber
+    /// with no statement behind it.
+    parent: ?*Ctx = null,
     /// Joined helper fibers record into the same list from other
     /// workers; the arena is not thread safe either, so formatting a
     /// label happens under this lock too. A few dozen records per
     /// statement, so the lock is never contended for long.
     lock: Spinlock = .{},
 
-    /// Copies the head of `name` (the statement text). Needs a running
-    /// runtime, whose allocator backs the arena.
-    pub fn init(name: String) Ctx {
-        var arena = std.heap.ArenaAllocator.init(_rt.runtime().allocator);
-        const head = name[0..@min(name.len, name_max)];
-        const owned = arena.allocator().dupe(u8, head) catch "";
-        return .{
-            .arena = arena,
-            .name = owned,
-            .start_unix_us = _clock.timestampNow(.realtime, .micros),
-            .start_mono_us = _clock.timestampNow(.monotonic, .micros),
-        };
-    }
+    /// The context of code off any fiber: `record` does nothing.
+    /// Never written.
+    pub var bg: Ctx = .{};
 
-    /// Makes this the current fiber's context and counts the statement
-    /// as in flight on the installed Shutdown (`Shutdown.enterCtx`).
-    /// Call once the Ctx has its final address; the fiber keeps a
-    /// pointer to it. Refused once the process is draining, and the
-    /// context is freed then, since no `detach` follows.
-    pub fn attach(self: *Ctx) YieldError!void {
-        const f = _rt.currentFiber();
-        std.debug.assert(f.ctx == null);
+    /// Begins a statement on this context, the current fiber's: copies
+    /// the head of `name` (the statement text) into a fresh arena,
+    /// resets the I/O class, and counts the statement as in flight on
+    /// the installed Shutdown (`Shutdown.enterCtx`). Refused once the
+    /// process is draining. Needs a running runtime, whose allocator
+    /// backs the arena.
+    pub fn start(self: *Ctx, name: String) YieldError!void {
+        std.debug.assert(self.arena == null and self.parent == null);
         if (_shutdown.installed()) |sd| {
-            if (!sd.enterCtx()) {
-                self.arena.deinit();
-                return error.Shutdown;
-            }
+            if (!sd.enterCtx()) return error.Shutdown;
             self.counted = true;
         }
-        f.ctx = self;
+        self.arena = std.heap.ArenaAllocator.init(_rt.runtime().allocator);
+        const head = name[0..@min(name.len, name_max)];
+        self.name = self.arena.?.allocator().dupe(u8, head) catch "";
+        self.start_unix_us = _clock.timestampNow(.realtime, .micros);
+        self.start_mono_us = _clock.timestampNow(.monotonic, .micros);
+        self.records = .empty;
+        self.prio = .p0;
+        self.cache = .use;
     }
 
-    /// Ends the statement: clears the fiber's slot, and either hands
-    /// the name and records to the sampler or frees them. Must run on
-    /// the fiber that attached.
-    pub fn detach(self: *Ctx) void {
-        const f = _rt.currentFiber();
-        std.debug.assert(f.ctx == self);
-        f.ctx = null;
+    /// Ends the statement: either hands the name and records to the
+    /// sampler or frees them, and leaves the context as a fresh
+    /// fiber's. Must run on the fiber that started it, after its
+    /// helpers are joined.
+    pub fn finish(self: *Ctx) void {
+        var arena = self.arena.?;
         if (self.counted) _shutdown.installed().?.leaveCtx();
-        if (!offer(self, self.elapsedUs())) self.arena.deinit();
+        if (!offer(self, arena, self.elapsedUs())) arena.deinit();
+        self.* = .{};
+    }
+
+    /// The context the records go to: the statement's, through
+    /// `parent` on a helper.
+    fn root(self: *Ctx) *Ctx {
+        return self.parent orelse self;
     }
 
     /// Stamps the moment with a label. A label without args is a
@@ -123,19 +157,20 @@ pub const Ctx = struct {
     /// into the arena. Out of memory drops the record; a statement
     /// never fails over its trace.
     pub fn record(self: *Ctx, comptime fmt: String, args: anytype) void {
-        if (self == &background) return;
-        const at_us = self.elapsedUs();
+        const r = self.root();
+        const arena = if (r.arena) |*a| a else return;
+        const at_us = r.elapsedUs();
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        r.lock.lock();
+        defer r.lock.unlock();
 
-        const arloc = self.arena.allocator();
+        const arloc = arena.allocator();
         const label = if (args.len == 0)
             fmt
         else
             std.fmt.allocPrint(arloc, fmt, args) catch return;
 
-        self.records.append(
+        r.records.append(
             arloc,
             .{ .label = label, .at_us = at_us },
         ) catch return;
@@ -155,31 +190,20 @@ pub const Ctx = struct {
     /// and never parks; the pause is what a cancel or a CPU budget will
     /// add. The drain stage before the stop is not an interrupt: a
     /// running statement gets the grace period to finish on its own,
-    /// only `attach` refuses new ones. Callers must treat this as a
-    /// blocking call: no spinlock held across it. A no-op on the
-    /// background context, so library code never branches on which
-    /// context it runs under.
+    /// only `start` refuses new ones. Callers must treat this as a
+    /// blocking call: no spinlock held across it.
     pub fn maybeYield(self: *Ctx) YieldError!void {
-        if (self == &background) return;
+        _ = self;
         const sd = _shutdown.installed() orelse return;
         if (sd.isStopping()) return error.Shutdown;
     }
 };
 
-/// The context of code with no statement. `record` is a no-op on it
-/// and it is never attached, so its arena is never touched.
-var background: Ctx = .{
-    .arena = undefined,
-    .name = "",
-    .start_unix_us = 0,
-    .start_mono_us = 0,
-};
-
-/// The current fiber's context, or the background context off a fiber
-/// or on a fiber with no statement. Never null.
+/// The current fiber's own context, or `Ctx.bg` off any fiber. Never
+/// null.
 pub fn current() *Ctx {
-    const f = _rt.currentFiberOrNull() orelse return &background;
-    return f.ctx orelse &background;
+    const f = _rt.currentFiberOrNull() orelse return &Ctx.bg;
+    return &f.ctx;
 }
 
 /// A finished statement kept by the sampler. Owns its arena, which
@@ -216,10 +240,10 @@ fn bucketFor(elapsed_us: u64) ?usize {
 /// Moves a finished statement into its bucket's ring, taking over the
 /// arena. Returns false, without locking, when the statement is too
 /// fast to keep: the common path, and the caller frees the context.
-fn offer(ctx: *Ctx, elapsed_us: u64) bool {
+fn offer(ctx: *Ctx, arena: std.heap.ArenaAllocator, elapsed_us: u64) bool {
     const b = bucketFor(elapsed_us) orelse return false;
     const trace: Trace = .{
-        .arena = ctx.arena,
+        .arena = arena,
         .name = ctx.name,
         .start_unix_us = ctx.start_unix_us,
         .elapsed_us = elapsed_us,

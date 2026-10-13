@@ -237,7 +237,7 @@ pub const MetaStore = struct {
                 .flags = .{ .writable = true, .truncate = true, .dsync = true },
             });
             defer tmp.close();
-            try tmp.write(file_buf.items, 0, .p0);
+            try tmp.write(file_buf.items, 0);
         }
 
         // Atomic rename — POSIX guarantees the directory entry flips
@@ -286,11 +286,15 @@ pub const MetaStore = struct {
         try zbuf.Frame.write(page, scratch.items);
 
         const offset: u64 = @as(u64, slot_idx) * slot_size;
-        try self.state_file.write(page, offset, .p0);
+        try self.state_file.write(page, offset);
     }
 
     fn recoverHardState(self: *MetaStore) !void {
-        const result = try self.state_file.readAligned(self.allocator, 0, state_file_size, .p0);
+        const result = try self.state_file.readAligned(
+            self.allocator,
+            0,
+            state_file_size,
+        );
         defer result.free();
         if (result.data.len < state_file_size) return Error.MetaCorrupt;
 
@@ -345,7 +349,11 @@ pub const MetaStore = struct {
 
         if (handle.file_size == 0) return; // Treat empty file as no snapshot.
 
-        const result = try handle.readAligned(self.allocator, 0, @intCast(handle.file_size), .p0);
+        const result = try handle.readAligned(
+            self.allocator,
+            0,
+            @intCast(handle.file_size),
+        );
         defer result.free();
         const buf = result.data;
 

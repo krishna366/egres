@@ -81,6 +81,11 @@ fn checkValue(comptime V: type) void {
 // Cache(K, V) — single shard, not thread-safe
 // ---------------------------------------------------------------------------
 
+/// What a hit says about the entry: `reuse` marks it for the eviction
+/// pass to keep, `once` does not (a reader wanting the bytes one time,
+/// or a writer adding to a cached value).
+pub const Hit = enum { reuse, once };
+
 pub fn Cache(
     comptime K: type,
     comptime V: type,
@@ -274,20 +279,13 @@ pub fn Cache(
             self.m.deinit(self.allocator);
         }
 
-        /// Returns the cached value for `key`, marking it as recently
-        /// used. The returned value has been incrRef'd; the caller must
-        /// decrRef when done. Only touches the map; no ring access.
-        pub fn get(self: *Self, key: K) ?V {
+        /// Returns the cached value for `key`, marked as recently used
+        /// on a `.reuse` hit. The returned value has been incrRef'd;
+        /// the caller must decrRef when done. Only touches the map; no
+        /// ring access.
+        pub fn get(self: *Self, key: K, hit: Hit) ?V {
             const entry = self.map.getPtr(key) orelse return null;
-            entry.freq.store(true, .release);
-            _ = entry.val.incrRef();
-            return entry.val;
-        }
-
-        /// `get` without the reuse mark: for a writer adding to a
-        /// cached value, which says nothing about readers wanting it.
-        pub fn peek(self: *Self, key: K) ?V {
-            const entry = self.map.getPtr(key) orelse return null;
+            if (hit == .reuse) entry.freq.store(true, .release);
             _ = entry.val.incrRef();
             return entry.val;
         }
@@ -610,11 +608,11 @@ pub fn ShardedCache(
 
         /// A shared lock suffices: `get` only touches atomics (freq bit,
         /// refcount) in a map that no put is reshaping meanwhile.
-        pub fn get(self: *Self, key: K) ?V {
+        pub fn get(self: *Self, key: K, hit: Hit) ?V {
             const s = self.pickShard(key);
             s.lock.lockShared(@src());
             defer s.lock.unlockShared();
-            const val = s.cache.get(key);
+            const val = s.cache.get(key, hit);
             const counter = if (val != null) &self.hits else &self.misses;
             _ = counter.fetchAdd(1, .monotonic);
             return val;

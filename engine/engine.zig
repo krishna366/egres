@@ -1004,6 +1004,8 @@ pub const Engine = struct {
     /// `flush_max_age_seconds` have passed since the last flush and at
     /// least one is. The first flush after start never waits.
     fn runFlushLoop(self: *Engine) void {
+        // Flushes and their uploads: ahead of compaction, behind users.
+        fiber.ctx().prio = .p1;
         const interval: u64 = 200;
         var last_flush_ms: ?i64 = null;
         while (!self.node.isShuttingDown()) {

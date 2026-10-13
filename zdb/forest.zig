@@ -813,7 +813,7 @@ pub const Forest = struct {
         const em = try self.allocator.create(Emitter);
         errdefer self.allocator.destroy(em);
 
-        em.* = try Emitter.init(tree, 0, .p0, snapshot_ts);
+        em.* = try Emitter.init(tree, 0, snapshot_ts);
         errdefer em.deinit();
 
         try emitters.append(self.allocator, em);
@@ -860,7 +860,7 @@ pub const Forest = struct {
         const tree = try self.singleTree(table_key);
         defer tree.release();
 
-        var em = try Emitter.init(tree, bottom, .p2, self.snapshotTs());
+        var em = try Emitter.init(tree, bottom, self.snapshotTs());
         defer em.deinit();
 
         for (items) |item| try em.push(item);

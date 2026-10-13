@@ -193,7 +193,7 @@ fn fillProbeFile(a: std.mem.Allocator, path: String) !void {
         .mode = .direct,
         .flags = .{ .truncate = true },
     };
-    try _vfs.writeAndSync(path, data, create, .p0);
+    try _vfs.writeAndSync(path, data, create);
 }
 
 /// Bytes per second over 250ms with `depth` fibers, one per

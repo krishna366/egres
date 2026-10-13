@@ -113,14 +113,12 @@ fn fillMultiGet(self: *Forest, mg: *MultiGet) !void {
     MultiGet.removeDone(&mg.pending);
 }
 
-/// One point read: the row, the timestamp it is read as of, and the
-/// I/O priority of the block reads it may issue.
+/// One point read: the row and the timestamp it is read as of.
 pub const Lookup = struct {
     key: Key,
     /// Versions above this are not visible. The default reads the
     /// latest.
     read_ts: u64 = std.math.maxInt(u64),
-    priority: vfs.Priority = .p0,
 };
 
 /// Get a value by key: the newest version at or below `read_ts`, from
@@ -164,7 +162,6 @@ fn getOne(
         &keys,
         .{
             .read_ts = lookup.read_ts,
-            .priority = lookup.priority,
             .include_deleted = include_deleted,
         },
     );
@@ -200,7 +197,7 @@ pub fn getBitmap(
         allocator,
         lookup.key.tableKey(),
         &keys,
-        .{ .read_ts = lookup.read_ts, .priority = lookup.priority },
+        .{ .read_ts = lookup.read_ts },
     );
     defer mg.deinit();
     try fillMultiGet(self, &mg);
@@ -245,7 +242,6 @@ pub const MultiGet = struct {
         /// Versions above this are not visible. Must be at or above
         /// `Forest.snapshotTs` for the entry points that check it.
         read_ts: u64 = std.math.maxInt(u64),
-        priority: vfs.Priority = .p0,
         /// Rows only: a txn's private writes, the first source (src 0
         /// of the memtable merge, as in ScanOptions.pending), so a
         /// pending write wins over every committed version and a
@@ -539,7 +535,6 @@ pub const MultiGet = struct {
         var it: Iterator = .{ .table = TableIterator.init(
             self.allocator,
             tbl,
-            self.opts.priority,
             self.table_key,
         ) };
         defer it.deinit();
@@ -567,7 +562,6 @@ pub const MultiGet = struct {
             cache,
             self.allocator,
             self.blocks.items,
-            self.opts.priority,
         );
     }
 
@@ -695,11 +689,6 @@ pub const ScanOptions = struct {
     /// "what changed since" pass (CREATE INDEX's merge of the rows
     /// written during its backfill). Memtables are always opened.
     min_ts: u64 = 0,
-    /// I/O priority for the SST reads this scan issues (see vfs). `.p0` is
-    /// the foreground/interactive class every current caller wants;
-    /// background sweeps should pick a lower one so they queue behind
-    /// user-facing reads.
-    priority: vfs.Priority = .p0,
     /// A transaction's private pending-write skiplist, merged in as
     /// the highest-priority source (src 0) so the txn sees its own
     /// uncommitted writes. Its entries carry ts = read_ts, which the
@@ -724,7 +713,7 @@ pub const ScanOptions = struct {
 ///
 /// `opts` carries everything else: how many items to return, the view
 /// (as-of timestamp, versions per key, deletions as data or absence), and
-/// the read priority — see `ScanOptions`. The defaults emit every live
+/// see `ScanOptions`. The defaults emit every live
 /// key's current value once and hide deleted keys, matching `get`.
 ///
 /// `scan_range`'s own timestamps only position the seek — `opts.read_ts`
@@ -969,7 +958,6 @@ pub const Cursor = struct {
             self.merge = try tree.openMerge(
                 a,
                 visit_range,
-                self.opts.priority,
                 self.opts.min_ts,
                 srcs,
             );

@@ -42,16 +42,16 @@ test "remotestore: file backend put/get/exists/delete round-trip" {
     var obj = try store.open("0001_000000000001.sst", vfs.page_size, .{});
     defer obj.close();
     try testing.expectEqual(@as(u64, vfs.page_size), obj.size());
-    const got = try obj.readAligned(alloc, 0, vfs.page_size, .p0);
+    const got = try obj.readAligned(alloc, 0, vfs.page_size);
     defer got.free();
     try testing.expectEqualSlices(u8, payload, got.data);
-    const ar = try obj.readAligned(alloc, 100, 32, .p0);
+    const ar = try obj.readAligned(alloc, 100, 32);
     defer ar.free();
     try testing.expectEqualSlices(u8, payload[100..132], ar.data);
 
     // Overwrite is idempotent (write-once contract: same bytes).
     try store.put("0001_000000000001.sst", payload);
-    const again = try obj.readAligned(alloc, 0, vfs.page_size, .p0);
+    const again = try obj.readAligned(alloc, 0, vfs.page_size);
     defer again.free();
     try testing.expectEqualSlices(u8, payload, again.data);
 

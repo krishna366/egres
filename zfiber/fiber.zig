@@ -253,10 +253,6 @@ pub const SpawnOptions = struct {
     /// guard page and crashes (raise it for deep-recursion bodies). Lazily
     /// backed, so a large value only costs the pages actually touched.
     stack_size: usize = default_stack_size,
-    /// The statement context the fiber records into. Default: a
-    /// joinable spawn inherits the spawner's, a detached one gets none,
-    /// because nothing bounds a detached fiber's life to the Ctx.
-    ctx: ?*Ctx = null,
 };
 
 /// Type-erased fiber body. A typed-args helper lives in `runtime.zig`.
@@ -318,12 +314,10 @@ pub const Fiber = struct {
         body: *anyopaque,
         allocator: std.mem.Allocator,
     ) void,
-    /// The statement this fiber works for, or null. Not owned: the
-    /// statement's frame holds the Ctx and clears the slot before it
-    /// ends (`Ctx.detach`). A joinable spawn copies the spawner's
-    /// pointer, so helpers record into the same statement; see
-    /// `spawnInner`.
-    ctx: ?*Ctx = null,
+    /// The fiber's own context (ctx.zig): its I/O class, and the
+    /// statement it runs or helps. Filled from the spawner's at spawn;
+    /// see `spawnInner`.
+    ctx: Ctx = .{},
     /// Fires after the fiber's body returns (state == .finished).
     /// Generated at `init` time so it knows the JoinState layout. Sets
     /// `state.released = true` under the join lock and returns the

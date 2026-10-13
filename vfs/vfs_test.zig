@@ -9,7 +9,6 @@ const utils = @import("utils");
 const String = utils.String;
 const bandwidth = vfs.bandwidth;
 const VFS = vfs.VFS;
-const Priority = vfs.Priority;
 const page_size = vfs.page_size;
 
 // 0.16 helpers: thin wrappers around std.Io.Dir that inject the
@@ -73,7 +72,7 @@ test "readAligned at aligned offset" {
     defer handle.close();
 
     // Read 100 bytes at offset 0 (aligned).
-    const r = try handle.readAligned(testing.allocator, 0, 100, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 100);
     defer r.free();
 
     try testing.expectEqual(@as(usize, 100), r.data.len);
@@ -95,7 +94,7 @@ test "readAligned at unaligned offset" {
     defer handle.close();
 
     // Read 12 bytes at offset 5000 (unaligned).
-    const r = try handle.readAligned(testing.allocator, 5000, 12, .p1);
+    const r = try handle.readAligned(testing.allocator, 5000, 12);
     defer r.free();
 
     try testing.expectEqual(@as(usize, 12), r.data.len);
@@ -118,7 +117,7 @@ test "readAligned alignment math" {
 
     // Read 12 bytes at offset 5000.
     // aligned_offset = 4096, prefix = 904, aligned_size = 4096.
-    const r = try handle.readAligned(testing.allocator, 5000, 12, .p2);
+    const r = try handle.readAligned(testing.allocator, 5000, 12);
     defer r.free();
 
     // Buffer must be 4KB-aligned.
@@ -168,7 +167,7 @@ test "O_DIRECT page-aligned write round-trips intact (content verified)" {
 
     const v = vfs.g().*;
     const wh = try v.createFile(path, .{ .mode = .direct });
-    try wh.write(data, 0, .p0);
+    try wh.write(data, 0);
     wh.close();
 
     // Read the file back through a plain (non-O_DIRECT) handle so we
@@ -206,7 +205,7 @@ test "O_DIRECT fallback on tmpfs" {
     try testing.expectEqual(@as(u64, 13), handle.file_size);
 
     // Also verify we can read through the fallback fd.
-    const r = try handle.readAligned(testing.allocator, 0, 13, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 13);
     defer r.free();
 
     try testing.expectEqualSlices(u8, "fallback test", r.data);
@@ -230,7 +229,7 @@ test "bandwidth limiter deducts on read" {
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .direct });
     defer handle.close();
 
-    const r = try handle.readAligned(testing.allocator, 0, 100, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 100);
     defer r.free();
 
     const pages_after = limiter.pages.load(.monotonic);
@@ -268,12 +267,12 @@ test "mmap readAligned" {
     defer handle.close();
 
     // Aligned offset.
-    const r1 = try handle.readAligned(testing.allocator, 0, 100, .p0);
+    const r1 = try handle.readAligned(testing.allocator, 0, 100);
     defer r1.free();
     try testing.expectEqualSlices(u8, data[0..100], r1.data);
 
     // Unaligned offset.
-    const r2 = try handle.readAligned(testing.allocator, 5000, 12, .p1);
+    const r2 = try handle.readAligned(testing.allocator, 5000, 12);
     defer r2.free();
     try testing.expectEqualSlices(u8, data[5000..5012], r2.data);
 }
@@ -289,7 +288,7 @@ test "mmap readAligned no allocation" {
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
     defer handle.close();
 
-    const r = try handle.readAligned(testing.allocator, 0, 14, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 14);
     defer r.free();
 
     try testing.expect(r.buf == null);
@@ -313,7 +312,7 @@ test "mmap enforces bandwidth limiter" {
     const handle = try v.openFile(testing.allocator, path, .{ .mode = .mmap });
     defer handle.close();
 
-    const r = try handle.readAligned(testing.allocator, 0, 100, .p0);
+    const r = try handle.readAligned(testing.allocator, 0, 100);
     defer r.free();
 
     // mmap reads now go through the limiter — tokens consumed.
@@ -356,9 +355,13 @@ test "read bandwidth enforcement" {
     };
     try testing.expectEqual(@as(u64, 0), limiter.pages.load(.monotonic));
 
-    // Time a P1 read of the full file — must wait for refill.
+    // Time a P1 read of the full file — must wait for refill. The
+    // class comes from the fiber's context; P0 would be granted at once.
+    const ctx = fiber.ctx();
+    ctx.prio = .p1;
+    defer ctx.prio = .p0;
     const start = nowMs();
-    const r = try handle.readAligned(testing.allocator, 0, file_size, .p1);
+    const r = try handle.readAligned(testing.allocator, 0, file_size);
     defer r.free();
     const elapsed_ms = nowMs() - start;
 
@@ -414,8 +417,12 @@ test "write bandwidth enforcement" {
         break :blk;
     };
 
+    // A P1 write, through the fiber's context: P0 is never throttled.
+    const ctx = fiber.ctx();
+    ctx.prio = .p1;
+    defer ctx.prio = .p0;
     const start = nowMs();
-    try fh.write(data, 0, .p1);
+    try fh.write(data, 0);
     const elapsed_ms = nowMs() - start;
 
     // Effective write rate ~4 MB/s. 2 MB should take ~500ms. Allow wide range.
@@ -431,8 +438,13 @@ const PriorityTestCtx = struct {
     finish_order: *std.atomic.Value(u32),
     my_order: std.atomic.Value(u32),
 
-    fn readerFn(ctx: *PriorityTestCtx, priority: Priority) void {
-        const r = ctx.handle.readAligned(testing.allocator, 0, 128 * page_size, priority) catch return;
+    fn readerFn(ctx: *PriorityTestCtx, priority: vfs.Priority) void {
+        fiber.ctx().prio = priority;
+        const r = ctx.handle.readAligned(
+            testing.allocator,
+            0,
+            128 * page_size,
+        ) catch return;
         defer r.free();
         ctx.bytes_read.store(@intCast(r.data.len), .monotonic);
         // Record completion order: first finisher gets 0, second gets 1.
@@ -476,10 +488,18 @@ test "P1 prioritized over P2" {
     var p2_ctx = PriorityTestCtx{ .handle = handle, .bytes_read = std.atomic.Value(u64).init(0), .finish_order = &finish_order, .my_order = std.atomic.Value(u32).init(99) };
 
     // Launch P2 first, then P1 — P1 should still finish first.
-    var p2_handle = try fiber.spawn(.{}, PriorityTestCtx.readerFn, .{ &p2_ctx, .p2 });
+    var p2_handle = try fiber.spawn(
+        .{},
+        PriorityTestCtx.readerFn,
+        .{ &p2_ctx, .p2 },
+    );
     // Small delay so P2 enters the wait loop first.
     fiber.sleepMs(5);
-    var p1_handle = try fiber.spawn(.{}, PriorityTestCtx.readerFn, .{ &p1_ctx, .p1 });
+    var p1_handle = try fiber.spawn(
+        .{},
+        PriorityTestCtx.readerFn,
+        .{ &p1_ctx, .p1 },
+    );
 
     p1_handle.join();
     p2_handle.join();
@@ -534,7 +554,7 @@ test "batchRead 512 requests" {
         };
     }
 
-    try handle.batchRead(&arena, requests, .p0);
+    try handle.batchRead(&arena, requests);
 
     // Verify each read got the correct fill byte.
     for (0..num_requests) |i| {

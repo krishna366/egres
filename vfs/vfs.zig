@@ -67,11 +67,9 @@ pub const Mode = enum {
 /// Who waits for whom at the limiter. P0 never waits: its subtract
 /// saturates. P1 sees the full bucket; P2 sees what P1's demand
 /// leaves, so an L0 backlog is cleared before deeper merges run.
-pub const Priority = enum(u2) {
-    p0, // what a user waits on: the WAL, and queries' reads
-    p1, // L0 compaction
-    p2, // L1+ compaction, log file prezero
-};
+/// The I/O class of a read or write: the current fiber's context
+/// carries it (`fiber.ctx().prio`), so nothing passes it down.
+pub const Priority = fiber.IoPriority;
 
 pub const IOKind = enum(u1) {
     read,
@@ -81,6 +79,8 @@ pub const IOKind = enum(u1) {
 pub const ReadResult = struct {
     buf: ?[]align(page_size) u8,
     data: String,
+    /// File offset of `data[0]`.
+    offset: u64,
     allocator: std.mem.Allocator,
 
     pub fn free(self: ReadResult) void {
@@ -108,11 +108,16 @@ pub const FileHandle = struct {
         allocator: std.mem.Allocator,
         offset: u64,
         len: usize,
-        priority: Priority,
     ) !ReadResult {
+        const priority = fiber.ctx().prio;
         // In-memory: slice from owned buffer (no allocation, no bandwidth).
         if (self.owned_buf) |buf| {
-            return .{ .buf = null, .data = buf[offset .. offset + len], .allocator = allocator };
+            return .{
+                .buf = null,
+                .data = buf[offset .. offset + len],
+                .offset = offset,
+                .allocator = allocator,
+            };
         }
 
         // Round offset down to page boundary.
@@ -140,7 +145,12 @@ pub const FileHandle = struct {
                 total_touched += read_len;
             }
             std.mem.doNotOptimizeAway(sink);
-            return .{ .buf = null, .data = mapped[offset .. offset + len], .allocator = allocator };
+            return .{
+                .buf = null,
+                .data = mapped[offset .. offset + len],
+                .offset = offset,
+                .allocator = allocator,
+            };
         }
 
         // Allocate page-aligned buffer for O_DIRECT compatibility.
@@ -165,6 +175,7 @@ pub const FileHandle = struct {
         return .{
             .buf = buf,
             .data = buf[prefix..end],
+            .offset = offset,
             .allocator = allocator,
         };
     }
@@ -184,17 +195,15 @@ pub const FileHandle = struct {
         self: FileHandle,
         arena: *std.heap.ArenaAllocator,
         requests: []ReadRequest,
-        priority: Priority,
     ) !void {
         for (requests) |*req| req.file = self.file.?;
-        return self.vfs.batchRead(self.bw, arena, requests, priority);
+        return self.vfs.batchRead(self.bw, arena, requests);
     }
 
     pub fn write(
         self: FileHandle,
         data: String,
         offset: u64,
-        priority: Priority,
     ) !void {
         const f = self.file.?;
 
@@ -211,7 +220,7 @@ pub const FileHandle = struct {
             std.debug.assert(offset % page_size == 0);
         }
 
-        var s = self.bw.spinner(priority, data.len, .write);
+        var s = self.bw.spinner(fiber.ctx().prio, data.len, .write);
         defer s.deinit();
         var written: usize = 0;
         while (true) {
@@ -307,7 +316,6 @@ pub const VFS = struct {
         bw: *bandwidth.Limiter,
         arena: *std.heap.ArenaAllocator,
         requests: []FileHandle.ReadRequest,
-        priority: Priority,
     ) !void {
         if (requests.len == 0) return;
 
@@ -315,7 +323,7 @@ pub const VFS = struct {
         var offset: usize = 0;
         while (offset < requests.len) {
             const end = @min(offset + max_batch_size, requests.len);
-            try self.batchReadChunk(bw, arena, requests[offset..end], priority);
+            try self.batchReadChunk(bw, arena, requests[offset..end]);
             offset = end;
         }
     }
@@ -325,7 +333,6 @@ pub const VFS = struct {
         bw: *bandwidth.Limiter,
         arena: *std.heap.ArenaAllocator,
         requests: []FileHandle.ReadRequest,
-        priority: Priority,
     ) !void {
         _ = self;
         const alloc = arena.allocator();
@@ -334,7 +341,7 @@ pub const VFS = struct {
         {
             var total: usize = 0;
             for (requests) |r| total += r.len;
-            var s = bw.spinner(priority, total, .read);
+            var s = bw.spinner(fiber.ctx().prio, total, .read);
             defer s.deinit();
             while (true) {
                 if (s.acquireBytes() == 0) break;
@@ -513,11 +520,10 @@ pub fn writeAndSync(
     path: String,
     data: String,
     opts: FileOptions,
-    priority: Priority,
 ) !void {
     const wh = try g().createFile(path, opts);
     defer wh.close();
-    try wh.write(data, 0, priority);
+    try wh.write(data, 0);
     try wh.sync();
 }
 

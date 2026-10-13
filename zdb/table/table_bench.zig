@@ -92,7 +92,7 @@ fn openStriped(
 ) !*Table {
     var tb = try buildStriped(alloc, stripe, stride, n, block_size, val_len);
     defer tb.deinit();
-    return openBuffer(alloc, &tb, .p0);
+    return openBuffer(alloc, &tb);
 }
 
 const value_len: usize = 16;
@@ -129,7 +129,7 @@ fn benchMergeScan(b: *Bench) !void {
         var iters: [num_tables]merge.Iterator = undefined;
         for (tables, 0..) |t, j| {
             iters[j] = .{
-                .table = TableIterator.init(a, t, .p0, zero_table_key),
+                .table = TableIterator.init(a, t, zero_table_key),
             };
         }
         var m = try merge.MergeIterator.init(a, iters[0..]);
@@ -191,7 +191,7 @@ fn benchMergeScanShared(b: *Bench) !void {
     while (opened < shared_sources) : (opened += 1) {
         var tb = try buildShared(a, shared_keys, shared_vers, 100 - 10 * opened, 4096, value_len);
         defer tb.deinit();
-        tables[opened] = try openBuffer(a, &tb, .p0);
+        tables[opened] = try openBuffer(a, &tb);
     }
 
     b.resetTimer();
@@ -200,7 +200,7 @@ fn benchMergeScanShared(b: *Bench) !void {
         var iters: [shared_sources]merge.Iterator = undefined;
         for (tables, 0..) |t, j| {
             iters[j] = .{
-                .table = TableIterator.init(a, t, .p0, zero_table_key),
+                .table = TableIterator.init(a, t, zero_table_key),
             };
         }
         var m = try merge.MergeIterator.init(a, iters[0..]);
@@ -222,7 +222,7 @@ fn benchPointSeeks(b: *Bench) !void {
     const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, .p0, zero_table_key);
+    var it = TableIterator.init(a, t, zero_table_key);
     defer it.deinit();
 
     b.resetTimer();
@@ -248,7 +248,7 @@ fn benchBlockSeekGe(b: *Bench) !void {
     defer destroyTable(t);
 
     const bpos = t.blockCount() / 2;
-    const block = try t.readBlock(bpos, .p0);
+    const block = try t.readBlock(bpos);
     defer block.decrRef();
     const base_raw = try t.blockBaseKey(bpos);
 
@@ -294,7 +294,7 @@ fn benchBlockKeyWalk(b: *Bench, val_len: usize) !void {
     defer destroyTable(t);
 
     const bpos = t.blockCount() / 2;
-    const block = try t.readBlock(bpos, .p0);
+    const block = try t.readBlock(bpos);
     defer block.decrRef();
     const base_raw = try t.blockBaseKey(bpos);
 
@@ -326,7 +326,7 @@ fn benchBlockEntryWalk(b: *Bench, val_len: usize) !void {
     defer destroyTable(t);
 
     const bpos = t.blockCount() / 2;
-    const block = try t.readBlock(bpos, .p0);
+    const block = try t.readBlock(bpos);
     defer block.decrRef();
     const base_raw = try t.blockBaseKey(bpos);
 
@@ -419,11 +419,11 @@ fn benchBlockEntryWalkZipf(b: *Bench, val_len: usize) !void {
     const a = gpa;
     var tb = try buildZipfVersions(a, single_keys, 64 * 1024, val_len);
     defer tb.deinit();
-    const t = try openBuffer(a, &tb, .p0);
+    const t = try openBuffer(a, &tb);
     defer destroyTable(t);
 
     const bpos = t.blockCount() / 2;
-    const block = try t.readBlock(bpos, .p0);
+    const block = try t.readBlock(bpos);
     defer block.decrRef();
     const base_raw = try t.blockBaseKey(bpos);
 
@@ -457,7 +457,7 @@ fn benchKeyScan(b: *Bench, val_len: usize) !void {
     const t = try openStriped(a, 0, 1, single_keys, 64 * 1024, val_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, .p0, zero_table_key);
+    var it = TableIterator.init(a, t, zero_table_key);
     defer it.deinit();
 
     b.resetTimer();
@@ -478,7 +478,7 @@ fn benchFullScan(b: *Bench) !void {
     const t = try openStriped(a, 0, 1, single_keys, 4096, value_len);
     defer destroyTable(t);
 
-    var it = TableIterator.init(a, t, .p0, zero_table_key);
+    var it = TableIterator.init(a, t, zero_table_key);
     defer it.deinit();
 
     b.resetTimer();

@@ -129,7 +129,6 @@ pub const Config = struct {
     /// codec byte, and whether a block is stored compressed, and
     /// whether later blocks are tried at all, is the `Election`'s.
     codec: _compress.Codec = .none,
-    priority: vfs.Priority = .p2,
     /// The tree the table is built for (`buffers.TreeKind`), which
     /// picks its filter. A rows table keeps its keys, 8-byte big-endian
     /// egids, exactly in a roaring bitmap: a miss is certain, a hit is

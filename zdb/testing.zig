@@ -65,7 +65,6 @@ pub fn buildCompaction(
 pub fn openBuffer(
     alloc: std.mem.Allocator,
     tb: *const TableBuffer,
-    priority: vfs.Priority,
 ) !*Table {
     const owned = try alloc.dupe(u8, tb.bytes);
     const handle: vfs.FileHandle = .{
@@ -76,7 +75,7 @@ pub fn openBuffer(
         // Memory-backed: reads never charge the limiter.
         .bw = vfs.g().bw,
     };
-    return Table.openObject(alloc, .{ .file = handle }, tb.extent(), priority);
+    return Table.openObject(alloc, .{ .file = handle }, tb.extent());
 }
 
 /// The extent of SST `name` read from the file itself — a stat and the
@@ -86,7 +85,6 @@ pub fn probeExtent(
     alloc: std.mem.Allocator,
     store: *vfs.RemoteStore,
     name: String,
-    priority: vfs.Priority,
 ) !Table.Extent {
     const size = (try store.stat(name)).size;
     if (size < _idx.trailer_len) return error.CorruptTable;
@@ -97,7 +95,6 @@ pub fn probeExtent(
         alloc,
         trailer_offset,
         _idx.trailer_len,
-        priority,
     );
     defer res.free();
     if (res.data.len < _idx.trailer_len) return error.CorruptTable;

@@ -39,7 +39,7 @@ fn probeExtent(
     defer obj.close();
 
     const trailer_at = size - trailer_len;
-    const res = try obj.readAligned(allocator, trailer_at, trailer_len, .p2);
+    const res = try obj.readAligned(allocator, trailer_at, trailer_len);
     defer res.free();
 
     if (res.data.len < trailer_len) return error.CorruptTable;
@@ -63,7 +63,6 @@ fn verifyOne(
         store,
         idFromName(base),
         extent,
-        .p2,
     ) catch |err| {
         std.debug.print("FAIL {s} open={s}\n", .{ base, @errorName(err) });
         return false;
@@ -78,7 +77,6 @@ fn verifyOne(
     var it = TableIterator.init(
         allocator,
         t,
-        .p2,
         .{ .namespace = 0, .table_id = 0 },
     );
     defer it.deinit();

@@ -44,6 +44,13 @@ pub const Config = struct {
     /// 36 s of merge and codec work on one core. Bounded by
     /// `compaction.max_compaction_fibers`.
     compaction_fibers: u8 = 3,
+    /// Bytes a compaction reads from each input table per request: a
+    /// window of whole blocks ahead of the merge, so a table is read
+    /// in a few large requests rather than one per block, on a file
+    /// and from S3 alike. Each partition fiber holds one window per
+    /// input table, so a job's read memory is about fibers times
+    /// inputs times this. 0 reads block by block.
+    compaction_window_bytes: usize = 4 << 20,
 
     // Level sizes. `lmax_target_bytes` is the bottom level's target; upper
     // levels cascade by dividing by `level_size_multiplier`. There is no
@@ -175,6 +182,9 @@ pub const Config = struct {
         .num_compactors = "Compaction worker fibers. Must not be 1.",
         .compaction_fibers = "Fibers a compaction into the level below" ++
             " splits into along that level's table boundaries, 1 to 16.",
+        .compaction_window_bytes = "Bytes a compaction reads from each" ++
+            " input table per request, whole blocks. 0 reads block by" ++
+            " block.",
         .level_size_multiplier = "Each level's byte target is the next" ++
             " deeper level's divided by this.",
         .max_levels = "Levels per tree, L0 included. At least 2.",

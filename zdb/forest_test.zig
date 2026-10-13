@@ -1958,7 +1958,6 @@ test "forest: a bottom-level compaction discards under the read floor" {
         var it = zdb.table.TableIterator.init(
             alloc,
             ents[0].table,
-            .p0,
             ns1_table0,
         );
         defer it.deinit();
@@ -3404,10 +3403,10 @@ fn copySst(
     var obj = try f.store.open(from_name, st.size, .{});
     defer obj.close();
     // readAligned: put needs a page-aligned buffer.
-    const r = try obj.readAligned(alloc, 0, @intCast(obj.size()), .p1);
+    const r = try obj.readAligned(alloc, 0, @intCast(obj.size()));
     defer r.free();
     try f.store.put(to_name, r.data);
-    const ext = try probeExtent(alloc, f.store, to_name, .p1);
+    const ext = try probeExtent(alloc, f.store, to_name);
     var needed = [_]zdb.tree.TableNeed{
         .{ .id = to, .level = 0, .extent = ext },
     };
@@ -3516,7 +3515,7 @@ test "forest: deleteFiles unlinks compaction inputs at the retire index" {
     // although the cache dropped it and the file is gone.
     try std.testing.expect(!f.table_cache.contains(pinned.file_id));
     {
-        var it = zdb.table.TableIterator.init(alloc, pinned, .p0, ns1_table0);
+        var it = zdb.table.TableIterator.init(alloc, pinned, ns1_table0);
         defer it.deinit();
         try it.seekRange(Key.inf, Key.inf);
         try std.testing.expect(it.itemRef() != null);
@@ -3578,7 +3577,7 @@ test "table cache: a table loaded for an install survives an evict before it is 
     // The loader's own ref keeps the table open and readable.
     try std.testing.expectEqual(@as(i32, 1), t.ref.load(.acquire));
     {
-        var it = zdb.table.TableIterator.init(alloc, t, .p0, ns1_table0);
+        var it = zdb.table.TableIterator.init(alloc, t, ns1_table0);
         defer it.deinit();
         try it.seekRange(Key.inf, Key.inf);
         try std.testing.expect(it.itemRef() != null);
@@ -3753,12 +3752,13 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
         try std.testing.expectEqual(@as(usize, 2), ents.len);
         for (ents, 0..) |e, i| {
             in_ids[i] = e.id;
-            const n = try e.table.prefetchBlocks(&cache, alloc, &.{0}, .p0);
+            const n = try e.table.prefetchBlocks(&cache, alloc, &.{0});
             try std.testing.expectEqual(@as(usize, 1), n);
         }
     }
     for (in_ids) |id| {
-        const v = cache.get(@as(u128, id) << 64) orelse return error.TestExpectedCached;
+        const v = cache.get(@as(u128, id) << 64, .reuse) orelse
+            return error.TestExpectedCached;
         v.decrRef();
     }
 
@@ -3793,7 +3793,7 @@ test "forest: evictTables evicts a compacted-away file; its blocks go with the t
     for (in_ids) |id|
         try std.testing.expectEqual(
             @as(?*zdb.cache.Value, null),
-            cache.get(@as(u128, id) << 64),
+            cache.get(@as(u128, id) << 64, .reuse),
         );
     try std.testing.expectEqual(@as(usize, 0), cache.count());
 

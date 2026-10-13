@@ -12,6 +12,7 @@ const cache = @import("cache");
 
 pub const Value = utils.RefValue;
 pub const Ghost = cache.Ghost;
+pub const Hit = cache.Hit;
 pub const hashKey = cache.hashKey;
 
 pub fn Cache(comptime K: type) type {

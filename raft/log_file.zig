@@ -202,7 +202,7 @@ pub const LogFile = struct {
         alloc: std.mem.Allocator,
         handle: _vfs.FileHandle,
     ) !std.ArrayList(entry) {
-        const page = try handle.readAligned(alloc, 0, _vfs.page_size, .p0);
+        const page = try handle.readAligned(alloc, 0, _vfs.page_size);
         defer page.free();
 
         const prefix = zbuf.Frame.readPrefix(page.data) catch
@@ -211,7 +211,7 @@ pub const LogFile = struct {
         if (frame_len > log_file_offset) return error.InvalidLogHeader;
         if (frame_len <= page.data.len) return parseHeader(alloc, page.data);
 
-        const whole = try handle.readAligned(alloc, 0, frame_len, .p0);
+        const whole = try handle.readAligned(alloc, 0, frame_len);
         defer whole.free();
         return parseHeader(alloc, whole.data);
     }
@@ -307,7 +307,11 @@ pub const LogFile = struct {
 
         // Single read of entire payload region.
         const payload_region_size: usize = @intCast(handle.file_size - log_file_offset);
-        const result = handle.readAligned(alloc, log_file_offset, payload_region_size, .p0) catch {
+        const result = handle.readAligned(
+            alloc,
+            log_file_offset,
+            payload_region_size,
+        ) catch {
             return .{
                 .fid = fid,
                 .handle = handle,
@@ -473,13 +477,13 @@ pub const LogFile = struct {
         return lf;
     }
 
-    /// Write zeros over [from, end), in pieces, at the lowest I/O
-    /// priority.
+    /// Write zeros over [from, end), in pieces, at the fiber's I/O
+    /// class: the lowest from `prepare`, the caller's at open.
     fn zeroFill(self: *LogFile, from: u64, end: u64) !void {
         var at: u64 = from;
         while (at < end) {
             const n: usize = @intCast(@min(zero_piece, end - at));
-            try self.handle.write(zero_block[0..n], at, .p2);
+            try self.handle.write(zero_block[0..n], at);
             at += n;
         }
     }
@@ -571,7 +575,7 @@ pub const LogFile = struct {
     /// Flush a write buffer to disk in one call.
     pub fn flushWriteBuffer(self: *LogFile, buf: String) !void {
         if (buf.len == 0) return;
-        try self.handle.write(buf, self.write_offset - buf.len, .p0);
+        try self.handle.write(buf, self.write_offset - buf.len);
     }
 
     /// Build the WAL header as a single WalHeader zbuf message and write
@@ -587,7 +591,7 @@ pub const LogFile = struct {
     pub fn writeHeader(self: *LogFile) !void {
         const frame = try self.encodeHeader();
         defer self.allocator.free(frame);
-        try self.handle.write(frame, 0, .p0);
+        try self.handle.write(frame, 0);
     }
 
     /// The framed WalHeader for the slot table as it is now: what
@@ -745,6 +749,8 @@ pub const NextLog = struct {
         is_spare: bool,
     ) anyerror!LogFile {
         std.debug.assert(self.opts.prezero == .true);
+        // The fill runs at the lowest I/O class, behind every commit.
+        fiber.ctx().prio = .p2;
         if (is_spare) {
             if (self.reuse(fid)) |lf| {
                 return lf;
@@ -1341,11 +1347,11 @@ pub const LogBuf = struct {
     /// watermark only rises, and the header is freed at the end.
     fn write_(self: *LogBuf, item: *Item) !void {
         const bytes = item.buf.items;
-        if (bytes.len > 0) try item.handle.write(bytes, item.offset, .p0);
+        if (bytes.len > 0) try item.handle.write(bytes, item.offset);
         self.synced.advance(item.last_index);
 
         if (item.header) |header| {
-            try item.handle.write(header, 0, .p0);
+            try item.handle.write(header, 0);
             try item.handle.truncate(item.dataEnd());
             try item.handle.syncData();
             self.allocator.free(header);

@@ -50,13 +50,13 @@ fn expectRead(
 ) !void {
     const got = try testing.allocator.alloc(u8, want.len);
     defer testing.allocator.free(got);
-    try testing.expect(try c.read(name, &span(idx, off, got), .p0));
+    try testing.expect(try c.read(name, &span(idx, off, got)));
     try testing.expectEqualSlices(u8, want, got);
 }
 
 fn expectMiss(c: *ChunkCache, name: String, idx: u64, off: u64) !void {
     var buf: [16]u8 = undefined;
-    try testing.expect(!try c.read(name, &span(idx, off, &buf), .p0));
+    try testing.expect(!try c.read(name, &span(idx, off, &buf)));
 }
 
 /// A read of `buf.len` bytes at `off` of chunk `idx`; `read` looks at
@@ -87,7 +87,7 @@ test "chunkcache: put then read, any offset, tail chunk, miss" {
 
     const a = try fill(alloc, chunk, 1);
     defer alloc.free(a);
-    try c.write("x.sst", 0, a[0..chunk], .p0);
+    try c.write("x.sst", 0, a[0..chunk]);
     try expectRead(&c, "x.sst", 0, 0, a[0..chunk]);
     try expectRead(&c, "x.sst", 0, 1234, a[1234..9876]);
     try expectRead(&c, "x.sst", 0, chunk - 7, a[chunk - 7 .. chunk]);
@@ -96,7 +96,7 @@ test "chunkcache: put then read, any offset, tail chunk, miss" {
     const tail_len: usize = 100_000;
     const t = try fill(alloc, tail_len, 2);
     defer alloc.free(t);
-    try c.write("x.sst", 1, t[0..tail_len], .p0);
+    try c.write("x.sst", 1, t[0..tail_len]);
     try expectRead(&c, "x.sst", 1, 50, t[50..tail_len]);
     try expectMiss(&c, "x.sst", 1, tail_len - 8);
 
@@ -131,9 +131,9 @@ test "chunkcache: restart restores slots; a bad page drops its chunk" {
         defer c.deinit();
         // S holds one chunk at this size; each put moves the previous
         // one to M, which has room, so all three stay resident.
-        try c.write("a.sst", 0, a[0..chunk], .p0);
-        try c.write("a.sst", 1, b[0..chunk], .p0);
-        try c.write("d.sst", 0, d[0..chunk], .p0);
+        try c.write("a.sst", 0, a[0..chunk]);
+        try c.write("a.sst", 1, b[0..chunk]);
+        try c.write("d.sst", 0, d[0..chunk]);
         c.forget("d.sst");
         try expectMiss(&c, "d.sst", 0, 0);
         // d.sst's chunk was fetched and never read: all 32 pages wasted.
@@ -207,7 +207,7 @@ test "chunkcache: eviction frees slots for new chunks" {
     const a = try fill(alloc, chunk, 5);
     defer alloc.free(a);
     // Twice the slots: every put must find a slot, none is dropped.
-    for (0..6) |i| try c.write("e.sst", i, a[0..chunk], .p0);
+    for (0..6) |i| try c.write("e.sst", i, a[0..chunk]);
     const st = c.stats();
     try testing.expectEqual(@as(u64, 6), st.puts);
     try testing.expectEqual(@as(u64, 0), st.drops);
@@ -222,8 +222,8 @@ test "chunkcache: eviction frees slots for new chunks" {
     try testing.expectEqual(@as(u64, 3), c.stats().unread_chunks);
     // Two more puts: 5 (read) moves to M and pushes out 1 (unread);
     // 6 leaves S unread. 0, read, survives M's pass.
-    try c.write("e.sst", 6, a[0..chunk], .p0);
-    try c.write("e.sst", 7, a[0..chunk], .p0);
+    try c.write("e.sst", 6, a[0..chunk]);
+    try c.write("e.sst", 7, a[0..chunk]);
     try testing.expectEqual(@as(u64, 160), c.stats().evicted_pages);
     try testing.expectEqual(@as(u64, 160), c.stats().unread_pages);
     try testing.expectEqual(@as(u64, 5), c.stats().unread_chunks);
@@ -237,8 +237,8 @@ test "chunkcache: disabled without a path; bad sizes refused" {
     try testing.expect(!off.enabled());
     try testing.expectEqual(ChunkCache.default_chunk_bytes, off.chunkBytes());
     var buf: [16]u8 = undefined;
-    try testing.expect(!try off.read("x", &span(0, 0, &buf), .p0));
-    try off.write("x", 0, &buf, .p0);
+    try testing.expect(!try off.read("x", &span(0, 0, &buf)));
+    try off.write("x", 0, &buf);
 
     try testing.expectError(error.BadChunkBytes, ChunkCache.init(alloc, .{
         .path = "/nonexistent/x",
@@ -273,7 +273,7 @@ test "chunkcache: restart restores records across header pages" {
         defer c.deinit();
         try testing.expectEqual(@as(u64, 400), c.stats().slots);
         // All resident: S holds 40, M promotes up to its reserve, 324.
-        for (0..300) |i| try c.write("m.sst", i, a[0..small], .p0);
+        for (0..300) |i| try c.write("m.sst", i, a[0..small]);
         try testing.expectEqual(@as(u64, 300), c.stats().used);
     }
     var c = try ChunkCache.init(alloc, cfg);

@@ -474,33 +474,33 @@ pub const Handler = struct {
         state: *pgwire.ConnState,
         ev: pgwire.Event,
     ) !void {
-        // The three events that are statements run under a context:
-        // everything below records into it through fiber.ctx(), detach
-        // keeps the trace if it was slow, and attach counts it in
-        // flight for the drain. Describe is one because the first
-        // Describe of a statement is where it gets parsed. The other
-        // events are bookkeeping between statements.
+        // The three events that are statements run under the fiber's
+        // context: everything below records into it through
+        // fiber.ctx(), finish keeps the trace if it was slow, and start
+        // counts it in flight for the drain. Describe is one because
+        // the first Describe of a statement is where it gets parsed.
+        // The other events are bookkeeping between statements.
         switch (ev) {
             .startup_complete => |params| try self.onStartup(state, params),
             .query => |sql| {
-                var qctx = fiber.Ctx.init(sql);
-                try qctx.attach();
-                defer qctx.detach();
+                const qctx = fiber.ctx();
+                try qctx.start(sql);
+                defer qctx.finish();
 
                 try self.onQuery(state, sql);
                 try state.endCommand();
             },
             .execute => |ctx| {
-                var qctx = fiber.Ctx.init(ctx.sql);
-                try qctx.attach();
-                defer qctx.detach();
+                const qctx = fiber.ctx();
+                try qctx.start(ctx.sql);
+                defer qctx.finish();
 
                 try self.onExecute(state, ctx);
             },
             .describe => |ctx| {
-                var qctx = fiber.Ctx.init(ctx.sql);
-                try qctx.attach();
-                defer qctx.detach();
+                const qctx = fiber.ctx();
+                try qctx.start(ctx.sql);
+                defer qctx.finish();
 
                 try self.onDescribe(state, ctx);
             },

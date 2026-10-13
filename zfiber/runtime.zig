@@ -1279,12 +1279,17 @@ fn spawn_(
     }
 
     if (detached) f.detached = true;
-    // A joinable helper is joined inside the statement's frame, so the
-    // Ctx it inherits outlives every slice it runs. A detached fiber
-    // has no such bound and gets only what the spawner vouches for.
-    f.ctx = opts.ctx;
-    if (f.ctx == null and !detached) {
-        if (currentFiberOrNull()) |parent| f.ctx = parent.ctx;
+    // The child runs at the spawner's I/O class. A joinable helper is
+    // joined inside its spawner's frame, so the statement's context
+    // outlives it and its records go there; a detached fiber has no
+    // such bound and records nothing.
+    if (currentFiberOrNull()) |parent| {
+        f.ctx.prio = parent.ctx.prio;
+        f.ctx.cache = parent.ctx.cache;
+        if (!detached) {
+            f.ctx.parent = parent.ctx.parent orelse
+                if (parent.ctx.arena != null) &parent.ctx else null;
+        }
     }
 
     try rt.appendFiber(f);

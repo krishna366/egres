@@ -10,6 +10,7 @@ const zdb = @import("zdb");
 const createTree = @import("testing.zig").createTree;
 const buildCompaction = @import("testing.zig").buildCompaction;
 const flags = @import("flags");
+const fiber = @import("zfiber");
 const vfs = zdb.vfs;
 const zroar = zdb.zroar;
 
@@ -471,7 +472,7 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
 
     // blockFor names the block a seek opens.
     for ([_]String{ "r000", "r150", "r299" }) |k| {
-        var it = zdb.table.TableIterator.init(alloc, tbl, .p0, table_key);
+        var it = zdb.table.TableIterator.init(alloc, tbl, table_key);
         defer it.deinit();
         try it.seekRange(Fixture.key(k), Key.inf);
         try std.testing.expect(it.itemRef() != null);
@@ -486,11 +487,11 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
     const idxs = try alloc.alloc(usize, nblocks);
     defer alloc.free(idxs);
     for (idxs, 0..) |*idx, i| idx.* = i;
-    const read = try tbl.prefetchBlocks(&cache, alloc, idxs, .p0);
+    const read = try tbl.prefetchBlocks(&cache, alloc, idxs);
     try std.testing.expectEqual(nblocks, read);
     try std.testing.expectEqual(nblocks, cache.count());
     const misses = cache.misses.load(.monotonic);
-    const again = try tbl.prefetchBlocks(&cache, alloc, idxs, .p0);
+    const again = try tbl.prefetchBlocks(&cache, alloc, idxs);
     try std.testing.expectEqual(@as(usize, 0), again);
     try std.testing.expectEqual(misses, cache.misses.load(.monotonic));
     try std.testing.expectEqual(@as(u64, nblocks), cache.hits.load(.monotonic));
@@ -499,13 +500,13 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
     // and evicts nothing: every block read is still there.
     var small = try zdb.cache.ShardedCache(u128).init(alloc, 4 << 20, 2);
     defer small.deinit();
-    const part = try tbl.prefetchBlocks(&small, alloc, idxs, .p0);
+    const part = try tbl.prefetchBlocks(&small, alloc, idxs);
     try std.testing.expect(part >= 1 and part < nblocks);
     try std.testing.expectEqual(part, small.count());
 
     // A cached block decodes: block 0 starts at the first row.
     const key0: u128 = @as(u128, tbl.file_id) << 64;
-    const val = cache.get(key0) orelse return error.TestExpectedBlock;
+    const val = cache.get(key0, .reuse) orelse return error.TestExpectedBlock;
     defer val.decrRef();
     var bi = try zdb.table.BlockIterator.init(
         alloc,
@@ -517,6 +518,67 @@ test "multiget: prefetch reads the blocks the seeks land in, in one batch" {
     try bi.seekToFirst();
     const first = bi.itemRef() orelse return error.TestExpectedItem;
     try std.testing.expectEqualStrings("r000", first.key.primary);
+}
+
+test "readBlock: a bypass context neither fills nor marks the cache" {
+    const alloc = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(alloc);
+    defer fx.teardown();
+
+    const wide = try alloc.alloc(u8, 1024);
+    defer alloc.free(wide);
+    @memset(wide, 'w');
+    var name: [4]u8 = undefined;
+    for (0..300) |i| {
+        _ = try std.fmt.bufPrint(&name, "r{d:0>3}", .{i});
+        try fx.put(&name, 10, wide);
+    }
+    try fx.flush();
+
+    const tree = fx.f.getTree(ns, fx.tree_id) orelse
+        return error.TestExpectedTree;
+    defer tree.release();
+    const tbl = blk: {
+        const held = tree.mu.hold(.shared, @src());
+        defer held.release();
+        const ents = tree.levels[0].entries(held);
+        ents[0].table.incrRef();
+        break :blk ents[0].table;
+    };
+    defer tbl.decrRef();
+
+    // A private cache: the process's is shared with the tests running
+    // alongside.
+    var cache = try zdb.cache.ShardedCache(u128).init(alloc, 64 << 20, 2);
+    defer cache.deinit();
+
+    const ctx = fiber.ctx();
+    defer ctx.cache = .use;
+
+    // Under bypass: the block is read but not kept.
+    ctx.cache = .bypass;
+    {
+        const val = try tbl.readBlock_(&cache, 0);
+        defer val.decrRef();
+    }
+    ctx.cache = .use;
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
+    try std.testing.expectEqual(@as(u64, 0), cache.hits.load(.monotonic));
+
+    // A normal read keeps it; a bypass read then takes it from the
+    // cache and leaves it as it was.
+    {
+        const val = try tbl.readBlock_(&cache, 0);
+        defer val.decrRef();
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    ctx.cache = .bypass;
+    {
+        const val = try tbl.readBlock_(&cache, 0);
+        defer val.decrRef();
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
 }
 
 const roar = struct {

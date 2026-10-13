@@ -40,7 +40,6 @@ const _cache = @import("cache");
 const _vfs = @import("vfs.zig");
 const String = utils.String;
 const Allocator = std.mem.Allocator;
-const Priority = _vfs.Priority;
 const page_size = _vfs.page_size;
 const log = std.log.scoped(.chunkcache);
 
@@ -180,7 +179,6 @@ pub const ChunkCache = struct {
         self: *ChunkCache,
         name: String,
         chunk: *const Chunk,
-        prio: Priority,
     ) !bool {
         const so = self.open orelse return false;
         const dst = chunk.req_buf;
@@ -189,7 +187,7 @@ pub const ChunkCache = struct {
         const key = keyOf(hashName(name), chunk.idx);
 
         so.mu.lock(@src());
-        const found = so.cache.get(key);
+        const found = so.cache.get(key, .reuse);
         const slot = found orelse {
             so.stats.misses += 1;
             so.mu.unlock();
@@ -210,7 +208,7 @@ pub const ChunkCache = struct {
             slot.decrRef();
             so.mu.unlock();
         }
-        if (!slot.verified and !try so.verify(slot, prio)) {
+        if (!slot.verified and !try so.verify(slot)) {
             so.mu.lock(@src());
             defer so.mu.unlock();
             so.stats.corrupt += 1;
@@ -226,7 +224,6 @@ pub const ChunkCache = struct {
             self.alloc,
             so.dataOff(slot.id) + off,
             dst.len,
-            prio,
         );
         defer res.free();
         if (res.data.len != dst.len) return error.ShortRead;
@@ -249,7 +246,6 @@ pub const ChunkCache = struct {
         fname: String,
         idx: u64,
         data: String,
-        prio: Priority,
     ) !void {
         const o = self.open orelse return;
         if (data.len == 0) return;
@@ -279,7 +275,7 @@ pub const ChunkCache = struct {
             slot.decrRef();
             o.mu.unlock();
         }
-        try o.writeData(slot.id, data, prio);
+        try o.writeData(slot.id, data);
 
         o.mu.lock(@src());
         defer o.mu.unlock();
@@ -570,12 +566,11 @@ const Open = struct {
     }
 
     /// Hash the slot's bytes against its record, once per process.
-    fn verify(self: *Open, slot: *Slot, prio: Priority) !bool {
+    fn verify(self: *Open, slot: *Slot) !bool {
         const res = try self.handle.readAligned(
             self.a,
             self.dataOff(slot.id),
             slot.len,
-            prio,
         );
         defer res.free();
         const ok = res.data.len == slot.len and
@@ -592,18 +587,18 @@ const Open = struct {
     /// buffer of whole pages: written as given when it is one (the
     /// fetch paths allocate chunks that way), else through a copy —
     /// an object's tail chunk, or a caller with a plain buffer.
-    fn writeData(self: *Open, id: u32, data: String, prio: Priority) !void {
+    fn writeData(self: *Open, id: u32, data: String) !void {
         const off = self.dataOff(id);
         const aligned = @intFromPtr(data.ptr) % page_size == 0 and
             data.len % page_size == 0;
-        if (aligned) return self.handle.write(data, off, prio);
+        if (aligned) return self.handle.write(data, off);
 
         const len = std.mem.alignForward(usize, data.len, page_size);
         const buf = try self.a.alignedAlloc(u8, _vfs.page_alignment, len);
         defer self.a.free(buf);
         @memcpy(buf[0..data.len], data);
         @memset(buf[data.len..], 0);
-        try self.handle.write(buf, off, prio);
+        try self.handle.write(buf, off);
     }
 
     const open_opts: _vfs.FileOptions = .{
@@ -625,7 +620,7 @@ const Open = struct {
 
         var hdr = FileHeader{ .chunk_bytes = chunk_bytes, .slots = n };
         hdr.crc = hdr.checksum();
-        try writePage(a, handle, 0, std.mem.asBytes(&hdr), .p1);
+        try writePage(a, handle, 0, std.mem.asBytes(&hdr));
         try handle.syncData();
         log.info("chunk cache: created {s}: {d} slots of {d} KiB", .{
             cfg.path, n, chunk_bytes >> 10,
@@ -745,7 +740,6 @@ const Open = struct {
                 a,
                 page * page_size,
                 count * page_size,
-                .p1,
             );
             defer res.free();
 
@@ -801,6 +795,8 @@ const Open = struct {
 
     /// Writes dirty record pages until closed, then once more.
     fn flushLoop(self: *Open) void {
+        // Record writes are housekeeping, behind every reader.
+        fiber.ctx().prio = .p2;
         const pg = self.a.alignedAlloc(
             u8,
             _vfs.page_alignment,
@@ -831,7 +827,7 @@ const Open = struct {
             self.composeSlotRecordPage(page, pg);
             self.mu.unlock();
 
-            self.handle.write(pg, page * page_size, .p2) catch |err| {
+            self.handle.write(pg, page * page_size) catch |err| {
                 log.warn("chunk cache: record page {d} not written: {s}", .{
                     page, @errorName(err),
                 });
@@ -850,17 +846,16 @@ fn writePage(
     handle: _vfs.FileHandle,
     off: u64,
     bytes: String,
-    prio: Priority,
 ) !void {
     const buf = try a.alignedAlloc(u8, _vfs.page_alignment, page_size);
     defer a.free(buf);
     @memcpy(buf[0..bytes.len], bytes);
     @memset(buf[bytes.len..], 0);
-    try handle.write(buf, off, prio);
+    try handle.write(buf, off);
 }
 
 fn readPage(a: Allocator, handle: _vfs.FileHandle, off: u64, out: []u8) !void {
-    const res = try handle.readAligned(a, off, out.len, .p1);
+    const res = try handle.readAligned(a, off, out.len);
     defer res.free();
     if (res.data.len != out.len) return error.ShortRead;
     @memcpy(out, res.data);

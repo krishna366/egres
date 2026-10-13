@@ -332,7 +332,6 @@ pub const Level = struct {
         var it = TableIterator.init(
             allocator,
             t,
-            lookup.priority,
             lookup.key.tableKey(),
         );
         defer it.deinit();

@@ -143,7 +143,7 @@ fn storedExtent(store: *vfs.RemoteStore, id: u64) !_manifest.Extent {
     const alloc = std.testing.allocator;
     const name = try zdb.sstName(alloc, id);
     defer alloc.free(name);
-    return probeExtent(alloc, store, name, .p0);
+    return probeExtent(alloc, store, name);
 }
 
 /// Sum of stale_data_size across a level's tables. buildCompaction records it
@@ -158,7 +158,7 @@ fn levelStaleBytes(level: *Level) u64 {
 /// Opens a heap-allocated Table from a TableBuffer, memory-backed.
 /// Duplicates tb.bytes internally; caller retains ownership of tb.
 fn openTableOwned(alloc: std.mem.Allocator, tb: *_table.builder.TableBuffer) !*Table {
-    return openBuffer(alloc, tb, .p0);
+    return openBuffer(alloc, tb);
 }
 
 fn destroyTable(t: *Table) void {
@@ -1079,7 +1079,6 @@ test "levels: compact L1 L2" {
     for (expected) |e| {
         const item = try tree.get(.{
             .key = .{ .primary = e.key },
-            .priority = .p2,
         });
         try std.testing.expect(item != null);
         defer item.?.free(alloc);
@@ -1156,7 +1155,6 @@ test "levels: get L0 shadows L1" {
     {
         const item = try tree.get(.{
             .key = .{ .primary = "foo" },
-            .priority = .p1,
         });
         try std.testing.expect(item != null);
         defer item.?.free(alloc);
@@ -1170,7 +1168,6 @@ test "levels: get L0 shadows L1" {
         const item = try tree.get(.{
             .key = .{ .primary = "foo" },
             .read_ts = 3,
-            .priority = .p2,
         });
         try std.testing.expect(item != null);
         defer item.?.free(alloc);

@@ -219,17 +219,21 @@ pub const Object = union(enum) {
         a: std.mem.Allocator,
         offset: u64,
         len: usize,
-        priority: _vfs.Priority,
     ) !_vfs.ReadResult {
         switch (self.*) {
-            .file => |*f| return f.readAligned(a, offset, len, priority),
+            .file => |*f| return f.readAligned(a, offset, len),
             .s3 => |*o| {
                 // The same aligned-buffer contract as the file path, so a
                 // caller cannot tell which backend served it.
                 const buf = try a.alignedAlloc(u8, _vfs.page_alignment, len);
                 errdefer a.free(buf);
-                try o.store.read(o.name, o.sz, offset, buf, priority);
-                return .{ .buf = buf, .data = buf, .allocator = a };
+                try o.store.read(o.name, o.sz, offset, buf);
+                return .{
+                    .buf = buf,
+                    .data = buf,
+                    .offset = offset,
+                    .allocator = a,
+                };
             },
         }
     }
@@ -241,16 +245,14 @@ pub const Object = union(enum) {
         self: *const Object,
         arena: *std.heap.ArenaAllocator,
         requests: []_vfs.FileHandle.ReadRequest,
-        priority: _vfs.Priority,
     ) !void {
         switch (self.*) {
-            .file => |*f| return f.batchRead(arena, requests, priority),
+            .file => |*f| return f.batchRead(arena, requests),
             .s3 => |*o| return o.store.batchRead(
                 o.name,
                 o.sz,
                 arena,
                 requests,
-                priority,
             ),
         }
     }
@@ -321,14 +323,14 @@ pub const FileStore = struct {
         // Direct I/O — a fresh SST is read back through its own direct
         // handle; the write must not churn the page cache. truncate — a
         // crashed put can leave a partial tmp file; re-putting must
-        // overwrite it. .p1: uploads gate proposes, the same class as
-        // flush I/O. The NAME's durability (dir entry) is the caller's
-        // batch-level barrier: one RemoteStore.sync after all puts.
+        // overwrite it. The write runs at the caller's I/O class: the
+        // flush or compaction whose output this is. The NAME's
+        // durability (dir entry) is the caller's batch-level barrier:
+        // one RemoteStore.sync after all puts.
         try _vfs.writeAndSync(
             tmp,
             data,
             .{ .mode = .direct, .flags = .{ .truncate = true } },
-            .p1,
         );
         try _vfs.renameFile(tmp, final);
     }

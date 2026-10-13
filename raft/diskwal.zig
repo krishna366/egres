@@ -665,7 +665,6 @@ pub const wal = struct {
             self.current.handle.bw,
             &planned.arena,
             planned.reqs.items,
-            .p0,
         );
 
         for (planned.reqs.items, planned.sentry_offs.items) |req, off| {

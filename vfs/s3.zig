@@ -268,7 +268,7 @@ pub const S3Store = struct {
     /// One ranged GET: [offset, offset+buf.len) of `name` straight into
     /// `buf`, written once, off the socket. The wire primitive every
     /// read builds on; `read` is the one that goes through the cache.
-    pub fn getNoCache(self: *S3Store, name: String, offset: u64, buf: []u8) !void {
+    fn getNoCache(self: *S3Store, name: String, offset: u64, buf: []u8) !void {
         if (buf.len == 0) return;
         var resp = try self.objectRequest(name, .{
             .method = .GET,
@@ -285,19 +285,12 @@ pub const S3Store = struct {
         }
     }
 
-    /// Whether a read at `prio` goes through the chunk cache, lookup
-    /// and admission both: user reads only. A compaction (p1, p2)
-    /// reads each input once; caching those chunks would churn the
-    /// cache for hits that never come, and its inputs were mostly
-    /// written by this node, so they are not in the cache to be hit
-    /// either.
-    /// TODO: the priority stands in for the intent. Every reader today
-    /// at p1 or p2 is a compaction, but a background scan that picks a
-    /// lower priority to queue behind users would lose the cache
-    /// without saying so. The read's context should carry both the
-    /// priority and whether to skip the cache; gate on that here.
-    fn useCache(self: *const S3Store, prio: _vfs.Priority) bool {
-        return self.cache.enabled() and prio == .p0;
+    /// Whether the current fiber's reads go through the chunk cache,
+    /// lookup and admission both. A compaction bypasses it: it reads
+    /// each input once, so caching those chunks would churn the cache
+    /// for hits that never come.
+    fn useCache(self: *const S3Store) bool {
+        return self.cache.enabled() and fiber.ctx().cache == .use;
     }
 
     /// Read [offset, offset+dst.len) of `name`, an object of `size`
@@ -310,10 +303,9 @@ pub const S3Store = struct {
         size: u64,
         offset: u64,
         dst: []u8,
-        prio: _vfs.Priority,
     ) !void {
         if (dst.len == 0) return;
-        if (!self.useCache(prio)) return self.getNoCache(name, offset, dst);
+        if (!self.useCache()) return self.getNoCache(name, offset, dst);
 
         // A range across chunks goes through the batch path: its
         // chunks are fetched concurrently, not one after another.
@@ -324,7 +316,7 @@ pub const S3Store = struct {
             var reqs = [_]_vfs.FileHandle.ReadRequest{
                 .{ .offset = offset, .len = dst.len },
             };
-            try self.batchRead(name, size, &arena, &reqs, prio);
+            try self.batchRead(name, size, &arena, &reqs);
             @memcpy(dst, reqs[0].data);
             return;
         }
@@ -337,28 +329,27 @@ pub const S3Store = struct {
             .req_hi = offset % c + dst.len,
             .req_buf = dst,
         };
-        try self.loadChunk(name, c, &chunk, prio);
+        try self.readChunk(name, c, &chunk);
     }
 
     /// One chunk's span of a batch: for a cached read the slot file,
     /// else the whole chunk fetched and stored; for an uncached read
     /// the span from the remote.
-    fn loadChunk(
+    fn readChunk(
         self: *S3Store,
         name: String,
         chunk_bytes: u64,
         chunk: *Chunk,
-        prio: _vfs.Priority,
     ) anyerror!void {
         const c = chunk;
-        if (!self.useCache(prio)) {
+        if (!self.useCache()) {
             // Uncached: just the span [req_lo, req_hi) from the remote.
             const off = c.idx * chunk_bytes + c.req_lo;
             return self.getNoCache(name, off, c.req_buf);
         }
 
-        if (try self.cache.read(name, c, prio)) return;
-        try self.getAndCache(name, c, prio);
+        if (try self.cache.read(name, c)) return;
+        try self.getAndCache(name, c);
     }
 
     /// A cached read's miss: the chunk whole from the remote, stored,
@@ -367,7 +358,6 @@ pub const S3Store = struct {
         self: *S3Store,
         name: String,
         chunk: *const Chunk,
-        prio: _vfs.Priority,
     ) !void {
         const c = self.cache.chunkBytes();
         const buf = try allocChunk(self.a, chunk.chunk_len);
@@ -376,7 +366,7 @@ pub const S3Store = struct {
         // buf.len might be longer because it allocates page-aligned buffer.
         const whole = buf[0..chunk.chunk_len];
         try self.getNoCache(name, chunk.idx * c, whole);
-        try self.cache.write(name, chunk.idx, whole, prio);
+        try self.cache.write(name, chunk.idx, whole);
         @memcpy(chunk.req_buf, whole[chunk.req_lo..chunk.req_hi]);
     }
 
@@ -466,9 +456,9 @@ pub const S3Store = struct {
     /// read, so each chunk is fetched and kept whole; for an uncached
     /// one (compaction) the endpoint's knee, so a run of blocks is one
     /// request however small the cache's chunks are.
-    fn planChunkBytes(self: *const S3Store, prio: _vfs.Priority) u64 {
+    fn planChunkBytes(self: *const S3Store) u64 {
         const c = self.cache.chunkBytes();
-        if (self.useCache(prio)) return c;
+        if (self.useCache()) return c;
         return @max(c, @max(self.lookahead, default_span));
     }
 
@@ -491,11 +481,10 @@ pub const S3Store = struct {
         size: u64,
         arena: *std.heap.ArenaAllocator,
         requests: []_vfs.FileHandle.ReadRequest,
-        prio: _vfs.Priority,
     ) !void {
         if (requests.len == 0) return;
         const arloc = arena.allocator();
-        const chunk_bytes = self.planChunkBytes(prio);
+        const chunk_bytes = self.planChunkBytes();
         var chunks = try planChunks(arloc, chunk_bytes, size, requests);
 
         var group = try fiber.Group(anyerror!void).initCapacity(
@@ -504,8 +493,8 @@ pub const S3Store = struct {
         );
         defer group.deinit();
         for (chunks.values()) |*chunk| {
-            try group.spawn(.{}, loadChunk, .{
-                self, name, chunk_bytes, chunk, prio,
+            try group.spawn(.{}, readChunk, .{
+                self, name, chunk_bytes, chunk,
             });
         }
         for (group.wait()) |res| try res;

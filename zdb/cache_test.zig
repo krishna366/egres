@@ -57,7 +57,7 @@ test "Cache basic put/get round-trip" {
         try std.testing.allocator.dupe(u8, "key"),
         val,
     );
-    const got = c.get("key") orelse return error.Missing;
+    const got = c.get("key", .reuse) orelse return error.Missing;
     defer got.decrRef();
     try std.testing.expectEqualStrings("hello", got.data);
     try std.testing.expectEqual(@as(usize, 1), c.count());
@@ -70,10 +70,10 @@ test "Cache put/get round-trip with u64 key" {
     const val = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "forty-two"));
     defer val.decrRef();
     try c.put(42, val);
-    const got = c.get(42) orelse return error.Missing;
+    const got = c.get(42, .reuse) orelse return error.Missing;
     defer got.decrRef();
     try std.testing.expectEqualStrings("forty-two", got.data);
-    try std.testing.expectEqual(@as(?*Value, null), c.get(99));
+    try std.testing.expectEqual(@as(?*Value, null), c.get(99, .reuse));
 }
 
 test "Cache one-hit-wonder: evicted to ghost, not M" {
@@ -97,8 +97,9 @@ test "Cache one-hit-wonder: evicted to ghost, not M" {
         try c.put(try std.testing.allocator.dupe(u8, "k1"), v);
     }
 
-    try std.testing.expectEqual(@as(?*Value, null), c.get("k0")); // evicted
-    if (c.get("k1")) |v| v.decrRef(); // still present
+    // evicted
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k0", .reuse));
+    if (c.get("k1", .reuse)) |v| v.decrRef(); // still present
     // k0 did NOT go to M, which holds only the filler.
     try std.testing.expectEqual(@as(usize, 1), c.m.len);
     const h0 = hashKey(String, "k0");
@@ -115,7 +116,7 @@ test "Cache reused key promoted S → M" {
         defer v.decrRef();
         try c.put(try std.testing.allocator.dupe(u8, "k0"), v);
     }
-    if (c.get("k0")) |v| v.decrRef(); // sets freq=true
+    if (c.get("k0", .reuse)) |v| v.decrRef(); // sets freq=true
 
     // k1 evicts k0 from S; freq=true → k0 goes to M.
     {
@@ -124,7 +125,7 @@ test "Cache reused key promoted S → M" {
         try c.put(try std.testing.allocator.dupe(u8, "k1"), v);
     }
 
-    const got = c.get("k0") orelse return error.Missing; // now in M
+    const got = c.get("k0", .reuse) orelse return error.Missing; // now in M
     defer got.decrRef();
     try std.testing.expectEqualStrings("v0", got.data);
     try std.testing.expectEqual(@as(usize, 1), c.m.len);
@@ -158,7 +159,7 @@ test "Cache ghost re-entry goes directly to M" {
     }
 
     try std.testing.expectEqual(@as(u64, 1), c.ghost_hits);
-    const got = c.get("k0") orelse return error.Missing;
+    const got = c.get("k0", .reuse) orelse return error.Missing;
     defer got.decrRef();
     try std.testing.expectEqualStrings("v0b", got.data);
     try std.testing.expectEqual(@as(usize, 1), c.m.len);
@@ -181,10 +182,10 @@ test "Cache S FIFO eviction order" {
     }
 
     // k0 and k1 were evicted (freq=false → ghost); k2 and k3 remain.
-    try std.testing.expectEqual(@as(?*Value, null), c.get("k0"));
-    try std.testing.expectEqual(@as(?*Value, null), c.get("k1"));
-    if (c.get("k2")) |v| v.decrRef();
-    if (c.get("k3")) |v| v.decrRef();
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k0", .reuse));
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k1", .reuse));
+    if (c.get("k2", .reuse)) |v| v.decrRef();
+    if (c.get("k3", .reuse)) |v| v.decrRef();
     try std.testing.expect(c.ghost.contains(hashKey(String, "k0")));
     try std.testing.expect(c.ghost.contains(hashKey(String, "k1")));
     // No promotions: M holds only the filler.
@@ -203,13 +204,13 @@ test "Cache M freq reset on reinsertion" {
         defer v.decrRef();
         try c.put(try std.testing.allocator.dupe(u8, "k0"), v);
     }
-    if (c.get("k0")) |v| v.decrRef(); // freq=true
+    if (c.get("k0", .reuse)) |v| v.decrRef(); // freq=true
     {
         const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v1"));
         defer v.decrRef();
         try c.put(try std.testing.allocator.dupe(u8, "k1"), v); // k0 → M
     }
-    if (c.get("k1")) |v| v.decrRef(); // freq=true in S
+    if (c.get("k1", .reuse)) |v| v.decrRef(); // freq=true in S
     {
         const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v2"));
         defer v.decrRef();
@@ -217,21 +218,22 @@ test "Cache M freq reset on reinsertion" {
     }
 
     // Mark both M entries as freq=true.
-    if (c.get("k0")) |v| v.decrRef();
-    if (c.get("k1")) |v| v.decrRef();
+    if (c.get("k0", .reuse)) |v| v.decrRef();
+    if (c.get("k1", .reuse)) |v| v.decrRef();
 
     // Promote k2 into M: M full by bytes → evictM cycles past freq=true entries,
     // reinserting with freq=false, until one is evicted (k0 comes around first).
-    if (c.get("k2")) |v| v.decrRef(); // freq=true in S
+    if (c.get("k2", .reuse)) |v| v.decrRef(); // freq=true in S
     {
         const v = try Value.init(std.testing.allocator, try std.testing.allocator.dupe(u8, "v3"));
         defer v.decrRef();
         try c.put(try std.testing.allocator.dupe(u8, "k3"), v); // k2 → M; evicts k0
     }
 
-    try std.testing.expectEqual(@as(?*Value, null), c.get("k0")); // evicted from M
-    if (c.get("k1")) |v| v.decrRef();
-    if (c.get("k2")) |v| v.decrRef();
+    // evicted from M
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k0", .reuse));
+    if (c.get("k1", .reuse)) |v| v.decrRef();
+    if (c.get("k2", .reuse)) |v| v.decrRef();
 }
 
 test "Cache update existing key frees old value" {
@@ -250,7 +252,7 @@ test "Cache update existing key frees old value" {
         try c.put(try std.testing.allocator.dupe(u8, "key"), v);
     }
 
-    const got = c.get("key") orelse return error.Missing;
+    const got = c.get("key", .reuse) orelse return error.Missing;
     defer got.decrRef();
     try std.testing.expectEqualStrings("new", got.data);
     try std.testing.expectEqual(@as(usize, 1), c.count()); // still one entry
@@ -297,7 +299,7 @@ test "ShardedCache basic get/put" {
         try std.testing.allocator.dupe(u8, "x"),
         val,
     );
-    const got = sc.get("x") orelse return error.Missing;
+    const got = sc.get("x", .reuse) orelse return error.Missing;
     defer got.decrRef();
     try std.testing.expectEqualStrings("xval", got.data);
 }
@@ -333,7 +335,7 @@ test "ShardedCache concurrent puts and gets" {
                 };
                 defer val.decrRef();
                 ctx.sc.put(key, val) catch {};
-                if (ctx.sc.get(key_lit)) |v| v.decrRef();
+                if (ctx.sc.get(key_lit, .reuse)) |v| v.decrRef();
             }
         }
     };
@@ -375,7 +377,8 @@ test "Cache ring growth preserves all entries" {
         }
 
         for (1..next_key) |key_i| {
-            const got = c.get(@intCast(key_i)) orelse return error.Missing;
+            const got = c.get(@intCast(key_i), .reuse) orelse
+                return error.Missing;
             defer got.decrRef();
             var buf: [20]u8 = undefined;
             const expected = std.fmt.bufPrint(&buf, "val-{d}", .{key_i}) catch unreachable;
@@ -420,7 +423,7 @@ test "Cache remove frees the entry and eviction skips its dead slot" {
 
     try std.testing.expect(c.remove(2));
     try std.testing.expect(!c.remove(2));
-    try std.testing.expectEqual(@as(?*Value, null), c.get(2));
+    try std.testing.expectEqual(@as(?*Value, null), c.get(2, .reuse));
     try std.testing.expectEqual(@as(usize, 1 + 2), c.count());
     try std.testing.expectEqual(2 * per, c.s.cost);
 
@@ -430,18 +433,18 @@ test "Cache remove frees the entry and eviction skips its dead slot" {
     // its entry as reused and change what the next eviction does.
     try putOne(&c, 4);
     try putOne(&c, 5);
-    try std.testing.expectEqual(@as(?*Value, null), c.get(1));
+    try std.testing.expectEqual(@as(?*Value, null), c.get(1, .reuse));
     try std.testing.expectEqual(@as(usize, 1 + 3), c.count());
     try std.testing.expectEqual(3 * per, c.s.cost);
 
     // 6 pushes S over budget again: the tail is 2's dead slot, which is
     // skipped, and 3 is the one evicted.
     try putOne(&c, 6);
-    try std.testing.expectEqual(@as(?*Value, null), c.get(3));
+    try std.testing.expectEqual(@as(?*Value, null), c.get(3, .reuse));
     try std.testing.expectEqual(@as(usize, 1 + 3), c.count());
     try std.testing.expectEqual(3 * per, c.s.cost);
     for ([_]u64{ 4, 5, 6 }) |k| {
-        const got = c.get(k) orelse return error.Missing;
+        const got = c.get(k, .reuse) orelse return error.Missing;
         got.decrRef();
     }
 }
@@ -465,9 +468,9 @@ test "Cache remove of a String key: its dead slot frees it when reclaimed" {
     try std.testing.expect(c.remove("k0"));
     try putOne(&c, "k1", "v1");
     try putOne(&c, "k2", "v2"); // S over budget: reclaims k0's slot
-    try std.testing.expectEqual(@as(?*Value, null), c.get("k0"));
+    try std.testing.expectEqual(@as(?*Value, null), c.get("k0", .reuse));
     for ([_]String{ "k1", "k2" }) |k| {
-        const got = c.get(k) orelse return error.Missing;
+        const got = c.get(k, .reuse) orelse return error.Missing;
         got.decrRef();
     }
     // A dead slot still in the ring at deinit: its key is freed there
@@ -500,9 +503,9 @@ test "Cache remove then re-put of the same key leaves a stale slot that eviction
     // 4 pushes S over budget: the tail meets 1's stale slot first, must
     // skip it, then evicts 1's live slot — not 2 or 3.
     try putOne(&c, 4);
-    try std.testing.expectEqual(@as(?*Value, null), c.get(1));
+    try std.testing.expectEqual(@as(?*Value, null), c.get(1, .reuse));
     for ([_]u64{ 2, 3, 4 }) |k| {
-        const got = c.get(k) orelse return error.Missing;
+        const got = c.get(k, .reuse) orelse return error.Missing;
         got.decrRef();
     }
     try std.testing.expectEqual(@as(usize, 1 + 3), c.count());
@@ -516,7 +519,7 @@ test "ShardedCache remove" {
     try c.put(7, v);
     try std.testing.expect(c.remove(7));
     try std.testing.expect(!c.remove(7));
-    try std.testing.expectEqual(@as(?*Value, null), c.get(7));
+    try std.testing.expectEqual(@as(?*Value, null), c.get(7, .reuse));
 }
 
 test "ShardedCache counts a put of a key its ghost ring remembers" {
@@ -549,7 +552,7 @@ test "ShardedCache setCapacity: a shrink evicts to the new budget" {
         const v = try Value.init(alloc, try alloc.alloc(u8, 4096));
         defer v.decrRef();
         try c.put(i, v);
-        if (c.get(i)) |got| got.decrRef(); // into M at the next put
+        if (c.get(i, .reuse)) |got| got.decrRef(); // into M at the next put
     }
     try std.testing.expect(c.totalCost() > 4 * 4096);
 
@@ -589,7 +592,7 @@ test "Cache sizes its ghost by M's entry count at turnover" {
         const v = try Value.init(arloc, try arloc.alloc(u8, 64));
         defer v.decrRef();
         try c.put(i, v);
-        const got = c.get(i) orelse return error.Missing;
+        const got = c.get(i, .reuse) orelse return error.Missing;
         got.decrRef();
     }
     // Full: one more entry, charged as S's are, would not fit.
@@ -684,7 +687,7 @@ test "Cache lookups of missing keys stay fast through put and evict churn" {
         defer v.decrRef();
         try c.put(i, v);
         // Every third key gets a hit, so some reach M and churn it too.
-        if (i % 3 == 0) if (c.get(i)) |got| got.decrRef();
+        if (i % 3 == 0) if (c.get(i, .reuse)) |got| got.decrRef();
     }
     try std.testing.expect(c.totalCost() <= 1 << 20);
     try std.testing.expect(c.count() > 1000);
@@ -692,7 +695,10 @@ test "Cache lookups of missing keys stay fast through put and evict churn" {
     const io = utils.context.g().io;
     const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
     for (0..100_000) |i| {
-        try std.testing.expectEqual(@as(?*Value, null), c.get(1_000_000 + i));
+        try std.testing.expectEqual(
+            @as(?*Value, null),
+            c.get(1_000_000 + i, .reuse),
+        );
     }
     const t1 = std.Io.Timestamp.now(io, .real).nanoseconds;
     const ms = @divTrunc(t1 - t0, 1_000_000);

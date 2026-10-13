@@ -238,6 +238,13 @@ pub fn createIndex(
         .{ name, ns, base_tid, index_tid, build.read_ts },
     );
 
+    // The backfill's reads and table writes queue behind users' I/O.
+    // The fiber's own context: helpers copy the class at spawn.
+    const ctx = fiber.ctx();
+    const prev_prio = ctx.prio;
+    ctx.prio = .p2;
+    defer ctx.prio = prev_prio;
+
     var rows = build.scan() catch |err| return build.fail("backfill", err);
     build.install(&rows) catch |err| return build.fail("install", err);
 
@@ -602,7 +609,7 @@ const IndexBuild = struct {
             self.a,
             self.baseKey(),
             .all,
-            .{ .read_ts = self.read_ts, .priority = .p2 },
+            .{ .read_ts = self.read_ts },
         );
         defer cur.deinit();
         var seen: usize = 0;
@@ -639,7 +646,6 @@ const IndexBuild = struct {
             .read_ts = eng.node.appliedTs(),
             .min_ts = self.read_ts,
             .include_deleted = true,
-            .priority = .p2,
         });
         defer cur.deinit();
         var changed: usize = 0;

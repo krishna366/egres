@@ -673,7 +673,6 @@ pub fn buildCompaction(
             .dest_level = 0,
             .src = srcs,
             .bot = &.{},
-            .prio = .p1,
             .out_raft_index = srcs[srcs.len - 1].raft_index,
         }, snapshot_ts),
         .split => unreachable,
@@ -701,7 +700,6 @@ fn mergeDown(
     snapshot_ts: u64,
 ) !std.ArrayList(_manifest.SSTableChange) {
     const dest = src + 1;
-    const prio: vfs.Priority = if (src == 0) .p1 else .p2;
 
     var kr: ?KeyRange = null;
     for (srcs) |e| {
@@ -725,7 +723,6 @@ fn mergeDown(
         .dest_level = dest,
         .src = srcs,
         .bot = bot,
-        .prio = prio,
     }, snapshot_ts);
 }
 
@@ -786,7 +783,6 @@ pub const MergeJob = struct {
     /// The destination level's tables the sources overlap; rewritten
     /// with them. Empty for an L0→L0 merge.
     bot: []const TableEntry,
-    prio: vfs.Priority,
     /// The `raft_index` the outputs are listed under; 0 = the index of
     /// the entry that applies the job (every job but an L0→L0 merge).
     out_raft_index: u64 = 0,
@@ -823,8 +819,10 @@ fn partitions(
         .namespace = self.namespace,
         .table_id = self.tableId(),
     };
+    const window = self.live.cur().compaction_window_bytes;
     for (bot, bot_iters) |e, *it| {
-        it.* = TableIterator.init(self.allocator, e.table, job.prio, table_key);
+        it.* = TableIterator.init(self.allocator, e.table, table_key);
+        it.window_bytes = window;
     }
     const n = @min(@max(max, 1), @max(bot.len, 1), out.len);
     for (out[0..n], 0..) |*part, i| {
@@ -1036,7 +1034,13 @@ fn runPartition_(
     snapshot_ts: u64,
 ) !Emitter.Result {
     const dest = job.dest_level;
-    const prio = job.prio;
+
+    // The job's I/O class: an L0 merge ahead of the rest. Its reads
+    // bypass the caches: each input is read once, and a hit must not
+    // count as reuse.
+    const ctx = fiber.ctx();
+    ctx.prio = if (job.src_level == 0) .p1 else .p2;
+    ctx.cache = .bypass;
 
     // --- one MergeIterator over the src tables + the partition's
     // concat over its bottom tables. The concat is this fiber's to
@@ -1053,15 +1057,12 @@ fn runPartition_(
         .namespace = self.namespace,
         .table_id = self.tableId(),
     };
-    for (job.src, 0..) |e, i|
-        all_iters[i] = .{
-            .table = TableIterator.init(
-                self.allocator,
-                e.table,
-                prio,
-                table_key,
-            ),
-        };
+    const window = self.live.cur().compaction_window_bytes;
+    for (job.src, 0..) |e, i| {
+        var it = TableIterator.init(self.allocator, e.table, table_key);
+        it.window_bytes = window;
+        all_iters[i] = .{ .table = it };
+    }
     all_iters[job.src.len] = .{ .concat = part_bot };
 
     // The merge takes every iterator over, the concat included.
@@ -1073,7 +1074,7 @@ fn runPartition_(
     try merge.seekRange(part.range.left, part.range.right);
 
     // --- merge loop ---
-    var emitter = try Emitter.init(self, dest, prio, snapshot_ts);
+    var emitter = try Emitter.init(self, dest, snapshot_ts);
     defer emitter.deinit();
     while (merge.itemRef()) |item| {
         try emitter.push(item);
