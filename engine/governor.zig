@@ -5,7 +5,7 @@
 //! the process holds, so the cache takes the memory nothing else needs
 //! and gives it back when something does.
 //!
-//! `total` (`--cache total_mib`) is the memory the process may hold as
+//! `total` (`--cache total_bytes`) is the memory the process may hold as
 //! the allocator holds it: resident, what the cgroup charges. The
 //! program counts its own live bytes (the counting allocator); the
 //! allocator holds more on top (size-class rounding, freed pages not
@@ -77,7 +77,7 @@ pub const Ratio = struct {
 };
 
 pub const Governor = struct {
-    /// The memory the process may hold, resident (`--cache total_mib`).
+    /// The memory the process may hold, resident (`--cache total_bytes`).
     total: u64,
     /// Kept for what the process holds outside the cache: the recent
     /// peak of it, never under `min_margin`.

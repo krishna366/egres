@@ -75,14 +75,14 @@ autovacuum_max_workers = 4
 
 # A server: ports, the database the workload lives in, its config.
 SERVERS = {
-    # `cache` is the server's --cache flag body ("total_mib=.."); empty
+    # `cache` is the server's --cache flag body ("total_bytes=.."); empty
     # leaves the server's default (90% of RAM or of the cgroup cap).
-    # `remote` is the --remote body; empty means the run's data dir
+    # `store` is the --store body; empty means the run's data dir
     # ("dir_path=<data>"), an s3 body ("s3_endpoint=..;s3_bucket=..")
     # puts the SSTs on an object store, with AWS_ACCESS_KEY_ID and
     # AWS_SECRET_ACCESS_KEY taken from this process's environment.
     "egres": {"sql_port": 3210, "admin_port": 5210, "dbname": "egres",
-              "zdb_extra": "num_compactors=8", "cache": "", "remote": ""},
+              "zdb_extra": "num_compactors=8", "cache": "", "store": ""},
     "postgres": {"port": 5434, "dbname": "bench", "conf": PG_CONF},
 }
 
@@ -348,10 +348,10 @@ def start_egres(run: Run):
     # server on the box; sql_port + 1500 stays clear of the admin port.
     listen = (f"sql-port={srv['sql_port']};client-port={srv['admin_port']};"
               f"raft-port={srv['sql_port'] + 1500}")
-    remote = srv["remote"] or f"dir_path={run.data}"
+    store = srv["store"] or f"dir_path={run.data}"
     cmd = scope_prefix(run) + [
         str(run.egres_bin), "--raft=id=1", f"--listen={listen}",
-        f"--remote={remote}", f"--wal=dir={run.wal}"]
+        f"--store={store}", f"--wal=dir={run.wal}"]
     if srv["zdb_extra"]:
         cmd.append(f"--zdb={srv['zdb_extra']}")
     if srv["cache"]:

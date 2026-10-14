@@ -507,18 +507,48 @@ test "writeHelp wraps at help_width and indents continuation lines" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "wrapped text wrapped text") != null);
 }
 
+test "_bytes field accepts a unit suffix" {
+    const alloc = std.testing.allocator;
+    var live = try flags.Live(WrapCfg).init(alloc, "cache-bytes=10gib;");
+    defer live.deinit();
+    try std.testing.expectEqual(@as(u64, 10 << 30), live.cur().cache_bytes);
+
+    try live.update("cache-bytes=64MiB;");
+    try std.testing.expectEqual(@as(u64, 64 << 20), live.cur().cache_bytes);
+    try live.update("cache-bytes=1.5KiB;");
+    try std.testing.expectEqual(@as(u64, 1536), live.cur().cache_bytes);
+    try live.update("cache-bytes=4096;");
+    try std.testing.expectEqual(@as(u64, 4096), live.cur().cache_bytes);
+    try live.update("cache-bytes=0;");
+    try std.testing.expectEqual(@as(u64, 0), live.cur().cache_bytes);
+
+    // Decimal or bare units are refused: 1g could mean 10^9 or 2^30.
+    const Err = error.InvalidBytes;
+    try std.testing.expectError(Err, live.update("cache-bytes=10g;"));
+    try std.testing.expectError(Err, live.update("cache-bytes=1gb;"));
+    try std.testing.expectError(Err, live.update("cache-bytes=gib;"));
+    try std.testing.expectError(Err, live.update("cache-bytes=1gibb;"));
+}
+
 test "writeHelp prints byte and duration defaults in readable units" {
     const alloc = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
     try flags.writeHelp(WrapCfg, "wrap", &out, alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "cache-bytes=1073741824 (u64, 1 GiB);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "odd-bytes=1500 (u64);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "idle-seconds=1800 (u64, 30 min);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "lease-seconds=7200 (u64, 2 h);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "tick-ms=5000 (duration, 5 s);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "retries=3 (u32);") != null);
+    // Each flag line ends after its type; the doc follows on its own
+    // line.
+    const help = out.items;
+    for ([_]String{
+        "cache-bytes=1GiB (bytes)\n",
+        "odd-bytes=1500 (bytes)\n",
+        "idle-seconds=1800 (u64, 30 min)\n",
+        "lease-seconds=7200 (u64, 2 h)\n",
+        "tick-ms=5000 (duration, 5 s)\n",
+        "retries=3 (u32)\n          A plain count.\n",
+    }) |want| {
+        try std.testing.expect(std.mem.indexOf(u8, help, want) != null);
+    }
 }
 
 const FixedCfg = struct {
@@ -581,18 +611,16 @@ test "writeHelp marks fixed fields" {
     defer out.deinit(alloc);
     try flags.writeHelp(FixedCfg, "fx", &out, alloc);
 
+    // The mark sits on the doc line under the flag's line.
     var lines = std.mem.splitScalar(u8, out.items, '\n');
     var seen: u8 = 0;
+    var want_fixed = false;
     while (lines.next()) |line| {
         const fixed = std.mem.indexOf(u8, line, "Fixed at startup.") != null;
-        if (std.mem.indexOf(u8, line, "dir=") != null or
-            std.mem.indexOf(u8, line, "workers=") != null)
-        {
-            try std.testing.expect(fixed);
-            seen += 1;
-        } else {
-            try std.testing.expect(!fixed);
-        }
+        try std.testing.expectEqual(want_fixed, fixed);
+        if (fixed) seen += 1;
+        want_fixed = std.mem.indexOf(u8, line, "dir=") != null or
+            std.mem.indexOf(u8, line, "workers=") != null;
     }
     try std.testing.expectEqual(@as(u8, 2), seen);
 }

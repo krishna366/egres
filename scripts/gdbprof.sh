@@ -16,7 +16,7 @@
 # port is taken from `--listen=offset=N` in the egres args (3210 + N).
 # Example:
 #   scripts/gdbprof.sh -n 200 -- --raft=id=1 \
-#     --remote=dir_path=/data/egres/sst --wal=dir=/data/egres/wal \
+#     --store=dir_path=/data/egres/sst --wal=dir=/data/egres/wal \
 #     --listen=offset=1 :: pgbench "host=127.0.0.1 port=3211 dbname=egres \
 #     sslmode=disable" -n -S -c 64 -j 16 -T 40
 set -euo pipefail

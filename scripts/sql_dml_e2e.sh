@@ -36,7 +36,7 @@ v() { psql "$E" -X -tA -c "$1"; } # tuples-only, unaligned (bare value)
 # Ready = listener up AND election won (see sql_ddl_e2e.sh).
 start_server() {
     ./zig-out/bin/egres --raft="id=1" \
-        --remote="dir_path=$DATA/sst" --wal="dir=$DATA/wal" >"$LOG" 2>&1 &
+        --store="dir_path=$DATA/sst" --wal="dir=$DATA/wal" >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 50); do
         if grep -q "sql listener started" "$LOG" 2>/dev/null &&

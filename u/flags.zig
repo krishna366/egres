@@ -16,6 +16,7 @@ pub const Error = error{
     InvalidFloat,
     InvalidEnum,
     InvalidDuration,
+    InvalidBytes,
     InvalidArgv,
     /// A live update named a field the struct lists in `fixed`.
     FixedOption,
@@ -122,6 +123,38 @@ fn parseDurationMs(raw: String) Error!i64 {
     }
     if (!saw_segment) return error.InvalidDuration;
     return @intFromFloat(sign * total_ms);
+}
+
+/// Parse a byte count: a bare integer, or a number with a binary unit
+/// spelled out, `64MiB`, `10gib`, `1.5KiB`, any case. `1g` and `1gb` are
+/// refused: whether they mean 10^9 or 2^30 is exactly what the suffix
+/// has to say.
+fn parseBytes(raw: String) Error!u64 {
+    const s = std.mem.trim(u8, raw, whitespace);
+    if (s.len == 0) return 0;
+    if (std.fmt.parseInt(u64, s, 0)) |n| return n else |_| {}
+
+    var i: usize = 0;
+    while (i < s.len and (std.ascii.isDigit(s[i]) or s[i] == '.')) i += 1;
+    if (i == 0) return error.InvalidBytes;
+    const value = std.fmt.parseFloat(f64, s[0..i]) catch
+        return error.InvalidBytes;
+    const unit = s[i..];
+    const units = [_]struct { name: String, shift: u6 }{
+        .{ .name = "kib", .shift = 10 },
+        .{ .name = "mib", .shift = 20 },
+        .{ .name = "gib", .shift = 30 },
+        .{ .name = "tib", .shift = 40 },
+    };
+    for (units) |u| {
+        if (!std.ascii.eqlIgnoreCase(unit, u.name)) continue;
+        const per: f64 = @floatFromInt(@as(u64, 1) << u.shift);
+        const bytes = value * per;
+        // 2^64 as a float, the first value a u64 cannot hold.
+        if (bytes >= 18446744073709551616.0) return error.InvalidBytes;
+        return @intFromFloat(bytes);
+    }
+    return error.InvalidBytes;
 }
 
 // ---------- string tokenizer ----------
@@ -289,6 +322,11 @@ fn parseField(
                 const ms = try parseDurationMs(value);
                 if (int_info.signedness == .unsigned and ms < 0) return error.InvalidInt;
                 break :blk std.math.cast(FT, ms) orelse error.InvalidInt;
+            }
+            // Byte counts take a binary unit suffix.
+            if (comptime std.mem.endsWith(u8, field_name, "_bytes")) {
+                const n = try parseBytes(value);
+                break :blk std.math.cast(FT, n) orelse error.InvalidInt;
             }
             const trimmed = std.mem.trim(u8, value, whitespace);
             break :blk std.fmt.parseInt(FT, trimmed, 0) catch error.InvalidInt;
@@ -488,17 +526,24 @@ pub fn writeHelp(
 
         try head.appendSlice(allocator, &canonical);
         try head.append(allocator, '=');
-        try writeDefault(f.type, @field(default_t, f.name), &head, allocator);
+        const default = @field(default_t, f.name);
+        if (comptime isByteField(f.type, f.name))
+            try writeByteDefault(default, &head, allocator)
+        else
+            try writeDefault(f.type, default, &head, allocator);
         try line.start("      ");
         try line.word(head.items);
 
         utils.clearRetainCap(&head);
         try head.append(allocator, '(');
         try head.appendSlice(allocator, comptime humanType(f.type, f.name));
-        try writeHumanDefault(f.type, f.name, @field(default_t, f.name), &head, allocator);
-        try head.appendSlice(allocator, ");");
+        try writeHumanDefault(f.type, f.name, default, &head, allocator);
+        try head.append(allocator, ')');
         try line.text(head.items);
+        try out.append(allocator, '\n');
 
+        // The doc on its own lines, indented under the flag.
+        try line.start("          ");
         try line.text(comptime docFor(T, f.name));
         if (comptime isFixed(T, f.name)) try line.text("Fixed at startup.");
         try out.append(allocator, '\n');
@@ -507,7 +552,7 @@ pub fn writeHelp(
 
 /// Help output never runs past this column, except for a single word that is
 /// itself longer (a URL in a doc string).
-pub const help_width: usize = 1000;
+pub const help_width: usize = 100;
 
 /// One logical help line being written into `out`, wrapped at `help_width`.
 const HelpLine = struct {
@@ -550,8 +595,36 @@ const HelpLine = struct {
     }
 };
 
-/// For a byte count or a duration, append ", <value in a readable unit>":
-/// `min-bytes=1073741824 (u64, 1 GiB)`. The unit comes from the field name's
+fn isByteField(comptime FT: type, comptime field_name: String) bool {
+    return @typeInfo(FT) == .int and std.mem.endsWith(u8, field_name, "_bytes");
+}
+
+/// A byte count's default in the form the flag accepts: `10GiB`, `64MiB`,
+/// `32KiB`, or the raw number when it is not a whole number of a unit.
+fn writeByteDefault(
+    value: anytype,
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) Error!void {
+    if (value > 0) {
+        const v: u64 = @intCast(value);
+        const Unit = struct { per: u64, name: String };
+        const units = [_]Unit{
+            .{ .per = 1 << 30, .name = "GiB" },
+            .{ .per = 1 << 20, .name = "MiB" },
+            .{ .per = 1 << 10, .name = "KiB" },
+        };
+        for (units) |u| {
+            if (v % u.per != 0) continue;
+            try out.print(allocator, "{d}{s}", .{ v / u.per, u.name });
+            return;
+        }
+    }
+    try out.print(allocator, "{d}", .{value});
+}
+
+/// For a duration, append ", <value in a readable unit>":
+/// `idle-seconds=1800 (u64, 30 min)`. The unit comes from the field name's
 /// suffix. Nothing is appended when the raw number already reads well (zero,
 /// or not a whole number of the next unit up).
 fn writeHumanDefault(
@@ -565,9 +638,8 @@ fn writeHumanDefault(
     if (value <= 0) return;
     const v: u64 = @intCast(value);
     const Unit = struct { per: u64, name: String };
-    const units: []const Unit = comptime if (std.mem.endsWith(u8, field_name, "_bytes"))
-        &.{ .{ .per = 1 << 30, .name = "GiB" }, .{ .per = 1 << 20, .name = "MiB" }, .{ .per = 1 << 10, .name = "KiB" } }
-    else if (std.mem.endsWith(u8, field_name, "_seconds"))
+    const is_seconds = comptime std.mem.endsWith(u8, field_name, "_seconds");
+    const units: []const Unit = comptime if (is_seconds)
         &.{ .{ .per = 3600, .name = "h" }, .{ .per = 60, .name = "min" } }
     else if (std.mem.endsWith(u8, field_name, "_ms"))
         &.{ .{ .per = 60_000, .name = "min" }, .{ .per = 1000, .name = "s" } }
@@ -586,6 +658,9 @@ fn humanType(comptime FT: type, comptime field_name: String) String {
         .bool => "bool",
         .int => blk: {
             if (comptime std.mem.endsWith(u8, field_name, "_ms")) break :blk "duration";
+            if (comptime std.mem.endsWith(u8, field_name, "_bytes")) {
+                break :blk "bytes";
+            }
             break :blk @typeName(FT);
         },
         .float => "float",

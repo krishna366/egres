@@ -80,44 +80,44 @@ const RaftCfg = struct {
 };
 
 /// `--cache` — the memory Egres may hold, resident: what the allocator
-/// holds, as the cgroup and `top` count it. `total_mib` defaults to 90%
+/// holds, as the cgroup and `top` count it. `total_bytes` defaults to 90%
 /// of the memory this process may use (host RAM, or the cgroup limit
 /// under Docker and Kubernetes); the tenth is for the WAL's page cache,
 /// the kernel and thread stacks. The cache governor measures the
 /// allocator's overhead and gives the SST block cache what the rest of
 /// the process leaves under it.
 const CacheCfg = struct {
-    total_mib: u64 = 0,
+    total_bytes: u64 = 0,
     disk_path: String = "",
-    disk_mib: u64 = 0,
-    chunk_kib: u64 = 0,
+    disk_bytes: u64 = 0,
+    chunk_bytes: u64 = 0,
 
     pub const docs = .{
         .self = "Cache memory and the local-disk chunk cache for an s3" ++
             " remote. The memory budget is a cap, not a reservation:" ++
             " memory is used as blocks are read.",
-        .total_mib = "The overall memory Egres aims to hold, resident," ++
-            " in MiB. 0 = 90% of host RAM or of the cgroup limit. The" ++
+        .total_bytes = "The overall memory Egres aims to hold, resident." ++
+            " 0 = 90% of host RAM or of the cgroup limit. The" ++
             " block cache is auto-resized based on what the rest of the" ++
             " process uses and the allocator's measured overhead. Set it" ++
             " on a host shared with other processes.",
         .disk_path = "Slot file of the chunk cache: pages of SSTs" ++
             " fetched from an s3 remote, kept on local disk. Empty =" ++
             " no disk cache.",
-        .disk_mib = "Chunk cache capacity in MiB.",
-        .chunk_kib = "Chunk size in KiB: what a miss fetches from the" ++
-            " remote and the unit of eviction, a power of two in" ++
-            " [8, 8192], fixed when the slot file is created. 0 = 128.",
+        .disk_bytes = "Chunk cache capacity.",
+        .chunk_bytes = "Chunk size: what a miss fetches from the remote" ++
+            " and the unit of eviction, a power of two from 8KiB to" ++
+            " 8MiB, fixed when the slot file is created. 0 = 128KiB.",
     };
 };
 
-/// `--remote` — the remote store that holds every SST: a compaction or
+/// `--store` — the object store that holds every SST: a compaction or
 /// flush puts its output there before proposing the manifest change,
 /// and every node reads SSTs from it. Required. A cluster's nodes must
 /// share one (an s3 bucket, or a dir on a shared mount); a plain local
 /// dir serves a single node. The dir is write-once blobs only — never
 /// the WAL dir. Exactly one of `dir_path` and `s3_endpoint` is set.
-const RemoteCfg = struct {
+const StoreCfg = struct {
     dir_path: String = "",
     s3_endpoint: String = "",
     s3_bucket: String = "",
@@ -126,8 +126,8 @@ const RemoteCfg = struct {
     pub const docs = .{
         .self = "Object store holding every SST. Required: either" ++
             " dir_path or the s3_* fields.",
-        .dir_path = "Write-once directory: local, or a shared mount such" ++
-            " as NFS for a cluster.",
+        .dir_path = "Directory the SSTs live in: local, or a shared mount" ++
+            " such as NFS for a cluster.",
         .s3_endpoint = "S3-compatible endpoint URL: http://host[:port]" ++
             " or https://host[:port]. The scheme decides TLS; the host" ++
             " may be a DNS name or IP literal, and names the SigV4" ++
@@ -309,13 +309,13 @@ fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const String) void {
 /// settings. See zfiber.Runtime.steal_lone / prepark_poll_us.
 /// `--wal` — where the raft WAL lives and how its log files are laid
 /// out. The WAL (with the raft snapshot and hard state) is the one thing
-/// Egres keeps on local disk; SSTs live in `--remote`. The layout
+/// Egres keeps on local disk; SSTs live in `--store`. The layout
 /// defaults suit a local SSD on any filesystem: `prezero=auto`
 /// zero-fills log files on ext4 and xfs and skips it on ZFS, btrfs and
 /// tmpfs.
 const WalCfg = struct {
     dir: String = "",
-    log_file_mib: u64 = 256,
+    log_file_bytes: u64 = 256 << 20,
     prezero: raft.diskwal.Prezero = .auto,
     max_spare_log_files: usize = 64,
 
@@ -323,7 +323,7 @@ const WalCfg = struct {
         .self = "Raft WAL location and log files (see raft/diskwal.zig" ++
             " OpenOptions).",
         .dir = "Directory holding the raft WAL. Required.",
-        .log_file_mib = "Log file size in MiB; a record that would cross it" ++
+        .log_file_bytes = "Log file size; a record that would cross it" ++
             " rotates to a pre-created log file.",
         .prezero = "Zero-fill a log file when it is created so appends never" ++
             " grow the file: true for ext4/xfs, false for ZFS/btrfs/tmpfs," ++
@@ -359,7 +359,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const live_raft = try flags.g().register("raft", RaftCfg);
     const live_shutdown = try flags.g().register("shutdown", ShutdownCfg);
     const live_zdb = try flags.g().register("zdb", zdb.config.Config);
-    const live_remote = try flags.g().register("remote", RemoteCfg);
+    const live_store = try flags.g().register("store", StoreCfg);
     const live_cache = try flags.g().register("cache", CacheCfg);
     const live_snapshot = try flags.g().register("snapshot", engine.SnapshotCfg);
     const live_runtime = try flags.g().register("runtime", RuntimeCfg);
@@ -396,7 +396,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const raft_cfg = live_raft.cur();
     const shutdown_cfg = live_shutdown.cur();
     const zdb_cfg = live_zdb.cur();
-    const remote_cfg = live_remote.cur();
+    const store_cfg = live_store.cur();
     const cache_cfg = live_cache.cur();
     const runtime_cfg = live_runtime.cur();
     const wal_cfg = live_wal.cur();
@@ -410,17 +410,17 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         usage(allocator);
         std.process.exit(1);
     }
-    const remote_dir = remote_cfg.dir_path.len > 0;
-    if (remote_dir == (remote_cfg.s3_endpoint.len > 0)) {
-        std.log.err("--remote needs dir_path or s3_endpoint, not both", .{});
+    const store_dir = store_cfg.dir_path.len > 0;
+    if (store_dir == (store_cfg.s3_endpoint.len > 0)) {
+        std.log.err("--store needs dir_path or s3_endpoint, not both", .{});
         std.process.exit(1);
     }
-    if (!remote_dir and remote_cfg.s3_bucket.len == 0) {
-        std.log.err("--remote s3_endpoint requires s3_bucket", .{});
+    if (!store_dir and store_cfg.s3_bucket.len == 0) {
+        std.log.err("--store s3_endpoint requires s3_bucket", .{});
         std.process.exit(1);
     }
-    if (remote_dir and std.mem.eql(u8, remote_cfg.dir_path, wal_cfg.dir)) {
-        std.log.err("--remote dir_path and --wal dir must differ", .{});
+    if (store_dir and std.mem.eql(u8, store_cfg.dir_path, wal_cfg.dir)) {
+        std.log.err("--store dir_path and --wal dir must differ", .{});
         std.process.exit(1);
     }
 
@@ -456,8 +456,8 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const calibrate = zdb.vfs.calibrate;
     try calibrate.initGlobal(io_cfg);
     const wal_vfs = try calibrate.deviceVfs(allocator, io_cfg, wal_dir);
-    const data_vfs = if (remote_dir)
-        try calibrate.deviceVfs(allocator, io_cfg, remote_cfg.dir_path)
+    const data_vfs = if (store_dir)
+        try calibrate.deviceVfs(allocator, io_cfg, store_cfg.dir_path)
     else
         null;
     const cache_vfs = if (cache_cfg.disk_path.len == 0)
@@ -480,31 +480,31 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     );
 
     // The remote store every SST lives in.
-    var store: zdb.vfs.RemoteStore = if (remote_dir)
+    var store: zdb.vfs.RemoteStore = if (store_dir)
         try zdb.vfs.RemoteStore.initFile(
             allocator,
-            remote_cfg.dir_path,
+            store_cfg.dir_path,
             data_vfs.?,
         )
     else
         try zdb.vfs.RemoteStore.initS3(allocator, .{
-            .endpoint = remote_cfg.s3_endpoint,
-            .bucket = remote_cfg.s3_bucket,
-            .prefix = remote_cfg.s3_prefix,
+            .endpoint = store_cfg.s3_endpoint,
+            .bucket = store_cfg.s3_bucket,
+            .prefix = store_cfg.s3_prefix,
             .cache = .{
                 .path = cache_cfg.disk_path,
-                .capacity_bytes = cache_cfg.disk_mib << 20,
-                .chunk_bytes = cache_cfg.chunk_kib << 10,
+                .capacity_bytes = cache_cfg.disk_bytes,
+                .chunk_bytes = cache_cfg.chunk_bytes,
                 .vfs = cache_vfs,
             },
         });
     defer store.deinit();
-    if (remote_dir) {
-        log.info("remote: dir {s}", .{remote_cfg.dir_path});
+    if (store_dir) {
+        log.info("store: dir {s}", .{store_cfg.dir_path});
     } else {
-        log.info("remote: s3 {s}/{s}/{s}", .{
-            remote_cfg.s3_endpoint, remote_cfg.s3_bucket,
-            remote_cfg.s3_prefix,
+        log.info("store: s3 {s}/{s}/{s}", .{
+            store_cfg.s3_endpoint, store_cfg.s3_bucket,
+            store_cfg.s3_prefix,
         });
     }
     // Size the future read-lookahead to this endpoint's latency knee.
@@ -528,7 +528,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     log.info("opening raft WAL at {s}", .{wal_dir});
     var wal = try raft.DiskWAL.openPath(wal_dir, allocator, .{
         .vfs = wal_vfs,
-        .log_file_size = wal_cfg.log_file_mib << 20,
+        .log_file_size = wal_cfg.log_file_bytes,
         .prezero = wal_cfg.prezero,
         .max_spare_log_files = wal_cfg.max_spare_log_files,
     });
@@ -556,8 +556,8 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // open table. With blocks cached decompressed here, tables open
     // O_DIRECT: the page cache would otherwise hold the same data twice.
     const mem = utils.host.memory();
-    const total: u64 = if (cache_cfg.total_mib > 0)
-        cache_cfg.total_mib << 20
+    const total: u64 = if (cache_cfg.total_bytes > 0)
+        cache_cfg.total_bytes
     else
         mem.bytes / 10 * 9;
     // Starts at the cap the governor's first tick would set.

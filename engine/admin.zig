@@ -1329,7 +1329,7 @@ pub const AdminServer = struct {
         try memLine(w, "other live", other, "");
         if (_governor.g()) |gov| {
             try w.print("governor:\n", .{});
-            try memLine(w, "total", gov.total, "--cache total_mib, resident");
+            try memLine(w, "total", gov.total, "--cache total_bytes, resident");
             try w.print("  ratio:        {d:.3}   (resident per live " ++
                 "byte, recent peak; last {d:.3})\n", .{
                 gov.ratio.cur, gov.ratio.measured,

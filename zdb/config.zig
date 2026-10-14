@@ -37,7 +37,7 @@ pub const Config = struct {
     flush_max_age_seconds: u32 = 30,
 
     block_bytes: usize = 32 * 1024,
-    num_compactors: u8 = 2,
+    num_compactors: u8 = 4,
     /// Fibers one merge into the level beneath splits into, along that
     /// level's table boundaries (compaction.partitions), each merging
     /// and writing its own key range. A merge on one fiber was up to
@@ -166,7 +166,7 @@ pub const Config = struct {
     pub const docs = .{
         .self = "LSM forest storage: memtable and flush policy, level" ++
             " shape, compaction and backpressure. SSTs live in the" ++
-            " --remote store. Live: an update reaches the next flush," ++
+            " --store. Live: an update reaches the next flush," ++
             " compaction job or check.",
         .read_only = "Open the forest without writing to it.",
         .table_bytes = "Bytes a memtable holds before it is frozen and" ++

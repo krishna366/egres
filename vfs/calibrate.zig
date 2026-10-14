@@ -36,7 +36,7 @@ const request_size: u64 = 1 << 20;
 /// and the setting when the probe is off.
 pub const Cfg = struct {
     auto_calibrate: bool = true,
-    bandwidth_mib: u64 = 1024,
+    bandwidth_bytes: u64 = 1 << 30,
     write_cost: u8 = 2,
 
     pub const docs = .{
@@ -45,9 +45,9 @@ pub const Cfg = struct {
             "write_cost reads of the same size.",
         .auto_calibrate = "Probe the data directory at startup and take " ++
             "both numbers from the device. A failed probe falls back to " ++
-            "bandwidth_mib and write_cost.",
-        .bandwidth_mib = "Read bandwidth in MiB/s the budget refills at, " ++
-            "when not calibrated.",
+            "bandwidth_bytes and write_cost.",
+        .bandwidth_bytes = "Read bandwidth per second the budget refills " ++
+            "at, when not calibrated.",
         .write_cost = "How many reads of the same size a write costs, " ++
             "when not calibrated. 1 to 32.",
     };
@@ -116,7 +116,7 @@ pub fn deviceVfs(
 /// The `--io` numbers as a limiter config.
 fn pinnedConfig(io_cfg: Cfg) _bandwidth.Config {
     return .{
-        .bytes_per_sec = io_cfg.bandwidth_mib << 20,
+        .bytes_per_sec = io_cfg.bandwidth_bytes,
         .write_cost = io_cfg.write_cost,
     };
 }
@@ -131,14 +131,15 @@ fn deviceConfig(
     if (!io_cfg.auto_calibrate) return pinned;
     const p = runCalibration(allocator, dir) catch |err| {
         log.warn("disk calibration of {s} failed: {s}; using --io " ++
-            "bandwidth_mib={d} write_cost={d}", .{
-            dir, @errorName(err), io_cfg.bandwidth_mib, io_cfg.write_cost,
+            "bandwidth_bytes={d}MiB write_cost={d}", .{
+            dir,                         @errorName(err),
+            io_cfg.bandwidth_bytes >> 20, io_cfg.write_cost,
         });
         return pinned;
     };
     const cfg = bwConfigFrom(p);
     log.info("disk calibrated: {s}: read {d} MiB/s, write {d} MiB/s; " ++
-        "setting bandwidth_mib={d} write_cost={d}", .{
+        "setting bandwidth_bytes={d}MiB write_cost={d}", .{
         dir,                     p.read_bps >> 20, p.write_bps >> 20,
         cfg.bytes_per_sec >> 20, cfg.write_cost,
     });
