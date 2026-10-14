@@ -58,8 +58,7 @@ pub const AmzDate = struct {
 /// Build the Authorization header value for one request. `path` is the
 /// canonical URI (absolute, already URI-safe — our object keys are hex
 /// names and prefixes are restricted to unreserved characters, so no
-/// percent-encoding pass is needed). No query string support (none used).
-/// Caller owns the returned slice.
+/// percent-encoding pass is needed). Caller owns the returned slice.
 pub fn authorization(
     a: std.mem.Allocator,
     access_key: String,
@@ -75,10 +74,24 @@ pub fn authorization(
     host: String,
     payload_hash: String,
     amz: *const AmzDate,
+    /// Temporary-credential token (AWS_SESSION_TOKEN), null for
+    /// long-lived keys. Sent as x-amz-security-token, which SigV4
+    /// requires in the signed set; it sorts after x-amz-date.
+    session_token: ?String,
 ) ![]u8 {
-    const canonical = try std.fmt.allocPrint(a, "{s}\n{s}\n{s}\nhost:{s}\nx-amz-content-sha256:{s}\nx-amz-date:{s}\n\n" ++
-        signed_headers ++ "\n{s}", .{
-        method, path, query, host, payload_hash, &amz.stamp, payload_hash,
+    const signed: String = if (session_token != null)
+        signed_headers ++ ";x-amz-security-token"
+    else
+        signed_headers;
+    const token_hdr: String = if (session_token) |t|
+        try std.fmt.allocPrint(a, "x-amz-security-token:{s}\n", .{t})
+    else
+        "";
+    defer if (session_token != null) a.free(token_hdr);
+    const canonical = try std.fmt.allocPrint(a, "{s}\n{s}\n{s}\nhost:{s}\n" ++
+        "x-amz-content-sha256:{s}\nx-amz-date:{s}\n{s}\n{s}\n{s}", .{
+        method,     path,      query,     host, payload_hash,
+        &amz.stamp, token_hdr, signed,    payload_hash,
     });
     defer a.free(canonical);
 
@@ -89,9 +102,9 @@ pub fn authorization(
     defer a.free(sts);
 
     const sig = signature(secret_key, amz.date(), region, service, sts);
-    return std.fmt.allocPrint(a, "AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/" ++ service ++
-        "/aws4_request, SignedHeaders=" ++ signed_headers ++ ", Signature={s}", .{
-        access_key, amz.date(), region, &sig,
+    return std.fmt.allocPrint(a, "AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/" ++
+        service ++ "/aws4_request, SignedHeaders={s}, Signature={s}", .{
+        access_key, amz.date(), region, signed, &sig,
     });
 }
 

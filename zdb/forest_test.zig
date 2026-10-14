@@ -2741,7 +2741,7 @@ test "cursor: pin_values holds handed-out values until releasePins" {
     try f.newMemtable(1);
 
     // 200 rows of 1 KiB, value[0] = the row number: one memtable arena
-    // now, several SST blocks (the builder targets 32 KiB) once flushed.
+    // now, several SST blocks (the builder targets 16 KiB) once flushed.
     const n_rows = 200;
     var keys: [n_rows][3]u8 = undefined;
     for (&keys, 0..) |*k, i| _ = try std.fmt.bufPrint(k, "{d:0>3}", .{i});

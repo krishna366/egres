@@ -445,7 +445,7 @@ test "sql.exec: seq_scan: borrowed values outlive the blocks the walk left" {
     var b = try Batch.init(testing.allocator);
     defer b.deinit();
 
-    // 400 rows of 1 KiB across several 32 KiB SST blocks, all in ONE
+    // 400 rows of 1 KiB across several 16 KiB SST blocks, all in ONE
     // batch: only keys land in `bytes`; values are borrows into blocks
     // the cursor pinned — and every one still reads after the walk
     // moved past its block.

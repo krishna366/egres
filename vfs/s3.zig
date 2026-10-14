@@ -16,7 +16,8 @@
 //! (chunked → error), single PUT ≤ 5 GiB (no multipart).
 //!
 //! Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY at
-//! init. Local testing: SeaweedFS — `weed server -s3`.
+//! init, plus AWS_SESSION_TOKEN when the keys are temporary (SSO, an
+//! assumed role). Local testing: SeaweedFS — `weed server -s3`.
 
 const std = @import("std");
 const fiber = @import("zfiber");
@@ -46,6 +47,10 @@ pub const S3Config = struct {
     /// only — keys are used verbatim in the request path (no
     /// percent-encoding pass).
     prefix: String = "",
+    /// SigV4 signing region. Empty = read off the endpoint host
+    /// (regionFromHost); set it when the host carries none (R2, a
+    /// VPC endpoint) and the service rejects us-east-1.
+    region: String = "",
     /// Requests in flight at once, which is also the number of
     /// keep-alive connections held: one response at a time per
     /// connection.
@@ -59,7 +64,7 @@ pub const S3Store = struct {
     /// Original endpoint URL, for logs.
     endpoint: String,
     bucket: String,
-    /// SigV4 signing region, taken from the host (regionFromHost).
+    /// SigV4 signing region: S3Config.region, else off the host.
     region: String,
     prefix: String,
     /// Bare host name — TLS SNI + certificate verification.
@@ -75,6 +80,8 @@ pub const S3Store = struct {
     // Environ-backed slices: process lifetime, never freed.
     access_key: String,
     secret_key: String,
+    /// AWS_SESSION_TOKEN; null for long-lived keys.
+    session_token: ?String,
     // System trust roots, loaded once at init when use_tls.
     ca_bundle: std.crypto.Certificate.Bundle = .empty,
     ca_lock: std.Io.RwLock = .init,
@@ -114,6 +121,7 @@ pub const S3Store = struct {
             log.err("s3 store requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the environment", .{});
             return error.MissingCredentials;
         }
+        const token = ctx.env("AWS_SESSION_TOKEN") orelse "";
         const ep = fiber.net.parseEndpoint(cfg.endpoint) catch {
             log.err("s3 endpoint must be http(s)://host[:port], got '{s}'", .{cfg.endpoint});
             return error.BadEndpoint;
@@ -133,7 +141,10 @@ pub const S3Store = struct {
             .arena = undefined,
             .endpoint = try arloc.dupe(u8, cfg.endpoint),
             .bucket = try arloc.dupe(u8, cfg.bucket),
-            .region = try arloc.dupe(u8, regionFromHost(ep.host)),
+            .region = try arloc.dupe(u8, if (cfg.region.len > 0)
+                cfg.region
+            else
+                regionFromHost(ep.host)),
             .prefix = try arloc.dupe(u8, cfg.prefix),
             .host = try arloc.dupe(u8, ep.host),
             .host_header = if (default_port)
@@ -144,6 +155,7 @@ pub const S3Store = struct {
             .use_tls = ep.tls,
             .access_key = access,
             .secret_key = secret,
+            .session_token = if (token.len > 0) token else null,
             .conns = try fiber.Channel(Slot).initAlloc(a, cfg.max_inflight),
             .cache = try _chunkcache.ChunkCache.init(a, cfg.cache),
         };
@@ -758,6 +770,7 @@ pub const S3Store = struct {
             self.host_header,
             &payload_hash,
             &amz,
+            self.session_token,
         );
         defer a.free(auth);
 
@@ -778,6 +791,9 @@ pub const S3Store = struct {
             &amz.stamp,                 &payload_hash, auth,
             if (body) |b| b.len else 0,
         });
+        if (self.session_token) |t| {
+            try head_buf.print(a, "x-amz-security-token: {s}\r\n", .{t});
+        }
         if (req.range) |r| {
             try head_buf.print(a, "Range: bytes={d}-{d}\r\n", .{
                 r[0], r[0] + r[1] - 1,

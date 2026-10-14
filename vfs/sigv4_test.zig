@@ -78,10 +78,39 @@ test "sigv4: authorization header shape" {
         "127.0.0.1:8333",
         &payload_hash,
         &amz,
+        null,
     );
     defer a.free(auth);
     try testing.expect(std.mem.startsWith(u8, auth, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, " ++
         "SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="));
     // Signature is 64 hex chars.
     try testing.expectEqual(@as(usize, 64), auth.len - (std.mem.indexOf(u8, auth, "Signature=").? + "Signature=".len));
+}
+
+test "sigv4: session token joins the signed headers" {
+    const a = testing.allocator;
+    const amz = sigv4.AmzDate.fromEpochSeconds(1440938160);
+    const payload_hash = sigv4.hashHex("");
+    const args = .{
+        "AKIDEXAMPLE",
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        "us-east-1",
+        "GET",
+        "/bucket/0001_000000000001.sst",
+        "",
+        "127.0.0.1:8333",
+        &payload_hash,
+        &amz,
+    };
+    const with = try @call(.auto, sigv4.authorization, .{a} ++ args ++
+        .{@as(?[]const u8, "FwoGZXIvYXdzEBYaDEXAMPLETOKEN")});
+    defer a.free(with);
+    const without = try @call(.auto, sigv4.authorization, .{a} ++ args ++
+        .{@as(?[]const u8, null)});
+    defer a.free(without);
+    try testing.expect(std.mem.indexOf(u8, with, "SignedHeaders=host;" ++
+        "x-amz-content-sha256;x-amz-date;x-amz-security-token, ") != null);
+    // The token changes the canonical request, so the signature too.
+    const sig_at = std.mem.indexOf(u8, with, "Signature=").?;
+    try testing.expect(!std.mem.eql(u8, with[sig_at..], without[sig_at..]));
 }

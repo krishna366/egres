@@ -122,6 +122,7 @@ const StoreCfg = struct {
     s3_endpoint: String = "",
     s3_bucket: String = "",
     s3_prefix: String = "",
+    s3_region: String = "",
 
     pub const docs = .{
         .self = "Object store holding every SST. Required: either" ++
@@ -130,14 +131,18 @@ const StoreCfg = struct {
             " such as NFS for a cluster.",
         .s3_endpoint = "S3-compatible endpoint URL: http://host[:port]" ++
             " or https://host[:port]. The scheme decides TLS; the host" ++
-            " may be a DNS name or IP literal, and names the SigV4" ++
-            " region (s3.<region>.<domain>, else us-east-1). E.g." ++
-            " https://s3.us-east-005.backblazeb2.com or" ++
+            " may be a DNS name or IP literal. E.g." ++
+            " https://s3.us-west-2.amazonaws.com or" ++
             " http://127.0.0.1:8333. Creds via AWS_ACCESS_KEY_ID /" ++
-            " AWS_SECRET_ACCESS_KEY.",
+            " AWS_SECRET_ACCESS_KEY, plus AWS_SESSION_TOKEN for" ++
+            " temporary ones.",
         .s3_bucket = "Bucket name. Required with s3_endpoint.",
         .s3_prefix = "Optional key prefix inside the bucket (unreserved URI" ++
             " characters only).",
+        .s3_region = "SigV4 signing region. Empty = taken from the" ++
+            " endpoint host (s3.<region>.<domain>, else us-east-1)." ++
+            " Set it for a host that carries none, such as R2 or a" ++
+            " VPC endpoint.",
     };
 };
 
@@ -491,6 +496,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
             .endpoint = store_cfg.s3_endpoint,
             .bucket = store_cfg.s3_bucket,
             .prefix = store_cfg.s3_prefix,
+            .region = store_cfg.s3_region,
             .cache = .{
                 .path = cache_cfg.disk_path,
                 .capacity_bytes = cache_cfg.disk_bytes,

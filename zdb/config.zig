@@ -36,7 +36,7 @@ pub const Config = struct {
     flush_min_memtables: u32 = 4,
     flush_max_age_seconds: u32 = 30,
 
-    block_bytes: usize = 32 * 1024,
+    block_bytes: usize = 16 * 1024,
     num_compactors: u8 = 4,
     /// Fibers one merge into the level beneath splits into, along that
     /// level's table boundaries (compaction.partitions), each merging
