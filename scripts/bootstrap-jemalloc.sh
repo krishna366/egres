@@ -66,8 +66,12 @@ fi
 mkdir -p "$build_dir"
 (
     cd "$build_dir"
+    # On macOS jemalloc defaults to a je_ API prefix; empty keeps the
+    # names galloc imports and makes it the default malloc zone too,
+    # as it overrides libc malloc on Linux.
     CFLAGS="-O3 -DNDEBUG" "$source_dir/configure" \
         --prefix="$install_dir" \
+        --with-jemalloc-prefix= \
         --disable-shared \
         --enable-static \
         --enable-stats \
