@@ -10,7 +10,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Linux is the deployment target; macOS is a development target,
+    # and the Apple Silicon runner is the only place its kqueue and
+    # 16 KiB-page paths run.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7

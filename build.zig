@@ -94,7 +94,7 @@ pub fn build(b: *std.Build) void {
     );
 
     const mods = makeModules(b, target, optimize);
-    const regen_buffers_step = addRegenAllBuffers(b, target, optimize, mods);
+    const regen_buffers_step = addRegenAllBuffers(b, optimize);
     const bootstrap_jemalloc = b.addSystemCommand(&.{
         "bash",
         "scripts/bootstrap-jemalloc.sh",
@@ -131,7 +131,7 @@ pub fn build(b: *std.Build) void {
     // The engine's admin `mem` prints the backend's own counters.
     mods.engine.addImport("galloc", galloc);
 
-    addZbufCli(b, target, optimize, mods);
+    addZbufCli(b, optimize);
     // `zig build check`: type-check the server binary and every test file with
     // no codegen and no linking. ZLS runs it on save for diagnostics; the
     // per-file test roots registered in addAllTests are what let ZLS resolve
@@ -352,21 +352,23 @@ fn generatedPathForSchema(b: *std.Build, schema_path: []const u8) []const u8 {
 
 fn addZbufGenRun(
     b: *std.Build,
-    target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    mods: Modules,
     buffers_path: []const u8,
     out_path: []const u8,
     exe_name: []const u8,
 ) *std.Build.Step {
-    const buffers_mod = makeModule(b, target, optimize, buffers_path);
-    buffers_mod.addImport("schema", mods.schema);
+    // The generator runs at build time, so it is built for the host
+    // even when `target` is a cross target; its modules follow.
+    const host = b.graph.host;
+    const schema = makeModule(b, host, optimize, "zbuf/schema.zig");
+    const buffers_mod = makeModule(b, host, optimize, buffers_path);
+    buffers_mod.addImport("schema", schema);
 
     const gen = b.addExecutable(.{
         .name = exe_name,
-        .root_module = makeModule(b, target, optimize, "zbuf/gen.zig"),
+        .root_module = makeModule(b, host, optimize, "zbuf/gen.zig"),
     });
-    gen.root_module.addImport("schema", mods.schema);
+    gen.root_module.addImport("schema", schema);
     gen.root_module.addImport("buffers", buffers_mod);
 
     const run_gen = b.addRunArtifact(gen);
@@ -381,9 +383,7 @@ fn addZbufGenRun(
 
 fn addRegenAllBuffers(
     b: *std.Build,
-    target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    mods: Modules,
 ) *std.Build.Step {
     const step = b.step("buffers", "Regenerate all discovered */buffers.gen.zig files");
     const schema_paths = collectBufferSchemas(b);
@@ -391,9 +391,7 @@ fn addRegenAllBuffers(
         const out_path = generatedPathForSchema(b, schema_path);
         const run_step = addZbufGenRun(
             b,
-            target,
             optimize,
-            mods,
             schema_path,
             out_path,
             b.fmt("zbuf-gen-all-{d}", .{idx}),
@@ -692,9 +690,7 @@ fn addAllTests(
 
 fn addZbufCli(
     b: *std.Build,
-    target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    mods: Modules,
 ) void {
     // Zbuf CLI: zig build zbuf -- path/to/buffers.zig
     // Defaults to zbuf/buffers.zig (the test/example schema) if no args.
@@ -706,9 +702,7 @@ fn addZbufCli(
     const out_path = generatedPathForSchema(b, buffers_path);
     const run_gen_step = addZbufGenRun(
         b,
-        target,
         optimize,
-        mods,
         buffers_path,
         out_path,
         "zbuf-gen-dyn",

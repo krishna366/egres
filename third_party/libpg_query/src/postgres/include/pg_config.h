@@ -807,7 +807,12 @@
 /* Define to the equivalent of the C99 'restrict' keyword, or to
    nothing if this is not supported.  Do not define if restrict is
    supported directly.  */
+/* egres: guarded. Darwin and musl define __restrict as restrict, and
+   Zig's translate-c loops on the restrict <-> __restrict cycle. A C99
+   compiler supports restrict directly, as the note above says. */
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L
 #define restrict __restrict
+#endif
 /* Work around a bug in Sun C++: it does not support _Restrict or
    __restrict__, even though the corresponding Sun C compiler ends up with
    "#define restrict _Restrict" or "#define restrict __restrict__" in the

@@ -43,7 +43,12 @@ if [[ ! -f "$archive" ]]; then
     mv "$archive.part" "$archive"
 fi
 
-actual_sha=$(sha256sum "$archive")
+# macOS ships shasum, not sha256sum; both print "<hash>  <file>".
+if command -v sha256sum >/dev/null; then
+    actual_sha=$(sha256sum "$archive")
+else
+    actual_sha=$(shasum -a 256 "$archive")
+fi
 actual_sha=${actual_sha%% *}
 if [[ "$actual_sha" != "$expected_sha" ]]; then
     echo "jemalloc checksum mismatch" >&2
@@ -67,7 +72,10 @@ mkdir -p "$build_dir"
         --enable-static \
         --enable-stats \
         --disable-debug
-    make -j"${JEMALLOC_BUILD_JOBS:-$(nproc)}"
+    # nproc is Linux; macOS answers through sysctl.
+    jobs=${JEMALLOC_BUILD_JOBS:-$(nproc 2>/dev/null ||
+        sysctl -n hw.ncpu)}
+    make -j"$jobs"
     make install_lib_static install_include
 )
 

@@ -682,34 +682,58 @@ test "diskwal rotated file with no record at all is dropped at open" {
         vfs.deleteTree(wal_dir) catch {};
         alloc.free(wal_dir);
     }
-    // 40 entries of 1 MiB in three 32 MiB files: 15 fit in a file
-    // (1 to 15, 16 to 30, 31 to 40).
-    const opts: raft.diskwal.OpenOptions = .{ .log_file_size = 32 << 20 };
-    const payload = try alloc.alloc(u8, 1 << 20);
+    // 12 entries of 300 KiB in 17 MiB files (1 MiB past the header,
+    // the minimum): 3 per file. The next file's 1 MiB zero-fill runs
+    // at p2 through a 1 MiB/s limiter whose one-second bucket the
+    // open's own fill empties, so it takes about a second and the
+    // first rotation, a few ms in, finds it unready: an unfilled file
+    // under a skipped fid, as on a slow disk. The layout is read
+    // back, not assumed.
+    var limiter = vfs.bandwidth.Limiter.init(.{
+        .bytes_per_sec = 1 << 20,
+        .write_cost = 1,
+    });
+    const wal_vfs = vfs.VFS.new(&limiter);
+    const opts: raft.diskwal.OpenOptions = .{
+        .log_file_size = 17 << 20,
+        .prezero = .true,
+        .vfs = &wal_vfs,
+    };
+    const payload = try alloc.alloc(u8, 300 << 10);
     defer alloc.free(payload);
+    var first_last: u64 = 0;
+    var second_fid: u64 = 0;
     {
         var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
         defer ds.deinit();
         var idx: u64 = 1;
-        while (idx <= 40) : (idx += 1) {
+        while (idx <= 12) : (idx += 1) {
             fillLargePayload(payload, idx);
             try appendEntry(alloc, &ds, idx, 1, payload);
         }
         try ds.sync();
+        const files = ds.wal_store.files.items;
+        first_last = files[0].lastEntry().?.index;
+        second_fid = files[1].fid;
     }
 
     // The second file as a crash can leave one whose records never
     // reached the disk: the empty header, and no record after it.
-    const second_path = try std.fmt.allocPrint(
+    var name_buf: raft.diskwal.LogFile.NameBuf = undefined;
+    const second_name = try raft.diskwal.LogFile.fname(
+        second_fid,
+        &name_buf,
+    );
+    const second_path = try raft.diskwal.LogFile.fullPath(
         alloc,
-        "{s}/00002.wal",
-        .{wal_dir},
+        wal_dir,
+        second_name,
     );
     defer alloc.free(second_path);
     const io = utils.context.g().io;
     {
         const created = raft.diskwal.LogFile{
-            .fid = 2,
+            .fid = second_fid,
             .handle = undefined,
             .allocator = alloc,
             .slots = .empty,
@@ -735,13 +759,16 @@ test "diskwal rotated file with no record at all is dropped at open" {
     }
 
     // Reopen: the empty file is gone, and the log ends where the gap
-    // it left begins, after the first file's 15 entries.
+    // it left begins, at the first file's last entry.
     var ds = try raft.DiskWAL.openPath(wal_dir, alloc, opts);
     defer ds.deinit();
-    try std.testing.expect(!try dirHas(wal_dir, "00002.wal"));
-    try std.testing.expectEqual(@as(u64, 15), ds.lastIndex());
-    try std.testing.expectEqual(@as(?u64, 1), try ds.term(15));
-    try std.testing.expectEqual(@as(?u64, null), try ds.term(16));
+    try std.testing.expect(!try dirHas(wal_dir, second_name));
+    try std.testing.expectEqual(first_last, ds.lastIndex());
+    try std.testing.expectEqual(@as(?u64, 1), try ds.term(first_last));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try ds.term(first_last + 1),
+    );
 }
 
 test "BIG: diskwal large payload rotation" {

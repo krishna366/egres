@@ -46,7 +46,12 @@ if [[ ! -f "$archive" ]]; then
     mv "$archive.part" "$archive"
 fi
 
-actual_sha=$(sha256sum "$archive")
+# macOS ships shasum, not sha256sum; both print "<hash>  <file>".
+if command -v sha256sum >/dev/null; then
+    actual_sha=$(sha256sum "$archive")
+else
+    actual_sha=$(shasum -a 256 "$archive")
+fi
 actual_sha=${actual_sha%% *}
 if [[ "$actual_sha" != "$expected_sha" ]]; then
     echo "mimalloc checksum mismatch" >&2

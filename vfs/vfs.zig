@@ -91,7 +91,9 @@ pub const ReadResult = struct {
 pub const FileHandle = struct {
     file: ?fiber.File = null,
     file_size: u64,
-    mapped: ?[]align(page_size) const u8 = null,
+    /// Aligned to the OS page, not `page_size`: munmap wants the
+    /// former, and on aarch64-macos it is 16 KiB.
+    mapped: ?[]align(std.heap.page_size_min) const u8 = null,
     owned_buf: ?[]u8 = null, // memory mode: entire file read into this buffer
     buf_allocator: ?std.mem.Allocator = null, // for freeing owned_buf on close
     vfs: *const VFS,
@@ -468,7 +470,7 @@ pub const VFS = struct {
         };
 
         if (builtin.os.tag == .macos and opts.mode == .direct) {
-            _ = posix.fcntl(fd, 48, 1) catch {};
+            _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
         }
 
         return .{
@@ -758,8 +760,8 @@ pub fn openDirect(path: String, opts: FileOptions) !posix.fd_t {
     };
 
     if (builtin.os.tag == .macos and direct_io) {
-        // F_NOCACHE = 48 on macOS — bypass the unified buffer cache.
-        _ = posix.fcntl(fd, 48, 1) catch {};
+        // F_NOCACHE: bypass the unified buffer cache. Best effort.
+        _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
     }
     if (opts.flags.random and !direct_io) adviseRandom(fd);
 
@@ -773,8 +775,8 @@ fn adviseRandom(fd: posix.fd_t) void {
             const linux = std.os.linux;
             _ = linux.fadvise(fd, 0, 0, linux.POSIX_FADV.RANDOM);
         },
-        // F_RDAHEAD = 45; 0 turns readahead off.
-        .macos => _ = posix.fcntl(fd, 45, 0) catch {},
+        // F_RDAHEAD 0 turns readahead off. Best effort.
+        .macos => _ = std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)),
         else => {},
     }
 }
