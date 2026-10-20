@@ -442,6 +442,13 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
 
     const seeds = try parseSeedList(raft_cfg.seeds, allocator);
     defer allocator.free(seeds);
+    // This release runs a single node: no joining, and no membership
+    // changes over the admin socket (AdminServer.handleConf).
+    if (seeds.len > 0) {
+        log.err("--raft seeds: joining a cluster is not available in" ++
+            " this release; start without seeds", .{});
+        return error.ClusteringDisabled;
+    }
     const args: Args = .{
         .listen = listen,
         .raft = raft_cfg,

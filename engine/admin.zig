@@ -1366,6 +1366,13 @@ pub const AdminServer = struct {
     }
 
     fn handleConf(self: *AdminServer, stream: fiber.net.Stream, req: proto.ConfCmd) !void {
+        // This release runs a single node (main.zig refuses seeds too).
+        const single_node_release = true;
+        if (single_node_release) {
+            try proto.writeErr(stream, "cluster membership changes are" ++
+                " not available in this release");
+            return;
+        }
         const change_type: raft.ConfChangeType = switch (req.action) {
             .add => .add_learner,
             .to_voter => .to_voter,
