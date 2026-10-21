@@ -1,5 +1,6 @@
 # The documentation site (manishrjain/docs-egres) builds from docs/ in this
-# repository. Tell it to rebuild whenever that directory changes on main.
+# repository and serves scripts/install.sh as egresql.io/install.sh. Tell
+# it to rebuild whenever either changes on main.
 #
 # DOCS_DISPATCH_TOKEN is a fine-grained token with write access to the
 # contents of manishrjain/docs-egres, which is what repository_dispatch
@@ -9,7 +10,7 @@ name: docs
 on:
   push:
     branches: [main]
-    paths: ['docs/**']
+    paths: ['docs/**', 'scripts/install.sh']
   workflow_dispatch:
 
 permissions:

@@ -74,6 +74,7 @@ mkdir -p "$build_dir"
         --with-jemalloc-prefix= \
         --disable-shared \
         --enable-static \
+        --disable-cxx \
         --enable-stats \
         --disable-debug
     # nproc is Linux; macOS answers through sysctl.
