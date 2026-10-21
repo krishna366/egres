@@ -36,7 +36,10 @@ SECTOR = 512  # /proc/diskstats counts 512-byte sectors on any device
 
 def disks() -> dict:
     """Whole disks: name -> (bytes read, bytes written, reads, writes)
-    since boot; the last two are completed requests."""
+    since boot; the last two are completed requests. Empty off Linux,
+    where there is no /proc: the summaries then carry no disk bytes."""
+    if not Path("/proc/diskstats").exists():
+        return {}
     names = {p.name for p in Path("/sys/block").iterdir()
              if not p.name.startswith(("loop", "ram", "zram", "zd"))}
     out = {}
@@ -58,6 +61,8 @@ def disk_of_dev(name: str) -> str:
 
 def device_of(path) -> list:
     """The disks under `path`, or [] when they cannot be told."""
+    if not Path("/proc/mounts").exists():
+        return []
     st = os.stat(path)
     node = Path(f"/sys/dev/block/{os.major(st.st_dev)}:"
                 f"{os.minor(st.st_dev)}")
@@ -100,10 +105,13 @@ def proc_io(pid):
     return int(vals["read_bytes"]), int(vals["write_bytes"])
 
 
-def host_cpu() -> tuple:
+def host_cpu():
     """(busy, total) CPU seconds of the host since boot, summed over
-    every CPU: busy is everything but idle and iowait."""
-    f = Path("/proc/stat").read_text().split("\n", 1)[0].split()
+    every CPU: busy is everything but idle and iowait. None off Linux."""
+    try:
+        f = Path("/proc/stat").read_text().split("\n", 1)[0].split()
+    except OSError:
+        return None
     ticks = [int(x) for x in f[1:9]]
     hz = os.sysconf("SC_CLK_TCK")
     idle = ticks[3] + ticks[4]
@@ -142,7 +150,7 @@ def delta(a: dict, b: dict) -> dict:
     """What happened between snapshots `a` and `b`. `proc` is None
     when the process is not the same one at both ends (a restart).
     `cpu`: the host's cores busy on average, its core count, and the
-    cores the server used on average (None when unknown)."""
+    cores the server used on average (each None when unknown)."""
     out = {"secs": b["time"] - a["time"], "disks": {}, "proc": None}
     for name, now in b["disks"].items():
         then = a["disks"].get(name, (0, 0, 0, 0))
@@ -152,13 +160,16 @@ def delta(a: dict, b: dict) -> dict:
     if a["proc"] and b["proc"] and a["pid"] == b["pid"]:
         out["proc"] = (b["proc"][0] - a["proc"][0],
                        b["proc"][1] - a["proc"][1])
-    busy = b["host_cpu"][0] - a["host_cpu"][0]
-    total = b["host_cpu"][1] - a["host_cpu"][1]
     ncpu = os.cpu_count() or 1
+    host = None
+    if a["host_cpu"] and b["host_cpu"]:
+        busy = b["host_cpu"][0] - a["host_cpu"][0]
+        total = b["host_cpu"][1] - a["host_cpu"][1]
+        host = busy / max(total, 1e-9) * ncpu
     server = None
     if a["server_cpu"] is not None and b["server_cpu"] is not None \
             and a["pid"] == b["pid"]:
         server = (b["server_cpu"] - a["server_cpu"]) / max(out["secs"], 1)
-    out["cpu"] = {"host_cores_busy": busy / max(total, 1e-9) * ncpu,
-                  "host_cores": ncpu, "server_cores": server}
+    out["cpu"] = {"host_cores_busy": host, "host_cores": ncpu,
+                  "server_cores": server}
     return out

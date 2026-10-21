@@ -175,6 +175,15 @@ def server_mem(pid) -> int:
     memory counted once. Page cache is not in it. 0 when unreadable."""
     if not pid:
         return 0
+    if not Path("/proc").exists():
+        # macOS: the server process's resident set, from ps (KiB).
+        try:
+            out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout
+            return int(out.strip() or 0) * 1024
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return 0
     anon, shared = 0, 0
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
@@ -568,12 +577,13 @@ def io_snapshot(run) -> dict:
 
 
 def cpu_text(cpu: dict) -> str:
-    """` cpu host=12.3/32 server=8.1` cores, server `-` when unknown."""
-    server = cpu["server_cores"]
-    return (f" cpu host={cpu['host_cores_busy']:.1f}/{cpu['host_cores']}"
-            f" server={server:.1f}" if server is not None else
-            f" cpu host={cpu['host_cores_busy']:.1f}/{cpu['host_cores']}"
-            " server=-")
+    """` cpu host=12.3/32 server=8.1` cores, `-` for what is unknown
+    (the server without a cgroup or a single process; the host off
+    Linux)."""
+    host, server = cpu["host_cores_busy"], cpu["server_cores"]
+    h = f"{host:.1f}" if host is not None else "-"
+    s = f"{server:.1f}" if server is not None else "-"
+    return f" cpu host={h}/{cpu['host_cores']} server={s}"
 
 
 def summarize_after(run, since: float, until: float, io: dict):
@@ -666,9 +676,10 @@ def disk_row(disk: str, d: dict, secs: float) -> str:
 def cpu_line(cpu: dict) -> str:
     """The summary's CPU line: cores busy on average, host and server
     (user and system time, from the cgroup or the process)."""
-    server = cpu["server_cores"]
-    return (f"- CPU, cores busy on average: host "
-            f"{cpu['host_cores_busy']:.1f} of {cpu['host_cores']}; "
+    host, server = cpu["host_cores_busy"], cpu["server_cores"]
+    h = f"{host:.1f}" if host is not None else "unknown (no /proc)"
+    return (f"- CPU, cores busy on average: host {h} of "
+            f"{cpu['host_cores']}; "
             + (f"server {server:.1f}." if server is not None else
                "server unknown (no cgroup, more than one process)."))
 

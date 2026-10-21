@@ -1,0 +1,116 @@
+# A run with load on each OS, twice a day and by hand: the orders
+# benchmark cut to a runner's size through scripts/soak.sh (about 20
+# minutes of load, readers, settle and a pgbench workload, then a clean
+# stop), in a ReleaseSafe build. The harness's own run dir, summaries
+# and server log included, is the job's artifact either way.
+name: soak
+
+on:
+  schedule:
+    # Noon and 6 pm PST; an hour later on the clock during PDT.
+    - cron: '0 20 * * *'
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-latest: 4 cores, 16 GB, and a ~70 GB scratch disk
+          # at /mnt. macos-15: 3 cores, 7 GB, 14 GB of disk in all,
+          # shared with the toolchain and the build. stop_bytes caps
+          # the data dir, checked once a minute; the WAL takes about
+          # half as much again beside it, so fewer streams on the Mac
+          # keep the overshoot small.
+          - os: ubuntu-latest
+            cache: 2GiB
+            streams: 4
+            stop_bytes: 12884901888
+          - os: macos-15
+            cache: 1GiB
+            streams: 2
+            stop_bytes: 4294967296
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The same key as ci.yml, so the allocator archive is a cache hit.
+      - uses: actions/cache@v6
+        with:
+          path: .deps
+          key: >-
+            deps-${{ runner.os }}-${{
+            hashFiles('build.zig', 'scripts/bootstrap-*.sh') }}
+
+      # The harness is Python 3.11+ (tomllib).
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # psql drives the load, pgbench the readers and the workload. The
+      # Ubuntu image ships PostgreSQL under /usr/lib/postgresql; the Mac
+      # gets libpq from brew, or the full server if that lacks pgbench.
+      - name: Find psql and pgbench
+        id: pg
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null \
+              | sort -V | tail -n 1)
+            if [ ! -x "$bin/pgbench" ]; then
+              sudo apt-get update -q
+              sudo apt-get install -y -q postgresql-16
+              sudo systemctl stop postgresql || true
+              bin=/usr/lib/postgresql/16/bin
+            fi
+          else
+            brew install -q libpq
+            bin=$(brew --prefix libpq)/bin
+            if [ ! -x "$bin/pgbench" ]; then
+              brew install -q postgresql@16
+              bin=$(brew --prefix postgresql@16)/bin
+            fi
+          fi
+          "$bin/pgbench" --version
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Point the harness at this runner
+        run: |
+          root=$RUNNER_TEMP/soak
+          # The Ubuntu runner's big disk is /mnt, root-owned.
+          if [ "$RUNNER_OS" = Linux ] && [ -d /mnt ]; then
+            root=/mnt/soak
+            sudo mkdir -p "$root" && sudo chown "$USER" "$root"
+          fi
+          mkdir -p "$root/out" "$root/data" "$root/wal"
+          echo "SOAK_ROOT=$root" >> "$GITHUB_ENV"
+          df -h "$root"
+          cat > benchmarks/run/local.toml <<EOF
+          out_root = "$root/out"
+          data_root = "$root/data"
+          wal_root = "$root/wal"
+          pgbin = "${{ steps.pg.outputs.bin }}"
+          EOF
+
+      - name: Soak
+        env:
+          SOAK_CACHE: ${{ matrix.cache }}
+          SOAK_STREAMS: ${{ matrix.streams }}
+          SOAK_STOP_BYTES: ${{ matrix.stop_bytes }}
+        run: scripts/soak.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ matrix.os }}
+          path: ${{ env.SOAK_ROOT }}/out
+          if-no-files-found: ignore

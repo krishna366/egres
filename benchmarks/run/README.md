@@ -34,6 +34,17 @@ same commands rerun the same benchmark on any machine.
   the Egres admin `zdb metrics` counters, `zdb` gauges, the data dir
   size and the capped server's cgroup memory at :9877.
 
+## A soak
+
+`scripts/soak.sh` runs this harness cut to a CI runner's size, in the
+foreground with pass/fail checks: a load with readers for 15 minutes,
+two minutes of settle, a row count, a two-minute pgbench workload, and
+a clean stop; the `.github/workflows/soak.yml` job runs it twice a
+day on Linux and macOS and uploads the run dir. `SOAK_*` variables
+set the durations, streams, clients and cache; it needs `local.toml`
+and an empty `<data_root>/egres-orders-soak`. Off Linux the summaries
+carry no disk or host CPU figures (there is no `/proc`).
+
 ## A run
 
 ```
