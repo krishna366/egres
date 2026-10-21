@@ -109,8 +109,20 @@ pub const Transport = struct {
         }
         log.info("Transport close Conns are done {d}", .{num_closed});
 
-        if (self.listener) |*l| l.shutdown(.both) catch {};
-        log.info("Transport l.close is done", .{});
+        // Wake the accept loop: it is parked in `accept`, and nothing
+        // else unparks it on every platform (macOS refuses `shutdown`
+        // on a listening socket), so self-connect as the admin listener
+        // does; acceptLoop sees `shutting_down` and drops the connection.
+        if (self.listener != null) {
+            if (self.listen_addr.connect(.{})) |poke| {
+                poke.close();
+            } else |err| {
+                log.warn("node {d}: shutdown self-connect failed: {s}", .{
+                    self.cfg.self_id, @errorName(err),
+                });
+            }
+        }
+        log.info("Transport accept loop woken", .{});
         self.group.wait();
         self.group.deinit();
         log.debug("node {d}: Transport group stopped", .{self.cfg.self_id});
@@ -255,6 +267,11 @@ pub const Transport = struct {
         defer log.debug("node {d}: accept loop exiting", .{self.cfg.self_id});
         while (true) {
             const conn = self.listener.?.accept(.{}) catch return;
+            // deinit's self-connect (see there): not a peer.
+            if (self.shutting_down.load(.acquire)) {
+                conn.close();
+                return;
+            }
             configureSocket(conn);
             self.group.spawn(.{ .lane = .raft }, handleInbound, .{ self, conn }) catch {
                 conn.close();

@@ -21,6 +21,14 @@ pub const timestampNow = coarse_clock.timestampNow;
 pub const String = []const u8;
 pub const GuardAllocator = @import("guard_allocator.zig").GuardAllocator;
 
+/// `mprotect` through libc, which every binary links: std.posix has no
+/// wrapper in this Zig and a raw Linux syscall is Linux only. `addr`
+/// must be page-aligned. `.SUCCESS` or the errno.
+pub fn mprotect(addr: usize, len: usize, prot: std.c.PROT) std.c.E {
+    const ptr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(addr);
+    return std.posix.errno(std.c.mprotect(ptr, len, prot));
+}
+
 /// Empty an ArrayList and keep its buffer. `clearRetainingCapacity`
 /// does the same but first memsets the whole slice with `undefined`,
 /// a real 0xAA fill in Debug and ReleaseSafe, which showed up on hot

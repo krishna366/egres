@@ -274,13 +274,14 @@ pub fn main(init: std.process.Init) !void {
     defer fiber_rt.deinit();
     log.info("runtime initialized: {d} workers", .{fiber_rt.workers.len});
 
-    // mimalloc has no background threads: freed memory returns to the OS
-    // only when something enters the allocator after the 1 s purge
-    // deadline passes. This fiber is that something. jemalloc needs no
-    // fiber — its two background threads (malloc_conf in jemalloc/
-    // root.zig) own reclamation — so the fiber isn't even compiled in.
-    if (comptime std.mem.eql(u8, galloc.kind, "mimalloc")) {
-        try fiber.spawnDetached(.{}, mimallocMaintenance, .{});
+    // Without allocator background threads (mimalloc has none; jemalloc
+    // has them on Linux only, see jemalloc/root.zig), freed memory
+    // returns to the OS only when something enters the allocator after
+    // a purge deadline passes, and a quiet arena has nobody to do that.
+    // This fiber is that somebody; it isn't even compiled in where the
+    // allocator reclaims on its own.
+    if (comptime !galloc.has_background_reclaim) {
+        try fiber.spawnDetached(.{}, allocMaintenance, .{});
     }
 
     try fiber.spawnDetached(.{}, bootstrapAndStop, .{ allocator, argv });
@@ -288,16 +289,25 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Detached and never joined: parked in sleepMs at shutdown, freed by
-/// Runtime.deinit like any other leftover fiber. The gentle tick costs
-/// ~5 µs under load (zmem measurement) and returns a freed burst to the
-/// OS within a couple of ticks.
-fn mimallocMaintenance() void {
+/// Runtime.deinit like any other leftover fiber. The decay step runs on
+/// an fsops pool thread, not inline: it purges with the arena lock held
+/// and a big post-burst purge is many madvise calls, which would wedge
+/// a worker for their whole duration. Under load it finds little to do
+/// (the allocation path keeps active arenas decayed; ~5 µs for mimalloc
+/// per the zmem measurement) and returns a freed burst to the OS within
+/// a couple of ticks.
+fn allocMaintenance() void {
     while (true) {
         fiber.sleepMs(1000);
-        // Infallible for mimalloc; the error union exists only so both
-        // backends share one collect() signature.
-        galloc.collect() catch {};
+        fiber.fsops.run(decayStep, .{});
     }
+}
+
+/// Runs on a pool thread, so it must not touch fiber state.
+fn decayStep() void {
+    galloc.decay() catch |err| {
+        log.warn("allocator decay failed: {}", .{err});
+    };
 }
 
 /// Spawned on the default lane to drive process bootstrap. Stops the

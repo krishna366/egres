@@ -8,6 +8,7 @@
 //! override individual settings for experiments or incident response.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -35,15 +36,47 @@ extern fn mallctl(
 const libc = struct {
     extern fn malloc(size: usize) ?*anyopaque;
     extern fn free(ptr: ?*anyopaque) void;
+    extern fn strdup(s: [*:0]const u8) ?[*:0]u8;
+};
+
+// macOS has no symbol interposition for the libc allocator: linking
+// jemalloc's `malloc` catches calls bound at link time (Zig, our C
+// archives) but not the ones libSystem makes internally — strdup in
+// libpg_query, asprintf, getaddrinfo. Those reach jemalloc only once
+// it is the default malloc zone, which `zone_register` arranges from
+// a load-time constructor in zone.o. A static archive member links
+// only when something references it, so without this reference the
+// constructor never runs, libSystem keeps allocating from the system
+// zone and jemalloc's `free` faults on those blocks (libpg_query's
+// stderr buffer was the first victim). `allocator()` is the anchor:
+// every binary that uses jemalloc at all calls it once at startup,
+// and the call is harmless after the constructor since it returns
+// early once a non-system zone is the default. The private namespace
+// keeps its je_ prefix even in the unprefixed public build galloc
+// links against.
+const darwin = struct {
+    extern fn je_zone_register() void;
 };
 
 // Derived from zmem experimentation.
 pub const default_configuration =
     "abort_conf:true," ++
     "tcache:true," ++
-    "percpu_arena:percpu," ++
-    "background_thread:true," ++
-    "max_background_threads:2," ++
+    // Linux-only knobs. percpu arenas need sched_getcpu, which only
+    // Linux has. Background threads are the production reclaim path
+    // (purging runs off the worker threads, on jemalloc's own adaptive
+    // schedule); jemalloc does not build them on macOS, whose mutexes
+    // are os_unfair_lock (no condition variable) and whose Mach-O
+    // linking defeats the pthread_create interposition they rely on.
+    // There the maintenance tick in main.zig stands in (`decay`,
+    // gated on `has_background_reclaim`). Elsewhere jemalloc would
+    // silently drop the first option and warn about the second.
+    (if (builtin.os.tag == .linux)
+        "percpu_arena:percpu," ++
+            "background_thread:true," ++
+            "max_background_threads:2,"
+    else
+        "") ++
     // Freed pages return to the kernel within ~2 s: long enough that
     // a page freed and wanted again soon is reused, short enough that
     // the block cache's churn does not pile up resident.
@@ -66,6 +99,8 @@ const vtable: Allocator.VTable = .{
 };
 
 pub fn allocator() Allocator {
+    // See `darwin`: links zone.o and makes jemalloc the default zone.
+    if (comptime builtin.os.tag.isDarwin()) darwin.je_zone_register();
     return .{ .ptr = undefined, .vtable = &vtable };
 }
 
@@ -261,16 +296,46 @@ pub fn verifyInUse(gpa: Allocator) VerifyError!void {
     {
         return error.LibcNotJemalloc;
     }
+
+    // The probe above binds `malloc` at link time, which passes even
+    // where libc's own internal allocations bypass jemalloc. strdup
+    // allocates from inside libc, so this is the probe that proves C
+    // libraries' allocations land here too (on macOS, that the zone
+    // registration in `allocator()` took). A failure here means a
+    // free of such a block would fault, as it did before the zone
+    // was linked.
+    const s_probe = libc.strdup("galloc probe") orelse
+        return error.LibcNotJemalloc;
+    s_probe[0] = 'G';
+    std.mem.doNotOptimizeAway(s_probe);
+    const s_during = threadActivity() orelse return error.LibcNotJemalloc;
+    libc.free(s_probe);
+
+    const s_after = threadActivity() orelse return error.LibcNotJemalloc;
+    if (s_during.allocated <= c_after.allocated or
+        s_after.deallocated <= c_after.deallocated)
+    {
+        return error.LibcNotJemalloc;
+    }
 }
 
-pub const CollectError = error{CollectionFailed};
+pub const DecayError = error{DecayFailed};
 
-/// Force release after an exceptional burst or memory-pressure event.
-/// Normal reclamation belongs to the configured background decay worker.
-pub fn collect() CollectError!void {
-    _ = mallctl("thread.tcache.flush", null, null, null, 0);
+/// Whether this build reclaims on its own: true where jemalloc's
+/// background threads are on (`default_configuration`). Where false,
+/// main.zig runs the maintenance tick that calls `decay`.
+pub const has_background_reclaim = builtin.os.tag == .linux;
+
+/// The periodic reclaim step for builds without background threads
+/// (`has_background_reclaim`): purge only the dirty pages whose decay
+/// deadline has passed, in every arena, which is the work those threads
+/// would do. The allocation path already runs decay on an arena it
+/// touches, so a busy arena has nothing left here; the call exists for
+/// arenas that went quiet with dirty pages, which nothing else would
+/// ever return to the OS. Harmless where the threads are on.
+pub fn decay() DecayError!void {
     // MALLCTL_ARENAS_ALL is 4096 in the pinned jemalloc headers.
-    if (mallctl("arena.4096.purge", null, null, null, 0) != 0) {
-        return error.CollectionFailed;
+    if (mallctl("arena.4096.decay", null, null, null, 0) != 0) {
+        return error.DecayFailed;
     }
 }

@@ -169,12 +169,17 @@ pub const Worker = struct {
     /// arms a CPU-clock timer per worker with it. 0 elsewhere.
     tid: i32 = 0,
 
-    pub fn init(w: *Worker, id: u8, allocator: std.mem.Allocator) !void {
+    pub fn init(
+        w: *Worker,
+        id: u8,
+        allocator: std.mem.Allocator,
+        io_pool: ?*xev.ThreadPool,
+    ) !void {
         // Construct via a struct literal so every field with a declared
         // default actually gets it.
         w.* = .{
             .id = id,
-            .loop = try xev.Loop.init(.{}),
+            .loop = try xev.Loop.init(.{ .thread_pool = io_pool }),
             .wake_async = undefined,
             .deadlines = undefined,
             .ready = undefined,
@@ -786,6 +791,14 @@ pub const Worker = struct {
                 self.unpark(rt);
                 continue;
             }
+            // Last look at `stopping` before blocking: any `run(.no_wait)`
+            // earlier in this pass (the pump, the poll above) may have
+            // consumed stop's wake, and stop brings no work for the
+            // rechecks above to find, so a block here would never end.
+            if (rt.stopping.load(.acquire)) {
+                self.unpark(rt);
+                break;
+            }
             // Block until a libxev completion (timer / I/O / cross-thread
             // async wake, including stop's) fires, then leave the parked
             // state and re-find work on the next pass.
@@ -909,9 +922,22 @@ fn raftWorkerCount(num_workers: usize, requested: ?usize) usize {
     return raft;
 }
 
+/// Whether the libxev backend needs a thread pool for regular-file I/O.
+/// io_uring submits `pread`/`pwrite` to the kernel directly; kqueue
+/// (macOS) and epoll cannot poll regular files, so libxev runs those ops
+/// on pool threads and completes them through the loop — and fails them
+/// with EPERM when the loop has no pool.
+const needs_io_pool = xev.backend != .io_uring;
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     workers: []Worker,
+    /// The file-I/O pool every worker loop shares on backends that need
+    /// one (`needs_io_pool`); elsewhere it is built but never handed to
+    /// a loop, so it spawns nothing. Threads start lazily on first use.
+    /// Pool threads complete into worker loops, so `deinit` stops and
+    /// joins the pool before it frees the loops.
+    io_pool: xev.ThreadPool,
     /// Registry of every fiber the runtime owns. Multi-worker means
     /// multiple threads can `spawn` concurrently → spinlock guards
     /// the ArrayList mutation. Reads (`stats`, `dumpFibers`) take
@@ -991,6 +1017,20 @@ pub const Runtime = struct {
             idle.len = @max(range.len, 1);
         }
 
+        // Twice the workers so one worker's outstanding reads overlap on
+        // disk instead of queueing behind each other, with a floor for
+        // tiny runtimes. Only the backends in `needs_io_pool` ever spawn
+        // a thread from it.
+        self.io_pool = xev.ThreadPool.init(.{
+            .max_threads = @intCast(@max(2 * n, 4)),
+        });
+        errdefer {
+            self.io_pool.shutdown();
+            self.io_pool.deinit();
+        }
+        const io_pool: ?*xev.ThreadPool =
+            if (needs_io_pool) &self.io_pool else null;
+
         self.workers = try allocator.alloc(Worker, n);
         errdefer allocator.free(self.workers);
 
@@ -999,7 +1039,7 @@ pub const Runtime = struct {
             for (self.workers[0..initialized]) |*w| w.deinit();
         }
         for (self.workers, 0..) |*w, i| {
-            try Worker.init(w, @intCast(i), allocator);
+            try Worker.init(w, @intCast(i), allocator, io_pool);
             w.lane_idx = if (i < raft_count)
                 @intFromEnum(Lane.raft)
             else
@@ -1025,6 +1065,10 @@ pub const Runtime = struct {
         // Stop the offload pool first: join every pool thread so none is
         // mid-`wake()` into the runtime state we're about to free.
         _fsops.stop();
+        // Same for the file-I/O pool: its threads complete into the
+        // worker loops freed just below, so join them first.
+        self.io_pool.shutdown();
+        self.io_pool.deinit();
         for (self.fibers.items) |f| {
             f.deinit(self.allocator);
         }

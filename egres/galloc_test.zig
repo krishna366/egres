@@ -8,7 +8,7 @@
 //! `zig build test -Dallocator=jemalloc` exercises jemalloc — same
 //! tests, no backend-specific C APIs. Everything here goes through the
 //! std.mem.Allocator interface plus the small API both adapters share
-//! (kind, allocator, verifyInUse, snapshot, collect).
+//! (kind, allocator, verifyInUse, snapshot, decay).
 
 const std = @import("std");
 const fiber = @import("zfiber");
@@ -132,10 +132,15 @@ test "galloc: blocks allocated here can be freed on another fiber" {
     handle.join();
 }
 
-test "galloc: snapshot and collect are callable" {
+test "galloc: decay and snapshot are callable, with and without dirty pages" {
+    // The maintenance tick calls decay once a second whatever the
+    // allocator has been doing, so both the "something to purge" and
+    // the "nothing to do" paths must be fine, repeatedly.
     _ = galloc.snapshot();
+    try galloc.decay();
     const burst = try galloc.allocator().alloc(u8, 8 * 1024 * 1024);
     galloc.allocator().free(burst);
-    try galloc.collect();
+    try galloc.decay();
+    try galloc.decay();
     _ = galloc.snapshot();
 }

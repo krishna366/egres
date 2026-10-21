@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fiber = @import("zfiber");
 const utils = @import("utils");
 const String = utils.String;
@@ -1601,7 +1602,17 @@ test "diskwal Prezero: true and false are fixed, auto reads the filesystem" {
     const Prezero = raft.diskwal.Prezero;
     try std.testing.expectEqual(Prezero.true, Prezero.true.resolve(wal_dir));
     try std.testing.expectEqual(Prezero.false, Prezero.false.resolve(wal_dir));
-    const magic = vfs.fsMagic(wal_dir) orelse return error.TestUnexpectedResult;
+    // fsMagic answers only on Linux. Elsewhere auto settles on `false`
+    // without it (macOS's APFS is copy-on-write), which is the contract
+    // to pin there.
+    const magic = vfs.fsMagic(wal_dir) orelse {
+        try std.testing.expect(builtin.os.tag != .linux);
+        try std.testing.expectEqual(
+            Prezero.false,
+            Prezero.auto.resolve(wal_dir),
+        );
+        return;
+    };
     const want: Prezero = switch (magic) {
         vfs.fs_magic.zfs, vfs.fs_magic.btrfs, vfs.fs_magic.tmpfs => .false,
         else => .true,

@@ -69,6 +69,10 @@ mkdir -p "$build_dir"
     # On macOS jemalloc defaults to a je_ API prefix; empty keeps the
     # names galloc imports and makes it the default malloc zone too,
     # as it overrides libc malloc on Linux.
+    # --disable-cxx drops the operator new/delete wrappers: nothing
+    # here links C++ (mimalloc's bootstrap turns its C++ build off
+    # too), and skipping them keeps the build off the host's C++
+    # headers, which macOS CommandLineTools do not always ship intact.
     CFLAGS="-O3 -DNDEBUG" "$source_dir/configure" \
         --prefix="$install_dir" \
         --with-jemalloc-prefix= \

@@ -17,13 +17,13 @@ zig build
 # The non-default allocator would otherwise never compile: build its exe
 # and run the generic allocator tests against it (the full suite runs on
 # the default backend below).
-echo "prepush: zig build -Dallocator=jemalloc (exe) ..."
-zig build -Dallocator=jemalloc
+echo "prepush: zig build -Dallocator=mimalloc (exe) ..."
+zig build -Dallocator=mimalloc
 
 echo "prepush: zig build test -- --bigtest ..."
 zig build test -- --bigtest
 
-echo "prepush: zig build test -Dallocator=jemalloc -- --filter galloc ..."
-zig build test -Dallocator=jemalloc -- --filter galloc
+echo "prepush: zig build test -Dallocator=mimalloc -- --filter galloc ..."
+zig build test -Dallocator=mimalloc -- --filter galloc
 
 echo "prepush: OK"

@@ -9,7 +9,7 @@
 //! pages the next request faulted back in). What mimalloc does need is a
 //! caller: it has no background threads, so freed memory returns to the
 //! OS only when something enters the allocator after the 1 s purge
-//! deadline. A maintenance fiber calling `collect()` about once a second
+//! deadline. A maintenance fiber calling `decay()` about once a second
 //! is that something — main.zig spawns it whenever this backend is
 //! selected.
 //!
@@ -50,6 +50,7 @@ extern fn mi_collect(force: bool) void;
 const libc = struct {
     extern fn malloc(size: usize) ?*anyopaque;
     extern fn free(ptr: ?*anyopaque) void;
+    extern fn strdup(s: [*:0]const u8) ?[*:0]u8;
 };
 extern fn mi_is_in_heap_region(p: ?*const anyopaque) bool;
 extern fn mi_process_info(
@@ -193,20 +194,38 @@ pub fn verifyInUse(gpa: Allocator) VerifyError!void {
     if (!mi_is_in_heap_region(c_probe)) {
         return error.MimallocNotInUse;
     }
+
+    // `malloc` above binds at link time; strdup allocates from inside
+    // libc itself, so only this probe proves C libraries' internal
+    // allocations are overridden too. On macOS that needs mimalloc's
+    // malloc zone to be the default, which a static link does not
+    // guarantee (see jemalloc/root.zig for the same trap).
+    const s_probe = libc.strdup("galloc probe") orelse
+        return error.MimallocNotInUse;
+    defer libc.free(s_probe);
+    s_probe[0] = 'G';
+    if (!mi_is_in_heap_region(s_probe)) {
+        return error.MimallocNotInUse;
+    }
 }
 
-pub const CollectError = error{CollectionFailed};
+pub const DecayError = error{DecayFailed};
 
-/// The scheduled maintenance tick. Gentle by design (`mi_collect(false)`):
-/// it honors the 1 s purge deadlines and rotates through the arenas, so a
-/// freed burst returns to the OS within a couple of ticks while memory
-/// freed and reused inside the window stays warm. The forced variant
-/// madvised reused pools away every tick — 80x slower on a burst-reuse
-/// cycle in the zmem study — and no collect can release pages pinned by
-/// live objects, so there is no stronger lever worth exposing.
+/// mimalloc has no background threads on any platform, so main.zig's
+/// maintenance tick always runs for it.
+pub const has_background_reclaim = false;
+
+/// The periodic reclaim step the maintenance tick calls (see
+/// jemalloc.decay). Gentle by design (`mi_collect(false)`): it honors
+/// the 1 s purge deadlines and rotates through the arenas, so a freed
+/// burst returns to the OS within a couple of ticks while memory freed
+/// and reused inside the window stays warm. The forced variant madvised
+/// reused pools away every tick, 80x slower on a burst-reuse cycle in
+/// the zmem study, and no collect can release pages pinned by live
+/// objects, so there is no stronger lever worth exposing.
 ///
 /// Never fails here; the error union exists so both backends share one
-/// collect() signature.
-pub fn collect() CollectError!void {
+/// decay() signature.
+pub fn decay() DecayError!void {
     mi_collect(false);
 }

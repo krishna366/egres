@@ -26,6 +26,7 @@
 //! `stack_size` in `SpawnOptions`.
 
 const std = @import("std");
+const utils = @import("utils");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const _spinlock = @import("spinlock.zig");
@@ -278,7 +279,9 @@ pub const guard_level: u8 = switch (builtin.mode) {
     .ReleaseFast, .ReleaseSmall => 0,
 };
 
-const guard_page: usize = 4096;
+// The platform's page: 4 KiB on Linux, 16 KiB on Apple Silicon. An
+// mprotect of a smaller span would still cover the whole page there.
+const guard_page: usize = std.heap.page_size_min;
 
 /// Magic written into `Fiber.magic` at init and verified at every dispatch via
 /// `assertMagic` (always on). A mismatch means EITHER the struct was clobbered (a wild
@@ -538,11 +541,14 @@ pub const Fiber = struct {
         std.heap.page_allocator.free(@as([*]u8, @ptrCast(c))[0..total]);
     }
 
-    fn mprotectCoro(c: *Coroutine, prot: std.os.linux.PROT) void {
-        // Raw syscall: 0 on success, -errno (as usize) on failure.
-        const rc = std.os.linux.mprotect(@ptrCast(c), guard_page, prot);
-        if (@as(isize, @bitCast(rc)) != 0)
-            std.debug.panic("mprotect coro page failed: rc={d}", .{@as(isize, @bitCast(rc))});
+    fn mprotectCoro(c: *Coroutine, prot: std.c.PROT) void {
+        // `c` is page-aligned: it comes from the page allocator
+        // (`allocCoro`).
+        const err = utils.mprotect(@intFromPtr(c), guard_page, prot);
+        if (err != .SUCCESS) std.debug.panic(
+            "mprotect coro page failed: {s}",
+            .{@tagName(err)},
+        );
     }
 
     /// Make the Coroutine page read-only / read-write. No-op when the guard is

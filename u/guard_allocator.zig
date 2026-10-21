@@ -21,8 +21,8 @@
 //! the whole process, and only in Debug/ReleaseSafe.
 
 const std = @import("std");
-const linux = std.os.linux;
 const posix = std.posix;
+const mprotect = @import("utils.zig").mprotect;
 
 /// Page size used both for rounding and as the mmap pointer alignment.
 const page: usize = std.heap.page_size_min;
@@ -98,8 +98,8 @@ pub const GuardAllocator = struct {
             0,
         ) catch return null;
         // Flip the trailing page into a guard.
-        const guard_ptr: [*]const u8 = @ptrFromInt(@intFromPtr(region.ptr) + data_len);
-        if (linux.mprotect(guard_ptr, page, .{}) != 0) {
+        const guard = @intFromPtr(region.ptr) + data_len;
+        if (mprotect(guard, page, .{}) != .SUCCESS) {
             posix.munmap(region);
             return null;
         }
@@ -148,8 +148,7 @@ pub const GuardAllocator = struct {
         // Whole mapping inaccessible: any later access through a dangling ptr
         // faults AT the access. Keep it reserved (no munmap) so the address is
         // never recycled; drop the physical pages so quarantine is RAM-cheap.
-        const base_ptr: [*]const u8 = @ptrFromInt(base);
-        _ = linux.mprotect(base_ptr, map_len, .{});
+        _ = mprotect(base, map_len, .{});
         const aligned: [*]align(page) u8 = @ptrFromInt(base);
         posix.madvise(aligned, map_len, posix.MADV.DONTNEED) catch {};
     }

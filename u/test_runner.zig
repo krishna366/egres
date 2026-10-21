@@ -181,7 +181,7 @@ pub const std_options_debug_threaded_io: ?*std.Io.Threaded = &std.testing.io_ins
 ///   addr2line -fipCe <binary> <addr>
 fn minimalPanic(msg: String, first_trace_addr: ?usize) noreturn {
     const marker = "[MINIMAL_PANIC_FIRED]\n";
-    _ = std.os.linux.write(2, marker.ptr, marker.len);
+    _ = rawWrite(marker);
     // 4 KiB so a long DOUBLE_PUSH ring dump (~800-1200 bytes) fits.
     // Without this, `rawStderrPrint`'s `bufPrint` returns an empty
     // slice on overflow and we see only "[MINIMAL_PANIC_FIRED]" with
@@ -495,8 +495,17 @@ const RunningSet = struct {
     }
 };
 
-/// Format into `buf` and write to stderr (fd 2) via the raw Linux
-/// write syscall — bypasses std.Io entirely. Used by the watchdog
+/// One write of `bytes` to stderr (fd 2) through libc, bypassing
+/// std.Io so it works when the fiber runtime is wedged. Bytes written,
+/// or null on error / nothing written ("stop trying").
+fn rawWrite(bytes: String) ?usize {
+    const rc = std.c.write(2, bytes.ptr, bytes.len);
+    if (rc <= 0) return null;
+    return @intCast(rc);
+}
+
+/// Format into `buf` and write to stderr (fd 2) via `rawWrite` —
+/// bypasses std.Io entirely. Used by the watchdog
 /// so its dumps land even when the runtime itself is wedged (the previous
 /// File.stderr().writer path would have blocked on the runtime's io).
 /// Truncates silently if the formatted string exceeds the buffer
@@ -504,11 +513,7 @@ const RunningSet = struct {
 fn rawStderrWriteAll(bytes: String) void {
     var written: usize = 0;
     while (written < bytes.len) {
-        const rc = std.os.linux.write(2, bytes.ptr + written, bytes.len - written);
-        // Linux raw syscall: negative encodes errno, positive is byte count.
-        // Treat any non-positive return as "stop trying".
-        if (rc == 0 or rc > std.math.maxInt(isize)) return;
-        written += rc;
+        written += rawWrite(bytes[written..]) orelse return;
     }
 }
 
