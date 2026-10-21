@@ -20,8 +20,8 @@
         // Our fork's `egres` branch: upstream 9ce8e8e plus one kqueue
         // fix the macOS build needs (the commit message has the why).
         .xev = .{
-            .url = "https://github.com/manishrjain/libxev/archive/a992288d1409d1015a17e517c3237ab34937fae7.tar.gz",
-            .hash = "libxev-0.0.0-86vtcxkSFAC8__jW3gp7Y62Xui4omCfjmPh32OTcn7dH",
+            .url = "https://github.com/manishrjain/libxev/archive/a17c233be025cfefbc5f25f84872663cdd2ec9e9.tar.gz",
+            .hash = "libxev-0.0.0-86vtcxEUFADjhjYZ-vs_yVMJPAwUhhDchs_NfLl0rnqh",
         },
         .zroar = .{
             .url = "https://github.com/manishrjain/zroar/archive/refs/tags/0.2608.1.tar.gz",

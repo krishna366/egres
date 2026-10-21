@@ -18,20 +18,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ubuntu-latest: 4 cores, 16 GB, and a ~70 GB scratch disk
-          # at /mnt. macos-15: 3 cores, 7 GB, 14 GB of disk in all,
-          # shared with the toolchain and the build. stop_bytes caps
-          # the data dir, checked once a minute; the WAL takes about
-          # half as much again beside it, so fewer streams on the Mac
-          # keep the overshoot small.
+          # ubuntu-latest: 4 cores, 16 GB, and a scratch disk at /mnt.
+          # macos-15: 3 cores, 7 GB. The data dir's cap comes from the
+          # free space the script finds, so a runner with less disk
+          # loads less rather than filling up.
           - os: ubuntu-latest
             cache: 2GiB
             streams: 4
-            stop_bytes: 12884901888
           - os: macos-15
             cache: 1GiB
             streams: 2
-            stop_bytes: 4294967296
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     steps:
@@ -105,7 +101,6 @@ jobs:
         env:
           SOAK_CACHE: ${{ matrix.cache }}
           SOAK_STREAMS: ${{ matrix.streams }}
-          SOAK_STOP_BYTES: ${{ matrix.stop_bytes }}
         run: scripts/soak.sh
 
       - uses: actions/upload-artifact@v4

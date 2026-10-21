@@ -29,8 +29,10 @@ WORKLOAD_SECS=${SOAK_WORKLOAD_SECS:-120}
 STREAMS=${SOAK_STREAMS:-4}
 READERS=${SOAK_READERS:-4}
 CLIENTS=${SOAK_CLIENTS:-8}
-# 6 GiB: a runner has about 14 GiB free, and the WAL is beside the data.
-STOP_BYTES=${SOAK_STOP_BYTES:-6442450944}
+# The data dir's cap. Unset = sized from the data root's free space
+# below: the WAL beside it runs about half the data dir again, the cap
+# is checked once a minute, and the logs need a little.
+STOP_BYTES=${SOAK_STOP_BYTES:-}
 CACHE=${SOAK_CACHE:-2GiB}
 COMPACTORS=${SOAK_COMPACTORS:-2}
 
@@ -46,7 +48,6 @@ done
 sets=(
     --set "load.streams=$STREAMS"
     --set "load.stop_secs=$LOAD_SECS"
-    --set "load.stop_bytes=$STOP_BYTES"
     --set "load.after_secs=$SETTLE_SECS"
     --set "load.chunk=20000"
     --set "readers.reads=$READERS"
@@ -74,18 +75,28 @@ ok() { echo "ok: $1"; pass=$((pass + 1)); }
 bad() { echo "FAIL: $1"; fail=$((fail + 1)); }
 
 out_root=$(local_key out_root)
+data_root=$(local_key data_root)
 pgbin=$(local_key pgbin)
 for kv in ${SOAK_LOCAL:-}; do
     case "$kv" in
         out_root=*) out_root=${kv#out_root=} ;;
+        data_root=*) data_root=${kv#data_root=} ;;
         pgbin=*) pgbin=${kv#pgbin=} ;;
     esac
 done
+if [ -z "$STOP_BYTES" ]; then
+    # df -k is POSIX: the fourth column is free KiB. A third of it for
+    # the data dir leaves the WAL, the overshoot and the logs their share.
+    free_kib=$(df -k "$data_root" | awk 'NR == 2 {print $4}')
+    STOP_BYTES=$((free_kib * 1024 / 3))
+fi
+sets+=(--set "load.stop_bytes=$STOP_BYTES")
 conn="host=127.0.0.1 port=3210 dbname=egres sslmode=disable"
 
 echo "soak: load ${LOAD_SECS}s + settle ${SETTLE_SECS}s + workload" \
     "${WORKLOAD_SECS}s; streams=$STREAMS readers=$READERS" \
-    "clients=$CLIENTS cache=$CACHE"
+    "clients=$CLIENTS cache=$CACHE data cap $((STOP_BYTES >> 20)) MiB"
+df -h "$data_root"
 "$bench" "$env" begin "${common[@]}" "${sets[@]}"
 run_dir=$(cat "$out_root/$env-$name.latest")
 # Whatever happens, no server outlives the script.

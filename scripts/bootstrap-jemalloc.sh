@@ -4,12 +4,16 @@
 
 set -euo pipefail
 
-if (( $# != 2 )); then
-    echo "usage: $0 VERSION SHA256" >&2
+if (( $# < 2 || $# > 3 )); then
+    echo "usage: $0 VERSION SHA256 [ZIG_TARGET]" >&2
     exit 1
 fi
 version=$1
 expected_sha=$2
+# A non-native build (`zig build -Dtarget=...`): jemalloc is compiled
+# by `zig cc` for that target and installed beside the host's copy, so
+# a cross build never replaces the archive the native build links.
+zig_target=${3:-}
 
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -25,8 +29,8 @@ deps_dir="$project_dir/.deps/jemalloc"
 archive_dir="$deps_dir/archives"
 archive="$archive_dir/jemalloc-$version.tar.bz2"
 source_dir="$deps_dir/source/$version"
-build_dir="$deps_dir/build/$version"
-install_dir="$deps_dir/install/$version"
+build_dir="$deps_dir/build/$version${zig_target:+-$zig_target}"
+install_dir="$deps_dir/install/$version${zig_target:+-$zig_target}"
 library="$install_dir/lib/libjemalloc.a"
 stamp="$install_dir/.installed-$expected_sha"
 
@@ -63,6 +67,29 @@ if [[ ! -f "$source_dir/.extracted" ]]; then
     touch "$source_dir/.extracted"
 fi
 
+# Cross-compiling (the target's arch is not the host's): configure
+# gets --host so it skips the probes that run a test program, and the
+# page size those would have measured. arm64 Linux kernels use 4 KiB
+# or 64 KiB pages; an archive built for 64 KiB runs on both.
+target_opts=()
+if [[ -n "$zig_target" ]]; then
+    export CC="zig cc -target $zig_target"
+    host_arch=$(uname -m)
+    [[ "$host_arch" == arm64 ]] && host_arch=aarch64
+    target_arch=${zig_target%%-*}
+    if [[ "$target_arch" != "$host_arch" ]]; then
+        export AR="zig ar" RANLIB="zig ranlib"
+        host=${zig_target%%.*}
+        case "$host" in
+            *-macos*) host="$target_arch-apple-darwin" ;;
+        esac
+        target_opts+=(--host="$host")
+        case "$target_arch" in
+            aarch64) target_opts+=(--with-lg-page=16) ;;
+        esac
+    fi
+fi
+
 mkdir -p "$build_dir"
 (
     cd "$build_dir"
@@ -80,7 +107,8 @@ mkdir -p "$build_dir"
         --enable-static \
         --disable-cxx \
         --enable-stats \
-        --disable-debug
+        --disable-debug \
+        "${target_opts[@]}"
     # nproc is Linux; macOS answers through sysctl.
     jobs=${JEMALLOC_BUILD_JOBS:-$(nproc 2>/dev/null ||
         sysctl -n hw.ncpu)}

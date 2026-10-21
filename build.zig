@@ -84,9 +84,20 @@ pub fn build(b: *std.Build) void {
         .ReleaseFast
     else
         b.standardOptimizeOption(.{});
+    // A non-native target gets its own jemalloc build and install dir
+    // (see scripts/bootstrap-jemalloc.sh); the native one stays where
+    // it is.
+    const cross_target: ?[]const u8 = if (target.query.isNative())
+        null
+    else
+        target.query.zigTriple(b.allocator) catch @panic("OOM");
     const jemalloc_library = b.fmt(
-        ".deps/jemalloc/install/{s}/lib/libjemalloc.a",
-        .{jemalloc_version},
+        ".deps/jemalloc/install/{s}{s}{s}/lib/libjemalloc.a",
+        .{
+            jemalloc_version,
+            if (cross_target != null) "-" else "",
+            cross_target orelse "",
+        },
     );
     const mimalloc_library = b.fmt(
         ".deps/mimalloc/install/{s}/lib/libmimalloc.a",
@@ -101,6 +112,7 @@ pub fn build(b: *std.Build) void {
         jemalloc_version,
         jemalloc_sha256,
     });
+    if (cross_target) |t| bootstrap_jemalloc.addArg(t);
     const bootstrap_mimalloc = b.addSystemCommand(&.{
         "bash",
         "scripts/bootstrap-mimalloc.sh",

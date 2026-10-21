@@ -241,6 +241,11 @@ def alive(pid) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
+    # A zombie still answers kill(pid, 0); read its state. Linux has
+    # /proc; macOS does not, and answering False there made stop_server
+    # skip its SIGTERM, so the harness never stopped a server on a Mac.
+    if not os.path.isdir("/proc"):
+        return "Z" not in ps_field(pid, "stat")
     try:
         with open(f"/proc/{pid}/status") as f:
             for line in f:
@@ -257,6 +262,14 @@ def load_local() -> dict:
         sys.exit(f"no {path}: copy local.example.toml and edit it")
     with open(path, "rb") as f:
         return tomllib.load(f)
+
+
+def ps_field(pid: int, field: str) -> str:
+    """One `ps -o <field>=` column for `pid`, stripped; empty when the
+    process is gone. The portable stand-in for /proc on macOS."""
+    out = subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)],
+                         capture_output=True, text=True)
+    return out.stdout.strip()
 
 
 def cgroup_of(pid: int) -> Path:
@@ -520,9 +533,12 @@ def cmd_status(run: Run):
     pid = run.pid("server.pid")
     if alive(pid):
         rss = ""
-        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith("VmRSS"):
-                rss = line.split()[1]
+        if os.path.isdir("/proc"):
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if line.startswith("VmRSS"):
+                    rss = line.split()[1]
+        else:
+            rss = ps_field(pid, "rss")
         print(f"server: {run.kind} pid {pid} rss_kb {rss}")
     else:
         print("server: NOT RUNNING")
