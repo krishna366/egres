@@ -71,6 +71,8 @@ fi
 # gets --host so it skips the probes that run a test program, and the
 # page size those would have measured. arm64 Linux kernels use 4 KiB
 # or 64 KiB pages; an archive built for 64 KiB runs on both.
+# Expanded below with the `[@]+` form: an empty array is "unbound" to
+# bash 3.2 (macOS) under set -u.
 target_opts=()
 if [[ -n "$zig_target" ]]; then
     export CC="zig cc -target $zig_target"
@@ -108,7 +110,7 @@ mkdir -p "$build_dir"
         --disable-cxx \
         --enable-stats \
         --disable-debug \
-        "${target_opts[@]}"
+        ${target_opts[@]+"${target_opts[@]}"}
     # nproc is Linux; macOS answers through sysctl.
     jobs=${JEMALLOC_BUILD_JOBS:-$(nproc 2>/dev/null ||
         sysctl -n hw.ncpu)}

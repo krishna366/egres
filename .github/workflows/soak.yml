@@ -18,10 +18,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ubuntu-latest: 4 cores, 16 GB, and a scratch disk at /mnt.
-          # macos-15: 3 cores, 7 GB. The data dir's cap comes from the
-          # free space the script finds, so a runner with less disk
-          # loads less rather than filling up.
+          # ubuntu-latest: 4 cores, 16 GB. macos-15: 3 cores, 7 GB.
+          # The data dir's cap comes from the free space the script
+          # finds, so a runner with less disk loads less rather than
+          # filling up.
           - os: ubuntu-latest
             cache: 2GiB
             streams: 4
@@ -79,14 +79,24 @@ jobs:
       - name: Build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
 
+      # The Ubuntu image has one 72 GB disk with about 12 GB free (no
+      # separate /mnt). Its preinstalled toolchains are 20-30 GB that
+      # this job never uses; the data cap below is sized from what is
+      # free, so every GB reclaimed is load time.
+      - name: Free the runner's disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+            /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/lib/jvm
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+
       - name: Point the harness at this runner
         run: |
           root=$RUNNER_TEMP/soak
-          # The Ubuntu runner's big disk is /mnt, root-owned.
-          if [ "$RUNNER_OS" = Linux ] && [ -d /mnt ]; then
-            root=/mnt/soak
-            sudo mkdir -p "$root" && sudo chown "$USER" "$root"
-          fi
           mkdir -p "$root/out" "$root/data" "$root/wal"
           echo "SOAK_ROOT=$root" >> "$GITHUB_ENV"
           df -h "$root"
