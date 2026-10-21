@@ -1,0 +1,28 @@
+# The documentation site (manishrjain/docs-egres) builds from docs/ in this
+# repository. Tell it to rebuild whenever that directory changes on main.
+#
+# DOCS_DISPATCH_TOKEN is a fine-grained token with write access to the
+# contents of manishrjain/docs-egres, which is what repository_dispatch
+# requires.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the docs-egres deploy
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/manishrjain/docs-egres/dispatches \
+            -f event_type=egres-docs \
+            -F 'client_payload[sha]=${{ github.sha }}'

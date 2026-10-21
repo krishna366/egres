@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 440" role="img" aria-labelledby="t-readers-during-load d-readers-during-load">
+<title id="t-readers-during-load">Reader transactions per second, in 5-minute averages, through the 600M-row load and the 30-minute settle after it, Postgres and Egres, on a log scale</title>
+<desc id="d-readers-during-load">Postgres starts near 66,246 a second, falls below 100 by the end of its load at 98 minutes and stays there through the settle, ending at 99. Egres starts near 23,661, declines to about 2,000 by the end of its load at 113 minutes and climbs to 3,739 by the end of its settle.</desc>
+<rect width="1000" height="440" rx="12" fill="#0D1015" stroke="#252B35"/>
+<text x="28.0" y="36.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" fill="#98A2B3" text-anchor="start" letter-spacing="0.08em">READERS THROUGH THE LOAD AND THE SETTLE · TRANSACTIONS PER SECOND, 5-MINUTE AVERAGES · 8 CLIENTS · LOG SCALE</text>
+<line x1="86" y1="334.0" x2="960" y2="334.0" stroke="#1C2129" stroke-width="1"/>
+<text x="74.0" y="338.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="end" >100</text>
+<line x1="86" y1="246.0" x2="960" y2="246.0" stroke="#1C2129" stroke-width="1"/>
+<text x="74.0" y="250.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="end" >1K</text>
+<line x1="86" y1="158.0" x2="960" y2="158.0" stroke="#1C2129" stroke-width="1"/>
+<text x="74.0" y="162.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="end" >10K</text>
+<line x1="86" y1="70.0" x2="960" y2="70.0" stroke="#1C2129" stroke-width="1"/>
+<text x="74.0" y="74.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="end" >100K</text>
+<line x1="86" y1="380.0" x2="960" y2="380.0" stroke="#252B35" stroke-width="1"/>
+<text x="86.0" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >0</text>
+<text x="173.4" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >15</text>
+<text x="260.8" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >30</text>
+<text x="348.2" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >45</text>
+<text x="435.6" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >60</text>
+<text x="523.0" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >75</text>
+<text x="610.4" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >90</text>
+<text x="697.8" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >105</text>
+<text x="785.2" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >120</text>
+<text x="872.6" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >135</text>
+<text x="960.0" y="400.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >150</text>
+<text x="523.0" y="422.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="middle" >minutes since the load began</text>
+<text x="74.0" y="56.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#98A2B3" text-anchor="end" >txns/s</text>
+<line x1="657.0" y1="70" x2="657.0" y2="380.0" stroke="#5B8DEF" stroke-width="1" stroke-opacity="0.45"/>
+<line x1="744.4" y1="70" x2="744.4" y2="380.0" stroke="#3FA86B" stroke-width="1" stroke-opacity="0.45"/>
+<text x="651.0" y="82.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="11" font-weight="400" fill="#98A2B3" text-anchor="end" >Postgres load ends · 98 min</text>
+<text x="750.4" y="98.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="11" font-weight="400" fill="#98A2B3" text-anchor="start" >Egres load ends · 113 min</text>
+<path d="M106.4,85.7 L135.5,130.9 L164.7,218.7 L193.8,253.8 L222.9,276.0 L252.1,284.7 L281.2,292.0 L310.3,298.8 L339.5,304.9 L368.6,315.6 L397.7,314.4 L426.9,322.8 L456.0,324.9 L485.1,327.0 L514.3,330.3 L543.4,330.0 L572.5,335.5 L601.7,344.0 L630.8,342.0 L659.9,345.5 L689.1,335.2 L718.2,333.2 L747.3,331.8 L776.5,334.4 L805.6,329.7 L828.9,334.4" fill="none" stroke="#5B8DEF" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="106.4" cy="85.7" r="5" fill="#0D1015"/>
+<circle cx="106.4" cy="85.7" r="4" fill="#5B8DEF"/>
+<circle cx="135.5" cy="130.9" r="5" fill="#0D1015"/>
+<circle cx="135.5" cy="130.9" r="4" fill="#5B8DEF"/>
+<circle cx="164.7" cy="218.7" r="5" fill="#0D1015"/>
+<circle cx="164.7" cy="218.7" r="4" fill="#5B8DEF"/>
+<circle cx="193.8" cy="253.8" r="5" fill="#0D1015"/>
+<circle cx="193.8" cy="253.8" r="4" fill="#5B8DEF"/>
+<circle cx="222.9" cy="276.0" r="5" fill="#0D1015"/>
+<circle cx="222.9" cy="276.0" r="4" fill="#5B8DEF"/>
+<circle cx="252.1" cy="284.7" r="5" fill="#0D1015"/>
+<circle cx="252.1" cy="284.7" r="4" fill="#5B8DEF"/>
+<circle cx="281.2" cy="292.0" r="5" fill="#0D1015"/>
+<circle cx="281.2" cy="292.0" r="4" fill="#5B8DEF"/>
+<circle cx="310.3" cy="298.8" r="5" fill="#0D1015"/>
+<circle cx="310.3" cy="298.8" r="4" fill="#5B8DEF"/>
+<circle cx="339.5" cy="304.9" r="5" fill="#0D1015"/>
+<circle cx="339.5" cy="304.9" r="4" fill="#5B8DEF"/>
+<circle cx="368.6" cy="315.6" r="5" fill="#0D1015"/>
+<circle cx="368.6" cy="315.6" r="4" fill="#5B8DEF"/>
+<circle cx="397.7" cy="314.4" r="5" fill="#0D1015"/>
+<circle cx="397.7" cy="314.4" r="4" fill="#5B8DEF"/>
+<circle cx="426.9" cy="322.8" r="5" fill="#0D1015"/>
+<circle cx="426.9" cy="322.8" r="4" fill="#5B8DEF"/>
+<circle cx="456.0" cy="324.9" r="5" fill="#0D1015"/>
+<circle cx="456.0" cy="324.9" r="4" fill="#5B8DEF"/>
+<circle cx="485.1" cy="327.0" r="5" fill="#0D1015"/>
+<circle cx="485.1" cy="327.0" r="4" fill="#5B8DEF"/>
+<circle cx="514.3" cy="330.3" r="5" fill="#0D1015"/>
+<circle cx="514.3" cy="330.3" r="4" fill="#5B8DEF"/>
+<circle cx="543.4" cy="330.0" r="5" fill="#0D1015"/>
+<circle cx="543.4" cy="330.0" r="4" fill="#5B8DEF"/>
+<circle cx="572.5" cy="335.5" r="5" fill="#0D1015"/>
+<circle cx="572.5" cy="335.5" r="4" fill="#5B8DEF"/>
+<circle cx="601.7" cy="344.0" r="5" fill="#0D1015"/>
+<circle cx="601.7" cy="344.0" r="4" fill="#5B8DEF"/>
+<circle cx="630.8" cy="342.0" r="5" fill="#0D1015"/>
+<circle cx="630.8" cy="342.0" r="4" fill="#5B8DEF"/>
+<circle cx="659.9" cy="345.5" r="5" fill="#0D1015"/>
+<circle cx="659.9" cy="345.5" r="4" fill="#5B8DEF"/>
+<circle cx="689.1" cy="335.2" r="5" fill="#0D1015"/>
+<circle cx="689.1" cy="335.2" r="4" fill="#5B8DEF"/>
+<circle cx="718.2" cy="333.2" r="5" fill="#0D1015"/>
+<circle cx="718.2" cy="333.2" r="4" fill="#5B8DEF"/>
+<circle cx="747.3" cy="331.8" r="5" fill="#0D1015"/>
+<circle cx="747.3" cy="331.8" r="4" fill="#5B8DEF"/>
+<circle cx="776.5" cy="334.4" r="5" fill="#0D1015"/>
+<circle cx="776.5" cy="334.4" r="4" fill="#5B8DEF"/>
+<circle cx="805.6" cy="329.7" r="5" fill="#0D1015"/>
+<circle cx="805.6" cy="329.7" r="4" fill="#5B8DEF"/>
+<circle cx="828.9" cy="334.4" r="5" fill="#0D1015"/>
+<circle cx="828.9" cy="334.4" r="4" fill="#5B8DEF"/>
+<path d="M106.4,125.1 L135.5,147.3 L164.7,153.5 L193.8,168.4 L222.9,169.6 L252.1,177.9 L281.2,186.1 L310.3,188.8 L339.5,194.1 L368.6,194.2 L397.7,202.8 L426.9,205.9 L456.0,211.4 L485.1,216.7 L514.3,207.0 L543.4,203.3 L572.5,209.8 L601.7,209.8 L630.8,220.6 L659.9,218.0 L689.1,227.5 L718.2,216.2 L747.3,216.5 L776.5,197.2 L805.6,196.3 L834.7,196.1 L863.9,196.5 L893.0,196.1 L919.2,195.6" fill="none" stroke="#3FA86B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="106.4" cy="125.1" r="5" fill="#0D1015"/>
+<circle cx="106.4" cy="125.1" r="4" fill="#3FA86B"/>
+<circle cx="135.5" cy="147.3" r="5" fill="#0D1015"/>
+<circle cx="135.5" cy="147.3" r="4" fill="#3FA86B"/>
+<circle cx="164.7" cy="153.5" r="5" fill="#0D1015"/>
+<circle cx="164.7" cy="153.5" r="4" fill="#3FA86B"/>
+<circle cx="193.8" cy="168.4" r="5" fill="#0D1015"/>
+<circle cx="193.8" cy="168.4" r="4" fill="#3FA86B"/>
+<circle cx="222.9" cy="169.6" r="5" fill="#0D1015"/>
+<circle cx="222.9" cy="169.6" r="4" fill="#3FA86B"/>
+<circle cx="252.1" cy="177.9" r="5" fill="#0D1015"/>
+<circle cx="252.1" cy="177.9" r="4" fill="#3FA86B"/>
+<circle cx="281.2" cy="186.1" r="5" fill="#0D1015"/>
+<circle cx="281.2" cy="186.1" r="4" fill="#3FA86B"/>
+<circle cx="310.3" cy="188.8" r="5" fill="#0D1015"/>
+<circle cx="310.3" cy="188.8" r="4" fill="#3FA86B"/>
+<circle cx="339.5" cy="194.1" r="5" fill="#0D1015"/>
+<circle cx="339.5" cy="194.1" r="4" fill="#3FA86B"/>
+<circle cx="368.6" cy="194.2" r="5" fill="#0D1015"/>
+<circle cx="368.6" cy="194.2" r="4" fill="#3FA86B"/>
+<circle cx="397.7" cy="202.8" r="5" fill="#0D1015"/>
+<circle cx="397.7" cy="202.8" r="4" fill="#3FA86B"/>
+<circle cx="426.9" cy="205.9" r="5" fill="#0D1015"/>
+<circle cx="426.9" cy="205.9" r="4" fill="#3FA86B"/>
+<circle cx="456.0" cy="211.4" r="5" fill="#0D1015"/>
+<circle cx="456.0" cy="211.4" r="4" fill="#3FA86B"/>
+<circle cx="485.1" cy="216.7" r="5" fill="#0D1015"/>
+<circle cx="485.1" cy="216.7" r="4" fill="#3FA86B"/>
+<circle cx="514.3" cy="207.0" r="5" fill="#0D1015"/>
+<circle cx="514.3" cy="207.0" r="4" fill="#3FA86B"/>
+<circle cx="543.4" cy="203.3" r="5" fill="#0D1015"/>
+<circle cx="543.4" cy="203.3" r="4" fill="#3FA86B"/>
+<circle cx="572.5" cy="209.8" r="5" fill="#0D1015"/>
+<circle cx="572.5" cy="209.8" r="4" fill="#3FA86B"/>
+<circle cx="601.7" cy="209.8" r="5" fill="#0D1015"/>
+<circle cx="601.7" cy="209.8" r="4" fill="#3FA86B"/>
+<circle cx="630.8" cy="220.6" r="5" fill="#0D1015"/>
+<circle cx="630.8" cy="220.6" r="4" fill="#3FA86B"/>
+<circle cx="659.9" cy="218.0" r="5" fill="#0D1015"/>
+<circle cx="659.9" cy="218.0" r="4" fill="#3FA86B"/>
+<circle cx="689.1" cy="227.5" r="5" fill="#0D1015"/>
+<circle cx="689.1" cy="227.5" r="4" fill="#3FA86B"/>
+<circle cx="718.2" cy="216.2" r="5" fill="#0D1015"/>
+<circle cx="718.2" cy="216.2" r="4" fill="#3FA86B"/>
+<circle cx="747.3" cy="216.5" r="5" fill="#0D1015"/>
+<circle cx="747.3" cy="216.5" r="4" fill="#3FA86B"/>
+<circle cx="776.5" cy="197.2" r="5" fill="#0D1015"/>
+<circle cx="776.5" cy="197.2" r="4" fill="#3FA86B"/>
+<circle cx="805.6" cy="196.3" r="5" fill="#0D1015"/>
+<circle cx="805.6" cy="196.3" r="4" fill="#3FA86B"/>
+<circle cx="834.7" cy="196.1" r="5" fill="#0D1015"/>
+<circle cx="834.7" cy="196.1" r="4" fill="#3FA86B"/>
+<circle cx="863.9" cy="196.5" r="5" fill="#0D1015"/>
+<circle cx="863.9" cy="196.5" r="4" fill="#3FA86B"/>
+<circle cx="893.0" cy="196.1" r="5" fill="#0D1015"/>
+<circle cx="893.0" cy="196.1" r="4" fill="#3FA86B"/>
+<circle cx="919.2" cy="195.6" r="5" fill="#0D1015"/>
+<circle cx="919.2" cy="195.6" r="4" fill="#3FA86B"/>
+<text x="116.4" y="79.7" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="500" fill="#C7CFDA" text-anchor="start" >66,246</text>
+<text x="96.4" y="129.1" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="500" fill="#C7CFDA" text-anchor="end" >23,661</text>
+<text x="838.9" y="338.4" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="500" fill="#C7CFDA" text-anchor="start" >99</text>
+<text x="929.2" y="199.6" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="500" fill="#C7CFDA" text-anchor="start" >3,739</text>
+<rect x="710" y="48" width="12" height="4" rx="1" fill="#5B8DEF"/>
+<text x="730.0" y="54.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#C7CFDA" text-anchor="start" >Postgres 18.6</text>
+<rect x="850" y="48" width="12" height="4" rx="1" fill="#3FA86B"/>
+<text x="870.0" y="54.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="12" font-weight="400" fill="#C7CFDA" text-anchor="start" >Egres</text>
+</svg>

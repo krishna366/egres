@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 400" role="img" aria-labelledby="t-tenants-one-process d-tenants-one-process">
+<title id="t-tenants-one-process">A VM per tenant versus one Egres process with thousands of tenants</title>
+<desc id="d-tenants-one-process">Left: three virtual machines, each with its own kernel and database process, one tenant each. Right: one Egres process on eight threads holding thousands of tenants as fibers, with CPU, memory and disk I/O metered per tenant.</desc>
+<rect width="1000" height="400" rx="12" fill="#0D1015"/>
+<rect x="24" y="24" width="466.0" height="352" rx="10" fill="none" stroke="#252B35"/>
+<text x="48" y="62" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500" fill="#6B7684" text-anchor="start" letter-spacing="1.4">OLD SCHOOL: A VM PER TENANT</text>
+<rect x="48.0" y="82" width="132.7" height="128" rx="6" fill="none" stroke="#343C48" stroke-width="2"/>
+<text x="62.0" y="110" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#98A2B3" text-anchor="start" >vm</text>
+<text x="62.0" y="136" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >kernel</text>
+<text x="62.0" y="160" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >db process</text>
+<text x="62.0" y="184" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >one tenant</text>
+<rect x="190.7" y="82" width="132.7" height="128" rx="6" fill="none" stroke="#343C48" stroke-width="2"/>
+<text x="204.66666666666666" y="110" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#98A2B3" text-anchor="start" >vm</text>
+<text x="204.66666666666666" y="136" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >kernel</text>
+<text x="204.66666666666666" y="160" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >db process</text>
+<text x="204.66666666666666" y="184" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >one tenant</text>
+<rect x="333.3" y="82" width="132.7" height="128" rx="6" fill="none" stroke="#343C48" stroke-width="2"/>
+<text x="347.3333333333333" y="110" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#98A2B3" text-anchor="start" >vm</text>
+<text x="347.3333333333333" y="136" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >kernel</text>
+<text x="347.3333333333333" y="160" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >db process</text>
+<text x="347.3333333333333" y="184" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#6B7684" text-anchor="start" >one tenant</text>
+<text x="48" y="272" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#98A2B3" text-anchor="start" >The database cannot tell tenants apart, so</text>
+<text x="48" y="295" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#98A2B3" text-anchor="start" >isolation is outsourced to a hypervisor. Every</text>
+<text x="48" y="318" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#98A2B3" text-anchor="start" >tenant pays for a kernel, a memory floor and a</text>
+<text x="48" y="341" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#98A2B3" text-anchor="start" >boot time, and the fix for a noisy neighbour is</text>
+<text x="48" y="364" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#98A2B3" text-anchor="start" >to over-provision.</text>
+<rect x="510.0" y="24" width="466.0" height="352" rx="10" fill="none" stroke="#F2B04E"/>
+<text x="534.0" y="62" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500" fill="#F2B04E" text-anchor="start" letter-spacing="1.4">EGRES: ONE PROCESS, METERED PER TENANT</text>
+<rect x="534.0" y="82" width="418.0" height="150" rx="6" fill="none" stroke="#3A4350"/>
+<text x="548.0" y="108" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="500" fill="#98A2B3" text-anchor="start" >one process · 8 threads · thousands of tenants</text>
+<rect x="908.0" y="120" width="30" height="18" rx="3" fill="none" stroke="#343C48"/>
+<text x="923.0" y="133" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500" fill="#C7CFDA" text-anchor="middle" >io</text>
+<rect x="861.0" y="120" width="42" height="18" rx="3" fill="none" stroke="#343C48"/>
+<text x="882.0" y="133" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500" fill="#C7CFDA" text-anchor="middle" >mem</text>
+<rect x="818.0" y="120" width="38" height="18" rx="3" fill="none" stroke="#343C48"/>
+<text x="837.0" y="133" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500" fill="#C7CFDA" text-anchor="middle" >cpu</text>
+<rect x="548.0" y="148" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="566.0" y="148" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="584.0" y="148" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="602.0" y="148" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="620.0" y="148" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="638.0" y="148" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="656.0" y="148" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="674.0" y="148" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="692.0" y="148" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="710.0" y="148" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="728.0" y="148" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="746.0" y="148" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="764.0" y="148" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="782.0" y="148" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="800.0" y="148" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="818.0" y="148" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="836.0" y="148" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="854.0" y="148" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="872.0" y="148" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="890.0" y="148" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="908.0" y="148" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="548.0" y="162" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="566.0" y="162" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="584.0" y="162" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="602.0" y="162" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="620.0" y="162" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="638.0" y="162" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="656.0" y="162" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="674.0" y="162" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="692.0" y="162" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="710.0" y="162" width="14" height="10" rx="2" fill="#F28B6A"/>
+<rect x="728.0" y="162" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="746.0" y="162" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="764.0" y="162" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="782.0" y="162" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="800.0" y="162" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="818.0" y="162" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="836.0" y="162" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="854.0" y="162" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="872.0" y="162" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="890.0" y="162" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="908.0" y="162" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="548.0" y="176" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="566.0" y="176" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="584.0" y="176" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="602.0" y="176" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="620.0" y="176" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="638.0" y="176" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="656.0" y="176" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="674.0" y="176" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="692.0" y="176" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="710.0" y="176" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="728.0" y="176" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="746.0" y="176" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="764.0" y="176" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="782.0" y="176" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="800.0" y="176" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="818.0" y="176" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="836.0" y="176" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="854.0" y="176" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="872.0" y="176" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="890.0" y="176" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="908.0" y="176" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="548.0" y="190" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="566.0" y="190" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="584.0" y="190" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="602.0" y="190" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="620.0" y="190" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="638.0" y="190" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="656.0" y="190" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="674.0" y="190" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="692.0" y="190" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="710.0" y="190" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="728.0" y="190" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="746.0" y="190" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="764.0" y="190" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="782.0" y="190" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="800.0" y="190" width="14" height="10" rx="2" fill="#353E4A"/>
+<rect x="818.0" y="190" width="14" height="10" rx="2" fill="#232A35"/>
+<rect x="836.0" y="190" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="854.0" y="190" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="872.0" y="190" width="14" height="10" rx="2" fill="#3E4856"/>
+<rect x="890.0" y="190" width="14" height="10" rx="2" fill="#2C343F"/>
+<rect x="908.0" y="190" width="14" height="10" rx="2" fill="#F28B6A"/>
+<text x="548.0" y="218" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="500" fill="#6B7684" text-anchor="start" >each tile is a tenant · orange: at its cap, parked</text>
+<text x="534.0" y="272" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#B4BCC8" text-anchor="start" >Every query is a fiber, and the scheduler knows</text>
+<text x="534.0" y="295" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#B4BCC8" text-anchor="start" >which tenant each fiber belongs to. CPU time,</text>
+<text x="534.0" y="318" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#B4BCC8" text-anchor="start" >memory and disk I/O are measured per query and</text>
+<text x="534.0" y="341" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#B4BCC8" text-anchor="start" >accounted per tenant, on shared threads, with</text>
+<text x="534.0" y="364" font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="400" fill="#B4BCC8" text-anchor="start" >no hypervisor in the loop.</text>
+</svg>
