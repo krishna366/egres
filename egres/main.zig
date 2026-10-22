@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const std = @import("std");
+const builtin = @import("builtin");
 const raft = @import("raft");
 const zdb = @import("zdb");
 const fiber = @import("zfiber");
@@ -17,7 +18,11 @@ const String = utils.String;
 const galloc = @import("galloc");
 
 pub const std_options = std.Options{
-    .log_level = .debug,
+    // Debug lines (raft prints three per apply batch) are compiled out
+    // of release builds: std.log filters at comptime.
+    .log_level = if (builtin.mode == .Debug) .debug else .info,
+    // `2026-10-22T14:05:31.123456Z INFO  raft: ...`; see u/log.zig.
+    .logFn = utils.log.logFn,
 };
 
 /// `--listen` — where the server binds. Actual addresses are
@@ -393,12 +398,12 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     var leftover: std.ArrayList(String) = .empty;
     defer leftover.deinit(allocator);
     flags.g().parseArgv(argv[1..], &leftover) catch |err| {
-        std.log.err("flag parse failed: {s}", .{@errorName(err)});
+        log.err("flag parse failed: {s}", .{@errorName(err)});
         usage(allocator);
         std.process.exit(1);
     };
     if (leftover.items.len != 0) {
-        std.log.err(
+        log.err(
             "unexpected positional '{s}' — config goes through" ++
                 " --listen/--raft/--zdb flags",
             .{leftover.items[0]},
@@ -421,21 +426,21 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     fiber.runtime().steal_lone = runtime_cfg.steal_lone;
     fiber.runtime().prepark_poll_us = runtime_cfg.poll_us;
     if (raft_cfg.id == 0 or wal_cfg.dir.len == 0) {
-        std.log.err("--raft requires id (>0); --wal requires dir", .{});
+        log.err("--raft requires id (>0); --wal requires dir", .{});
         usage(allocator);
         std.process.exit(1);
     }
     const store_dir = store_cfg.dir_path.len > 0;
     if (store_dir == (store_cfg.s3_endpoint.len > 0)) {
-        std.log.err("--store needs dir_path or s3_endpoint, not both", .{});
+        log.err("--store needs dir_path or s3_endpoint, not both", .{});
         std.process.exit(1);
     }
     if (!store_dir and store_cfg.s3_bucket.len == 0) {
-        std.log.err("--store s3_endpoint requires s3_bucket", .{});
+        log.err("--store s3_endpoint requires s3_bucket", .{});
         std.process.exit(1);
     }
     if (store_dir and std.mem.eql(u8, store_cfg.dir_path, wal_cfg.dir)) {
-        std.log.err("--store dir_path and --wal dir must differ", .{});
+        log.err("--store dir_path and --wal dir must differ", .{});
         std.process.exit(1);
     }
 
@@ -607,7 +612,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     // Open zdb forest.
     log.info("opening forest", .{});
     zdb_cfg.validate() catch |err| {
-        std.log.err("--zdb: invalid storage options: {s}", .{@errorName(err)});
+        log.err("--zdb: invalid storage options: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
     var forest = try zdb.forest.Forest.open(allocator, live_zdb, &store);
@@ -655,7 +660,7 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
 /// cluster, then hand off to the engine (recovery + loops) and register the
 /// admin front-end, finally blocking until a shutdown signal.
 fn appMain(eng: *engine.Engine, admin_srv: *engine.AdminServer, sql_srv: *sql.Server, node: *raft.Node, args: *const Args) void {
-    log.info("inside appMain", .{});
+    log.debug("inside appMain", .{});
 
     // Transport must be up before the cluster join (seeded nodes) and before
     // recovery fetches missing SSTs from the leader.
@@ -745,6 +750,6 @@ fn runJoin(args: *const Args, allocator: std.mem.Allocator) void {
         args.raft.id,
         args.raft_addr,
     ) catch |err| {
-        std.log.err("cluster join failed: {s}", .{@errorName(err)});
+        log.err("cluster join failed: {s}", .{@errorName(err)});
     };
 }

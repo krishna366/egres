@@ -7,4 +7,5 @@ test {
     _ = @import("date_test.zig");
     _ = @import("flags_test.zig");
     _ = @import("hlc_test.zig");
+    _ = @import("log_test.zig");
 }

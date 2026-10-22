@@ -23,6 +23,7 @@
 //! `current_do_not_use_directly` thread-local).
 
 const std = @import("std");
+const log = std.log.scoped(.fiber);
 const builtin = @import("builtin");
 const xev = @import("xev");
 const _fb = @import("fiber.zig");
@@ -486,7 +487,7 @@ pub const Worker = struct {
         const size = @sizeOf(linux.cpu_set_t);
         const rc = linux.sched_getaffinity(0, size, &allowed);
         if (@as(isize, @bitCast(rc)) < 0) {
-            std.log.warn("W{d}: sched_getaffinity failed", .{self.id});
+            log.warn("W{d}: sched_getaffinity failed", .{self.id});
             return;
         }
         var count: usize = 0;
@@ -497,7 +498,7 @@ pub const Worker = struct {
         // worker free instead.
         const total = runtime().workers.len;
         if (total > count) {
-            if (self.id == 0) std.log.warn(
+            if (self.id == 0) log.warn(
                 "{d} workers on {d} allowed CPUs: workers left unpinned",
                 .{ total, count },
             );
@@ -521,7 +522,7 @@ pub const Worker = struct {
         const shift: std.math.Log2Int(usize) = @intCast(cpu % word_bits);
         set[cpu / word_bits] |= @as(usize, 1) << shift;
         linux.sched_setaffinity(0, &set) catch |err| {
-            std.log.warn("W{d}: pin to cpu {d} failed: {s}", .{
+            log.warn("W{d}: pin to cpu {d} failed: {s}", .{
                 self.id, cpu, @errorName(err),
             });
         };
@@ -916,7 +917,7 @@ fn raftWorkerCount(num_workers: usize, requested: ?usize) usize {
     // with the same message (panic text only reaches stderr).
     if (raft > num_workers / 2) {
         const msg = "fiber.Runtime: raft_workers ({d}) exceeds half of num_workers ({d}); raft must not take more than half the workers";
-        std.log.err(msg, .{ raft, num_workers });
+        log.err(msg, .{ raft, num_workers });
         std.debug.panic(msg, .{ raft, num_workers });
     }
     return raft;
@@ -1776,7 +1777,7 @@ fn calibrateTsc() void {
     const max_ghz = q32_one / @as(f64, @floatFromInt(samples[0]));
     const min_ghz = q32_one / @as(f64, @floatFromInt(samples[N - 1]));
     const med_ghz = q32_one / @as(f64, @floatFromInt(median));
-    std.log.info(
+    log.info(
         "tsc calibration: median={d:.4} GHz (min={d:.4}, max={d:.4}, samples={d})",
         .{ med_ghz, min_ghz, max_ghz, N },
     );

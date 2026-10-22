@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const std = @import("std");
+const log = std.log.scoped(.diskwal);
 const builtin = @import("builtin");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
@@ -733,7 +734,7 @@ pub const NextLog = struct {
         ) catch |err| {
             // The pop left the capacity in place.
             if (spare) |s| self.spares.appendAssumeCapacity(s);
-            std.log.warn("raft/diskwal: no fiber to prepare log file {d}: {s}", .{
+            log.warn("no fiber to prepare log file {d}: {s}", .{
                 fid, @errorName(err),
             });
             return;
@@ -755,8 +756,8 @@ pub const NextLog = struct {
             if (self.reuse(fid)) |lf| {
                 return lf;
             } else |err| {
-                std.log.warn(
-                    "raft/diskwal: reuse of log file {d}: {s}; " ++
+                log.warn(
+                    "reuse of log file {d}: {s}; " ++
                         "creating a new one",
                     .{ fid, @errorName(err) },
                 );
@@ -940,8 +941,8 @@ pub const NextLog = struct {
         inline_opts.prezero = .false;
         if (self.creating) |*handle| {
             if (!handle.fiber.isFinished()) {
-                std.log.warn(
-                    "raft/diskwal: next log file not ready at rotation; " ++
+                log.warn(
+                    "next log file not ready at rotation; " ++
                         "using an unfilled one",
                     .{},
                 );
@@ -975,7 +976,7 @@ pub const NextLog = struct {
                 prepared.fid = fid;
                 return prepared;
             } else |err| {
-                std.log.err("raft/diskwal: prepared log file failed: {s}; creating inline", .{
+                log.err("prepared log file failed: {s}; creating inline", .{
                     @errorName(err),
                 });
             }
@@ -1319,7 +1320,7 @@ pub const LogBuf = struct {
         defer self.inflight.setDone();
         while (true) {
             self.write_(item) catch |err| {
-                std.log.err("raft/diskwal: write through index {d}: {s}", .{
+                log.err("write through index {d}: {s}", .{
                     item.last_index, @errorName(err),
                 });
                 if (self.stopping.load(.acquire)) {

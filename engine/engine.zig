@@ -56,6 +56,8 @@ const Meta = zdb.kv.Meta;
 const TreeKey = zdb.kv.TreeKey;
 const metrics = zdb.metrics;
 const log = std.log.scoped(.engine);
+/// A manifest apply past this holds every entry behind it: a warning.
+const slow_manifest_apply_us: i64 = 100_000;
 
 /// A front-end's hook into the commit stream. `onData` fires on the apply
 /// fiber right after a committed Mutations entry is written to the forest,
@@ -246,19 +248,26 @@ pub const StorageImpl = struct {
             self.allocator.destroy(mcs);
         }
 
-        // TRACE: pinpoints which entry / cmd hangs the apply path. Last
-        // "enter" without a matching "exit" is the wedge.
-        log.info("applyManifestChange enter idx={d} cmd={t} mt={d} tcs={d}", .{
+        // The last "enter" without an "exit" names the entry that wedged
+        // the apply path; debug only, two lines per manifest change.
+        log.debug("applyManifestChange enter idx={d} cmd={t} mt={d} tcs={d}", .{
             index, mcs.cmd, mcs.memtable_id, mcs.sstable_changes.len,
         });
         // The apply fiber applies everything in order: a slow manifest
-        // apply holds every data entry behind it. Log how long each took.
+        // apply holds every data entry behind it, so a slow one is a
+        // warning.
         const t0 = utils.timestampNow(.monotonic, .micros);
         defer {
-            const t1 = utils.timestampNow(.monotonic, .micros);
-            log.info("applyManifestChange exit  idx={d} cmd={t} took={d}us", .{
-                index, mcs.cmd, t1 - t0,
+            const took = utils.timestampNow(.monotonic, .micros) - t0;
+            log.debug("applyManifestChange exit  idx={d} cmd={t} took={d}us", .{
+                index, mcs.cmd, took,
             });
+            if (took > slow_manifest_apply_us) {
+                log.info(
+                    "applyManifestChange slow idx={d} cmd={t} took={d}us",
+                    .{ index, mcs.cmd, took },
+                );
+            }
         }
 
         switch (mcs.cmd) {
@@ -366,8 +375,8 @@ pub const InFlight = struct {
     src_level: u8 = 0,
     src_tables: u32 = 0,
     /// Compaction id (`cid`) for `kind == .compaction`; 0 otherwise. Lets
-    /// the watchdog log line cross-reference the per-compaction phase
-    /// logs (`compact cid=N start/build_done/...`).
+    /// the watchdog log line cross-reference the compaction's own line
+    /// (`compact cid=N done ...`, and its phases at debug).
     cid: u64 = 0,
     started_at_ms: i64,
 };
@@ -504,7 +513,7 @@ pub const Engine = struct {
     fn runRaft(r: *raft.RaftRuntime) void {
         r.run() catch |err| {
             if (err == error.Canceled) return;
-            std.log.err("raft runtime error: {s}", .{@errorName(err)});
+            log.err("raft runtime error: {s}", .{@errorName(err)});
             if (@errorReturnTrace()) |bt| {
                 // Zig 0.16 split StackTrace: `@errorReturnTrace` returns
                 // `builtin.StackTrace`; `dumpStackTrace` wants `debug.StackTrace`.
@@ -916,7 +925,9 @@ pub const Engine = struct {
         defer scratch.deinit(self.allocator);
         for (result.entries) |stored| {
             const reader = raft.buffers.LogEntryReader.parseRoot(stored.bytes) catch |err| {
-                log.warn("maybeProposeSnapshot: parseRoot at index={d}: {s}", .{ stored.index, @errorName(err) });
+                log.err("maybeProposeSnapshot: parseRoot at index={d}: {s}", .{
+                    stored.index, @errorName(err),
+                });
                 continue;
             };
             // An entry's data may be stored compressed.
@@ -929,7 +940,8 @@ pub const Engine = struct {
             if (payload.len == 0) continue;
 
             const parsed = zdb_bufs.parseMessageWithTail(payload) catch |err| {
-                log.warn("maybeProposeSnapshot: parseMessageWithTail at index={d}: {s}", .{ stored.index, @errorName(err) });
+                log.err("maybeProposeSnapshot: parseMessageWithTail at " ++
+                    "index={d}: {s}", .{ stored.index, @errorName(err) });
                 continue;
             };
             switch (parsed) {
@@ -1177,7 +1189,7 @@ pub const Engine = struct {
 
         const src = job.cand.level;
         const t0 = utils.coarseMs();
-        log.info("compact cid={d} start tree={d} L{d}", .{
+        log.debug("compact cid={d} start tree={d} L{d}", .{
             cid, job.key.tree_id, src,
         });
 
@@ -1192,11 +1204,13 @@ pub const Engine = struct {
             // The job went stale between the pick and the build (an
             // install unlisted one of its tables). `releaseJob` refreshes
             // the candidate, so the next pick sees what the tree needs.
-            log.info("compact cid={d} build_done changes=0 (no-op)", .{cid});
+            log.debug("compact cid={d} build_done changes=0 (no-op)", .{cid});
             return;
         }
         const t1 = utils.coarseMs();
-        log.info("compact cid={d} build_done changes={d} build_ms={d}", .{ cid, changes.items.len, t1 - t0 });
+        log.debug("compact cid={d} build_done changes={d} build_ms={d}", .{
+            cid, changes.items.len, t1 - t0,
+        });
 
         // The build, merge and write, of merges only: a move renames one
         // file and would pull its level pair's times toward zero.
@@ -1212,14 +1226,25 @@ pub const Engine = struct {
 
         try self.announceNewFiles(changes.items);
         const t2 = utils.coarseMs();
-        log.info("compact cid={d} distribute_done distribute_ms={d}", .{ cid, t2 - t1 });
+        log.debug("compact cid={d} distribute_done distribute_ms={d}", .{
+            cid, t2 - t1,
+        });
 
         const payload = try encodeManifestChange(self.allocator, .compaction, changes.items, &.{}, 0);
         defer self.allocator.free(payload);
 
         try self.node.proposeAndWaitForApply(payload, .manifest);
         const t3 = utils.coarseMs();
-        log.info("compact cid={d} done propose_ms={d} total_ms={d}", .{ cid, t3 - t2, t3 - t0 });
+        // The one line per compaction a release log keeps: every phase's
+        // time is in it.
+        log.info(
+            "compact cid={d} done tree={d} L{d} changes={d} build_ms={d} " ++
+                "distribute_ms={d} propose_ms={d} total_ms={d}",
+            .{
+                cid,     job.key.tree_id, src,     changes.items.len,
+                t1 - t0, t2 - t1,         t3 - t2, t3 - t0,
+            },
+        );
     }
 
     fn proposeSplit(self: *Engine, key: TreeKey) !void {
@@ -1248,7 +1273,7 @@ pub const Engine = struct {
         ) orelse {
             // No split key (Lmax has < 2 tables): the candidate that
             // sent us here was stale. `releaseJob` recomputes it.
-            log.warn("proposeSplit tree={d} skipped: no split key", .{
+            log.debug("proposeSplit tree={d} skipped: no split key", .{
                 key.tree_id,
             });
             return;

@@ -162,15 +162,16 @@ then
 else
     bad "server did not shut down cleanly"
 fi
-# Levels print at a line's start: `error(scope):`, `warning(scope):`.
-errors=$(grep -cE '^(error|panic)' "$log" || true)
+# The level is a line's second field: `<time> ERROR <scope>: ...`. A
+# panic is Zig's own text, with no timestamp.
+errors=$(grep -cE '^[^ ]+ ERROR ' "$log" || true)
 panics=$(grep -c 'panic' "$log" || true)
-warnings=$(grep -c '^warning' "$log" || true)
+warnings=$(grep -cE '^[^ ]+ WARN ' "$log" || true)
 if [ "$errors" = 0 ] && [ "$panics" = 0 ]; then
     ok "server log: no error or panic ($warnings warnings)"
 else
     bad "server log: errors=$errors panics=$panics warnings=$warnings"
-    grep -E '^(error|panic)|panic' "$log" | head -n 5
+    grep -E '^[^ ]+ ERROR |panic' "$log" | head -n 5
 fi
 
 echo

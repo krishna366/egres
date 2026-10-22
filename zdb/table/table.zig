@@ -522,9 +522,8 @@ pub const Table = struct {
             if (cache.?.put(cache_key, val)) |_| {
                 self.setCachedBit(block_idx);
             } else |err| {
-                log.warn("block cache put failed: {s}; file_id={d} block={d}", .{
-                    @errorName(err), self.file_id, block_idx,
-                });
+                log.debug("block cache put failed: {s}; file_id={d} " ++
+                    "block={d}", .{ @errorName(err), self.file_id, block_idx });
             }
         }
 
@@ -590,9 +589,8 @@ pub const Table = struct {
             if (cache.put(self.cacheKey(idx), val)) |_| {
                 self.setCachedBit(idx);
             } else |err| {
-                log.warn("block cache put failed: {s}; file_id={d} block={d}", .{
-                    @errorName(err), self.file_id, idx,
-                });
+                log.debug("block cache put failed: {s}; file_id={d} " ++
+                    "block={d}", .{ @errorName(err), self.file_id, idx });
             }
         }
         return wanted.items.len;

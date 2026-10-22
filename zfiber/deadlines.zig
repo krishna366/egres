@@ -24,6 +24,7 @@
 //! lock and on the owner thread.
 
 const std = @import("std");
+const log = std.log.scoped(.fiber);
 const xev = @import("xev");
 const _heap = @import("heap.zig");
 const _coarse = @import("utils").coarse_clock;
@@ -288,7 +289,7 @@ pub const Deadlines = struct {
             @intCast(delta);
 
         const node = self.acquireNode() catch {
-            std.log.err("deadlines: OOM arming timer; head deferred", .{});
+            log.err("OOM arming timer; head deferred", .{});
             return;
         };
         node.deadline_ms = deadline;

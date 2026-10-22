@@ -28,8 +28,8 @@ Egres keeps two directories: the store, where every SSTable lives, and the write
 
 ```sh
 $ egres --raft id=1 --store dir_path=./egres-data --wal dir=./egres-wal
-info(egres): starting egres id=1 cluster=1 raft=127.0.0.1:4210 admin=127.0.0.1:5210 sql=127.0.0.1:3210 wal=./egres-wal tick=20ms seeds=0
-info(sql): sql listener started on port 3210 (pgwire)
+2026-10-22T14:05:31.123456Z INFO  egres: starting egres id=1 cluster=1 raft=127.0.0.1:4210 admin=127.0.0.1:5210 sql=127.0.0.1:3210 wal=./egres-wal tick=20ms seeds=0
+2026-10-22T14:05:31.140211Z INFO  sql: sql listener started on port 3210 (pgwire)
 ```
 
 Postgres clients connect on port `3210`. The admin port is `5210` and the Raft port is `4210`; `--listen` moves all three. Every flag is `--group key=value`, and `egres --help` lists them with their defaults.

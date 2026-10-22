@@ -132,7 +132,7 @@ fn deviceConfig(
     const p = runCalibration(allocator, dir) catch |err| {
         log.warn("disk calibration of {s} failed: {s}; using --io " ++
             "bandwidth_bytes={d}MiB write_cost={d}", .{
-            dir,                         @errorName(err),
+            dir,                          @errorName(err),
             io_cfg.bandwidth_bytes >> 20, io_cfg.write_cost,
         });
         return pinned;
@@ -220,7 +220,7 @@ fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
     const elapsed_ns: u64 = @intCast(@max(t1 - t0, 1));
     const moved: u128 = @as(u128, total) * std.time.ns_per_s;
     const bps: u64 = @intCast(moved / elapsed_ns);
-    log.info("{s} at depth {d}: {d} MiB in {d} ms = {d} MiB/s", .{
+    log.debug("{s} at depth {d}: {d} MiB in {d} ms = {d} MiB/s", .{
         @tagName(kind),                  depth,     total >> 20,
         elapsed_ns / std.time.ns_per_ms, bps >> 20,
     });

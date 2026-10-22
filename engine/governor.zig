@@ -142,7 +142,7 @@ pub const Governor = struct {
         if (cap != self.knob.now) {
             self.knob.set(cap);
             // The cap moves a little on most ticks: sample it every 5 s.
-            utils.logEvery(5, "governor: cache cap {d} MiB (margin " ++
+            utils.logEvery(.debug, 5, "governor: cache cap {d} MiB (margin " ++
                 "{d} MiB, ratio {d:.3})", .{
                 cap >> 20, self.margin >> 20, self.ratio.cur,
             });

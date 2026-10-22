@@ -733,27 +733,28 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     var leftover: std.ArrayList(String) = .empty;
     defer leftover.deinit(allocator);
     flags.g().parseArgv(argv[1..], &leftover) catch |err| {
-        std.log.err("flag parse failed: {s}", .{@errorName(err)});
+        log.err("flag parse failed: {s}", .{@errorName(err)});
         usage(allocator);
         std.process.exit(1);
     };
     if (leftover.items.len != 0) {
-        std.log.err("unexpected positional '{s}' — config goes through --bench flag", .{leftover.items[0]});
+        log.err("unexpected positional '{s}' — config goes through " ++
+            "--bench flag", .{leftover.items[0]});
         usage(allocator);
         std.process.exit(1);
     }
 
     const args = live.cur();
     if (args.read_pct > 100) {
-        std.log.err("--bench read_pct must be in [0..100]", .{});
+        log.err("--bench read_pct must be in [0..100]", .{});
         std.process.exit(1);
     }
     if (args.namespaces == 0 or args.batch_size == 0) {
-        std.log.err("--bench namespaces and batch_size must be > 0", .{});
+        log.err("--bench namespaces and batch_size must be > 0", .{});
         std.process.exit(1);
     }
     if (!std.mem.eql(u8, args.phase, "load") and !std.mem.eql(u8, args.phase, "run") and !std.mem.eql(u8, args.phase, "both")) {
-        std.log.err("--bench phase must be \"load\", \"run\", or \"both\"", .{});
+        log.err("--bench phase must be \"load\", \"run\", or \"both\"", .{});
         std.process.exit(1);
     }
 

@@ -26,6 +26,7 @@
 //! read.
 
 const std = @import("std");
+const log = std.log.scoped(.profile);
 const builtin = @import("builtin");
 const _rt = @import("runtime.zig");
 const timestampNow = @import("utils").timestampNow;
@@ -238,7 +239,7 @@ const LinuxTimer = struct {
             .tid = tid,
         };
         if (timer_create(clk, &ev, &self.id) != 0) {
-            std.log.warn("profile: timer_create for tid {d}: {s}", .{
+            log.err("timer_create for tid {d}: {s}", .{
                 tid, @tagName(std.posix.errno(-1)),
             });
             return error.TimerCreate;
@@ -405,7 +406,7 @@ pub fn stop(out: *std.Io.Writer, output: Output) !Report {
     defer arena.deinit();
     var names: Names = .{ .a = arena.allocator() };
     const t_sym = timestampNow(.monotonic, .millis);
-    defer std.log.info("profile: symbolized {d} addresses in {d} ms " ++
+    defer log.info("symbolized {d} addresses in {d} ms " ++
         "(first {d} ms)", .{
         names.cache.count(), timestampNow(.monotonic, .millis) - t_sym,
         names.first_ms,

@@ -303,8 +303,12 @@ fn handleConn(self: *Server, stream: fiber.net.Stream) void {
     // writes dropped) runs BEFORE the socket closes above. Covers clean
     // Terminate and every error exit from serve.
     defer handler.deinit();
-    handler.serve(&s) catch |err| {
-        log.warn("conn serve error: {s}", .{@errorName(err)});
+    handler.serve(&s) catch |err| switch (err) {
+        // A client that went away: psql and pgbench end this way.
+        error.ReadFailed, error.WriteFailed, error.EndOfStream => {
+            log.debug("conn closed: {s}", .{@errorName(err)});
+        },
+        else => log.warn("conn serve error: {s}", .{@errorName(err)}),
     };
 }
 
@@ -922,7 +926,7 @@ pub const Handler = struct {
     fn beginTxn(self: *Handler, state: *pgwire.ConnState) !void {
         if (self.txn != null) {
             // Postgres warns and no-ops.
-            log.warn("BEGIN inside a transaction block — no-op", .{});
+            log.debug("BEGIN inside a transaction block — no-op", .{});
             return state.sendCommandComplete("BEGIN");
         }
         const ns = try self.sessionNamespace(state) orelse return;
@@ -937,7 +941,9 @@ pub const Handler = struct {
     /// Postgres behavior); outside a block both warn and no-op.
     fn endTxn(self: *Handler, state: *pgwire.ConnState, commit: bool) !void {
         const t = self.txn orelse {
-            log.warn("{s} outside a transaction block — no-op", .{if (commit) "COMMIT" else "ROLLBACK"});
+            log.debug("{s} outside a transaction block — no-op", .{
+                if (commit) "COMMIT" else "ROLLBACK",
+            });
             return state.sendCommandComplete(if (commit) "COMMIT" else "ROLLBACK");
         };
         defer {

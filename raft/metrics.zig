@@ -18,8 +18,11 @@ pub const PhaseLabels = struct {
 
 // Millisecond bucket boundaries. utils.coarseMs ticks ~every 1 ms, so any
 // sub-ms phase lands in the lowest bucket — a tail above ~10 ms points
-// at fsync stalls or scheduling hazards. Last bucket = 1 s.
-const phase_buckets: []const u64 = &.{ 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000 };
+// at fsync stalls or scheduling hazards. Out to 10 s: a WAL write stalled
+// behind compaction on a shared disk has taken seconds.
+const phase_buckets: []const u64 = &.{
+    1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000,
+};
 
 // Powers-of-two bucket boundaries for proposal-batch sizes. The propose
 // pipeline drains the entire pending queue per call, so this histogram
@@ -28,10 +31,12 @@ const batch_buckets: []const u64 = &.{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 10
 
 pub const PhaseHist = m.HistogramVec(u64, PhaseLabels, phase_buckets);
 // Microsecond buckets for the per-commit timeline (see Node.Timeline):
-// stages are 50 us to a few ms, and the interesting tail is 5 to 50 ms.
+// stages are 50 us to a few ms, the interesting tail is 5 to 50 ms, and
+// the stalls that get a commit+apply warning are seconds.
 const stage_buckets_us: []const u64 = &.{
-    50,   100,  200,  300,  500,   750,   1000,
-    1500, 2000, 3000, 5000, 10000, 50000,
+    50,    100,    200,    300,       500,       750,
+    1000,  1500,   2000,   3000,      5000,      10000,
+    50000, 100000, 500000, 1_000_000, 5_000_000, 10_000_000,
 };
 pub const StageHist = m.HistogramVec(u64, PhaseLabels, stage_buckets_us);
 pub const BatchHist = m.Histogram(u64, batch_buckets);

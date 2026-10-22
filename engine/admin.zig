@@ -734,7 +734,7 @@ pub const AdminServer = struct {
     }
 
     pub fn runListener(self: *AdminServer) void {
-        log.info("inside runListener", .{});
+        log.debug("inside runListener", .{});
         defer log.info("client loop exiting (shutdown)", .{});
 
         const listener = self.listen_addr.listen(.{ .reuse_address = true }) catch |err| {
@@ -772,7 +772,7 @@ pub const AdminServer = struct {
                 return;
             }
             conn_id += 1;
-            log.info("accepted client connection #{d}", .{conn_id});
+            log.debug("accepted client connection #{d}", .{conn_id});
             fiber.spawnDetached(.{}, handleClient, .{ self, stream }) catch {
                 log.err("failed to spawn handler for connection #{d}", .{conn_id});
                 stream.close();
@@ -803,11 +803,12 @@ pub const AdminServer = struct {
             // close the connection — byte stream is at an unknown offset.
             const line = proto.readLine(r, line_buf) catch |err| switch (err) {
                 error.EndOfStream => {
-                    log.info("client disconnected after {d} ops (EOF)", .{ops});
+                    log.debug("client disconnected after {d} ops (EOF)", .{ops});
                     return;
                 },
                 else => {
-                    log.warn("client stream error after {d} ops: {s} — closing", .{ ops, @errorName(err) });
+                    log.debug("client stream error after {d} ops: {s}; " ++
+                        "closing", .{ ops, @errorName(err) });
                     proto.writeErr(stream, @errorName(err)) catch {};
                     return;
                 },
@@ -892,7 +893,7 @@ pub const AdminServer = struct {
                 },
             }
         }
-        log.info("client handler exiting after {d} ops (shutdown)", .{ops});
+        log.debug("client handler exiting after {d} ops (shutdown)", .{ops});
     }
 
     fn handleSet(self: *AdminServer, stream: fiber.net.Stream, req: proto.SetCmd) !void {

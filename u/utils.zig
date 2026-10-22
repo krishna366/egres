@@ -7,6 +7,7 @@ pub const compression = @import("compress.zig");
 pub const hlc = @import("hlc.zig");
 pub const host = @import("host.zig");
 pub const date = @import("date.zig");
+pub const log = @import("log.zig");
 /// Process-wide context (gpa/arena/io/args) and the coarse clock live
 /// here, at the bottom of the module graph, so every layer including
 /// the fiber runtime reaches them without a cycle.
@@ -136,14 +137,27 @@ pub fn testPrint(comptime fmt: String, args: anytype) void {
     _ = args;
 }
 
-/// Rate-limited log: each call site (unique comptime instantiation) logs at most once per interval.
-pub fn logEvery(comptime interval_secs: i64, comptime fmt: String, args: anytype) void {
+/// Rate-limited log: each call site (one comptime instantiation) logs
+/// at most once per interval, at the given level. For a line that a
+/// loop would otherwise print on every pass, a retry above all.
+pub fn logEvery(
+    comptime level: std.log.Level,
+    comptime interval_secs: i64,
+    comptime fmt: String,
+    args: anytype,
+) void {
     const S = struct {
         var last: i64 = 0;
     };
     const now = coarse_clock.ms();
     if (now - S.last > interval_secs * 1_000) {
-        std.log.debug(fmt, args);
+        // std.log.log is private: pick the level's function.
+        switch (level) {
+            .err => std.log.err(fmt, args),
+            .warn => std.log.warn(fmt, args),
+            .info => std.log.info(fmt, args),
+            .debug => std.log.debug(fmt, args),
+        }
         S.last = now;
     }
 }

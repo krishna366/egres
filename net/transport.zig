@@ -107,7 +107,7 @@ pub const Transport = struct {
                 }
             }
         }
-        log.info("Transport close Conns are done {d}", .{num_closed});
+        log.debug("Transport close Conns are done {d}", .{num_closed});
 
         // Wake the accept loop: it is parked in `accept`, and nothing
         // else unparks it on every platform (macOS refuses `shutdown`
@@ -122,7 +122,7 @@ pub const Transport = struct {
                 });
             }
         }
-        log.info("Transport accept loop woken", .{});
+        log.debug("Transport accept loop woken", .{});
         self.group.wait();
         self.group.deinit();
         log.debug("node {d}: Transport group stopped", .{self.cfg.self_id});

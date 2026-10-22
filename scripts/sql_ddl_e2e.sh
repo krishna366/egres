@@ -460,7 +460,7 @@ expect "length on text rejected" "not allowed for type" psql "$E" -X -c "CREATE 
 expect "DROP char(n) table" "DROP TABLE" psql "$E" -X -c "DROP TABLE cn;"
 
 # --- no unexpected server-side errors ---------------------------------------
-if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
+if grep -qE '^[^ ]+ ERROR ' "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
 
 echo
 echo "$pass passed, $fail failed"

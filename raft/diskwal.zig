@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const std = @import("std");
+const log = std.log.scoped(.diskwal);
 const builtin = @import("builtin");
 const zen = @import("buffers_gen");
 const zbuf = @import("zbuf").zbuf;
@@ -272,7 +273,7 @@ pub const wal = struct {
         var opts = opts_in;
         opts.prezero = opts_in.prezero.resolve(path);
         if (opts_in.prezero == .auto and !builtin.is_test) {
-            std.log.info("raft/diskwal: {s}: prezero {s} (fs magic 0x{x})", .{
+            log.info("{s}: prezero {s} (fs magic 0x{x})", .{
                 path, @tagName(opts.prezero), _vfs.fsMagic(path) orelse 0,
             });
         }
@@ -403,8 +404,8 @@ pub const wal = struct {
         // existing highest fid as current.
         if (first_bad) |bad_idx| {
             if (!builtin.is_test) {
-                std.log.err(
-                    "raft/diskwal: dropping malformed trailing WAL files from fid={d} in {s}",
+                log.err(
+                    "dropping malformed trailing WAL files from fid={d} in {s}",
                     .{ found_fids.items[bad_idx], path },
                 );
             }
@@ -459,7 +460,7 @@ pub const wal = struct {
         // down here, a rotated file's leftovers included.
         self.buf.stop();
         self.syncLocked() catch |err| {
-            std.log.err("raft/diskwal: flush at close: {s}", .{@errorName(err)});
+            log.err("flush at close: {s}", .{@errorName(err)});
         };
         self.next.deinit();
         self.cache.deinit();
@@ -759,7 +760,7 @@ pub const wal = struct {
         // A rotated file's last records and header still queued for
         // the writer must land before that file can be closed under it.
         self.buf.drain() catch |err| {
-            std.log.err("raft/diskwal: drain before delete: {s}", .{
+            log.err("drain before delete: {s}", .{
                 @errorName(err),
             });
             return;
@@ -819,8 +820,9 @@ pub const wal = struct {
         const start = self.slotGe(start_index);
         const slot_idx = start.slot_idx orelse {
             if (self.lastIndex() > 0) {
-                std.log.warn(
-                    "raft/diskwal: WAL starts past start_index in {s} (start_index={d}, firstIndex={d}); wiping WAL",
+                log.warn(
+                    "WAL starts past start_index in {s} (start_index={d}, " ++
+                        "firstIndex={d}); wiping WAL",
                     .{ self.dir_path, start_index, self.firstIndex() },
                 );
                 try self.truncateFrom(self.firstIndex());
@@ -837,8 +839,9 @@ pub const wal = struct {
             while (si < lf.slots.items.len) : (si += 1) {
                 const ent = lf.slots.items[si];
                 if (ent.index != expected) {
-                    std.log.warn(
-                        "raft/diskwal: WAL gap in {s} (expected={d}, found={d}); truncating from {d}",
+                    log.warn(
+                        "WAL gap in {s} (expected={d}, found={d}); " ++
+                            "truncating from {d}",
                         .{ self.dir_path, expected, ent.index, expected },
                     );
                     try self.truncateFrom(expected);
@@ -961,7 +964,7 @@ pub const DiskWAL = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Closed => RaftLogError.Unavailable,
             else => {
-                std.log.err("mapToRaftLogError: unmapped error: {}", .{err});
+                log.err("mapToRaftLogError: unmapped error: {}", .{err});
                 return RaftLogError.Unavailable;
             },
         };

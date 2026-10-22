@@ -679,7 +679,7 @@ else bad "row lock survived the disconnect"; fi
 close_session 2
 
 # --- no unexpected server-side errors --------------------------------------
-if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
+if grep -qE '^[^ ]+ ERROR ' "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
 
 echo
 echo "$pass passed, $fail failed"

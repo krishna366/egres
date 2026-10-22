@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const std = @import("std");
+const log = std.log.scoped(.manifest);
 const _zen = @import("buffers.gen.zig");
 const Key = @import("kv.zig").Key;
 const KeyRange = @import("kv.zig").KeyRange;
@@ -257,7 +258,7 @@ pub const Manifest = struct {
 
         if (self.names.get(name)) |owner| {
             if (owner != namespace)
-                std.log.err(
+                log.err(
                     "namespace name '{s}' already owned by ns={d}, not " ++
                         "renaming ns={d}",
                     .{ name, owner, namespace },
@@ -301,7 +302,7 @@ pub const Manifest = struct {
 
         if (slot.value_ptr.tables.get(name)) |owner| {
             if (owner != table_key.table_id)
-                std.log.err(
+                log.err(
                     "table name '{s}' in ns={d} already owned by " ++
                         "table_id={d}, not renaming table_id={d}",
                     .{

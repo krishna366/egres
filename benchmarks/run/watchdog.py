@@ -151,11 +151,11 @@ class Watch:
     def new_log_lines(self):
         """Counts of panic / error / warn in the server log since the
         last call, and one sample line of each."""
-        # Egres prints a level as `error(scope):` or `error:`, and warn
-        # as `warning`, never `warn(`: match the words, at a line's
-        # start so a query or path containing one does not count.
+        # An Egres line is `<time> ERROR <scope>: ...`: the level is
+        # the second field, so a query or path holding the word does
+        # not count. A panic is Zig's own text, anywhere in the line.
         egres = self.run.kind == "egres"
-        keys = ("panic", "error", "warning") if egres \
+        keys = ("panic", "ERROR", "WARN") if egres \
             else ("PANIC", "ERROR", "FATAL")
         counts = {k: 0 for k in keys}
         sample = {}
@@ -171,9 +171,10 @@ class Watch:
         except OSError:
             return counts, sample
         for line in chunk.decode(errors="replace").splitlines():
+            level = line.split(None, 2)[1:2]
             for key in counts:
                 hit = key in line if not egres or key == "panic" \
-                    else line.startswith(key)
+                    else level == [key]
                 if hit:
                     counts[key] += 1
                     sample.setdefault(key, line[:300])

@@ -12,6 +12,7 @@
 //! index-0 paths with no Raft entry behind them, `Manifest.commit`).
 
 const std = @import("std");
+const log = std.log.scoped(.forest);
 const utils = @import("utils");
 const String = utils.String;
 const _manifest = @import("manifest.zig");
@@ -255,7 +256,7 @@ pub fn applyNsBranch(
             .table_id = std.math.maxInt(u32),
         }),
     }, ts, .{ .namespace = dst, .table_id = null });
-    std.log.info("branch ns={d} -> ns={d} at ts={d}: {d} memtable keys", .{
+    log.info("branch ns={d} -> ns={d} at ts={d}: {d} memtable keys", .{
         src, dst, ts, copied,
     });
 }
@@ -302,7 +303,7 @@ pub fn applyTableBranch(
             .left = Key.tableLeft(src),
             .right = Key.tableRight(src),
         }, ts, .{ .namespace = ns, .table_id = dst_tid });
-        std.log.info("branch ns={d} table={d} -> table={d} at ts={d}: {d} " ++
+        log.info("branch ns={d} table={d} -> table={d} at ts={d}: {d} " ++
             "memtable keys", .{ ns, src.table_id, dst_tid, ts, copied });
     }
 }

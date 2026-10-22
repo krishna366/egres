@@ -860,7 +860,8 @@ pub const Node = struct {
         while (lo <= last) {
             var result = while (true) {
                 break self.log.entriesRange(.{ .lo = lo, .hi = last + 1, .ty = .conf }) catch |err| {
-                    std.log.err("restoreConfState: entriesRange failed: {}, retrying...", .{err});
+                    utils.logEvery(.err, 5, "restoreConfState: " ++
+                        "entriesRange failed: {}, retrying", .{err});
                     fiber.sleepMs(1000);
                     continue;
                 };
@@ -1096,7 +1097,12 @@ pub const Node = struct {
         self.state = .leader;
         self.leader_id = self.id;
         self.elapsed_ticks = 0;
-        dbg("become-leader tick={d} node={d} term={d}", .{ self.tick_count, self.id, self.current_term });
+        // Info, not debug: one line per election, and the e2e scripts
+        // and benchmarks/run wait for it as the ready signal.
+        raft_log.info(
+            "become-leader tick={d} node={d} term={d}",
+            .{ self.tick_count, self.id, self.current_term },
+        );
 
         var it = self.peers.iterator();
         while (it.next()) |kv| {
@@ -1225,7 +1231,9 @@ pub const Node = struct {
         const value = try self.buildAppendEntries(state.next_index);
         defer value.decrRef();
         tr.sendMsg(peer, .p0, _serial.msg_type_raft, value) catch |err| {
-            utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ peer, @errorName(err) });
+            utils.logEvery(.debug, 5, "sendMsg to {d} failed: {s}", .{
+                peer, @errorName(err),
+            });
         };
     }
 
@@ -1458,7 +1466,8 @@ pub const Node = struct {
             }
         }
 
-        // utils.logEvery(10, "node {d}: handleAE entries={d} leaderCommit={d} ci={d} lastIndex={d}", .{
+        // utils.logEvery(.debug, 10, "node {d}: handleAE entries={d} " ++
+        //     "leaderCommit={d} ci={d} lastIndex={d}", .{
         //     self.id, ae_entries_len, ae.leaderCommit(), self.commit_index.load(), self.log.lastIndex(),
         // });
 
@@ -1912,7 +1921,8 @@ pub const Node = struct {
         );
 
         while (ai < ci) {
-            utils.logEvery(1, "applyCommits progress: ai={d} ci={d} remaining={d}", .{ ai, ci, ci - ai });
+            utils.logEvery(.debug, 1, "applyCommits progress: ai={d} " ++
+                "ci={d} remaining={d}", .{ ai, ci, ci - ai });
             const now = nowUs();
             var result = self.log.entriesRange(.{ .lo = ai + 1, .hi = ci + 1, .max_bytes = max_apply_bytes }) catch return;
             _metrics.g().observeStage("entries_range", nowUs() - now);
@@ -1933,10 +1943,10 @@ pub const Node = struct {
                         reader.data(),
                         &self.apply_scratch,
                     ) catch |err| {
-                        raft_log.err(
-                            "entry idx={d}: decode data: {s}, retrying in 1ms",
-                            .{ entry.index, @errorName(err) },
-                        );
+                        utils.logEvery(.err, 5, "entry idx={d}: decode " ++
+                            "data: {s}, retrying", .{
+                            entry.index, @errorName(err),
+                        });
                         if (self.isShuttingDown()) return;
                         fiber.sleepMs(1);
                         continue;
@@ -1964,17 +1974,21 @@ pub const Node = struct {
                         // machine must NOT do its own retry loop — it would
                         // wedge shutdown.
                         //
-                        // Logging policy: hard errors fire on every retry
-                        // (loud signal that something's wrong). The expected
-                        // transient `error.RecoveryInProgress` would spam
-                        // ~1000 lines/sec during normal startup, so it goes
-                        // through `utils.logEvery` (5 s).
+                        // A 1 ms retry would print a thousand lines a
+                        // second: both lines are rate-limited, the
+                        // expected `RecoveryInProgress` of startup at
+                        // debug, a real failure at err.
                         while (true) {
                             s.apply(sm_entry, data) catch |err| {
                                 if (err == error.RecoveryInProgress) {
-                                    utils.logEvery(5, "apply idx={d}: recovery in progress, retrying", .{entry.index});
+                                    utils.logEvery(.debug, 5, "apply " ++
+                                        "idx={d}: recovery in progress, " ++
+                                        "retrying", .{entry.index});
                                 } else {
-                                    raft_log.err("apply idx={d}: {s}, retrying in 1ms", .{ entry.index, @errorName(err) });
+                                    utils.logEvery(.err, 5, "apply idx={d}: " ++
+                                        "{s}, retrying", .{
+                                        entry.index, @errorName(err),
+                                    });
                                 }
                                 if (self.isShuttingDown()) return;
                                 fiber.sleepMs(1);
@@ -2211,7 +2225,9 @@ pub const Node = struct {
             const persisted = self.log.hardState().commit_index;
             if (ci < persisted + min_advance) continue;
             self.log.setHardState(.{ .commit_index = ci }) catch |err| {
-                raft_log.warn("commitPersistLoop: setHardState failed: {s}", .{@errorName(err)});
+                raft_log.err("commitPersistLoop: setHardState failed: {s}", .{
+                    @errorName(err),
+                });
                 continue;
             };
         }
@@ -2223,7 +2239,8 @@ pub const Node = struct {
         const ci = self.commit_index.load();
         if (ci > self.log.hardState().commit_index) {
             self.log.setHardState(.{ .commit_index = ci }) catch |err| {
-                raft_log.warn("commitPersistLoop: final setHardState failed: {s}", .{@errorName(err)});
+                raft_log.err("commitPersistLoop: final setHardState " ++
+                    "failed: {s}", .{@errorName(err)});
             };
         }
     }
@@ -2251,7 +2268,9 @@ pub const Node = struct {
         };
         defer value.decrRef();
         tr.sendMsg(to, .p0, _serial.msg_type_raft, value) catch |err| {
-            utils.logEvery(5, "sendMsg to {d} failed: {s}", .{ to, @errorName(err) });
+            utils.logEvery(.debug, 5, "sendMsg to {d} failed: {s}", .{
+                to, @errorName(err),
+            });
         };
     }
 
@@ -2550,7 +2569,8 @@ pub const Node = struct {
 
         _ = old_timeout;
         _ = reason;
-        // utils.logEvery(5, "timeout-reset tick={d} node={d} reason={s} old={d} new={d} range=[{d},{d}] elapsed={d}", .{
+        // utils.logEvery(.debug, 5, "timeout-reset tick={d} node={d} " ++
+        //     "reason={s} old={d} new={d} range=[{d},{d}] elapsed={d}", .{
         //     self.tick_count,
         //     self.id,
         //     @tagName(reason),

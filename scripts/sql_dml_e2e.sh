@@ -463,7 +463,7 @@ expect "connection is usable after the pipeline" "a" \
 expect "DROP the extended-path table" "DROP TABLE" q "DROP TABLE pt;"
 
 # --- no unexpected server-side errors --------------------------------------
-if grep -q "^error" "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
+if grep -qE '^[^ ]+ ERROR ' "$LOG"; then bad "server log has errors"; else ok "server log clean"; fi
 
 echo
 echo "$pass passed, $fail failed"

@@ -141,7 +141,7 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
         // expensive error; climbing a rung too far only costs a few reads.
         const med_total_ns = median(size_totals.items);
         const med_ttfb_ns = try ttfbMedian(a, probes.items);
-        log.info("lookahead probe: size={d} total_med={f} ttfb_pooled={f}", .{
+        log.debug("lookahead probe: size={d} total_med={f} ttfb_pooled={f}", .{
             size, dur(med_total_ns), dur(med_ttfb_ns),
         });
         // Only consecutive rising sizes end the climb — a single
@@ -177,7 +177,8 @@ pub fn calibrate(a: std.mem.Allocator, store: anytype, block_size: u64) !u64 {
             };
             try probes.append(a, s);
         }
-        log.info("lookahead sweep {d}/{d}: {d} probes across {d} sizes in {d} ms ({d} total)", .{
+        log.debug("lookahead sweep {d}/{d}: {d} probes across {d} sizes " ++
+            "in {d} ms ({d} total)", .{
             sweep + 1,       2 * probe_repeats,           probes.items.len - before,
             heavy.items.len, utils.coarseMs() - start_ms, probes.items.len,
         });
