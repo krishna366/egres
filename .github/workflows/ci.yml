@@ -40,3 +40,49 @@ jobs:
 
       - name: prepush (builds + full test suite incl. big tests)
         run: ./scripts/prepush.sh
+
+  # The end-to-end scripts (scripts/e2e.sh): a real server driven over
+  # pgwire by psql. A job of its own, beside the tests, so a red check
+  # says which kind failed, and not in prepush.sh, which gates a local
+  # push.
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: actions/cache@v6
+        with:
+          path: .deps
+          key: >-
+            deps-${{ runner.os }}-${{
+            hashFiles('build.zig', 'scripts/bootstrap-*.sh') }}
+
+      # The Ubuntu image ships psql; the Mac gets it from brew's libpq.
+      - name: Find psql
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            command -v psql >/dev/null || {
+              sudo apt-get update -q
+              sudo apt-get install -y -q postgresql-client
+            }
+          else
+            brew install -q libpq
+            echo "$(brew --prefix libpq)/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: e2e
+        env:
+          DATA: ${{ runner.temp }}/e2e
+        run: ./scripts/e2e.sh
