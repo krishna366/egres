@@ -36,7 +36,7 @@ const request_size: u64 = 1 << 20;
 /// and read it as the bandwidth; alternating the directions keeps a
 /// stall from covering every sample of one of them, and the writes
 /// from running back to back, which is what provokes the stall.
-const rounds = 3;
+const rounds = 5;
 /// Writes below this fraction of the reads on one device are read as
 /// a stall that outlasted the probe, and said so.
 const stall_ratio = 10;
@@ -224,14 +224,22 @@ fn fillProbeFile(a: std.mem.Allocator, path: String) !void {
 /// Bytes per second over 250ms with `depth` fibers, one per
 /// worker, each issuing `request_size` O_DIRECT requests at random
 /// offsets of the probe file, back to back. One sample of `rounds`.
+/// The file is opened once here: reads and writes are positional,
+/// so every worker shares the descriptor.
 fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
+    const f = fiber.File.fromFd(try _vfs.openDirect(path, .{
+        .mode = .direct,
+        .flags = .{ .writable = kind == .write },
+    }));
+    defer f.close();
+
     var stop = std.atomic.Value(bool).init(false);
     var group = fiber.Group(anyerror!u64).init(a);
     defer group.deinit();
     const t0 = utils.timestampNow(.monotonic, .nanos);
     for (0..depth) |i| {
         try group.spawn(.{ .worker_id = @intCast(i) }, worker, .{
-            a, path, kind, &stop,
+            a, f, kind, &stop,
         });
     }
     fiber.sleepMs(250);
@@ -251,11 +259,11 @@ fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
     return bps;
 }
 
-/// One fiber's share of `throughput`: the file opened once, requests
-/// until `stop`, the bytes moved returned.
+/// One fiber's share of `throughput`: requests until `stop`, the
+/// bytes moved returned.
 fn worker(
     a: std.mem.Allocator,
-    path: String,
+    f: fiber.File,
     kind: _vfs.IOKind,
     stop: *std.atomic.Value(bool),
 ) anyerror!u64 {
@@ -263,12 +271,6 @@ fn worker(
     const buf = try a.alignedAlloc(u8, _vfs.page_alignment, size);
     defer a.free(buf);
     @memset(buf, 0xA5);
-
-    const f = fiber.File.fromFd(try _vfs.openDirect(path, .{
-        .mode = .direct,
-        .flags = .{ .writable = kind == .write },
-    }));
-    defer f.close();
 
     var seed: [8]u8 = undefined;
     utils.context.g().io.random(&seed);
