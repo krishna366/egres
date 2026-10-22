@@ -98,15 +98,19 @@ def script_args(run, scripts, extra_vars: dict) -> list[str]:
 
 def start(run, log: Path, prom_name: str, run_label: str, clients: int,
           secs: int, scripts, extra_vars: dict, lat_prefix=None,
-          sample: float = 1.0) -> Handle:
+          sample: float = 1.0, max_tries: int = 1) -> Handle:
     """`lat_prefix`: where the per-transaction latency logs go (a path
     prefix, its dir created here), or None for none. `sample`: the
     fraction of transactions logged; fast scripts at full rate would
-    write gigabytes onto the disk under test."""
+    write gigabytes onto the disk under test. `max_tries` above 1
+    retries a transaction that fails with a serialization or deadlock
+    error that many times, as a client would; 1 counts it as failed."""
     # Appending, never truncating: a second start with the same name
     # must not erase a finished run's numbers.
     cmd = [str(run.pgbench), run.conn, "-n", "-c", str(clients), "-j",
            str(min(clients, 16)), "-T", str(secs), "-P", "5"]
+    if max_tries > 1:
+        cmd.append(f"--max-tries={max_tries}")
     if lat_prefix is not None:
         Path(lat_prefix).parent.mkdir(parents=True, exist_ok=True)
         cmd += ["-l", f"--log-prefix={lat_prefix}"]

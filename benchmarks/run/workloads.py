@@ -265,7 +265,122 @@ ORDERS = {
             ("insert", 25), ("reschedule", 5), ("amount", 3), ("delete", 2)],
 }
 
-WORKLOADS = {"orders": ORDERS}
+# ---------------------------------------------------------------------------
+# bank: pgbench's accounts, tellers and branches, for the long run
+# ---------------------------------------------------------------------------
+# The TPC-B-like transaction pgbench ships, on tables of its shape,
+# with two changes. The branch and the teller are the account's own,
+# not drawn apart from it, so for every branch the accounts, the
+# tellers and the branch row sum to the same number, and so does the
+# whole bank. And every 100 accounts have a group row that takes the
+# same delta: a group's accounts and its row are 101 point reads, so
+# benchmarks/longrun checks groups in one snapshot all the time,
+# where a scan of the accounts takes hours. history carries a bucket
+# column so old rows can be deleted by equality (the only predicate
+# the server takes today).
+
+BANK_ACCOUNTS_PER_BRANCH = 100_000
+BANK_TELLERS_PER_BRANCH = 10
+BANK_ACCOUNTS_PER_GROUP = 100
+BANK_FILLER = 500
+
+BANK_DDL = """\
+CREATE TABLE pgbench_accounts (
+  aid BIGINT PRIMARY KEY,
+  bid BIGINT,
+  abalance BIGINT,
+  filler TEXT
+);
+CREATE TABLE pgbench_branches (
+  bid BIGINT PRIMARY KEY,
+  bbalance BIGINT
+);
+CREATE TABLE pgbench_groups (
+  gid BIGINT PRIMARY KEY,
+  gbalance BIGINT
+);
+CREATE TABLE pgbench_tellers (
+  tid BIGINT PRIMARY KEY,
+  bid BIGINT,
+  tbalance BIGINT
+);
+CREATE TABLE pgbench_history (
+  tid BIGINT,
+  bid BIGINT,
+  aid BIGINT,
+  delta BIGINT,
+  mtime TIMESTAMP,
+  bucket BIGINT
+);
+CREATE INDEX pgbench_history_bucket ON pgbench_history (bucket);
+"""
+
+BANK_INSERT = "INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES"
+
+
+def bank_row(aid: int) -> str:
+    r = random.Random(aid)
+    bid = (aid - 1) // BANK_ACCOUNTS_PER_BRANCH + 1
+    return f"({aid}, {bid}, 0, '{blended(r, BANK_FILLER)}')"
+
+
+def bank_branches(accounts: int) -> int:
+    return (accounts + BANK_ACCOUNTS_PER_BRANCH - 1) // \
+        BANK_ACCOUNTS_PER_BRANCH
+
+
+def bank_groups(accounts: int) -> int:
+    return (accounts + BANK_ACCOUNTS_PER_GROUP - 1) // \
+        BANK_ACCOUNTS_PER_GROUP
+
+
+# `:run` is the pgbench start count and `:n` this client's transaction
+# count, so a bucket never repeats across starts; the long run deletes
+# a start's buckets once it is two starts old.
+BANK_TPCB = """\
+\\set aid random(1, :accounts)
+\\set gid (:aid - 1) / :accounts_per_group + 1
+\\set bid (:aid - 1) / :accounts_per_branch + 1
+\\set tid (:bid - 1) * :tellers_per_branch + random(1, :tellers_per_branch)
+\\set delta random(-5000, 5000)
+\\set n :n + 1
+\\set bucket :run * 100000 + :n / 10000
+BEGIN;
+UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;
+SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+UPDATE pgbench_groups SET gbalance = gbalance + :delta WHERE gid = :gid;
+UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid;
+UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid;
+INSERT INTO pgbench_history (tid, bid, aid, delta, mtime, bucket)
+  VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP, :bucket);
+END;
+"""
+
+BANK_READ = """\
+\\set aid random(1, :accounts)
+SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+"""
+
+BANK = {
+    "ddl": BANK_DDL,
+    "insert": BANK_INSERT,
+    "row": bank_row,
+    "exists": "SELECT aid FROM pgbench_accounts WHERE aid = {id};",
+    # The load is the accounts only; longrun adds the groups, branches
+    # and tellers for the count it loaded. load.last is the scale:
+    # about 600 bytes a row.
+    "load": {"first": 1, "last": 10_000_000, "streams": 8,
+             "chunk": 50_000, "stop_bytes": None, "stop_secs": None,
+             "create": True, "after_secs": 0},
+    "vars": {"accounts_per_branch": BANK_ACCOUNTS_PER_BRANCH,
+             "tellers_per_branch": BANK_TELLERS_PER_BRANCH,
+             "accounts_per_group": BANK_ACCOUNTS_PER_GROUP},
+    "scripts": {"tpcb": BANK_TPCB, "read": BANK_READ},
+    "reads": [],
+    "mix": [("tpcb", 90), ("read", 10)],
+}
+
+WORKLOADS = {"orders": ORDERS, "bank": BANK}
 
 
 def script_path(run, script: str) -> Path:

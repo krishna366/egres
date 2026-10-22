@@ -97,6 +97,10 @@ ENVS = {
                      "memory_max": None},
     "postgres-orders": {"server": "postgres", "workload": "orders",
                         "memory_max": None},
+    # benchmarks/longrun drives this one: days of the bank workload
+    # with faults, checked between them.
+    "egres-bank": {"server": "egres", "workload": "bank",
+                   "memory_max": None},
 }
 ENV_DEFAULTS = {"runs": 2, "secs": 7200, "clients": 64,
                 "latency_sample": 0.1}

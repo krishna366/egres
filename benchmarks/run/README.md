@@ -45,6 +45,12 @@ set the durations, streams, clients and cache; it needs `local.toml`
 and an empty `<data_root>/egres-orders-soak`. Off Linux the summaries
 carry no disk or host CPU figures (there is no `/proc`).
 
+## A long run
+
+`../longrun/` drives the `egres-bank` env for days: the bank
+workload held at a steady size, a server kill every few hours, and
+two oracles checked between faults. See its README.
+
 ## A run
 
 ```
