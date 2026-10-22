@@ -113,9 +113,15 @@ jobs:
           SOAK_STREAMS: ${{ matrix.streams }}
         run: scripts/soak.sh
 
+      # The harness's `current` is a symlink to the run dir; the upload
+      # follows symlinks, so without the exclusion the run dir is in the
+      # artifact twice.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: soak-${{ matrix.os }}
-          path: ${{ env.SOAK_ROOT }}/out
+          path: |
+            ${{ env.SOAK_ROOT }}/out
+            !${{ env.SOAK_ROOT }}/out/current
+            !${{ env.SOAK_ROOT }}/out/current/**
           if-no-files-found: ignore

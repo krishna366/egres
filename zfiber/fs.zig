@@ -130,15 +130,32 @@ pub const File = struct {
 };
 
 fn syncImpl(fd: SioFile.Handle, data_only: bool) !void {
+    if (builtin.os.tag.isDarwin()) return fullFsync(fd);
     // A data-only sync leaves the inode's timestamps out, which is what
-    // a log append wants. Where the OS has no fdatasync (macOS, Windows)
-    // a full sync is the honest equivalent.
+    // a log append wants. Where the OS has no fdatasync a full sync is
+    // the honest equivalent.
     const has_fdatasync = switch (builtin.os.tag) {
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
         else => false,
     };
     if (data_only and has_fdatasync) return std.posix.fdatasync(fd);
     return sioFile(fd).sync(_fsops.io());
+}
+
+/// macOS: fsync(2) only hands the data to the drive, so a commit would
+/// not survive a power cut. F_FULLFSYNC also asks the drive to flush to
+/// the media, which is what fsync and fdatasync already mean on Linux.
+/// A filesystem without it (network mounts) answers ENOTSUP and gets
+/// the plain fsync. std.posix has no fcntl wrapper, hence the raw call.
+fn fullFsync(fd: SioFile.Handle) !void {
+    const rc = std.c.fcntl(fd, std.c.F.FULLFSYNC, @as(c_int, 0));
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => return,
+        .OPNOTSUPP, .INVAL => return sioFile(fd).sync(_fsops.io()),
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
 }
 
 fn setLengthImpl(fd: SioFile.Handle, length: u64) !void {
