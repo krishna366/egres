@@ -1,17 +1,34 @@
 ---
 title: Quickstart
-description: Build Egres, start a server, connect with the psql you already have, and branch your first database.
+description: Install Egres, start a server, connect with the psql you already have, and branch your first database.
 ---
 
-Build Egres, start a server, connect with the `psql` you already have, and branch your first database. About five minutes, plus the build.
+Install Egres, start a server, connect with the `psql` you already have, and branch your first database. About five minutes.
 
 :::note
 Egres speaks the PostgreSQL wire protocol. Anything that connects to Postgres — `psql`, your ORM, your drivers — connects to Egres unchanged.
 :::
 
-## Build
+## Install
 
-Egres is one binary. It needs [Zig 0.16.0](https://ziglang.org/download/) and a C compiler for the vendored parser; everything else is in the repository.
+```sh
+$ curl -fsSL https://egresql.io/install.sh | sh
+```
+
+The script downloads the latest release for your platform, verifies its checksum, and installs a single `egres` binary into `~/.local/bin`. Builds exist for Linux x86_64 and macOS on Apple silicon.
+
+Nothing else is installed: no service, no config file. To uninstall, delete the binary. Two variables change the defaults:
+
+| Variable | Effect |
+|---|---|
+| `EGRES_VERSION` | Install a specific release tag, such as `v0.2610.0`, instead of the latest. Pre-releases need an explicit tag. |
+| `EGRES_INSTALL_DIR` | Put the binary somewhere else, such as `/usr/local/bin`. |
+
+If you prefer not to pipe into `sh`, you can read the script first before executing, or download the tarball straight from [GitHub releases](https://github.com/manishrjain/egres/releases).
+
+### Build from source
+
+Egres is one binary. Building it needs [Zig 0.16.0](https://ziglang.org/download/), plus `bash`, `make` and `curl`: the first build downloads jemalloc, the allocator Egres links, and compiles it with Zig's own C compiler. No gcc or clang is needed; the Postgres parser and the compression libraries are vendored and compiled by Zig too.
 
 ```sh
 $ git clone https://github.com/manishrjain/egres
@@ -20,19 +37,25 @@ $ zig build -Doptimize=ReleaseFast
 $ zig-out/bin/egres --help
 ```
 
-Prebuilt binaries come with the first release.
-
 ## Start the server
 
-Egres keeps two directories: the store, where every SSTable lives, and the write-ahead log. A single node needs no flags: both go under `egres-data` in the working directory, created if they do not exist, and `--store dir_path=` and `--wal dir=` move them.
+Egres keeps two directories: the store, where every SSTable lives, and the write-ahead log. If you run egres without any flags, it would store both under local directory `egres-data`.
+
+:::tip
+It is recommended that you put the `--store` on a different device than the
+`--wal`, so their operations don't interfere with each other. Note that
+WAL doesn't need a lot of disk space, and would benefit from NVMe.
+:::
 
 ```sh
-$ egres
+$ egres --help # To see all the options
+
+$ egres # To run the server
 2026-10-22T14:05:31.123456Z INFO  egres: starting egres id=1 cluster=1 raft=127.0.0.1:4210 admin=127.0.0.1:5210 sql=127.0.0.1:3210 wal=egres-data/wal tick=20ms seeds=0
 2026-10-22T14:05:31.140211Z INFO  sql: sql listener started on port 3210 (pgwire)
 ```
 
-Postgres clients connect on port `3210`. The admin port is `5210` and the Raft port is `4210`; `--listen` moves all three. Every flag is `--group key=value`, and `egres --help` lists them with their defaults.
+Postgres clients connect on port `3210`. The admin port is `5210` and the Raft port is `4210`; `--listen` moves all three. Every flag is `--group "key=value; key2=value2"`.
 
 ## Connect
 

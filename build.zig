@@ -113,6 +113,9 @@ pub fn build(b: *std.Build) void {
         jemalloc_sha256,
     });
     if (cross_target) |t| bootstrap_jemalloc.addArg(t);
+    // The script compiles jemalloc with this Zig's `cc`, so no system C
+    // compiler is needed; pass the executable rather than rely on PATH.
+    bootstrap_jemalloc.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     const bootstrap_mimalloc = b.addSystemCommand(&.{
         "bash",
         "scripts/bootstrap-mimalloc.sh",

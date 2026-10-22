@@ -303,6 +303,14 @@ class Owner(threading.Thread):
             # connection died. An ERROR is an answer, and a rollback.
             with self.lock:
                 self.counts["unknown"] += 1
+        elif not out:
+            # Not even BEGIN answered: the connection was refused, as
+            # while the server drains after SIGTERM. The key's state is
+            # unchanged (F), but it is no failed transaction to count,
+            # and the loop waits instead of spinning on refusals.
+            self.pending.pop(k, None)
+            self.note("F", k)
+            time.sleep(1)
         else:
             self.pending.pop(k, None)
             self.note("F", k)

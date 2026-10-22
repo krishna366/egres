@@ -11,9 +11,14 @@ fi
 version=$1
 expected_sha=$2
 # A non-native build (`zig build -Dtarget=...`): jemalloc is compiled
-# by `zig cc` for that target and installed beside the host's copy, so
-# a cross build never replaces the archive the native build links.
+# for that target and installed beside the host's copy, so a cross build
+# never replaces the archive the native build links.
 zig_target=${3:-}
+
+# jemalloc is compiled with Zig's own C compiler, native or cross, so
+# building Egres needs no gcc or clang on the machine. build.zig passes
+# the running Zig in ZIG; a direct invocation falls back to PATH.
+zig=${ZIG:-zig}
 
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -32,7 +37,9 @@ source_dir="$deps_dir/source/$version"
 build_dir="$deps_dir/build/$version${zig_target:+-$zig_target}"
 install_dir="$deps_dir/install/$version${zig_target:+-$zig_target}"
 library="$install_dir/lib/libjemalloc.a"
-stamp="$install_dir/.installed-$expected_sha"
+# The stamp names the toolchain so an archive built with the system
+# compiler by an older bootstrap is rebuilt once, not kept.
+stamp="$install_dir/.installed-$expected_sha-zigcc"
 
 if [[ -f "$library" && -f "$stamp" ]]; then
     exit 0
@@ -74,13 +81,13 @@ fi
 # Expanded below with the `[@]+` form: an empty array is "unbound" to
 # bash 3.2 (macOS) under set -u.
 target_opts=()
+export CC="$zig cc" AR="$zig ar" RANLIB="$zig ranlib"
 if [[ -n "$zig_target" ]]; then
-    export CC="zig cc -target $zig_target"
+    export CC="$zig cc -target $zig_target"
     host_arch=$(uname -m)
     [[ "$host_arch" == arm64 ]] && host_arch=aarch64
     target_arch=${zig_target%%-*}
     if [[ "$target_arch" != "$host_arch" ]]; then
-        export AR="zig ar" RANLIB="zig ranlib"
         host=${zig_target%%.*}
         case "$host" in
             *-macos*) host="$target_arch-apple-darwin" ;;

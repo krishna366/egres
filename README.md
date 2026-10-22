@@ -34,8 +34,10 @@ psql -h localhost -p 3210 -d egres
 
 ## Build from source
 
-[Zig 0.16.0](https://ziglang.org/download/) and a C compiler for the
-vendored Postgres parser; everything else is in the repository.
+[Zig 0.16.0](https://ziglang.org/download/), plus `bash`, `make` and
+`curl`: the first build downloads jemalloc and compiles it with Zig's own
+C compiler. No gcc or clang is needed; the Postgres parser and the
+compression libraries are vendored and compiled by Zig too.
 
 ```sh
 zig build -Doptimize=ReleaseFast

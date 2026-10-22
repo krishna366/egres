@@ -176,16 +176,21 @@ Latency, in ms:
 
 | Query | | p50 (ms) | p95 (ms) | p99 (ms) |
 |---|---|---|---|---|
-| `select` | Postgres | 0.52 | **0.74** | 1.65 |
+| `select` | Postgres | 0.52 | **0.72** | 1.65 |
 | | Egres | **0.18** | 0.79 | **1.46** |
-| `customer` | Postgres | 9.7 | **14.4** | **16.1** |
+| `customer` | Postgres | 9.7 | **14.1** | **16.1** |
 | | Egres | **0.85** | 20.4 | 24.3 |
-| `sku_day` | Postgres | 461 | 536 | 748 |
+| `sku_day` | Postgres | 461 | 490 | 748 |
 | | Egres | **2.04** | **3.9** | **5.3** |
-| `customer_day_count` | Postgres | 12.0 | 15.7 | 17.2 |
+| `customer_day_count` | Postgres | 12.0 | 15.1 | 17.2 |
 | | Egres | **0.99** | **2.0** | **3.7** |
 
-The p95 in the table is over the whole settle; the 490 ms and 3.9 ms quoted at the top are the same measure as the findings notes use, and the 536 ms here is a per-minute recount of the same logs.
+Every number in both tables is the harness's whole-settle summary for the run, the same measure as the 490 ms and 3.9 ms quoted at the top.
+
+<figure class="fig">
+  <img src="figures/settle-latency.svg" width="1000" height="630" alt="Query latency in the 30-minute settle, Postgres and Egres, p50, p95 and p99 for each of the four reader queries, in milliseconds on a log scale" loading="lazy" />
+  <figcaption>The same table as a picture: each row is one percentile of one query, with the Postgres value as a circle and the Egres value as a square, joined by a line that carries the Postgres-to-Egres ratio, on a log scale so that the two-column queries and the sub-millisecond point read fit on one axis. Egres has the lower median on every query. The three rows where Postgres is to the left are its wins: p95 on the point read, and p95 and p99 on the customer lookup.</figcaption>
+</figure>
 
 Which system is faster, per query:
 
