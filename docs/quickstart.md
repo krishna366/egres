@@ -24,11 +24,11 @@ Prebuilt binaries come with the first release.
 
 ## Start the server
 
-Egres keeps two directories: the store, where every SSTable lives, and the write-ahead log. Both are created if they do not exist. A single node needs its Raft id and nothing else.
+Egres keeps two directories: the store, where every SSTable lives, and the write-ahead log. A single node needs no flags: both go under `egres-data` in the working directory, created if they do not exist, and `--store dir_path=` and `--wal dir=` move them.
 
 ```sh
-$ egres --raft id=1 --store dir_path=./egres-data --wal dir=./egres-wal
-2026-10-22T14:05:31.123456Z INFO  egres: starting egres id=1 cluster=1 raft=127.0.0.1:4210 admin=127.0.0.1:5210 sql=127.0.0.1:3210 wal=./egres-wal tick=20ms seeds=0
+$ egres
+2026-10-22T14:05:31.123456Z INFO  egres: starting egres id=1 cluster=1 raft=127.0.0.1:4210 admin=127.0.0.1:5210 sql=127.0.0.1:3210 wal=egres-data/wal tick=20ms seeds=0
 2026-10-22T14:05:31.140211Z INFO  sql: sql listener started on port 3210 (pgwire)
 ```
 

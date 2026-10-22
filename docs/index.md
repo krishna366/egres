@@ -3,7 +3,9 @@ title: Introduction
 description: What Egres is, and where to start reading.
 ---
 
-Written in Zig, Egres isn't just a Postgres rewrite, it's a ground-up, first principles redesign.
+Egres is a Postgres-compatible database for heavy, multi-tenant workloads.
+Written in Zig, Egres isn't just a Postgres rewrite: it is a ground-up, first
+principles redesign.
 
 Egres:
 
@@ -18,6 +20,7 @@ Egres:
   utilizing (an optional) local disk cache.
 - Raft based replication, with read-your-write guarantees.
 - Instant database and table branching, without doing copy-on-write.
+- Open Source under Apache 2.0.
 
 ## Start here
 

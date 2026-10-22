@@ -69,14 +69,14 @@ const ShutdownCfg = struct {
 /// be > 0). `seeds` is comma-separated; if empty, the node bootstraps as a
 /// single-node cluster.
 const RaftCfg = struct {
-    id: u64 = 0,
+    id: u64 = 1,
     cluster_id: u64 = 1,
     seeds: String = "",
     tick_ms: u32 = 20,
 
     pub const docs = .{
         .self = "Raft identity and cluster wiring.",
-        .id = "Raft node ID (required, must be > 0).",
+        .id = "Raft node ID, above 0. A single node is 1.",
         .cluster_id = "Cluster ID for handshake gating.",
         .seeds = "Comma-separated raft addresses of existing peers. Empty =" ++
             " bootstrap as a single-node cluster.",
@@ -123,17 +123,18 @@ const CacheCfg = struct {
 /// dir serves a single node. The dir is write-once blobs only — never
 /// the WAL dir. Exactly one of `dir_path` and `s3_endpoint` is set.
 const StoreCfg = struct {
-    dir_path: String = "",
+    dir_path: String = "egres-data/store",
     s3_endpoint: String = "",
     s3_bucket: String = "",
     s3_prefix: String = "",
     s3_region: String = "",
 
     pub const docs = .{
-        .self = "Object store holding every SST. Required: either" ++
-            " dir_path or the s3_* fields.",
+        .self = "Object store holding every SST: dir_path, or the" ++
+            " s3_* fields, which win when s3_endpoint is set.",
         .dir_path = "Directory the SSTs live in: local, or a shared mount" ++
-            " such as NFS for a cluster.",
+            " such as NFS for a cluster. Under the working directory" ++
+            " unless set.",
         .s3_endpoint = "S3-compatible endpoint URL: http://host[:port]" ++
             " or https://host[:port]. The scheme decides TLS; the host" ++
             " may be a DNS name or IP literal. E.g." ++
@@ -344,7 +345,7 @@ fn bootstrapAndStop(allocator: std.mem.Allocator, argv: []const String) void {
 /// zero-fills log files on ext4 and xfs and skips it on ZFS, btrfs and
 /// tmpfs.
 const WalCfg = struct {
-    dir: String = "",
+    dir: String = "egres-data/wal",
     log_file_bytes: u64 = 256 << 20,
     prezero: raft.diskwal.Prezero = .auto,
     max_spare_log_files: usize = 64,
@@ -352,7 +353,8 @@ const WalCfg = struct {
     pub const docs = .{
         .self = "Raft WAL location and log files (see raft/diskwal.zig" ++
             " OpenOptions).",
-        .dir = "Directory holding the raft WAL. Required.",
+        .dir = "Directory holding the raft WAL. Under the working" ++
+            " directory unless set.",
         .log_file_bytes = "Log file size; a record that would cross it" ++
             " rotates to a pre-created log file.",
         .prezero = "Zero-fill a log file when it is created so appends never" ++
@@ -449,9 +451,10 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
         usage(allocator);
         std.process.exit(1);
     }
-    const store_dir = store_cfg.dir_path.len > 0;
-    if (store_dir == (store_cfg.s3_endpoint.len > 0)) {
-        log.err("--store needs dir_path or s3_endpoint, not both", .{});
+    // An endpoint selects S3; dir_path has a default, so it cannot.
+    const store_dir = store_cfg.s3_endpoint.len == 0;
+    if (store_dir and store_cfg.dir_path.len == 0) {
+        log.err("--store needs dir_path or s3_endpoint", .{});
         std.process.exit(1);
     }
     if (!store_dir and store_cfg.s3_bucket.len == 0) {

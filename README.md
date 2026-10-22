@@ -1,174 +1,66 @@
-# egres
+# Egres
 
-## Regenerating Buffers Code
+Egres is a Postgres-compatible database for heavy, multi-tenant workloads.
+Written in Zig, Egres is not a Postgres rewrite: it is a ground-up,
+first-principles redesign.
 
-Buffer schemas live in `<module>/buffers.zig` files (e.g. `zbuf/buffers.zig`,
-`raft/buffers.zig`, `zdb/buffers.zig`). Each generates its `<module>/buffers.gen.zig`
-sibling.
+This README is barebones on purpose. The full documentation is at
+[egresql.io][docs].
 
-Regenerate every discovered `*/buffers.gen.zig` at once:
+[docs]: https://egresql.io/docs
 
-```bash
-zig build buffers
+## Install
+
+```sh
+curl -fsSL https://egresql.io/install.sh | sh
 ```
 
-To generate for a specific schema file (writes `<input>.gen.zig` next to it):
+The installer puts the latest release's `egres` on your path. Release
+tarballs for Linux x86_64 and Apple Silicon are on the releases page,
+with a `SHA256SUMS` beside them.
 
-```bash
-zig build zbuf -- path/to/buffers.zig
+## Run
+
+A single node needs no flags: it keeps its store and write-ahead log
+under `egres-data` in the working directory and listens for Postgres
+clients on port 3210.
+
+```sh
+egres
+psql -h localhost -p 3210 -d egres
 ```
 
-## Load Testing
+`egres --help` lists every flag with its default.
 
-A load test spins up one or more `egres` nodes, creates a namespace, and
-drives writes through the `zdb-bench` client. It exists to validate correctness
-and surface deadlocks / runaway loops under sustained write load.
+## Build from source
 
-### 1. Build the binaries
+[Zig 0.16.0](https://ziglang.org/download/) and a C compiler for the
+vendored Postgres parser; everything else is in the repository.
 
-Never benchmark the default `zig build`: it is `Debug`, whose safety
-checks dominate the runtime. Two release modes matter:
-
-- `ReleaseFast` for benchmarks. Its numbers are the ones to report.
-- `ReleaseSafe` for every long-running correctness test (the e2e
-  scripts, kill -9 durability runs, soak), for everyday development,
-  and for any benchmark that crashed under `ReleaseFast`: the same bug
-  that is a silent heap corruption in `ReleaseFast` (a lock-table
-  release race was, under a 64-client pgbench load) is an assertion with
-  a stack trace in `ReleaseSafe`.
-
-The checks cost about 20% on CPU-bound point reads and nothing on
-disk-bound writes or on scans. `ReleaseSafe` also writes `undefined`
-as 0xAA, including inside std's allocator on every allocation, so
-allocation-heavy code looks slower than it is; do not size hot paths
-by `ReleaseSafe` profiles alone. Always say which mode a number came
-from, and never compare across modes.
-
-```bash
-zig build -Doptimize=ReleaseFast egres zdb-bench   # benchmarks
-zig build -Doptimize=ReleaseSafe egres             # tests, development
+```sh
+zig build -Doptimize=ReleaseFast
+zig-out/bin/egres --help
 ```
 
-Binaries land in `zig-out/bin/`.
+A plain `zig build` is a Debug build: slow, every assertion on, and
+debug log lines in.
 
-### 2. Run a single-node load test (recommended)
+## Developing
 
-`scripts/loadtest.py` orchestrates the whole flow: wipe the workdir, start the
-server, create the namespace, run the load generator, sample `/stats` into a
-TSV, then tear everything down.
+`zig build test` runs the unit tests; `scripts/e2e.sh` drives a real
+server over pgwire with `psql`; `scripts/prepush.sh` is the gate a push
+to main passes, and CI runs both on every push. The conventions the
+code follows are in [AGENTS.md](AGENTS.md).
 
-```bash
-python3 scripts/loadtest.py run \
-    --nodes 1 \
-    --workdir /data/egres \
-    --records 10500000 \
-    --value-size 1024 \
-    --clients 16 \
-    --batch-size 256 \
-    --duration 30m
-```
+## AI Policy
 
-This writes ~10 GiB of values (≈ `records × value-size`). Size `--records` for
-your target: `records = target_bytes / value_size` (10 GiB at 1 KiB values ≈
-10,485,760 records). The run ends as soon as the load completes or `--duration`
-elapses, whichever comes first.
+Most of the Egres code base was written using AI agents: Claude Opus and
+then Fable. I reviewed every live code path myself, line by line, and
+iterated on it until it was correct and struck the right balance between
+performance and readability.
 
-Output lives under `--workdir` (default: repo root — use a roomy throwaway
-filesystem like `/data/egres`, since a 10 GiB load expands further on disk via
-the WAL + write amplification before compaction and snapshots catch up):
-
-- `data/sst/` — the SSTs, one remote store shared by every node
-- `data/node1/wal/` — node 1's raft WAL
-- `logs/node1.log` — the server log (grep here first on any problem)
-- `logs/stats-node1.txt` — final `/stats` dump, including latency histograms
-- `metrics.tsv` — periodic samples (flushes, compactions, bytes, disk usage)
-
-At the end of a run the driver also prints each node's **worker-CPU histogram**
-(the server's `workers` admin command): per-worker accumulated CPU plus a
-`max/avg` imbalance ratio (1.0 = perfectly balanced, higher = work piled onto a
-few workers), so you can see how evenly the fiber runtime spread the load.
-
-Inspect a running cluster or clean up afterwards:
-
-```bash
-python3 scripts/loadtest.py stats --node 1   # one-shot Prometheus stats dump
-python3 scripts/loadtest.py clean            # wipe data/ logs/ metrics.tsv
-```
-
-> The driver applies `offset=i` per node, so node 1 binds admin port `5211`
-> and raft port `4211`. `--nodes N` runs a real N-voter cluster (it promotes
-> the joiners from learner to voter before loading).
-
-### 3. Manual single-server run (for debugging)
-
-When you want to poke at a running server yourself, start one directly. With
-`offset=0` it binds the admin port at `5210` and raft at `4210`. SSTs live in
-the object store (`--store`: `dir_path=` for a local directory or shared
-mount, or `s3_endpoint=`/`s3_bucket=` for an s3 bucket); the WAL is the only
-thing on local disk:
-
-```bash
-rm -rf /data/egres/node1 && mkdir -p /data/egres/node1 /tmp/zdb
-./zig-out/bin/egres \
-    --raft="id=1; cluster-id=1" \
-    --store="dir_path=/data/egres/node1/sst" \
-    --wal="dir=/data/egres/node1/wal" \
-    --listen="client-port=5210; raft-port=4210" \
-    > /tmp/zdb/server.log 2>&1 &
-```
-
-It self-bootstraps as a single-node cluster and elects itself leader (look for
-`become-leader` in the log). The bench rejects writes to an unknown namespace,
-so create one first — the protocol is line-based text, so a bash `/dev/tcp`
-one-liner is enough:
-
-```bash
-exec 3<>/dev/tcp/127.0.0.1/5210
-printf 'ns create 1\n' >&3
-head -1 <&3            # expect: OK
-exec 3>&-
-```
-
-Then drive the load, and stop the server with `SIGTERM` when done:
-
-```bash
-./zig-out/bin/zdb-bench --bench="addr=127.0.0.1:5210; clients=16; \
-    records=10500000; value-size=1024; batch-size=256; namespaces=1; phase=load"
-
-pkill -TERM -x egres      # -KILL if it won't stop
-```
-
-### 4. Health checks
-
-The whole point is to catch deadlocks and runaway loops, so watch the server
-log:
-
-```bash
-# first thing on any failure — silent error spam is common
-grep -iE "error|panic|deadlock|wedge|KeyOrder" /tmp/zdb/server.log
-
-# a healthy idle server ticks only ~1 commit/sec (a handful of debug lines).
-# Tens of thousands of lines/sec — typically repeated applyManifestChange or
-# split-trigger entries — means a background loop is spinning. Measure it:
-a=$(wc -l < /tmp/zdb/server.log); sleep 2; b=$(wc -l < /tmp/zdb/server.log)
-echo "log grew $((b-a)) lines in 2s"
-```
-
-The text protocol also exposes diagnostic verbs you can query live (each
-returns a blank-line-terminated dump): `workers` (per-worker CPU histogram),
-`locks` (held tracked mutexes), `vfs` (bandwidth limiter), and `zdb` (stats):
-
-```bash
-# worker CPU distribution from a running server on admin port 5210
-exec 3<>/dev/tcp/127.0.0.1/5210
-printf 'workers\n' >&3
-while IFS= read -r line <&3; do [ -z "$line" ] && break; echo "$line"; done
-exec 3>&-
-```
-
-A successful load reports `0 err` per worker plus a Load Phase summary
-(`records`, `throughput`, `errors: 0`). On disk you should see SST files
-appear and the WAL stay bounded as snapshots truncate it.
+A pull request is expected to have had the same quality of human review
+before it is considered.
 
 ## License
 
