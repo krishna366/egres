@@ -64,7 +64,8 @@ The default SQL port is `3210`. The database `egres` exists from the first boot,
 | `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK` | Yes | Transaction modes such as `ISOLATION LEVEL` are accepted and ignored; isolation is snapshot isolation. |
 | `SAVEPOINT`, `PREPARE TRANSACTION` | Not&nbsp;yet | |
 | DDL inside a transaction block | Not&nbsp;yet | Returns `25001`. Each DDL statement runs as its own transaction. |
-| `SET`, `SHOW`, `RESET` | Not&nbsp;yet | A driver that sends `SET` on connect sees an error on that statement. |
+| `SET`, `RESET` | Yes | Any parameter, accepted and ignored. |
+| `SHOW` | Not&nbsp;yet | |
 | `EXPLAIN`, `ANALYZE` | Not&nbsp;yet | |
 | `VACUUM` | Not&nbsp;applicable | See [No VACUUM](design/no-vacuum.md). |
 | `CREATE FUNCTION`, `CREATE PROCEDURE`, `DO` (user-defined functions and procedures) | Not&nbsp;yet | |
@@ -88,6 +89,7 @@ FROM one_table
 
 | Clause | Status | Notes |
 |---|---|---|
+| `SELECT 1`, constants with no `FROM` | Yes | One row; a pool's connection check. Aliases allowed. |
 | Column references and `*` in the target list | Yes | The `egid` column can be selected by name. |
 | `count(*)` | Yes | Alone in the target list. |
 | Other aggregates, expressions, casts, aliases, functions in the target list | Not&nbsp;yet | |

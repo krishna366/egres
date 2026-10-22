@@ -512,6 +512,75 @@ test "sql.parse: SELECT rejections carry a reason" {
     }
 }
 
+test "sql.parse: SELECT without FROM is a row of constants" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const s1 = try parse.statement(alloc, "SELECT 1;");
+    try testing.expect(s1 == .select_row);
+    try testing.expectEqual(1, s1.select_row.cells.len);
+    try testing.expectEqualStrings("?column?", s1.select_row.cells[0].name);
+    try testing.expectEqual(1, s1.select_row.cells[0].value.int);
+    try testing.expectEqual(null, s1.select_row.limit);
+
+    const s2 = try parse.statement(
+        alloc,
+        "SELECT 1 AS one, 'a' b, true, NULL, 1.5 LIMIT 0;",
+    );
+    const cells = s2.select_row.cells;
+    try testing.expectEqual(5, cells.len);
+    try testing.expectEqualStrings("one", cells[0].name);
+    try testing.expectEqualStrings("b", cells[1].name);
+    try testing.expectEqualStrings("a", cells[1].value.str);
+    try testing.expectEqual(true, cells[2].value.bool_);
+    try testing.expect(cells[3].value == .null_value);
+    try testing.expectEqualStrings("1.5", cells[4].value.float);
+    try testing.expectEqual(0, s2.select_row.limit);
+
+    const cases = [_]struct { sql: String, needle: String }{
+        .{ .sql = "SELECT now();", .needle = "constants" },
+        .{ .sql = "SELECT count(*);", .needle = "constants" },
+        .{ .sql = "SELECT a;", .needle = "constants" },
+        .{ .sql = "SELECT $1;", .needle = "constants" },
+        .{ .sql = "SELECT 1 + 1;", .needle = "constants" },
+        .{ .sql = "SELECT 1 WHERE true;", .needle = "FROM" },
+        .{ .sql = "SELECT 1 FOR UPDATE;", .needle = "FROM" },
+        .{ .sql = "VALUES (1);", .needle = "VALUES" },
+    };
+    for (cases) |case| {
+        const stmt = try parse.statement(alloc, case.sql);
+        try testing.expect(stmt == .invalid);
+        try testing.expect(
+            std.mem.indexOf(u8, stmt.invalid, case.needle) != null,
+        );
+    }
+}
+
+test "sql.parse: SET and RESET are accepted and ignored" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const sets = [_]String{
+        "SET extra_float_digits = 3;",
+        "SET application_name TO 'x';",
+        "SET LOCAL search_path = public;",
+        "SET TIME ZONE 'UTC';",
+        "SET client_encoding = DEFAULT;",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;",
+    };
+    for (sets) |text|
+        try testing.expect(try parse.statement(alloc, text) == .set_var);
+    const r1 = try parse.statement(alloc, "RESET search_path;");
+    try testing.expect(r1 == .reset_var);
+    const r2 = try parse.statement(alloc, "RESET ALL;");
+    try testing.expect(r2 == .reset_var);
+}
+
 test "sql.parse: DELETE parses table and the optional equality filter" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

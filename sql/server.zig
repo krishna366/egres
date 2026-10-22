@@ -694,6 +694,7 @@ pub const Handler = struct {
         if (self.txn) |t| if (t.failed) return replyFailedBlock(state);
         switch (stmt) {
             .select => |sel| try _dml.describeSelect(self, state, sel),
+            .select_row => |sr| try _dml.describeSelectRow(self, state, sr),
             else => try state.sendNoData(),
         }
     }
@@ -739,9 +740,12 @@ pub const Handler = struct {
             .create_index => |ci| try _index_ddl.createIndex(self, state, ci),
             .drop_index => |di| try _index_ddl.dropIndex(self, state, di),
             .insert, .select, .delete, .update => try self.runDml(state, stmt),
+            .select_row => |sr| try _dml.selectRow(self, state, sr),
             .begin_txn => try self.beginTxn(state),
             .commit_txn => try self.endTxn(state, true),
             .rollback_txn => try self.endTxn(state, false),
+            .set_var => try state.sendCommandComplete("SET"),
+            .reset_var => try state.sendCommandComplete("RESET"),
             .invalid => |msg| try replyErrorCode(state, pgwire.sqlstate.feature_not_supported, msg),
             .unsupported => try replyError(state, "unsupported statement"),
         }

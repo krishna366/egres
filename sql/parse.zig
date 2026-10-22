@@ -4,12 +4,12 @@
 //! Statement parsing: SQL text → a small typed `Stmt`, via libpg_query
 //! (reused from pgwire). Only the statements the server executes are
 //! recognized — CREATE/DROP DATABASE, TABLE, INDEX; INSERT, SELECT,
-//! DELETE, UPDATE; BEGIN, COMMIT, ROLLBACK — everything else maps to
-//! `.unsupported`. A statement we recognize but must reject (unsupported
-//! type, constraint, clause, …) maps to `.invalid` carrying the
-//! client-facing reason — parse succeeded, this is a semantic rejection.
-//! Syntax errors propagate as ParseError so the endpoint can answer with
-//! a 42601.
+//! DELETE, UPDATE; BEGIN, COMMIT, ROLLBACK; SET, RESET — everything
+//! else maps to `.unsupported`. A statement we recognize but must
+//! reject (unsupported type, constraint, clause, …) maps to `.invalid`
+//! carrying the client-facing reason — parse succeeded, this is a
+//! semantic rejection. Syntax errors propagate as ParseError so the
+//! endpoint can answer with a 42601.
 //!
 //! `statement` takes an arena and returns a `Stmt` whose every string
 //! and slice lives in it: the walk copies names and literals out of the
@@ -181,6 +181,22 @@ pub const Select = struct {
     param_count: u16 = 0,
 };
 
+/// One target of a SELECT without FROM: a constant and its output
+/// name, the alias or Postgres's `?column?`.
+pub const Cell = struct {
+    name: String, // borrowed
+    value: Literal,
+};
+
+/// SELECT constants with no FROM, the one-row answer a pool or driver
+/// uses to check a connection (`SELECT 1`). Constants only: a
+/// function, a column, an expression or a `$n` is refused.
+pub const SelectRow = struct {
+    cells: []Cell, // borrowed
+    /// LIMIT 0 drops the row; anything else keeps it.
+    limit: ?usize = null,
+};
+
 pub const Delete = struct {
     table: String, // borrowed
     where: ?Where, // null = delete every row
@@ -236,11 +252,17 @@ pub const Stmt = union(enum) {
     drop_index: DropIndex,
     insert: Insert,
     select: Select,
+    select_row: SelectRow,
     delete: Delete,
     update: Update,
     begin_txn,
     commit_txn,
     rollback_txn,
+    /// SET and RESET of any parameter, accepted and ignored: drivers
+    /// send them on connect, and no setting changes anything here.
+    /// SET TRANSACTION is ignored the way BEGIN's modes are.
+    set_var,
+    reset_var,
     invalid: String, // recognized but rejected; reason
     unsupported,
 
@@ -284,6 +306,7 @@ pub fn statement(alloc: std.mem.Allocator, sql: String) parser.ParseError!Stmt {
     if (parser.cast(c.DeleteStmt, node)) |s| return parseDelete(alloc, s);
     if (parser.cast(c.UpdateStmt, node)) |s| return parseUpdate(alloc, s);
     if (parser.cast(c.TransactionStmt, node)) |s| return parseTransaction(s);
+    if (parser.cast(c.VariableSetStmt, node)) |s| return parseSet(s);
     return .unsupported;
 }
 
@@ -919,8 +942,9 @@ fn parseExpr(
 }
 
 /// SELECT [cols|*|count(*)] FROM one_table [WHERE ...] [FOR UPDATE]
-/// [LIMIT n]. Joins, subqueries, ORDER BY / GROUP BY / OFFSET /
-/// DISTINCT and expression targets are rejected.
+/// [LIMIT n], or constants with no FROM (parseSelectRow). Joins,
+/// subqueries, ORDER BY / GROUP BY / OFFSET / DISTINCT and expression
+/// targets are rejected.
 fn parseSelect(
     alloc: std.mem.Allocator,
     ss: *const c.SelectStmt,
@@ -952,6 +976,7 @@ fn parseSelect(
     }
 
     const from = parser.items(ss.fromClause);
+    if (from.len == 0) return parseSelectRow(alloc, ss, limit);
     if (from.len != 1)
         return invalid("SELECT must read exactly one table");
     const rv = parser.cast(c.RangeVar, from[0].ptr_value) orelse
@@ -1035,6 +1060,47 @@ fn parseSelect(
         .limit = limit,
         .param_count = params.count,
     } };
+}
+
+/// SELECT constant [AS name], ... with no FROM: one row, nothing
+/// read. VALUES has no target list and is refused; WHERE and FOR
+/// UPDATE have nothing to apply to.
+fn parseSelectRow(
+    alloc: std.mem.Allocator,
+    ss: *const c.SelectStmt,
+    limit: ?usize,
+) parser.ParseError!Stmt {
+    if (ss.valuesLists != null) return invalid("VALUES is not supported");
+    if (ss.whereClause != null or ss.lockingClause != null)
+        return invalid("WHERE and FOR UPDATE need a FROM");
+    const targets = parser.items(ss.targetList);
+    if (targets.len == 0) return .unsupported;
+    const cells = try alloc.alloc(Cell, targets.len);
+    for (targets, cells) |t, *cell| {
+        const rt = parser.cast(c.ResTarget, t.ptr_value) orelse
+            return .unsupported;
+        const ac = parser.cast(c.A_Const, rt.val) orelse
+            return invalid("only constants are supported without a FROM");
+        const lit = try literalFrom(alloc, ac);
+        if (lit == .unsupported)
+            return invalid("only constants are supported without a FROM");
+        cell.* = .{
+            .name = if (rt.name != null)
+                try dup(alloc, rt.name)
+            else
+                "?column?",
+            .value = lit,
+        };
+    }
+    return .{ .select_row = .{ .cells = cells, .limit = limit } };
+}
+
+/// SET and RESET, any kind and parameter (Stmt.set_var).
+fn parseSet(vs: *const c.VariableSetStmt) Stmt {
+    return switch (vs.kind) {
+        c.VAR_RESET, c.VAR_RESET_ALL => .reset_var,
+        else => .set_var,
+    };
 }
 
 /// Whether a target's function call is exactly `count(*)`: no

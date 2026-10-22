@@ -370,6 +370,19 @@ expect "index on a date column" "CREATE INDEX" q "CREATE INDEX dt_d ON dt (d);"
 expect "indexed date lookup" "(1 row)" q "SELECT id FROM dt WHERE d = '2001-01-01';"
 expect "DROP date table" "DROP TABLE" q "DROP TABLE dt;"
 
+# --- SELECT without FROM, SET and RESET: what a driver sends on connect --
+expect "SELECT 1" "(1 row)" q "SELECT 1;"
+expect "SELECT 1 value" "1" v "SELECT 1;"
+expect "SELECT 1 column name" "?column?" q "SELECT 1;"
+expect "constants with aliases" "1|a|t||1.5" v \
+    "SELECT 1 AS one, 'a' b, true, NULL, 1.5;"
+expect "constants keep their aliases" "one | b |" q \
+    "SELECT 1 AS one, 'a' b, true, NULL, 1.5;"
+expect "SELECT 1 LIMIT 0" "(0 rows)" q "SELECT 1 LIMIT 0;"
+expect "a function without FROM errors" "constants" q "SELECT now();"
+expect "SET is accepted" "SET" q "SET extra_float_digits = 3;"
+expect "RESET is accepted" "RESET" q "RESET ALL;"
+
 # --- extended query protocol: psql 18's \bind, \parse, \bind_named --------
 # `\bind` sends Parse (unnamed) + Bind + Describe(portal) + Execute + Sync,
 # the shape pgbench -M extended uses; `\parse` + `\bind_named` is a named
@@ -388,6 +401,10 @@ expect "extended SELECT header comes from Describe" "name" \
 expect "extended SELECT row count tag" "(1 row)" \
     xq 'SELECT name FROM pt WHERE id = $1 \bind 2 \g'
 expect "extended count(*)" "2" x 'SELECT count(*) FROM pt \bind \g'
+expect "extended SELECT 1" "1" x 'SELECT 1 \bind \g'
+expect "extended SELECT 1 header comes from Describe" "?column?" \
+    xq 'SELECT 1 \bind \g'
+expect "extended SET" "SET" xq 'SET application_name = e2e \bind \g'
 expect "extended UPDATE, param under an operator" "UPDATE 1" \
     xq 'UPDATE pt SET n = n + $1 WHERE name = $2 \bind 5 a \g'
 expect "the UPDATE landed" "15" x 'SELECT n FROM pt WHERE id = $1 \bind 1 \g'

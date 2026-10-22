@@ -574,6 +574,64 @@ fn describeSelectLoad(
     try state.sendRowDescription(proj.fields);
 }
 
+/// SELECT constants with no FROM: the one row, straight from the
+/// statement; no table, transaction or lock. Describe sends the
+/// fields on the extended path, as for select.
+pub fn selectRow(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    sr: _parse.SelectRow,
+) !void {
+    if (self.mode == .simple) try describeSelectRow(self, state, sr);
+    const emit = (sr.limit orelse 1) > 0;
+    if (emit) {
+        var dw = try state.beginDataRow(@intCast(sr.cells.len));
+        for (sr.cells) |cell| {
+            if (cell.value == .null_value) {
+                try dw.writeNull();
+                continue;
+            }
+            const w = try dw.beginColumn();
+            switch (cell.value) {
+                .int => |n| try w.print("{d}", .{n}),
+                .float, .str => |s| try w.writeAll(s),
+                .bool_ => |b| try w.writeAll(if (b) "t" else "f"),
+                else => unreachable, // the parser keeps only constants
+            }
+            dw.endColumn();
+        }
+        try dw.finish();
+    }
+    try state.sendCommandComplete(if (emit) "SELECT 1" else "SELECT 0");
+}
+
+/// The RowDescription of a SELECT without FROM: each field named by
+/// its target and typed by its constant, the widest of its kind. An
+/// untyped NULL is text, as Postgres resolves it.
+pub fn describeSelectRow(
+    self: *Handler,
+    state: *pgwire.ConnState,
+    sr: _parse.SelectRow,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(self.srv.engine.allocator);
+    defer arena.deinit();
+    const fields = try arena.allocator().alloc(
+        pgwire.FieldDescription,
+        sr.cells.len,
+    );
+    for (sr.cells, fields) |cell, *fd| fd.* = .{
+        .name = cell.name,
+        .type_oid = switch (cell.value) {
+            .int => pgwire.oid.int8,
+            .float => pgwire.oid.float8,
+            .bool_ => pgwire.oid.bool_,
+            .str, .null_value => pgwire.oid.text,
+            else => unreachable, // the parser keeps only constants
+        },
+    };
+    try state.sendRowDescription(fields);
+}
+
 /// A SELECT's output, resolved against its table: the projected
 /// columns and their wire descriptions, one per column. count(*)
 /// projects no column — one int8 field.
