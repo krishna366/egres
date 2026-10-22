@@ -166,7 +166,6 @@ pub fn build(b: *std.Build) void {
     // Load-test driver lives in `scripts/loadtest.py` (orchestration glue is
     // far cleaner in Python than in Zig's std.process/std.Io.Dir surface).
     addSstVerify(b, target, optimize, mods);
-    addLookaheadProbe(b, target, optimize, mods);
     // `zig build test` — one binary, auto-discovered from `*_test.zig` /
     // `test.zig` files. Replaces the previous test-zdb / test-zbuf /
     // test-utils / test-raft / test-net per-file plumbing.
@@ -876,24 +875,6 @@ fn addSstVerify(
 
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step("sst-verify", "Build the SST verification tool");
-    step.dependOn(&install.step);
-}
-
-fn addLookaheadProbe(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    mods: Modules,
-) void {
-    const exe = b.addExecutable(.{
-        .name = "lookahead-probe",
-        .root_module = makeModule(b, target, optimize, "scripts/lookahead_probe.zig"),
-    });
-    addImports(exe.root_module, mods, .{ "vfs", "zfiber", "utils" });
-    b.installArtifact(exe);
-
-    const install = b.addInstallArtifact(exe, .{});
-    const step = b.step("lookahead-probe", "Build the store lookahead probe tool");
     step.dependOn(&install.step);
 }
 

@@ -161,7 +161,8 @@ pub const RemoteStore = union(enum) {
     /// Measure the ideal readahead for this store endpoint (see
     /// lookahead.calibrate): the size whose transfer time equals the
     /// per-request fixed cost — a network round trip for s3, syscall +
-    /// device latency for file.
+    /// device latency for file. Run by `--probe`, not at startup:
+    /// nothing in the server consumes it.
     pub fn calibrateLookahead(self: *RemoteStore, block_size: u64) !u64 {
         switch (self.*) {
             .file => |*f| return f.calibrateLookahead(block_size),
@@ -175,14 +176,6 @@ pub const RemoteStore = union(enum) {
         switch (self.*) {
             .file => return null,
             .s3 => |*s| return &s.cache,
-        }
-    }
-
-    /// The calibrated readahead in bytes; 0 = none needed/uncalibrated.
-    pub fn lookahead(self: *const RemoteStore) u64 {
-        switch (self.*) {
-            .file => |*f| return f.lookahead,
-            .s3 => |*s| return s.lookahead,
         }
     }
 };
@@ -280,9 +273,6 @@ pub const FileStore = struct {
     a: std.mem.Allocator,
     depot: String,
     vfs: *const _vfs.VFS,
-    /// calibrateLookahead at startup. 0 = uncalibrated. Not consumed yet —
-    /// tiered reads will size their readahead from it.
-    lookahead: u64 = 0,
 
     pub fn init(
         a: std.mem.Allocator,
@@ -372,13 +362,12 @@ pub const FileStore = struct {
     }
 
     /// Measure this depot's ideal readahead (policy in vfs/lookahead.zig;
-    /// this store contributes probeRead and the object ops) and record it
-    /// in `lookahead`. Meaningful locally too: the knee is device latency
-    /// × device bandwidth (~100s of KB on NVMe) instead of network round
-    /// trip × link bandwidth (~MBs).
+    /// this store contributes probeRead and the object ops). Meaningful
+    /// locally too: the knee is device latency × device bandwidth (~100s
+    /// of KB on NVMe) instead of network round trip × link bandwidth
+    /// (~MBs).
     pub fn calibrateLookahead(self: *FileStore, block_size: u64) !u64 {
-        self.lookahead = try _lookahead.calibrate(self.a, self, block_size);
-        return self.lookahead;
+        return _lookahead.calibrate(self.a, self, block_size);
     }
 
     /// One timed ranged read of the probe object — the disk analog of

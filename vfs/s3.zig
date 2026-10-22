@@ -92,10 +92,6 @@ pub const S3Store = struct {
     /// cap. A slot's conn is reusable only after its response was
     /// fully drained — parseResponse guarantees that.
     conns: fiber.Channel(Slot),
-    /// Ideal readahead in bytes for this endpoint, set by
-    /// calibrateLookahead at startup. 0 = uncalibrated. Informs the
-    /// chunk size the cache is created with (chunkcache.zig).
-    lookahead: u64 = 0,
     /// Local-disk chunk cache in front of every read (chunkcache.zig).
     cache: _chunkcache.ChunkCache,
 
@@ -466,16 +462,18 @@ pub const S3Store = struct {
 
     /// The chunk size a batch is planned on: the cache's for a cached
     /// read, so each chunk is fetched and kept whole; for an uncached
-    /// one (compaction) the endpoint's knee, so a run of blocks is one
-    /// request however small the cache's chunks are.
+    /// one (compaction) at least `uncached_span`, so a run of blocks is
+    /// one request however small the cache's chunks are.
     fn planChunkBytes(self: *const S3Store) u64 {
         const c = self.cache.chunkBytes();
         if (self.useCache()) return c;
-        return @max(c, @max(self.lookahead, default_span));
+        return @max(c, uncached_span);
     }
 
-    /// The uncached batch chunk size when the endpoint is uncalibrated.
-    const default_span: u64 = 4 << 20;
+    /// Past the knee of every endpoint measured so far (`--probe` says
+    /// where a given one's is): a request this large costs about its
+    /// transfer time, not its round trip.
+    const uncached_span: u64 = 4 << 20;
 
     /// Fill a batch of reads of `name`, an object of `size` bytes, with
     /// every `req.data` in `arena`. The requests are mapped onto chunks
@@ -817,17 +815,10 @@ pub const S3Store = struct {
 
     /// Measure this endpoint's ideal readahead (the calibration policy
     /// lives in vfs/lookahead.zig; this store contributes probeRead and
-    /// the object ops) and record it in `lookahead`. Run at startup;
-    /// callers treat failure as non-fatal. Logged beside the chunk
-    /// size, which is what a miss actually asks for.
+    /// the object ops). For `--probe`; the server's uncached reads use
+    /// `uncached_span` instead.
     pub fn calibrateLookahead(self: *S3Store, block_size: u64) !u64 {
-        self.lookahead = try _lookahead.calibrate(self.a, self, block_size);
-        if (self.cache.enabled()) {
-            log.info("chunk cache: {d} KiB chunks; endpoint knee {d} KiB", .{
-                self.cache.chunkBytes() >> 10, self.lookahead >> 10,
-            });
-        }
-        return self.lookahead;
+        return _lookahead.calibrate(self.a, self, block_size);
     }
 
     /// One timed ranged GET of the calibration probe object — the

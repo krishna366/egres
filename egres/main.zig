@@ -170,8 +170,18 @@ fn usage(alloc: std.mem.Allocator) void {
     const io = utils.context.g().io;
     const stderr = std.Io.File.stderr();
     stderr.writeStreamingAll(io, help.items) catch {};
-    stderr.writeStreamingAll(io, "\n") catch {};
+    stderr.writeStreamingAll(io, "\n" ++ probe_help ++ "\n") catch {};
 }
+
+const probe_help =
+    \\Modes:
+    \\  --help   this text
+    \\  --probe  run the probes and exit: the disk calibration of every
+    \\           data directory, and the store's ideal readahead (the
+    \\           read size past which a request costs its transfer rather
+    \\           than its round trip, for sizing a cache's chunks). The
+    \\           numbers go to stdout; takes the same --store/--wal flags.
+;
 
 const log = std.log.scoped(.egres);
 
@@ -386,18 +396,27 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
     const live_wal = try flags.g().register("wal", WalCfg);
     const live_io = try flags.g().register("io", zdb.vfs.calibrate.Cfg);
 
-    // --help is terminal; handle after registration so writeHelpAll has
-    // every module's fields populated.
+    // --help and --probe are modes, not settings: --help is terminal,
+    // handled after registration so writeHelpAll has every module's
+    // fields; --probe is taken off argv before the groups parse it.
+    var probe = false;
+    var settings: std.ArrayList(String) = .empty;
+    defer settings.deinit(allocator);
     for (argv[1..]) |a| {
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             usage(allocator);
             return;
         }
+        if (std.mem.eql(u8, a, "--probe")) {
+            probe = true;
+            continue;
+        }
+        try settings.append(allocator, a);
     }
 
     var leftover: std.ArrayList(String) = .empty;
     defer leftover.deinit(allocator);
-    flags.g().parseArgv(argv[1..], &leftover) catch |err| {
+    flags.g().parseArgv(settings.items, &leftover) catch |err| {
         log.err("flag parse failed: {s}", .{@errorName(err)});
         usage(allocator);
         std.process.exit(1);
@@ -535,14 +554,27 @@ fn bootstrap(allocator: std.mem.Allocator, argv: []const String) !void {
             store_cfg.s3_prefix,
         });
     }
-    // Size the future read-lookahead to this endpoint's latency knee.
-    // Non-fatal: a probe hiccup shouldn't block boot; lookahead stays 0.
-    _ = store.calibrateLookahead(zdb_cfg.block_bytes) catch |err| {
-        log.warn("remote lookahead calibration failed: {s}", .{
-            @errorName(err),
+    // `--probe`: the probes' numbers instead of the server. The disks
+    // were probed by deviceVfs above; the store's readahead runs here.
+    // Returning is the shutdown path, so the store above is closed on
+    // the way out.
+    if (probe) {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        for (calibrate.devices()) |d| {
+            try out.print(allocator, "disk {s}: bandwidth_bytes={d}MiB " ++
+                "write_cost={d}\n", .{
+                d.path, d.cfg.bytes_per_sec >> 20, d.cfg.write_cost,
+            });
+        }
+        const la = try store.calibrateLookahead(zdb_cfg.block_bytes);
+        try out.print(allocator, "store lookahead: {d} bytes ({d} KiB)\n", .{
+            la, la >> 10,
         });
-    };
-
+        const io = utils.context.g().io;
+        try std.Io.File.stdout().writeStreamingAll(io, out.items);
+        return;
+    }
     // Initialize global metrics before anything that might increment them.
     // zdb owns storage-layer metrics; raft owns its own propose-phase
     // histograms — they live in separate Metrics structs but both surface

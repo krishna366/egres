@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Disk calibration at startup: the data directory's read and write
-//! bandwidth, measured with several requests in flight, which
+//! bandwidth, measured with several requests in flight over a few
+//! alternating write and read samples, the best of each kept, which
 //! `bwConfigFrom` turns into the bandwidth limiter's settings. Works
 //! on a scratch file under the data dir, removed afterwards. Runs
 //! before the limiter is configured, so nothing here is throttled.
@@ -12,8 +13,8 @@ const fiber = @import("zfiber");
 const utils = @import("utils");
 const String = utils.String;
 const _vfs = @import("vfs.zig");
-const _lookahead = @import("lookahead.zig");
 const _bandwidth = @import("bandwidth.zig");
+const _lookahead = @import("lookahead.zig");
 
 const log = std.log.scoped(.calibrate);
 
@@ -29,6 +30,16 @@ const scratch_dir = "calibrate";
 /// and the limiter regulates the sum of many fibers' I/O.
 const depth = 8;
 const request_size: u64 = 1 << 20;
+/// Rounds of one write sample then one read sample, 250 ms each; the
+/// best of each direction is the device's capacity. One sample can
+/// land in a drive's housekeeping stall (seconds on a DRAM-less SSD)
+/// and read it as the bandwidth; alternating the directions keeps a
+/// stall from covering every sample of one of them, and the writes
+/// from running back to back, which is what provokes the stall.
+const rounds = 3;
+/// Writes below this fraction of the reads on one device are read as
+/// a stall that outlasted the probe, and said so.
+const stall_ratio = 10;
 
 /// The `--io` flag: what the disk bandwidth limiter is configured from. By
 /// default the data directory is probed at startup (vfs/calibrate.zig)
@@ -60,6 +71,8 @@ pub const Device = struct {
     /// The first of its directories, for the dump.
     path: String,
     vfs: *const _vfs.VFS,
+    /// What the limiter was configured with: probed or pinned.
+    cfg: _bandwidth.Config,
 };
 
 /// The devices in `deviceVfs` order; startup-only mutation.
@@ -108,6 +121,7 @@ pub fn deviceVfs(
         .dev = dev,
         .path = dir,
         .vfs = v,
+        .cfg = cfg,
     });
 
     return v;
@@ -165,9 +179,19 @@ pub fn runCalibration(a: std.mem.Allocator, data_dir: String) !Profile {
     defer a.free(path);
     try fillProbeFile(a, path);
 
-    const read_bps = try throughput(a, path, .read);
-    const write_bps = try throughput(a, path, .write);
+    var read_bps: u64 = 0;
+    var write_bps: u64 = 0;
+    for (0..rounds) |_| {
+        write_bps = @max(write_bps, try throughput(a, path, .write));
+        read_bps = @max(read_bps, try throughput(a, path, .read));
+    }
     if (read_bps == 0 or write_bps == 0) return error.CalibrationFailed;
+    if (write_bps * stall_ratio < read_bps) {
+        log.warn("{s}: writes at {d} MiB/s against reads at {d} MiB/s " ++
+            "look like a drive stall; --io pins the numbers", .{
+            data_dir, write_bps >> 20, read_bps >> 20,
+        });
+    }
     return .{ .read_bps = read_bps, .write_bps = write_bps };
 }
 
@@ -199,7 +223,7 @@ fn fillProbeFile(a: std.mem.Allocator, path: String) !void {
 
 /// Bytes per second over 250ms with `depth` fibers, one per
 /// worker, each issuing `request_size` O_DIRECT requests at random
-/// offsets of the probe file, back to back.
+/// offsets of the probe file, back to back. One sample of `rounds`.
 fn throughput(a: std.mem.Allocator, path: String, kind: _vfs.IOKind) !u64 {
     var stop = std.atomic.Value(bool).init(false);
     var group = fiber.Group(anyerror!u64).init(a);
