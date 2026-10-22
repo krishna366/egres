@@ -66,14 +66,23 @@ jobs:
             deps-${{ runner.os }}-${{
             hashFiles('build.zig', 'scripts/bootstrap-*.sh') }}
 
-      # The Ubuntu image ships psql; the Mac gets it from brew's libpq.
+      # The scripts use psql 18 meta-commands (\parse, \close_prepared,
+      # \startpipeline); the Ubuntu image ships 16, so Linux takes
+      # PGDG's client. The Mac gets a current one from brew's libpq.
       - name: Find psql
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            command -v psql >/dev/null || {
-              sudo apt-get update -q
-              sudo apt-get install -y -q postgresql-client
-            }
+            key=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+            sudo install -d "$(dirname "$key")"
+            sudo curl -fsS -o "$key" \
+              https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            . /etc/os-release
+            echo "deb [signed-by=$key]" \
+              "https://apt.postgresql.org/pub/repos/apt" \
+              "$VERSION_CODENAME-pgdg main" |
+              sudo tee /etc/apt/sources.list.d/pgdg.list
+            sudo apt-get update -q
+            sudo apt-get install -y -q postgresql-client-18
           else
             brew install -q libpq
             echo "$(brew --prefix libpq)/bin" >> "$GITHUB_PATH"

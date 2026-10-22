@@ -308,7 +308,8 @@ expect "INSERT 300 KB row" "INSERT 0 1" big_insert 1
 expect "INSERT second 300 KB row" "INSERT 0 1" big_insert 2
 expect "small row after them" "INSERT 0 1" q "INSERT INTO big VALUES (3, 's');"
 expect "oversized rows stream" "(3 rows)" q "SELECT id FROM big;"
-if [ "$(v "SELECT name FROM big WHERE id = 2;" | wc -c)" = "300001" ]; then
+# $(( )) strips the spaces BSD wc pads its count with.
+if [ $(( $(v "SELECT name FROM big WHERE id = 2;" | wc -c) )) = 300001 ]; then
     ok "oversized row round-trips intact"
 else bad "oversized row came back with the wrong length"; fi
 expect "UPDATE oversized rows" "UPDATE 3" q "UPDATE big SET id = 9;"
@@ -318,7 +319,7 @@ expect "DELETE oversized rows" "DELETE 3" q "DELETE FROM big WHERE id = 9;"
 # SELECT lists take column references only, so padding is checked by the
 # byte length of the bare value (`v` prints it plus a newline).
 expect_len() { # <desc> <bytes> <sql>: the value's length in bytes, newline included
-    local got; got=$(v "$3" | wc -c)
+    local got; got=$(( $(v "$3" | wc -c) ))
     if [ "$got" = "$2" ]; then ok "$1"; else bad "$1 — got $got bytes"; fi
 }
 expect "CREATE char/varchar table" "CREATE TABLE" \
