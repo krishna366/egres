@@ -72,6 +72,7 @@ sys.path.insert(0, str(HERE.parent / "run"))
 
 import bench  # noqa: E402
 import pgbench  # noqa: E402
+import watchdog  # noqa: E402
 import workloads  # noqa: E402
 
 ENV = "egres-bank"
@@ -86,6 +87,8 @@ CREATE TABLE ledger (
 CREATE INDEX ledger_owner ON ledger (owner);
 """
 ROWS_PER_STMT = 200
+# The admin `zdb` dump prints sizes as `12.34GiB`.
+UNITS = {"B": 1, "KiB": 2**10, "MiB": 2**20, "GiB": 2**30, "TiB": 2**40}
 # History buckets: `:run * 100000 + :n / 10000` per client. Every
 # client passes through every bucket number up to its own count, so a
 # run's buckets are a gapless range from its base.
@@ -640,6 +643,10 @@ class Driver:
                           f"pid {pid}; sending SIGKILL")
             os.kill(pid, signal.SIGKILL)
             time.sleep(5)
+        # The restart renames the log: count the shutdown's lines first.
+        counts = self.new_log_lines()
+        self.note(f"server log at {name}: " +
+                  " ".join(f"{k}={v}" for k, v in counts.items()))
         self.state["kills"] += 1
         self.save()
 
@@ -773,11 +780,13 @@ class Driver:
 
     def numbers(self) -> dict:
         pid = self.run.pid("server.pid")
-        rss = fds = None
+        rss = fds = threads = None
         try:
             for line in open(f"/proc/{pid}/status"):
                 if line.startswith("VmRSS"):
                     rss = int(line.split()[1]) * 1024
+                elif line.startswith("Threads"):
+                    threads = int(line.split()[1])
             fds = len(os.listdir(f"/proc/{pid}/fd"))
         except OSError:
             pass
@@ -797,9 +806,36 @@ class Driver:
                     continue
         tps = self.pg.last[0] if self.pg is not None and self.pg.last \
             else None
-        return {"rss": rss, "fds": fds, "data": data, "wal": wal,
-                "ssts": ssts, "tps": tps,
-                "free": shutil.disk_usage(self.run.data).free}
+        # p99 of the tpcb script, in ms, over the last sampled window.
+        p99 = None
+        if self.pg is not None and "tpcb" in self.pg.lat_last:
+            p99 = round(self.pg.lat_last["tpcb"][2], 1)
+        n = {"rss": rss, "fds": fds, "threads": threads, "data": data,
+             "wal": wal, "ssts": ssts, "tps": tps, "p99": p99,
+             "free": shutil.disk_usage(self.run.data).free}
+        n.update(self.zdb())
+        return n
+
+    def zdb(self) -> dict:
+        """The engine's own view from the admin `zdb` dump: block
+        cache bytes, open tables and tables per level, so RSS at the
+        cache cap and growth above it can be told apart, and L0 depth
+        is seen as a number. Empty when the server does not answer."""
+        try:
+            text = watchdog.admin("zdb", self.run.env["server"]["admin_port"])
+        except OSError:
+            return {}
+        out = {}
+        m = re.search(r"block_cache: entries=\d+ bytes=([\d.]+)(\w+)", text)
+        if m:
+            out["cache"] = int(float(m.group(1)) * UNITS[m.group(2)])
+        m = re.search(r"tables: open=(\d+)", text)
+        if m:
+            out["tables"] = int(m.group(1))
+        levels = re.findall(r"^\s+L\d+: tables=(\d+)", text, re.M)
+        if levels:
+            out["levels"] = [int(x) for x in levels]
+        return out
 
     def status(self, phase: str):
         n = self.numbers()
@@ -811,11 +847,16 @@ class Driver:
 
         def gib(v):
             return "-" if v is None else f"{v / GIB:.1f}"
+        levels = "/".join(str(x) for x in n.get("levels", [])) or "-"
+        # No p99 until pgbench has flushed its first latency samples.
+        p99 = "-" if n["p99"] is None else f"{n['p99']}ms"
         self.note(
             f"phase={phase} cycle={self.state['cycle']} "
             f"kills={self.state['kills']} rss={gib(n['rss'])}GiB "
+            f"cache={gib(n.get('cache'))}GiB threads={n['threads']} "
             f"fds={n['fds']} data={gib(n['data'])}GiB wal={gib(n['wal'])}GiB "
-            f"ssts={n['ssts']} free={gib(n['free'])}GiB tps={n['tps']} "
+            f"ssts={n['ssts']} tables={n.get('tables')} levels={levels} "
+            f"free={gib(n['free'])}GiB tps={n['tps']} p99={p99} "
             f"ledger={ledger} bank={bank} log=" +
             " ".join(f"{k}={v}" for k, v in counts.items()))
         self.write_prom(n, ledger, bank)
@@ -829,9 +870,15 @@ class Driver:
             lines.append(f'longrun_ledger_txns{{outcome="{key}"}} {val}')
         for key, val in bank.items():
             lines.append(f'longrun_bank_reads{{outcome="{key}"}} {val}')
-        for key in ("rss", "fds", "data", "wal", "ssts"):
+        for key in ("rss", "fds", "threads", "data", "wal", "ssts",
+                    "cache", "tables"):
             if n.get(key) is not None:
                 lines.append(f"longrun_server_{key} {n[key]}")
+        for lvl, count in enumerate(n.get("levels", [])):
+            lines.append(f'longrun_server_level_tables{{level="{lvl}"}} '
+                         f"{count}")
+        if n.get("p99") is not None:
+            lines.append(f"longrun_pgbench_p99_ms {n['p99']}")
         path = self.run.textfile / "longrun.prom"
         tmp = path.with_suffix(".tmp")
         tmp.write_text("\n".join(lines) + "\n")
@@ -1073,6 +1120,13 @@ def cmd_begin(run, a):
 
 def cmd_run(run, a):
     cfg = json.loads(cfg_path(run).read_text())
+    # A resumed run may change its schedule: flags given here replace
+    # what begin stored, and the file keeps the result for the child.
+    changed = {k: getattr(a, k) for k in DEFAULTS
+               if getattr(a, k, None) is not None}
+    if changed:
+        cfg.update(changed)
+        cfg_path(run).write_text(json.dumps(cfg, indent=2) + "\n")
     if not a.foreground:
         if bench.alive(run.pid("longrun.pid")):
             sys.exit(f"driver already running: pid {run.pid('longrun.pid')}")
@@ -1147,7 +1201,8 @@ def main():
     ap.add_argument("--foreground", action="store_true")
     for key, val in DEFAULTS.items():
         ap.add_argument(f"--{key}", type=type(val),
-                        help=f"begin: the schedule's {key} (default {val})")
+                        help=f"begin or run: the schedule's {key} "
+                             f"(default {val})")
     a = ap.parse_args()
     run = make_run(a)
     {"begin": cmd_begin, "run": cmd_run, "check": cmd_check,

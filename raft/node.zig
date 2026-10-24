@@ -2074,6 +2074,8 @@ pub const Node = struct {
             if (wall_sec <= last_ts.seconds) continue;
 
             self.proposeAndWaitForApply(&.{}, .data) catch |err| {
+                // The queue closes under a tick during shutdown.
+                if (self.isShuttingDown()) continue;
                 raft_log.warn("clock tick propose failed: {s}", .{@errorName(err)});
             };
         }

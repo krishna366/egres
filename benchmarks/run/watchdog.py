@@ -58,8 +58,12 @@ def prom(query: str, default=None):
 
 
 def admin(command: str, port: int, timeout: float = 10.0) -> str:
+    """One command's whole answer: the server closes the connection
+    once this side has, and a `zdb` dump has blank lines inside it, so
+    the end is EOF, not an empty line."""
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
         s.sendall((command + "\n").encode())
+        s.shutdown(socket.SHUT_WR)
         out = b""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -70,8 +74,6 @@ def admin(command: str, port: int, timeout: float = 10.0) -> str:
             if not chunk:
                 break
             out += chunk
-            if out.endswith(b"\n\n"):
-                break
     return out.decode(errors="replace")
 
 

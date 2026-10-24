@@ -1084,7 +1084,15 @@ pub const Engine = struct {
                 };
             } else {
                 self.proposeCompaction(job) catch |err| {
-                    log.err("proposeCompaction failed: {s}", .{@errorName(err)});
+                    // A job that outlives the proposal queue is redone
+                    // after the restart; only a live node has failed.
+                    if (self.node.isShuttingDown()) {
+                        log.info("compaction result dropped at shutdown", .{});
+                    } else {
+                        log.err("proposeCompaction failed: {s}", .{
+                            @errorName(err),
+                        });
+                    }
                 };
             }
         }

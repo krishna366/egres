@@ -216,7 +216,7 @@ pub const TableCache = struct {
             const now = utils.coarseMs();
             if (now - last_warn >= 15_000) {
                 log.warn(
-                    "loadTables watchdog: {d}/{d} opens completed after {d}manifest",
+                    "loadTables watchdog: {d}/{d} opens completed after {d}ms",
                     .{ completed.load(.acquire), total, now - start },
                 );
                 last_warn = now;
