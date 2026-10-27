@@ -26,3 +26,6 @@ patches/
 __pycache__/
 benchmarks/monitor/.env
 benchmarks/run/local.toml
+
+# A server started with no flags keeps its data here.
+egres-data/

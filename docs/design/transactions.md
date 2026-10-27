@@ -25,18 +25,22 @@ unless `FOR UPDATE`.
 
 Writes use pessimistic locking. A write statement first gathers all the rows it
 would change, then locks them in key order to avoid cycles. Locking is done via
-a SemaphoreMap which exists only in leader's memory. In addition to holding
+[SemaphoreMap][] which exists only in leader's memory. In addition to holding
 locks, the map maintains a wait-for graph and detects any deadlocks at the time
 of lock acquisition. In case it finds a deadlock cycle, the transaction is
 immediately aborted and all held locks are released. There are no lock timeouts.
 
+[SemaphoreMap]: https://github.com/manishrjain/egres/blob/main/zfiber/semaphore_map.zig
+
 ## Conflict Detection
 
-The leader also keeps an in-memory oracle: a map from row hash to its latest commit
-timestamp. After locks are acquired, their hashes are checked against Oracle to
-find the max commit timestamp among them, T<sub>max_commit</sub>. If
-T<sub>max_commit</sub> is at or below T<sub>read</sub>, nobody else changed them
-and the statement proceeds.
+The leader also keeps an in-memory [Oracle][oracle]: a map from row hash to its
+latest commit timestamp. After locks are acquired, their hashes are checked
+against the Oracle to find the max commit timestamp among them,
+T<sub>max_commit</sub>. If T<sub>max_commit</sub> is at or below
+T<sub>read</sub>, nobody else changed them and the statement proceeds.
+
+[oracle]: https://github.com/manishrjain/egres/blob/main/sql/oracle.zig
 
 If T<sub>max_commit</sub> is higher than T<sub>read</sub>, the rows are stale.
 Egres bumps up the T<sub>read</sub> to T<sub>max_commit</sub> and re-runs the
@@ -52,11 +56,12 @@ serialization failure Postgres returns.
   <img src="../figures/conflict-detection.svg" width="1000" height="402" alt="Conflict detection: a transaction reads at 1020, its first statement locks a row last committed at 1010 and proceeds, another transaction commits a second row at 1038, the second statement locks that row and finds it stale, the oracle confirms the first row has not moved, the read timestamp is bumped to 1038 and only the second statement re-runs with its locks held, then the write set commits at 1042" loading="lazy" />
 </figure>
 
-All pending writes live in a private skiplist on the leader. Nothing touches
-storage or the Raft log until COMMIT, which proposes the whole write set, rows
-and index entries, applied atomically on every replica. There is no validation
-phase at commit, because every conflict was settled by the above described
-locking process before the statement wrote anything.
+All of a transaction's row and index writes go into a memtable owned by that
+transaction. When reading, this memtable is overlaid on zdb, so the transaction
+can see its own pending writes. Nothing touches storage or the Raft log until
+COMMIT, which proposes the entire write set, applied atomically on every
+replica. There is no validation phase at commit, because every conflict was
+settled by the locking described above before the statement wrote anything.
 
 Pessimistic locking was chosen over optimistic on purpose. Dgraph had optimistic
 locking which caused abort storms under high contention. N transactions would
