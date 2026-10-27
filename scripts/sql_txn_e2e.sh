@@ -55,11 +55,16 @@ trap 'stop_server; rm -rf "$D"' EXIT
 # Session N: a FIFO (kept open on fd 3+N) feeding a long-lived psql whose
 # output lands in $D/outN. `sync_session` sends an \echo marker and waits
 # for it — i.e. for every statement queued before it to have finished.
+# Line-buffered output, so a marker is in outN as soon as psql prints
+# it: GNU stdbuf, gstdbuf from Homebrew coreutils, or neither on a bare
+# macOS, where psql's own flush after each result has to do.
+LINEBUF=$(command -v stdbuf || command -v gstdbuf || true)
+[ -n "$LINEBUF" ] && LINEBUF="$LINEBUF -oL -eL"
 open_session() { # $1 = 1|2
     mkfifo "$D/in$1"
     # 4>&- 5>&-: don't let this psql inherit the OTHER session's FIFO
     # write end, or closing that fd would never EOF the other psql.
-    stdbuf -oL -eL psql "$E" -X -tA -f - <"$D/in$1" >"$D/out$1" 2>&1 4>&- 5>&- &
+    $LINEBUF psql "$E" -X -tA -f - <"$D/in$1" >"$D/out$1" 2>&1 4>&- 5>&- &
     eval "PID$1=\$!"
     eval "exec $((3 + $1))>\"$D/in$1\""
     send "$1" "\\set VERBOSITY verbose" # errors show their SQLSTATE

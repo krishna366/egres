@@ -786,7 +786,12 @@ test "BIG: diskwal large payload rotation" {
     defer alloc.free(payload);
 
     {
-        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{});
+        // No prezero: a fill that falls behind on a slow disk makes
+        // the wal rotate onto an unfilled file and again when the
+        // prepared one is ready, and the file count below is exact.
+        var ds = try raft.DiskWAL.openPath(wal_dir, alloc, .{
+            .prezero = .false,
+        });
         defer ds.deinit();
         const log = &ds;
 
