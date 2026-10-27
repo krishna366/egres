@@ -92,6 +92,32 @@ pub fn validateEmbedding(
     return .{ .vector = try bytes.toOwnedSlice(alloc) };
 }
 
+/// The external inference operation. Keeping it injected makes the network
+/// boundary, credential resolution, cancellation, and accounting visible to
+/// the SQL executor that owns them.
+pub const Invoke = *const fn (
+    ctx: *anyopaque,
+    provider: Provider,
+    input: String,
+) anyerror![]const f64;
+
+/// Execute one embedding request through a registered provider and turn the
+/// response into a SQL vector value. The returned vector bytes are owned by
+/// `alloc`; the invoke result need only live through this call.
+pub fn embed(
+    alloc: std.mem.Allocator,
+    registry: *const Registry,
+    provider_name: String,
+    input: String,
+    ctx: *anyopaque,
+    invoke: Invoke,
+) !_value.Value {
+    if (input.len == 0) return error.EmptyInput;
+    const provider = registry.get(provider_name) orelse return error.UnknownProvider;
+    const response = try invoke(ctx, provider, input);
+    return validateEmbedding(alloc, provider, response);
+}
+
 fn copyProvider(alloc: std.mem.Allocator, p: Provider) !Provider {
     return .{ .name = try alloc.dupe(u8, p.name), .endpoint = try alloc.dupe(u8, p.endpoint), .model = try alloc.dupe(u8, p.model), .dimensions = p.dimensions, .credential_ref = try alloc.dupe(u8, p.credential_ref), .timeout_ms = p.timeout_ms, .max_concurrency = p.max_concurrency };
 }

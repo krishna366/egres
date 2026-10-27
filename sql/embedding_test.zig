@@ -60,3 +60,20 @@ test "sql.embedding: response validation returns canonical vector bytes" {
     try testing.expectError(error.NonFiniteEmbedding, sql.embedding.validateEmbedding(testing.allocator, provider, &.{ std.math.nan(f64), 0.0, 0.0 }));
     try testing.expectError(error.NonFiniteEmbedding, sql.embedding.validateEmbedding(testing.allocator, provider, &.{ 1e100, 0.0, 0.0 }));
 }
+
+test "sql.embedding: embed resolves a provider and validates its response" {
+    var registry = sql.embedding.Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.add(.{ .name = "docs", .endpoint = "https://example.com/v1", .model = "test", .dimensions = 2, .credential_ref = "docs-key" });
+
+    const Invoke = struct {
+        fn call(_: *anyopaque, _: Provider, _: []const u8) ![]const f64 {
+            return &.{ 1.0, 2.0 };
+        }
+    };
+    var context: u8 = 0;
+    const vector = try sql.embedding.embed(testing.allocator, &registry, "docs", "hello", &context, Invoke.call);
+    defer testing.allocator.free(vector.vector);
+    try testing.expectEqual(@as(usize, 8), vector.vector.len);
+    try testing.expectError(error.UnknownProvider, sql.embedding.embed(testing.allocator, &registry, "nope", "hello", &context, Invoke.call));
+}
