@@ -81,7 +81,11 @@ fi
 # Expanded below with the `[@]+` form: an empty array is "unbound" to
 # bash 3.2 (macOS) under set -u.
 target_opts=()
-export CC="$zig cc" AR="$zig ar" RANLIB="$zig ranlib"
+# `zig cc` compiles for the host's own CPU unless told otherwise, and
+# an archive built on one machine and cached for another (CI) then
+# faults on an instruction that machine lacks. Baseline is the arch's
+# floor, which a cross target gets by itself.
+export CC="$zig cc -mcpu=baseline" AR="$zig ar" RANLIB="$zig ranlib"
 if [[ -n "$zig_target" ]]; then
     export CC="$zig cc -target $zig_target"
     host_arch=$(uname -m)
