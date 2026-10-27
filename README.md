@@ -56,10 +56,10 @@ code follows are in [AGENTS.md](AGENTS.md).
 
 ## AI Policy
 
-Most of the Egres code base was written using AI agents: Claude Opus and
-then Fable. I reviewed every live code path myself, line by line, and
-iterated on it until it was correct and struck the right balance between
-performance and readability.
+Most of the Egres code base was written using AI agents: Claude Opus and then
+Claude Fable. I drove both the architecture and code design. I reviewed every
+live code path myself, line by line, and iterated on it until it was correct and
+struck the right balance between performance and readability.
 
 A pull request is expected to have had the same quality of human review
 before it is considered.
