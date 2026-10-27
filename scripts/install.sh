@@ -10,7 +10,7 @@
 # under dash on Debian and under busybox in Alpine. Everything is inside
 # main, called on the last line, so a download cut short runs nothing.
 #
-#   EGRES_VERSION      release tag to install, e.g. v0.1.0 (default: the
+#   EGRES_VERSION      release tag to install, e.g. v0.2610.0 (default: the
 #                      latest release; pre-releases need an explicit tag)
 #   EGRES_INSTALL_DIR  where the binary goes (default: /usr/local/bin as
 #                      root, ~/.local/bin otherwise)
@@ -153,9 +153,8 @@ main() {
     say "Installed egres $version to $dir/egres"
     path_hint "$dir"
     say ""
-    say "Start a server:"
-    say "  egres --raft id=1 --store dir_path=./egres-data" \
-        "--wal dir=./egres-wal"
+    say "Start a server (its store and WAL go under ./egres-data):"
+    say "  egres"
     say "Connect with psql:"
     say "  psql -h localhost -p 3210 -d egres"
     say "To uninstall, delete $dir/egres."

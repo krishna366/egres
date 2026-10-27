@@ -15,7 +15,7 @@ Egres speaks the PostgreSQL wire protocol. Anything that connects to Postgres â€
 $ curl -fsSL https://egresql.io/install.sh | sh
 ```
 
-The script downloads the latest release for your platform, verifies its checksum, and installs a single `egres` binary into `~/.local/bin`. Builds exist for Linux x86_64 and macOS on Apple silicon.
+The script downloads the latest release for your platform, verifies its checksum, and installs a single `egres` binary into `~/.local/bin`, or `/usr/local/bin` when run as root. Builds exist for Linux x86_64 and macOS on Apple silicon.
 
 Nothing else is installed: no service, no config file. To uninstall, delete the binary. Two variables change the defaults:
 
@@ -39,7 +39,7 @@ $ zig-out/bin/egres --help
 
 ## Start the server
 
-Egres keeps two directories: the store, where every SSTable lives, and the write-ahead log. If you run egres without any flags, it would store both under local directory `egres-data`.
+Egres keeps two directories: the store, where every SSTable lives, and the write-ahead log. Without flags, both go under `egres-data` in the working directory, as `egres-data/store` and `egres-data/wal`.
 
 :::tip
 It is recommended that you put the `--store` on a different device than the
@@ -50,12 +50,16 @@ WAL doesn't need a lot of disk space, and would benefit from NVMe.
 ```sh
 $ egres --help # To see all the options
 
-$ egres # To run the server
+$ egres # To run the server with both directories under ./egres-data
 2026-10-22T14:05:31.123456Z INFO  egres: starting egres id=1 cluster=1 raft=127.0.0.1:4210 admin=127.0.0.1:5210 sql=127.0.0.1:3210 wal=egres-data/wal tick=20ms seeds=0
 2026-10-22T14:05:31.140211Z INFO  sql: sql listener started on port 3210 (pgwire)
 ```
 
-Postgres clients connect on port `3210`. The admin port is `5210` and the Raft port is `4210`; `--listen` moves all three. Every flag is `--group "key=value; key2=value2"`.
+Postgres clients connect on port `3210`. The admin port is `5210` and the Raft port is `4210`; `--listen` moves all three. Every flag is `--group "key=value; key2=value2"`; to put the two directories on different devices:
+
+```sh
+$ egres --store dir-path=/nvme1/egres/store --wal dir=/nvme2/egres/wal
+```
 
 ## Connect
 
@@ -135,7 +139,7 @@ Every commit is in the write-ahead log before the client hears back. Kill the se
 
 ```sh
 $ kill -9 $(pgrep -x egres)
-$ egres --raft id=1 --store dir_path=./egres-data --wal dir=./egres-wal
+$ egres
 ```
 
 ```sql
