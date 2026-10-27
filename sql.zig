@@ -56,6 +56,7 @@ pub const plan = @import("sql/plan.zig");
 pub const pred = @import("sql/pred.zig");
 pub const expr = @import("sql/expr.zig");
 pub const vector = @import("sql/vector.zig");
+pub const embedding = @import("sql/embedding.zig");
 
 pub const Server = server.Server;
 pub const default_database = server.default_database;
