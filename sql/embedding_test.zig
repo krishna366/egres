@@ -62,7 +62,7 @@ test "sql.embedding: response validation returns canonical vector bytes" {
 }
 
 test "sql.embedding: embed resolves a provider and validates its response" {
-    var registry = sql.embedding.Registry.init(testing.allocator);
+    var registry = try sql.embedding.Registry.init(testing.allocator);
     defer registry.deinit();
     try registry.add(.{ .name = "docs", .endpoint = "https://example.com/v1", .model = "test", .dimensions = 2, .credential_ref = "docs-key" });
 
