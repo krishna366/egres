@@ -8,7 +8,7 @@ const sql = @import("sql");
 const Provider = sql.embedding.Provider;
 
 test "sql.embedding: registry owns validated provider configuration" {
-    var registry = sql.embedding.Registry.init(testing.allocator);
+    var registry = try sql.embedding.Registry.init(testing.allocator);
     defer registry.deinit();
     const provider = Provider{ .name = "docs", .endpoint = "https://example.com/v1", .model = "test", .dimensions = 3, .credential_ref = "docs-key" };
     try registry.add(provider);

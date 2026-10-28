@@ -37,33 +37,31 @@ pub const Provider = struct {
 /// catalog DDL layer will persist and hydrate the same Provider records.
 pub const Registry = struct {
     alloc: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
     providers: std.StringHashMap(Provider),
 
-    pub fn init(alloc: std.mem.Allocator) Registry {
-        return .{ .alloc = alloc, .providers = std.StringHashMap(Provider).init(alloc) };
+    pub fn init(alloc: std.mem.Allocator) !Registry {
+        const arena = try alloc.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(alloc);
+        return .{
+            .alloc = alloc,
+            .arena = arena,
+            .providers = std.StringHashMap(Provider).init(arena.allocator()),
+        };
     }
 
     pub fn deinit(self: *Registry) void {
-        var it = self.providers.iterator();
-        while (it.next()) |entry| {
-            self.alloc.free(entry.key_ptr.*);
-            self.alloc.free(entry.value_ptr.name);
-            self.alloc.free(entry.value_ptr.endpoint);
-            self.alloc.free(entry.value_ptr.model);
-            self.alloc.free(entry.value_ptr.credential_ref);
-        }
         self.providers.deinit();
+        self.arena.deinit();
+        self.alloc.destroy(self.arena);
     }
 
     pub fn add(self: *Registry, provider: Provider) !void {
         try provider.validate();
-        const key = try self.alloc.dupe(u8, provider.name);
-        errdefer self.alloc.free(key);
-        const owned = try copyProvider(self.alloc, provider);
-        errdefer freeProvider(self.alloc, owned);
-        const result = try self.providers.getOrPut(key);
+        if (self.providers.contains(provider.name)) return error.DuplicateProvider;
+        const owned = try copyProvider(self.arena.allocator(), provider);
+        const result = try self.providers.getOrPut(owned.name);
         if (result.found_existing) return error.DuplicateProvider;
-        result.key_ptr.* = key;
         result.value_ptr.* = owned;
     }
 
@@ -96,11 +94,4 @@ pub fn validateEmbedding(
 
 fn copyProvider(alloc: std.mem.Allocator, p: Provider) !Provider {
     return .{ .name = try alloc.dupe(u8, p.name), .endpoint = try alloc.dupe(u8, p.endpoint), .model = try alloc.dupe(u8, p.model), .dimensions = p.dimensions, .credential_ref = try alloc.dupe(u8, p.credential_ref), .timeout_ms = p.timeout_ms, .max_concurrency = p.max_concurrency };
-}
-
-fn freeProvider(alloc: std.mem.Allocator, p: Provider) void {
-    alloc.free(p.name);
-    alloc.free(p.endpoint);
-    alloc.free(p.model);
-    alloc.free(p.credential_ref);
 }
