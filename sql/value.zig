@@ -266,8 +266,10 @@ pub fn parseVector(
     if (text.len < 2 or text[0] != '[' or text[text.len - 1] != ']')
         return error.InvalidVector;
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
+    const byte_len = std.math.mul(usize, dimensions, 4) catch
+        return error.VectorDimensionMismatch;
+    const out = try alloc.alloc(u8, byte_len);
+    errdefer alloc.free(out);
     var fields = std.mem.splitScalar(u8, text[1 .. text.len - 1], ',');
     var count: u32 = 0;
     while (fields.next()) |field| {
@@ -277,14 +279,12 @@ pub fn parseVector(
         const number = try std.fmt.parseFloat(f32, part);
         if (std.math.isNan(number) or std.math.isInf(number))
             return error.NonFiniteVector;
-        try out.ensureUnusedCapacity(alloc, 4);
-        const start = out.items.len;
-        out.items.len += 4;
-        std.mem.writeInt(u32, out.items[start..][0..4], @bitCast(number), .little);
+        const start = @as(usize, count) * 4;
+        std.mem.writeInt(u32, out[start..][0..4], @bitCast(number), .little);
         count += 1;
     }
     if (count != dimensions) return error.VectorDimensionMismatch;
-    return .{ .vector = try out.toOwnedSlice(alloc) };
+    return .{ .vector = out };
 }
 
 fn parseBool(text: String) !bool {
