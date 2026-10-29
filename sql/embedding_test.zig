@@ -77,3 +77,50 @@ test "sql.embedding: embed resolves a provider and validates its response" {
     try testing.expectEqual(@as(usize, 8), vector.vector.len);
     try testing.expectError(error.UnknownProvider, sql.embedding.embed(testing.allocator, &registry, "nope", "hello", &context, Invoke.call));
 }
+
+test "sql.embedding: embed preserves invocation and response failures" {
+    var registry = try sql.embedding.Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.add(.{
+        .name = "docs",
+        .endpoint = "https://example.com/v1",
+        .model = "test",
+        .dimensions = 2,
+        .credential_ref = "docs-key",
+    });
+
+    const Invoke = struct {
+        fn fails(_: *anyopaque, _: Provider, _: []const u8) ![]const f64 {
+            return error.ProviderUnavailable;
+        }
+
+        fn wrongDimensions(_: *anyopaque, _: Provider, _: []const u8) ![]const f64 {
+            return &.{1.0};
+        }
+    };
+    var context: u8 = 0;
+    try testing.expectError(error.EmptyInput, sql.embedding.embed(
+        testing.allocator,
+        &registry,
+        "docs",
+        "",
+        &context,
+        Invoke.fails,
+    ));
+    try testing.expectError(error.ProviderUnavailable, sql.embedding.embed(
+        testing.allocator,
+        &registry,
+        "docs",
+        "hello",
+        &context,
+        Invoke.fails,
+    ));
+    try testing.expectError(error.DimensionMismatch, sql.embedding.embed(
+        testing.allocator,
+        &registry,
+        "docs",
+        "hello",
+        &context,
+        Invoke.wrongDimensions,
+    ));
+}
